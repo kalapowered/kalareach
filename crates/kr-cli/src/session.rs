@@ -1407,9 +1407,12 @@ where
     .await;
     // The reader stops before anything else reads this terminal: a command that goes on after the
     // attachment must be the only reader of it.
-    input_stop.stop();
     // What it had read and the loop had not taken is dropped, and a typed key in it was lost.
-    said_after.extend(fallback.finish(&mut input));
+    said_after.extend(after_the_reader_stops(
+        input_stop.stop(),
+        &mut fallback,
+        &mut input,
+    ));
 
     // The terminal comes back here on every path out of the loop, and the guard is released only
     // once it has.
@@ -1483,6 +1486,12 @@ const WATCHING_AFTER_A_REFUSAL: &str = "kr: the application in the session uses 
      encoding that console keys cannot be sent in, and this console would not spell its keys \
      itself, so this attachment stopped sending keys and watched.";
 
+/// What an attachment says when the thread that reads its console had not ended by the time the
+/// attachment did.
+const READER_STILL_RUNNING: &str = "kr: the part of this command that reads the console's keys had \
+     not ended when the terminal came back, so the next key you type may be lost, and the keys it \
+     had already taken were not counted.";
+
 /// What is added to either when something the person typed was lost with the refusal.
 const TYPED_KEYS_LOST: &str = "Keys typed just before the session refused them were lost: the batch \
      it refused, the writes sent behind that batch and the records this command had already read.";
@@ -1505,6 +1514,21 @@ struct Fallback {
     typed_keys_lost: bool,
 }
 
+/// What the attachment says once the thread that reads its console has been stopped: how it went on
+/// if the session refused its console keys, counting what the reader left, and that the thread had
+/// not ended if it had not.
+fn after_the_reader_stops(
+    stopped: crate::attach::Stopped,
+    fallback: &mut Fallback,
+    input: &mut tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
+) -> Vec<Shown> {
+    let mut said: Vec<Shown> = fallback.finish(input, &stopped.left).into_iter().collect();
+    if stopped.still_running {
+        said.push(Shown::said(READER_STILL_RUNNING));
+    }
+    said
+}
+
 /// How an attachment goes on once the session refused its console keys.
 #[derive(Clone, Copy, Debug)]
 enum Spelling {
@@ -1515,19 +1539,25 @@ enum Spelling {
 }
 
 impl Fallback {
-    /// Counts the records left in `input`, which are dropped, and returns what the attachment says
-    /// after the terminal is the person's again, if it changed how it sends keys.
+    /// Counts the records left in `input` and the ones the reader left when it ended, which are
+    /// dropped, and returns what the attachment says after the terminal is the person's again, if it
+    /// changed how it sends keys.
     ///
     /// The reader must have stopped, so that nothing it read is still on its way.
     fn finish(
         &mut self,
         input: &mut tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
+        left: &[TerminalInput],
     ) -> Option<Shown> {
         self.how?;
-        while let Ok(read) = input.try_recv() {
+        let mut count = |read: &TerminalInput| {
             if let TerminalInput::Keys(keys) = read {
-                self.typed_keys_lost |= presses(&keys);
+                self.typed_keys_lost |= presses(keys);
             }
+        };
+        left.iter().for_each(&mut count);
+        while let Ok(read) = input.try_recv() {
+            count(&read);
         }
         self.line()
     }
@@ -2703,8 +2733,9 @@ async fn wait_for_resize(_resized: &mut Option<&mut WindowChanges>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Answer, AttachOutcome, Heard, Outstanding, Ownership, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY,
-        Sending, Subscriptions, WindowReports, drop_unseen_releases, landed, ownership, presses,
+        Answer, AttachOutcome, Fallback, Heard, Outstanding, Ownership, SCROLL_BACK_KEY,
+        SCROLL_FORWARD_KEY, Sending, Spelling, Subscriptions, WindowReports,
+        after_the_reader_stops, drop_unseen_releases, landed, ownership, presses,
         resizes_in_flight, scroll_keys, scroll_step, scrolled, take_scroll_keys,
     };
     #[cfg(unix)]
@@ -3072,7 +3103,11 @@ mod tests {
             let sent = log.lock().expect("the log is not poisoned").clone();
             Ran {
                 outcome,
-                said: fallback.finish(&mut input).into_iter().collect(),
+                said: super::super::after_the_reader_stops(
+                    crate::attach::Stopped::default(),
+                    &mut fallback,
+                    &mut input,
+                ),
                 sent,
             }
         }
@@ -3910,6 +3945,63 @@ mod tests {
             assert!(!presses(&[key(lock, true)]), "{name} types nothing");
             assert!(presses(&[key(lock, true), key(u16::from(b'A'), true)]));
         }
+    }
+
+    /// What the attachment says once the reader of its console has been stopped: that the reader had
+    /// not ended when it had not, and a typed key the reader left when it ended among the keys lost
+    /// with the refusal. A reader that ended with nothing, or with a modifier on its own, says
+    /// nothing of either.
+    #[test]
+    fn what_the_reader_leaves_when_it_is_stopped_is_counted_and_a_reader_still_running_is_said() {
+        use crate::attach::{Stopped, TerminalInput};
+        use kr_term::win32::KeyRecord;
+
+        let key = |virtual_key: u16, unicode: u16| {
+            TerminalInput::Keys(vec![KeyRecord {
+                virtual_key,
+                scan_code: 0,
+                unicode,
+                key_down: true,
+                control_keys: 0,
+                repeat: 1,
+            }])
+        };
+        let (_keep, mut input) = tokio::sync::mpsc::unbounded_channel();
+        let spelling = || Fallback {
+            how: Some(Spelling::Console),
+            typed_keys_lost: false,
+        };
+
+        // Nothing left, nothing running, and no refusal: nothing to say.
+        let said = after_the_reader_stops(Stopped::default(), &mut Fallback::default(), &mut input);
+        assert!(said.is_empty(), "{said:?}");
+
+        // A reader that had not ended says so, whether or not the session refused anything.
+        let running = Stopped {
+            still_running: true,
+            left: Vec::new(),
+        };
+        let said = after_the_reader_stops(running, &mut Fallback::default(), &mut input);
+        assert!(
+            said.len() == 1 && said[0].as_str().contains("had not ended"),
+            "{said:?}"
+        );
+
+        // The half of a character the reader held is a key typed; a modifier on its own is not.
+        let left = |read| Stopped {
+            still_running: false,
+            left: vec![read],
+        };
+        let said = after_the_reader_stops(left(key(0, 0xd83d)), &mut spelling(), &mut input);
+        assert!(
+            said.len() == 1 && said[0].as_str().contains("were lost"),
+            "a half held at the stop was typed: {said:?}"
+        );
+        let said = after_the_reader_stops(left(key(0x10, 0)), &mut spelling(), &mut input);
+        assert!(
+            said.len() == 1 && !said[0].as_str().contains("lost"),
+            "a modifier left at the stop is no typing: {said:?}"
+        );
     }
 
     /// A key that came up without this attachment seeing it go down is not the session's, however

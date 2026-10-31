@@ -793,17 +793,110 @@ pub(crate) trait ConsoleInput {
     fn bytes(&mut self) -> std::io::Result<Vec<u8>>;
 }
 
-/// Starts the thread that reads `console`, and links it to `switch`.
-///
-/// `wake` ends the reader's wait so that it hears a request of the switch.
+/// How long the stop waits for the reader to end.
+#[cfg(all(not(unix), not(test)))]
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The same, short enough for a case to wait out.
+#[cfg(test)]
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How long the stop waits before it cancels the read of the console that a reader which has not
+/// ended is blocked in.
+#[cfg(all(not(unix), not(test)))]
+const CANCEL_AFTER: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The same, short enough for a case to wait out.
+#[cfg(test)]
+const CANCEL_AFTER: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// What the stop of a reader learned.
+#[derive(Debug, Default)]
+pub struct Stopped {
+    /// Whether the reader was still running when the stop gave up waiting for it, so that it may
+    /// hold keys it took from the console, which the stop cannot count.
+    pub still_running: bool,
+    /// What the reader had taken from the console and not handed on when it ended, the first half
+    /// of a character among it.
+    pub left: Vec<TerminalInput>,
+}
+
+/// What the reader's thread is woken and cancelled with.
 #[cfg(any(not(unix), test))]
-fn start_reader<C: ConsoleInput + Send + 'static>(
+pub(crate) struct Wakes {
+    /// Ends the reader's wait so that it hears a request of the switch.
+    pub(crate) ask: Box<dyn Fn() + Send + Sync>,
+    /// Ends the reader's wait so that it sees the stop.
+    pub(crate) stop: Box<dyn Fn() + Send + Sync>,
+    /// Cancels the read of the console that the reader is blocked in.
+    pub(crate) cancel: Box<dyn Fn(&ReaderThread) + Send + Sync>,
+}
+
+/// The thread that reads a console, which ends with what it had taken and not handed on.
+#[cfg(any(not(unix), test))]
+pub type ReaderThread = std::thread::JoinHandle<Vec<TerminalInput>>;
+
+/// What ends the thread [`spawn_input_reader`] started.
+#[cfg(any(not(unix), test))]
+pub struct ReaderStop {
+    /// Set before the thread is woken, and looked at by the thread before it reads and sends.
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes the thread out of its wait, to end.
+    wake: Box<dyn Fn() + Send + Sync>,
+    /// Cancels the read of the console that the thread is blocked in, which nothing else wakes.
+    cancel: Box<dyn Fn(&ReaderThread) + Send + Sync>,
+    /// The reading thread.
+    thread: ReaderThread,
+}
+
+#[cfg(any(not(unix), test))]
+impl ReaderStop {
+    /// Wakes the thread, which has ended a moment later: it is waiting for the console and for this
+    /// together, and is not part way through a read it cannot leave. A thread that has not ended
+    /// after a tenth of a second is in a read of the console that nothing but a cancel ends, and
+    /// has that read cancelled, again and again until it has ended or the wait is over. The console
+    /// gives the next key to a read that was cancelled, so this is for a thread that would
+    /// otherwise go on taking keys.
+    ///
+    /// A thread that has not ended when the wait is over is left, and the answer says so. It reads
+    /// nothing and sends nothing from the moment the stop is made, so what it does when it goes on
+    /// is to end; what it holds then is not counted.
+    pub fn stop(self) -> Stopped {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        (self.wake)();
+        let started = std::time::Instant::now();
+        let deadline = started + STOP_WAIT;
+        let cancel_from = started + CANCEL_AFTER;
+        while !self.thread.is_finished() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Stopped {
+                    still_running: true,
+                    left: Vec::new(),
+                };
+            }
+            if now >= cancel_from {
+                (self.cancel)(&self.thread);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        Stopped {
+            still_running: false,
+            left: self.thread.join().unwrap_or_default(),
+        }
+    }
+}
+
+/// Starts the thread that reads `console`, and links it to `switch`.
+#[cfg(any(not(unix), test))]
+pub(crate) fn start_reader<C: ConsoleInput + Send + 'static>(
     mut console: C,
     switch: &InputSwitch,
-    wake: Box<dyn Fn() + Send + Sync>,
+    wakes: Wakes,
 ) -> (
     tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
-    std::thread::JoinHandle<()>,
+    ReaderStop,
 ) {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let (answer_to, answers) = std::sync::mpsc::channel();
@@ -817,15 +910,28 @@ fn start_reader<C: ConsoleInput + Send + 'static>(
         .reader
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ReaderLine {
-        wake,
+        wake: wakes.ask,
         answers,
         state,
     });
-    let thread = std::thread::spawn(move || read_console(&mut console, &switching, &sender));
-    (receiver, thread)
+    let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread = {
+        let stopped = std::sync::Arc::clone(&stopped);
+        std::thread::spawn(move || read_console(&mut console, &switching, &sender, &stopped))
+    };
+    (
+        receiver,
+        ReaderStop {
+            stopped,
+            wake: wakes.stop,
+            cancel: wakes.cancel,
+            thread,
+        },
+    )
 }
 
-/// Reads `console` until its input ends, a batch has nowhere to go, or the stop is made.
+/// Reads `console` until its input ends, a batch has nowhere to go, or the stop is made, and
+/// returns what it had taken from the console and not handed on.
 ///
 /// The console is read as records until the switch asks. The thread then asks the console to spell
 /// its keys, between two reads, and reads its text from then on as it comes, none of it turned into
@@ -833,17 +939,25 @@ fn start_reader<C: ConsoleInput + Send + 'static>(
 /// only ever waiting for the console and for the stop together, and reads the console only when it
 /// holds text, so the stop has no read to cancel unless the console keeps a record that the test of
 /// `key_can_make_text` has not met.
+///
+/// `stopped` is set by the stop before it wakes the thread, and the thread looks at it as soon as
+/// its wait ends, before it reads or asks anything of the console, and again before each send. A
+/// thread that was held back between two calls while the stop was made therefore reads nothing and
+/// sends nothing when it goes on, and what it had read by then is what it returns, with the first
+/// half of a character it was holding, so that the caller can count it.
 #[cfg(any(not(unix), test))]
 fn read_console(
     console: &mut impl ConsoleInput,
     switching: &Switching,
     sender: &tokio::sync::mpsc::UnboundedSender<TerminalInput>,
-) {
+    stopped: &std::sync::atomic::AtomicBool,
+) -> Vec<TerminalInput> {
     use std::sync::atomic::Ordering::SeqCst;
 
+    let mut left = Vec::new();
     let mut spelled = false;
     let mut in_a_row = 0_u32;
-    loop {
+    'reading: loop {
         // A console that keeps having input is read a few times, and then a request that has been
         // waiting goes first.
         let requests_first = in_a_row >= READS_BEFORE_A_REQUEST;
@@ -853,24 +967,35 @@ fn read_console(
         } else {
             0
         };
+        // Nothing is read from the console or asked of it once the stop has been made, whatever
+        // woke the thread.
+        if stopped.load(SeqCst) {
+            break;
+        }
         match woken {
             Ok(Woken::Console) if spelled => match console.bytes() {
                 Ok(bytes) if bytes.is_empty() => {}
                 Ok(bytes) => {
+                    if stopped.load(SeqCst) {
+                        left.push(TerminalInput::Bytes(bytes));
+                        break;
+                    }
                     if sender.send(TerminalInput::Bytes(bytes)).is_err() {
-                        return;
+                        break;
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return,
+                Err(_) => break,
             },
             Ok(Woken::Console) => {
                 let Ok(runs) = console.keys() else {
-                    return;
+                    break;
                 };
                 for keys in runs {
-                    if sender.send(TerminalInput::Keys(keys)).is_err() {
-                        return;
+                    if stopped.load(SeqCst) {
+                        left.push(TerminalInput::Keys(keys));
+                    } else if sender.send(TerminalInput::Keys(keys)).is_err() {
+                        break 'reading;
                     }
                 }
             }
@@ -894,7 +1019,7 @@ fn read_console(
                 // it is handed on to be dropped with the others and counted.
                 let held = console.held();
                 if !held.is_empty() && sender.send(TerminalInput::Keys(held)).is_err() {
-                    return;
+                    break;
                 }
                 // A console that already spells its keys is not asked again.
                 let answer = if spelled { Ok(()) } else { (switching.ask)() };
@@ -904,9 +1029,15 @@ fn read_console(
                 switching.state.store(request::IDLE, SeqCst);
                 let _ = switching.answers.send(answer);
             }
-            Ok(Woken::Stop) | Err(_) => return,
+            Ok(Woken::Stop) | Err(_) => break,
         }
     }
+    // Whatever half of a character the reader still holds is the last record it took.
+    let held = console.held();
+    if !held.is_empty() {
+        left.push(TerminalInput::Keys(held));
+    }
+    left
 }
 
 /// The key and modifiers the console spells a NUL with, as `VkKeyScanW(0)` names them.
@@ -1151,18 +1282,24 @@ pub fn spawn_input_reader(
 
     let stop = Arc::new(WakeEvent::new()?);
     let asked = Arc::new(WakeEvent::new()?);
-    let wake = {
-        let asked = Arc::clone(&asked);
-        Box::new(move || asked.signal())
+    let wakes = Wakes {
+        ask: {
+            let asked = Arc::clone(&asked);
+            Box::new(move || asked.signal())
+        },
+        stop: {
+            let stop = Arc::clone(&stop);
+            Box::new(move || stop.signal())
+        },
+        cancel: Box::new(crate::platform::cancel_blocked_read),
     };
     let console = WindowsConsole {
         reader: RecordReader::over(console),
-        stop: Arc::clone(&stop),
+        stop,
         asked,
         carry: None,
     };
-    let (receiver, thread) = start_reader(console, switch, wake);
-    Ok((receiver, InputStop { stop, thread }))
+    Ok(start_reader(console, switch, wakes))
 }
 
 /// The Windows console, as the reader thread reads it.
@@ -1268,44 +1405,18 @@ impl InputStop {
     /// Ends the thread, which has ended when this returns, unless it cannot be woken: a thread
     /// blocked in a read of a terminal that cannot be waited for is left to end with the next key,
     /// and is not joined.
-    pub fn stop(self) {
+    pub fn stop(self) -> Stopped {
         drop(self.wake);
         if !self.unwakeable.load(std::sync::atomic::Ordering::SeqCst) {
             let _ = self.thread.join();
         }
+        Stopped::default()
     }
 }
 
 /// What ends the thread [`spawn_input_reader`] started.
 #[cfg(not(unix))]
-pub struct InputStop {
-    /// The event the thread also waits on.
-    stop: std::sync::Arc<crate::windows::records::WakeEvent>,
-    /// The reading thread.
-    thread: std::thread::JoinHandle<()>,
-}
-
-#[cfg(not(unix))]
-impl InputStop {
-    /// Wakes the thread, which has ended a moment later: it is waiting for the console and for this
-    /// together, and is not part way through a read it cannot leave. A thread that has not ended
-    /// after a tenth of a second is in a read of the console that nothing but a cancel ends, and
-    /// has that read cancelled, again and again until it has ended or a second has gone. The
-    /// console gives the next key to a read that was cancelled, so this is for a thread that would
-    /// otherwise go on taking keys.
-    pub fn stop(self) {
-        self.stop.signal();
-        let started = std::time::Instant::now();
-        let deadline = started + std::time::Duration::from_secs(1);
-        let cancel_from = started + std::time::Duration::from_millis(100);
-        while !self.thread.is_finished() && std::time::Instant::now() < deadline {
-            if std::time::Instant::now() >= cancel_from {
-                crate::platform::cancel_blocked_read(&self.thread);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-}
+pub type InputStop = ReaderStop;
 
 /// What an attachment needs to know of the session it attaches to.
 ///
@@ -1560,8 +1671,8 @@ mod reader {
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::{
-        ConsoleInput, InputSwitch, NulKey, READS_BEFORE_A_REQUEST, TerminalInput, Woken,
-        key_can_make_text, start_reader, utf8_of_console_text,
+        ConsoleInput, InputSwitch, NulKey, READS_BEFORE_A_REQUEST, ReaderStop, Stopped,
+        TerminalInput, Wakes, Woken, key_can_make_text, start_reader, utf8_of_console_text,
     };
     use crate::error::{CliError, Result};
 
@@ -1580,6 +1691,31 @@ mod reader {
         held: Vec<KeyRecord>,
         bytes: mpsc::Receiver<Vec<u8>>,
         steps: Steps,
+        /// Holds the thread inside one of its calls, once, until the case lets it go.
+        pause: Option<Pause>,
+    }
+
+    /// Where the thread is held, and the two ends of the holding.
+    struct Pause {
+        /// The call it is held at: `"wait"` or `"keys"`, after the call has done what it does and
+        /// before it returns.
+        at: &'static str,
+        /// Told when the thread is there.
+        arrived: mpsc::Sender<()>,
+        /// Waited on until the case lets the thread go.
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Scripted {
+        /// Holds the thread here if the case asked for it at this call.
+        fn paused_at(&mut self, call: &'static str) {
+            if self.pause.as_ref().is_some_and(|pause| pause.at == call)
+                && let Some(pause) = self.pause.take()
+            {
+                let _ = pause.arrived.send(());
+                let _ = pause.release.recv();
+            }
+        }
     }
 
     impl ConsoleInput for Scripted {
@@ -1602,15 +1738,19 @@ mod reader {
             if requests_first {
                 self.steps.lock().expect("steps").push("requests first");
             }
-            Ok(match request {
+            let woken = match request {
                 Some(at) => self.pending.remove(at).expect("it is there"),
                 None => self.pending.pop_front().expect("something is pending"),
-            })
+            };
+            self.paused_at("wait");
+            Ok(woken)
         }
 
         fn keys(&mut self) -> Result<Vec<Vec<KeyRecord>>> {
             self.steps.lock().expect("steps").push("keys");
-            Ok(self.keys.pop_front().unwrap_or_default())
+            let read = self.keys.pop_front().unwrap_or_default();
+            self.paused_at("keys");
+            Ok(read)
         }
 
         fn held(&mut self) -> Vec<KeyRecord> {
@@ -1633,8 +1773,14 @@ mod reader {
         go: mpsc::Sender<()>,
         /// Says that the switch has woken the reader.
         woke: mpsc::Receiver<()>,
+        /// Says that the stop has woken the reader.
+        stopping: mpsc::Receiver<()>,
+        /// Says that the thread is held at the call the case asked for.
+        held: mpsc::Receiver<()>,
+        /// Lets the thread go from where it is held.
+        release: mpsc::Sender<()>,
         steps: Steps,
-        thread: std::thread::JoinHandle<()>,
+        stop: Option<ReaderStop>,
     }
 
     impl Run {
@@ -1647,10 +1793,36 @@ mod reader {
             wake_reaches_the_reader: bool,
             held_back: bool,
         ) -> Self {
+            Self::built(
+                will_spell,
+                keys,
+                held,
+                wake_reaches_the_reader,
+                held_back,
+                None,
+            )
+        }
+
+        /// Starts the thread over a console that holds it inside its call `at`, once.
+        fn paused(at: &'static str, keys: Vec<Vec<Vec<KeyRecord>>>, held: Vec<KeyRecord>) -> Self {
+            Self::built(true, keys, held, true, false, Some(at))
+        }
+
+        fn built(
+            will_spell: bool,
+            keys: Vec<Vec<Vec<KeyRecord>>>,
+            held: Vec<KeyRecord>,
+            wake_reaches_the_reader: bool,
+            held_back: bool,
+            pause_at: Option<&'static str>,
+        ) -> Self {
             let (wakes, heard) = mpsc::channel();
             let (bytes, spelled) = mpsc::channel();
             let (go, start) = mpsc::channel();
             let (woke_to, woke) = mpsc::channel();
+            let (stopping_to, stopping) = mpsc::channel();
+            let (arrived, held_at) = mpsc::channel();
+            let (release, released) = mpsc::channel();
             let steps: Steps = Arc::default();
             let asked = Arc::clone(&steps);
             let switch = InputSwitch::new(move || {
@@ -1669,17 +1841,33 @@ mod reader {
                 held,
                 bytes: spelled,
                 steps: Arc::clone(&steps),
+                pause: pause_at.map(|at| Pause {
+                    at,
+                    arrived,
+                    release: released,
+                }),
             };
-            let wake = {
-                let wakes = wakes.clone();
-                Box::new(move || {
-                    if wake_reaches_the_reader {
-                        let _ = wakes.send(Woken::Asked);
-                    }
-                    let _ = woke_to.send(());
-                })
+            let reader_wakes = Wakes {
+                ask: {
+                    let wakes = wakes.clone();
+                    Box::new(move || {
+                        if wake_reaches_the_reader {
+                            let _ = wakes.send(Woken::Asked);
+                        }
+                        let _ = woke_to.send(());
+                    })
+                },
+                stop: {
+                    let wakes = wakes.clone();
+                    Box::new(move || {
+                        let _ = wakes.send(Woken::Stop);
+                        let _ = stopping_to.send(());
+                    })
+                },
+                // The console of a case has no read that nothing else wakes.
+                cancel: Box::new(|_| {}),
             };
-            let (input, thread) = start_reader(console, &switch, wake);
+            let (input, stop) = start_reader(console, &switch, reader_wakes);
             Self {
                 input,
                 switch,
@@ -1687,8 +1875,11 @@ mod reader {
                 bytes,
                 go,
                 woke,
+                stopping,
+                held: held_at,
+                release,
                 steps,
-                thread,
+                stop: Some(stop),
             }
         }
 
@@ -1718,11 +1909,39 @@ mod reader {
             }
         }
 
+        /// Makes the stop, which returns once the thread has ended or the wait is over.
+        fn stops(&mut self) -> Stopped {
+            self.stop.take().expect("the stop is made once").stop()
+        }
+
         /// Ends the thread, and returns what it asked of the console.
-        fn ends(self) -> Vec<&'static str> {
-            let _ = self.wakes.send(Woken::Stop);
-            self.thread.join().expect("the reader ended");
+        fn ends(mut self) -> Vec<&'static str> {
+            let stopped = self.stops();
+            assert!(!stopped.still_running, "the reader ended");
             self.steps.lock().expect("steps").clone()
+        }
+
+        /// What the thread handed on until it ended, and what it asked of the console. Waits for
+        /// the thread to end, which closes its channel, within ten seconds.
+        fn handed_on_until_it_ends(&mut self) -> (Vec<TerminalInput>, Vec<&'static str>) {
+            use tokio::sync::mpsc::error::TryRecvError;
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut handed = Vec::new();
+            loop {
+                match self.input.try_recv() {
+                    Ok(read) => handed.push(read),
+                    Err(TryRecvError::Disconnected) => break,
+                    Err(TryRecvError::Empty) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the reader did not end in ten seconds"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+            (handed, self.steps.lock().expect("steps").clone())
         }
     }
 
@@ -1817,11 +2036,9 @@ mod reader {
     /// A switch asked of a reader that has ended fails at once and does not wait for it.
     #[test]
     fn a_reader_that_has_ended_cannot_be_asked() {
-        let run = Run::start(true, Vec::new());
-        run.wakes.send(Woken::Stop).expect("the reader waits");
-        let Run { switch, thread, .. } = run;
-        thread.join().expect("the reader ended");
-        assert!(switch.engage().is_err());
+        let mut run = Run::start(true, Vec::new());
+        assert!(!run.stops().still_running, "the reader ended");
+        assert!(run.switch.engage().is_err());
     }
 
     /// A console that keeps having input is read a few times and then the request that has waited
@@ -1899,6 +2116,99 @@ mod reader {
         run.switch.engage().expect("the console spells its keys");
         assert_eq!(run.next(), TerminalInput::Keys(vec![half]));
         run.ends();
+    }
+
+    /// A reader held between its wait and its read of the console when the stop is made reads
+    /// nothing after it, and the stop says the reader was still running.
+    #[test]
+    fn a_reader_held_before_a_read_when_the_stop_is_made_does_not_read() {
+        let down = key(u16::from(b'A'), u16::from(b'a'), true);
+        let mut run = Run::paused("wait", vec![vec![vec![down]]], Vec::new());
+        run.has_input();
+        run.held.recv().expect("the reader is held after its wait");
+        let stopped = run.stops();
+        assert!(
+            stopped.still_running,
+            "a reader held inside a call has not ended when the wait is over"
+        );
+        run.release.send(()).expect("the reader is held");
+        let (handed, steps) = run.handed_on_until_it_ends();
+        assert!(
+            !steps.contains(&"keys"),
+            "the console was read after the stop: {steps:?}"
+        );
+        assert!(handed.is_empty(), "something was handed on: {handed:?}");
+    }
+
+    /// A reader held between its read of the console and its send when the stop is made sends
+    /// nothing after it.
+    #[test]
+    fn a_reader_held_before_a_send_when_the_stop_is_made_sends_nothing() {
+        let down = key(u16::from(b'A'), u16::from(b'a'), true);
+        let mut run = Run::paused("keys", vec![vec![vec![down]]], Vec::new());
+        run.has_input();
+        run.held.recv().expect("the reader is held after its read");
+        let stopped = run.stops();
+        assert!(stopped.still_running);
+        run.release.send(()).expect("the reader is held");
+        let (handed, _) = run.handed_on_until_it_ends();
+        assert!(
+            handed.is_empty(),
+            "a record read at the stop was handed on after it: {handed:?}"
+        );
+    }
+
+    /// A reader that ends within the wait is seen to end, and what it had read and not sent is
+    /// what the stop has of it, so that it can be counted.
+    #[test]
+    fn a_reader_that_ends_within_the_wait_leaves_what_it_read_and_did_not_send() {
+        let down = key(u16::from(b'A'), u16::from(b'a'), true);
+        let mut run = Run::paused("keys", vec![vec![vec![down]]], Vec::new());
+        run.has_input();
+        run.held.recv().expect("the reader is held after its read");
+        let stop = run.stop.take().expect("the stop is made once");
+        let stopped = std::thread::scope(|scope| {
+            let stopping = scope.spawn(move || stop.stop());
+            run.stopping.recv().expect("the stop woke the reader");
+            run.release.send(()).expect("the reader is held");
+            stopping.join().expect("the stop ended")
+        });
+        assert!(!stopped.still_running, "the reader ended within the wait");
+        assert_eq!(stopped.left, vec![TerminalInput::Keys(vec![down])]);
+        let (handed, _) = run.handed_on_until_it_ends();
+        assert!(handed.is_empty(), "something was handed on: {handed:?}");
+    }
+
+    /// The first half of a character that the reader holds when it ends is what it leaves, as at
+    /// the switch.
+    #[test]
+    fn the_half_of_a_character_the_reader_holds_at_the_stop_is_left() {
+        let half = key(0, 0xd83d, true);
+        let mut run = Run::started(true, Vec::new(), vec![half], true, false);
+        let stopped = run.stops();
+        assert!(!stopped.still_running);
+        assert_eq!(stopped.left, vec![TerminalInput::Keys(vec![half])]);
+    }
+
+    /// A request the reader hears at the stop is not made: the console would be asked to spell its
+    /// keys after the stop, when the modes are the person's again.
+    #[test]
+    fn a_request_the_reader_hears_at_the_stop_is_not_made() {
+        let mut run = Run::paused("wait", Vec::new(), Vec::new());
+        let stop = run.stop.take().expect("the stop is made once");
+        let asked = std::thread::scope(|scope| {
+            let asking = scope.spawn(|| run.switch.engage());
+            run.held.recv().expect("the reader is held after its wait");
+            assert!(stop.stop().still_running);
+            run.release.send(()).expect("the reader is held");
+            asking.join().expect("the switch ended")
+        });
+        let (_, steps) = run.handed_on_until_it_ends();
+        assert!(
+            !steps.contains(&"ask"),
+            "the console was asked after the stop: {steps:?}"
+        );
+        assert!(asked.is_err(), "the switch was told the reader is gone");
     }
 
     /// The text a console spells is UTF-8 whatever the console's code page: a NUL stays, a character

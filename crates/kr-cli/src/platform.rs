@@ -75,7 +75,7 @@ pub const fn ignore_background_write_signal() -> std::io::Result<()> {
 /// request: the thread is not joined after it, because a console that did not honour it would hold
 /// the joiner for good.
 #[cfg(not(unix))]
-pub fn cancel_blocked_read(thread: &std::thread::JoinHandle<()>) {
+pub fn cancel_blocked_read<T>(thread: &std::thread::JoinHandle<T>) {
     use std::os::windows::io::AsRawHandle as _;
 
     // SAFETY: the handle is the thread's own, kept open by the `JoinHandle` this borrows, and the
