@@ -876,8 +876,9 @@ fn asked_again_until_answered(
     }
 }
 
-/// Does what [`remove_jobs`] does, asking the user manager through `systemctl`, and returns each
-/// unit still loaded afterwards and each question the manager did not answer.
+/// Does what [`remove_jobs`] does, for the user manager's units: lists them and stops those that
+/// run inside the tree through `systemctl`, and returns each unit still loaded afterwards, each
+/// question the manager did not answer and each unit file that could not be read.
 ///
 /// A transient unit is collected once its process has ended, but one whose process is still
 /// running outlives the test and the tree its program was in. A unit is this tree's when the
