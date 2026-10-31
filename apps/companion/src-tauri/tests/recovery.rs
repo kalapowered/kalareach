@@ -1771,8 +1771,10 @@ async fn a_step_holds_the_lock_another_companion_waits_on_while_it_runs() {
 /* The account's token                                                         */
 /* -------------------------------------------------------------------------- */
 
-/// KR-REQ-17.14: the account's token goes only to the service the account is signed in to. A sync
-/// service setting that names another is refused with the setting named, and nothing is sent.
+/// KR-REQ-17.14: the sync service is a choice of its own, and the account's token goes only to the
+/// service the account is signed in to. A sync service setting that names another is refused with
+/// the setting named, and nothing is sent. The case reads no client the application was given and
+/// no line of what is available.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_account_token_goes_only_to_the_service_the_account_is_signed_in_to() {
     let computer = Computer::new().await;
@@ -1869,12 +1871,12 @@ fn asks_for_another_setting(words: &str) -> bool {
     .any(|instruction| words.contains(instruction))
 }
 
-/// KR-REQ-17.14: a record goes on naming the service named for its bundle when the account is
-/// signed in at another service and the setting names that one. The page is shown what is wrong
-/// for a record that is made and not kept and for one that is kept, the same account at the
-/// record's service goes on with the record, and the kit, saved as text or as a QR code, names the
-/// service the record names and the locator it began with. Sending nothing to either
-/// service is held for each step by the case below.
+/// KR-REQ-20.18: the kit, saved as text or as a QR code, names the service the bundle is kept at
+/// and the locator the first kit saved after the record was kept named, whatever the sync service
+/// setting names and whichever service the account is signed in at, and saving it sends nothing
+/// to either service. The case also shows the page what is wrong for a record that is made and
+/// not kept and for one that is kept, and that the same account at the record's service goes on
+/// with the record; what each step does at another service is held by the cases below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_keeps_naming_its_service_and_its_kit_when_the_account_signs_in_elsewhere() {
     let computer = Computer::new().await;
