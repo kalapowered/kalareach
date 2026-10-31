@@ -954,6 +954,12 @@ impl BackupSetup {
         // The fixed token source refuses once another account is signed in, and says nothing that
         // tells that apart from the service's own unavailability, so the account is looked at.
         if self.account.mark_at(self.origin.as_str()) != Some(mark) {
+            // A delay the service named with this answer is owed whichever account is signed in.
+            // The failure of the check that a token can be had is the sign-in's and not the
+            // service's.
+            if !before_token {
+                self.owe(Hold::of(error));
+            }
             return declined(BackupEnableCause::AnotherAccount {});
         }
         if before_token {
@@ -964,11 +970,16 @@ impl BackupSetup {
         self.ended_by_error(error)
     }
 
-    fn ended_by_error(&self, error: &ClientError) -> Ended {
-        let hold = Hold::of(error);
+    /// Records the delay the service named, when it named one.
+    fn owe(&self, hold: Hold) {
         if let Some(delay) = hold.retry_after {
             self.quiet.owe(delay);
         }
+    }
+
+    fn ended_by_error(&self, error: &ClientError) -> Ended {
+        let hold = Hold::of(error);
+        self.owe(hold);
         match error {
             ClientError::Refused { .. } => match hold.code {
                 ErrorCode::QuotaExceeded => declined(BackupEnableCause::NoAllowance {}),
@@ -1120,6 +1131,67 @@ mod tests {
             *probe.held.lock().unwrap_or_else(PoisonError::into_inner),
             Some(true),
             "the registration is taken while the store is held"
+        );
+    }
+
+    /// A delay the service names in an answer that arrives after another account has signed in is
+    /// still owed: the call ends as another account's, and the service still asked to be left
+    /// alone. The delay is the service's and not the account's. The failure of the check that a
+    /// token can be had is the sign-in's, and names no delay of the service's.
+    ///
+    /// The service stand-in answers a request at once, so no suite can hold a refusal in flight
+    /// while an account signs in; this case gives the answer to the step that ends the call.
+    #[tokio::test]
+    async fn a_delay_named_in_an_answer_that_arrives_after_another_account_signed_in_is_owed() {
+        let root = tempfile::tempdir().expect("a disposable directory");
+        let runtime = tempfile::tempdir().expect("a runtime directory");
+        let quiet = Arc::new(Quiet::new(HeldTimer::automatic()));
+        let setup = BackupSetup::new(
+            GatewayOrigin::new("https://storage.example").expect("an origin"),
+            None,
+            AuthorisationKeyPair::generate().expect("a key"),
+            AuthorisationKeyPair::generate().expect("a key"),
+            StoredEnvelopeKeyPair::generate().expect("a key"),
+            // Nobody is signed in, which is another account than the one the call began under.
+            Arc::new(HostAccount::new(
+                Arc::new(kr_crypto::store::MemoryStore::default()),
+                EnvironmentId::new(Uuid::from_bytes([9; 16])),
+                runtime.path(),
+                Err(SignInUnavailable::NotUsable),
+                None,
+            )),
+            Arc::new(BackupService::in_memory(&root.path().join("backup")).expect("a service")),
+            Arc::clone(&quiet),
+        );
+        let began_under = kr_client::services::AccountMark::from_bytes([7; 32]);
+        let rate_limited = ClientError::Refused {
+            error: kr_protocol::error::ProtocolError::new(
+                ErrorCode::RateLimited,
+                "the service refuses that request for now".to_owned(),
+            ),
+            retry_after_seconds: Some(30),
+            action: kr_client::retry::UserAction::Wait,
+            service_code: None,
+        };
+
+        let before_the_token_check = setup.ended_by(&rate_limited, began_under, true);
+
+        assert_eq!(
+            before_the_token_check,
+            declined(BackupEnableCause::AnotherAccount {})
+        );
+        assert_eq!(quiet.left(), None, "the sign-in's failure names no delay");
+
+        let after_a_request = setup.ended_by(&rate_limited, began_under, false);
+
+        assert_eq!(
+            after_a_request,
+            declined(BackupEnableCause::AnotherAccount {})
+        );
+        assert_eq!(
+            quiet.left(),
+            Some(Duration::from_secs(30)),
+            "the delay the service named is owed"
         );
     }
 }
