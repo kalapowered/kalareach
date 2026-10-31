@@ -5058,33 +5058,166 @@ fn unmount(mount: &Path) -> Result<(), String> {
     Err(why)
 }
 
+/// How long the process a rootless container runtime keeps beside its containers is given to be
+/// gone once it has been told to end.
+const PAUSE_PROCESS_ENDS_WITHIN: Duration = Duration::from_secs(10);
+
 /// Ends the process a rootless container runtime keeps beside its containers, if the application
-/// the case ran asked the runtime anything.
+/// the case ran asked the runtime anything, and says why it could not.
 ///
 /// The runtime starts it in a session of its own, so the end of the application's group does not
-/// reach it, and it goes on holding the case's runtime directory long after the case. Its number
-/// is in the runtime directory, and it is ended only if it was started in that directory. The
-/// process is taken by its start identity before its environment is read, and ended by that
-/// identity, so a number that passes to another process between the steps is left alone.
-fn end_the_container_runtimes_pause_process(runtime: &Path) {
+/// reach it, and it lives on after the case with the case's runtime directory in its environment.
+/// Its number is in the runtime directory, and it is ended only if its environment names that
+/// directory. The process is taken by its start identity before its environment is read, and ended
+/// by that identity, so a number that passes to another process between the steps is left alone.
+///
+/// # Errors
+///
+/// Returns why the process could not be identified, why the system would not end it, or that it
+/// was still there [`PAUSE_PROCESS_ENDS_WITHIN`] after it was told to go.
+fn end_the_container_runtimes_pause_process(runtime: &Path) -> Result<(), String> {
+    end_the_pause_process_through(
+        runtime,
+        |identity| kr_ipc::identity::stop_process(identity, kr_ipc::identity::Stop::Kill),
+        PAUSE_PROCESS_ENDS_WITHIN,
+    )
+}
+
+/// [`end_the_container_runtimes_pause_process`], ending the process by `stop` and waiting
+/// `ends_within` for it to be gone.
+fn end_the_pause_process_through(
+    runtime: &Path,
+    stop: impl Fn(&ProcessStartIdentity) -> kr_ipc::identity::Stopped,
+    ends_within: Duration,
+) -> Result<(), String> {
+    use kr_ipc::identity::Stopped;
+
     let Some(number) = std::fs::read_to_string(runtime.join("libpod/tmp/pause.pid"))
         .ok()
         .and_then(|text| text.trim().parse::<u32>().ok())
     else {
-        return;
+        return Ok(());
     };
-    let Ok(identity) = process_start_identity(number) else {
-        return;
-    };
+    let identity = process_start_identity(number).map_err(|error| {
+        format!("the container runtime's pause process {number} could not be identified: {error}")
+    })?;
     let wanted = format!("XDG_RUNTIME_DIR={}", runtime.display());
     let started_here = std::fs::read(format!("/proc/{number}/environ")).is_ok_and(|environment| {
         environment
             .split(|byte| *byte == 0)
             .any(|variable| variable == wanted.as_bytes())
     });
-    if started_here {
-        let _ = kr_ipc::identity::stop_process(&identity, kr_ipc::identity::Stop::Kill);
+    if !started_here {
+        return Ok(());
     }
+    match stop(&identity) {
+        Stopped::Signalled | Stopped::Gone => {}
+        refused => {
+            return Err(format!(
+                "the container runtime's pause process {number} was not ended: {refused:?}"
+            ));
+        }
+    }
+    let begun = Instant::now();
+    loop {
+        match process_state(&identity) {
+            ProcessState::Ended => return Ok(()),
+            ProcessState::Running if begun.elapsed() < ends_within => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            state => {
+                return Err(format!(
+                    "the container runtime's pause process {number} was {state:?} {ends_within:?} \
+                     after it was told to end"
+                ));
+            }
+        }
+    }
+}
+
+/// A process that stands for the pause process of a runtime whose runtime directory is
+/// `runtime`: it lives on, with the variable the runtime gives it, and its number is in the file
+/// the runtime keeps it in.
+#[cfg(target_os = "linux")]
+fn a_pause_process(runtime: &Path, environment: &Path) -> std::process::Child {
+    let child = std::process::Command::new("sleep")
+        .arg("300")
+        .env("XDG_RUNTIME_DIR", environment)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("starts a process");
+    std::fs::create_dir_all(runtime.join("libpod/tmp")).expect("the runtime's directory");
+    std::fs::write(
+        runtime.join("libpod/tmp/pause.pid"),
+        format!("{}\n", child.id()),
+    )
+    .expect("the file that names it");
+    child
+}
+
+/// The pause process a case left, which names the case's runtime directory, is ended by the case's
+/// teardown and is gone when that says so.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_pause_process_a_case_left_is_ended_and_seen_to_end() {
+    let runtime = tempfile::tempdir().expect("a directory");
+    let mut pause = a_pause_process(runtime.path(), runtime.path());
+    end_the_container_runtimes_pause_process(runtime.path()).expect("the process is ended");
+    // The process is this test's child, so its end is read from its status.
+    assert!(
+        pause.try_wait().expect("its state").is_some(),
+        "the process was still running when the teardown said it had ended it"
+    );
+}
+
+/// A process the file names that was not started in the case's runtime directory is not the case's
+/// to end.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_process_that_does_not_name_the_runtime_directory_is_left_alone() {
+    let runtime = tempfile::tempdir().expect("a directory");
+    let elsewhere = tempfile::tempdir().expect("a directory");
+    let mut other = a_pause_process(runtime.path(), elsewhere.path());
+    end_the_container_runtimes_pause_process(runtime.path()).expect("nothing to end");
+    let running = other.try_wait().expect("its state").is_none();
+    let _ = other.kill();
+    let _ = other.wait();
+    assert!(running, "a process of another directory was ended");
+}
+
+/// A stop the system refuses leaves the process alive, and the teardown says so: a case that
+/// ended with the process running does not pass.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stop_that_is_refused_leaves_the_pause_process_and_is_reported() {
+    let runtime = tempfile::tempdir().expect("a directory");
+    let mut pause = a_pause_process(runtime.path(), runtime.path());
+    let result = end_the_pause_process_through(
+        runtime.path(),
+        |_| kr_ipc::identity::Stopped::Refused("not allowed".to_owned()),
+        Duration::from_secs(1),
+    );
+    let _ = pause.kill();
+    let _ = pause.wait();
+    let why = result.expect_err("a refusal is an error");
+    assert!(why.contains("was not ended"), "{why}");
+}
+
+/// A stop that was delivered and did not end the process within the time given is reported too.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pause_process_that_is_still_there_after_the_stop_is_reported() {
+    let runtime = tempfile::tempdir().expect("a directory");
+    let mut pause = a_pause_process(runtime.path(), runtime.path());
+    let result = end_the_pause_process_through(
+        runtime.path(),
+        |_| kr_ipc::identity::Stopped::Signalled,
+        Duration::from_millis(300),
+    );
+    let _ = pause.kill();
+    let _ = pause.wait();
+    let why = result.expect_err("a process that stays is an error");
+    assert!(why.contains("after it was told to end"), "{why}");
 }
 
 impl HeadlessEmulator {
@@ -5137,12 +5270,14 @@ impl HeadlessEmulator {
         }
     }
 
-    /// Ends the application's group, takes down what its session mounted under the case's tree, and
-    /// says what is still mounted there, and why, if anything is.
+    /// Ends the application's group and the container runtime's pause process, takes down what the
+    /// application's session mounted under the case's tree, and says what is still mounted there,
+    /// or what could not be ended, and why, if anything is.
     ///
     /// # Errors
     ///
-    /// Returns the mounts that stay, each with why it could not be taken down.
+    /// Returns the mounts that stay, each with why it could not be taken down, and the pause
+    /// process if it was not seen to end.
     fn end(&self) -> Result<(), String> {
         if !self.ended.replace(true) {
             // The group is the child's own, named by the child's identifier.
@@ -5155,10 +5290,13 @@ impl HeadlessEmulator {
             }
             let _ = child.wait();
         }
-        end_the_container_runtimes_pause_process(&self.root.join("xdg-runtime"));
+        let pause = end_the_container_runtimes_pause_process(&self.root.join("xdg-runtime"));
         let table =
             |error: std::io::Error| format!("the table of mounts could not be read: {error}");
         let mut refused = Vec::new();
+        if let Err(why) = &pause {
+            refused.push(why.clone());
+        }
         for mount in mounts_under(&self.root).map_err(table)? {
             if let Err(why) = unmount(&mount) {
                 refused.push(format!("{}: {why}", mount.display()));
@@ -5166,7 +5304,7 @@ impl HeadlessEmulator {
         }
         // What the table shows afterwards decides, not what the program said.
         let left = mounts_under(&self.root).map_err(table)?;
-        if left.is_empty() {
+        if left.is_empty() && pause.is_ok() {
             Ok(())
         } else {
             Err(format!(
@@ -5396,7 +5534,7 @@ fn windows_through_the_profile_create_a_session_each(
     // The application and its bus are over, and the document portal their session started has left
     // no mount under this case's tree: a mount there would stop the tree being removed.
     if let Err(left) = emulator.end() {
-        panic!("a mount stays under the case's tree after the application ended:\n{left}");
+        panic!("the application did not leave the case's tree clean when it ended:\n{left}");
     }
 }
 
