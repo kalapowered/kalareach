@@ -588,6 +588,55 @@ async fn each_family_is_refused_what_the_daemon_does_not_have() {
     assert!(text(&mistaken["message"]).contains("is not a workspace identifier"));
 }
 
+/// KR-REQ-07.47: a host that cannot run Git says so under `HOST_NOT_CONFIGURED` with a sentence that
+/// says what a person does, and a command that runs Git shows that sentence and not the line the
+/// code carries elsewhere, "Change a setting on this device or on the host.", which no setting
+/// answers. A command that does not run Git keeps the line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_cannot_run_git_is_said_in_its_own_words_and_not_asked_for_a_setting() {
+    const CHANGE_A_SETTING: &str = "Change a setting on this device or on the host.";
+    const SAID: &str = "this kernel's Landlock interface is version 2, and the boundary around a \
+                        Git invocation needs version 3 (Linux 6.2) or later; use a host that \
+                        offers it";
+    let temp = kr_ipc::testing::TempHost::create();
+    let nowhere = temp.root().join("nowhere").display().to_string();
+    let (_asked, serving) = scripted_daemon(
+        &temp,
+        always(Err(ProtocolError::new(ErrorCode::HostNotConfigured, SAID))),
+    );
+
+    for line in [
+        vec!["project", "init", &nowhere],
+        vec!["workspace", "remove", NOBODY],
+        vec!["diff", "read", "--workspace", NOBODY],
+    ] {
+        let output = run_kr(&temp, &line);
+        assert_eq!(output.status.code(), Some(8), "kr {}", line.join(" "));
+        let said = String::from_utf8_lossy(&output.stderr).into_owned()
+            + &String::from_utf8_lossy(&output.stdout);
+        assert!(
+            said.contains(SAID),
+            "kr {} says what the host said: {said}",
+            line.join(" ")
+        );
+        assert!(
+            !said.contains(CHANGE_A_SETTING),
+            "kr {} asks for no setting: {said}",
+            line.join(" ")
+        );
+        // The code is still the one a script reads.
+        let (status, document) = json(&temp, &line);
+        assert_eq!(status, Some(8), "{document}");
+        assert_eq!(document["code"], "HOST_NOT_CONFIGURED", "{document}");
+    }
+    // The control: a command that does not run Git is told the line as it always was.
+    let output = run_kr(&temp, &["device", "revoke", NOBODY]);
+    let said = String::from_utf8_lossy(&output.stderr).into_owned()
+        + &String::from_utf8_lossy(&output.stdout);
+    assert!(said.contains(CHANGE_A_SETTING), "{said}");
+    serving.abort();
+}
+
 /// KR-REQ-07.47: `kr device` lists the paired devices with each one's standing and revokes one by
 /// its identifier, under this account's own authority on this host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
