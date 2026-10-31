@@ -27,7 +27,7 @@
 //! connection's window are each about half a minute or more, and counted from the moments they
 //! began they woke an idle host at different instants, each time through the stages a timer that
 //! far off passes through. [`Activity::on_the_beat`] puts every wait of a whole beat or more at the
-//! latest beat it allows, counted from when the supervision began, so they wake the host together.
+//! latest beat it allows, counted from the wall clock's half minutes, so they wake the host together.
 //!
 //! The limits of the middle row are worth being exact about, because traffic is a *hint* rather
 //! than a proof and the observation it asks for is a sample rather than a record of what happened.
@@ -109,7 +109,8 @@ pub struct Activity {
     /// Whether the supervision is in the middle of a look at the session.
     #[cfg(feature = "testing")]
     looking: AtomicBool,
-    /// The instant the beat counts from: when the supervision began.
+    /// The instant the beat counts from: the wall clock's half minute at or before the moment the
+    /// supervision began ([`wall_beat_start`]).
     beat: OnceLock<Instant>,
 }
 
@@ -149,13 +150,13 @@ impl Activity {
     }
 
     /// Counts the beat from `start`, unless it is counted from an earlier instant already.
-    fn anchor_beat(&self, start: Instant) {
+    pub(crate) fn anchor_beat(&self, start: Instant) {
         let _ = self.beat.set(start);
     }
 
     /// Returns when a wait that is due at `due` and began at `after` ends, put on the session's
     /// beat: the latest instant at or before `due` that is a whole number of
-    /// [`IDLE_SWEEP_INTERVAL`]s after the supervision began.
+    /// [`IDLE_SWEEP_INTERVAL`]s after the beat's start.
     ///
     /// An idle session keeps several clocks of about that length, and each woke the host by
     /// itself: the sweep, the adoption watch's look, the daemon's held request, the maintenance
@@ -163,8 +164,8 @@ impl Activity {
     /// fell at different instants, and a timer that far off passes through the timer wheel in
     /// stages that each wake the host. On one beat they wake it together, and the stages are
     /// shared. A wait is never put later than it was due, and only a wait of a whole beat or more
-    /// is moved, so it always has a beat to land on after `after`. The supervision has not begun
-    /// when the beat is not counted yet, and then nothing moves.
+    /// is moved, so it always has a beat to land on after `after`. Nothing moves before the beat has
+    /// a start, which the supervision gives it when it begins.
     #[must_use]
     pub fn on_the_beat(&self, due: Instant, after: Instant) -> Instant {
         let Some(&start) = self.beat.get() else {
@@ -289,6 +290,26 @@ impl Drop for Looking<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
     }
+}
+
+/// Returns the latest instant at or before `now` that falls on a whole multiple of
+/// [`IDLE_SWEEP_INTERVAL`] on the wall clock.
+///
+/// A session's beat counted from here is the same beat for every session host on this machine, and
+/// for the daemon that holds a request open to each of them. Counted from each host's own start
+/// the beats of twenty hosts fall at twenty instants, and the daemon is woken for each; counted
+/// from the wall clock's half minutes they fall together and it is woken once. A wall clock that
+/// steps moves the beat once, which costs one early or late wake and nothing else.
+#[must_use]
+pub fn wall_beat_start(now: Instant) -> Instant {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let into_beat = since_epoch.as_nanos() % IDLE_SWEEP_INTERVAL.as_nanos();
+    u64::try_from(into_beat)
+        .ok()
+        .and_then(|nanos| now.checked_sub(Duration::from_nanos(nanos)))
+        .unwrap_or(now)
 }
 
 /// When the ownership boundary is next observed, and why.
@@ -590,6 +611,32 @@ mod tests {
             started + IDLE_SWEEP_INTERVAL,
             "and the mark is spent by the observation it caused, after which the sweep is back on \
              the session's beat"
+        );
+    }
+
+    /// KR-PERF-003: every session host on a machine keeps the same beat, so the daemon that holds
+    /// a request open to each of them is woken once for all of them and not once for each.
+    #[test]
+    fn kr_perf_003_the_beat_is_counted_from_the_wall_clocks_half_minutes() {
+        let now = Instant::now();
+        let before = std::time::SystemTime::now();
+        let start = super::wall_beat_start(now);
+        assert!(start <= now);
+        assert!(
+            now.duration_since(start) < IDLE_SWEEP_INTERVAL,
+            "it is the latest such instant"
+        );
+        // The wall clock at that instant is a whole number of half minutes, give or take the time
+        // the two readings of the clocks are apart from each other.
+        let at_start = before
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .saturating_sub(now.duration_since(start));
+        let off = at_start.as_nanos() % IDLE_SWEEP_INTERVAL.as_nanos();
+        let off = off.min(IDLE_SWEEP_INTERVAL.as_nanos() - off);
+        assert!(
+            off < Duration::from_millis(250).as_nanos(),
+            "{off} ns from a half minute"
         );
     }
 
