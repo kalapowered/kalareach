@@ -132,7 +132,7 @@ pub struct RecoveryView {
     pub sync_service: SyncServiceView,
     /// Where recovery stands.
     pub state: RecoveryState,
-    /// The host of the service the bundle is kept at, once material has been made.
+    /// The host of the service the record names, once material has been made.
     pub kept_at: Option<String>,
     /// What stops the next step now.
     pub blocker: Option<Blocker>,
@@ -1110,8 +1110,8 @@ fn said(error: RecoveryError) -> CommandError {
     match error {
         RecoveryError::BundleOutcomeUnknown { .. } => CommandError::new(
             ErrorCode::OutcomeUnknown,
-            "the service the bundle is kept at did not answer the write to the recovery bundle, so \
-             it is not known whether it landed. Settle it before anything else is written",
+            "the service named for the recovery bundle did not answer the write to it, so it is not \
+             known whether it landed. Settle it before anything else is written",
         ),
         RecoveryError::HostOutcomeUnknown { .. } => CommandError::new(
             ErrorCode::OutcomeUnknown,

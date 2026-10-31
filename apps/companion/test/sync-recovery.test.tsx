@@ -200,6 +200,7 @@ describe('recovery', () => {
     })
     const kept = within(recovery).getByTestId('recovery-blocker')
     expect(kept).toHaveTextContent('reach.kala.to')
+    expect(kept).toHaveTextContent('until this device is signed in to sync.example')
     expect(kept).not.toHaveTextContent(/change the setting/i)
     expect(within(recovery).queryByRole('button')).toBeNull()
   })
