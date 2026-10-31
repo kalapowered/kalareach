@@ -813,15 +813,13 @@ mod tests {
         source
             .require_no_more_on(lower.0)
             .expect("the desktop is used once the starter's label is on it");
-        let there = security_of(lower.0).expect("the target's security");
-        assert_eq!(
-            there
-                .text(LABEL_SECURITY_INFORMATION)
-                .expect("the target's label"),
-            source
-                .text(LABEL_SECURITY_INFORMATION)
-                .expect("the model's label")
-        );
+        // The flags the system writes before the entry say how the list came to be, and are not
+        // the label's own.
+        let there = security_of(lower.0)
+            .expect("the target's security")
+            .text(LABEL_SECURITY_INFORMATION)
+            .expect("the target's label");
+        assert!(there.contains("(ML;;NW;;;ME)"), "{there}");
     }
 
     /// The bytes of a security identifier, from the letters or the text the system writes for one.

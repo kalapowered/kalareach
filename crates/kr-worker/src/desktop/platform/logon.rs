@@ -302,6 +302,7 @@ mod tests {
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
         );
+        println!("{said}");
         assert!(run.status.success(), "the probe failed: {said}");
         assert!(said.contains("1 passed"), "the probe did not run: {said}");
     }

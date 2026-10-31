@@ -29,10 +29,10 @@
 //! The text of an access list is read only when it holds as many entries as the list itself, as
 //! the system counts them. A text that holds a condition, a double quote or a parenthesis inside
 //! an entry, is read only when the starter's own and the object's are the same text. The grammar
-//! has no form for a double quote inside a string, no run shows what the system writes for one,
-//! and an attribute name may hold a parenthesis unencoded. Nothing else keeps a string from
-//! ending early and hiding the entries up to the next quote, and a count alone does not: false
-//! entries can stand in for the hidden ones.
+//! has no form for a double quote inside a string, and Windows 11 writes one as it is, so a string
+//! ends early; an attribute name may hold a parenthesis unencoded as well. Nothing else keeps the
+//! reading from losing the entries up to the next quote, and a count alone does not: false entries
+//! can stand in for the hidden ones.
 //!
 //! The text is what the system writes for a descriptor, `D:` and its entries for an access list or
 //! `S:` and its label entry for the integrity label. Nothing here calls the system, so it is read
