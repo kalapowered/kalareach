@@ -1523,9 +1523,10 @@ account, makes its own clients and is not a slot of `ServiceClients`.
 
 Each process fills its own slots of `ServiceClients` from the clients its own desks use, and reports
 availability from them. The daemon builds its set in `crates/kr-controller/src/service/clients.rs`
-and reports with `ServiceClients::availability`. The companion holds the clients of the services it
-uses where each is used, and when its account sheet asks which of them it holds a client of, it puts
-those into a `ServiceClients` and reports `ServiceClients::availability_of` for each
+and reports with `ServiceClients::availability`. The companion makes the clients of the services it
+uses where each is used. Its account sheet takes the account's client and asks the sync, push and
+voice factories for a client each, puts them into a `ServiceClients` and reports
+`ServiceClients::availability_of` for each
 ([the companion's guide](../companion/README.md#the-managed-services-the-application-holds)). In
 both, a fork replaces a slot by supplying its implementation of the trait where the process makes
 that client.
