@@ -179,7 +179,15 @@ fn ssh_stand_in(tools: &Path, destination: &Path, home: &Path) -> String {
         r##"#!/bin/sh
 # A test that wants a connection that never answers says so with a file.
 if [ -f '{tools}/stalls' ]; then
-  exec sleep 40
+  printf '%s\n' "$$" >'{tools}/stalled.pid'
+  # It answers nothing, and it goes when the program that asked for the connection does, or at
+  # the end of the stall in any case.
+  waited=0
+  while kill -0 "$PPID" 2>/dev/null && [ "$waited" -lt 40 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  exit 255
 fi
 # A test that wants the destination unreachable says so with a file, and the connection is refused
 # the way `ssh` refuses one.
@@ -633,7 +641,7 @@ impl World {
                 self.destination.paths().state_root(),
             )
             .current_dir("/");
-        assert!(close.output().expect("runs kr").status.success());
+        assert!(to_its_end(close, KR_CALL_BOUND).status.success());
         self.wait_until_closed_in_destination(session, &worker);
     }
 
@@ -2941,7 +2949,7 @@ async fn an_export_from_an_environment_in_privacy_mode_writes_nothing() {
             world.destination.paths().state_root(),
         )
         .current_dir("/");
-    let turned_on = privacy.output().expect("runs kr");
+    let turned_on = to_its_end(privacy, KR_CALL_BOUND);
     assert!(
         String::from_utf8_lossy(&turned_on.stdout).contains("\"enabled\": true"),
         "{}; {}",
@@ -3036,11 +3044,9 @@ async fn an_export_of_a_session_on_this_host_is_the_same_file() {
     // A bare file name, which is made in the directory the command is run in. The command writes the
     // file and then makes the name durable, and a name with no directory in it is not a failure.
     let file = world.export_path("here");
-    let exported = world
-        .kr(&["--json", "export", &display, "--output", "here.json"])
-        .current_dir(world.source.root())
-        .output()
-        .expect("runs kr");
+    let mut export = world.kr(&["--json", "export", &display, "--output", "here.json"]);
+    export.current_dir(world.source.root());
+    let exported = to_its_end(export, KR_CALL_BOUND);
     assert!(
         exported.status.success(),
         "kr export: {}; it said {}",
@@ -3462,26 +3468,35 @@ impl Container {
 
     /// Removes the container, whether or not the runtime made it. Says why when it could not: the
     /// runtime refused, or the call did not end. It does not panic for either.
+    ///
+    /// A removal can be asked again, and a loaded machine's runtime can take longer than one call
+    /// is given, so a call that does not end is asked again until the time a slow call is given
+    /// has passed. A refusal is not asked again: it would be refused again.
     fn remove(&self) -> Result<(), String> {
-        let removed = self.runtime.run(
-            &[
-                "rm",
-                "--force",
-                "--ignore",
-                "--time",
-                "0",
-                "--",
-                self.target(),
-            ],
-            self.runtime.quick,
-        )?;
-        if removed.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "the runtime said: {}",
-                String::from_utf8_lossy(&removed.stderr).trim()
-            ))
+        let until = Instant::now() + self.runtime.slow;
+        loop {
+            match self.runtime.run(
+                &[
+                    "rm",
+                    "--force",
+                    "--ignore",
+                    "--time",
+                    "0",
+                    "--",
+                    self.target(),
+                ],
+                self.runtime.quick,
+            ) {
+                Ok(removed) if removed.status.success() => return Ok(()),
+                Ok(removed) => {
+                    return Err(format!(
+                        "the runtime said: {}",
+                        String::from_utf8_lossy(&removed.stderr).trim()
+                    ));
+                }
+                Err(why) if Instant::now() >= until => return Err(why),
+                Err(_) => std::thread::sleep(Duration::from_millis(200)),
+            }
         }
     }
 }
@@ -3620,12 +3635,19 @@ fn a_removal_that_stalls_is_an_error_and_aborts_nothing_while_an_assertion_fails
         .remove()
         .expect_err("a removal that never ends is an error and not a panic");
     assert!(why.contains("\"rm\""), "the call is named: {why}");
-    assert!(
-        recorded_calls(directory.path())
+    let removals = |directory: &Path| {
+        recorded_calls(directory)
             .iter()
-            .any(|call| call.starts_with("rm ")
-                && call.ends_with(&format!(" -- {STAND_IN_CONTAINER_ID}"))),
-        "a container the runtime issued an identifier for is removed by it"
+            .filter(|call| {
+                call.starts_with("rm ") && call.ends_with(&format!(" -- {STAND_IN_CONTAINER_ID}"))
+            })
+            .count()
+    };
+    let asked = removals(directory.path());
+    assert!(
+        asked >= 2,
+        "a call that does not end is asked again before it is given up on, by the identifier the \
+         runtime issued: {asked} calls"
     );
 
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -3636,24 +3658,10 @@ fn a_removal_that_stalls_is_an_error_and_aborts_nothing_while_an_assertion_fails
         panic_message(failed.expect_err("the assertion's own panic is what unwinds")),
         "an assertion of the case fails"
     );
-    let removals = recorded_calls(directory.path())
-        .iter()
-        .filter(|call| call.starts_with("rm "))
-        .count();
-    assert_eq!(removals, 2, "the unwinding case tried to remove it too");
-}
-
-/// A removal the runtime refuses is an error that says what the runtime said, and not a removal.
-#[test]
-fn a_removal_the_runtime_refuses_is_an_error_that_says_what_it_said() {
-    let directory = tempfile::tempdir().expect("a directory");
-    let container = held_in(stand_in_runtime(directory.path(), &[], &["rm"]));
-    let why = container
-        .remove()
-        .expect_err("a refused removal is an error");
-    assert!(why.contains(STAND_IN_REFUSAL), "{why}");
-    // Nothing was made, so there is nothing for the destructor to remove either.
-    std::mem::forget(container);
+    assert!(
+        removals(directory.path()) > asked,
+        "the unwinding case tried to remove it too"
+    );
 }
 
 /// A case that passes while its container could not be removed fails: the container is still
@@ -3671,6 +3679,11 @@ fn a_case_that_passes_fails_when_its_container_could_not_be_removed() {
             && said.contains(STAND_IN_REFUSAL),
         "{said}"
     );
+    let asked = recorded_calls(directory.path())
+        .iter()
+        .filter(|call| call.starts_with("rm "))
+        .count();
+    assert_eq!(asked, 1, "a refusal is not asked again");
 }
 
 /// Run by the case below as a process of its own: a case that fails while its container cannot be
@@ -3954,28 +3967,25 @@ fn a_call_that_does_not_end_is_asked_to_end_before_it_is_killed() {
     let directory = tempfile::tempdir().expect("a directory");
     let ready = directory.path().join("ready");
     let asked = directory.path().join("asked-to-end");
-    let mut child = std::process::Command::new("/bin/sh")
+    let mut command = std::process::Command::new("/bin/sh");
+    command
         .arg("-c")
         .arg("trap ': > \"$2\"; kill $!; exit 0' TERM; sleep 30 & : > \"$1\"; wait")
         .arg("program")
         .arg(&ready)
-        .arg(&asked)
-        .spawn()
-        .expect("starts the program");
-    // The program is ended only once it is ready to be asked.
-    let begun = Instant::now();
-    while !ready.exists() {
-        assert!(
-            begun.elapsed() < LIVENESS_DEADLINE,
-            "the program did not get ready"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let failed = user_manager::end_and_collect(&mut child);
-    assert_eq!(failed, "", "ending it failed");
+        .arg(&asked);
+    // The bound is far longer than the program takes to get ready to be asked: a program that is
+    // ended before it is ready is ended by a signal it has not got a say in.
+    let why = user_manager::bounded(command, Duration::from_secs(5))
+        .expect_err("a program that never ends is ended and the call says so");
+    assert!(why.contains("did not end within"), "{why}");
+    assert!(
+        ready.exists(),
+        "the program was never ready to be asked: {why}"
+    );
     assert!(
         asked.exists(),
-        "the program was killed without being asked to end"
+        "the program was killed without being asked to end: {why}"
     );
 }
 
@@ -4009,6 +4019,23 @@ async fn a_kr_run_that_does_not_end_within_its_bound_fails_the_case_and_names_th
         said.contains("\"enrol\"") && said.contains("within"),
         "the call is named: {said}"
     );
+    // What `kr` was waiting for goes with it, and does not outlast the case.
+    let stalled = std::fs::read_to_string(world.tools.join("stalled.pid"))
+        .expect("the stand-in recorded the connection it became");
+    let pid = stalled
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .expect("a process number");
+    let begun = Instant::now();
+    while rustix::process::test_kill_process(pid).is_ok() {
+        assert!(
+            begun.elapsed() < LIVENESS_DEADLINE,
+            "the connection the ended run was waiting for is still there"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 impl World {

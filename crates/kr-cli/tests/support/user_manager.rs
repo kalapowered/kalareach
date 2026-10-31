@@ -100,20 +100,16 @@ const ASKED_TO_END_FOR: Duration = Duration::from_secs(5);
 ///
 /// The child is asked to end first and given [`ASKED_TO_END_FOR`] to do so. A program that is
 /// killed outright cannot clean up after itself: an image build that is, leaves the program its
-/// step was running, which goes on after the build that wanted it.
+/// step was running, which goes on after the build that wanted it. The request is a signal sent
+/// from this process, so it takes no turn to start a program and waits for nothing.
 pub fn end_and_collect(child: &mut std::process::Child) -> String {
     let mut failed = String::new();
-    let asked = spawning(|| {
-        Command::new("/bin/kill")
-            .arg("-TERM")
-            .arg(child.id().to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    });
+    let asked = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .map(|pid| rustix::process::kill_process(pid, rustix::process::Signal::TERM));
     let begun = Instant::now();
-    if asked.is_ok_and(|status| status.success()) {
+    if matches!(asked, Some(Ok(()))) {
         while matches!(child.try_wait(), Ok(None)) && begun.elapsed() < ASKED_TO_END_FOR {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -147,9 +143,11 @@ pub fn end_and_collect(child: &mut std::process::Child) -> String {
 /// Runs a command to its end within `bound`, ending and collecting it when it has not ended.
 ///
 /// For teardown, which must not panic: every failure is returned as what it was, and none waits
-/// without an end. The bound counts from the call, so the wait for the turn to start a process,
-/// the run itself and the collecting of what it printed are all inside it or inside
-/// [`STREAMS_DEADLINE`] beyond it.
+/// without an end. The bound counts from the call, so the wait for the turn to start a process
+/// and the run itself are inside it. Beyond it, a call that did not end is given
+/// [`ASKED_TO_END_FOR`] to end when asked and [`STREAMS_DEADLINE`] to be collected, and what it
+/// printed is given [`STREAMS_DEADLINE`] to reach its end. A call that ended while something it
+/// started still holds its output is a failure, and names the call.
 pub fn bounded(mut command: Command, bound: Duration) -> Result<Output, String> {
     let what = format!("{command:?}");
     let begun = Instant::now();
@@ -189,15 +187,24 @@ pub fn bounded(mut command: Command, bound: Duration) -> Result<Output, String> 
             }
         }
     };
-    let collect = |stream: Option<Receiver<Vec<u8>>>| {
-        stream
-            .and_then(|stream| stream.recv_timeout(STREAMS_DEADLINE).ok())
-            .unwrap_or_default()
+    let until = Instant::now() + STREAMS_DEADLINE;
+    let collect = |stream: Option<Receiver<Vec<u8>>>| match stream {
+        None => Ok(Vec::new()),
+        Some(stream) => stream
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .map_err(|_| {
+                format!(
+                    "{what} ended, and something it started still holds its output after \
+                     {STREAMS_DEADLINE:?}"
+                )
+            }),
     };
+    let stdout = collect(stdout)?;
+    let stderr = collect(stderr)?;
     Ok(Output {
         status,
-        stdout: collect(stdout),
-        stderr: collect(stderr),
+        stdout,
+        stderr,
     })
 }
 
