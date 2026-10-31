@@ -18,6 +18,7 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs};
 
 use kr_controller::bridge::launch::CONTAINER_RUNTIME;
+use kr_controller::bridge::platform::{self, PLATFORM_LIMIT};
 
 use crate::cli::{
     BridgeEnrolArguments, BridgeForgetArguments, BridgeListArguments, BridgeRefreshArguments,
@@ -189,24 +190,37 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
 /// is put to the runtime and the identifier it answers with is what the record keeps. A name that
 /// happens to be hexadecimal takes the same path as any other name.
 fn resolve_container_target(target: &str) -> Result<String> {
-    let output = std::process::Command::new(CONTAINER_RUNTIME)
-        .args(["container", "inspect", "--format", "{{.Id}}", "--", target])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|error| {
-            CliError::Usage(shown!(
-                "{} could not be run to resolve the target to a container identifier ({}); pass \
-                 the identifier the runtime issued",
-                CONTAINER_RUNTIME,
-                Shown::io(&error)
-            ))
-        })?;
+    resolve_container_target_through(CONTAINER_RUNTIME, PLATFORM_LIMIT, target)
+}
+
+/// [`resolve_container_target`], through the container runtime `runtime` and for no longer than
+/// `limit`.
+///
+/// The runtime is asked while the daemon's record of enrolled environments may be wanted by
+/// another command, so a runtime that never answers must not hold this one: the call is ended at
+/// the limit, and the refusal names it.
+fn resolve_container_target_through(
+    runtime: &'static str,
+    limit: std::time::Duration,
+    target: &str,
+) -> Result<String> {
+    let arguments =
+        ["container", "inspect", "--format", "{{.Id}}", "--", target].map(str::to_owned);
+    let output = platform::run_bounded(runtime, &arguments, limit).map_err(|error| {
+        CliError::Usage(shown!(
+            "{} container inspect, which resolves the target to a container identifier, did not \
+             run to its end within {} seconds ({}); pass the identifier the runtime issued",
+            runtime,
+            limit.as_secs(),
+            error.code()
+        ))
+    })?;
     // Neither the target nor what the runtime printed is repeated: the target is what was typed,
     // and the runtime's own output is whatever it chose to say.
     if !output.status.success() {
         return Err(CliError::Usage(shown!(
             "{} knows no container by that name ({})",
-            CONTAINER_RUNTIME,
+            runtime,
             output.status
         )));
     }
@@ -214,7 +228,7 @@ fn resolve_container_target(target: &str) -> Result<String> {
     if !kr_protocol::identity::is_container_identifier(&resolved) {
         return Err(CliError::Usage(shown!(
             "{} answered with something that is not the whole identifier a container carries",
-            CONTAINER_RUNTIME
+            runtime
         )));
     }
     Ok(resolved)
@@ -495,5 +509,31 @@ mod tests {
             let refused = probe_decision(quiet).expect_err("not asked");
             assert!(refused.to_string().contains("would start it"), "{refused}");
         }
+    }
+
+    /// A runtime that never answers ends the resolution of a target at its limit, and the refusal
+    /// names the call without repeating the target.
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_that_never_answers_ends_the_resolution_of_a_target_and_the_refusal_names_the_call()
+    {
+        let directory = tempfile::tempdir().expect("a directory");
+        let source = directory.path().join("source");
+        std::fs::write(&source, "#!/bin/sh\nexec sleep 40\n").expect("a stand-in runtime");
+        let program = directory.path().join("podman");
+        kr_ipc::testing::place_program(&source, &program);
+        let runtime: &'static str = Box::leak(program.display().to_string().into_boxed_str());
+        let refused = resolve_container_target_through(
+            runtime,
+            std::time::Duration::from_secs(1),
+            "a-name-the-person-typed",
+        )
+        .expect_err("a call that never ends is refused");
+        let said = refused.to_string();
+        assert!(
+            said.contains("container inspect") && said.contains("within 1 seconds"),
+            "{said}"
+        );
+        assert!(!said.contains("a-name-the-person-typed"), "{said}");
     }
 }

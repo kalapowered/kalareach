@@ -237,7 +237,26 @@ enum Ending {
     Unknown(String),
 }
 
-/// Runs one argument vector, ending it when it outlasts `limit`.
+/// What a refusal names a call by: the program and the words after it up to the first option,
+/// which say what it was asked to do (`podman container inspect`), and none of the values after
+/// that (a name, a user, a path). A call made of options only is named by its first.
+fn named(program: &str, arguments: &[String]) -> String {
+    let mut words: Vec<&str> = arguments
+        .iter()
+        .map(String::as_str)
+        .take_while(|argument| !argument.starts_with('-'))
+        .collect();
+    if words.is_empty() {
+        words.extend(arguments.first().map(String::as_str));
+    }
+    std::iter::once(program)
+        .chain(words)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Runs one argument vector, ending it when it outlasts `limit`, and returns what it printed on
+/// each stream. A refusal names the call.
 ///
 /// The child and the reading are both bounded by one deadline. The output is read on threads of its
 /// own, because a child that fills a pipe while nobody reads it would wait for a reader that is
@@ -245,12 +264,13 @@ enum Ending {
 /// rather than by joining them, because a descendant that inherited the pipe keeps it open after
 /// the child has gone, whether the child exited or was ended. What arrived by the deadline is the
 /// answer, and a thread still waiting on a pipe nobody closed ends with that pipe.
-fn run_bounded(
+pub fn run_bounded(
     program: &str,
     arguments: &[String],
     limit: std::time::Duration,
 ) -> Result<std::process::Output> {
     let deadline = std::time::Instant::now() + limit;
+    let call = named(program, arguments);
     let mut child = Command::new(program)
         .args(arguments)
         .stdin(Stdio::null())
@@ -258,7 +278,7 @@ fn run_bounded(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| {
-            ControllerError::supervision(format!("{program} could not be run: {error}"))
+            ControllerError::supervision(format!("{call} could not be run: {error}"))
         })?;
     let reading_out = read_in_the_background(child.stdout.take());
     let reading_err = read_in_the_background(child.stderr.take());
@@ -293,7 +313,7 @@ fn run_bounded(
             stderr,
         }),
         Ending::Deadline => Err(ControllerError::supervision(format!(
-            "{program} said nothing for {} seconds and {}",
+            "{call} said nothing for {} seconds and {}",
             limit.as_secs(),
             if ended {
                 "was ended"
@@ -302,7 +322,7 @@ fn run_bounded(
             }
         ))),
         Ending::Unknown(error) => Err(ControllerError::supervision(format!(
-            "{program} could not be waited for: {error}"
+            "{call} could not be waited for: {error}"
         ))),
     }
 }
@@ -358,13 +378,8 @@ fn run_within(
 /// stopped.
 #[must_use]
 pub fn container_runtime_present() -> bool {
-    Command::new(CONTAINER_RUNTIME)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    run_bounded(CONTAINER_RUNTIME, &["--version".to_owned()], PLATFORM_LIMIT)
+        .is_ok_and(|output| output.status.success())
 }
 
 /// Reads one distribution's state out of the two listings of names `wsl.exe` prints.
@@ -436,6 +451,10 @@ mod tests {
         )
         .expect_err("the command is ended");
         assert!(error.to_string().contains("was ended"), "{error}");
+        assert!(
+            error.to_string().starts_with("/bin/sleep 600 said nothing"),
+            "the refusal names the call: {error}"
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(20),
             "it returned after {:?}",
