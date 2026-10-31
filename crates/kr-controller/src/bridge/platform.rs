@@ -264,6 +264,11 @@ fn named(program: &str, arguments: &[String]) -> String {
 /// rather than by joining them, because a descendant that inherited the pipe keeps it open after
 /// the child has gone, whether the child exited or was ended. What arrived by the deadline is the
 /// answer, and a thread still waiting on a pipe nobody closed ends with that pipe.
+///
+/// # Errors
+///
+/// Returns a supervision failure that names the call when the program could not be run, could not
+/// be waited for, or did not end within `limit` and was ended.
 pub fn run_bounded(
     program: &str,
     arguments: &[String],
