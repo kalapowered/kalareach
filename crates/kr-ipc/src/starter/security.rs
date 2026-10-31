@@ -421,7 +421,7 @@ fn outside_literals(text: &str) -> impl Iterator<Item = (usize, char)> + '_ {
 
 /// The text inside each top-level pair of parentheses of `text`, which holds nothing else.
 fn parenthesised(text: &str) -> Result<Vec<&str>, String> {
-    if text.matches('"').count() % 2 != 0 {
+    if !text.matches('"').count().is_multiple_of(2) {
         return Err(format!("{text:?} leaves a string open"));
     }
     let mut entries = Vec::new();
