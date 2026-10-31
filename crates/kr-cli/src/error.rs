@@ -47,7 +47,8 @@ pub enum CliError {
     ///
     /// A managed service knows more about its refusal than the code carries. A refusal this command
     /// makes in words that already say what to do is also said this way, with no action after it:
-    /// [`CliError::refused_in_its_own_words`].
+    /// [`CliError::refused_in_its_own_words`]. So is the host's refusal of a command that runs Git
+    /// as a host that is not set up for it, whose sentence says what to do.
     ServiceRefused {
         /// What the service said was wrong.
         error: kr_protocol::error::ProtocolError,

@@ -6,12 +6,14 @@
 //! reach its daemon, and ask it. The daemon decides every refusal and says why; a command adds the
 //! request's shape and a readable answer, and nothing it prints is decided anywhere else.
 
+use kr_client::retry::UserAction;
 use kr_client::shown;
 use std::str::FromStr;
 
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::envelope::ActionTarget;
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::method::Method;
 
@@ -59,7 +61,9 @@ impl Daemon {
         P: serde::Serialize + ?Sized,
         T: kr_protocol::wire::WireMessage,
     {
-        crate::bind::read(&mut self.client, method, params).await
+        crate::bind::read(&mut self.client, method, params)
+            .await
+            .map_err(|error| in_the_hosts_words(method, error))
     }
 
     /// Calls a mutation on this environment, under an action identity of its own.
@@ -73,7 +77,9 @@ impl Daemon {
         T: kr_protocol::wire::WireMessage,
     {
         let target = ActionTarget::environment(self.environment_id);
-        crate::bind::mutate(&mut self.client, method, target, params).await
+        crate::bind::mutate(&mut self.client, method, target, params)
+            .await
+            .map_err(|error| in_the_hosts_words(method, error))
     }
 
     /// Calls a mutation on this environment that asks for a lifetime of `ttl`, for a call whose
@@ -93,7 +99,41 @@ impl Daemon {
         T: kr_protocol::wire::WireMessage,
     {
         let target = ActionTarget::environment(self.environment_id);
-        crate::bind::mutate_within(&mut self.client, method, target, params, ttl).await
+        crate::bind::mutate_within(&mut self.client, method, target, params, ttl)
+            .await
+            .map_err(|error| in_the_hosts_words(method, error))
+    }
+}
+
+/// The methods that run Git on the host.
+const RUN_GIT: [Method; 9] = [
+    Method::ProjectInit,
+    Method::ProjectClone,
+    Method::ProjectAdopt,
+    Method::WorkspaceCreate,
+    Method::WorkspaceRemove,
+    Method::ChangesetCapture,
+    Method::DiffRead,
+    Method::DiffApply,
+    Method::DiffRevert,
+];
+
+/// Returns a refusal as a person is told it: for a method that runs Git, a host that is not set up
+/// for it (no usable Git, or a kernel the boundary cannot be built on) says in its own sentence
+/// what a person does, which is to install Git where it names the step or to use a host whose
+/// kernel has the interface. The client's one line for that code, which tells a person to change a
+/// setting, fits neither, so it is not added. Every other refusal is as it was.
+fn in_the_hosts_words(method: Method, error: CliError) -> CliError {
+    match error {
+        CliError::Refused(refused)
+            if refused.code == ErrorCode::HostNotConfigured && RUN_GIT.contains(&method) =>
+        {
+            CliError::ServiceRefused {
+                error: refused,
+                action: UserAction::Nothing,
+            }
+        }
+        other => other,
     }
 }
 
