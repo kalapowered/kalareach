@@ -1503,11 +1503,11 @@ const READER_STILL_RUNNING: &str = "kr: the part of this command that reads the 
      not ended when the terminal came back, so the next key you type may be lost, the console's \
      input mode may change, and the keys it had already taken were not counted.";
 
-/// What an attachment says when that thread ended only after its read of the console was cancelled,
-/// which hands the next key typed to the read that was cancelled.
-const READER_CANCELLED: &str = "kr: the part of this command that reads the console's keys was \
-     still in a read of the console when the attachment ended, so the command cancelled the read, \
-     and the next key you type may be lost.";
+/// What an attachment says when that thread ended only after the command asked the system to cancel
+/// its read of the console, which hands the next key typed to a read that was cancelled.
+const READER_CANCEL_ASKED: &str = "kr: the part of this command that reads the console's keys had \
+     not ended when the attachment did, so the command asked the system to cancel its read of the \
+     console, and the next key you type may be lost.";
 
 /// What is added to either when something the person typed was lost with the refusal.
 const TYPED_KEYS_LOST: &str = "Keys typed just before the session refused them were lost: the batch \
@@ -1534,7 +1534,7 @@ struct Fallback {
 
 /// What the attachment says once the thread that reads its console has been stopped: how it went on
 /// if the session refused its console keys, counting what the reader left, that the thread had not
-/// ended if it had not, and otherwise that a read of the console had to be cancelled if one was.
+/// ended if it had not, and otherwise that a cancel of a read of the console was asked if one was.
 fn after_the_reader_stops(
     stopped: crate::attach::Stopped,
     fallback: &mut Fallback,
@@ -1543,8 +1543,8 @@ fn after_the_reader_stops(
     let mut said: Vec<Shown> = fallback.finish(input, &stopped.left).into_iter().collect();
     if stopped.still_running {
         said.push(Shown::said(READER_STILL_RUNNING));
-    } else if stopped.cancelled {
-        said.push(Shown::said(READER_CANCELLED));
+    } else if stopped.cancel_asked {
+        said.push(Shown::said(READER_CANCEL_ASKED));
     }
     said
 }
@@ -4080,10 +4080,10 @@ mod tests {
             "{said:?}"
         );
 
-        // A reader that had not ended and had a read cancelled says the first, once.
+        // A reader that had not ended and had a cancel asked says the first, once.
         let both = Stopped {
             still_running: true,
-            cancelled: true,
+            cancel_asked: true,
             ..Stopped::default()
         };
         let said = after_the_reader_stops(both, &mut Fallback::default(), &mut input);
@@ -4092,14 +4092,14 @@ mod tests {
             "{said:?}"
         );
 
-        // A reader that ended only after its read of the console was cancelled says so too.
-        let cancelled = Stopped {
-            cancelled: true,
+        // A reader that ended only after a cancel of its read of the console was asked says so too.
+        let cancel_asked = Stopped {
+            cancel_asked: true,
             ..Stopped::default()
         };
-        let said = after_the_reader_stops(cancelled, &mut Fallback::default(), &mut input);
+        let said = after_the_reader_stops(cancel_asked, &mut Fallback::default(), &mut input);
         assert!(
-            said.len() == 1 && said[0].as_str().contains("cancelled"),
+            said.len() == 1 && said[0].as_str().contains("asked the system to cancel"),
             "{said:?}"
         );
 

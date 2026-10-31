@@ -1996,8 +1996,8 @@ terminal is the person's again the client says once that its keys went as the co
 and says that keys typed just before the refusal were lost when a typed key was among them: a
 modifier on its own, a key coming up and a lock key are not typed keys, but an Alt coming up with a
 character composed on the numeric keypad is. If the thread that reads the console has not ended when
-the terminal is the person's again, or had to have a read of the console cancelled to end, the client
-says that too. A console that will not
+the terminal is the person's again, or the client asked the system to cancel a read of the console to
+end it, the client says that too. A console that will not
 spell its keys is given up on: the client hands the lease back with `input.release` and goes on
 watching, and says that the keys typed since were not sent. The worker does not check a write of
 bytes against the keyboard state. Under `Fidelity::Records` the worker refuses nothing for the

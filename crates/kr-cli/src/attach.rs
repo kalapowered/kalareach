@@ -816,9 +816,10 @@ pub struct Stopped {
     /// Whether the reader was still running when the stop gave up waiting for it, so that it may
     /// hold keys it took from the console, which the stop cannot count.
     pub still_running: bool,
-    /// Whether the stop cancelled a read of the console the reader was blocked in. The console
-    /// gives the next key to a read that was cancelled.
-    pub cancelled: bool,
+    /// Whether the stop asked the system to cancel a read of the console the reader was blocked in
+    /// and the system took the request. The request can race with the read's own end, so the read
+    /// may not have needed it; the console gives the next key to a read that was cancelled.
+    pub cancel_asked: bool,
     /// What the reader had taken from the console and not handed on when it ended, the first half
     /// of a character among it. Records are counted as lost typing when the session refused the
     /// records; text is kept for the caller but is not counted, as text left in the channel is not.
@@ -867,8 +868,8 @@ impl ReaderStop {
     /// A thread that has not ended when the wait is over is left, and the answer says so. It looks
     /// for the stop before it reads the console, asks it anything and sends, so what it does when it
     /// goes on is to end, unless it was already past those looks; what it holds then is not
-    /// counted. A read that was cancelled is said as well, since the console gives its next key to
-    /// that read.
+    /// counted. A request to cancel a read is said as well, since the console gives its next key to
+    /// a read that was cancelled.
     pub fn stop(self) -> Stopped {
         self.stopped
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -876,24 +877,24 @@ impl ReaderStop {
         let started = std::time::Instant::now();
         let deadline = started + STOP_WAIT;
         let cancel_from = started + CANCEL_AFTER;
-        let mut cancelled = false;
+        let mut cancel_asked = false;
         while !self.thread.is_finished() {
             let now = std::time::Instant::now();
             if now >= deadline {
                 return Stopped {
                     still_running: true,
-                    cancelled,
+                    cancel_asked,
                     left: Vec::new(),
                 };
             }
             if now >= cancel_from {
-                cancelled |= (self.cancel)(&self.thread);
+                cancel_asked |= (self.cancel)(&self.thread);
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         Stopped {
             still_running: false,
-            cancelled,
+            cancel_asked,
             left: self.thread.join().unwrap_or_default(),
         }
     }
@@ -2366,10 +2367,10 @@ mod reader {
         assert!(!run.steps.lock().expect("steps").contains(&"ask"));
     }
 
-    /// A stop that cancelled a read of the console says so, even when the reader ended: the console
-    /// gives the next key to a read that was cancelled.
+    /// A stop that asked to cancel a read of the console says so, even when the reader ended: the
+    /// console gives the next key to a read that was cancelled.
     #[test]
-    fn a_stop_that_cancelled_a_read_says_so() {
+    fn a_stop_that_asked_to_cancel_a_read_says_so() {
         let down = key(u16::from(b'A'), u16::from(b'a'), true);
         let mut run = Run::paused("keys", vec![vec![vec![down]]], Vec::new());
         run.finds_a_read
@@ -2386,13 +2387,13 @@ mod reader {
             stopping.join().expect("the stop ended")
         });
         assert!(!stopped.still_running, "the reader ended once released");
-        assert!(stopped.cancelled, "the stop cancelled a read");
+        assert!(stopped.cancel_asked, "the stop asked to cancel a read");
     }
 
-    /// A stop that asked to cancel and found no read to cancel does not say it cancelled one: the
+    /// A stop that asked to cancel and found no read to cancel does not say it asked for one: the
     /// reader was between two calls, and no key is at risk.
     #[test]
-    fn a_stop_that_found_no_read_to_cancel_does_not_say_it_cancelled_one() {
+    fn a_stop_that_found_no_read_to_cancel_does_not_say_a_cancel_was_asked() {
         let down = key(u16::from(b'A'), u16::from(b'a'), true);
         let mut run = Run::paused("keys", vec![vec![vec![down]]], Vec::new());
         run.has_input();
@@ -2407,11 +2408,11 @@ mod reader {
             stopping.join().expect("the stop ended")
         });
         assert!(!stopped.still_running);
-        assert!(!stopped.cancelled, "there was no read to cancel");
+        assert!(!stopped.cancel_asked, "there was no read to cancel");
 
         // A reader that ends at once is not cancelled either, whether or not the stop asked.
         let mut run = Run::start(true, Vec::new());
-        assert!(!run.stops().cancelled);
+        assert!(!run.stops().cancel_asked);
     }
 
     /// A console whose layout names another key for a NUL stores a lone record with no character on

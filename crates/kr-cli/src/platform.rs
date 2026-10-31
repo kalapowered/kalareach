@@ -73,8 +73,9 @@ pub const fn ignore_background_write_signal() -> std::io::Result<()> {
 ///
 /// A read of the console's text cannot be woken by anything else the thread waits on. The call is a
 /// request: the thread is not joined after it, because a console that did not honour it would hold
-/// the joiner for good. It says whether the thread had a read to cancel, which a thread paused
-/// between two calls has not.
+/// the joiner for good. It says whether the system took the request, which it does not for a thread
+/// paused between two calls, and which does not say how the read ended: a read can end by itself as
+/// the request arrives.
 #[cfg(not(unix))]
 pub fn cancel_blocked_read<T>(thread: &std::thread::JoinHandle<T>) -> bool {
     use std::os::windows::io::AsRawHandle as _;
