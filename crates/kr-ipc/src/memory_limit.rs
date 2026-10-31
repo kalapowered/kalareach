@@ -574,8 +574,8 @@ mod tests {
         );
     }
 
-    /// The system refuses every commit a process makes past the limit, and records the first. The
-    /// process asks four times: with nothing done between the first and the second, with a small
+    /// The system refuses every commit a process makes past the limit, and on the build this was
+    /// tried on it records the first. The process asks four times: with nothing done between the first and the second, with a small
     /// commit kept for the third, and with that commit given back for the fourth. The system
     /// refuses each, and the limit says so after the first and once. What it holds after the
     /// others is the system's to post and is printed, not required: on the build this was tried on

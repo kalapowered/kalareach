@@ -200,31 +200,33 @@ let run all the same. A start that fails or panics between creating the process 
 ends and collects the process. The job also ends the process when the daemon lets go of it, so a
 daemon that ends once the process is in the job leaves none that never ran either. One case remains:
 a daemon that stops without unwinding in the few calls between the process's creation and its entry
-into the job, or before it lets run a process the job did not take. It is killed from outside, or
-ended by a fault or an abort on one of its other threads, and it leaves the process behind. A commit
-past the limit is refused by the system. A runtime that cannot allocate ends, and one that catches
-the failed allocation answers that its load or job failed and goes on. The daemon asks the job when
-the process closes its end, when its frames stop short, and when it answers that a load or a job
-failed. If the job recorded a refused commit, the process ended for memory: it is ended, inference
-pauses with `memory_pressure` as it does for a reading past the ceiling, and the job is not retried.
-The answer of the load or the job in hand, when it does not say that the load or the job failed,
-clears what the job recorded, so a refusal the runtime got over does not count against a later end.
-The job's message and the process's frames reach the daemon by different routes, with no order
-between them, so the daemon cannot tell a refusal the runtime got over from one the system posted
-just after the runtime wrote that answer. Both are cleared, and the end that follows the second
-reads as an ordinary end. An answer for other work, a late or a repeated one, neither clears nor
-uses it. Windows does not promise to deliver the job's message, so a refusal that was not recorded
-reads as an ordinary end or an ordinary failure. On the build this was tried on (Windows Server
-2025, build 26100), a process that asked the system for memory four times, with nothing done between
-the first two requests, a small commit kept for the third and given back for the fourth, was refused
-all four and had only the first recorded. A later refusal may therefore leave no record, and it
-reads as an ordinary failure. A failed job unloads the process and restarts inference, and the next
-process may record a first refusal of its own. A failed load leaves the process in place with no
-model, and the next load, after the restart delay, goes to it, so failures in a row can pause
-inference as `inference_failed` and not as `memory_pressure`. The limit is on committed memory and
-not on the resident set, so it does not count the weights a model maps for reading, and the daemon's
-reading stays the measure of the resident set. A host that will not apply the limit says so on its
-standard error and keeps the daemon's reading as the only ender.
+into the job, or before it lets run a process the job did not take. The daemon may be killed from
+outside, for instance, or ended by a fault or an abort on any of its threads; it leaves the process
+behind. A commit past the limit is refused by the system. A runtime that cannot allocate ends, and
+one that catches the failed allocation answers that its load or job failed and goes on. The daemon
+asks the job when the process closes its end, when its frames stop short, and when it answers that a
+load or a job failed. If the job recorded a refused commit, the daemon takes it that the process
+ended for memory: the process is ended, inference pauses with `memory_pressure` as it does for a
+reading past the ceiling, and the job is not retried. The answer of the load or the job in hand,
+when it does not say that the load or the job failed, clears what the job recorded, so a refusal the
+runtime got over does not count against a later end. The job's message and the process's frames
+reach the daemon by different routes, with no order between them, so the daemon cannot tell a
+refusal the runtime got over from one the system posted just after the runtime wrote that answer.
+Both are cleared when the daemon handles the answer, and the end that follows the second reads as an
+ordinary end; a refusal posted after that stays recorded for the end it leads to. An answer for
+other work, a late or a repeated one, neither clears nor uses it. Windows does not promise to
+deliver the job's message, so a refusal that was not recorded reads as an ordinary end or an
+ordinary failure. On the build this was tried on (Windows Server 2025, build 26100), a process that
+asked the system for memory four times, with nothing done between the first two requests, a small
+commit kept for the third and given back for the fourth, was refused all four and had only the first
+recorded. A later refusal may therefore leave no record, and it reads as an ordinary failure. A
+failed job unloads the process and restarts inference, and the next process may record a first
+refusal of its own. A failed load leaves the process in place with no model, and the next load,
+after the restart delay, goes to it, so failures in a row can pause inference as `inference_failed`
+and not as `memory_pressure`. The limit is on committed memory and not on the resident set, so it
+does not count the weights a model maps for reading, and the daemon's reading stays the measure of
+the resident set. A host that will not apply the limit says so on its standard error and keeps the
+daemon's reading as the only ender.
 
 CPU-only is two settings rather than one. Zero GPU layers keeps every layer's weights on the
 processor; turning the library's *operation* offload off keeps the arithmetic there too, because the
@@ -463,9 +465,10 @@ The model runs in a process of its own, `kr-describe-inference`, one per executi
 control daemon starts it as its own child the first time work is due, in the directory the daemon
 names and with no environment beyond what the daemon gives it. The two talk over the child's
 standard input and output, and when the daemon goes, the child's input ends, and it cancels its job
-and exits. On Windows a process created held has not yet read its input, and the job it is put in
-ends it when the daemon goes; the one window that leaves a process behind is described with the
-memory limit.
+and exits. On Windows the job the child is put in also ends it when the daemon's last handle to the
+job closes, so a process created held, which has not read its input, goes with the daemon, and a
+running one may go before it has cancelled; the one window that leaves a process behind is
+described with the memory limit.
 
 They speak section 23's frame, a four-byte length and one KR-CBOR-1 object, through the protocol's
 own codec. The daemon says hello, and the process answers with its build, its target, its start
