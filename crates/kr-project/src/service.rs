@@ -5118,10 +5118,13 @@ impl ProjectService {
             return Qualification::refused(Refusal::Platform, Refusal::Platform.text())
                 .with_narrowing(narrowing);
         }
-        // Asked first, as the invocation would be: a kernel without the confinement the rules need
-        // is that cause, and not a host that cannot name its Git's libraries, which `support_set`
-        // would say of it by asking for the Git first.
-        if let Some(refusal) = crate::boundary::kernel_refusal() {
+        // Asked first, as the invocation would be: a kernel without the confinement the rules need,
+        // or a machine whose system-call numbers this host does not hold, is that cause, and not a
+        // host that cannot name its Git's libraries, which `support_set` would say of it by asking
+        // for the Git first.
+        let unenclosable = crate::boundary::kernel_refusal()
+            .or_else(|| crate::boundary::NO_GIT.map(crate::boundary::no_git_refusal));
+        if let Some(refusal) = unenclosable {
             return Qualification::refused(Refusal::Invocation, &refusal.to_string())
                 .with_narrowing(narrowing);
         }
