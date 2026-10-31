@@ -3948,18 +3948,29 @@ fn a_call_that_waits_for_the_turn_to_start_a_process_is_bounded_from_the_call() 
 #[test]
 fn a_call_that_does_not_end_is_asked_to_end_before_it_is_killed() {
     let directory = tempfile::tempdir().expect("a directory");
-    let marker = directory.path().join("asked-to-end");
-    let mut command = std::process::Command::new("/bin/sh");
-    command
+    let ready = directory.path().join("ready");
+    let asked = directory.path().join("asked-to-end");
+    let mut child = std::process::Command::new("/bin/sh")
         .arg("-c")
-        .arg("trap ': > \"$1\"; kill $!; exit 0' TERM; sleep 30 & wait")
+        .arg("trap ': > \"$2\"; kill $!; exit 0' TERM; sleep 30 & : > \"$1\"; wait")
         .arg("program")
-        .arg(&marker);
-    let why = user_manager::bounded(command, Duration::from_secs(1))
-        .expect_err("a call that outlasts its bound fails");
-    assert!(why.contains("did not end within"), "{why}");
+        .arg(&ready)
+        .arg(&asked)
+        .spawn()
+        .expect("starts the program");
+    // The program is ended only once it is ready to be asked.
+    let begun = Instant::now();
+    while !ready.exists() {
+        assert!(
+            begun.elapsed() < LIVENESS_DEADLINE,
+            "the program did not get ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let failed = user_manager::end_and_collect(&mut child);
+    assert_eq!(failed, "", "ending it failed");
     assert!(
-        marker.exists(),
+        asked.exists(),
         "the program was killed without being asked to end"
     );
 }

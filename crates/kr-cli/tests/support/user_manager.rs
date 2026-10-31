@@ -101,7 +101,7 @@ const ASKED_TO_END_FOR: Duration = Duration::from_secs(5);
 /// The child is asked to end first and given [`ASKED_TO_END_FOR`] to do so. A program that is
 /// killed outright cannot clean up after itself: an image build that is, leaves the program its
 /// step was running, which goes on after the build that wanted it.
-fn end_and_collect(child: &mut std::process::Child) -> String {
+pub fn end_and_collect(child: &mut std::process::Child) -> String {
     let mut failed = String::new();
     let asked = spawning(|| {
         Command::new("/bin/kill")
