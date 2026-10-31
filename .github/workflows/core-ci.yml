@@ -980,6 +980,16 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-ipc --lib
 
+      # The daemon's side of the description process, driven over a stub process's real pipes. On
+      # this platform the process is created held and let run only once the job around it has been
+      # tried, and the cases that show it run only here: a process that commits memory as it starts
+      # is refused by the job's limit, a process the system refused memory ends as memory pressure
+      # whether its runtime ends or answers that its work failed, and a start that panics after it
+      # created the process leaves no process behind.
+      - name: Test the daemon's side of the description process
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-describe --test supervise
+
       # The one directory flush every local store makes a changed name durable with: through a
       # handle holding the right the change used, and for a directory a store holds, through a second
       # handle opened from that one. Its tests hold the directory open without shared writing, so a
