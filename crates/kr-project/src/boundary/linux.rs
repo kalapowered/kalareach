@@ -39,7 +39,9 @@
 //!   boundary never made writable. An older kernel therefore runs no Git, and putting the service
 //!   inside a bubblewrap container does not change that: the refusal is about what this kernel can
 //!   enforce rather than about what surrounds the process, so a host on such a kernel needs a
-//!   different mechanism rather than a wrapper.
+//!   different mechanism rather than a wrapper. Every invocation there is refused as a host that
+//!   is not set up for the work, under a code a client does not send again, with the version the
+//!   kernel has and the version the boundary needs, before Git is looked for.
 //! * A remote operation requires the **fourth**, Linux 6.7, which is where Landlock gained the
 //!   rules that say which addresses a process may reach. Below it a remote operation is refused and
 //!   a local one still runs, because a local one reaches nothing through a different mechanism.
@@ -211,7 +213,9 @@ fn kernel_interface() -> u32 {
 /// an invocation runs inside, when it cannot, and what it has and what the boundary needs.
 ///
 /// A remote operation needs the version that restricts addresses, a local one the version that
-/// mediates truncation.
+/// mediates truncation. The refusal is that of a host that is not set up for the work, as a
+/// platform that runs no Git gives: nothing but another kernel changes what this one has, so a
+/// client is not told to try again, and a person is told what to use instead.
 fn lacking(found: u32, remote: bool) -> Option<ProjectError> {
     let (needed, release, what) = if remote {
         (
@@ -232,7 +236,7 @@ fn lacking(found: u32, remote: bool) -> Option<ProjectError> {
     } else {
         format!("this kernel's Landlock interface is version {found}")
     };
-    Some(ProjectError::GitFailed {
+    Some(ProjectError::GitUnavailable {
         detail: format!(
             "{has}, and the boundary around {what} needs version {needed} (Linux {release}) or \
              later; use a host whose kernel has it"
@@ -379,11 +383,13 @@ fn pin_descriptors() -> std::io::Result<()> {
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::GitFailed`] when this kernel cannot enforce the rights this boundary is
-/// made of, when a remote operation asks for rules a kernel this old does not have, or when an
-/// object the rules are attached to cannot be opened. An invocation whose reads are bounded is
-/// also refused when it would reach a remote, when a support object is missing, and when a
-/// filesystem is mounted beneath a directory it would be granted.
+/// Returns [`ProjectError::GitUnavailable`] when this kernel does not have the Landlock interface
+/// the boundary needs, or a remote operation asks for rules a kernel this old does not have: it
+/// says which version the kernel has and which the boundary needs. Returns
+/// [`ProjectError::GitFailed`], a fault that may pass, when the rules cannot be built or an object
+/// they are attached to cannot be opened. An invocation whose reads are bounded is also refused
+/// when it would reach a remote, when a support object is missing, and when a filesystem is
+/// mounted beneath a directory it would be granted.
 pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
     let remote = !matches!(confinement.reach, Reach::Nothing);
     if let Some(refusal) = lacking(kernel_interface(), remote) {
@@ -1089,7 +1095,8 @@ const UNKNOWN_MACHINE: u32 = 0x8000_0000;
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::GitFailed`] on an instruction set this host holds no call numbers for.
+/// Returns [`ProjectError::GitUnavailable`] on an instruction set this host holds no call numbers
+/// for, which [`NO_GIT`] has already said before any invocation is built.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn filter(remote: bool) -> Result<Vec<libc::sock_filter>> {
     let mut program = vec![
@@ -1181,8 +1188,8 @@ fn filter(remote: bool) -> Result<Vec<libc::sock_filter>> {
 ///
 /// # Errors
 ///
-/// Always returns [`ProjectError::GitFailed`]: this host holds no call numbers for this instruction
-/// set and will not install a filter that does not mean what it says.
+/// Always returns [`ProjectError::GitUnavailable`]: this host holds no call numbers for this
+/// instruction set and will not install a filter that does not mean what it says.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn filter(_remote: bool) -> Result<Vec<libc::sock_filter>> {
     Err(no_system_call_numbers())
@@ -1191,9 +1198,7 @@ fn filter(_remote: bool) -> Result<Vec<libc::sock_filter>> {
 /// Returns the refusal of a machine whose system-call numbers this host does not hold.
 #[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
 fn no_system_call_numbers() -> ProjectError {
-    ProjectError::GitFailed {
-        detail: NO_SYSTEM_CALL_NUMBERS.into(),
-    }
+    super::no_git_refusal(NO_SYSTEM_CALL_NUMBERS)
 }
 
 /// Returns one instruction of the filter.
