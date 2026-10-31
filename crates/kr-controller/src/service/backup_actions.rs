@@ -241,3 +241,56 @@ impl SetupAdmission for Unchecked {
         write()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use kr_protocol::ids::{ActorId, ConnectionId};
+
+    use super::super::AdmittedConnection;
+    use super::super::a_transfer_left_unanswered::daemon;
+    use super::*;
+    use crate::authority::AdmittedMutation;
+
+    /// The setup is recorded while the registration it was admitted under is held standing: a
+    /// withdrawal, or a refusal the authority feed raises, takes the lock this write is run under
+    /// for writing, so it lands wholly before the check or wholly after the write and never in it.
+    /// The write here asks that lock, as a withdrawal would.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_record_of_a_setup_is_written_while_its_registration_is_held_standing() {
+        let (_temp, controller) = daemon().await;
+        let revision = controller.policy().authority_revision();
+        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        controller.admitted_write().insert(
+            connection_id,
+            AdmittedConnection::new(ActorId::new("local:test").expect("a principal"), revision),
+        );
+        let admission = SetupStands {
+            controller: Arc::clone(&controller),
+            carried: AdmittedMutation {
+                connection_id,
+                admitted_revision: revision,
+                deadline: None,
+            },
+        };
+        let mut withdrawable_in_the_write = None;
+
+        admission
+            .admitted(&mut || {
+                withdrawable_in_the_write = Some(controller.commit_hold.try_write().is_ok());
+                Ok(())
+            })
+            .expect("the registration stands");
+
+        assert_eq!(
+            withdrawable_in_the_write,
+            Some(false),
+            "a withdrawal waits for the write to end"
+        );
+        assert!(
+            controller.commit_hold.try_write().is_ok(),
+            "the hold is let go when the write has ended"
+        );
+    }
+}
