@@ -358,14 +358,14 @@ const VK_SCROLL: u16 = 0x91;
 /// release among them.
 ///
 /// Where a scroll key's first record went is where the rest of the hold goes: `held` is the
-/// scroll keys down now, each with whether it is the window's. A key the session was sent going
-/// down has its repeats and its release sent too, whatever the modifiers do meanwhile, and a key
-/// taken is taken until it comes up. A chord that is not this terminal's (`mine` is false) is the
-/// session's, and a repeat of a key the window has, when the window is no longer this terminal's,
-/// is dropped.
+/// scroll keys down now, each by [`which_key`] with whether it is the window's. A key the session
+/// was sent going down has its repeats and its release sent too, whatever the modifiers do
+/// meanwhile, and a key taken is taken until it comes up. A chord that is not this terminal's
+/// (`mine` is false) is the session's, and a repeat of a key the window has, when the window is no
+/// longer this terminal's, is dropped.
 fn take_scroll_keys(
     keys: Vec<kr_term::win32::KeyRecord>,
-    held: &mut Vec<(u16, bool)>,
+    held: &mut Vec<(WhichKey, bool)>,
     mine: bool,
 ) -> (Vec<kr_term::win32::KeyRecord>, i64) {
     use kr_term::win32::control_keys::{
@@ -385,7 +385,8 @@ fn take_scroll_keys(
                 continue;
             }
         };
-        let place = held.iter().position(|(code, _)| *code == key.virtual_key);
+        let which = which_key(&key);
+        let place = held.iter().position(|(code, _)| *code == which);
         if !key.key_down {
             // The key comes up where it went down. One not seen going down is the session's.
             match place.map(|at| held.remove(at)) {
@@ -399,7 +400,7 @@ fn take_scroll_keys(
             None => {
                 let window =
                     mine && key.control_keys & SHIFT_PRESSED != 0 && key.control_keys & OTHERS == 0;
-                held.push((key.virtual_key, window));
+                held.push((which, window));
                 window
             }
         };
@@ -412,32 +413,41 @@ fn take_scroll_keys(
     (rest, steps)
 }
 
+/// A key, told by its virtual key, its scan code and whether it is an enhanced key: two keys can
+/// report one virtual key (the left and right Shift, Ctrl and Alt, and the Page Up of the cursor
+/// block and the one of the numeric keypad), and only the scan code and the enhanced flag tell them
+/// apart.
+type WhichKey = (u16, u16, bool);
+
+/// The key a record is of.
+const fn which_key(key: &kr_term::win32::KeyRecord) -> WhichKey {
+    (
+        key.virtual_key,
+        key.scan_code,
+        key.control_keys & kr_term::win32::control_keys::ENHANCED_KEY != 0,
+    )
+}
+
 /// Takes the releases of keys this attachment did not see go down out of a run of key records.
 ///
 /// A console reports a key coming up that went down before the attachment began to read, most often
 /// the Return that started the command. Sending that release tells the application a key came up
 /// that was never pressed, and a session that cannot spell records refuses the write for it. `down`
-/// is the keys whose press this attachment has sent, each by its virtual key, its scan code and
-/// whether it is an enhanced key, since two keys report one virtual key (the left and right Shift,
-/// Ctrl and Alt) and only those tell them apart. The order of what is kept is the order it arrived
-/// in. A record with no key of its own (a character an input method committed, or none) cannot be
-/// matched to a press, and is kept. So is an Alt coming up with the character composed on the
-/// numeric keypad, whether or not its press was seen: the character is on that record alone, and
-/// dropping it would lose text the person typed.
+/// is the keys whose press this attachment has sent, each by [`which_key`]. The order of what is
+/// kept is the order it arrived in. A record with no key of its own (a character an input method
+/// committed, or none) cannot be matched to a press, and is kept. So is an Alt coming up with the
+/// character composed on the numeric keypad, whether or not its press was seen: the character is on
+/// that record alone, and dropping it would lose text the person typed.
 fn drop_unseen_releases(
     keys: Vec<kr_term::win32::KeyRecord>,
-    down: &mut Vec<(u16, u16, bool)>,
+    down: &mut Vec<WhichKey>,
 ) -> Vec<kr_term::win32::KeyRecord> {
     keys.into_iter()
         .filter(|key| {
             if matches!(key.virtual_key, 0 | VK_PACKET) {
                 return true;
             }
-            let which = (
-                key.virtual_key,
-                key.scan_code,
-                key.control_keys & kr_term::win32::control_keys::ENHANCED_KEY != 0,
-            );
+            let which = which_key(key);
             let place = down.iter().position(|pressed| *pressed == which);
             if key.key_down {
                 if place.is_none() {
@@ -451,8 +461,8 @@ fn drop_unseen_releases(
         .collect()
 }
 
-/// Whether a record is an Alt coming up with the character composed on the numeric keypad, which the
-/// console reports on the Alt's release and on no other record.
+/// Whether a record is an Alt coming up with the character composed on the numeric keypad, which
+/// the console reports on the Alt's release and on no other record.
 const fn composed_with_alt(key: &kr_term::win32::KeyRecord) -> bool {
     !key.key_down && key.virtual_key == VK_MENU && key.unicode != 0
 }
@@ -1747,9 +1757,9 @@ async fn drive(
     // Whether a bracketed paste is open, so that nothing inside one is read as a key.
     let mut paste = PasteWatch::default();
     // The scroll keys that are down now, each with whether this terminal took it.
-    let mut scroll_keys_held: Vec<(u16, bool)> = Vec::new();
+    let mut scroll_keys_held: Vec<(WhichKey, bool)> = Vec::new();
     // The keys whose press has been sent to the session and whose release is still to come.
-    let mut keys_down: Vec<(u16, u16, bool)> = Vec::new();
+    let mut keys_down: Vec<WhichKey> = Vec::new();
     // Whether the console spells its keys itself now, because the session refused its records. The
     // records the reader read before that are dropped, and none are sent after it.
     let mut console_spells = false;
@@ -3981,6 +3991,45 @@ mod tests {
             false,
         );
         assert_eq!((rest.len(), steps), (0, 0));
+        assert!(held.is_empty());
+    }
+
+    /// The Page Up of the cursor block and the one of the numeric keypad report one virtual key, and
+    /// only the enhanced flag tells them apart. Each goes where it went down and comes up where it
+    /// went down: the one held with Shift is the window's, the other, held without, is the session's,
+    /// and neither one's release moves the other.
+    #[test]
+    fn two_scroll_keys_that_share_a_virtual_key_are_told_apart() {
+        use kr_term::win32::{
+            KeyRecord,
+            control_keys::{ENHANCED_KEY, SHIFT_PRESSED},
+        };
+
+        let page_up = |key_down: bool, control_keys: u32| KeyRecord {
+            virtual_key: super::VK_PRIOR,
+            scan_code: 0x49,
+            unicode: 0,
+            key_down,
+            control_keys,
+            repeat: 1,
+        };
+        let block_down = page_up(true, ENHANCED_KEY | SHIFT_PRESSED);
+        let block_up = page_up(false, ENHANCED_KEY);
+        let keypad_down = page_up(true, 0);
+        let keypad_up = page_up(false, 0);
+        let mut held = Vec::new();
+
+        // The block's key, with Shift, moves the window.
+        let (rest, steps) = take_scroll_keys(vec![block_down], &mut held, true);
+        assert_eq!((rest.len(), steps), (0, 1));
+        // The keypad's, without Shift, is the application's, though the block's is still down.
+        let (rest, steps) = take_scroll_keys(vec![keypad_down], &mut held, true);
+        assert_eq!((rest, steps), (vec![keypad_down], 0));
+        // The block's comes up first and is the window's; the keypad's release is the session's.
+        let (rest, steps) = take_scroll_keys(vec![block_up], &mut held, true);
+        assert_eq!((rest.len(), steps), (0, 0));
+        let (rest, steps) = take_scroll_keys(vec![keypad_up], &mut held, true);
+        assert_eq!((rest, steps), (vec![keypad_up], 0));
         assert!(held.is_empty());
     }
 
