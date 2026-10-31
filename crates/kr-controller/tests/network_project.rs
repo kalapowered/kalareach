@@ -357,11 +357,15 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
         .read(Method::ProjectList, &list_params)
         .await
         .expect("project.list is served to the device");
+    let mut owner_list = owner_list;
+    assert_eq!(owner_list.projects.len(), 3);
+    for project in &mut owner_list.projects {
+        withhold_the_place(&mut project.display_path);
+    }
     assert_eq!(
         owner_list, device_list,
-        "project.list is the same answer on both ingresses"
+        "project.list is the same answer on both ingresses, but for the places a device is not given"
     );
-    assert_eq!(owner_list.projects.len(), 3);
 
     let read_params = ProjectReadParams {
         project_repository_id: project,
@@ -372,9 +376,21 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
         .read(Method::ProjectRead, &read_params)
         .await
         .expect("project.read is served to the device");
+    let mut owner_read = owner_read;
+    withhold_the_place(&mut owner_read.project.display_path);
+    for workspace in &mut owner_read.workspaces {
+        withhold_the_place(&mut workspace.display_path);
+    }
+    for operation in &mut owner_read.operation.0 {
+        operation
+            .retained_staging_paths
+            .iter_mut()
+            .chain(&mut operation.removed_staging_paths)
+            .for_each(withhold_the_place);
+    }
     assert_eq!(
         owner_read, device_read,
-        "project.read is the same answer on both ingresses"
+        "project.read is the same answer on both ingresses, but for the places a device is not given"
     );
     assert_eq!(device_read.project.label, "source");
 
@@ -388,11 +404,15 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
         .read(Method::WorkspaceList, &list_params)
         .await
         .expect("workspace.list is served to the device");
+    let mut owner_list = owner_list;
+    assert_eq!(owner_list.workspaces.len(), 1);
+    for workspace in &mut owner_list.workspaces {
+        withhold_the_place(&mut workspace.display_path);
+    }
     assert_eq!(
         owner_list, device_list,
-        "workspace.list is the same answer on both ingresses"
+        "workspace.list is the same answer on both ingresses, but for the places a device is not given"
     );
-    assert_eq!(owner_list.workspaces.len(), 1);
 
     let read_params = WorkspaceReadParams {
         workspace_id: workspace.workspace_id,
@@ -403,9 +423,11 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
         .read(Method::WorkspaceRead, &read_params)
         .await
         .expect("workspace.read is served to the device");
+    let mut owner_read = owner_read;
+    withhold_the_place(&mut owner_read.workspace.display_path);
     assert_eq!(
         owner_read, device_read,
-        "workspace.read is the same answer on both ingresses"
+        "workspace.read is the same answer on both ingresses, but for the places a device is not given"
     );
 
     // `project.operation.cancel` reaches a device, and section 23 puts it under the resource
@@ -3961,6 +3983,15 @@ async fn a_device_clones_makes_a_working_copy_and_removes_it_inside_its_granted_
         "and nothing else was removed"
     );
     granted.stop().await;
+}
+
+/// A place on the host as a device is given it: withheld as a path is, the way the directory of a
+/// materialisation is.
+fn withhold_the_place(place: &mut String) {
+    *place = kr_protocol::hostinfo::export::withheld(
+        kr_protocol::hostinfo::export::ContentClass::Path,
+        place,
+    );
 }
 
 /// A working copy the device made beneath its destination location, by name.
