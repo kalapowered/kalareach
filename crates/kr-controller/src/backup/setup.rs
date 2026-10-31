@@ -229,6 +229,20 @@ impl Admitted {
         }
     }
 
+    /// Keeps the admission's refusal for the call's end.
+    fn keep(&self, refusal: ControllerError) {
+        *self.refused.lock().unwrap_or_else(PoisonError::into_inner) = Some(refusal);
+    }
+
+    /// Asks the admission before a step that sends a request or reads the delay the service named.
+    /// The refusal is kept for the call's end, and the answer returned here only stops the step.
+    fn ask(&self) -> std::result::Result<(), Ended> {
+        self.admission.stands().map_err(|refusal| {
+            self.keep(refusal);
+            unknown(None)
+        })
+    }
+
     /// How the call ends when a step did not go on with `answer`: with the admission's refusal when
     /// that is what stopped a request, and otherwise with the step's own answer.
     fn ended(&self, answer: Ended) -> std::result::Result<Step, Ended> {
@@ -249,7 +263,7 @@ impl AccountTokenSource for Admitted {
         Box::pin(async move {
             let token = self.inner.token(scope).await?;
             if let Err(refusal) = self.admission.stands() {
-                *self.refused.lock().unwrap_or_else(PoisonError::into_inner) = Some(refusal);
+                self.keep(refusal);
                 return Err(ClientError::refusal(
                     ErrorCode::PermissionDenied,
                     kr_client::shown::Shown::said(
@@ -637,25 +651,25 @@ impl BackupSetup {
             return Err(self.ended_by(&error, mark, true));
         }
 
-        // The admission is asked as each request leaves, and not once at the call's start: the
-        // wait for another call, for a token and for each earlier request can outlast a fence this
-        // host comes to owe or the registration the call was made under. A request that carries a
-        // token asks it once the token is in hand ([`Admitted`]), the last point before the request
-        // leaves; the enrolment carries none and asks it just before.
+        // The admission is asked before each request to the storage service, and not once at the
+        // call's start: the wait for another call, for a token and for each earlier request can
+        // outlast a fence this host comes to owe or the registration the call was made under. It is
+        // asked just before the request is prepared, ahead of the delay the service named, so that
+        // a call that meets both is refused and not told the delay ([`Self::before_a_request`]),
+        // and a request that carries a token asks it again once the token is in hand
+        // ([`Admitted`]), the last point before the request leaves. The check above that a token
+        // can be had, and the renewal of the host's own sign-in that it may make, come before the
+        // first: that is no request to the storage service, and a renewal under way is not dropped,
+        // so a lapse does not stop it.
         let tokens = Arc::new(Admitted::over(tokens, Arc::clone(admission)));
-        // 2. The bundle first. The admission is asked before the delay the service named is read,
-        // so that a call that meets both is refused and not told the delay.
-        if let Err(refusal) = admission.stands() {
-            return Ok(Step::Stopped(refusal));
-        }
+        // 2. The bundle first.
         if let Err(done) = self.write_bundle(params, mark, &tokens).await {
             return tokens.ended(done);
         }
         // 3. The writer's enrolment.
-        if let Err(refusal) = admission.stands() {
-            return Ok(Step::Stopped(refusal));
+        if let Err(done) = self.enrol(params, mark, &tokens).await {
+            return tokens.ended(done);
         }
-        self.enrol(params, mark).await?;
         // 4. Managed backup storage on, which asks the admission again before each change it
         // makes, after the read of the storage state that precedes it.
         if let Err(done) = self.turn_storage_on(mark, &tokens).await {
@@ -726,7 +740,7 @@ impl BackupSetup {
         mark: kr_client::services::AccountMark,
         tokens: &Arc<Admitted>,
     ) -> std::result::Result<(), Ended> {
-        self.wait_out_delay()?;
+        self.before_a_request(tokens)?;
         let installation = AuthorisationKeyPair::generate().map_err(|_| unknown(None))?;
         let transport = self.transport().map_err(|_| unknown(None))?;
         let sync = ManagedSyncService::new(
@@ -752,7 +766,9 @@ impl BackupSetup {
         match sent {
             Ok(SyncDispatch::Answered(SyncExchanged::Applied { .. })) => Ok(()),
             // Refused, or signed before the collection's cutoff: what is there decides.
-            Ok(SyncDispatch::Answered(_)) => self.settle_bundle(&sync, &collection, params).await,
+            Ok(SyncDispatch::Answered(_)) => {
+                self.settle_bundle(&sync, &collection, params, tokens).await
+            }
             // Refused on this host before anything left: nothing can have been written.
             Ok(SyncDispatch::NotSent(error)) => Err(self.ended_by(&error, mark, false)),
             Err(error) => {
@@ -760,7 +776,7 @@ impl BackupSetup {
                 // what the service holds decides.
                 match self.ended_by(&error, mark, false) {
                     BackupEnableResult::Unknown { .. } => {
-                        self.settle_bundle(&sync, &collection, params).await
+                        self.settle_bundle(&sync, &collection, params, tokens).await
                     }
                     ended => Err(ended),
                 }
@@ -774,10 +790,11 @@ impl BackupSetup {
         sync: &ManagedSyncService,
         collection: &str,
         params: &BackupEnableParams,
+        tokens: &Admitted,
     ) -> std::result::Result<(), Ended> {
         // A delay the service named with the answer that brought the call here is owed to the
         // read as much as to any other request.
-        self.wait_out_delay()?;
+        self.before_a_request(tokens)?;
         match sync.fetch(collection).await {
             Ok(SyncFetched::Held { ciphertext, .. }) => {
                 if ciphertext == params.sealed_bundle.as_slice() {
@@ -800,8 +817,9 @@ impl BackupSetup {
         &self,
         params: &BackupEnableParams,
         mark: kr_client::services::AccountMark,
+        tokens: &Admitted,
     ) -> std::result::Result<(), Ended> {
-        self.wait_out_delay()?;
+        self.before_a_request(tokens)?;
         let payload = BackupWriterRecordPayload {
             archive_id: params.archive_id,
             writer: TrustedWriter {
@@ -851,7 +869,7 @@ impl BackupSetup {
             .storage_presenting(Arc::clone(tokens) as _)
             .map_err(|_| unknown(None))?;
         for _ in 0..RETENTION_TRIES {
-            self.wait_out_delay()?;
+            self.before_a_request(tokens)?;
             let status = storage
                 .status()
                 .await
@@ -876,8 +894,11 @@ impl BackupSetup {
         Err(unknown(None))
     }
 
-    /// Ends the call, without a request, if the service asked to be left alone.
-    fn wait_out_delay(&self) -> std::result::Result<(), Ended> {
+    /// Ends the call, without a request, if the admission it was made under no longer stands or the
+    /// service asked to be left alone. The admission is asked first, so that a call that meets both
+    /// is refused and not told the delay.
+    fn before_a_request(&self, tokens: &Admitted) -> std::result::Result<(), Ended> {
+        tokens.ask()?;
         match self.quiet.left() {
             Some(left) => Err(unknown(Some(left))),
             None => Ok(()),
