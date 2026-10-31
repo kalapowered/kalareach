@@ -52,6 +52,23 @@ pub const BEGAN_PREFIX: &str = "stub-began-";
 /// followed by its process identifier.
 pub const LOADED_PREFIX: &str = "stub-loaded-";
 
+/// The name of the file in a stub's runtime directory that [`release_held_work`] makes, and that
+/// ends the wait of a load or a job the script holds.
+const RELEASE_MARK: &str = "stub-released";
+
+/// Lets the loads and the jobs run that stub processes with `runtime_dir` as their runtime
+/// directory hold ([`Script::load_until_released`] and [`Script::generate_until_released`]): the
+/// ones waiting now end, and the ones that begin afterwards are not held.
+///
+/// # Panics
+///
+/// Panics when the mark cannot be made, since a case that cannot release its work would wait for
+/// nothing.
+pub fn release_held_work(runtime_dir: &Path) {
+    std::fs::write(runtime_dir.join(RELEASE_MARK), "released")
+        .expect("the mark that releases held work is made");
+}
+
 thread_local! {
     /// The frame thread a driver on this thread does not start next, by name.
     static REFUSED_THREAD: std::cell::Cell<Option<&'static str>> =
@@ -211,6 +228,13 @@ pub struct Script {
     /// and, as `lock-held`, when it finds another process holding the environment's lock: what a
     /// test waits for before it cancels work it means to be in the middle of.
     pub mark_work: bool,
+    /// Whether a load waits, as well as for its cancellation and its deadline, for the test to
+    /// call [`release_held_work`]: what lets a case decide when the load ends by an event it has
+    /// seen, and not by a delay. The load takes no time of its own beyond that.
+    pub load_until_released: bool,
+    /// Whether a job waits for [`release_held_work`] in the same way. The job takes no time of its
+    /// own beyond that.
+    pub generate_until_released: bool,
     /// How long a job takes, in milliseconds.
     pub generate_ms: u64,
     /// Whether a job waits until it is cancelled or passes its deadline.
@@ -385,6 +409,8 @@ impl Script {
             }
         };
         flag("load-until-cancelled", self.load_until_cancelled);
+        flag("load-until-released", self.load_until_released);
+        flag("generate-until-released", self.generate_until_released);
         flag("verify-until-cancelled", self.verify_until_cancelled);
         flag(
             "verify-passes-once-cancelled",
@@ -460,6 +486,8 @@ impl Script {
                 "wedge-input-after" => script.wedge_input_after = Some(number()?),
                 "wedge-output-from" => script.wedge_output_from = Some(number()?),
                 "load-until-cancelled" => script.load_until_cancelled = true,
+                "load-until-released" => script.load_until_released = true,
+                "generate-until-released" => script.generate_until_released = true,
                 "verify-until-cancelled" => script.verify_until_cancelled = true,
                 "verify-on-load" => script.verify_on_load = true,
                 "mark-loads" => script.mark_loads = true,
@@ -527,6 +555,15 @@ impl StubModel {
         }
     }
 
+    /// The file whose presence releases work the script holds, when the model has a runtime
+    /// directory to look in.
+    fn release_mark(&self, held: bool) -> Option<PathBuf> {
+        self.runtime_dir
+            .as_ref()
+            .filter(|_| held)
+            .map(|runtime_dir| runtime_dir.join(RELEASE_MARK))
+    }
+
     /// Builds a model that follows a script.
     #[must_use]
     pub const fn new(script: Script) -> Self {
@@ -551,15 +588,23 @@ enum Waited {
     PastDeadline,
 }
 
-/// Waits `duration`, or until the token is cancelled or the deadline passes, whichever is first;
-/// with no duration, until one of the other two.
-fn wait(spin: bool, duration: Option<Duration>, token: &Cancellation, deadline: Instant) -> Waited {
+/// Waits `duration`, or until the token is cancelled or the deadline passes, or until the file
+/// `released` is there, whichever is first; with no duration, until one of the others.
+fn wait(
+    spin: bool,
+    duration: Option<Duration>,
+    released: Option<&Path>,
+    token: &Cancellation,
+    deadline: Instant,
+) -> Waited {
     let started = Instant::now();
     loop {
         if token.is_cancelled() {
             return Waited::Cancelled;
         }
-        if duration.is_some_and(|duration| started.elapsed() >= duration) {
+        if duration.is_some_and(|duration| started.elapsed() >= duration)
+            || released.is_some_and(Path::exists)
+        {
             return Waited::Done;
         }
         if Instant::now() >= deadline {
@@ -599,9 +644,16 @@ impl Model for StubModel {
         if self.script.load_ignore_token_ms > 0 {
             std::thread::sleep(Duration::from_millis(self.script.load_ignore_token_ms));
         }
-        let duration =
-            (!self.script.load_until_cancelled).then(|| Duration::from_millis(self.script.load_ms));
-        match wait(self.script.spin, duration, token, deadline) {
+        let released = self.release_mark(self.script.load_until_released);
+        let duration = (!self.script.load_until_cancelled && !self.script.load_until_released)
+            .then(|| Duration::from_millis(self.script.load_ms));
+        match wait(
+            self.script.spin,
+            duration,
+            released.as_deref(),
+            token,
+            deadline,
+        ) {
             Waited::Done => {
                 if self.script.mark_loads
                     && let Some(runtime_dir) = &self.runtime_dir
@@ -656,9 +708,17 @@ impl Model for StubModel {
         if kept.is_some() {
             self.began("held");
         }
-        let duration = (!self.script.generate_until_cancelled)
+        let released = self.release_mark(self.script.generate_until_released);
+        let duration = (!self.script.generate_until_cancelled
+            && !self.script.generate_until_released)
             .then(|| Duration::from_millis(self.script.generate_ms));
-        match wait(self.script.spin, duration, token, deadline) {
+        match wait(
+            self.script.spin,
+            duration,
+            released.as_deref(),
+            token,
+            deadline,
+        ) {
             Waited::Done => {}
             Waited::Cancelled if self.script.produce_when_cancelled => {}
             Waited::Cancelled => {
@@ -714,7 +774,7 @@ impl Model for StubModel {
     ) -> Verifying {
         self.began("check");
         if self.script.verify_passes_once_cancelled {
-            return match wait(self.script.spin, None, token, deadline) {
+            return match wait(self.script.spin, None, None, token, deadline) {
                 Waited::Cancelled | Waited::Done => check_file(asset, path),
                 Waited::PastDeadline => Verifying::Ended {
                     result: VerifyResult::DeadlineExceeded,
@@ -727,7 +787,7 @@ impl Model for StubModel {
         }
         let duration = (!self.script.verify_until_cancelled)
             .then(|| Duration::from_millis(self.script.verify_ms));
-        match wait(self.script.spin, duration, token, deadline) {
+        match wait(self.script.spin, duration, None, token, deadline) {
             Waited::Done => check_file(asset, path),
             Waited::Cancelled => Verifying::Ended {
                 result: VerifyResult::Cancelled,
