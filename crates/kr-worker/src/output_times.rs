@@ -116,6 +116,9 @@ struct Open {
 #[derive(Debug, Default)]
 struct State {
     open: Option<Open>,
+    /// The open interval as the file last received it, so that a write with the interval unchanged
+    /// since then leaves the file alone.
+    written_open: Option<Mark>,
     /// Closed intervals the file has not been given.
     closed: Vec<Mark>,
     /// Closed intervals a write has taken and has not finished with: they are in no list and not
@@ -366,9 +369,17 @@ impl TimeIndex {
             let mut state = locked(&self.inner.state);
             let closed = std::mem::take(&mut state.closed);
             state.in_flight = closed.len();
+            // The open interval is written when the file does not already hold it as it stands.
+            // An idle session's last interval does not change, and a write that restates it opens
+            // the file, takes its locks and commits a transaction to record what is already there.
+            let written = state.written_open;
             (
                 closed,
-                state.open.as_ref().map(|open| open.mark),
+                state
+                    .open
+                    .as_ref()
+                    .map(|open| open.mark)
+                    .filter(|mark| written != Some(*mark)),
                 state.prune_below,
                 !state.pruned && state.prune_below > 0,
             )
@@ -388,6 +399,9 @@ impl TimeIndex {
             Ok(rows) => {
                 state.rows = rows;
                 state.failure = None;
+                if open.is_some() {
+                    state.written_open = open;
+                }
                 if prune_owed && state.prune_below == prune {
                     state.pruned = true;
                 }
@@ -421,6 +435,7 @@ impl TimeIndex {
         {
             let mut state = locked(&self.inner.state);
             state.open = None;
+            state.written_open = None;
             state.closed.clear();
             state.in_flight = 0;
             state.rows = 0;
@@ -903,6 +918,44 @@ mod tests {
         assert!(!path.exists());
         index.flush().expect("nothing is left to write");
         assert!(!path.exists());
+    }
+
+    /// KR-PERF-003: an idle session is written to once a minute by the host's maintenance, and a
+    /// write that has nothing new in it must not open the file.
+    #[test]
+    fn kr_perf_003_a_write_with_nothing_new_in_it_leaves_the_file_alone() {
+        let (index, path, _kept) = index("unchanged");
+        index.note_at(0, 10, 1_000, true, 5_000);
+        index.flush().expect("writes");
+        let gone = |path: &Path| {
+            for name in [
+                path.to_path_buf(),
+                beside(path, "-wal"),
+                beside(path, "-shm"),
+            ] {
+                let _ = std::fs::remove_file(name);
+            }
+        };
+        // With the file taken away, a write that touches it makes it again.
+        gone(&path);
+        index.flush().expect("has nothing to write");
+        assert!(
+            !path.exists(),
+            "the open interval is already in the file and is not written again"
+        );
+        // What the session goes on to produce is written, the interval it extended included.
+        index.note_at(10, 10, 1_001, true, 5_001);
+        index.flush().expect("writes the extended interval");
+        let read = read(&path, 0, 20, 16).expect("reads");
+        assert_eq!(
+            read.marks,
+            vec![TimedRange {
+                from: 0,
+                to: 20,
+                at_ms: 1_000,
+                proven: true
+            }]
+        );
     }
 
     #[test]
