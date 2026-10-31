@@ -127,6 +127,23 @@ async function readAgain(page: Page): Promise<void> {
   })
 }
 
+/**
+ * Answers the card an invitation has opened by pressing `control`, once the card has come to rest,
+ * and waits for the card to go.
+ *
+ * Both controls act on a press that is released over them, so when the card moves out from under a
+ * press that began on it, nothing is answered: a press that slid off is meant to do nothing. A card
+ * in the last frames of its arrival can still pass the engine's own test for a steady target, which
+ * compares two frames, so the press waits for what the card publishes about itself: that it is at
+ * rest.
+ */
+async function answerOffer(page: Page, control: 'accept-offer' | 'not-now'): Promise<void> {
+  const sheet = page.getByTestId('sheet')
+  await expect(sheet).toHaveAttribute('data-presentation', 'here')
+  await page.getByTestId(control).click()
+  await expect(sheet).toBeHidden()
+}
+
 /** Lets the page draw two frames, in which what was asked of it (a scroll, an insertion) has happened. */
 async function drawn(page: Page): Promise<void> {
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
@@ -230,8 +247,7 @@ for (const surface of ['ios', 'android'] as const) {
               window.krTestHost?.sharing.loseNextAnswer()
             })
             await page.getByRole('button', { name: new RegExp(`shared session ${session} with you`) }).click()
-            await page.getByTestId('accept-offer').click()
-            await expect(page.getByTestId('sheet')).toBeHidden()
+            await answerOffer(page, 'accept-offer')
             // The toast that says so lies over the inbox and the body of the next card: it is taken away.
             await page.locator('.toast').getByRole('button', { name: 'Dismiss' }).click()
             await expect(page.locator('.toast')).toBeHidden()
@@ -241,9 +257,8 @@ for (const surface of ['ios', 'android'] as const) {
           await page.getByTestId('attempt-hide').first().click()
           await expect(page.getByTestId('hidden-attempts')).toBeVisible()
           await page.getByRole('button', { name: /shared session 5 with you/ }).click()
-          await page.getByTestId('not-now').click()
+          await answerOffer(page, 'not-now')
           await expect(page.getByTestId('hidden-offers')).toBeVisible()
-          await expect(page.getByTestId('sheet')).toBeHidden()
           // The row that says one is hidden lays its words and its action out as a row of its own.
           await expect(page.getByTestId('hidden-offers')).toHaveCSS('display', 'flex')
 
@@ -272,8 +287,7 @@ for (const surface of ['ios', 'android'] as const) {
           await page.evaluate((id) => {
             window.krTestHost?.sharing.withdrawOffer(id, 'this invitation was withdrawn')
           }, invitation)
-          await page.getByTestId('accept-offer').click()
-          await expect(page.getByTestId('sheet')).toBeHidden()
+          await answerOffer(page, 'accept-offer')
 
           const toast = page.locator('.toast')
           await expect(toast).toContainText('The host said: this invitation was withdrawn')
@@ -329,8 +343,7 @@ for (const surface of ['ios', 'android'] as const) {
           await page.getByRole('button', { name: /^Attention\b/ }).click()
           for (const session of ['3', '4']) {
             await page.getByRole('button', { name: new RegExp(`shared session ${session} with you`) }).click()
-            await page.getByTestId('accept-offer').click()
-            await expect(page.getByTestId('sheet')).toBeHidden()
+            await answerOffer(page, 'accept-offer')
             // The message that says so rests above the tab bar and lies over the next row at the
             // largest size: it is taken away.
             await page.locator('.toast').getByRole('button', { name: 'Dismiss' }).click()
@@ -553,8 +566,7 @@ test.describe('a message in passing over the card an invitation opens', () => {
       }, how.inset)
     }
     await page.getByRole('button', { name: /shared session 3 with you/ }).click()
-    await page.getByTestId('accept-offer').click()
-    await expect(page.getByTestId('sheet')).toBeHidden()
+    await answerOffer(page, 'accept-offer')
     const toast = page.locator('.toast')
     await expect(toast).toContainText('Session 3 is shared with you until')
     await toast.dispatchEvent('pointerover', { pointerType: 'mouse', pointerId: 1 })
@@ -848,8 +860,7 @@ test.describe('a message in passing over the card an invitation opens', () => {
       await expect(loaded.getByTestId('offers')).toBeVisible()
     })
     await page.getByRole('button', { name: /shared session 3 with you/ }).click()
-    await page.getByTestId('accept-offer').click()
-    await expect(page.getByTestId('sheet')).toBeHidden()
+    await answerOffer(page, 'accept-offer')
     const toast = page.locator('.toast')
     await expect(toast).toContainText('Session 3 is shared with you until')
     // Held where it is, as a pointer resting on it holds it, while an item's card is opened over it.
