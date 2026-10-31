@@ -3674,19 +3674,10 @@ mod tests {
             read_by_a_device(&listed).sessions.remove(0),
         ] {
             // The session is still bound to a desktop, which is not a secret; what the desktop is
-            // called is.
-            let told = device
-                .desktop
-                .desktop_session_id
-                .0
-                .as_ref()
-                .expect("the session is still bound to a desktop")
-                .to_string();
-            assert!(
-                !["marguerite", "501", "100019", "5a17c309"]
-                    .iter()
-                    .any(|name| told.contains(name)),
-                "{told}"
+            // called is, and the device is told what the capability answers tell it.
+            assert_eq!(
+                device.desktop.desktop_session_id.0,
+                Some(kr_protocol::hostinfo::export::withheld_identity())
             );
             // The generation the binding was taken at is told as it is, and nothing else of the
             // session changes.
@@ -3800,12 +3791,14 @@ mod tests {
         }
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let door = source.join("net");
+        // `net/owner.rs` is the owner's confirmation ceremony, and its text is the owner's.
+        let owners = door.join("owner.rs");
         let mut found = Vec::new();
         sources(&source, &mut found);
         assert!(found.len() > 100, "{} sources read", found.len());
         let outside: Vec<_> = found
             .iter()
-            .filter(|path| !path.starts_with(&door))
+            .filter(|path| !path.starts_with(&door) || **path == owners)
             .filter(|path| {
                 std::fs::read_to_string(path).is_ok_and(|text| text.contains("device_errors"))
             })
@@ -3833,7 +3826,7 @@ mod tests {
         let text = |text: &str| CanonicalValue::Text(text.to_owned());
         let place = "/Users/marguerite/work/x";
         // The key, what it holds, and the members that make the record it is in.
-        let records: [Record; 15] = [
+        let records: [Record; 16] = [
             ("reason", place, &[("subsystem", "privacy")]),
             ("reason", place, &[("state", "unavailable")]),
             (
@@ -3876,6 +3869,11 @@ mod tests {
                 &[("remote_name", "origin"), ("transport", "local_path")],
             ),
             ("endpoint", place, &[("session", "s-1")]),
+            (
+                "desktop_session_id",
+                A_DESKTOP_NAME,
+                &[("login_generation", "42")],
+            ),
             (
                 "suspension_reason",
                 A_CONVERSATION_LOCK_THAT_FAILED,

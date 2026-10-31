@@ -9271,16 +9271,13 @@ mod tests {
     fn the_number_of_an_account_is_not_exported() {
         let context = crate::desktop::DesktopContext {
             uid: Nullable::some(crate::scalars::U64::new(501)),
+            login_generation: Nullable::some(crate::scalars::U64::new(7)),
             ..a_desktop()
         };
         let exported = export::desktop_context(context.clone());
         assert_eq!(exported.uid, Nullable::null());
-        // The rest of the context leaves as it did, and the context this host keeps is untouched.
-        assert_eq!(
-            exported.os_user,
-            export::desktop_context(a_desktop()).os_user
-        );
-        assert_eq!(context.uid, Nullable::some(crate::scalars::U64::new(501)));
+        // The numbers the platform reads of the login leave as they were.
+        assert_eq!(exported.login_generation, context.login_generation);
     }
 
     /// KR-REQ-26.13, KR-REQ-26.44: the report a host shows its owner names the paths; the one that
