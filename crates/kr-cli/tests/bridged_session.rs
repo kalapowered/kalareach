@@ -177,6 +177,10 @@ fn ssh_stand_in(tools: &Path, destination: &Path, home: &Path) -> String {
     let temporary = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_owned());
     format!(
         r##"#!/bin/sh
+# A test that wants a connection that never answers says so with a file.
+if [ -f '{tools}/stalls' ]; then
+  exec sleep 40
+fi
 # A test that wants the destination unreachable says so with a file, and the connection is refused
 # the way `ssh` refuses one.
 if [ -f '{tools}/unreachable' ]; then
@@ -3976,16 +3980,33 @@ fn a_call_that_does_not_end_is_asked_to_end_before_it_is_killed() {
 }
 
 /// A run of `kr` that does not end within its bound fails the case that ran it, with the call
-/// named. A bound of nothing is one that no run of `kr` meets, so this needs no stalled program.
+/// named: a `kr` that waits for an `ssh` that never answers is the one that stalls here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_kr_run_that_does_not_end_within_its_bound_fails_the_case_and_names_the_call() {
     let mut world = World::start().await;
-    world.kr_bound = Duration::ZERO;
-    let failed =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| world.run(&["--version"])));
+    std::fs::write(world.tools.join("stalls"), "").expect("a mark for the stand-in");
+    world.kr_bound = Duration::from_secs(3);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        world.run(&[
+            "--json",
+            "bridge",
+            "enrol",
+            "--access",
+            "ssh",
+            "--label",
+            "never",
+            "--target",
+            "build.example",
+            "--user",
+            "nobody",
+            "--helper",
+            "/bin/true",
+            "--probe",
+        ])
+    }));
     let said = panic_message(failed.expect_err("a run that outlasts its bound fails the case"));
     assert!(
-        said.contains("\"--version\"") && said.contains("within"),
+        said.contains("\"enrol\"") && said.contains("within"),
         "the call is named: {said}"
     );
 }
