@@ -4204,9 +4204,28 @@ async fn the_same_method_answers_both_ingresses_alike_once_the_grant_admits_the_
         .read(Method::SessionRead, &SessionReadParams { session_id })
         .await
         .expect("session.read is served to the device");
+    // The worker's socket is a place on this host: the owner is told it, and a device is given the
+    // withheld record of a path, as long as the owner's. The rest of the answer is the same.
+    let socket = locally
+        .endpoint
+        .0
+        .clone()
+        .expect("the owner is told the socket of the session's worker");
     assert_eq!(
-        locally, remotely,
-        "a session the grant admits reads the same on both ingresses"
+        remotely.endpoint.0,
+        Some(kr_protocol::hostinfo::export::withheld(
+            kr_protocol::hostinfo::export::ContentClass::Path,
+            &socket
+        )),
+        "a device is given the withheld record of the worker's socket"
+    );
+    assert_eq!(
+        SessionReadResult {
+            endpoint: locally.endpoint.clone(),
+            ..remotely
+        },
+        locally,
+        "a session the grant admits reads the same on both ingresses, but for the socket"
     );
 
     let parameters = kr_protocol::session::SessionListParams {
