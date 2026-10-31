@@ -116,7 +116,8 @@ minutes, and memory and every view's progress are read every five seconds. The s
 
 ## How each figure is taken
 
-Every measurement of `scripts/bench-all.sh` runs in a release build, one at a time.
+Every Rust measurement of `scripts/bench-all.sh` runs in a release build, and the companion's
+runs under Vitest, one at a time.
 
 With `KR_PERF_SETTLE_LOAD` set to a load, `scripts/performance.sh` starts each measurement only once
 the one-minute load is under it, and fails without taking the figure if ten minutes pass first. The
@@ -206,15 +207,18 @@ where and why. The conformance report attaches each section to its identifier (s
 | `kr-perf-stress.md` | `tests/perf/tests/stress.rs` | KR-PERF-001, KR-PERF-003 twice, KR-PERF-007 |
 | `bench-all.md` | `scripts/bench-all.sh` | KR-PERF-006's client share, KR-PERF-008, KR-PERF-009, KR-PERF-010, and one conditions section for each identifier the run measured |
 
-A measurement's own section starts with its host (the transport's two sections in
-`kr-transport-scheduling.md` give the build, the operating system and architecture, the processor,
-the processors, the memory and the load average at one edge, and read neither the speed nor the
-disk; the KR-PERF-005 section adds the stolen share, and the KR-PERF-006 section does not): the build, the operating system and architecture,
+A measurement's own section starts with its host: the build, the operating system and architecture,
 the processor, the processors and the memory against the reference host's, the load average entering
 and leaving, the time a fixed piece of single-threaded work took entering and leaving (the host's
 speed, so that a figure which reads high can be told from a host that ran slow; a window opened
 inside another measurement's interval reads none and says so), the stolen share, for a figure that
-waits on a durable write the disk's time for one, and which of those fall short. For each identifier
+waits on a durable write the disk's time for one, and which of those fall short. Two records give
+less. The transport's two sections in `kr-transport-scheduling.md` give the build, the operating
+system and architecture, the processor, the processors, the memory and the load average at one
+edge, and read neither the speed nor the disk; the KR-PERF-005 section adds the stolen share, and
+the KR-PERF-006 section does not. `kr-term-output-handling.md` gives the build, the operating
+system and architecture, the processors and the processor, and reads no memory, load average,
+speed, stolen share or shortfall. For each identifier
 the run measured, `bench-all.md` adds a conditions section. It gives each step that measured the identifier, with its
 exit status, the load average at both edges, the other work over the ten seconds before the step and
 through it (the bound on its busiest five seconds, how much of that the allowances make up, its
@@ -242,11 +246,13 @@ The four-processor Linux runners that continuous integration uses meet the defin
 processors, and their figures count as Linux x86-64 figures only where the runner's four processors
 are four physical cores. The record does not show that: a hosted runner records a processor model
 name, which does not say how the runner's processors divide into cores. No step of the landing
-workflow reads the topology, so no hosted runner's figure counts as a release figure on the record
-alone; it would count once the runner's topology is read and stated beside the figure in the
-release acceptance record, and a runner whose four processors are two cores with two hardware
+workflow reads the topology, and no job of it runs `scripts/bench-all.sh --reference-host`, so no
+hosted runner's figure counts as a release figure on the record alone; it would count once the
+runner's topology is read and stated beside the figure in the release acceptance record and the
+figure comes from such a run, and a runner whose four processors are two cores with two hardware
 threads each records its figures and none of them is a release figure. The macOS runners it uses are
 `macos-15`, with three processors, below the reference host's four, so its figures are recorded and
 none of them is a release figure, and `macos-reference`'s `macos-15-intel`, which the workflow treats
-as a four-processor host and whose topology no step reads either, so its figures count as release
-figures only where the person who reads the topology states it beside them.
+as a four-processor host and whose topology no step reads either. Its job runs
+`scripts/performance.sh` and not a `--reference-host` run of `scripts/bench-all.sh`, so its figures
+are recorded and none of them is a release figure either.
