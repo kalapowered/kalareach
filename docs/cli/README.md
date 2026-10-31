@@ -378,10 +378,11 @@ console that will not spell its keys gives the lease back and goes on watching, 
 that and says that every key typed since was not sent. The scroll-back keys above are taken from the
 records of Shift and Page Up or Page Down, key by key: the key going down and the same key coming up
 are the window's. The release of a key this attachment did not see go down, the Return that started
-the command among them, is not sent, and every other record is the session's. A key is told by its
-virtual key, its scan code and whether it is an enhanced key, so the left and right Shift are two
-keys and each one's release is sent. The command does not ask the console for mouse or window-size
-records, so the console keeps the mouse for selecting text.
+the command among them, is not sent, unless it is an Alt coming up with a character composed on the
+numeric keypad, which is the person's text and is sent. Every other record is the session's. A key
+is told by its virtual key, its scan code and whether it is an enhanced key, so the left and right
+Shift are two keys and each one's release is sent. The command does not ask the console for mouse or
+window-size records, so the console keeps the mouse for selecting text.
 
 Bracketed paste is the one piece of context the command keeps, and it keeps it by watching the
 bytes as they go past rather than by holding any of them: a start delimiter opens a paste and an

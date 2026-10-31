@@ -421,7 +421,9 @@ fn take_scroll_keys(
 /// whether it is an enhanced key, since two keys report one virtual key (the left and right Shift,
 /// Ctrl and Alt) and only those tell them apart. The order of what is kept is the order it arrived
 /// in. A record with no key of its own (a character an input method committed, or none) cannot be
-/// matched to a press, and is kept.
+/// matched to a press, and is kept. So is an Alt coming up with the character composed on the
+/// numeric keypad, whether or not its press was seen: the character is on that record alone, and
+/// dropping it would lose text the person typed.
 fn drop_unseen_releases(
     keys: Vec<kr_term::win32::KeyRecord>,
     down: &mut Vec<(u16, u16, bool)>,
@@ -443,19 +445,25 @@ fn drop_unseen_releases(
                 }
                 return true;
             }
-            place.map(|at| down.remove(at)).is_some()
+            let seen = place.map(|at| down.remove(at)).is_some();
+            seen || composed_with_alt(key)
         })
         .collect()
 }
 
+/// Whether a record is an Alt coming up with the character composed on the numeric keypad, which the
+/// console reports on the Alt's release and on no other record.
+const fn composed_with_alt(key: &kr_term::win32::KeyRecord) -> bool {
+    !key.key_down && key.virtual_key == VK_MENU && key.unicode != 0
+}
+
 /// Whether a run of key records holds a key the person pressed: one going down that is not a
-/// modifier or a lock, or an Alt coming up with the character composed on the numeric keypad, which
-/// the console reports on the Alt's release. Any other release, a modifier on its own and a lock key
-/// are not typing.
+/// modifier or a lock, or an Alt coming up with the character composed on the numeric keypad. Any
+/// other release, a modifier on its own and a lock key are not typing.
 fn presses(keys: &[kr_term::win32::KeyRecord]) -> bool {
     keys.iter().any(|key| {
         if !key.key_down {
-            return key.virtual_key == VK_MENU && key.unicode != 0;
+            return composed_with_alt(key);
         }
         !matches!(
             key.virtual_key,
@@ -4178,6 +4186,44 @@ mod tests {
             drop_unseen_releases(vec![a_up, a_down], &mut down),
             vec![a_down]
         );
+    }
+
+    /// The character composed on the numeric keypad is on the record of the Alt coming up, and is
+    /// the person's text however the Alt's going down was missed: the attachment began to read the
+    /// console after it, or the Alt went down in a read it did not take. The record is kept, so that
+    /// the character reaches the session and a refusal counts it, where the release of any other
+    /// key this attachment did not see go down is not sent.
+    #[test]
+    fn an_alt_coming_up_with_a_composed_character_is_sent_though_its_press_was_not_seen() {
+        use kr_term::win32::KeyRecord;
+
+        let alt = |key_down: bool, unicode: u16| KeyRecord {
+            virtual_key: super::VK_MENU,
+            scan_code: 0x38,
+            unicode,
+            key_down,
+            control_keys: 0,
+            repeat: 1,
+        };
+        let mut down = Vec::new();
+
+        // The press was never seen: the character is kept.
+        let composed = alt(false, 0x00e9);
+        assert_eq!(
+            drop_unseen_releases(vec![composed], &mut down),
+            vec![composed]
+        );
+        assert!(down.is_empty(), "a release leaves nothing down");
+        assert!(presses(&[composed]), "and a refusal counts it");
+        // An Alt coming up with no character is still not sent.
+        assert!(drop_unseen_releases(vec![alt(false, 0)], &mut down).is_empty());
+        // The press was seen: the character is kept and the Alt is no longer down.
+        let pressed = alt(true, 0);
+        assert_eq!(
+            drop_unseen_releases(vec![pressed, composed], &mut down),
+            vec![pressed, composed]
+        );
+        assert!(down.is_empty(), "the Alt came up");
     }
 
     /// Two keys can report one virtual key: the left and right Shift, and the left and right Ctrl
