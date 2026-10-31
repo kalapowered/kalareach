@@ -1043,7 +1043,10 @@ fn read_console(
 /// The key and modifiers the console spells a NUL with, as `VkKeyScanW(0)` names them.
 ///
 /// The console keeps a key going down that has no character in its queue and a read of its text
-/// passes over it and waits, except for this one: it is what Ctrl+Space and Ctrl+@ come out as.
+/// passes over it and waits, except for this one: it is what Ctrl+Space and Ctrl+@ come out as. The
+/// layout asked is this command's, which the console's may not be, and a console may store the key
+/// with the modifiers the key has and not the ones the layout names, so this is one of the ways a
+/// NUL is recognised and not the only one (see [`key_can_make_text`]).
 #[cfg(any(not(unix), test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NulKey {
@@ -1070,37 +1073,57 @@ impl NulKey {
             alt: high & 4 != 0,
         })
     }
+
+    /// Whether a record for this key has any of the modifiers the layout names for it, or the
+    /// layout names none.
+    const fn has_a_modifier_in(self, control_keys: u32) -> bool {
+        use kr_term::win32::control_keys::{
+            LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED,
+            SHIFT_PRESSED,
+        };
+
+        (!self.shift && !self.control && !self.alt)
+            || (self.shift && control_keys & SHIFT_PRESSED != 0)
+            || (self.control && control_keys & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0)
+            || (self.alt && control_keys & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0)
+    }
 }
 
 /// Whether a key record can make text in a console that spells its keys itself, which is whether a
 /// read of that text would return for it and not pass over it and wait.
 ///
-/// A key going down that has a character does. One that has none does only if it is the key a NUL
-/// comes out as, with its modifiers; Shift, Ctrl, Alt, the Windows key, the locks, the Apps key, a
-/// media key and a dead key are all kept as records the read passes over. A key coming up does not,
-/// except an Alt coming up with the character that was composed on the numeric keypad.
+/// A key going down that has a character does. One that has none does only if it is a key a NUL
+/// comes out as; Shift, Ctrl, Alt, the Windows key, the locks, the Apps key, a media key and a dead
+/// key are all kept as records the read passes over. A key coming up does not, except an Alt coming
+/// up with the character that was composed on the numeric keypad.
+///
+/// The rule for a NUL leans to text, because a record wrongly taken for text only makes one read
+/// wait for the next key, and one wrongly taken for none is a key the person typed, taken off the
+/// queue and lost. It was found on one console build and one layout, and the layout asked is this
+/// command's and not the console's. So a record is a NUL's when it is the key this command's layout
+/// names with any of the modifiers it names, and when it is the space bar or the '2' key with Ctrl,
+/// whatever the layout names or fails to name.
 #[cfg(any(not(unix), test))]
 #[must_use]
 pub(crate) fn key_can_make_text(key: &kr_term::win32::KeyRecord, nul: Option<NulKey>) -> bool {
-    use kr_term::win32::control_keys::{
-        LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
-    };
+    use kr_term::win32::control_keys::{LEFT_CTRL_PRESSED, RIGHT_CTRL_PRESSED};
 
     /// The Alt key's virtual key.
     const MENU: u16 = 0x12;
+    /// The space bar's virtual key.
+    const SPACE: u16 = 0x20;
+    /// The '2' key's virtual key, which Ctrl+@ is.
+    const TWO: u16 = 0x32;
     if !key.key_down {
         return key.virtual_key == MENU && key.unicode != 0;
     }
     if key.unicode != 0 {
         return true;
     }
-    nul.is_some_and(|nul| {
-        let held = key.control_keys;
-        key.virtual_key == nul.virtual_key
-            && (!nul.shift || held & SHIFT_PRESSED != 0)
-            && (!nul.control || held & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0)
-            && (!nul.alt || held & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0)
-    })
+    let held = key.control_keys;
+    let control = held & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0;
+    (control && matches!(key.virtual_key, SPACE | TWO))
+        || nul.is_some_and(|nul| key.virtual_key == nul.virtual_key && nul.has_a_modifier_in(held))
 }
 
 /// The UTF-8 of the UTF-16 units a console spelled, with a high surrogate that ended the read kept
@@ -2234,6 +2257,81 @@ mod reader {
         );
     }
 
+    /// The record the console stores for a NUL, as a key going down with no character.
+    fn stored(virtual_key: u16, control_keys: u32) -> KeyRecord {
+        KeyRecord {
+            control_keys,
+            ..key(virtual_key, 0, true)
+        }
+    }
+
+    const CONTROL: u32 = 0x08;
+    const RIGHT_CONTROL: u32 = 0x04;
+    const SHIFT: u32 = 0x10;
+
+    /// A Ctrl+Space the console stores by a layout other than the one this command asked is still
+    /// text: a read of the console's text would return for it, and a key taken off the queue as if it
+    /// made none is a key the person typed and lost. A false "text" costs a read that waits for the
+    /// next key.
+    #[test]
+    fn a_nul_key_the_layouts_disagree_on_is_text() {
+        // This command's layout names the '2' key with Ctrl and Shift, as a US layout does. A console
+        // that stores the key with the modifiers Ctrl+Space really has holds one of the two, or the
+        // other.
+        let named = NulKey::named_by(0x0332);
+        assert!(
+            key_can_make_text(&stored(0x32, CONTROL), named),
+            "Ctrl only"
+        );
+        assert!(key_can_make_text(&stored(0x32, SHIFT), named), "Shift only");
+        assert!(
+            !key_can_make_text(&stored(0x32, 0), named),
+            "the same key with none of them"
+        );
+
+        // This command's layout names another key altogether, and the console's own is the '2' key
+        // or the space bar, with Ctrl.
+        let other = NulKey::named_by(0x0651);
+        for (virtual_key, name) in [(0x32, "the '2' key"), (0x20, "the space bar")] {
+            assert!(
+                key_can_make_text(&stored(virtual_key, CONTROL | SHIFT), other),
+                "{name} with Ctrl, on another layout"
+            );
+        }
+        assert!(
+            !key_can_make_text(&stored(0x41, CONTROL | SHIFT), other),
+            "another key with Ctrl, and no character, is not a NUL"
+        );
+    }
+
+    /// Where this command's layout names no key for a NUL, the space bar and the '2' key with Ctrl
+    /// are still text.
+    #[test]
+    fn a_nul_key_this_layout_lacks_is_text() {
+        for (virtual_key, name) in [(0x32, "the '2' key"), (0x20, "the space bar")] {
+            assert!(
+                key_can_make_text(&stored(virtual_key, CONTROL | SHIFT), None),
+                "{name} with Ctrl and Shift"
+            );
+            assert!(
+                key_can_make_text(&stored(virtual_key, CONTROL), None),
+                "{name} with Ctrl"
+            );
+            assert!(
+                key_can_make_text(&stored(virtual_key, RIGHT_CONTROL), None),
+                "{name} with the right Ctrl"
+            );
+            assert!(
+                !key_can_make_text(&stored(virtual_key, SHIFT), None),
+                "{name} with no Ctrl"
+            );
+        }
+        assert!(
+            !key_can_make_text(&stored(0x41, CONTROL), None),
+            "another key with Ctrl, and no character, is not a NUL"
+        );
+    }
+
     /// A key going down with no character makes text only if it is the key a NUL comes out as, and a
     /// key coming up makes none unless it is an Alt coming up with a composed character.
     #[test]
@@ -2256,10 +2354,6 @@ mod reader {
                 nul
             ),
             "the same key without its modifiers"
-        );
-        assert!(
-            !key_can_make_text(&stored, None),
-            "a layout with no NUL key"
         );
         // Keys the console keeps as records that a read of its text passes over.
         for none in [
