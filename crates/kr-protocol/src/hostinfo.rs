@@ -6735,7 +6735,10 @@ pub mod export {
         field("DesktopContext", "login_generation", ContentClass::Number),
         field("DesktopContext", "generation_source", ContentClass::Term),
         field("DesktopContext", "os_user", ContentClass::Name),
-        field("DesktopContext", "uid", ContentClass::Number),
+        // The number of the account the desktop belongs to. It names the account on a platform
+        // that numbers its users, and the type holds a number rather than a shape, so the export
+        // carries none of it, as it carries none of a boot identity's value.
+        field("DesktopContext", "uid", ContentClass::Name),
         field("DesktopContext", "boot_identity", ContentClass::Structure),
         field("BootIdentity", "source", ContentClass::Term),
         // The bytes the kernel handed this host for the boot it is in. Which facility they came
@@ -7711,7 +7714,9 @@ pub mod export {
     /// all names something outside this build supplied, so each leaves as its class and its
     /// length. The derived identity is a typed identifier with nowhere to put such a record, so a
     /// present one leaves as a fixed marker: whether there is a desktop is not a secret, and what
-    /// it is called is. The context this host keeps for its own comparisons is untouched.
+    /// it is called is. The number of the account is a number with nowhere to put such a record
+    /// either, and it leaves as none. The context this host keeps for its own comparisons is
+    /// untouched.
     #[must_use]
     pub fn desktop_context(
         context: crate::desktop::DesktopContext,
@@ -7730,6 +7735,7 @@ pub mod export {
                     .as_ref()
                     .map(|_| withheld_identity()),
             ),
+            uid: crate::scalars::Nullable::null(),
             boot_identity: boot_identity(&context.boot_identity),
             ..context
         }
@@ -7792,7 +7798,8 @@ pub mod export {
     /// the platform session and the boot, so none of it may leave. Dropping the field says
     /// something different and untrue: a reader takes an absent identity for a host with no
     /// graphical login at all. This says the identity is withheld and the desktop is there.
-    fn withheld_identity() -> crate::ids::DesktopSessionId {
+    #[must_use]
+    pub fn withheld_identity() -> crate::ids::DesktopSessionId {
         crate::ids::DesktopSessionId::new("[name withheld]")
             .expect("the withheld marker is a valid identifier")
     }
@@ -9257,6 +9264,23 @@ mod tests {
             exported.platform_session.0.as_deref(),
             Some("[name withheld, 7 bytes]")
         );
+    }
+
+    /// KR-REQ-26.44: the number of the account a desktop belongs to is not exported.
+    #[test]
+    fn the_number_of_an_account_is_not_exported() {
+        let context = crate::desktop::DesktopContext {
+            uid: Nullable::some(crate::scalars::U64::new(501)),
+            ..a_desktop()
+        };
+        let exported = export::desktop_context(context.clone());
+        assert_eq!(exported.uid, Nullable::null());
+        // The rest of the context leaves as it did, and the context this host keeps is untouched.
+        assert_eq!(
+            exported.os_user,
+            export::desktop_context(a_desktop()).os_user
+        );
+        assert_eq!(context.uid, Nullable::some(crate::scalars::U64::new(501)));
     }
 
     /// KR-REQ-26.13, KR-REQ-26.44: the report a host shows its owner names the paths; the one that
