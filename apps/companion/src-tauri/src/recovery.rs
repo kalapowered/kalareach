@@ -79,7 +79,7 @@ pub const SEED_SCOPE: &str = "owner";
 /// The directory under the application's data directory that recovery keeps its records in.
 pub const DIRECTORY: &str = "recovery";
 
-/// The record of where this computer's bundle is, in [`DIRECTORY`].
+/// The record of the service named for this computer's bundle and its locator, in [`DIRECTORY`].
 const RECORD: &str = "recovery.json";
 
 /// Whose bundle the record is: written beside the record when it is made, so that deleting an
@@ -267,7 +267,8 @@ impl From<HostCover> for HostCoverView {
     }
 }
 
-/// Where this computer's bundle is, and whether the first write is known to have landed.
+/// The service named for this computer's bundle and its locator, and whether the first write is
+/// known to have landed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
@@ -294,7 +295,7 @@ impl Record {
     fn origin(&self) -> Result<GatewayOrigin> {
         GatewayOrigin::new(self.service_origin.as_str()).map_err(|error| {
             CommandError::local_failure(format!(
-                "the service this computer's recovery bundle is kept at is not one it can reach: \
+                "the service named for this computer's recovery bundle is not one it can reach: \
                  {error}"
             ))
         })
