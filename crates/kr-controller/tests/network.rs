@@ -1559,7 +1559,9 @@ async fn a_host_on_every_interface_hints_the_addresses_it_found_there() {
 ///
 /// The device has read everything the session produced before it is revoked. Were a frame still on
 /// its way, the relay's own authority check would end the connection when that frame reached it,
-/// and the wait could not tell that apart from the revocation's fence.
+/// and the wait could not tell that apart from the revocation's fence. The case shows that the
+/// connection ends with no request from the device, and not how soon: its waits are bounded by
+/// the suite's patience.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_device_is_fenced_before_it_is_served_again() {
