@@ -6512,6 +6512,65 @@ async fn a_repeat_answered_from_the_recorded_setup_is_refused_when_a_fence_lands
     ));
 }
 
+/// KR-REQ-09.09: a repeat of a call that finished is answered from the setup it recorded only to a
+/// caller whose registration stands. The authority this host withdraws after the repeat was admitted
+/// and before it is answered takes the registration with it and leaves no fence owed, so what stops
+/// the answer is the registration and not the fence. The repeat waits behind a call of another kit,
+/// which the withdrawal ends; the control is the same repeat made again on a connection of the
+/// authority now in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_answered_from_the_recorded_setup_is_refused_when_its_registration_is_withdrawn_before_it_is_answered()
+ {
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+
+    // A replacement holds the service's turn at its bundle write; the repeat is admitted behind it.
+    let replacement = rig.prepared_setup(archive_two(), true);
+    web.fail(SYNC, 1, Moment::Slow);
+    let holding = rig.enable_outcome_in_the_background(&replacement.params);
+    within(
+        "the replacement's bundle write",
+        web.requests_reach(SYNC, 2),
+    )
+    .await;
+    let repeat = rig.enable_outcome_in_the_background(&made.params);
+    within("both calls are told", async {
+        loop {
+            if let BackupSetupState::InProgress { kit_fingerprints } =
+                rig.backup_status().await.setup
+                && kit_fingerprints.len() == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    rig.controller
+        .revoke_authority()
+        .await
+        .expect("the authority is withdrawn");
+    web.release_held();
+    for call in [holding, repeat] {
+        let refusal = call
+            .await
+            .expect("the call ends")
+            .expect_err("a call whose registration is gone is refused");
+        assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+        assert!(refusal.message.contains("withdrawn"), "{}", refusal.message);
+    }
+
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+}
+
 /// KR-REQ-09.09: a repeat of a call that finished is answered from the setup it recorded when its
 /// deadline has passed, as a receipt outlives the deadline it was accepted under. The repeat waits
 /// behind a call of another kit, and the deadline passes while it waits: the other call is refused
