@@ -568,7 +568,7 @@ fn another_recipient() -> kr_protocol::scalars::StoredEnvelopeKey {
     *StoredEnvelopeKeyPair::generate().expect("a key").public()
 }
 
-/// How many writes of the bundle reached the service, whether or not it acted on them.
+/// How many writes of the bundle were sent to the service, whether or not it saw or acted on them.
 fn writes_sent(computer: &Computer) -> usize {
     writes_at(&computer.served)
 }
@@ -1965,9 +1965,9 @@ async fn a_record_is_not_used_at_the_service_the_account_signed_in_to_in_its_pla
 
 /// KR-REQ-17.14: a record is read and covered at the service it names when only the setting
 /// changes. With the account still signed in at the record's service and the setting naming
-/// another, the page is shown nothing wrong, the archives are listed and the offline copy is read
-/// from the record's service, the host is covered through it, and the service the setting names is
-/// sent nothing.
+/// another, the page is shown nothing wrong, turning recovery on again changes nothing, the
+/// archives are listed and the offline copy is read from the record's service, the host is covered
+/// through it, and the service the setting names is sent nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_is_read_and_covered_at_its_own_service_when_the_setting_names_another() {
     let computer = Computer::new().await;
@@ -1985,6 +1985,15 @@ async fn a_record_is_read_and_covered_at_its_own_service_when_the_setting_names_
     assert_eq!(view["state"], "on", "{view}");
     assert_eq!(view["kept_at"], host_of(computer.served.origin()), "{view}");
     assert_eq!(view["blocker"], Value::Null, "{view}");
+
+    // Going on with a record that is kept changes nothing and sends nothing.
+    let before = computer.served.web().arrived().len();
+    let again = page
+        .call("recovery_turn_on", json!({}))
+        .expect("turning recovery on again is not refused");
+    assert_eq!(again["state"], "on", "{again}");
+    assert_eq!(again["kept_at"], view["kept_at"], "{again}");
+    assert_eq!(computer.served.web().arrived().len(), before);
 
     let before = computer.served.web().arrived().len();
     assert_eq!(
@@ -2103,7 +2112,11 @@ async fn recovery_goes_on_with_an_unkept_record_at_its_own_service_when_the_sett
     assert_eq!(on["state"], "on", "{on}");
     assert_eq!(writes_at(&fork_service), written + 1, "one write was sent");
     let arrived = fork_service.web().arrived();
-    let write = arrived.last().expect("the write");
+    let write = arrived
+        .iter()
+        .rev()
+        .find(|request| request.body.get("exchange").is_some())
+        .expect("the write");
     assert_eq!(write.body["exchange"]["kind"], "recovery_bundle");
     assert_eq!(write.token.as_deref(), Some(TOKEN));
     let asked = recording.asked.lock().expect("the record").clone();
@@ -2164,26 +2177,41 @@ async fn a_lost_write_is_settled_and_the_host_covered_at_the_records_service_whe
     let ours = computer.served.origin().to_owned();
     let asks = || recording.asked.lock().expect("the record").clone();
 
-    fork_service.web().fail(SYNC_PATH, 1, Moment::After);
+    fork_service
+        .web()
+        .fail_with_member(SYNC_PATH, "exchange", 1, Moment::After);
     let lost = page
         .call("recovery_turn_on", json!({}))
         .expect_err("the write is not answered");
     assert_eq!(lost["code"], "OUTCOME_UNKNOWN");
     assert_eq!(page.view()["state"], "unsettled");
 
-    let before = asks().len();
     let settled = page
         .call("recovery_settle", json!({}))
         .expect("the lost write is settled");
     assert_eq!(settled["state"], "on", "{settled}");
-    assert!(
-        asks().len() > before,
-        "settling asked the clients it was given"
-    );
 
-    let before = asks().len();
+    // The record is kept now. A write of the cover whose answer is lost is settled the same way,
+    // and the host is not asked meanwhile.
     let host = Host::new(&computer, computer.served.origin()).reading_bundles_at(&fork_service);
     host.sets_up();
+    fork_service
+        .web()
+        .fail_with_member(SYNC_PATH, "exchange", 1, Moment::After);
+    let unknown = page
+        .recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect_err("the write is not answered");
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
+    assert!(host.setups_sent().is_empty(), "the host is not asked");
+    assert_eq!(page.view()["state"], "unsettled");
+    let settled = page
+        .call("recovery_settle", json!({}))
+        .expect("the lost write is settled");
+    assert_eq!(settled["state"], "on", "{settled}");
+
+    let before = asks().len();
     let covered = page
         .recovery
         .cover_host(&page.account, &host, false)
