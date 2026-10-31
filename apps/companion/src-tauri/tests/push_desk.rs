@@ -1019,10 +1019,10 @@ impl PushService for ForkPush {
 /// KR-REQ-17.14: the push desk reaches the gateway through the client its factory makes. A fork's
 /// own client in that place receives the registration calls and, when a choice of previews is told
 /// to the host after the registration, the issue that follows, and the host is handed the
-/// credential that client's issue returned; no other client is made for either. The build's gateway
-/// is a stand-in on a loopback port, which a client made outside the factory would reach and which
-/// receives nothing here. The set the Account sheet is reported over holds a client the same
-/// factory makes, and availability reports it as configured.
+/// credential that client's issue returned; no request leaves outside the factory's client. The
+/// build's gateway is a stand-in on a loopback port, which a client made outside the factory would
+/// reach and which receives nothing here. The set the Account sheet is reported over holds a
+/// client the same factory makes, and availability reports it as configured.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_push_desk_talks_to_the_gateway_client_it_was_given() {
     let owner = DeviceKeys::generate().expect("keys");
