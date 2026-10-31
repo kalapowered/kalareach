@@ -346,32 +346,37 @@ the console keeps that make none (a key coming up, a modifier, the Apps key) by 
 and virtual key. A key going down with no character counts as text when it is the key the keyboard
 layout names for a NUL, with any of the modifiers the layout names, and when it is the space bar or
 the 2 key with Ctrl, whatever the layout names or fails to name. The rule leans to text on purpose.
-A record wrongly taken for text only makes one read wait for the next key, and a record wrongly
-taken for none is a key the person typed, lost. The rule was run on Windows build 26100 with a US
-layout only, and no older build was run. The layout it asks is the command's own, which the
-console's may not match. The attachment keeps its input lease and invents no spelling. The command
-stops its reader before the terminal is the person's again. The reader looks for the stop before
-each read and each send, so once it has seen the stop it reads nothing from the console and sends
-nothing on. If it has not ended after a second, the command says so, and that the next key typed may
-be lost, because the reader may hold keys the command cannot count. After the terminal is the
-person's again, the command says once that its keys went as the console spells them, with the
-console's own modifier detail and without key releases. Keys typed just before the session refused
-them are lost, and the command says so only when a typed key was lost: a modifier on its own, a key
-coming up and a lock key are not typed keys, but an Alt coming up with a character composed on the
-numeric keypad is, since the console reports that character on the Alt's release. What is lost is
-the batch the session refused, the writes already sent as records behind it, whose answers the
-command ignores, the records it had already read, which it drops and does not turn into bytes, and
-the half of a character the reader was holding. One loss is not counted: a key with no character
-that was still in the console's own queue when the command changed the mode. The console reads that
-queue as text from then on and passes such a key over. A console that will not spell its keys gives
-the lease back and goes on watching, and the command says that and says that every key typed since
-was not sent. The scroll-back keys above are taken from the records of Shift and Page Up or Page
-Down, key by key: the key going down and the same key coming up are the window's. The release of a
-key this attachment did not see go down, the Return that started the command among them, is not
-sent, and every other record is the session's. A key is told by its virtual key, its scan code and
-whether it is an enhanced key, so the left and right Shift are two keys and each one's release is
-sent. The command does not ask the console for mouse or window-size records, so the console keeps
-the mouse for selecting text.
+A record wrongly taken for text makes one read wait for the next key, and the stop then cancels that
+read, which the command says; a record wrongly taken for none is a key the person typed, lost. The
+rule was run on Windows build 26100 with a US layout only, and no older build was run. The layout it
+asks is the command's own, which the console's may not match. The attachment keeps its input lease
+and invents no spelling. The command stops its reader before the terminal is the person's again. The
+reader looks for the stop before each read of the console, before it asks the console to spell its
+keys and before each send, and a reader that has seen the stop does none of them. One that is
+already inside one of those calls finishes it. If the reader has not ended after a second, the
+command says so: the reader may still take the next key typed, the console's input mode may still
+change, and the keys the reader had taken are not counted. If the command had to cancel a read of
+the console to end the reader, it says that too, since the console hands the next key typed to the
+read that was cancelled. After the terminal is the person's again, the command says once that its
+keys went as the console spells them, with the console's own modifier detail and without key
+releases. Keys typed just before the session refused them are lost, and the command says so only
+when a typed key was lost: a modifier on its own, a key coming up and a lock key are not typed keys,
+but an Alt coming up with a character composed on the numeric keypad is, since the console reports
+that character on the Alt's release. What is lost is the batch the session refused, the writes
+already sent as records behind it, whose answers the command ignores, the records it had already
+read, which it drops and does not turn into bytes, and the half of a character the reader was
+holding. Some losses are not counted. One is a key with no character that was still in the console's
+own queue when the command changed the mode, which the console passes over because it reads that
+queue as text from then on. Another is text the reader had read and not sent when it was stopped, or
+a half of a character of that text. A third is the next key typed when the stop cancelled a read,
+which the command says instead. A console that will not spell its keys gives the lease back and goes
+on watching, and the command says that and says that every key typed since was not sent. The
+scroll-back keys above are taken from the records of Shift and Page Up or Page Down, key by key: the
+key going down and the same key coming up are the window's. The release of a key this attachment did
+not see go down, the Return that started the command among them, is not sent, and every other record
+is the session's. A key is told by its virtual key, its scan code and whether it is an enhanced key,
+so the left and right Shift are two keys and each one's release is sent. The command does not ask
+the console for mouse or window-size records, so the console keeps the mouse for selecting text.
 
 Bracketed paste is the one piece of context the command keeps, and it keeps it by watching the
 bytes as they go past rather than by holding any of them: a start delimiter opens a paste and an
