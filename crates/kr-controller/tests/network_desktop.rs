@@ -90,6 +90,17 @@ async fn a_device_reads_the_desktop_capability_records_the_owner_reads() {
         evidence(&remotely),
         "the capability evidence is the same answer on both ingresses"
     );
+    // The number of the account the desktop belongs to is the owner's to read and not a device's:
+    // the owner is told it, and a device is told the platform gives none.
+    assert!(
+        locally.desktop.desktop.uid.0.is_some(),
+        "the owner is told which account the desktop belongs to"
+    );
+    assert_eq!(
+        remotely.desktop.desktop.uid,
+        kr_protocol::scalars::Nullable::null(),
+        "a device is not told the number of the account"
+    );
     // A binary identity where this machine has one. A headless host may have found none, and then
     // there is no path for either door to describe; the account name below is there on every host.
     // Whether there is one is not the device's to decide, so the two answers have to agree about

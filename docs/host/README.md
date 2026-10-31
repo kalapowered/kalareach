@@ -825,9 +825,11 @@ its members, so a type that is reachable only inside another one is covered and 
 one fails the build's own tests on the day it is added. A form the walk cannot account for is
 refused rather than passed over: a value of any shape, a map, whose keys are text nothing classes,
 and a keyword that holds a schema the walk does not follow. Nothing may be classed that no export
-reaches, which keeps the list a record of what leaves rather than a place entries accumulate. One value is reported by its kind alone: the boot identity is
+reaches, which keeps the list a record of what leaves rather than a place entries accumulate. Two values are reported by their kind alone: the boot identity is
 opaque bytes that identify one boot of one machine, so an export says which kernel facility this
-platform reads it from and carries none of the value.
+platform reads it from and carries none of the value; and the number of the account a desktop
+belongs to names that account on a platform that numbers its users, so an export of the desktop
+context carries none.
 
 ### What a paired device reads of this host
 

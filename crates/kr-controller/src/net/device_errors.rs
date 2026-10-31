@@ -23,9 +23,10 @@
 //! where this host's failures are written as plain text and not as an error are held to the same
 //! rule: a closure's list of what it left behind, and the members of the records in
 //! [`FAILURE_TEXTS`]. The places that hold a place on this host and no failure ([`HOST_PATHS`])
-//! are withheld as a path is, and the reason an agent instance's rich mutations wait is told by
-//! what it says of the wait ([`suspension_for_a_device`]), in a result and in the refusal of a
-//! rich mutation.
+//! are withheld as a path is, and the name of the desktop a session is bound to is told as the
+//! capability answers tell it ([`withheld_desktop_name`]). The reason an agent instance's rich
+//! mutations wait is told by what it says of the wait ([`suspension_for_a_device`]), in a result
+//! and in the refusal of a rich mutation.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -857,10 +858,32 @@ fn shown_member(map: &CanonicalMap, key: &str, child: &CanonicalValue) -> Option
     {
         return suspension_for_a_device(text).map(CanonicalValue::Text);
     }
+    if let CanonicalValue::Text(name) = child
+        && is_a_desktop_name(map, key)
+    {
+        return withheld_desktop_name(name).map(CanonicalValue::Text);
+    }
     if is_a_host_path(map, key) {
         return withheld_paths(child);
     }
     shown_value(child)
+}
+
+/// Whether the text under `key` in `map` is the name of the desktop a session is bound to: the
+/// `desktop_session_id` of a binding, which has the generation it was taken at beside it.
+fn is_a_desktop_name(map: &CanonicalMap, key: &str) -> bool {
+    key == "desktop_session_id" && map.get("login_generation").is_some()
+}
+
+/// What a device is told in place of the name of a desktop, or `None` when it is told it already.
+///
+/// The name spells out the kind of login, the account's name and number, the platform's session,
+/// the generation and the boot. The device is told what the capability answers tell it, a marker
+/// that says the session is bound to a desktop and not which one, so a session that is bound to
+/// none is still told apart from one that is.
+fn withheld_desktop_name(name: &str) -> Option<String> {
+    let marker = kr_protocol::hostinfo::export::withheld_identity().to_string();
+    (name != marker).then_some(marker)
 }
 
 /// Whether the text under `key` in `map` is why an agent instance's rich mutations wait: the
@@ -3490,5 +3513,81 @@ mod tests {
         // An attachment that did not fail has no failure to withhold.
         let sound = draft_attachment(None);
         assert_eq!(read_by_a_device(&sound), sound);
+    }
+
+    /// The name of the desktop a session is bound to, as this host derives it: the login kind, the
+    /// account's name and number, the platform session, the generation and the boot.
+    const A_DESKTOP_NAME: &str =
+        "macos_security_session:user=marguerite:uid=501:session=100019:generation=42:boot=5a17c309";
+
+    fn bound_session() -> kr_protocol::session::SessionSummary {
+        let mut summary = session_summary();
+        summary.worker_profile = kr_protocol::identity::WorkerProfile::DesktopBound;
+        summary.desktop = kr_protocol::identity::DesktopBinding {
+            desktop_session_id: Nullable::some(
+                kr_protocol::ids::DesktopSessionId::new(A_DESKTOP_NAME).expect("a desktop name"),
+            ),
+            login_generation: Nullable::some(U64::new(42)),
+        };
+        summary
+    }
+
+    #[test]
+    fn the_desktop_a_session_is_bound_to_is_not_named_to_a_device() {
+        let owner = bound_session();
+        let read = kr_protocol::session::SessionReadResult {
+            session: owner.clone(),
+            endpoint: Nullable::null(),
+            launch_profile: Nullable::null(),
+            last_command_block: Nullable::null(),
+            outstanding_launches: Nullable::null(),
+            metrics: None,
+        };
+        let created = kr_protocol::session::SessionCreateResult {
+            session: owner.clone(),
+            endpoint: Nullable::null(),
+            deduplicated: false,
+            presentation_error: Nullable::null(),
+        };
+        let listed = kr_protocol::session::SessionListResult {
+            sessions: vec![owner.clone()],
+        };
+        for device in [
+            read_by_a_device(&read).session,
+            read_by_a_device(&created).session,
+            read_by_a_device(&listed).sessions.remove(0),
+        ] {
+            // The session is still bound to a desktop, which is not a secret; what the desktop is
+            // called is.
+            let told = device
+                .desktop
+                .desktop_session_id
+                .0
+                .as_ref()
+                .expect("the session is still bound to a desktop")
+                .to_string();
+            assert!(
+                !["marguerite", "501", "100019", "5a17c309"]
+                    .iter()
+                    .any(|name| told.contains(name)),
+                "{told}"
+            );
+            // The generation the binding was taken at is told as it is, and nothing else of the
+            // session changes.
+            assert_eq!(
+                device.desktop.login_generation,
+                owner.desktop.login_generation
+            );
+            assert_eq!(
+                kr_protocol::session::SessionSummary {
+                    desktop: owner.desktop.clone(),
+                    ..device
+                },
+                owner
+            );
+        }
+        // A session that is bound to none has none to withhold.
+        let free = session_summary();
+        assert_eq!(read_by_a_device(&free), free);
     }
 }
