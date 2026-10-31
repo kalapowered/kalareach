@@ -931,29 +931,6 @@ pub fn remove_units_through(
             return left;
         }
     };
-    let units: Vec<&str> = listed
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .collect();
-    if units.is_empty() {
-        return left;
-    }
-    let shown = match asked_again_until_answered(give_up_after, |bound| {
-        run_bounded_output_within(
-            manager()
-                .args(["show", "--property=Id,WorkingDirectory"])
-                .args(&units),
-            bound,
-        )
-    }) {
-        Ok(shown) => shown,
-        Err(error) => {
-            left.push(format!(
-                "the user manager's units could not be read: {error}"
-            ));
-            return left;
-        }
-    };
     // The tree as it was named and as the kernel resolves it, since a daemon may hand a unit
     // either spelling.
     let roots: Vec<std::path::PathBuf> = [
@@ -963,19 +940,31 @@ pub fn remove_units_through(
     .into_iter()
     .flatten()
     .collect();
-    for described in shown.split("\n\n") {
-        let property = |name: &str| {
-            described
-                .lines()
-                .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
-        };
-        let (Some(unit), Some(directory)) = (property("Id"), property("WorkingDirectory")) else {
+    // Where each unit runs is read from the file the manager keeps for it, and not asked of the
+    // manager: `systemctl show` of many units has the manager build every property of each of them,
+    // which is about four milliseconds of its one thread for each unit it holds, and every test
+    // that ends asks it of every unit every test on the machine has started and not yet ended.
+    // That is the machine's whole user manager busy for half a second at each test's end, and
+    // while it is, a launch waits behind the questions.
+    let transient = std::path::Path::new(&runtime).join("systemd/transient");
+    for unit in listed
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+    {
+        let Some(directory) = std::fs::read_to_string(transient.join(unit))
+            .ok()
+            .and_then(|file| {
+                file.lines()
+                    .find_map(|line| line.strip_prefix("WorkingDirectory="))
+                    .map(str::to_owned)
+            })
+        else {
             continue;
         };
         if directory.is_empty()
             || !roots
                 .iter()
-                .any(|root| std::path::Path::new(directory).starts_with(root))
+                .any(|root| std::path::Path::new(&directory).starts_with(root))
         {
             continue;
         }
