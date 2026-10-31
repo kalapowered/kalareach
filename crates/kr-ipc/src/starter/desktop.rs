@@ -14,10 +14,12 @@
 //! station, so the headless sessions of one logon share them. The station and the desktop are
 //! given the access list and integrity label of the starter's own, so the worker, which runs as
 //! the starter does, is admitted to them exactly as it would be to the starter's desktop. A
-//! station that exists already keeps what it has, because creating it again ignores the security
-//! asked for, so the starter reads the access list and label of each object it is about to use
-//! and refuses to start a child on one that admits more than its own does, or that it cannot show
-//! to admit no more. An object whose list is the starter's own with allowing entries left out and
+//! station that exists already keeps the access list it was made with, because creating it again
+//! ignores the security asked for. Where the starter's own object has an integrity label, the
+//! starter applies it to the object it uses and reads the label back, whether or not the change
+//! was allowed. It then reads the access list and label of each object it is about to use and
+//! refuses to start a child on one that admits more than its own does, or that it cannot show to
+//! admit no more. An object whose list is the starter's own with allowing entries left out and
 //! denying entries put in is used: a station made before an entry was added to the interactive one
 //! (a "Run as different user" may add one) has not that entry, and the worker, which runs as the
 //! starter does, is admitted to it all the same. [`super::security`] says exactly what is used and
@@ -369,8 +371,10 @@ impl Source {
 
     /// Gives `target` this object's integrity label, if it has one and the starter may set it.
     ///
-    /// A refusal is not looked at here: a station that exists already is not the starter's to
-    /// relabel. What decides is [`Self::require_no_more_on`], which reads the label back.
+    /// A refusal of the change is not looked at here: an object that exists already can withhold
+    /// the right to change its label, with a denying entry that takes it from everyone. What
+    /// decides is [`Self::require_no_more_on`], which reads the label back whether or not the
+    /// change was allowed.
     fn label_onto(&self, target: HANDLE) {
         if self.label.is_null() {
             return;

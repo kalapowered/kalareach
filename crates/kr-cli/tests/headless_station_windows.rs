@@ -2,16 +2,16 @@
 //! daemon and a real worker.
 //!
 //! KR-REQ-03.24: a headless worker is started on a desktop of its own, on the window station of its
-//! logon. A station that exists already keeps the security it was made with, so the starter reads
-//! the station back and refuses to start a worker on one that admits more than the starter's own
-//! station does, and starts it on one that admits less: the interactive station gains entries
-//! while a logon lasts (a "Run as different user" may add one for the account it starts a program
-//! as), and a station made before that has not the new entry. A station that differs in a way the
-//! comparison does not weigh, such as one entry with another mask, is refused too, and the refusal
-//! does not say that it admits more.
+//! logon. A station that exists already keeps the access list it was made with, and the starter
+//! raises its integrity label to its own where it may, so it reads the station back and refuses to
+//! start a worker on one that admits more than the starter's own station does, and starts it on one
+//! that admits less: the interactive station gains entries while a logon lasts (a "Run as different
+//! user" may add one for the account it starts a program as), and a station made before that has not
+//! the new entry. A station that differs in a way the comparison does not weigh, such as one entry
+//! with another mask, is refused too, and the refusal does not say that it admits more.
 //!
 //! The desktop is checked the same way. A desktop that exists already on the station keeps the
-//! security it was made with, so a desktop that admits more than the starter's own is refused. A
+//! access list it was made with, so a desktop that admits more than the starter's own is refused. A
 //! worker's desktop is named for its reservation, so the case takes a launch of a reservation of
 //! its own, holds a desktop of that name, and hands the launch to the task's starter.
 //!
@@ -213,9 +213,9 @@ async fn a_desktop_that_exists_already_and_admits_more_than_the_starters_own_ref
     };
     assert!(
         detail.contains("check the desktop's security")
-            && (detail.contains("admits more")
-                || detail.contains("is not one the starter accepts")),
-        "the refusal does not say that the desktop's security refused it: {detail}"
+            && detail.contains("access list")
+            && detail.contains("admits more"),
+        "the refusal does not say that the desktop's access list admits more: {detail}"
     );
 }
 

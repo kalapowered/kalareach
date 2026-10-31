@@ -66,7 +66,8 @@ impl HeldStation {
     /// # Errors
     ///
     /// Returns what went wrong, including that the logon already had a station, whose access list
-    /// or label is then not the one asked for.
+    /// is then not the one asked for. The label is read back for the case to check, and is not
+    /// compared here.
     pub fn make_labelled(change: impl FnOnce(&str) -> String, label: &str) -> Result<Self, String> {
         let interactive = Interactive::open(READ_CONTROL)?;
         let own = access_list_text(interactive.station)?;
