@@ -20,13 +20,14 @@ use windows_sys::Win32::Security::Authorization::{
     SE_WINDOW_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR,
-    SECURITY_ATTRIBUTES,
+    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, LABEL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
 use windows_sys::Win32::System::StationsAndDesktops::{
-    CloseDesktop, CloseWindowStation, CreateWindowStationW, GetUserObjectInformationW, HDESK,
-    HWINSTA, OpenDesktopW, OpenWindowStationW, UOI_NAME,
+    CloseDesktop, CloseWindowStation, CreateDesktopW, CreateWindowStationW,
+    GetProcessWindowStation, GetUserObjectInformationW, HDESK, HWINSTA, OpenDesktopW,
+    OpenWindowStationW, SetProcessWindowStation, UOI_NAME,
 };
 use windows_sys::Win32::System::SystemServices::MAXIMUM_ALLOWED;
 
@@ -43,6 +44,9 @@ pub struct HeldStation {
     handle: HWINSTA,
     /// The station's access list as the system writes it, as it was read back after it was made.
     pub access_list: String,
+    /// The station's integrity label as the system writes it, as it was read back after it was
+    /// made, or empty when it has none.
+    pub label: String,
 }
 
 impl HeldStation {
@@ -53,10 +57,21 @@ impl HeldStation {
     /// Returns what went wrong, including that the logon already had a station, whose access list
     /// is then not the one asked for.
     pub fn make(change: impl FnOnce(&str) -> String) -> Result<Self, String> {
+        Self::make_labelled(change, "")
+    }
+
+    /// Makes the logon's station as [`Self::make`] does, with the integrity label `label` as the
+    /// system writes one (`S:(ML;;NW;;;LW)`), or none when it is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong, including that the logon already had a station, whose access list
+    /// or label is then not the one asked for.
+    pub fn make_labelled(change: impl FnOnce(&str) -> String, label: &str) -> Result<Self, String> {
         let interactive = Interactive::open(READ_CONTROL)?;
         let own = access_list_text(interactive.station)?;
         let wanted = change(&own);
-        let descriptor = DescriptorFromText::of(&wanted)?;
+        let descriptor = DescriptorFromText::of(&format!("{wanted}{label}"))?;
         let attributes = SECURITY_ATTRIBUTES {
             nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
             lpSecurityDescriptor: descriptor.descriptor,
@@ -76,6 +91,7 @@ impl HeldStation {
         let mut held = Self {
             handle,
             access_list: String::new(),
+            label: String::new(),
         };
         // MAXIMUM_ALLOWED does not always include the right to read the list, so it is read
         // through a handle opened for that.
@@ -89,6 +105,7 @@ impl HeldStation {
             ));
         }
         held.access_list = read_back;
+        held.label = label_text(reader.0)?;
         Ok(held)
     }
 }
@@ -97,6 +114,91 @@ impl Drop for HeldStation {
     fn drop(&mut self) {
         // SAFETY: the handle is this value's own, returned by the call that made it.
         unsafe { CloseWindowStation(self.handle) };
+    }
+}
+
+/// A desktop made by this test on a window station it holds, with an access list of its own, and
+/// held open until this is dropped.
+///
+/// A desktop lasts as long as any handle of it does, and a desktop that exists already keeps the
+/// security it was made with, so a starter that is asked for a desktop of this name meets this one.
+pub struct HeldDesktop {
+    handle: HDESK,
+    /// The desktop's access list as the system writes it, as it was read back after it was made.
+    pub access_list: String,
+}
+
+impl HeldDesktop {
+    /// Makes the desktop `name` on `station` with the interactive desktop's access list as
+    /// `change` alters it.
+    ///
+    /// This process uses `station` for the one call that makes the desktop there, and is put back
+    /// on the station it used before, so no other thread of it may use a window station meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong, including that the station already had a desktop of this name.
+    pub fn make(
+        station: &HeldStation,
+        name: &str,
+        change: impl FnOnce(&str) -> String,
+    ) -> Result<Self, String> {
+        let interactive = Interactive::open(READ_CONTROL)?;
+        let own = access_list_text(interactive.desktop)?;
+        let wanted = change(&own);
+        let descriptor = DescriptorFromText::of(&wanted)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+            lpSecurityDescriptor: descriptor.descriptor,
+            bInheritHandle: 0,
+        };
+        // SAFETY: the call has no preconditions and returns a handle the process owns.
+        let previous = unsafe { GetProcessWindowStation() };
+        // SAFETY: the station handle is open with the right to be used by this process.
+        if unsafe { SetProcessWindowStation(station.handle) } == 0 {
+            return Err(format!(
+                "the held station was not used: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: the name is terminated, the device and mode are absent, the attributes point at
+        // a descriptor that lives until the call returns, and the call returns a handle or null.
+        let handle = unsafe {
+            CreateDesktopW(
+                wide(name).as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                MAXIMUM_ALLOWED,
+                &raw const attributes,
+            )
+        };
+        let made = std::io::Error::last_os_error();
+        // SAFETY: `previous` is the station this process was using, which it keeps open.
+        unsafe { SetProcessWindowStation(previous) };
+        if handle.is_null() {
+            return Err(format!("the desktop {name} was not made: {made}"));
+        }
+        let mut held = Self {
+            handle,
+            access_list: String::new(),
+        };
+        let read_back = access_list_text(held.handle)?;
+        if read_back != normalised(&wanted)? {
+            return Err(format!(
+                "the station already had a desktop {name} with another access list: {read_back} \
+                 where {wanted} was asked for"
+            ));
+        }
+        held.access_list = read_back;
+        Ok(held)
+    }
+}
+
+impl Drop for HeldDesktop {
+    fn drop(&mut self) {
+        // SAFETY: the handle is this value's own, returned by the call that made it.
+        unsafe { CloseDesktop(self.handle) };
     }
 }
 
@@ -304,11 +406,37 @@ impl DescriptorFromText {
 /// The text of an object's access list, as the system writes it.
 fn access_list_text(object: HANDLE) -> Result<String, String> {
     let (_, descriptor) = dacl_of(object)?;
-    text_of(descriptor.0)
+    text_of(descriptor.0, DACL_SECURITY_INFORMATION)
 }
 
-/// The text of a descriptor's access list.
-fn text_of(descriptor: PSECURITY_DESCRIPTOR) -> Result<String, String> {
+/// The text of an object's integrity label, as the system writes it, or empty when it has none.
+fn label_text(object: HANDLE) -> Result<String, String> {
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: the object is open with the right to read its security, the other parts are
+    // absent, which the call permits, and the out parameter is live.
+    let status = unsafe {
+        GetSecurityInfo(
+            object,
+            SE_WINDOW_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(format!(
+            "the object's integrity label was not read: error {status}"
+        ));
+    }
+    let held = Local(descriptor);
+    text_of(held.0, LABEL_SECURITY_INFORMATION)
+}
+
+/// The text of one part of a descriptor, the access list or the integrity label.
+fn text_of(descriptor: PSECURITY_DESCRIPTOR, information: u32) -> Result<String, String> {
     let mut text: *mut u16 = std::ptr::null_mut();
     // SAFETY: the descriptor is a live one, the length is not asked for, and `text` is a live out
     // parameter.
@@ -316,14 +444,14 @@ fn text_of(descriptor: PSECURITY_DESCRIPTOR) -> Result<String, String> {
         ConvertSecurityDescriptorToStringSecurityDescriptorW(
             descriptor,
             SDDL_REVISION_1,
-            DACL_SECURITY_INFORMATION,
+            information,
             &raw mut text,
             std::ptr::null_mut(),
         )
     };
     if converted == 0 || text.is_null() {
         return Err(format!(
-            "the access list could not be written as text: {}",
+            "the security could not be written as text: {}",
             std::io::Error::last_os_error()
         ));
     }
@@ -342,7 +470,10 @@ fn text_of(descriptor: PSECURITY_DESCRIPTOR) -> Result<String, String> {
 /// The text of `text` after the system has read it as a descriptor and written it again, which is
 /// what a station made from it reads back as.
 fn normalised(text: &str) -> Result<String, String> {
-    text_of(DescriptorFromText::of(text)?.descriptor)
+    text_of(
+        DescriptorFromText::of(text)?.descriptor,
+        DACL_SECURITY_INFORMATION,
+    )
 }
 
 /// An object's access list, with the descriptor that holds it.
