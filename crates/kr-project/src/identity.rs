@@ -1280,6 +1280,8 @@ fn unlocated(error: &std::io::Error) -> ProjectError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use kr_protocol::error::ErrorCode;
 
     /// KR-REQ-14.05: the administrative handles name the objects whose identities were read, and
     /// go on naming them when the paths they were read from name something else.
@@ -1577,5 +1579,88 @@ mod tests {
                 .expect_err("the update did not come to an update that was made");
             assert_eq!(failure.code(), code, "{why}: {failure}");
         }
+    }
+
+    /// A directory made as a recorded tree, with the identity a record of it holds.
+    #[cfg(unix)]
+    fn recorded_tree_in(root: &Path) -> (EnvironmentId, PathBuf, RecordedIdentity) {
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([11; 16]));
+        let tree = root.join("tree");
+        std::fs::create_dir(&tree).expect("the tree");
+        let recorded = AuthorisedDirectory::open_root(environment_id, &tree)
+            .expect("the tree opens")
+            .recorded()
+            .expect("it reads its identity");
+        (environment_id, tree, recorded)
+    }
+
+    /// Nothing at a recorded tree's place is a source that changed: the tree was removed, or the
+    /// place is a link that leads nowhere. Both are what the open itself finds, so the answer does
+    /// not depend on what a look saw an instant before.
+    #[cfg(unix)]
+    #[test]
+    fn nothing_at_a_recorded_trees_place_is_a_source_that_changed() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let (environment_id, tree, recorded) = recorded_tree_in(root.path());
+
+        std::fs::remove_dir(&tree).expect("the tree is removed");
+        let removed = open_recorded_root(environment_id, &tree, recorded)
+            .expect_err("nothing is at the place");
+        assert_eq!(removed.code(), ErrorCode::SourceChanged, "{removed}");
+
+        std::os::unix::fs::symlink(root.path().join("nowhere"), &tree)
+            .expect("a link to nothing takes the place");
+        let dangling = open_recorded_root(environment_id, &tree, recorded)
+            .expect_err("a link that leads nowhere is nothing at the place");
+        assert_eq!(dangling.code(), ErrorCode::SourceChanged, "{dangling}");
+        assert!(
+            dangling
+                .to_string()
+                .contains("the object rather than the path"),
+            "and it says why: {dangling}"
+        );
+    }
+
+    /// Every other failure of the open is the caller's argument and keeps its answer: a parent that
+    /// is now a regular file, and a link that cannot be followed, are not trees that went missing.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_trees_place_that_cannot_be_opened_for_another_reason_is_a_bad_argument() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let (environment_id, _, recorded) = recorded_tree_in(root.path());
+
+        let parent = root.path().join("parent");
+        std::fs::write(&parent, "a file now").expect("the parent is a regular file");
+        let beneath_a_file = open_recorded_root(environment_id, &parent.join("tree"), recorded)
+            .expect_err("nothing can be below a file");
+        assert_eq!(
+            beneath_a_file.code(),
+            ErrorCode::InvalidArgument,
+            "{beneath_a_file}"
+        );
+
+        let (first, second) = (root.path().join("first"), root.path().join("second"));
+        std::os::unix::fs::symlink(&second, &first).expect("a link");
+        std::os::unix::fs::symlink(&first, &second).expect("and a link back");
+        let looping = open_recorded_root(environment_id, &first, recorded)
+            .expect_err("a link that leads to itself cannot be followed");
+        assert_eq!(looping.code(), ErrorCode::InvalidArgument, "{looping}");
+    }
+
+    /// A directory at the place opens, whatever it is: that it is not the recorded tree is decided
+    /// after, by its identity.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_at_a_recorded_trees_place_is_opened_for_its_identity_to_decide() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let (environment_id, tree, recorded) = recorded_tree_in(root.path());
+
+        let same = open_recorded_root(environment_id, &tree, recorded).expect("the tree opens");
+        assert!(same.check_recorded(recorded).is_ok());
+        std::fs::remove_dir(&tree).expect("the tree is removed");
+        std::fs::create_dir(&tree).expect("another directory takes the place");
+        let other = open_recorded_root(environment_id, &tree, recorded)
+            .expect("a directory at the place opens");
+        assert!(other.check_recorded(recorded).is_err());
     }
 }
