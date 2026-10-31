@@ -17,9 +17,9 @@
  * conditions: every key reached the composer in order and was timed, and the stream advanced on
  * the screen between the first key's event and the last key's timing. The only time limits are
  * Playwright's: 90 seconds for the case, which is raised from the default of 30 because a slower
- * engine on a hosted runner draws 4,000 nodes slowly, 60 seconds for the wait for that draw, which
- * the case's limit does not reach by itself, and the default 5 seconds for each other `expect`.
- * The readings are the
+ * engine on a hosted runner draws 4,000 nodes slowly, and 60 seconds for the wait for that draw,
+ * which the case's limit does not reach by itself; the other `expect`s read a value once and wait
+ * for nothing. The readings are the
  * median of the keys in frame periods of the page's own idle frames and against the same keys with
  * a short history and nothing streaming; each is printed with the engine, the host it was taken on
  * and a verdict against the reference bounds below, and attached to the run. The verdict is for a
@@ -155,8 +155,8 @@ async function startTiming(page: Page): Promise<void> {
             if (keys.pending === 0) keys.drawnAtLastTiming = keys.drawn()
           })
         )
-        // The first key of a run, read after its frames are asked for, so the key's own time is
-        // not delayed by it.
+        // The first key of a run. The read runs in this key's handler, so it is inside this key's
+        // own timed span: one key in 48, which does not move the median.
         if (keys.names.length === 1) keys.drawnAtFirstKey = keys.drawn()
       },
       true
@@ -167,8 +167,9 @@ async function startTiming(page: Page): Promise<void> {
 /**
  * Types the keys and returns the time of each, once the last has been timed, with how far the
  * stream had been drawn at the first key's event and at the moment the last key's timing was
- * taken. Both positions are read in the page at those moments, so the stream cannot have moved
- * between a timing and the reading of the position that goes with it.
+ * taken. Both positions are read in the page at those moments: the last is read in the callback
+ * that takes the last key's time, so the stream cannot have moved between that time and the
+ * position that goes with it.
  */
 async function typeKeys(page: Page): Promise<{ times: number[]; drawnBefore: number; drawnAfter: number }> {
   const composer = page.getByTestId('composer-input')
