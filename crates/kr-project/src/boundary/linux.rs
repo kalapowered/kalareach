@@ -120,8 +120,20 @@ use crate::error::{ProjectError, Result};
 pub const MECHANISM: &str = "Landlock rules attached to the directory handles this host opened, \
                              with a system-call filter for the sockets Landlock does not cover";
 
-/// This platform has a boundary an invocation runs inside.
-pub const NO_GIT: Option<&str> = None;
+/// Why a machine of an instruction set this host holds no system-call numbers for runs no Git.
+///
+/// The filter that refuses a process its sockets is written in the numbers of the calls it judges,
+/// and a filter written for the numbers of another machine would not mean what it says.
+const NO_SYSTEM_CALL_NUMBERS: &str = "this host does not hold the system-call numbers for this \
+                                      machine, so a Git invocation cannot be enclosed";
+
+/// This platform has a boundary an invocation runs inside, on a machine whose system-call numbers
+/// this host holds.
+pub const NO_GIT: Option<&str> = if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+    None
+} else {
+    Some(NO_SYSTEM_CALL_NUMBERS)
+};
 
 /// The interface version the filesystem confinement is built against.
 ///
@@ -129,8 +141,111 @@ pub const NO_GIT: Option<&str> = None;
 /// writable, so this is the floor rather than a preference.
 const FILESYSTEM_ABI: ABI = ABI::V3;
 
+/// [`FILESYSTEM_ABI`] as the number a kernel reports it as, and the Linux release that has it.
+const FILESYSTEM_VERSION: u32 = 3;
+const FILESYSTEM_RELEASE: &str = "6.2";
+
 /// The interface version at which Landlock can restrict which addresses a process reaches.
 const NETWORK_ABI: ABI = ABI::V4;
+
+/// [`NETWORK_ABI`] as the number a kernel reports it as, and the Linux release that has it.
+const NETWORK_VERSION: u32 = 4;
+const NETWORK_RELEASE: &str = "6.7";
+
+/// The flag that asks `landlock_create_ruleset` for the highest interface version the kernel has,
+/// in place of making a ruleset.
+const CREATE_RULESET_VERSION: u32 = 1;
+
+#[cfg(any(test, feature = "git-fixtures"))]
+thread_local! {
+    /// The interface version this thread's kernel reports instead of the real one, when a case
+    /// forces one.
+    static FORCED: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `run` with the kernel reporting Landlock interface `version` to this thread, for a case
+/// that shows what a kernel without the interface the boundary needs does.
+///
+/// Nothing in the kernel changes: it is the answer to the probe that is replaced, on this thread
+/// only, so cases on other threads see the real kernel.
+#[cfg(any(test, feature = "git-fixtures"))]
+pub fn with_kernel_interface<R>(version: u32, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u32>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCED.with(|forced| forced.set(self.0));
+        }
+    }
+
+    let _restore = Restore(FORCED.with(|forced| forced.replace(Some(version))));
+    run()
+}
+
+/// The Landlock interface version this kernel reports, or zero when it reports none: Landlock is
+/// not built into the kernel, is not enabled at boot, or is not permitted to this process.
+///
+/// A kernel's answer does not change while a process runs, so it is asked once.
+fn kernel_interface() -> u32 {
+    #[cfg(any(test, feature = "git-fixtures"))]
+    if let Some(forced) = FORCED.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static REPORTED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *REPORTED.get_or_init(|| {
+        // SAFETY: one system call that makes nothing. With this flag the kernel reports the
+        // highest interface version it has and reads neither of the other two arguments.
+        let reported = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<libc::c_void>(),
+                0_usize,
+                CREATE_RULESET_VERSION,
+            )
+        };
+        u32::try_from(reported).unwrap_or(0)
+    })
+}
+
+/// Returns why a kernel that reports Landlock interface version `found` cannot build the boundary
+/// an invocation runs inside, when it cannot, and what it has and what the boundary needs.
+///
+/// A remote operation needs the version that restricts addresses, a local one the version that
+/// mediates truncation.
+fn lacking(found: u32, remote: bool) -> Option<ProjectError> {
+    let (needed, release, what) = if remote {
+        (
+            NETWORK_VERSION,
+            NETWORK_RELEASE,
+            "a Git invocation that reaches a remote",
+        )
+    } else {
+        (FILESYSTEM_VERSION, FILESYSTEM_RELEASE, "a Git invocation")
+    };
+    if found >= needed {
+        return None;
+    }
+    let has = if found == 0 {
+        "this kernel has no Landlock interface (version 0: it is not built in, not enabled at \
+         boot, or not permitted to this process)"
+            .to_owned()
+    } else {
+        format!("this kernel's Landlock interface is version {found}")
+    };
+    Some(ProjectError::GitFailed {
+        detail: format!(
+            "{has}, and the boundary around {what} needs version {needed} (Linux {release}) or \
+             later; use a host whose kernel has it"
+        )
+        .into(),
+    })
+}
+
+/// Returns the refusal of a kernel that cannot build the boundary around any Git invocation, or
+/// nothing when it can. A remote operation needs more than this, which [`prepare`] asks.
+pub fn kernel_refusal() -> Option<ProjectError> {
+    lacking(kernel_interface(), false)
+}
 
 /// The device files a process needs to run at all.
 const DEVICES: &[&str] = &["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"];
@@ -271,6 +386,9 @@ fn pin_descriptors() -> std::io::Result<()> {
 /// filesystem is mounted beneath a directory it would be granted.
 pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
     let remote = !matches!(confinement.reach, Reach::Nothing);
+    if let Some(refusal) = lacking(kernel_interface(), remote) {
+        return Err(refusal);
+    }
     if remote && matches!(confinement.reads, Reads::Bounded(_)) {
         return Err(ProjectError::GitFailed {
             detail: "an invocation for a caller bounded by a grant reaches no remote: a location \
@@ -1067,11 +1185,15 @@ fn filter(remote: bool) -> Result<Vec<libc::sock_filter>> {
 /// set and will not install a filter that does not mean what it says.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn filter(_remote: bool) -> Result<Vec<libc::sock_filter>> {
-    Err(ProjectError::GitFailed {
-        detail: "this host does not hold the system-call numbers for this machine, so a Git \
-                 invocation cannot be enclosed and is not run"
-            .into(),
-    })
+    Err(no_system_call_numbers())
+}
+
+/// Returns the refusal of a machine whose system-call numbers this host does not hold.
+#[cfg(any(test, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+fn no_system_call_numbers() -> ProjectError {
+    ProjectError::GitFailed {
+        detail: NO_SYSTEM_CALL_NUMBERS.into(),
+    }
 }
 
 /// Returns one instruction of the filter.
@@ -1119,6 +1241,128 @@ mod tests {
         let (loaders, libraries) =
             support_set(&[program], nothing.path()).expect("the program's support set is named");
         SupportSet { loaders, libraries }
+    }
+
+    /// A kernel whose Landlock interface is older than the one the boundary needs runs no Git, and
+    /// says so under a code a client does not send again, with what the kernel has and what the
+    /// boundary needs. The kernel is not changed: the answer to the boundary's own probe is.
+    #[test]
+    fn a_kernel_without_the_interface_the_boundary_needs_refuses_under_a_code_a_client_does_not_retry()
+     {
+        let root = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let confinement = confinement_in(
+            root.path(),
+            Path::new("/bin/sh"),
+            Reach::Nothing,
+            Reads::Everywhere,
+        );
+
+        for found in [0, 1, 2] {
+            let refusal = with_kernel_interface(found, || prepare(&confinement))
+                .expect_err("a kernel that cannot mediate truncation encloses nothing");
+
+            assert!(
+                matches!(refusal, ProjectError::GitUnavailable { .. }),
+                "version {found}: {refusal:?}"
+            );
+            assert_eq!(
+                refusal.code(),
+                kr_protocol::error::ErrorCode::HostNotConfigured,
+                "version {found}"
+            );
+            assert!(
+                !refusal.code().retry_category().permits_automatic_retry(),
+                "version {found}"
+            );
+            let said = refusal.to_string();
+            assert!(
+                said.contains(&format!("version {found}"))
+                    && said.contains("version 3 (Linux 6.2)"),
+                "it names what the kernel has and what the boundary needs: {said}"
+            );
+        }
+    }
+
+    /// A remote operation needs the interface that restricts which addresses a process reaches. A
+    /// kernel with the filesystem rules and not those refuses it, in the same words, and a local
+    /// operation on it is not refused by the probe.
+    #[test]
+    fn a_remote_operation_needs_the_interface_that_restricts_addresses() {
+        let root = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let confinement = confinement_in(
+            root.path(),
+            Path::new("/bin/sh"),
+            Reach::Outbound(vec![443]),
+            Reads::Everywhere,
+        );
+
+        let refusal = with_kernel_interface(3, || prepare(&confinement))
+            .expect_err("a remote operation needs version 4");
+
+        assert!(
+            matches!(refusal, ProjectError::GitUnavailable { .. }),
+            "{refusal:?}"
+        );
+        assert!(!refusal.code().retry_category().permits_automatic_retry());
+        let said = refusal.to_string();
+        assert!(
+            said.contains("version 3")
+                && said.contains("version 4 (Linux 6.7)")
+                && said.contains("reaches a remote"),
+            "{said}"
+        );
+        assert!(
+            lacking(3, false).is_none(),
+            "a local operation runs on version 3"
+        );
+        assert!(lacking(4, true).is_none(), "and a remote one on version 4");
+    }
+
+    /// A fault that passes is not the refusal of a host that is not set up: an object the rules are
+    /// attached to is gone for the moment, and a client sends the request again.
+    #[test]
+    fn a_fault_that_passes_is_still_a_failure_a_client_sends_again() {
+        let root = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let confinement = confinement_in(
+            root.path(),
+            Path::new("/bin/sh"),
+            Reach::Nothing,
+            Reads::Everywhere,
+        );
+        std::fs::remove_dir(&confinement.exec_path).expect("the helper directory goes");
+
+        let refusal = prepare(&confinement).expect_err("the rules cannot be attached to nothing");
+
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::UpstreamUnavailable
+        );
+        assert!(refusal.code().retry_category().permits_automatic_retry());
+    }
+
+    /// A machine whose system-call numbers this host does not hold runs no Git, under the code of a
+    /// platform that runs none, and says what it lacks.
+    #[test]
+    fn a_machine_without_system_call_numbers_refuses_under_a_code_a_client_does_not_retry() {
+        let refusal = no_system_call_numbers();
+
+        assert!(
+            matches!(refusal, ProjectError::GitUnavailable { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::HostNotConfigured
+        );
+        assert!(!refusal.code().retry_category().permits_automatic_retry());
+        assert!(
+            refusal.to_string().contains("system-call numbers"),
+            "{refusal}"
+        );
     }
 
     #[test]

@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use kr_project::boundary::{ObjectIdentity, identity_of};
-use kr_project::git::{GitRequest, Interposition, RemoteAccess};
+use kr_project::git::{GitRequest, Interposition, RemoteAccess, RestrictedProfile};
 use kr_project::identity::OpenedRepository;
 use kr_project::workspace::{PreviewRequest, survey};
 use kr_protocol::project::{
@@ -1084,6 +1084,96 @@ fn a_platform_whose_mechanisms_cannot_hold_the_guarantees_runs_no_git() {
         "and it names both guarantees it cannot make: {said}"
     );
     assert!(kr_project::boundary::MECHANISM.starts_with("none"));
+}
+
+/// A kernel without the Landlock interface the boundary needs runs no Git on any route, as a
+/// platform that runs none does not: the profile's own run, whether it found its Git, was handed
+/// one, or has none to find, and a request to the service. Each is refused as a host that is not
+/// set up for the work, which a client does not send again, with what the kernel has and what the
+/// boundary needs, and before the request makes a directory. The kernel is not changed: the answer
+/// to the boundary's own probe is, on this thread only.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_kernel_without_the_interface_the_boundary_needs_runs_no_git_on_any_route() {
+    use kr_protocol::project::ProjectInitParams;
+
+    fn assert_refused_for_the_kernel(refusal: &kr_project::ProjectError, route: &str) {
+        assert!(
+            matches!(refusal, kr_project::ProjectError::GitUnavailable { .. }),
+            "{route}: {refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::HostNotConfigured,
+            "{route}"
+        );
+        assert!(
+            !refusal.code().retry_category().permits_automatic_retry(),
+            "{route}"
+        );
+        let said = refusal.to_string();
+        assert!(
+            said.contains("version 2") && said.contains("version 3 (Linux 6.2)"),
+            "{route} names what the kernel has and what the boundary needs: {said}"
+        );
+        assert!(
+            !said.contains("Install"),
+            "{route} names no install: {said}"
+        );
+    }
+
+    let fixture = Fixture::create();
+    let arguments: [&OsStr; 2] = [OsStr::new("status"), OsStr::new("--porcelain=v2")];
+    let never_made = fixture.work().join("never-made");
+    let nowhere = tempfile::tempdir().expect("a search path with no Git on it");
+    let searching = RestrictedProfile::prepare_on(
+        &fixture.work().join("searching"),
+        fixture.environment_id(),
+        Some(nowhere.path().as_os_str().to_owned()),
+        Duration::from_secs(60),
+    )
+    .expect("a profile is prepared without asking anything of Git");
+
+    kr_project::boundary::with_kernel_interface(2, || {
+        let refusal = fixture
+            .service()
+            .profile()
+            .run(&GitRequest::read(fixture.work(), &arguments))
+            .expect_err("no Git runs on this kernel");
+        assert_refused_for_the_kernel(&refusal, "the profile's run");
+
+        let refusal = searching
+            .git()
+            .expect_err("no Git is looked for on this kernel");
+        assert_refused_for_the_kernel(&refusal, "a profile that has no Git to find");
+
+        let refusal = fixture
+            .service()
+            .project_init(
+                &actor(),
+                &ProjectInitParams {
+                    destination: destination(
+                        fixture.environment_id(),
+                        fixture.work(),
+                        "never-made",
+                    ),
+                    label: "never-made".to_owned(),
+                    initial_branch: Nullable(None),
+                },
+                Some(&action("project.init", 4)),
+            )
+            .expect_err("no repository is made on this kernel");
+        assert_refused_for_the_kernel(&refusal, "project.init");
+    });
+
+    assert!(!never_made.exists(), "and the request made no directory");
+    // The control: the same profile runs Git where the kernel is the real one.
+    // Where there is no repository Git runs and says so, which a refusal for the kernel does not.
+    fixture
+        .service()
+        .profile()
+        .run(&GitRequest::read(fixture.work(), &arguments))
+        .expect("on the real kernel Git runs");
 }
 
 #[test]
