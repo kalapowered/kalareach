@@ -92,11 +92,35 @@ pub fn read_aside(
     Ok(receiver)
 }
 
+/// How long a child that was asked to end is given before it is ended without being asked.
+const ASKED_TO_END_FOR: Duration = Duration::from_secs(5);
+
 /// Ends one of this test's own children that it has not collected, and collects it within
 /// [`STREAMS_DEADLINE`]. Returns what of that failed, as text to add to a reason, or nothing.
+///
+/// The child is asked to end first and given [`ASKED_TO_END_FOR`] to do so. A program that is
+/// killed outright cannot clean up after itself: an image build that is, leaves the program its
+/// step was running, which goes on after the build that wanted it.
 fn end_and_collect(child: &mut std::process::Child) -> String {
     let mut failed = String::new();
-    if let Err(error) = child.kill() {
+    let asked = spawning(|| {
+        Command::new("/bin/kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    });
+    let begun = Instant::now();
+    if asked.is_ok_and(|status| status.success()) {
+        while matches!(child.try_wait(), Ok(None)) && begun.elapsed() < ASKED_TO_END_FOR {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    if matches!(child.try_wait(), Ok(None))
+        && let Err(error) = child.kill()
+    {
         failed.push_str(&format!("; ending it failed: {error}"));
     }
     let begun = Instant::now();
