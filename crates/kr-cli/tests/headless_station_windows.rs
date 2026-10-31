@@ -7,13 +7,13 @@
 //! station does, and starts it on one that admits less: the interactive station gains entries
 //! while a logon lasts (a "Run as different user" may add one for the account it starts a program
 //! as), and a station made before that has not the new entry. A station that differs in a way the
-//! lists alone do not show to admit more, such as one entry with another mask, is refused too, and
-//! the refusal does not say that it admits more.
+//! comparison does not weigh, such as one entry with another mask, is refused too, and the refusal
+//! does not say that it admits more.
 //!
 //! The desktop is checked the same way. A desktop that exists already on the station keeps the
-//! security it was made with, so a desktop that admits more than the starter's own is refused. The
-//! name of a worker's desktop is not one a case can know, so the case asks the starter for a
-//! desktop of a name it chose, the way the daemon's task does.
+//! security it was made with, so a desktop that admits more than the starter's own is refused. A
+//! worker's desktop is named for its reservation, so the case takes a launch of a reservation of
+//! its own, holds a desktop of that name, and hands the launch to the task's starter.
 //!
 //! These cases change the security of objects that every headless start of this logon meets, so
 //! they run one at a time, and each puts back what it changed. They need a signed-in interactive
@@ -31,9 +31,7 @@ mod teardown;
 mod windows_session;
 mod windows_station;
 
-use std::path::Path;
-
-use kr_ipc::starter::{ChildCommand, ChildRefusal, StartedChild, current_session, end_process};
+use kr_controller::supervision::{LaunchOutcome, WorkerSupervisor};
 use windows_session::WorkerHost;
 use windows_station::{EntryOnInteractive, HeldDesktop, HeldStation};
 
@@ -183,63 +181,42 @@ async fn a_logon_station_with_a_lower_integrity_label_refuses_the_start() {
     );
 }
 
-/// Starts a program that ends at once on the desktop `label` of this logon's window station, as the
-/// task's starter does for a headless worker.
-fn start_on_desktop(label: &str) -> Result<StartedChild, ChildRefusal> {
-    let system = std::env::var_os("SystemRoot").expect("the system directory");
-    let program = Path::new(&system).join("System32").join("cmd.exe");
-    kr_ipc::starter::start_child(&ChildCommand {
-        application: &program,
-        command_line: "cmd.exe /c exit 0",
-        directory: Path::new(&system),
-        environment: &[],
-        session: current_session().expect("this process's session"),
-        output: None,
-        own_desktop: Some(label),
-    })
-}
-
 /// KR-REQ-03.24: a desktop that exists already on the logon's window station and admits more than
-/// the starter's own is refused, with the step named, and no program is started on it. Control: a
-/// desktop that does not exist yet is made on the same station and a program starts on it, which
-/// shows that the starter meets the station this test holds.
+/// the starter's own is refused, with the step named, and no worker is started on it. The desktop
+/// of a headless worker is named for its reservation, so the case takes a launch of a reservation
+/// of its own, holds a desktop of that name, and hands the launch to the task's starter, which is
+/// how the daemon starts a worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_desktop_that_exists_already_and_admits_more_than_the_starters_own_refuses_the_start() {
-    const WIDER: &str = "kr-test-wider-desktop";
-    const FRESH: &str = "kr-test-fresh-desktop";
     let _alone = ONE_AT_A_TIME.lock().await;
+    let host = WorkerHost::start().await;
+    the_starter_meets_the_stations_this_test_makes(&host).await;
 
     let station = HeldStation::make(|own| own.to_owned()).unwrap_or_else(|error| {
         panic!("the logon's station as the starter would make it: {error}")
     });
-    let wider = HeldDesktop::make(&station, WIDER, |own| format!("{own}(A;;0x1;;;WD)"))
-        .unwrap_or_else(|error| panic!("a desktop wider than the starter's own: {error}"));
+    let launch = host.headless_launch();
+    let wider = HeldDesktop::make(&station, &launch.label(), |own| {
+        format!("{own}(A;;0x1;;;WD)")
+    })
+    .unwrap_or_else(|error| panic!("a desktop wider than the starter's own: {error}"));
 
-    let refused = start_on_desktop(WIDER).err().unwrap_or_else(|| {
+    let supervisor = host.task_supervisor();
+    let outcome = tokio::task::spawn_blocking(move || supervisor.start(&launch))
+        .await
+        .expect("the start returns");
+    let LaunchOutcome::NotStarted { detail } = outcome else {
         panic!(
-            "a program was started on a desktop that admits everyone: {}",
+            "a worker was started on a desktop that admits everyone ({}): {outcome:?}",
             wider.access_list
-        )
-    });
+        );
+    };
     assert!(
-        refused.detail.contains("check the desktop's security"),
-        "the refusal does not say which check refused: {}",
-        refused.detail
+        detail.contains("check the desktop's security")
+            && (detail.contains("admits more")
+                || detail.contains("is not one the starter accepts")),
+        "the refusal does not say that the desktop's security refused it: {detail}"
     );
-    assert!(
-        refused.remaining_pid.is_none(),
-        "a program was created for the refused start: {refused:?}"
-    );
-
-    let started = start_on_desktop(FRESH).unwrap_or_else(|refusal| {
-        panic!(
-            "the start on a desktop that does not exist yet was refused, so the starter may not meet \
-             the station this test holds ({}): {}",
-            station.access_list, refusal.detail
-        )
-    });
-    // The program ends by itself; a second end is not an error.
-    let _ = end_process(&started.identity);
 }
 
 /// KR-REQ-03.24: a window station that exists already and admits less than the starter's own, for

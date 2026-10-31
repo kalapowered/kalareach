@@ -492,6 +492,31 @@ impl WorkerHost {
         self._task.supervisor(&self.tree.environment())
     }
 
+    /// A launch of a headless worker as the daemon builds one, for a reservation of its own, to
+    /// hand to [`Self::task_supervisor`]. The desktop it asks for is named for the reservation, so
+    /// a test that holds a desktop of that name is met by the starter that takes the launch.
+    pub fn headless_launch(&self) -> kr_controller::supervision::WorkerLaunch {
+        let environment = self.tree.environment();
+        kr_controller::supervision::WorkerLaunch {
+            reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
+            session_id: kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()),
+            environment_id: environment.environment_id(),
+            display_number: kr_protocol::session::DisplayNumber::new(1),
+            program: self.tree.root().join("kr-worker.exe"),
+            rendezvous: environment
+                .rendezvous_endpoint()
+                .expect("an endpoint")
+                .as_path()
+                .to_path_buf(),
+            runtime_directory: self.tree.paths().runtime_root().to_path_buf(),
+            state_directory: self.tree.paths().state_root().to_path_buf(),
+            jobs_directory: environment.jobs_dir(),
+            working_directory: self.tree.root().to_path_buf(),
+            desktop_environment: Vec::new(),
+            profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        }
+    }
+
     pub async fn start() -> Self {
         Prepared::new().start(None).await
     }
