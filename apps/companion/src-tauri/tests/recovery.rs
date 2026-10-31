@@ -1801,10 +1801,20 @@ async fn an_account_token_goes_only_to_the_service_the_account_is_signed_in_to()
         "the refusal names the setting and the service it names: {words}"
     );
     assert!(
+        words.contains("Choose reach.kala.to as the sync service"),
+        "and asks for the account's service as the sync service: {words}"
+    );
+    assert!(
         computer.served.web().arrived().is_empty(),
         "nothing left this computer"
     );
     assert_eq!(page.view()["state"], "off", "nothing was made");
+    assert!(
+        load_recovery_seed(&*computer.secrets, SEED_SCOPE)
+            .expect("the store is read")
+            .is_none(),
+        "no seed was made"
+    );
 
     // Control: with the account signed in to the service the setting names, the same call goes,
     // and carries the account's token.
@@ -1844,14 +1854,28 @@ fn names_both(words: &str, record: &str, account: &str) -> bool {
     words.contains(record) && words.contains(account)
 }
 
-/// KR-REQ-17.14: a record is used at the service it names and at no other. With the account signed
-/// in at another service and the setting naming that one, a record that is made and not kept is not
-/// turned on, a write is not settled, the host is not covered and neither the archives nor the
-/// offline copy are read; each is refused with both services named and nothing is sent to either.
-/// The page is shown what is wrong, and the kit, saved as text or as a QR code, still names the
-/// service the bundle is kept at.
+/// Whether `words` tell the person that the setting names the record's service, or to choose or
+/// change the sync service: what a record that exists cannot be moved by.
+fn asks_for_another_setting(words: &str) -> bool {
+    let words = words.to_lowercase();
+    [
+        "setting names",
+        "choose",
+        "change the setting",
+        "as the sync service",
+    ]
+    .iter()
+    .any(|instruction| words.contains(instruction))
+}
+
+/// KR-REQ-17.14: a record goes on naming the service its bundle is kept at when the account is
+/// signed in at another service and the setting names that one. The page is shown what is wrong
+/// for a record that is made and not kept and for one that is kept, the same account at the
+/// record's service goes on with the record, and the kit, saved as text or as a QR code, names the
+/// service the bundle is kept at and the locator it began with. Sending nothing to either
+/// service is held for each step by the case below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_record_is_not_used_at_the_service_the_account_signed_in_to_in_its_place() {
+async fn a_record_keeps_naming_its_service_and_its_kit_when_the_account_signs_in_elsewhere() {
     let computer = Computer::new().await;
     let other = serve().await;
     let (ours, theirs) = (host_of(computer.served.origin()), host_of(other.origin()));
@@ -1870,20 +1894,12 @@ async fn a_record_is_not_used_at_the_service_the_account_signed_in_to_in_its_pla
     drop(page);
 
     // The account is signed in at another service and the setting names it. The record does not
-    // move: the page is shown the mismatch, and going on with the record sends nothing.
-    let sent = computer.served.web().arrived().len();
+    // move: the page is shown the mismatch.
     let moved = moved_to(&computer, &other).await;
     let view = moved.view();
     assert_eq!(view["state"], "unfinished", "{view}");
     assert_eq!(view["kept_at"], ours, "{view}");
     assert_eq!(view["blocker"], wrong_service, "{view}");
-    let refusal = moved
-        .call("recovery_turn_on", json!({}))
-        .expect_err("the account's sign-in is not sent to the record's service");
-    assert_eq!(refusal["code"], "PERMISSION_DENIED");
-    let words = refusal["message"].as_str().expect("words");
-    assert!(names_both(words, &ours, &theirs), "{words}");
-    assert_eq!(computer.served.web().arrived().len(), sent);
     drop(moved);
 
     // The same account at the record's service goes on with the record, and the bundle is kept.
@@ -1903,54 +1919,6 @@ async fn a_record_is_not_used_at_the_service_the_account_signed_in_to_in_its_pla
     assert_eq!(view["state"], "on", "{view}");
     assert_eq!(view["kept_at"], ours, "{view}");
     assert_eq!(view["blocker"], wrong_service, "{view}");
-
-    let refusal = moved
-        .call("recovery_settle", json!({}))
-        .expect_err("a write is not settled at a service the account is not signed in to");
-    assert_eq!(refusal["code"], "PERMISSION_DENIED");
-    let words = refusal["message"].as_str().expect("words");
-    assert!(names_both(words, &ours, &theirs), "{words}");
-
-    let host = Host::new(&computer, computer.served.origin());
-    host.sets_up();
-    let refusal = moved
-        .recovery
-        .cover_host(&moved.account, &host, false)
-        .await
-        .expect_err("the host is not covered through a service the account is not signed in to");
-    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
-    assert!(
-        names_both(&refusal.message, &ours, &theirs),
-        "{}",
-        refusal.message
-    );
-    assert_eq!(
-        *host.statuses.lock().expect("statuses"),
-        0,
-        "the host was not asked"
-    );
-
-    let refusal = moved
-        .call("recovery_archives", json!({}))
-        .expect_err("the archives are not read through a service the account is not signed in to");
-    assert_eq!(refusal["code"], "PERMISSION_DENIED");
-    let words = refusal["message"].as_str().expect("words");
-    assert!(names_both(words, &ours, &theirs), "{words}");
-
-    let exported = out.path().join("bundle.krexport");
-    moved.dialog_returns(&exported);
-    let refusal = moved
-        .call(
-            "recovery_export_offline",
-            json!({ "path": exported.to_string_lossy(), "archive": null }),
-        )
-        .expect_err(
-            "the offline copy is not read through a service the account is not signed in to",
-        );
-    assert_eq!(refusal["code"], "PERMISSION_DENIED");
-    let words = refusal["message"].as_str().expect("words");
-    assert!(names_both(words, &ours, &theirs), "{words}");
-    assert!(!exported.exists());
 
     // The kit is made from the record: saved as text or as a QR code, it names the service the
     // bundle is kept at, whatever the setting names now.
@@ -1973,7 +1941,7 @@ async fn a_record_is_not_used_at_the_service_the_account_signed_in_to_in_its_pla
     assert_eq!(
         computer.served.web().arrived().len(),
         sent,
-        "nothing was sent to the service the record names"
+        "saving the kit sent nothing to the service the record names"
     );
     assert!(
         other.web().arrived().is_empty(),
@@ -1986,11 +1954,11 @@ async fn a_record_is_not_used_at_the_service_the_account_signed_in_to_in_its_pla
 /// setting naming the record's service, the account's or a third service changes nothing: settling
 /// a write that has no answer, going on with a record that is made and not kept, and then, with
 /// the record kept, settling, covering the host (replacing it too), listing the archives and making
-/// the offline copy (of the bundle and of an archive) are each refused with the record's service
-/// and the account's named and the sign-in the person needs, the page is shown what is wrong, and
-/// nothing is sent to any of the three services. The refusal does not say that the setting names
-/// the record's service, and does not tell the person to choose the account's service as the sync
-/// service, which cannot move a record.
+/// the offline copy (of the bundle and of an archive), with a write of the cover that has no
+/// answer waiting as well, are each refused with the record's service and the account's named and
+/// the sign-in the person needs, the page is shown what is wrong, and nothing is sent to any of the
+/// three services. The refusal does not say that the setting names the record's service, and does
+/// not tell the person to choose or change the sync service, which cannot move a record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_is_refused_to_an_account_signed_in_elsewhere_whatever_the_setting_names() {
     let computer = Computer::new().await;
@@ -2030,7 +1998,7 @@ async fn a_record_is_refused_to_an_account_signed_in_elsewhere_whatever_the_sett
             "the refusal says where the person has to be signed in: {words}"
         );
         assert!(
-            !words.contains("setting names") && !words.contains(&format!("Choose {theirs}")),
+            !asks_for_another_setting(words),
             "the refusal does not say the setting names the record's service, or ask for another \
              choice of it: {words}"
         );
@@ -2097,78 +2065,124 @@ async fn a_record_is_refused_to_an_account_signed_in_elsewhere_whatever_the_sett
         assert_eq!(view["state"], "on", "{setting}: {view}");
         assert_eq!(view["kept_at"], ours, "{setting}: {view}");
         assert_eq!(view["blocker"], wrong_service, "{setting}: {view}");
-
-        let refusal = moved
-            .call("recovery_settle", json!({}))
-            .expect_err("a write is not settled at a service the account is not signed in to");
-        assert_eq!(refusal["code"], "PERMISSION_DENIED", "{setting}");
-        says_where(refusal["message"].as_str().expect("words"));
-
-        let host = Host::new(&computer, computer.served.origin());
-        host.sets_up();
-        let refusal = moved
-            .recovery
-            .cover_host(&moved.account, &host, false)
-            .await
-            .expect_err(
-                "the host is not covered through a service the account is not signed in to",
-            );
-        assert_eq!(refusal.code, ErrorCode::PermissionDenied, "{setting}");
-        says_where(&refusal.message);
-        assert_eq!(
-            *host.statuses.lock().expect("statuses"),
-            0,
-            "{setting}: the host was not asked"
-        );
-        let refusal = moved
-            .recovery
-            .cover_host(&moved.account, &host, true)
-            .await
-            .expect_err(
-                "a replacement is not made through a service the account is not signed in to",
-            );
-        assert_eq!(refusal.code, ErrorCode::PermissionDenied, "{setting}");
-        says_where(&refusal.message);
-        assert_eq!(
-            *host.statuses.lock().expect("statuses"),
-            0,
-            "{setting}: the host was not asked to be replaced"
-        );
-
-        let refusal = moved.call("recovery_archives", json!({})).expect_err(
-            "the archives are not read through a service the account is not signed in to",
-        );
-        assert_eq!(refusal["code"], "PERMISSION_DENIED", "{setting}");
-        says_where(refusal["message"].as_str().expect("words"));
-
-        let exported = out.path().join("bundle.krexport");
-        moved.dialog_returns(&exported);
-        let refusal = moved
-            .call(
-                "recovery_export_offline",
-                json!({ "path": exported.to_string_lossy(), "archive": null }),
-            )
-            .expect_err(
-                "the offline copy is not read through a service the account is not signed in to",
-            );
-        assert_eq!(refusal["code"], "PERMISSION_DENIED", "{setting}");
-        says_where(refusal["message"].as_str().expect("words"));
-        assert!(!exported.exists(), "{setting}");
-        moved.dialog_returns(&exported);
-        let refusal = moved
-            .call(
-                "recovery_export_offline",
-                json!({
-                    "path": exported.to_string_lossy(),
-                    "archive": "00000000-0000-4000-8000-000000000099"
-                }),
-            )
-            .expect_err("an archive is not read through a service the account is not signed in to");
-        assert_eq!(refusal["code"], "PERMISSION_DENIED", "{setting}");
-        says_where(refusal["message"].as_str().expect("words"));
-        assert!(!exported.exists(), "{setting}");
+        kept_record_is_refused_at_every_step(&computer, &moved, &says_where, setting, out.path())
+            .await;
         nothing_sent(sent, setting);
     }
+
+    // The record is kept, and a write of the cover whose answer is lost leaves it waiting to be
+    // settled. With the account signed in elsewhere, every step is refused all the same.
+    let page = computer.page().await;
+    let host = Host::new(&computer, computer.served.origin());
+    host.sets_up();
+    computer
+        .served
+        .web()
+        .fail_with_member(SYNC_PATH, "exchange", 1, Moment::After);
+    let unknown = page
+        .recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect_err("the write is not answered");
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(page.view()["state"], "unsettled");
+    drop(page);
+
+    let sent = computer.served.web().arrived().len();
+    for setting in &settings {
+        let moved = signed_in_at(&computer, &signed_in, setting).await;
+        let view = moved.view();
+        assert_eq!(view["state"], "unsettled", "{setting}: {view}");
+        assert_eq!(view["kept_at"], ours, "{setting}: {view}");
+        assert_eq!(view["blocker"], wrong_service, "{setting}: {view}");
+        kept_record_is_refused_at_every_step(&computer, &moved, &says_where, setting, out.path())
+            .await;
+        nothing_sent(sent, setting);
+    }
+
+    // The account at the record's service settles it.
+    let page = computer.page().await;
+    let settled = page
+        .call("recovery_settle", json!({}))
+        .expect("the lost write is settled");
+    assert_eq!(settled["state"], "on", "{settled}");
+}
+
+/// Every step that reaches the service a kept record names, asked with the account signed in at
+/// another service: each is refused with both services named and the sign-in the person needs,
+/// and the host is not asked.
+async fn kept_record_is_refused_at_every_step(
+    computer: &Computer,
+    moved: &Page,
+    says_where: &dyn Fn(&str),
+    setting: &str,
+    out: &Path,
+) {
+    let refusal = moved
+        .call("recovery_settle", json!({}))
+        .expect_err("a write is not settled at a service the account is not signed in to");
+    assert_eq!(refusal["code"], "PERMISSION_DENIED", "{setting}");
+    says_where(refusal["message"].as_str().expect("words"));
+
+    let host = Host::new(computer, computer.served.origin());
+    host.sets_up();
+    let refusal = moved
+        .recovery
+        .cover_host(&moved.account, &host, false)
+        .await
+        .expect_err("the host is not covered through a service the account is not signed in to");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied, "{setting}");
+    says_where(&refusal.message);
+    assert_eq!(
+        *host.statuses.lock().expect("statuses"),
+        0,
+        "{setting}: the host was not asked"
+    );
+    let refusal = moved
+        .recovery
+        .cover_host(&moved.account, &host, true)
+        .await
+        .expect_err("a replacement is not made through a service the account is not signed in to");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied, "{setting}");
+    says_where(&refusal.message);
+    assert_eq!(
+        *host.statuses.lock().expect("statuses"),
+        0,
+        "{setting}: the host was not asked to be replaced"
+    );
+
+    let refusal = moved
+        .call("recovery_archives", json!({}))
+        .expect_err("the archives are not read through a service the account is not signed in to");
+    assert_eq!(refusal["code"], "PERMISSION_DENIED", "{setting}");
+    says_where(refusal["message"].as_str().expect("words"));
+
+    let exported = out.join("bundle.krexport");
+    moved.dialog_returns(&exported);
+    let refusal = moved
+        .call(
+            "recovery_export_offline",
+            json!({ "path": exported.to_string_lossy(), "archive": null }),
+        )
+        .expect_err(
+            "the offline copy is not read through a service the account is not signed in to",
+        );
+    assert_eq!(refusal["code"], "PERMISSION_DENIED", "{setting}");
+    says_where(refusal["message"].as_str().expect("words"));
+    assert!(!exported.exists(), "{setting}");
+    moved.dialog_returns(&exported);
+    let refusal = moved
+        .call(
+            "recovery_export_offline",
+            json!({
+                "path": exported.to_string_lossy(),
+                "archive": "00000000-0000-4000-8000-000000000099"
+            }),
+        )
+        .expect_err("an archive is not read through a service the account is not signed in to");
+    assert_eq!(refusal["code"], "PERMISSION_DENIED", "{setting}");
+    says_where(refusal["message"].as_str().expect("words"));
+    assert!(!exported.exists(), "{setting}");
 }
 
 /// KR-REQ-17.14: a record is read and covered at the service it names when only the setting
@@ -2638,6 +2652,20 @@ async fn turning_recovery_on_adopts_an_earlier_write_at_the_records_service_when
     assert!(
         setting.web().arrived().is_empty(),
         "the service the setting names was sent nothing"
+    );
+
+    // The kit names the bundle that was adopted, at the service the record names: the locator is
+    // the one the earlier write used, and does not change with the setting.
+    let out = tempfile::tempdir().expect("a directory");
+    let (_, kit) = page.kit(out.path());
+    assert_eq!(
+        kit.bundle_locator, LOCATOR,
+        "the kit names the adopted bundle"
+    );
+    assert_eq!(
+        kit.service_origins,
+        [ours.clone()],
+        "and the service the record names"
     );
 
     // An adopted bundle has no owner anyone knows: deleting the account that is signed in at the
