@@ -12,11 +12,15 @@
 
 mod net_support;
 
-use std::process::{Command, Output, Stdio};
+use std::io::Write as _;
+use std::process::Output;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use kr_controller::bridge::launch;
-use kr_controller::bridge::platform::{PlatformObserver, container_runtime_present};
+use kr_controller::bridge::platform::{
+    PLATFORM_LIMIT, PlatformObserver, container_runtime_present, run_bounded,
+};
 use kr_controller::bridge::store::Observer;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::identity::{
@@ -43,13 +47,22 @@ fn runtime_available(suite: &str) -> bool {
     false
 }
 
-/// Runs the container runtime once, with nothing on its standard input.
+/// How long a call that fetches an image is given. Any other call is given [`PLATFORM_LIMIT`].
+const PULL_BOUND: Duration = Duration::from_secs(300);
+
+/// Runs the container runtime once, with nothing on its standard input, within `bound`, or says
+/// what went wrong with the call named.
+fn runtime_within(arguments: &[&str], bound: Duration) -> Result<Output, String> {
+    let arguments: Vec<String> = arguments
+        .iter()
+        .map(|argument| (*argument).to_owned())
+        .collect();
+    run_bounded(launch::CONTAINER_RUNTIME, &arguments, bound).map_err(|error| error.to_string())
+}
+
+/// Runs the container runtime once, and fails the case if the call does not end.
 fn runtime(arguments: &[&str]) -> Output {
-    Command::new(launch::CONTAINER_RUNTIME)
-        .args(arguments)
-        .stdin(Stdio::null())
-        .output()
-        .expect("the container runtime runs")
+    runtime_within(arguments, PLATFORM_LIMIT).unwrap_or_else(|why| panic!("{why}"))
 }
 
 /// Both of the runtime's streams, standard output first, for a message about what it did.
@@ -75,8 +88,13 @@ fn image_present() {
         if podman(&["image", "exists", "--", IMAGE]).0 {
             return;
         }
-        let (pulled, text) = podman(&["pull", "--quiet", "--", IMAGE]);
-        assert!(pulled, "the runtime pulls {IMAGE}: {text}");
+        let pulled = runtime_within(&["pull", "--quiet", "--", IMAGE], PULL_BOUND)
+            .unwrap_or_else(|why| panic!("{why}"));
+        assert!(
+            pulled.status.success(),
+            "the runtime pulls {IMAGE}: {}",
+            printed(&pulled)
+        );
     });
 }
 
@@ -135,7 +153,7 @@ impl Container {
         let id = container_identifier(&output.stdout).unwrap_or_else(|refusal| {
             // There is no identifier to remove it by, so the container goes by the name this test
             // gave it a moment ago.
-            let _ = podman(&["rm", "--force", "--", name]);
+            let _ = runtime_within(&["rm", "--force", "--", name], PLATFORM_LIMIT);
             panic!("{refusal}")
         });
         Self {
@@ -162,8 +180,26 @@ impl Container {
 impl Drop for Container {
     fn drop(&mut self) {
         // Only what this test made, and by the identifier it recorded rather than by a name
-        // somebody else might now hold.
-        let _ = podman(&["rm", "--force", "--", &self.id]);
+        // somebody else might now hold. A container the case itself removed is not one to
+        // complain of. A removal that fails is recorded, and fails a case that passed; a case that is already failing has said so, and a second panic would end the
+        // whole test binary.
+        let removed = runtime_within(
+            &["rm", "--force", "--ignore", "--", &self.id],
+            PLATFORM_LIMIT,
+        );
+        let why = match removed {
+            Ok(output) if output.status.success() => return,
+            Ok(output) => printed(&output),
+            Err(why) => why,
+        };
+        let record = format!(
+            "the container {} ({}) was not removed and may still be running: {why}",
+            self.name, self.id
+        );
+        let _ = writeln!(std::io::stderr(), "{record}");
+        if !std::thread::panicking() {
+            panic!("{record}");
+        }
     }
 }
 
