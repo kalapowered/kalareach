@@ -526,6 +526,64 @@ fn a_rename_of_the_checkout_keeps_the_grant_and_a_replacement_at_its_path_does_n
 }
 
 #[test]
+fn a_checkout_removed_with_nothing_in_its_place_is_a_source_that_changed() {
+    // The record names an object, and at its path there is nothing: that is the same answer as for
+    // a replacement there, the source is no longer the object the record names, and not an
+    // argument the caller got wrong.
+    let fixture = Fixture::create();
+    let created = fixture
+        .service()
+        .project_init(
+            &actor(),
+            &ProjectInitParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "gone"),
+                label: "gone".to_owned(),
+                initial_branch: Nullable(None),
+            },
+            Some(&action("project.init", 14)),
+        )
+        .expect("it is created");
+    let gone = fixture.work().join("gone");
+    let recorded =
+        OpenedRepository::open(fixture.service().profile(), fixture.environment_id(), &gone)
+            .expect("it opens")
+            .recorded()
+            .expect("it reads its identity");
+    std::fs::remove_dir_all(&gone).expect("the checkout is removed");
+
+    let refusal = open_recorded(&fixture, &gone, recorded)
+        .expect_err("a record whose tree is gone names nothing there");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged, "{refusal}");
+    assert!(
+        refusal
+            .to_string()
+            .contains("the object rather than the path"),
+        "the refusal says why: {refusal}"
+    );
+    // The service's own record names the old path, so a workspace of the project is refused the
+    // same way.
+    let refusal = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &kr_protocol::project::WorkspaceCreateParams {
+                project_repository_id: created.project.project_repository_id,
+                label: "review".to_owned(),
+                kind: kr_protocol::project::WorkspaceKind::SharedExisting,
+                isolation: Nullable(None),
+                policy: support::include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(None),
+                preview_only: true,
+            },
+            Some(&action("workspace.create", 15)),
+        )
+        .expect_err("the record names an object that is gone from its path");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged, "{refusal}");
+}
+
+#[test]
 fn an_added_worktree_is_its_own_object_and_a_record_of_one_tree_never_covers_another() {
     let fixture = Fixture::create();
     let source = ordinary_repository(fixture.work(), "shared");

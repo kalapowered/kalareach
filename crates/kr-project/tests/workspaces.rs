@@ -1187,6 +1187,32 @@ fn a_request_against_an_opened_independent_clone_does_not_search_above_its_tree(
     );
 }
 
+/// A workspace whose tree was removed with nothing in its place is one whose record names an object
+/// that is gone from its path, which is the answer for a tree that was replaced, and not an
+/// argument the caller got wrong.
+#[cfg(unix)]
+#[test]
+fn a_workspace_tree_removed_with_nothing_in_its_place_is_a_source_that_changed() {
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "gone-source");
+    let workspace_id = isolated_workspace(
+        &fixture,
+        project,
+        fixture.work(),
+        "gone-clone",
+        IsolationMechanism::IndependentClone,
+        131,
+    );
+    std::fs::remove_dir_all(fixture.work().join("gone-clone")).expect("the tree is removed");
+
+    let refusal = fixture
+        .service()
+        .open_workspace_repository(workspace_id)
+        .expect_err("a record whose tree is gone names nothing there");
+
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged, "{refusal}");
+}
+
 /// The first Git call of an open of an independent clone does not search above the clone's tree
 /// either: a clone whose `.git` is no longer a repository (its `HEAD` is gone, and the directory is
 /// still the object that was recorded) is one Git finds nothing for, and the repository around it
