@@ -407,25 +407,31 @@ impl Authorisation {
 
 impl RemoteOutput {
     pub(super) fn new(session: &AuthorisedSession, authority: Arc<Authorisation>) -> Self {
-        Self::writing_to(
+        Self::for_a_peer_receiving(
             Box::new(ControlStream {
                 sender: session.control.sender(),
                 connection: session.connection.clone(),
             }),
             authority,
-        )
-        .limited_to(
-            usize::try_from(session.selection.limits.max_control_frame_len.get())
-                .unwrap_or(usize::MAX)
-                .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN),
+            &session.selection.limits,
         )
     }
 
-    /// This output with the most bytes one frame may carry named, so that a frame the host's own
-    /// edits made larger is refused here and not by the stream, which would end the connection.
-    pub(super) fn limited_to(mut self, max_payload: usize) -> Self {
-        self.max_payload = Some(max_payload);
-        self
+    /// An output to `sink` for a peer that said it can receive no more than `receiving`, so that a
+    /// frame the host's own edits made larger than the peer's frame is refused here and not by the
+    /// stream, which would end the connection.
+    pub(super) fn for_a_peer_receiving(
+        sink: Box<dyn FrameSink>,
+        authority: Arc<Authorisation>,
+        receiving: &kr_protocol::hello::ReceiveLimits,
+    ) -> Self {
+        let mut output = Self::writing_to(sink, authority);
+        output.max_payload = Some(
+            usize::try_from(receiving.max_control_frame_len.get())
+                .unwrap_or(usize::MAX)
+                .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN),
+        );
+        output
     }
 
     pub(super) fn writing_to(sink: Box<dyn FrameSink>, authority: Arc<Authorisation>) -> Self {

@@ -2389,7 +2389,7 @@ mod tests {
                 assert!(!told.contains("example.com"), "{reason}: {told}");
                 assert!(!told.contains("net user"), "{reason}: {told}");
                 assert!(told.contains(kind), "{reason}: {told}");
-                // Nothing else of the binding changes, and the owner's own copy is as it was.
+                // Nothing else of the binding changes.
                 assert!(device.rich_mutations_suspended);
                 assert_eq!(
                     kr_protocol::agent::AgentBindingState {
@@ -2399,7 +2399,6 @@ mod tests {
                     owner
                 );
             }
-            assert_eq!(owner.suspension_reason.0.as_deref(), Some(reason.as_str()));
         }
     }
 
@@ -2534,7 +2533,7 @@ mod tests {
         );
         let device = read_by_a_device(&owner);
         assert_eq!(device.project.display_path, withheld_path(place));
-        // Nothing else of the repository changes, and the owner's own copy is as it was.
+        // Nothing else of the repository changes.
         assert_eq!(
             device.project,
             kr_protocol::project::ProjectSummary {
@@ -2542,7 +2541,6 @@ mod tests {
                 ..owner.project.clone()
             }
         );
-        assert_eq!(owner.project.display_path, place);
     }
 
     #[test]
@@ -2560,7 +2558,6 @@ mod tests {
                 ..owner.workspaces[0].clone()
             }
         );
-        assert_eq!(owner.workspaces[0].display_path, place);
     }
 
     #[test]
@@ -2588,7 +2585,6 @@ mod tests {
                 ..owner.operation.clone()
             }
         );
-        assert_eq!(owner.operation.retained_staging_paths, kept);
     }
 
     #[test]
@@ -2605,7 +2601,6 @@ mod tests {
             device.operation.removed_staging_paths,
             removed.map(withheld_path).to_vec()
         );
-        assert_eq!(owner.operation.removed_staging_paths, removed);
     }
 
     #[test]
@@ -3086,11 +3081,10 @@ mod tests {
             withheld_remote(&device.operation.0.as_ref().expect("an operation").remote),
             withheld_path(source)
         );
-        // The rest of the remote is as it was, and the owner's own copy is.
+        // The rest of the remote is as it was.
         let kept = device.project.remote.0.as_ref().expect("a remote");
         assert_eq!(kept.transport, RemoteTransport::LocalPath);
         assert_eq!(kept.remote_name, "origin");
-        assert_eq!(withheld_remote(&owner.project.remote), source);
 
         // The address of a remote on the web is the owner's to share and is not held.
         let mut web = project("a repository");
@@ -3464,7 +3458,6 @@ mod tests {
         // The session is shown as it is, its working directory and its shell with it: they are how
         // a person is told what the session is.
         assert_eq!(device.session, owner.session);
-        assert_eq!(owner.endpoint.0.as_deref(), Some(socket));
         // A session that has closed has none, and none is what a device is told.
         assert_eq!(read_by_a_device(&read(None)), read(None));
         // The create's answer carries it the same way.
@@ -3725,5 +3718,150 @@ mod tests {
             "the package does not accept  as an attachment",
         );
         assert!(!told.message.contains("kind of attachment"), "{told:?}");
+    }
+
+    /// The owner is told the whole text because the owner's route never meets this module: only
+    /// the door a paired device uses calls it.
+    #[test]
+    fn only_the_door_of_a_paired_device_calls_this_module() {
+        fn sources(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("a source directory") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let door = source.join("net");
+        let mut found = Vec::new();
+        sources(&source, &mut found);
+        assert!(found.len() > 100, "{} sources read", found.len());
+        let outside: Vec<_> = found
+            .iter()
+            .filter(|path| !path.starts_with(&door))
+            .filter(|path| {
+                std::fs::read_to_string(path).is_ok_and(|text| text.contains("device_errors"))
+            })
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "the owner's route reaches the device rule: {outside:?}"
+        );
+    }
+
+    /// A member's key, the text it holds, and the members that make the record it is in.
+    type Record = (
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+    );
+
+    /// A member is held by the record around it, and a record with one of its members missing, or
+    /// with a member that names another record, is not that record.
+    ///
+    /// The members that make each record are written out here, and not read from the rules, so a
+    /// rule that stops asking for one of them is a case that fails.
+    #[test]
+    fn a_member_is_held_only_beside_every_member_that_names_its_record() {
+        let text = |text: &str| CanonicalValue::Text(text.to_owned());
+        let place = "/Users/marguerite/work/x";
+        // The key, what it holds, and the members that make the record it is in.
+        let records: [Record; 15] = [
+            ("reason", place, &[("subsystem", "privacy")]),
+            ("reason", place, &[("state", "unavailable")]),
+            (
+                "detail",
+                place,
+                &[("kind", "workspace"), ("change_set_id", "c-1")],
+            ),
+            ("detail", place, &[("display_path", "/x")]),
+            ("detail", place, &[("retained_staging_paths", "[]")]),
+            ("refusal", place, &[("application_instance_id", "i-1")]),
+            ("failure", place, &[("download", "failed")]),
+            (
+                "detail",
+                place,
+                &[("state", "left_out"), ("reason", "revoked")],
+            ),
+            (
+                "failure_detail",
+                place,
+                &[("handle", "h-1"), ("insertion_method", "paste")],
+            ),
+            (
+                "display_path",
+                place,
+                &[("project_repository_id", "p-1"), ("environment_id", "e-1")],
+            ),
+            (
+                "retained_staging_paths",
+                place,
+                &[("action_id", "a-1"), ("destination_state", "kept")],
+            ),
+            (
+                "removed_staging_paths",
+                place,
+                &[("action_id", "a-1"), ("destination_state", "kept")],
+            ),
+            (
+                "url",
+                place,
+                &[("remote_name", "origin"), ("transport", "local_path")],
+            ),
+            ("endpoint", place, &[("session", "s-1")]),
+            (
+                "suspension_reason",
+                A_CONVERSATION_LOCK_THAT_FAILED,
+                &[
+                    ("rich_mutations_suspended", "true"),
+                    ("binding_revision", "3"),
+                ],
+            ),
+        ];
+        // The members that must hold one text, and no other, for the record to be that one.
+        let only_as = [
+            ("state", "unavailable"),
+            ("state", "left_out"),
+            ("transport", "local_path"),
+            ("download", "failed"),
+        ];
+        let record = |key: &str, held: &str, members: &[(&str, &str)]| {
+            let mut entries = vec![(key.to_owned(), text(held))];
+            entries.extend(
+                members
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), text(value))),
+            );
+            rebuilt(entries)
+        };
+        let mut wrong = Vec::new();
+        for (key, held, members) in records {
+            if shown_value(&record(key, held, members)).is_none() {
+                wrong.push(format!("{key} is not held beside {members:?}"));
+            }
+            for left_out in 0..members.len() {
+                let without: Vec<_> = members
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter_map(|(at, member)| (at != left_out).then_some(member))
+                    .collect();
+                if shown_value(&record(key, held, &without)).is_some() {
+                    wrong.push(format!("{key} is held without {}", members[left_out].0));
+                }
+                let (name, value) = members[left_out];
+                if only_as.contains(&(name, value)) {
+                    let mut other = without;
+                    other.push((name, "another text"));
+                    if shown_value(&record(key, held, &other)).is_some() {
+                        wrong.push(format!("{key} is held with {name} other than {value}"));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
