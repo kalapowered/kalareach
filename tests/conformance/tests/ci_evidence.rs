@@ -693,16 +693,21 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
 /// hand and by nothing else, that runs the acceptance script on a hosted Windows machine by a step
 /// that is not disabled, because the landing workflow does not carry it. The Linux set that
 /// acceptance installs is built by a job of its own on a hosted Linux machine, kept, and fetched
-/// by the acceptance, and the conformance document says where the workflow is.
+/// by the acceptance, each by a step that is not disabled and runs whenever its job does, and the
+/// conformance document says where the workflow is.
 #[test]
 fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
     let workflow = fs::read_to_string(repository().join(".github/workflows/wsl-acceptance.yml"))
         .expect("the WSL2 acceptance workflow");
     let triggers = trigger_lines(&workflow);
     assert_eq!(
-        triggers,
-        ["  workflow_dispatch:"],
+        triggers.first().copied(),
+        Some("  workflow_dispatch:"),
         "the WSL2 acceptance is started by hand and by nothing else"
+    );
+    assert!(
+        triggers[1..].iter().all(|line| line.starts_with("    ")),
+        "the WSL2 acceptance has a trigger besides workflow_dispatch"
     );
     let text = job(&workflow, "acceptance");
     assert!(
@@ -749,6 +754,17 @@ fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
         set.contains("runs-on: ubuntu-24.04"),
         "the Linux set is not built on a hosted Linux machine"
     );
+    for built in steps_running(&set, "cargo build --locked -p kr-cli") {
+        assert!(
+            !is_disabled(&built),
+            "the step that builds the set is disabled"
+        );
+        assert_eq!(
+            step_condition(&built),
+            None,
+            "the step that builds the set runs under a condition"
+        );
+    }
     for kept in steps_holding(&set, "name: wsl-linux-set") {
         assert!(
             !is_disabled(&kept),
@@ -758,6 +774,11 @@ fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
             step_condition(&kept),
             None,
             "the step that keeps the set runs under a condition"
+        );
+        assert!(
+            value_at(&kept, 8, "uses")
+                .is_some_and(|action| action.starts_with("actions/upload-artifact@")),
+            "the step that keeps the set is not made by the upload action"
         );
         assert_eq!(
             value_at(&kept, 10, "if-no-files-found").as_deref(),
@@ -769,6 +790,16 @@ fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
         assert!(
             !is_disabled(&fetched),
             "the step that fetches the set is disabled"
+        );
+        assert_eq!(
+            step_condition(&fetched),
+            None,
+            "the step that fetches the set runs under a condition"
+        );
+        assert!(
+            value_at(&fetched, 8, "uses")
+                .is_some_and(|action| action.starts_with("actions/download-artifact@")),
+            "the step that fetches the set is not made by the download action"
         );
     }
 
