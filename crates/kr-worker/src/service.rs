@@ -196,6 +196,8 @@ struct Owed {
 /// The worker's endpoint server.
 pub struct WorkerService {
     runtime: Arc<SessionRuntime>,
+    /// The session's marks and its beat, which this service's idle clocks fall on.
+    activity: Arc<crate::lifecycle::Activity>,
     identity: Arc<WorkerIdentity>,
     endpoint: Endpoint,
     environment_id: EnvironmentId,
@@ -662,7 +664,9 @@ impl WorkerService {
                 wall,
             ));
         }
+        let activity = runtime.session().activity();
         Ok(Self {
+            activity,
             runtime,
             identity,
             endpoint,
@@ -1771,18 +1775,26 @@ impl WorkerService {
     /// outright. Then the records past the retention period are collected, on the schedule the
     /// journal itself keeps rather than on this one.
     async fn maintain(self: Arc<Self>) {
-        let mut tick = tokio::time::interval(HOST_MAINTENANCE);
         // The first pass happens at once, so a host that has just come up collects, looks at its
         // clocks before it waits a minute to do either.
-        tick.tick().await;
         loop {
             // The pass commits to the journal under the dispatch barrier and the session, on a
             // thread the executor can do without.
             if self.maintain_pass() {
                 break;
             }
-            tick.tick().await;
+            tokio::time::sleep_until(self.on_the_beat(HOST_MAINTENANCE)).await;
         }
+    }
+
+    /// Returns when something that is due in `wait` from now is waited for: on the session's beat
+    /// where it is a whole beat or more, so that the idle clocks of this host wake it together.
+    fn on_the_beat(&self, wait: std::time::Duration) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        tokio::time::Instant::from_std(
+            self.activity
+                .on_the_beat((now + wait).into_std(), now.into_std()),
+        )
     }
 
     /// One pass of the host's maintenance, made on a thread the executor can do without. Returns
@@ -1965,13 +1977,11 @@ impl WorkerService {
         let withdrawn = Arc::clone(&registration.withdrawn);
         state.facts.attachments = Arc::clone(&registration.attachments);
         state.withdrawn = Arc::clone(&registration.withdrawn);
-        // The timer fires once immediately; that first tick is consumed here so a connection is
-        // not handed a replacement window before it has read the one in its acknowledgement. It is
-        // let go of when the connection turns out to be one that admits no mutation, so that such
-        // a connection keeps no clock at all.
-        let mut every = tokio::time::interval(self.window_renewal);
-        every.tick().await;
-        let mut renewal = Some(every);
+        // The first replacement is due a period from now, so a connection is not handed a window
+        // before it has read the one in its acknowledgement. The clock is let go of when the
+        // connection turns out to be one that admits no mutation, so that such a connection keeps
+        // none at all.
+        let mut renewal = Some(self.on_the_beat(self.window_renewal));
         // When the next keepalive is due, on a connection a process bridge made, and never on any
         // other: nothing else reads this stream for silence, so another connection keeps no
         // keepalive clock and its host is not woken for it. The hello is what says which it is,
@@ -2047,12 +2057,13 @@ impl WorkerService {
                     // before a mutation. A connection whose registration has been withdrawn is no
                     // longer that: a replacement window for it would be a freshness resource issued
                     // to authority that has gone, so the renewal stops with the registration.
-                    _ = async {
-                        match renewal.as_mut() {
-                            Some(every) => every.tick().await,
+                    () = async {
+                        match renewal {
+                            Some(due) => tokio::time::sleep_until(due).await,
                             None => std::future::pending().await,
                         }
                     }, if state.facts.negotiated => {
+                        renewal = Some(self.on_the_beat(self.window_renewal));
                         if self.check_authority(&state.facts).is_err() {
                             continue;
                         }
@@ -3697,7 +3708,7 @@ impl WorkerService {
             .wait_ms
             .get()
             .min(kr_protocol::attention::MAX_ATTENTION_SOURCE_WAIT_MS);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(bound);
+        let deadline = self.on_the_beat(std::time::Duration::from_millis(bound));
         let recorded = request.recorded_generation.0.map(U64::get);
         let mut generation: Option<Option<U64>> = None;
         loop {
