@@ -9,12 +9,13 @@
 //! surface a candidate reaches before it is paired.
 //!
 //! The rule: an error a device receives keeps its code, its retry category and its diagnostic
-//! identifier. Its message is kept when it names nothing of this host. A command quoted in
-//! backticks is a quotation with an end, so it is replaced by `a command` and the sentence it was
-//! in is kept. Anything else that names the host (a path of any kind, the number of an account, the
-//! name of a program that changes who may use a file) has no end this module can find, so the device
-//! is given the part of the message that comes before the first such name, if that is a clause of
-//! its own, and otherwise a sentence composed here from the code.
+//! identifier. Its message is kept when it names nothing of this host, unless the refusal is one
+//! this module knows by its wording ([`KNOWN_REASONS`]), which is told by its reason. A command
+//! quoted in backticks is a quotation with an end, so it is replaced by `a command` and the
+//! sentence it was in is kept. Anything else that names the host (a path of any kind, the number
+//! of an account, the name of a program that changes who may use a file) has no end this module
+//! can find, so the device is given the part of the message that comes before the first such name,
+//! if that is a clause of its own, and otherwise a sentence composed here from the code.
 //!
 //! The same rule reaches an error wherever it is, because the text of an error that has already
 //! been made (a worker's, one a store kept, one a catalogue receipt holds) cannot be made again:
@@ -856,7 +857,7 @@ mod tests {
     ];
 
     /// Text that is the host's own sentence, or the device's own words back, and names nothing.
-    const NAMES_NOTHING: [&str; 19] = [
+    const NAMES_NOTHING: [&str; 20] = [
         "the invitation expired",
         "session 0193 has closed",
         "src/main.rs is not tracked",
@@ -876,6 +877,8 @@ mod tests {
         "this environment is already in machine group 0193abcd-1111-4222-8333-444455556666",
         "this environment is already in machine group 01234567-89ab-4cde-8f01-234567890abc",
         "the page read 42 users and 7 groups",
+        // Holds one marker of a refusal this module knows by its wording, and not the others.
+        "a task named backup was not run",
     ];
 
     fn error(code: ErrorCode, message: &str) -> ProtocolError {
@@ -1628,7 +1631,9 @@ mod tests {
                     error_for_a_device(&error(ErrorCode::ResourceUnavailable, &said)).into_owned();
                 assert_eq!(shown.code, ErrorCode::ResourceUnavailable);
                 assert!(
-                    !shown.message.contains("marguerite") && !shown.message.contains("kr host"),
+                    shown.message.contains("not this installation's own")
+                        && !shown.message.contains("marguerite")
+                        && !shown.message.contains("kr host"),
                     "{said}: {shown:?}"
                 );
             }
