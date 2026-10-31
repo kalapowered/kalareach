@@ -15,15 +15,20 @@
 //! Any other list is refused as well, whether or not it admits more, and the refusal says which
 //! it is. An object "admits more" when its entries show a loss that the starter's own does not
 //! have: no access list, a null one, an allowing entry for a trustee that the starter's own allows
-//! nothing (other than the owner's rights), a denying entry taken away, a lower integrity level or
-//! a weaker policy. That is a reading of the entries, not an evaluation of which entry decides for
-//! a given process, so an allowing entry behind a denying one is still called wider. An object
-//! whose entries differ in any other way (other rights on an entry, another order, an entry more
-//! or less often, an entry for the owner's rights left out) "is not one the starter accepts",
-//! because this module compares neither rights nor order.
+//! nothing (other than the owner's rights), a denying entry whose trustee has none left, a lower
+//! integrity level or a weaker policy. That is a reading of the entries, not an evaluation of
+//! which entry decides for a given process, so an allowing entry behind a denying one is still
+//! called wider. An object whose entries differ in any other way (other rights on an entry,
+//! another order, an entry more or less often, an allowing entry for the owner's rights left out)
+//! "is not one the starter accepts", because this module does not evaluate what a difference in
+//! rights or in order does to access.
 //!
-//! The text of an access list is checked against the system's own count of its entries, so that no
-//! text, whatever it holds, can be read as fewer entries than the list has.
+//! The text of an access list is read only when it holds as many entries as the list itself, as
+//! the system counts them, and a text that holds a string in a condition is read only when it is
+//! the starter's own. The grammar has no form for a double quote inside a string and no run shows
+//! what the system writes for one, so nothing else keeps a string from ending early and hiding the
+//! entries up to the next quote, and a count alone does not: false entries can stand in for the
+//! hidden ones.
 //!
 //! The text is what the system writes for a descriptor, `D:` and its entries for an access list or
 //! `S:` and its label entry for the integrity label. Nothing here calls the system, so it is read
@@ -82,8 +87,8 @@ impl fmt::Display for Stop {
 /// Why an object that was read is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Refusal {
-    /// Whether the text shows that the object admits more than the starter's own does. If not, the
-    /// object is one the starter does not accept, and may admit no more.
+    /// Whether the entries show that the object admits more than the starter's own does. If not,
+    /// the object is one the starter does not accept, and may admit no more.
     admits_more: bool,
     /// What differs.
     why: String,
@@ -114,6 +119,14 @@ impl Refusal {
 /// starter's own, or that it is not one the starter accepts.
 pub(super) fn require_no_more(own: &Texts<'_>, found: &Texts<'_>) -> Result<(), Stop> {
     let unreadable = |what: &'static str| move |why| Stop::Unreadable { what, why };
+    if found.access.contains('"') && found.access.trim() != own.access.trim() {
+        return Err(Stop::Unreadable {
+            what: "access list",
+            why: "it holds a string in a condition and is not the starter's own, and the entries \
+                  around such a string cannot be told apart from it"
+                .to_owned(),
+        });
+    }
     let (own_list, found_list) = (
         access_list_of(own.access, own.access_entries).map_err(unreadable("access list"))?,
         access_list_of(found.access, found.access_entries).map_err(unreadable("access list"))?,
@@ -167,7 +180,7 @@ struct Entry {
     /// Everything that decides whom the entry affects and what it affects: the kind, the rights,
     /// the object identifiers, the trustee and any condition. The flags that say which child
     /// objects inherit the entry are not in it, because they do not change who may use this
-    /// object; an entry for the owner's rights keeps them.
+    /// object; an allowing entry for the owner's rights keeps them.
     meaning: String,
     /// Whom the entry is for.
     trustee: String,
@@ -312,12 +325,12 @@ fn label(text: &str) -> Result<Label, String> {
 
 /// Says why `found` is refused against `own`, or nothing when it is used.
 ///
-/// Fewer allowing entries admit less, except an entry for the owner's rights, and further denying
-/// entries admit less. A missing denying entry, an allowing entry for a trustee the starter's own
-/// allows nothing, and a null or absent list where there were entries admit more. Every other
-/// difference, an entry with other rights, one more or less often, entries in another order that
-/// the system may evaluate differently, cannot be shown to admit more or to admit no more, and is
-/// refused as not accepted.
+/// Fewer allowing entries admit less, except an allowing entry for the owner's rights, and
+/// further denying entries admit less. A missing denying entry, an allowing entry for a trustee
+/// the starter's own allows nothing, and a null or absent list where there were entries admit
+/// more. Every other difference, an entry with other rights, one more or less often, entries in
+/// another order that the system may evaluate differently, cannot be shown to admit more or to
+/// admit no more, and is refused as not accepted.
 fn access_list_refusal(own: &AccessList, found: &AccessList) -> Option<Refusal> {
     match (own, found) {
         (AccessList::Entries(own), AccessList::Entries(found)) => entries_refusal(own, found),
@@ -377,7 +390,7 @@ fn entries_refusal(own: &[Entry], found: &[Entry]) -> Option<Refusal> {
         list.iter()
             .any(|entry| entry.decision == decision && entry.trustee == trustee)
     };
-    // The text shows that these admit more: nothing in the starter's own allows the trustee, or
+    // The entries show that these admit more: nothing in the starter's own allows the trustee, or
     // nothing in the found list denies the trustee that the starter's own denies.
     if let Some(entry) = found.iter().find(|entry| {
         entry.decision == Decision::Allow && !for_trustee(own, Decision::Allow, &entry.trustee)
@@ -395,7 +408,7 @@ fn entries_refusal(own: &[Entry], found: &[Entry]) -> Option<Refusal> {
             entry.meaning
         )));
     }
-    // Everything else differs in a way the text alone does not show to admit more.
+    // Everything else differs in a way this reading does not weigh.
     let times = |list: &[Entry], entry: &Entry| list.iter().filter(|other| *other == entry).count();
     if let Some(entry) = found
         .iter()
@@ -689,8 +702,9 @@ mod tests {
         assert!(access_list("D:(XA;;FX;;;WD;(@User.X==\"a(b\"))(A;;GA;;;SY)\"").is_err());
     }
 
-    /// KR-REQ-03.24: the fields of an entry are split at the semicolons outside its condition, and a
-    /// condition's strings, which may hold an unbalanced parenthesis or a semicolon, do not end it.
+    /// KR-REQ-03.24: the fields of an entry are split at the semicolons outside its
+    /// condition, and a condition's strings, which may hold an unbalanced parenthesis or a
+    /// semicolon, do not end it.
     #[test]
     fn the_fields_of_an_entry_are_split_outside_its_condition_and_its_strings() {
         let last = "x";
@@ -877,8 +891,8 @@ mod tests {
         );
     }
 
-    /// KR-REQ-03.24: an entry for the owner's rights is compared with its inheritance flags, which
-    /// an entry for anyone else is not.
+    /// KR-REQ-03.24: an allowing entry for the owner's rights is compared with its
+    /// inheritance flags, which an entry for anyone else is not.
     #[test]
     fn an_entry_for_the_owners_rights_keeps_its_flags() {
         for owner in ["OW", "S-1-3-4"] {
@@ -1069,6 +1083,59 @@ mod tests {
         // A string outside an entry is not skipped: it is an error, and so is one never closed.
         assert!(access_list("D:(A;;0x1;;;SY)\"(A;;GA;;;WD)\"").is_err());
         assert!(access_list("D:(A;;0x1;;;SY)(XA;;FX;;;WD;(@User.X==\"a))").is_err());
+    }
+
+    /// KR-REQ-03.24: a text that holds a string in a condition is read only when it is the
+    /// starter's own. A count of entries is not enough for it: a double quote inside a string, for
+    /// which the grammar has no form, ends the string early, and false entries it makes can stand
+    /// in for the entries it hides.
+    #[test]
+    fn an_access_list_with_a_string_in_a_condition_is_read_only_as_the_starters_own() {
+        let own_text = "D:(A;;0x1;;;SY)";
+        let own = texts(own_text, "");
+        // Four entries hidden as two, and four entries of which one is the hidden allow for
+        // everyone inside a false one, so that the counts agree.
+        let compensating = "D:(XD;;0x1;;;BG;(@User.X==\"a\"))(D;;0x1;;;BG)\
+                            (XD;;0x1;;;BG;(@User.X==\"a\"b\"))(A;;GA;;;WD)\
+                            (XD;;0x1;;;BG;(@User.X==\"c\"d\"))(A;;0x1;;;SY)";
+        let found = |access, entries| {
+            require_no_more(
+                &own,
+                &Texts {
+                    access,
+                    access_entries: entries,
+                    label: "",
+                },
+            )
+        };
+        let hidden = found(compensating, entries(compensating));
+        assert!(
+            matches!(&hidden, Err(stop) if stop.is_unreadable()),
+            "{hidden:?}"
+        );
+
+        // Any other list with a string in it is not read, whatever the count, also one that would
+        // be only narrower.
+        let narrower = "D:(XD;;0x1;;;BG;(@User.X==\"a(b\"))(A;;0x1;;;SY)";
+        let unread = found(narrower, 2);
+        assert!(
+            matches!(&unread, Err(stop) if stop.is_unreadable()),
+            "{unread:?}"
+        );
+
+        // The starter's own with a string in it is itself, and is used.
+        let with_a_string = "D:(XA;;FX;;;WD;(@User.X==\"a(b\"))(A;;0x1;;;SY)";
+        let strung = Texts {
+            access: with_a_string,
+            access_entries: 2,
+            label: "",
+        };
+        assert_eq!(require_no_more(&strung, &strung), Ok(()));
+        // A list without a string is read as before, whichever the starter's own is.
+        assert_eq!(
+            require_no_more(&strung, &texts("D:(A;;0x1;;;SY)", "")),
+            Ok(())
+        );
     }
 
     /// KR-REQ-03.24: what a person reads says whether the object admits more, or is only one the
