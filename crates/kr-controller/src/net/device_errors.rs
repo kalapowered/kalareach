@@ -139,20 +139,21 @@ const FAILURE_TEXTS: [FailureText; 6] = [
 ];
 
 /// The host's own reasons for refusing the argument of a call that reaches the agent of a session,
-/// by the shape of their wording, and what a device is told of each.
+/// by the shape of their wording, and the sentence a device is told of each.
 ///
 /// The worker puts the upstream's words under the same code with nothing before them, so the
 /// host's own reasons are told apart from them by their wording, and a message that is not one of
 /// these is the upstream's. A shape does not show where its words came from: a `{}` stands for any
-/// one word, which the upstream could have written. A reason whose shape holds only text of the
-/// host's own and numbers (`{n}`, digits) is sent as it is. Any other is recognised and the device
-/// is given the sentence beside it, which holds no word of the message.
+/// one word, which the upstream could have written, and so could the digits of a size. So no word
+/// or number of a message reaches a device. The device is given the sentence beside the shape, a
+/// closed set of this host's own text, or the shape itself where it has no `{}` and so is one
+/// fixed sentence already.
 const OWN_ARGUMENT_REASONS: [(&str, Option<&str>); 6] = [
     ("a prompt names either a draft or inline text", None),
     ("a prompt names a draft or inline text, not both", None),
     (
-        "the package accepts {n} bytes of an attachment and this one is {n}",
-        None,
+        "the package accepts {} bytes of an attachment and this one is {}",
+        Some("the attachment is larger than the package accepts"),
     ),
     (
         "{} does not declare a parameter named {}",
@@ -167,11 +168,6 @@ const OWN_ARGUMENT_REASONS: [(&str, Option<&str>); 6] = [
         Some("the package does not accept this kind of attachment"),
     ),
 ];
-
-/// The longest word of an argument that stands for a `{}` of an own reason, and the most digits
-/// of a `{n}`.
-const LONGEST_ARGUMENT_WORD: usize = 128;
-const LONGEST_NUMBER: usize = 20;
 
 /// The error `error` is for a device: itself when it names nothing of this host, and otherwise the
 /// error the module note describes.
@@ -339,38 +335,28 @@ fn told_in_place_of_the_upstreams(error: &ProtocolError) -> Option<String> {
             .find(|(shape, _)| fits_shape(shape, &error.message))
         {
             None => Some(from_the_code()),
-            Some((_, kind)) => kind.map(str::to_owned),
+            // A shape with no `{}` is its own sentence, and the message is that sentence.
+            Some((_, Some(sentence))) => Some((*sentence).to_owned()),
+            Some((_, None)) => None,
         },
         _ => None,
     }
 }
 
 /// Whether `message` is `shape` with one word of the argument, up to the next space, in place of
-/// each `{}`, and a number in place of each `{n}`.
+/// each `{}`.
 fn fits_shape(shape: &str, message: &str) -> bool {
     let (mut shape, mut rest) = (shape, message);
-    while let Some(open) = shape.find('{') {
-        let Some(close) = shape[open..].find('}').map(|at| open + at) else {
-            return false;
-        };
+    while let Some(open) = shape.find("{}") {
         let Some(after) = rest.strip_prefix(&shape[..open]) else {
             return false;
         };
-        let length = after.find(char::is_whitespace).unwrap_or(after.len());
-        let word = &after[..length];
-        let fits = match &shape[open + 1..close] {
-            "" => (1..=LONGEST_ARGUMENT_WORD).contains(&word.len()),
-            "n" => {
-                (1..=LONGEST_NUMBER).contains(&word.len())
-                    && word.bytes().all(|b| b.is_ascii_digit())
-            }
-            _ => false,
-        };
-        if !fits {
+        let word = after.find(char::is_whitespace).unwrap_or(after.len());
+        if word == 0 {
             return false;
         }
-        rest = &after[length..];
-        shape = &shape[close + 1..];
+        rest = &after[word..];
+        shape = &shape[open + "{}".len()..];
     }
     rest == shape
 }
@@ -1694,22 +1680,17 @@ mod tests {
         };
         let neither = prompt(false, false).validate().expect_err("no prompt");
         let both = prompt(true, true).validate().expect_err("two prompts");
-        // Reasons made of the host's own text and numbers are sent as they are.
+        // A reason with no word of the argument in it is sent as the host wrote it.
         for (method, message) in [
             (Method::AgentPromptSubmit, neither),
             (Method::AgentPromptQueue, both),
-            // The worker's refusal of an attachment over the size a package accepts.
-            (
-                Method::PluginActionInvoke,
-                "the package accepts 1048576 bytes of an attachment and this one is 2097152",
-            ),
         ] {
             let told = told_on(method, ErrorCode::InvalidArgument, message);
             assert_eq!(told.message, message, "{method:?}");
             assert_eq!(told.code, ErrorCode::InvalidArgument);
         }
-        // The worker's refusals that quote a word of the argument are told by what they refuse,
-        // without the word.
+        // The worker's refusals that quote a word or a number of the argument are told by what they
+        // refuse, without it.
         for (message, kind, quoted) in [
             (
                 "summarise does not declare a parameter named depth",
@@ -1725,6 +1706,11 @@ mod tests {
                 "the package does not accept application/zip as an attachment",
                 "does not accept this kind of attachment",
                 "zip",
+            ),
+            (
+                "the package accepts 1048576 bytes of an attachment and this one is 2097152",
+                "larger than the package accepts",
+                "1048576",
             ),
         ] {
             let told = told_on(
@@ -1760,22 +1746,30 @@ mod tests {
             "marguerite@example.com does not declare a parameter named depth",
             "the package does not accept marguerite as an attachment",
             "the package accepts marguerite bytes of an attachment and this one is 20",
+            // And a number that is an account's, in the place of a size.
+            "the package accepts 501 bytes of an attachment and this one is 2097152",
+            "the package accepts 1048576 bytes of an attachment and this one is 502",
         ] {
             let refused = upstream(said);
             assert_eq!(refused.code, ErrorCode::InvalidArgument);
             let told = told_on(Method::AgentPromptSubmit, refused.code, &refused.message);
             assert_eq!(told.code, ErrorCode::InvalidArgument);
             assert!(
-                !told.message.contains("marguerite") && !told.message.contains("cwd"),
+                !["marguerite", "cwd", "501", "502"]
+                    .iter()
+                    .any(|word| told.message.contains(word)),
                 "{told:?}"
             );
         }
-        // A reason of the host's that quotes a place is cut as any message is.
+        // A reason of the host's that quotes a place is told by its kind, without the place.
         let told = told_on(
             Method::PluginActionInvoke,
             ErrorCode::InvalidArgument,
             "the package does not accept /Users/marguerite/x.zip as an attachment",
         );
-        assert!(!told.message.contains("marguerite"), "{told:?}");
+        assert!(
+            !told.message.contains("marguerite") && !told.message.contains('/'),
+            "{told:?}"
+        );
     }
 }
