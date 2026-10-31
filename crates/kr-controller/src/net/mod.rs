@@ -4560,13 +4560,16 @@ pub(crate) mod tests {
         );
     }
 
-    /// The pairing surface the transport is given for a candidate does not show it what this host's
-    /// own store reported.
+    /// The pairing surface the host's handler gives the transport is the one held to the rule for a
+    /// candidate: a storage failure is told to it as a sentence of this host's, whatever the store
+    /// said.
     ///
     /// The store the invitations are read from stops answering, which a candidate meets as a
-    /// storage failure; the transport reaches the surface through the host's handler.
+    /// storage failure. Without the rule the candidate is told the sentence the pairing service
+    /// makes of it, so the case holds the handler's wrapper and not the words of the store.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_pairing_surface_a_candidate_reaches_does_not_show_what_the_store_reported() {
+    async fn the_pairing_surface_the_host_hands_the_transport_holds_a_storage_failure_to_the_rule()
+    {
         use kr_protocol::envelope::ParamsValue;
         use kr_protocol::error::ErrorCode;
         use kr_protocol::ids::{ConnectionId, InvitationId};
@@ -4624,7 +4627,7 @@ pub(crate) mod tests {
         assert_eq!(told.code, ErrorCode::StorageUnavailable, "{told:?}");
         assert!(
             told.message.contains("not sent to a candidate"),
-            "what the store reported is not shown to a candidate: {told:?}"
+            "a storage failure is told to a candidate by the rule for a candidate: {told:?}"
         );
         network.shutdown().await;
     }
