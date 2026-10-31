@@ -14,6 +14,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -192,6 +193,42 @@ fn copy_directory_into(root: &Path, relative: &str) {
                 &format!("{relative}/{}", entry.file_name().to_string_lossy()),
             );
         }
+    }
+}
+
+/// How long a script's background jobs are given to end once the script has: the emulator's
+/// stand-in records its call and ends, and the page server's stand-in ends with the script, so
+/// this is only what a loaded machine adds to the moments they need.
+const JOBS_END_WITHIN: Duration = Duration::from_secs(60);
+
+/// Returns once no process has `root`, the directory the case made, in its command line: the script
+/// and every job it started from there (each runs a program of the case's own) are over, and the
+/// record holds every call they made.
+///
+/// A job the script put in the background is not waited for by the script or by the case's read of
+/// its output, and a script that fails soon after starting the emulator can end first.
+fn until_nothing_of_the_case_runs(root: &Path) {
+    let begun = Instant::now();
+    loop {
+        let found = Command::new("pgrep")
+            .arg("-f")
+            .arg("--")
+            .arg(root)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("pgrep lists the processes that name the case's directory");
+        // 0 when some process matches, 1 when none does; anything else is pgrep's own failure.
+        match found.code() {
+            Some(1) => return,
+            Some(0) => {}
+            other => panic!("pgrep ended with {other:?}"),
+        }
+        assert!(
+            begun.elapsed() < JOBS_END_WITHIN,
+            "something the script started in {} was still running {JOBS_END_WITHIN:?} after it ended",
+            root.display()
+        );
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -426,6 +463,9 @@ fn run(
     let output = command.output().expect("the script runs");
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
+    // A script starts its emulator as a background job and may end before that job has run its
+    // first line, so what the record holds is read once nothing of the case is left running.
+    until_nothing_of_the_case_runs(root);
     let calls = fs::read_to_string(&record)
         .expect("the record")
         .lines()
