@@ -5763,11 +5763,40 @@ mod tests {
         });
 
         let outcome = waiting.join().expect("the waiting request ends");
-        assert!(outcome.is_err(), "it is told the look had no answer");
+        assert!(
+            matches!(outcome, Err(Unfound::Passing(_))),
+            "it is told the look had no answer, which says nothing of the Git: {outcome:?}"
+        );
         assert!(
             installation.current.lock().expect("the slot").is_none(),
             "and the next request makes a look of its own"
         );
+    }
+
+    /// A look that is said to have found Git and left none behind is a look that ended without an
+    /// answer, and a request that waited for it is told so as a fault that passes, as it is for a
+    /// look whose request stopped: nothing is known of the Git.
+    ///
+    /// A platform that runs no Git refuses a request before it reaches the slot, so the case is for
+    /// the platforms that look for it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_look_that_ended_and_left_no_git_behind_is_a_fault_that_passes() {
+        let installation = Installation::looked_for_on(None, PROBE_BOUND);
+        let look = Arc::new(Look::default());
+        look.end(Ok(()));
+        *installation.current.lock().expect("the slot") = Some(look);
+
+        let refusal = installation
+            .program()
+            .map(|_| ())
+            .expect_err("a look that left no Git behind has none to give");
+
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+        assert!(refusal.to_string().contains("ended without an answer"));
     }
 
     /// Ends the look it borrows when it goes out of scope, if nothing has ended it, so that a case
