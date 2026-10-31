@@ -2141,8 +2141,8 @@ mod tests {
             // The refusal is told the same without the command, which is not what holds it.
             for said in [
                 format!(
-                    "could not start a worker: {foreign}: run kr host startup --set standalone \
-                     for this environment"
+                    "could not start a worker: {foreign}: {} for this environment",
+                    crate::supervision::windows::SETUP_ACTION
                 ),
                 format!("could not start a worker: {foreign}"),
             ] {
@@ -2449,15 +2449,18 @@ mod tests {
 
     #[test]
     fn what_the_task_scheduler_said_is_not_told_to_a_device() {
-        use crate::supervision::windows::{Asked, Outcome as Ran, ReadBack, TaskError, task_name};
+        use crate::supervision::windows::{
+            Asked, Outcome as Ran, ReadBack, TaskError, could_not_list, could_not_list_tasks,
+            did_not_register, did_not_remove, did_not_run, task_name,
+        };
         let name = task_name(kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()));
         // What each command of the Task Scheduler's failure begins with, and what it was doing.
         let failures = [
-            (format!("{DID_NOT_REGISTER}{name}"), "register"),
-            (format!("{DID_NOT_REMOVE}{name}"), "remove"),
-            (format!("{COULD_NOT_LIST}its tasks"), "list"),
-            (format!("{COULD_NOT_LIST}{name}"), "list"),
-            (format!("{DID_NOT_RUN}{name}"), "run"),
+            (did_not_register(&name), "register"),
+            (did_not_remove(&name), "remove"),
+            (could_not_list_tasks(), "list"),
+            (could_not_list(&name), "list"),
+            (did_not_run(&name), "run"),
         ];
         // What it may say after: a bare account, an address, a line of an identity, a command.
         let said = [
@@ -3224,7 +3227,9 @@ mod tests {
 
     #[test]
     fn a_task_that_differs_from_the_environments_own_is_told_to_a_device_without_what_it_holds() {
-        use crate::supervision::windows::{Difference, ReadBack, TaskError, task_name};
+        use crate::supervision::windows::{
+            Difference, ReadBack, TaskError, task_differs, task_name,
+        };
         let name = task_name(kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()));
         let differences = vec![
             Difference::Arguments {
@@ -3237,17 +3242,9 @@ mod tests {
             },
             Difference::RunLevel("uid: 501".to_owned()),
         ];
-        let joined = differences
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ");
         for said in [
             // The launch refusal, then the command that mends it.
-            format!(
-                "the environment's task {name}{NOT_THE_ONE_REGISTERED}{joined}): run kr host \
-                 startup --set standalone to repair it"
-            ),
+            task_differs(&name, &differences),
             // A change that read back differently.
             TaskError::ReadBack {
                 name: name.clone(),
