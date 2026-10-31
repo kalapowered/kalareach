@@ -898,6 +898,69 @@ fn presence_of(generation: Option<u64>, asked: Asked) -> Presence {
     }
 }
 
+/// The error Terminal Services fails a query for one session with when it has no such session.
+#[cfg(any(windows, test))]
+const NO_SUCH_SESSION_ERROR: u32 = 7022;
+
+/// What Terminal Services' query about one session returned, before anything is made of it.
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Query {
+    /// A record that was read.
+    Record(SessionRecord),
+    /// The query failed, with this error when the system gave one.
+    Failed(Option<u32>),
+    /// The query succeeded and returned nothing this host can read: no buffer, a short one, or a
+    /// logon time before the epoch.
+    Unreadable,
+}
+
+/// What Terminal Services' list of sessions makes of a session number.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Listing {
+    /// The list holds the number.
+    Holds,
+    /// The list was had and lacks the number.
+    Lacks,
+    /// The list could not be had, or came back with no session in it.
+    Unread,
+}
+
+/// Says what the system's list of sessions makes of `session`, given the numbers it holds.
+///
+/// A host always has the services session, so a list with nothing in it is not an answer.
+#[cfg(any(windows, test))]
+fn listing_of(held: &[u32], session: u32) -> Listing {
+    if held.is_empty() {
+        Listing::Unread
+    } else if held.contains(&session) {
+        Listing::Holds
+    } else {
+        Listing::Lacks
+    }
+}
+
+/// Says what Terminal Services answered about a session from what its query returned.
+///
+/// A record is the answer, and so is the error that says there is no such session. Any other
+/// failure, and a success with nothing readable, say nothing about whether the session exists
+/// (the system fails a query for a number it does not have in more than one way), so the list of
+/// sessions is asked, and only when the query leaves the question open. A number the list lacks is
+/// a session that is not there. A number it holds, and a list that cannot be had, leave the
+/// question open.
+#[cfg(any(windows, test))]
+fn asked_of(query: Query, listing: impl FnOnce() -> Listing) -> Asked {
+    match query {
+        Query::Record(record) => Asked::Record(record),
+        Query::Failed(Some(NO_SUCH_SESSION_ERROR)) => Asked::NoSuchSession,
+        Query::Failed(_) | Query::Unreadable => match listing() {
+            Listing::Lacks => Asked::NoSuchSession,
+            Listing::Holds | Listing::Unread => Asked::Unanswered,
+        },
+    }
+}
+
 #[cfg(windows)]
 mod logon;
 
@@ -966,7 +1029,8 @@ fn availability(state: &str, locked: bool, active: bool) -> DesktopAvailability 
 #[cfg(test)]
 mod tests {
     use super::{
-        Asked, Login, Presence, Reading, SessionRecord, presence, presence_of, reading_of,
+        Asked, Listing, Login, Presence, Query, Reading, SessionRecord, asked_of, listing_of,
+        presence, presence_of, reading_of,
     };
     #[cfg(target_os = "macos")]
     use super::{creator_pid, domain_header};
@@ -1144,6 +1208,87 @@ mod tests {
         assert_eq!(presence_of(Some(5), Asked::Unanswered), Presence::Unknown);
     }
 
+    /// KR-REQ-03.18: the system's list of sessions says a number is there, is not there, or says
+    /// nothing, and a list with no session in it says nothing, because every host has the services
+    /// session.
+    #[test]
+    fn the_list_of_sessions_settles_a_number_only_when_it_holds_sessions() {
+        assert_eq!(listing_of(&[0, 2, 5], 5), Listing::Holds);
+        assert_eq!(listing_of(&[0, 2, 5], 0), Listing::Holds);
+        assert_eq!(listing_of(&[0, 2, 5], 4), Listing::Lacks);
+        assert_eq!(listing_of(&[0, 2, 5], u32::MAX), Listing::Lacks);
+        assert_eq!(listing_of(&[], 5), Listing::Unread);
+    }
+
+    /// KR-REQ-03.18: a login whose session the system does not have has ended, a login whose session
+    /// the system has, or whose existence it cannot tell, is not known to have, and the list of
+    /// sessions is asked only when the query itself leaves the question open.
+    #[test]
+    fn a_login_has_ended_only_when_the_system_has_no_such_session() {
+        let never = || -> Listing { panic!("the list of sessions was asked after an answer") };
+        // The error for a session that is not there, and a record, are answers.
+        assert_eq!(
+            asked_of(Query::Failed(Some(super::NO_SUCH_SESSION_ERROR)), never),
+            Asked::NoSuchSession
+        );
+        let record = SessionRecord {
+            logon_time: 133_900_000_000_000_000,
+            remote: false,
+        };
+        assert_eq!(
+            asked_of(Query::Record(record.clone()), never),
+            Asked::Record(record)
+        );
+
+        // Any other failure, a failure with no error, and a reply with nothing readable in it
+        // leave the question to the list: a number it lacks is not a session, a number it holds
+        // or a list that could not be had leaves the login's end unknown.
+        for query in [
+            Query::Failed(Some(5)),
+            Query::Failed(Some(1722)),
+            Query::Failed(None),
+            Query::Unreadable,
+        ] {
+            assert_eq!(
+                asked_of(query.clone(), || Listing::Lacks),
+                Asked::NoSuchSession,
+                "{query:?}"
+            );
+            assert_eq!(
+                asked_of(query.clone(), || Listing::Holds),
+                Asked::Unanswered,
+                "{query:?}"
+            );
+            assert_eq!(
+                asked_of(query.clone(), || Listing::Unread),
+                Asked::Unanswered,
+                "{query:?}"
+            );
+
+            // What the host then reads: the login has ended, or it is not known to have.
+            assert_eq!(
+                presence_of(Some(5), asked_of(query.clone(), || Listing::Lacks)),
+                Presence::Ended
+            );
+            assert_eq!(
+                presence_of(Some(5), asked_of(query.clone(), || Listing::Holds)),
+                Presence::Unknown
+            );
+            assert_eq!(
+                presence_of(Some(5), asked_of(query.clone(), || Listing::Unread)),
+                Presence::Unknown
+            );
+            // And a process in the session that cannot be asked about does not read itself as
+            // gone, whatever the list says.
+            for listing in [Listing::Holds, Listing::Lacks, Listing::Unread] {
+                assert_eq!(
+                    reading_of(5, asked_of(query.clone(), || listing)),
+                    Reading::Unavailable
+                );
+            }
+        }
+    }
+
     /// KR-REQ-03.18: a process in a user session reads that session's login whatever rights its
     /// account has, with the session's logon time as the generation, and asking about the session
     /// by number says the same login is still there and a login with another logon time is not.
@@ -1180,15 +1325,44 @@ mod tests {
             ),
             Presence::Ended
         );
-        for nobody in [
-            "123456789".to_owned(),
-            format!("99{session}"),
-            "992".to_owned(),
-        ] {
+
+        // The system's list of sessions holds the session this process runs in. That is what makes
+        // a number it lacks a session that is not there, and a number it holds one that is.
+        let listed = super::logon::sessions();
+        assert!(
+            listed.contains(&session),
+            "the system's list of sessions {listed:?} lacks the session {session} this process runs in"
+        );
+        assert_eq!(listing_of(&listed, session), Listing::Holds);
+
+        // Numbers that cannot name a session of a host: far beyond the numbers a host hands out
+        // (the listener sessions start at 65536, and the services session is 0), and none of them
+        // is 4294967295, which the system reads as the caller's own session. The first three the
+        // system answers with the error that says there is no such session, and the others with
+        // another error, which only the list of sessions settles. A host that lists one of them
+        // fails here, and says so, rather than passing without having shown anything.
+        let nobody = [
+            1_048_576_u32,
+            123_456_789,
+            2_147_483_647,
+            1_000,
+            4_096,
+            65_535,
+        ];
+        for number in nobody {
+            assert!(
+                !listed.contains(&number),
+                "this host lists a session {number}, so this case cannot show what it is for"
+            );
             assert_eq!(
-                super::named_presence(&nobody, login.generation, 0),
+                super::logon::record(number),
+                Asked::NoSuchSession,
+                "session {number}, which nobody holds, is not a session of this host"
+            );
+            assert_eq!(
+                super::named_presence(&number.to_string(), login.generation, 0),
                 Presence::Ended,
-                "session {nobody}, which nobody holds, is a login that has ended"
+                "session {number}, which nobody holds, is a login that has ended"
             );
         }
     }
