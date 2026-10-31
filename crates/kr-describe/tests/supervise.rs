@@ -2192,8 +2192,8 @@ fn a_process_that_commits_memory_as_it_starts_is_refused_by_the_systems_limit() 
 
 /// KR-REQ-22.10: a start that fails after it created the process leaves no process behind, even
 /// when it fails by a panic, and on Windows the process it created has not run. A process created
-/// held does not run, so it never reads that its owner has gone, and nothing but the start itself
-/// would end it. The start is made to panic at the last point before the limit. The process is read
+/// held does not run, so it never reads that its owner has gone, and until it is in its job nothing
+/// but the start itself would end it. The start is made to panic at the last point before the limit. The process is read
 /// by its identifier and its start at that point, so that a process that takes the identifier
 /// afterwards is not taken for it, and is looked for as soon as the panic has been caught.
 #[cfg(windows)]
@@ -2713,14 +2713,15 @@ fn a_frame_thread_that_cannot_start_leaves_no_process_behind() {
     }
 }
 
-/// A start that returns after it created the process ends and collects the process. The system
-/// will not let it run, so the start returns an error with the process there and its pipes in the
-/// hands of the threads that carry its frames. The process is made to outlive the end of its input,
-/// as one stuck inside a read does, so that only the start can end it before the daemon goes. It is
-/// looked for by its identifier and its start as soon as the call returns: the control is the same
-/// process, found running at the point the system refuses it.
+/// A start that returns after it created the process ends the process. The system will not let it
+/// run, so the start returns an error with the process there and its pipes in the hands of the
+/// threads that carry its frames. The process is made to outlive the end of its input, as one stuck
+/// inside a read does, so that only the start can end it before the daemon goes. It is looked for
+/// by its identifier and its start as soon as the call returns: the control is the same process,
+/// found running at the point the system refuses it. The platforms read a child that has ended and
+/// not been collected as ended, so this shows the end and not the collection.
 #[test]
-fn a_start_that_returns_after_creating_the_process_ends_and_collects_it() {
+fn a_start_that_returns_after_creating_the_process_ends_it() {
     let mut rig = Rig::new(&Script {
         wedge_input_after: Some(0),
         ..Script::default()
