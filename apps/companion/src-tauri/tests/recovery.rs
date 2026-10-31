@@ -1986,9 +1986,10 @@ async fn a_record_is_not_used_at_the_service_the_account_signed_in_to_in_its_pla
 /// setting naming the record's service or a third service changes nothing: going on with a record
 /// that is made and not kept, settling a write, covering the host, listing the archives and making
 /// the offline copy are each refused with the record's service and the account's named, the page is
-/// shown what is wrong, and nothing is sent to any of the three services. The refusal does not say
-/// that the setting names the record's service, and does not tell the person to change it, which
-/// cannot move a record.
+/// shown what is wrong, and nothing is sent to any of the three services, whether or not a write is
+/// waiting to be settled. The refusal does not say that the setting names the record's service, and
+/// does not tell the person to choose the account's service as the sync service, which cannot move
+/// a record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_is_refused_to_an_account_signed_in_elsewhere_whatever_the_setting_names() {
     let computer = Computer::new().await;
@@ -2023,16 +2024,37 @@ async fn a_record_is_refused_to_an_account_signed_in_elsewhere_whatever_the_sett
     let says_where = |words: &str| {
         assert!(names_both(words, &ours, &theirs), "{words}");
         assert!(
-            !words.contains("setting"),
-            "the refusal does not say the setting names the record's service: {words}"
+            !words.contains("setting names") && !words.contains(&format!("Choose {theirs}")),
+            "the refusal does not say the setting names the record's service, or ask for another \
+             choice of it: {words}"
         );
     };
 
-    // A first write that never landed leaves a record that is made and not kept.
+    // A first write that never got an answer leaves a record that is made and not kept, and a write
+    // waiting to be settled.
     let page = computer.page().await;
     computer.served.web().fail(SYNC_PATH, 1, Moment::Before);
     page.call("recovery_turn_on", json!({}))
         .expect_err("the first write is not answered");
+    drop(page);
+
+    // Settling it asks the record's service, which the account's sign-in is not sent to.
+    let sent = computer.served.web().arrived().len();
+    for setting in &settings {
+        let moved = signed_in_at(&computer, &signed_in, setting).await;
+        let view = moved.view();
+        assert_eq!(view["state"], "unsettled", "{setting}: {view}");
+        assert_eq!(view["kept_at"], ours, "{setting}: {view}");
+        assert_eq!(view["blocker"], wrong_service, "{setting}: {view}");
+        let refusal = moved
+            .call("recovery_settle", json!({}))
+            .expect_err("a write is not settled at a service the account is not signed in to");
+        assert_eq!(refusal["code"], "PERMISSION_DENIED", "{setting}");
+        says_where(refusal["message"].as_str().expect("words"));
+        nothing_sent(sent, setting);
+    }
+
+    let page = computer.page().await;
     let settled = page
         .call("recovery_settle", json!({}))
         .expect("the write is settled");
@@ -2092,6 +2114,20 @@ async fn a_record_is_refused_to_an_account_signed_in_elsewhere_whatever_the_sett
             0,
             "{setting}: the host was not asked"
         );
+        let refusal = moved
+            .recovery
+            .cover_host(&moved.account, &host, true)
+            .await
+            .expect_err(
+                "a replacement is not made through a service the account is not signed in to",
+            );
+        assert_eq!(refusal.code, ErrorCode::PermissionDenied, "{setting}");
+        says_where(&refusal.message);
+        assert_eq!(
+            *host.statuses.lock().expect("statuses"),
+            0,
+            "{setting}: the host was not asked to be replaced"
+        );
 
         let refusal = moved.call("recovery_archives", json!({})).expect_err(
             "the archives are not read through a service the account is not signed in to",
@@ -2109,6 +2145,19 @@ async fn a_record_is_refused_to_an_account_signed_in_elsewhere_whatever_the_sett
             .expect_err(
                 "the offline copy is not read through a service the account is not signed in to",
             );
+        assert_eq!(refusal["code"], "PERMISSION_DENIED", "{setting}");
+        says_where(refusal["message"].as_str().expect("words"));
+        assert!(!exported.exists(), "{setting}");
+        moved.dialog_returns(&exported);
+        let refusal = moved
+            .call(
+                "recovery_export_offline",
+                json!({
+                    "path": exported.to_string_lossy(),
+                    "archive": "00000000-0000-4000-8000-000000000099"
+                }),
+            )
+            .expect_err("an archive is not read through a service the account is not signed in to");
         assert_eq!(refusal["code"], "PERMISSION_DENIED", "{setting}");
         says_where(refusal["message"].as_str().expect("words"));
         assert!(!exported.exists(), "{setting}");
