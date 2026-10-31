@@ -63,15 +63,16 @@ On macOS a verified directory whose access list has an allow entry for an accoun
 to be this user is refused with no command, since `chmod 700` leaves the list as it is. Where `kr`
 itself meets the refusal, as `kr host startup` and `kr host install` do when they make a directory,
 it says that the directory's owner or its access list is not known to keep other accounts out.
-`session.create` shows the daemon's own text instead: the directory, and what its access list said.
-The rule is conservative. An allow entry that grants nothing, an allow that a deny before it cancels, an entry
-for a group of one and an entry that only what is made inside inherits refuse the directory as well.
-So does an entry for this user when the account's name is a number or the text of a GUID, or the
-system has no record of it, since the list names a user number or an identity without a record by
-that number or text. A list that cannot be read is refused alike, except on a file system that keeps
-no lists. Either is passed again once its owner and mode are right and every allow entry of its
-readable list is known to be this user's. The check is the host's own, so the directories that the
-macOS companion makes through `create_private_directory` get it too.
+`session.create` shows a local client the daemon's own text instead: the directory, and what its
+access list said. A paired device is told the reason without either. The rule is conservative. An
+allow entry that grants nothing, an allow that a deny before it cancels, an entry for a group of one
+and an entry that only what is made inside inherits refuse the directory as well. So does an entry
+for this user when the account's name is a number or the text of a GUID, or the system has no record
+of it, since the list names a user number or an identity without a record by that number or text. A
+list that cannot be read is refused alike, except on a file system that keeps no lists. Either is
+passed again once its owner and mode are right and every allow entry of its readable list is known
+to be this user's. The check is the host's own, so the directories that the macOS companion makes
+through `create_private_directory` get it too.
 
 On Linux, $XDG_RUNTIME_DIR/kalareach is the default runtime root, unless that directory would end up
 in a location shared between all WSL distros. WSLg sets $XDG_RUNTIME_DIR to /mnt/wslg/runtime-dir,
@@ -5680,19 +5681,18 @@ write a working tree: `changeset.capture`, `diff.apply`, `diff.revert` and `diff
 copy. The message ends with the step that installs Git: `xcode-select --install` on macOS and the
 system package manager on Linux. Windows runs no Git at all, so there it gives the platform's own
 refusal, under the same code, before it looks for Git, whether or not Git is installed, and names
-no install. A client does not send such a request again. The project
-methods and `changeset.capture` keep the refusal as the answer to the request's action identifier,
-so a request repeated after Git is installed carries a new identifier. `diff.apply` and
-`diff.revert` refuse before they claim their action and keep nothing. `project.list`,
-`project.read`, `workspace.list` and `workspace.read` read the project journal alone and answer as
-on any host.
+no install. A client does not send such a request again. The project methods and
+`changeset.capture` keep the refusal as the answer to the request's action identifier, so a request
+repeated after Git is installed carries a new identifier. `diff.apply` and `diff.revert` refuse
+before they claim their action and keep nothing. `project.list`, `project.read`,
+`workspace.list` and `workspace.read` read the project journal alone and answer as on any host.
 
 A search that finds no usable Git is not kept, so a Git installed while the daemon runs is found by
 the first request that makes a look after the install, without a restart; a request that joined a
-look under way when Git was installed is refused with it, and its retry finds Git. On Linux a paired device
-stays refused the five repository operations and the four change-set methods above until the next
-`kr doctor` repeats the proof, and the owner's requests do not wait for it. On a Mac without the Command Line Tools, each search starts
-the stub that asks to install them.
+look under way when Git was installed is refused with it, and its retry finds Git. On Linux a
+paired device stays refused the five repository operations and the four change-set methods above
+until the next `kr doctor` repeats the proof, and the owner's requests do not wait for it. On a Mac
+without the Command Line Tools, each search starts the stub that asks to install them.
 
 ### The boundary around a Git invocation
 
