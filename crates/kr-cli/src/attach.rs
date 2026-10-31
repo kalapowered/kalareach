@@ -1097,15 +1097,17 @@ fn read_console(
     outlet.left
 }
 
-/// Whether a key record can make text in a console that spells its keys itself, which is whether a
-/// read of that text would return for it and not pass over it and wait.
+/// Whether a key record is taken for text in a console that spells its keys itself, which is meant
+/// to be whether a read of that text would return for it and not pass over it and wait.
 ///
-/// A key going down that has a character does. One that has none does only when Ctrl is held and the
+/// A key going down that has a character is. One that has none is only when Ctrl is held and the
 /// key is not a modifier or a lock: that is how the console stores a NUL (Ctrl+Space and Ctrl+@), on
-/// whatever key its keyboard layout names for it, or on none. Shift, Ctrl, Alt, the Windows key, the
-/// locks, the Apps key, a media key and a dead key are all kept as records the read passes over. A
-/// key coming up does not make text, except an Alt coming up with the character that was composed on
-/// the numeric keypad.
+/// whatever key its keyboard layout names for it, or on none. Shift, Ctrl, Alt, the Windows key and
+/// the locks are kept as records the read passes over, and so is any other key with no character
+/// and no Ctrl held. The rule also takes for text a key with Ctrl held that the read passes over
+/// (the Apps key, a media key, a dead key under AltGr), which only makes one read wait for the next
+/// key. A key coming up is not text, except an Alt coming up with the character that was composed
+/// on the numeric keypad.
 ///
 /// The rule leans to text, because a record wrongly taken for text makes one read wait for the next
 /// key (and a stop that has to cancel that read costs the key the console gives it), and one wrongly
@@ -2410,7 +2412,7 @@ mod reader {
         assert!(!stopped.still_running);
         assert!(!stopped.cancel_asked, "there was no read to cancel");
 
-        // A reader that ends at once is not cancelled either, whether or not the stop asked.
+        // A reader that ends at once has no cancel asked of it.
         let mut run = Run::start(true, Vec::new());
         assert!(!run.stops().cancel_asked);
     }
@@ -2467,6 +2469,21 @@ mod reader {
             );
         }
         assert!(!key_can_make_text(&stored(0x32, 0)), "the '2' key alone");
+        // A key coming up with Ctrl still held: the release of a letter of a Ctrl chord, and the
+        // release of the NUL's own key. The console keeps these as records.
+        for (virtual_key, unicode) in [(0x32, 0), (0x20, 0), (0x5a, 0x1a)] {
+            assert!(
+                !key_can_make_text(&KeyRecord {
+                    key_down: false,
+                    unicode,
+                    control_keys: CONTROL,
+                    ..key(virtual_key, 0, false)
+                }),
+                "a key coming up with Ctrl held, {virtual_key:#x}"
+            );
+        }
+        // Another key is not a Ctrl key: the right Alt without Ctrl.
+        assert!(!key_can_make_text(&stored(0x51, 0x01)), "the right Alt");
         // A modifier or a lock, with Ctrl held (Ctrl's own record has it held).
         for modifier in [
             0x10, 0x11, 0x12, 0x5b, 0x5c, 0x14, 0x90, 0x91, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5,
