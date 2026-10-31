@@ -1146,6 +1146,80 @@ async fn the_push_desk_talks_to_the_gateway_client_it_was_given() {
     );
 }
 
+/// KR-REQ-17.14: the reissue a device run asks for, which leaves the host holding a credential the
+/// gateway no longer accepts, is asked of the client the factory makes for the gateway the desk
+/// talks to. A fork's own client in that place receives the issue and the host is told nothing;
+/// the build's gateway is a stand-in on a loopback port, which a client made outside the factory
+/// would reach and which receives nothing here, and the factory is asked for that gateway alone.
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_runs_reissue_asks_the_client_the_factory_makes_for_the_gateway_the_desk_talks_to()
+{
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    let device = phone.companion.device();
+    let registered = Arc::new(Mutex::new(Registered::default()));
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let calls = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let stand_in = kr_service_stand_in::serve().await;
+    let origin = kr_protocol::service::GatewayOrigin::new(stand_in.origin()).expect("an origin");
+    let opened = open_replacing(
+        origin.clone(),
+        phone.data.path(),
+        &device,
+        &Receiver::new(FIRST_TOKEN),
+        Arc::new(HostLink(Arc::clone(&registered))),
+        {
+            let (asked, calls) = (Arc::clone(&asked), Arc::clone(&calls));
+            move |managed| -> Arc<GatewayFor> {
+                Arc::new(move |origin, signer| {
+                    asked
+                        .lock()
+                        .expect("the record")
+                        .push(origin.as_str().to_owned());
+                    Ok(Arc::new(ForkPush {
+                        managed: managed(origin, signer)?,
+                        calls: Arc::clone(&calls),
+                    }) as Arc<dyn PushService>)
+                })
+            }
+        },
+    );
+    let paired = device
+        .pairing()
+        .hosts
+        .list()
+        .expect("the paired hosts")
+        .remove(0);
+
+    let reissued = opened.desk.reissue_unannounced(&paired).await;
+    assert_eq!(
+        calls.lock().expect("the record").clone(),
+        vec!["issue"],
+        "the issue went to the fork's client"
+    );
+    assert_eq!(
+        asked.lock().expect("the record").clone(),
+        vec![origin.as_str().to_owned()],
+        "the factory was asked for the gateway the desk talks to, and no other"
+    );
+    assert!(
+        stand_in.web().arrived().is_empty(),
+        "{:?}: a request left for the build's gateway outside the factory",
+        stand_in.web().arrived()
+    );
+    reissued.expect("the gateway issued the authorisation again");
+    assert!(
+        registered
+            .lock()
+            .expect("what was handed")
+            .credentials
+            .is_empty(),
+        "the host was told nothing"
+    );
+}
+
 /// KR-REQ-16.08: a registration the phone stopped itself, as it does for an account that has left,
 /// is shown in the phone's own words; only a host's refusal or silence is shown as the host not
 /// taking the phone.

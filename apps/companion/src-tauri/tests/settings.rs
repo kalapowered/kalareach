@@ -1596,6 +1596,358 @@ async fn a_choice_between_versions_and_a_dropped_copy_go_to_the_service_the_reco
     );
 }
 
+/// A computer whose settings sync was turned on while the setting named one service, whose
+/// application reaches the service its record names through a fork's client, and whose setting
+/// now names another service. What reached each service says which one a step went to.
+struct Forked {
+    // The page goes first: fields drop in this order, and the application stops before the data
+    // directory it watches is removed.
+    page: Page,
+    chosen: Served,
+    fork: Arc<Fork>,
+    fork_service: Served,
+    computer: Computer,
+    fork_origin: GatewayOrigin,
+    recorded: String,
+}
+
+impl Forked {
+    async fn new() -> Self {
+        let computer = Computer::new().await;
+        let fork_service = serve().await;
+        let fork_origin = GatewayOrigin::new(fork_service.origin()).expect("an origin");
+        let fork = Fork::at(
+            &fork_service,
+            computer.identity().keys.authorisation.clone(),
+        );
+        let page = computer.start_with(Some(Arc::clone(&fork) as _));
+        page.choose("dark");
+        assert_eq!(page.turn_on()["sync"]["state"], "on");
+        let recorded = computer.served.origin().to_owned();
+        let chosen = serve().await;
+        page.call("sync_service_set", json!({ "origin": chosen.origin() }))
+            .expect("another service is chosen");
+        Self {
+            computer,
+            page,
+            fork_service,
+            fork_origin,
+            fork,
+            chosen,
+            recorded,
+        }
+    }
+
+    /// Another device's store of the collection, at the fork's service.
+    fn elsewhere(&self) -> Elsewhere {
+        self.computer.elsewhere_over(&self.fork_origin, 0)
+    }
+
+    /// Nothing was asked for, and nothing reached, a service other than the fork's: the clients
+    /// were asked for the service the record names alone, the service that origin names received
+    /// no request, and neither did the service the setting names now.
+    fn only_the_fork_was_reached(&self) {
+        assert!(
+            !self.fork.asked().is_empty()
+                && self
+                    .fork
+                    .asked()
+                    .iter()
+                    .all(|origin| *origin == self.recorded),
+            "{:?}: a client was asked for another service than the record names",
+            self.fork.asked()
+        );
+        assert!(
+            !self.fork_service.web().arrived().is_empty(),
+            "the fork's service received the calls"
+        );
+        assert!(
+            self.computer.served.web().arrived().is_empty(),
+            "the fork's service took the place of the service the record names"
+        );
+        assert!(
+            self.chosen.web().arrived().is_empty(),
+            "the service the setting names now received none"
+        );
+    }
+}
+
+/// KR-REQ-17.14: the drafts of other devices are brought down, a later version of one comes down
+/// as another copy, and the note of one its device removed is let go, through the client the
+/// application was given, at the service the record names, after the setting names another. The
+/// fork's service receives the looks at the collection and the draft asked for; the service the
+/// record's origin names and the one the setting names now receive none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_of_another_device_comes_down_through_the_client_at_the_service_the_record_names() {
+    let forked = Forked::new().await;
+    let (environment, studio) = host(1, "studio");
+    forked
+        .computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let page = &forked.page;
+    page.write_draft(Some(&studio), "this computer's own draft");
+    page.drafts_on(true).expect("drafts sync is on");
+
+    let elsewhere = forked.elsewhere();
+    let other = elsewhere.drafts();
+    let theirs = other.publish("what the other device wrote").await;
+    page.sync_now();
+    let copies = || -> Vec<String> {
+        page.kept_drafts()
+            .iter()
+            .filter(|draft| draft["copyOf"] == json!(theirs.draft_id))
+            .map(|draft| draft["text"].as_str().expect("text").to_owned())
+            .collect()
+    };
+    assert_eq!(
+        copies(),
+        vec!["what the other device wrote".to_owned()],
+        "the draft came down from the fork's service: {:?}",
+        page.kept_drafts()
+    );
+
+    // A later version is another copy, asked for at the same service.
+    other
+        .edit(&theirs, "what the other device wrote next")
+        .await;
+    page.sync_now();
+    let texts = copies();
+    assert_eq!(texts.len(), 2, "{texts:?}");
+    assert!(texts.contains(&"what the other device wrote next".to_owned()));
+
+    // Its device throws the draft away: the fork's service no longer holds it, and what this
+    // computer kept to ask about it goes.
+    let pulled = || -> Vec<String> {
+        std::fs::read(
+            forked
+                .computer
+                .data
+                .path()
+                .join("settings-sync/drafts/pulled.json"),
+        )
+        .map(|bytes| serde_json::from_slice(&bytes).expect("a list"))
+        .unwrap_or_default()
+    };
+    assert_eq!(pulled(), vec![theirs.draft_id.to_string()]);
+    let note = other
+        .store
+        .checkpoint(theirs.draft_id)
+        .expect("a note")
+        .expect("it was published");
+    other
+        .sync
+        .remove(theirs.draft_id, note.position, TimestampMs::new(now_ms()))
+        .await
+        .expect("a removal");
+    page.sync_now();
+    assert!(pulled().is_empty(), "nothing is asked about it any more");
+    forked.only_the_fork_was_reached();
+}
+
+/// KR-REQ-17.14: the copy the service kept of a draft write it refused is dropped, when the person
+/// asks, through the client the application was given, at the service the record names, after the
+/// setting names another: the fork's service is asked in the pass that follows, and drops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_copy_of_a_draft_is_dropped_through_the_client_at_the_service_the_record_names() {
+    let forked = Forked::new().await;
+    let (environment, studio) = host(1, "studio");
+    forked
+        .computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let page = &forked.page;
+    let (draft, _) = page.write_draft(Some(&studio), "written for the studio");
+    let held = page
+        .app
+        .state::<AppState>()
+        .drafts()
+        .store()
+        .expect("drafts");
+    let elsewhere = forked.elsewhere();
+    elsewhere
+        .claim_draft(&held.load(draft).expect("the draft"))
+        .await;
+    page.drafts_on(true).expect("drafts sync is on");
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        1,
+        "the fork's service kept a copy"
+    );
+
+    let listed = kept_by_the_service(page);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["deletable"], true);
+    let reference = listed[0]["reference"].as_str().expect("a reference");
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+    assert!(
+        settings
+            .drop_sync_copy(reference)
+            .await
+            .expect("the service is asked"),
+        "the service dropped it"
+    );
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        0,
+        "the fork's service holds none"
+    );
+    assert!(kept_by_the_service(page).is_empty());
+    forked.only_the_fork_was_reached();
+}
+
+/// KR-REQ-17.14: a removal the service is owed for a draft whose first publication lost its answer
+/// is found by asking the service what it holds, and made, through the client the application was
+/// given, at the service the record names, after the setting names another: the draft is sent
+/// while its host is private, the host lets it go, and the fork's service ends with none of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_found_by_asking_the_service_goes_through_the_client_the_record_names() {
+    let forked = Forked::new().await;
+    let (environment, studio) = host(1, "studio");
+    forked
+        .computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let page = &forked.page;
+    let (draft, version) = page.write_draft(Some(&studio), "sent before the answer came back");
+    // The pass asks the collection once for the settings and then publishes the draft, so it is
+    // the second request.
+    forked.fork_service.web().fail(SYNC_PATH, 2, Moment::After);
+    page.drafts_on(true).expect("drafts sync is on");
+    let elsewhere = forked.elsewhere();
+    assert_eq!(
+        elsewhere.draft_at(draft).await,
+        Some(1),
+        "it landed at the fork's service"
+    );
+
+    assert_eq!(page.discard_draft(draft, &version)["removed"], true);
+    forked
+        .computer
+        .hosts
+        .say(environment, HostPrivacy::On { generation: 2 });
+    page.sync_now();
+    assert_eq!(
+        elsewhere.draft_at(draft).await,
+        Some(1),
+        "the host is private, so the removal waits"
+    );
+    forked
+        .computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 3 });
+    page.sync_now();
+    page.sync_now();
+    assert_eq!(
+        elsewhere.draft_at(draft).await,
+        None,
+        "it was removed at the fork's service"
+    );
+    assert!(
+        page.kept_drafts().is_empty(),
+        "and it did not come back as a copy: {:?}",
+        page.kept_drafts()
+    );
+    forked.only_the_fork_was_reached();
+}
+
+/// KR-REQ-17.14: a draft sent to a session of another host after its first publication lost its
+/// answer is still removed where it was published, through the client the application was given, at
+/// the service the record names, after the setting names another: the removal is for no host yet,
+/// and goes through the store of what came down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_for_no_host_goes_through_the_client_at_the_service_the_record_names() {
+    let forked = Forked::new().await;
+    let (first, studio) = host(1, "studio");
+    let (second, laptop) = host(2, "laptop");
+    forked
+        .computer
+        .hosts
+        .say(first, HostPrivacy::Off { generation: 1 });
+    forked
+        .computer
+        .hosts
+        .say(second, HostPrivacy::Off { generation: 1 });
+    let page = &forked.page;
+    let (draft, version) = page.write_draft(Some(&studio), "sent before the answer came back");
+    forked.fork_service.web().fail(SYNC_PATH, 2, Moment::After);
+    page.drafts_on(true).expect("drafts sync is on");
+    let elsewhere = forked.elsewhere();
+    assert_eq!(
+        elsewhere.draft_at(draft).await,
+        Some(1),
+        "it landed at the fork's service"
+    );
+
+    let moved = page.retarget_draft(draft, &version, &laptop);
+    assert_eq!(page.discard_draft(draft, &moved)["removed"], true);
+    page.sync_now();
+    page.sync_now();
+    assert_eq!(
+        elsewhere.draft_at(draft).await,
+        None,
+        "it was removed at the fork's service"
+    );
+    assert!(
+        page.kept_drafts().is_empty(),
+        "and it did not come back as a copy: {:?}",
+        page.kept_drafts()
+    );
+    forked.only_the_fork_was_reached();
+}
+
+/// KR-REQ-17.14: a copy the service kept of a refused settings write that the person already chose
+/// to have dropped, while the service could not be reached, is asked about again when the person
+/// asks again, through the client the application was given, at the service the record names,
+/// after the setting names another: the fork's service drops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn asking_again_for_a_kept_copy_to_go_asks_the_service_the_record_names() {
+    let forked = Forked::new().await;
+    let page = &forked.page;
+    let elsewhere = forked.elsewhere();
+    assert!(matches!(
+        elsewhere.write("light").await,
+        Published::Accepted { .. }
+    ));
+    let view = page.choose("system");
+    assert_eq!(view["sync"]["conflicts"], 1, "{view}");
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        1,
+        "the fork's service kept a copy of the refused write"
+    );
+    let listed = kept_by_the_service(page);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let reference = listed[0]["reference"].as_str().expect("a reference");
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+
+    // The fork's service cannot be reached: the choice is made, and nothing is dropped.
+    forked.fork_service.web().fail(SYNC_PATH, 1, Moment::Before);
+    assert!(
+        !settings
+            .drop_sync_copy(reference)
+            .await
+            .expect("the choice is recorded"),
+        "the service has not said it dropped the copy"
+    );
+    assert_eq!(elsewhere.copies_kept().await, 1);
+
+    // The person asks again. The choice was made before, so the service alone is asked.
+    assert!(
+        settings
+            .drop_sync_copy(reference)
+            .await
+            .expect("the service is asked again"),
+        "the service said it dropped the copy"
+    );
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        0,
+        "the fork's service dropped the copy"
+    );
+    forked.only_the_fork_was_reached();
+}
+
 /// A start the service could not take is not lost: the record names the collection, and turning
 /// sync on again goes on with it instead of starting a second one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
