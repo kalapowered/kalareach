@@ -401,7 +401,9 @@ impl Source {
     /// # Errors
     ///
     /// Returns a permission error saying whether the target admits more or is only not one the
-    /// starter accepts, or the operating system's error when the target's security cannot be read.
+    /// starter accepts, an invalid-data error when the text of a list cannot be read or does not
+    /// account for the entries of the list, or the operating system's error when the target's
+    /// security cannot be read.
     fn require_no_more_on(&self, target: HANDLE) -> io::Result<()> {
         let there = security_of(target)?;
         let (own_access, own_label) = (
