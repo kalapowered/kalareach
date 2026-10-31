@@ -68,9 +68,10 @@ pub const OBSERVE_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a session with nothing happening goes between sweeps, unless it was given another.
 ///
 /// One wake serves every question left without an event source: a process that started without
-/// producing output or consuming input, the login a desktop-bound session is tied to, and the root
-/// shell's status where a child signal was lost. Each of them has something else that asks it when
-/// it matters, so the sweep is the backstop behind that, and a minute is long enough for it.
+/// producing output or consuming input, the login a desktop-bound session is tied to where the
+/// platform reports no end of it, and the root shell's status where a child signal was lost. While
+/// the session is idle nothing else asks them, so a minute is how long each can go unanswered. No
+/// requirement sets a shorter time, and the closure observes the boundary again as it closes.
 pub const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The beat the idle clocks of a session fall on: a wait of this length or more ends on the latest
@@ -300,15 +301,22 @@ impl Drop for Looking<'_> {
 /// wall clock.
 ///
 /// A session's beat counted from here is the same beat for every session host on this machine, and
-/// for the daemon that holds a request open to each of them. Counted from each host's own start
-/// the beats of twenty hosts fall at twenty instants, and the daemon is woken for each; counted
-/// from the wall clock's half minutes they fall together and it is woken once. A wall clock that
-/// steps moves the beat once, which costs one early or late wake and nothing else.
+/// for the daemon that holds a request to each of them. Counted from each host's own start the
+/// beats of twenty hosts fall at twenty instants, and the daemon is woken for each; counted from
+/// the wall clock's half minutes they fall together and it is woken once. A host reads the wall
+/// clock once, when its supervision begins, so a clock that steps, or a machine that sleeps,
+/// leaves the hosts that began on either side of it on different beats for as long as they run,
+/// which costs the daemon one more wake for each group and nothing else.
 #[must_use]
 pub fn wall_beat_start(now: Instant) -> Instant {
     let since_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
+    beat_start_before(now, since_epoch)
+}
+
+/// [`wall_beat_start`] for a reading of the wall clock, `since_epoch` after the epoch at `now`.
+fn beat_start_before(now: Instant, since_epoch: Duration) -> Instant {
     let into_beat = since_epoch.as_nanos() % BEAT.as_nanos();
     u64::try_from(into_beat)
         .ok()
@@ -623,25 +631,23 @@ mod tests {
     #[test]
     fn kr_perf_003_the_beat_is_counted_from_the_wall_clocks_half_minutes() {
         let now = Instant::now();
-        let before = std::time::SystemTime::now();
+        // A reading of the wall clock, and how far into its half minute it is.
+        for (since_epoch, into_beat) in [
+            (Duration::from_secs(90), Duration::ZERO),
+            (
+                Duration::from_millis(12_345_678),
+                Duration::from_millis(15_678),
+            ),
+            (Duration::from_millis(29_999), Duration::from_millis(29_999)),
+        ] {
+            assert_eq!(
+                now.duration_since(super::beat_start_before(now, since_epoch)),
+                into_beat,
+                "the beat starts at the half minute at or before {since_epoch:?}"
+            );
+        }
         let start = super::wall_beat_start(now);
-        assert!(start <= now);
-        assert!(
-            now.duration_since(start) < BEAT,
-            "it is the latest such instant"
-        );
-        // The wall clock at that instant is a whole number of half minutes, give or take the time
-        // the two readings of the clocks are apart from each other.
-        let at_start = before
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("after the epoch")
-            .saturating_sub(now.duration_since(start));
-        let off = at_start.as_nanos() % BEAT.as_nanos();
-        let off = off.min(BEAT.as_nanos() - off);
-        assert!(
-            off < Duration::from_millis(250).as_nanos(),
-            "{off} ns from a half minute"
-        );
+        assert!(start <= now && now.duration_since(start) < BEAT);
     }
 
     /// KR-PERF-003: an idle session's clocks of about half a minute each woke its host at

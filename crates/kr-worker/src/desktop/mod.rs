@@ -77,8 +77,8 @@ pub const RECHECK_INTERVAL: Duration = Duration::from_millis(1_000);
 /// The shortest time between two readings of the platform's own session facilities.
 ///
 /// This is the fallback for a login session whose owning process the platform did not name. It
-/// costs a conversation with the platform rather than a kernel query, so it happens on the cadence
-/// an idle session sweeps on rather than on every wake.
+/// costs a conversation with the platform rather than a kernel query, so it is made no oftener
+/// than this and not on every wake.
 pub const REREAD_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Reads the desktop this worker's user currently has.
