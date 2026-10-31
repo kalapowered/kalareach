@@ -123,6 +123,8 @@ use self::unsupported as platform;
 #[cfg(windows)]
 use self::windows as platform;
 
+#[cfg(all(target_os = "linux", feature = "git-fixtures"))]
+pub use self::linux::with_kernel_interface;
 #[cfg(all(target_os = "macos", any(test, feature = "git-fixtures")))]
 pub use self::macos::profile_text;
 #[cfg(unix)]
@@ -149,6 +151,24 @@ pub const NO_GIT: Option<&str> = platform::NO_GIT;
 pub(crate) fn no_git_refusal(why: &str) -> ProjectError {
     ProjectError::GitUnavailable {
         detail: format!("Git is not run on this platform: {why}").into(),
+    }
+}
+
+/// The refusal of a host whose kernel cannot build the boundary around a Git invocation at all,
+/// when it cannot.
+///
+/// Said before Git is looked for, as [`NO_GIT`] is, and for the same reason: a host that cannot run
+/// Git answers the same way whether or not one is installed. Nothing but another kernel changes it,
+/// so it is not an upstream that may answer later. Only Linux asks its kernel; the other platforms'
+/// mechanisms need nothing of one.
+pub(crate) fn kernel_refusal() -> Option<ProjectError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::kernel_refusal()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 

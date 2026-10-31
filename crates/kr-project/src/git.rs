@@ -851,6 +851,11 @@ impl Installation {
     }
 
     fn program(&self) -> Result<&GitProgram> {
+        // Asked of the kernel before the stored program is read: a kernel that cannot build the
+        // boundary runs no Git, whichever Git a profile was handed or found.
+        if let Some(refusal) = crate::boundary::kernel_refusal() {
+            return Err(refusal);
+        }
         if let Some(found) = self.found.get() {
             return Ok(found);
         }
