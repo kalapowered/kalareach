@@ -36,8 +36,8 @@
 //! it is put in ends it with the daemon, and a start that fails or panics ends it too. One window
 //! remains: a daemon that stops without unwinding in the few calls between the process's creation
 //! and its entry into the job, or before it lets run a process the job did not take, leaves the
-//! process behind. It is killed from outside, or ended by a fault or an abort on one of its other
-//! threads.
+//! process behind. The daemon may be killed from outside, for instance, or ended by a fault or an
+//! abort on any of its threads.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -1067,12 +1067,13 @@ impl Driver {
                     // runtime got over is forgotten and is not taken for the cause of a later end.
                     // The system's message and the process's frames reach the daemon by different
                     // routes with no order between them, so a refusal posted just after the
-                    // runtime wrote an answer that does not say it failed is cleared with it, and
-                    // the end it leads to reads as an ordinary one: nothing the daemon reads tells
-                    // it from a refusal the runtime got over. The system may post nothing for a
-                    // later refusal of the same process, which then reads as an ordinary failure.
-                    // An answer for other work, which a late or a repeated answer is, belongs to
-                    // no refusal that the work in hand is owed.
+                    // runtime wrote an answer that does not say it failed, and before the daemon
+                    // handles it, is cleared with it, and the end it leads to reads as an ordinary
+                    // one: nothing the daemon reads tells it from a refusal the runtime got over.
+                    // One posted after the daemon has handled the answer stays for the end. The
+                    // system may post nothing for a later refusal of the same process, which then
+                    // reads as an ordinary failure. An answer for other work, which a late or a
+                    // repeated answer is, belongs to no refusal that the work in hand is owed.
                     if in_hand && self.the_system_refused_memory() && the_work_failed(&answer) {
                         return self.kill(ProcessEnd::MemoryCeiling, now, reports);
                     }

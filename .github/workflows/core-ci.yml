@@ -634,6 +634,9 @@ jobs:
       #   - the local endpoint, descriptors and process identity the host rests on: `kr-ipc`'s
       #     `windows`, `stop`, `peer_gone` and `install` (the store of releases) suites and its
       #     library, and all of `kr-flush`, the directory flush of every local store;
+      #   - the daemon's side of the description process over a stub process's real pipes,
+      #     `kr-describe`'s `supervise` suite, among it the cases that need a process created held
+      #     behind a job's memory limit;
       #   - the control daemon over the environment's scheduled task and the starter it runs:
       #     `supervision::windows`, the `task_supervisor` suite (with a daemon refused in a login
       #     session other than the one its work runs in), the `plugin_runtime_service` suite over
