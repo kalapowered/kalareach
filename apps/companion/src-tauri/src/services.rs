@@ -183,9 +183,9 @@ impl Held {
     /// The account's client, and, where the desk that uses one has been opened, a client of the
     /// sync service from the installed [`SyncServices`] at the origin the setting names now (a
     /// record made earlier may keep another), the push gateway's from the push desk, and the voice
-    /// broker's, which `calls` makes for the tokens it is given. The others are asked for afresh. A desk
-    /// that is not open holds none, and neither does a factory that cannot make its client: the
-    /// error is dropped, and the line for the service says no client is configured.
+    /// broker's, which `calls` makes for the tokens it is given. The others are asked for afresh.
+    /// A desk that is not open gives no client, and neither does a factory that cannot make its
+    /// client: the error is dropped, and the line for the service says no client is configured.
     #[must_use]
     pub fn of(
         state: Option<&crate::state::AppState>,
@@ -207,8 +207,8 @@ impl Held {
     }
 }
 
-/// The clients the Account sheet reports over, as [`Held::of`] gets them from the application's
-/// state and its voice calls.
+/// The clients the Account sheet reports over, as [`Held::of`] gets them: the application's state
+/// and its voice calls give the others, and `account` is the account's own.
 #[must_use]
 pub fn held_by<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,

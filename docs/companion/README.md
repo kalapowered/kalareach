@@ -1042,7 +1042,7 @@ client.
   `AppState::sync_clients` has run changes nothing.
 - **Push.** `push::Wiring::gateway` makes the client of the push gateway for an origin and the
   installation's signer, `push::gateway_over` makes the managed one over a transport, and
-  `PushDesk::client` asks that factory for a client at the origin the phone talks to now.
+  `PushDesk::client` asks `Wiring::gateway` for a client at the origin the phone talks to now.
 - **Managed inference.** `voice::Service::with_brokers` gives the voice service another way to make
   the client of its broker, and `Calls::broker` asks that factory for a client.
 - **Account login.** `Account::service` is the client the account signs in through.
@@ -1054,8 +1054,10 @@ service changes it where it is made:
   (`src-tauri/src/revocation.rs`), which make their clients at the sync service's origin; the feed
   also publishes;
 - the pairing admission (`src-tauri/src/device/mod.rs`), a `ManagedPairingAdmission` over the
-  managed service's origin, and the pairing room, whose sockets `RoomConnector::platform` opens in
-  the same file at the origin each invitation names;
+  managed service's origin, and the pairing room: `Parts::platform` makes its `RoomConnector` in
+  the same file, and `kr-client` opens the sockets at the attempt's origin, which for a typed code
+  is the one this computer is set to use (by default `DEFAULT_RENDEZVOUS_ORIGIN`) and for a
+  scanned or pasted code the one the code names;
 - account deletion (`src-tauri/src/lib.rs`), a `ManagedAccountDeletion`;
 - recovery's reads of the bundle for the archive list and the offline copy, which go through
   `kr-client`'s `AccountSource` and its own clients;

@@ -1523,8 +1523,8 @@ account, makes its own clients and is not a slot of `ServiceClients`.
 
 Each process fills its own slots of `ServiceClients` from the clients its own desks use, and reports
 availability from them. The daemon builds its set in `crates/kr-controller/src/service/clients.rs`
-and reports with `ServiceClients::availability`. The companion makes the clients of the services it
-uses where each is used. Its account sheet takes the account's client and asks the sync, push and
+and reports with `ServiceClients::availability`. Each use in the companion takes its client from
+the place that decides it. Its account sheet takes the account's client and asks the sync, push and
 voice factories for a client each, puts them into a `ServiceClients` and reports
 `ServiceClients::availability_of` for each
 ([the companion's guide](../companion/README.md#the-managed-services-the-application-holds)). In
