@@ -493,10 +493,12 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
     press(b"\x1b[69;18;233;0;0;1_");
     press(b"\x1b[66;48;98;1;0;1_");
     press(b"\x1b[66;48;98;0;0;1_");
-    // Ctrl on its own, and the Apps key, right behind the letter: the console keeps each as a key
-    // going down and coming up that make no text, and a read of the console's text would wait for
-    // the next key. The probe stops the reader once it has seen the letter and the console holds
-    // nothing more.
+    waits_for("kr-probe:bytes:", &mut child);
+    // Ctrl on its own, and the Apps key, once the reader has the letter: the console keeps each as a
+    // key going down and coming up that make no text, and a read of the console's text would wait
+    // for the next key. (Behind the letter in the same burst they are taken by the read that
+    // returns it.) The probe stops the reader once the console has been quiet for a second and
+    // holds nothing more.
     press(b"\x1b[17;29;0;1;8;1_");
     press(b"\x1b[17;29;0;0;0;1_");
     press(b"\x1b[93;93;0;1;256;1_");
@@ -597,9 +599,8 @@ fn spell_probe_in_the_console() {
         }
     }
     println!("kr-probe:bytes:{}", hex(&spelled));
-    // The test has pressed Ctrl on its own and the Apps key right behind the letter. The reader is
-    // stopped once the console has been quiet for a while and holds no input, which is when the
-    // reader has seen them.
+    // The test now presses Ctrl on its own and the Apps key. The reader is stopped once the console
+    // has been quiet for a second and holds no input, which is when the reader has seen them.
     let waiting = kr_cli::windows::records::RecordReader::over(
         console
             .handle()
@@ -607,7 +608,8 @@ fn spell_probe_in_the_console() {
             .expect("a handle to count with"),
     );
     let quiet_from = Instant::now();
-    while quiet_from.elapsed() < Duration::from_millis(500) || waiting.waiting().unwrap_or(1) != 0 {
+    while quiet_from.elapsed() < Duration::from_millis(1000) || waiting.waiting().unwrap_or(1) != 0
+    {
         assert!(
             quiet_from.elapsed() < LIVENESS_DEADLINE,
             "the console never held no input"
