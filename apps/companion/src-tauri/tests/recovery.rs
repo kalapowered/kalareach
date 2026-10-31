@@ -800,11 +800,13 @@ impl companion_tauri::services::SyncServices for Recording {
     }
 }
 
-/// KR-REQ-17.14: recovery reaches the sync service through the clients the application was given,
-/// and at the origin its record names. The bundle is written through the client it is given: a
-/// fork's client of a service of its own receives the write and the service the setting names
-/// receives none. A record made while the setting named one service keeps asking for that service
-/// after the setting names another; only a record made now reads the setting.
+/// KR-REQ-17.14: recovery's bundle store reaches the sync service through the clients the
+/// application was given, and at the origin its record names. The bundle is written through the
+/// client it is given: a fork's client of a service of its own receives the write and the service
+/// the setting names receives none. A record made while the setting named one service keeps asking
+/// for that service after the setting names another; only a record made now reads the setting.
+/// The reads of the archive list and the offline copy are made through the clients of
+/// `AccountSource`, not these, and are held to the record's service by the cases below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_asks_its_clients_for_the_service_its_record_names() {
     let computer = Computer::new().await;
@@ -1785,6 +1787,242 @@ async fn an_account_token_goes_only_to_the_service_the_account_is_signed_in_to()
     let arrived = computer.served.web().arrived();
     assert_eq!(arrived.len(), 1);
     assert_eq!(arrived[0].token.as_deref(), Some(TOKEN));
+}
+
+/// How a service is named to a person: its host.
+fn host_of(origin: &str) -> String {
+    origin.replace("http://", "")
+}
+
+/// The application over `computer`'s records, with the account signed in at `service`, with the
+/// right to write backup storage there, and the sync service setting naming `service` as well.
+async fn moved_to(computer: &Computer, service: &Served) -> Page {
+    let origin = GatewayOrigin::new(service.origin()).expect("an origin");
+    let page = computer.start(account(&origin, Some(&RECOVERY_BACKUP_SCOPES)).await);
+    page.call("sync_service_set", json!({ "origin": service.origin() }))
+        .expect("the service is chosen");
+    page
+}
+
+/// Whether `words` name both services: the one a record is kept at and the one the account is
+/// signed in to.
+fn names_both(words: &str, record: &str, account: &str) -> bool {
+    words.contains(record) && words.contains(account)
+}
+
+/// KR-REQ-17.14: a record is used at the service it names and at no other. With the account signed
+/// in at another service and the setting naming that one, a record that is made and not kept is not
+/// turned on, a write is not settled, the host is not covered and neither the archives nor the
+/// offline copy are read; each is refused with both services named and nothing is sent to either.
+/// The page is shown what is wrong, and the kit, saved as text or as a QR code, still names the
+/// service the bundle is kept at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_is_not_used_at_the_service_the_account_signed_in_to_in_its_place() {
+    let computer = Computer::new().await;
+    let other = serve().await;
+    let (ours, theirs) = (host_of(computer.served.origin()), host_of(other.origin()));
+    let wrong_service =
+        json!({ "reason": "wrong_service", "sync_service": ours, "account": theirs });
+
+    // A first write that never landed leaves a record that is made and not kept.
+    let page = computer.page().await;
+    computer.served.web().fail(SYNC_PATH, 1, Moment::Before);
+    page.call("recovery_turn_on", json!({}))
+        .expect_err("the first write is not answered");
+    let settled = page
+        .call("recovery_settle", json!({}))
+        .expect("the write is settled");
+    assert_eq!(settled["state"], "unfinished");
+    drop(page);
+
+    // The account is signed in at another service and the setting names it. The record does not
+    // move: the page is shown the mismatch, and going on with the record sends nothing.
+    let sent = computer.served.web().arrived().len();
+    let moved = moved_to(&computer, &other).await;
+    let view = moved.view();
+    assert_eq!(view["state"], "unfinished", "{view}");
+    assert_eq!(view["kept_at"], ours, "{view}");
+    assert_eq!(view["blocker"], wrong_service, "{view}");
+    let refusal = moved
+        .call("recovery_turn_on", json!({}))
+        .expect_err("the account's sign-in is not sent to the record's service");
+    assert_eq!(refusal["code"], "PERMISSION_DENIED");
+    let words = refusal["message"].as_str().expect("words");
+    assert!(names_both(words, &ours, &theirs), "{words}");
+    assert_eq!(computer.served.web().arrived().len(), sent);
+    drop(moved);
+
+    // The same account at the record's service goes on with the record, and the bundle is kept.
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({}))
+        .expect("recovery goes on with the record it began");
+    assert_eq!(page.view()["state"], "on");
+    let out = tempfile::tempdir().expect("a directory");
+    let (_, kit) = page.kit(out.path());
+    assert_eq!(kit.service_origins, [computer.served.origin().to_owned()]);
+    drop(page);
+
+    // Signed in at the other service again, with the bundle kept at the first.
+    let sent = computer.served.web().arrived().len();
+    let moved = moved_to(&computer, &other).await;
+    let view = moved.view();
+    assert_eq!(view["state"], "on", "{view}");
+    assert_eq!(view["kept_at"], ours, "{view}");
+    assert_eq!(view["blocker"], wrong_service, "{view}");
+
+    let refusal = moved
+        .call("recovery_settle", json!({}))
+        .expect_err("a write is not settled at a service the account is not signed in to");
+    assert_eq!(refusal["code"], "PERMISSION_DENIED");
+    let words = refusal["message"].as_str().expect("words");
+    assert!(names_both(words, &ours, &theirs), "{words}");
+
+    let host = Host::new(&computer, computer.served.origin());
+    host.sets_up();
+    let refusal = moved
+        .recovery
+        .cover_host(&moved.account, &host, false)
+        .await
+        .expect_err("the host is not covered through a service the account is not signed in to");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(
+        names_both(&refusal.message, &ours, &theirs),
+        "{}",
+        refusal.message
+    );
+    assert_eq!(
+        *host.statuses.lock().expect("statuses"),
+        0,
+        "the host was not asked"
+    );
+
+    let refusal = moved
+        .call("recovery_archives", json!({}))
+        .expect_err("the archives are not read through a service the account is not signed in to");
+    assert_eq!(refusal["code"], "PERMISSION_DENIED");
+    let words = refusal["message"].as_str().expect("words");
+    assert!(names_both(words, &ours, &theirs), "{words}");
+
+    let exported = out.path().join("bundle.krexport");
+    moved.dialog_returns(&exported);
+    let refusal = moved
+        .call(
+            "recovery_export_offline",
+            json!({ "path": exported.to_string_lossy(), "archive": null }),
+        )
+        .expect_err(
+            "the offline copy is not read through a service the account is not signed in to",
+        );
+    assert_eq!(refusal["code"], "PERMISSION_DENIED");
+    let words = refusal["message"].as_str().expect("words");
+    assert!(names_both(words, &ours, &theirs), "{words}");
+    assert!(!exported.exists());
+
+    // The kit is made from the record: saved as text or as a QR code, it names the service the
+    // bundle is kept at, whatever the setting names now.
+    let (_, as_text) = moved.kit(out.path());
+    assert_eq!(as_text.service_origins, kit.service_origins);
+    assert_eq!(as_text.bundle_locator, kit.bundle_locator);
+    let path = out.path().join("kit.svg");
+    moved.dialog_returns(&path);
+    moved
+        .call(
+            "recovery_save_kit_qr",
+            json!({ "path": path.to_string_lossy() }),
+        )
+        .expect("the QR code is saved");
+    let (_, text, _) = scanned(&std::fs::read_to_string(&path).expect("the file"));
+    let from_the_code = parse_kit(&text).expect("a kit");
+    assert_eq!(from_the_code.service_origins, kit.service_origins);
+    assert_eq!(from_the_code.bundle_locator, kit.bundle_locator);
+
+    assert_eq!(
+        computer.served.web().arrived().len(),
+        sent,
+        "nothing was sent to the service the record names"
+    );
+    assert!(
+        other.web().arrived().is_empty(),
+        "nothing was sent to the service the account is signed in to"
+    );
+}
+
+/// KR-REQ-17.14: a record is read and covered at the service it names when only the setting
+/// changes. With the account still signed in at the record's service and the setting naming
+/// another, the page is shown nothing wrong, the archives are listed and the offline copy is read
+/// from the record's service, the host is covered through it, and the service the setting names is
+/// sent nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_is_read_and_covered_at_its_own_service_when_the_setting_names_another() {
+    let computer = Computer::new().await;
+    let setting = serve().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let out = tempfile::tempdir().expect("a directory");
+    let (_, kit) = page.kit(out.path());
+    drop(page);
+
+    let page = computer.start(account(&computer.origin(), Some(&RECOVERY_BACKUP_SCOPES)).await);
+    page.call("sync_service_set", json!({ "origin": setting.origin() }))
+        .expect("another service is chosen");
+    let view = page.view();
+    assert_eq!(view["state"], "on", "{view}");
+    assert_eq!(view["kept_at"], host_of(computer.served.origin()), "{view}");
+    assert_eq!(view["blocker"], Value::Null, "{view}");
+
+    let before = computer.served.web().arrived().len();
+    assert_eq!(
+        page.call("recovery_archives", json!({}))
+            .expect("the archives are listed"),
+        json!([]),
+        "a bundle that names no archive lists none"
+    );
+    assert!(
+        computer.served.web().arrived().len() > before,
+        "the archives were read at the service the record names"
+    );
+    let exported = out.path().join("bundle.krexport");
+    page.dialog_returns(&exported);
+    let saved = page
+        .call(
+            "recovery_export_offline",
+            json!({ "path": exported.to_string_lossy(), "archive": null }),
+        )
+        .expect("the bundle is exported");
+    assert_eq!(saved["archive_id"], Value::Null);
+    let export = kr_client::recovery::OfflineExport::from_canonical_slice(
+        &std::fs::read(&exported).expect("the file"),
+    )
+    .expect("an export");
+    assert_eq!(
+        Some(export.encrypted_bundle.as_slice().to_vec()),
+        computer.served.web().bundle(&kit.bundle_locator),
+        "the offline copy is the bundle as the service the record names holds it"
+    );
+
+    let host = Host::new(&computer, computer.served.origin());
+    host.sets_up();
+    let covered = page
+        .recovery
+        .cover_host(&page.account, &host, false)
+        .await
+        .expect("the host is covered");
+    assert!(
+        matches!(covered, HostCoverView::Covered { .. }),
+        "{covered:?}"
+    );
+    let bundle = read_with_only_the_kit(&computer.served, &kit).await;
+    assert!(
+        bundle
+            .trusted_writers
+            .iter()
+            .any(|held| held.writer_key_id == host.keys.writer_key_id),
+        "the bundle at the record's service names the host's writer"
+    );
+    assert!(
+        setting.web().arrived().is_empty(),
+        "the service the setting names was sent nothing"
+    );
 }
 
 /// Recovery writes the account's backup storage, so a sign-in that is missing or does not carry
