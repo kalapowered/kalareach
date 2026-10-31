@@ -1408,7 +1408,7 @@ async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_it
     page.sync_now();
     assert!(
         fork_service.web().arrived().len() > before,
-        "a step after the setting changed reached the service the record names"
+        "a step after the setting changed went to the fork's service, not the setting's"
     );
     let view = page.turn_on();
     assert_eq!(view["sync"]["state"], "on", "{view}");
@@ -1423,7 +1423,7 @@ async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_it
     assert_eq!(
         elsewhere.draft_at(draft).await,
         Some(2),
-        "the draft's next version reached the service the record names"
+        "the draft's next version went to the fork's service, not the setting's"
     );
 
     // The members are asked about and changed at the service the record names. A computer that
@@ -1460,7 +1460,7 @@ async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_it
     assert!(recorded_revocation, "the membership recorded it");
     assert!(
         page.view()["sync"]["problem"].is_null(),
-        "the step that took the phone out ended well: {}",
+        "the step that recorded the revocation ended without a problem: {}",
         page.view()
     );
     page.call("settings_devices_dismiss", json!({}))
