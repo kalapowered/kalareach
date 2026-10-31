@@ -41,6 +41,9 @@ use windows_station::{EntryOnInteractive, HeldDesktop, HeldStation};
 /// starts.
 const NATIVE: &[&str] = &["--shell-mode", "native_compat"];
 
+/// The integrity label no object can have a lower one than: untrusted, with no writing from below.
+const UNTRUSTED_LABEL: &str = "S:(ML;;NW;;;S-1-16-0)";
+
 /// Held by each case for as long as it changes the security of anything.
 static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -140,28 +143,29 @@ async fn a_logon_station_with_a_narrower_entry_is_refused_without_being_called_w
     );
 }
 
-/// KR-REQ-03.24: a window station that exists already, with the starter's own access list and an
-/// integrity label below the starter's own, is refused for its label, with the step named, and
-/// the refusal says that it admits more. The starter would raise a label that it may change, so
-/// the station withholds that right from everyone with a denying entry, which is a further entry
-/// and admits less. Control: once it is gone the next start is not refused.
+/// KR-REQ-03.24: a window station that exists already, with the starter's own access list and the
+/// lowest integrity label, which is below whatever the interactive station has, is refused for its
+/// label, with the step named, and the refusal says that it admits more. The starter would raise a
+/// label that it may change, so the station withholds that right from everyone with a denying
+/// entry, which is a further entry and admits less. Control: once it is gone the next start is not
+/// refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_logon_station_with_a_lower_integrity_label_refuses_the_start() {
     let _alone = ONE_AT_A_TIME.lock().await;
     let host = WorkerHost::start().await;
     the_starter_meets_the_stations_this_test_makes(&host).await;
 
-    let lower = HeldStation::make_labelled(without_the_right_to_relabel, "S:(ML;;NW;;;LW)")
-        .unwrap_or_else(|error| panic!("a station with a low integrity label: {error}"));
+    let lower = HeldStation::make_labelled(without_the_right_to_relabel, UNTRUSTED_LABEL)
+        .unwrap_or_else(|error| panic!("a station with the lowest integrity label: {error}"));
     assert!(
-        lower.label.contains("LW"),
-        "the station was made with another label than the low one: {:?}",
+        lower.label.contains("S-1-16-0"),
+        "the station was made with another label than the lowest one: {:?}",
         lower.label
     );
     let refused = host.kr_new(NATIVE).await;
     assert!(
         !refused.succeeded(),
-        "a headless session was started on a window station with a low integrity label: {}",
+        "a headless session was started on a window station with the lowest integrity label: {}",
         lower.label
     );
     let said = refused.said();
