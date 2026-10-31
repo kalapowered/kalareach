@@ -139,11 +139,15 @@ of these falls back to reading the configuration and hoping.
   does not change that: the refusal is about what this kernel can enforce rather than about what
   surrounds the process. Supporting such a kernel means a different mechanism, not a wrapper. The
   refusal is `HOST_NOT_CONFIGURED`, which a client does not send again, and it says which interface
-  version the kernel has and which the boundary needs. It is made before Git is looked for.
+  version the kernel has and which the boundary needs. It is made before Git is looked for. A kernel
+  that reports no interface at all is refused the same way. It may have the interface and still
+  withhold it from this process, because Landlock is not enabled at boot or a system-call filter
+  surrounds the process, and the refusal names those causes too.
 * **A kernel older than Linux 6.7** has no rules for which addresses a process reaches, so an
-  operation that needs a remote is refused there, in the same way. Local operations still run: their
-  filesystem confinement is the same, and the system-call filter that refuses them an internet
-  socket does not depend on the kernel's Landlock version.
+  operation that needs a remote is refused there under the same code and in the same words. The
+  refusal comes when the invocation that reaches the remote is built, and not before Git is looked
+  for. Local operations still run: their filesystem confinement is the same, and the system-call
+  filter that refuses them an internet socket does not depend on the kernel's Landlock version.
 * **A machine whose system calls this service does not hold the numbers for** refuses every
   invocation rather than installing a filter that would not mean what it says, as
   `HOST_NOT_CONFIGURED`.
