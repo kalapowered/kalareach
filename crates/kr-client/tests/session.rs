@@ -2752,8 +2752,10 @@ fn kr_cli_build_id() -> BuildId {
 
 /// KR-REQ-17.14: the local product needs no managed service, and replacing every service client
 /// changes nothing it does. A session's read and mutation, a draft and a control decide the same
-/// with nothing configured and with all five service clients replaced; availability is explained
-/// service by service, and nothing consulted it before doing that work.
+/// with nothing configured and with all five service clients replaced, a client being replaced that
+/// none of that work is given; availability is explained service by service. That nothing reads
+/// availability before local work is read from the code: its callers are the account sheet's report
+/// and the daemon's doctor check.
 #[tokio::test]
 async fn a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_change_with_one() {
     let host = side(1, true).await;
@@ -2764,8 +2766,8 @@ async fn a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_chan
     // The same work, twice: once with nothing configured, once with every service replaced by a
     // client that answers nothing. Section 17 says the local product is complete without any of
     // them, so what a session, a draft store and a control decide has to be the same both times.
-    // None of these paths reaches a service at all, which is the claim: not that every observable
-    // in the library is unchanged, but that this work never asks.
+    // None of this work is given a service client, which is the claim: not that every observable
+    // in the library is unchanged, but that this work has no client to ask.
     let mut observed = Vec::new();
     for (round, clients) in [
         ("nothing configured", ServiceClients::none()),
@@ -2845,7 +2847,7 @@ async fn a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_chan
         ));
 
         // Availability is explained service by service, in one shape, and every explanation names
-        // its service. It explains; nothing above consulted it before doing any of the work here.
+        // its service. It explains; the work above is given no client and reads no availability.
         let availability = clients.availability();
         assert_eq!(availability.len(), ManagedService::ALL.len(), "{round}");
         for report in &availability {

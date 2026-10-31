@@ -8,7 +8,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-17.14 | the `kr_req_17_14_` tests here, and the spent allowance in `relay_leases.rs` |
+//! | KR-REQ-17.14 | the `kr_req_17_14_` tests here |
 
 mod net_support;
 
