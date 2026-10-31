@@ -11,8 +11,13 @@
 //! made is sent them; the one-per-cent figure itself is measured with the other idle figures, not
 //! asserted here.
 //!
+//! The other clock a connection keeps is the replacement of its action window, which a connection
+//! needs only if it can first-admit a mutation. The daemon's attention and descriptions
+//! connections carry one kind of read each and are refused anything else, so they keep no such
+//! clock; a command line and the daemon's authority connection do.
+//!
 //! This uses a real worker service on its real endpoint and a real shell. The keepalive's period
-//! is shortened so that the case sees several of them, and what it waits for is a count of the
+//! and the window's are shortened so that the cases see several of them, and what it waits for is a count of the
 //! keepalives the bridge's connection has been sent, not a length of time: by then every other
 //! connection that was opened before it has had the same number of chances to be sent one.
 
@@ -38,7 +43,8 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 
-/// How often the worker under test sends a connection a process bridge made a keepalive.
+/// How often the worker under test sends a connection a process bridge made a keepalive, and
+/// replaces the action window of a connection that can admit a mutation.
 const PERIOD: Duration = Duration::from_millis(100);
 
 /// How many keepalives the bridge's connection is waited for before the others are looked at.
@@ -132,7 +138,8 @@ async fn host() -> Host {
             },
         )
         .expect("a worker service")
-        .with_keepalive(PERIOD),
+        .with_keepalive(PERIOD)
+        .with_window_renewal(PERIOD),
     );
     tokio::spawn(Arc::clone(&service).serve(listener));
     Host {
@@ -205,6 +212,40 @@ impl Raw {
         })
         .await
         .expect("a bridge's connection is sent a keepalive");
+    }
+
+    /// Reads the next replacement action window, whatever else arrives first.
+    async fn window(&mut self) {
+        tokio::time::timeout(BEAT_BOUND, async {
+            loop {
+                let frame = self.reader.next().await;
+                if matches!(
+                    frame,
+                    ControlFrame::Event(ControlEvent::ActionWindowRenewed(_))
+                ) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("a connection that admits a mutation is sent a replacement window");
+    }
+
+    /// Whether a replacement window is waiting in this connection, or arrives while it is looked at.
+    async fn holds_a_window(&mut self) -> bool {
+        tokio::time::timeout(LOOK, async {
+            loop {
+                let frame = self.reader.next().await;
+                if matches!(
+                    frame,
+                    ControlFrame::Event(ControlEvent::ActionWindowRenewed(_))
+                ) {
+                    return;
+                }
+            }
+        })
+        .await
+        .is_ok()
     }
 
     /// Whether a keepalive is waiting in this connection, or arrives while it is looked at.
@@ -336,6 +377,51 @@ async fn only_a_bridges_connection_is_sent_a_keepalive() {
         assert!(
             !connection.holds_a_keepalive().await,
             "{what} was not made by a process bridge, so it is sent no keepalive"
+        );
+    }
+}
+
+/// A connection that can admit a mutation is sent a replacement window on a clock, and a connection
+/// of the daemon's that carries one kind of read and is refused anything else is not: nothing it
+/// could do would present the window. The connections are opened before the last one is, so its
+/// being sent its eighth window means each of them has had the same chances to be sent eight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_perf_003_only_a_connection_that_can_admit_a_mutation_is_sent_a_replacement_window() {
+    let host = host().await;
+    let mut quiet = vec![
+        (
+            "the daemon's attention connection",
+            daemon(&host, ControllerConnectionRole::Attention).await,
+        ),
+        (
+            "the daemon's descriptions connection",
+            daemon(&host, ControllerConnectionRole::Descriptions).await,
+        ),
+    ];
+    let mut renewed = vec![
+        (
+            "the daemon's authority connection",
+            daemon(&host, ControllerConnectionRole::Authority).await,
+        ),
+        (
+            "a command line that has attached nothing",
+            Raw::of(cli(&host).await),
+        ),
+    ];
+    let mut last = Raw::of(cli(&host).await);
+    for _ in 0..BEATS {
+        last.window().await;
+    }
+    for (what, connection) in &mut quiet {
+        assert!(
+            !connection.holds_a_window().await,
+            "{what} admits no mutation, so it is sent no replacement window"
+        );
+    }
+    for (what, connection) in &mut renewed {
+        assert!(
+            connection.holds_a_window().await,
+            "{what} can admit a mutation, so it is sent replacement windows"
         );
     }
 }
