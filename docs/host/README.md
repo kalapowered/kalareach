@@ -834,11 +834,12 @@ its members, so a type that is reachable only inside another one is covered and 
 one fails the build's own tests on the day it is added. A form the walk cannot account for is
 refused rather than passed over: a value of any shape, a map, whose keys are text nothing classes,
 and a keyword that holds a schema the walk does not follow. Nothing may be classed that no export
-reaches, which keeps the list a record of what leaves rather than a place entries accumulate. Two values are reported by their kind alone: the boot identity is
-opaque bytes that identify one boot of one machine, so an export says which kernel facility this
-platform reads it from and carries none of the value; and the number of the account a desktop
-belongs to names that account on a platform that numbers its users, so an export of the desktop
-context carries none.
+reaches, which keeps the list a record of what leaves rather than a place entries accumulate.
+Two values leave without their content. The boot identity is opaque bytes that identify one boot
+of one machine, so an export says which kernel facility this platform reads it from and carries
+none of the value. The number of the account a desktop belongs to names that account on a
+platform that numbers its users, so an export of the desktop context carries none of it and says
+nothing of its kind: a reader sees an empty field, the same as on a platform that has no number.
 
 ### What a paired device reads of this host
 
@@ -3282,17 +3283,22 @@ the session is bound to a desktop and not which one. The `actor_id` of the owner
 actor, so nothing needs the number back. A session's `cwd` and `shell_path`, the `command` and `cwd`
 of its last command block, a question's `executable`, an attachment's staged `host_path`, the
 `command` of a materialisation (`changeset.read`) and in the offer of `shell.launch.surface`, and
-the `metadata_url` and `targets_url` of a catalogue are sent as they are: the specification shows
-them to the person on purpose, as part of how a session, a question, a manual attachment, a change,
-a launch or a catalogue is described, and a device that may see a session sees its terminal. Each
-reaches a device that holds the right of the method that reads it; the command block reaches only a
-device whose grant keeps history from the moment the command started or earlier. A catalogue's two
-locations are a directory on this host when the catalogue is a local one; only a device that holds
-`host.manage` reads them, and an owner device rebuilds the digest of a trust plan from them. The
-`disabled_reason` of a capability record in `plugin.capabilities` is a sentence of the host's; for
-a record of a signed qualification that is not usable it is followed by the statement of that
-qualification, which is the publisher's published text and not this host's, and is sent as it is.
-The
+the `metadata_url` and `targets_url` of a catalogue are sent as they are. The specification names a
+question's verified executable, the command blocks of a session with their working directory, and
+the command a materialisation ran. A session's directory and shell and an attachment's staged path
+are how the product describes a session and a manual attachment, and a device that may see a
+session sees its terminal. The command in the launch offer is a command the person asked the host
+to run, and the companion shows it so that the person can read it before and after the launch. A
+catalogue's two locations are a directory on this host when the catalogue is a local one; they are
+sent because an owner device rebuilds the digest of a trust plan from them and because the
+companion shows where the metadata is. Each reaches a device that holds the right of the method
+that reads it, and a catalogue's locations only a device that holds `host.manage`; the command block
+reaches only a device whose grant keeps history from the moment the command started or earlier. The
+`disabled_reason` of a capability record in `plugin.capabilities` is a sentence of the host's. For
+a signed qualification that the host accepted and whose state is not usable, it is followed by the
+statement of that qualification, which is the publisher's published text and not this host's, and
+is sent as it is. A qualification the host refused is reported as not tested, with the host's own
+sentence of the refusal and no statement. The
 `suspension_reason` of an agent instance's binding, which says why rich mutations wait, and the
 refusal of a rich mutation that repeats it, are sent as the host wrote them when the reason is one
 of the host's own sentences. Otherwise the device is told what kind of wait it was: the method of a
