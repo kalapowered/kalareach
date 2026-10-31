@@ -1655,9 +1655,8 @@ impl RestrictedProfile {
     /// # Errors
     ///
     /// Returns [`ProjectError::GitUnavailable`] when there is no usable Git, with the step that
-    /// installs it, and the platform's own [`ProjectError::GitFailed`] before any search where the
-    /// platform runs no Git at all and this profile holds no program it was handed. The search is
-    /// made again at the next call.
+    /// installs it, and, without that step, before any search where the platform runs no Git at all
+    /// and this profile holds no program it was handed. The search is made again at the next call.
     pub fn git(&self) -> Result<&GitProgram> {
         self.git.program()
     }
@@ -5201,10 +5200,9 @@ mod tests {
 
         gather(&mut pipe, &mut seen, deadline);
 
-        assert!(
-            pipe.reads <= 1,
-            "a pass whose deadline came during it ended with the read it came in, after {} reads",
-            pipe.reads
+        assert_eq!(
+            pipe.reads, 1,
+            "a pass whose deadline came during its first read ended with that read"
         );
     }
 
@@ -5527,114 +5525,47 @@ mod tests {
     }
 
     /// A request that arrived while a look was under way is answered with that look's refusal when
-    /// it ends, and is not held by the look the next request makes: the look it joined is the one it
-    /// waited for, and no other. The case ends the first look and holds the second, so a request
-    /// that went on waiting would be answered only when the case let the second go. The stand-in
-    /// ends each look when the case writes the file named for its number, and the bound is only a
-    /// guard for a case that hangs.
-    #[cfg(unix)]
+    /// it ends, and is not held by the look that follows: the look it joined is the one it waited
+    /// for, and no other. The second look is in the slot, and stays under way, before the first one
+    /// ends, so a request that went on to wait for whatever stands in the slot would be answered
+    /// only when the case let the second go. Nothing here waits for a time: the case moves when a
+    /// condition holds, and the bound on its one wait is only a guard for a request that is held.
     #[test]
     fn a_request_that_waited_for_one_look_is_not_held_by_the_look_that_follows() {
-        let directory = tempfile::tempdir().expect("a directory for this test");
-        let search = directory.path().join("search");
-        std::fs::create_dir(&search).expect("a search path of this test's own");
-        let started = directory.path().join("started");
-        let text = directory.path().join("git.text");
-        std::fs::write(
-            &text,
-            format!(
-                "#!/bin/sh\necho started >> '{started}'\nn=$(wc -l < '{started}' | tr -d ' ')\n\
-                 i=0\nwhile [ ! -e '{dir}/release-'$n ] && [ $i -lt 2400 ]; do sleep 0.05; \
-                 i=$((i+1)); done\nexit 1\n",
-                started = started.display(),
-                dir = directory.path().display(),
-            ),
-        )
-        .expect("the stand-in's text");
-        kr_ipc::testing::place_program(&text, &search.join("git"));
-        let installation =
-            Installation::looked_for_on(Some(OsString::from(&search)), Duration::from_secs(60));
-        let starts = || std::fs::read_to_string(&started).map_or(0, |marks| marks.lines().count());
-        let release = |number: u32| {
-            std::fs::write(directory.path().join(format!("release-{number}")), "")
-                .expect("a look is let go");
-        };
-        let guarded = |what: &str, mut holds: Box<dyn FnMut() -> bool + '_>| {
-            let guard = Instant::now() + Duration::from_secs(30);
-            while !holds() {
-                assert!(Instant::now() < guard, "{what}");
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        };
-        // How many hold the look under way: the request that made it, the slot, and each request
-        // that joined it.
-        let holding = || {
-            installation
-                .current
-                .try_lock()
-                .ok()
-                .and_then(|slot| slot.as_ref().map(Arc::strong_count))
-        };
+        let installation = Installation::looked_for_on(None, PROBE_BOUND);
+        let first = Arc::new(Look::default());
+        *installation.current.lock().expect("the slot") = Some(Arc::clone(&first));
+        let (answer, answered) = std::sync::mpsc::channel();
 
         std::thread::scope(|scope| {
             let installation = &installation;
-            let first = scope.spawn(move || {
-                installation
-                    .program()
-                    .map(|_| ())
-                    .expect_err("no Git answers")
-            });
-            guarded(
-                "the first look never started the stand-in",
-                Box::new(|| starts() == 1),
-            );
-            let (answer, answered) = std::sync::mpsc::channel();
-            let earlier = scope.spawn(move || {
-                let refusal = installation
-                    .program()
-                    .map(|_| ())
-                    .expect_err("no Git answers");
+            scope.spawn(move || {
+                let refusal = installation.program().map(|_| ()).expect_err("no Git");
                 answer
                     .send(refusal.to_string())
                     .expect("the case is waiting");
             });
-            guarded(
-                "the earlier request never joined the first look",
-                Box::new(|| holding() == Some(3)),
-            );
+            // The request has joined the first look once a third holder of it exists: the slot,
+            // this case and the request.
+            let guard = Instant::now() + Duration::from_secs(30);
+            while Arc::strong_count(&first) < 3 {
+                assert!(
+                    Instant::now() < guard,
+                    "the request never joined the first look"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
 
-            // The first look ends, and the next request makes a look of its own, which the case
-            // holds.
-            release(1);
-            let first_refusal = first.join().expect("the first look ends");
-            let later = scope.spawn(move || {
-                installation
-                    .program()
-                    .map(|_| ())
-                    .expect_err("no Git answers")
-            });
-            guarded(
-                "the second look never started the stand-in",
-                Box::new(|| starts() == 2),
-            );
+            // The second look takes the slot and stays under way while the first one ends.
+            let second = Arc::new(Look::default());
+            *installation.current.lock().expect("the slot") = Some(Arc::clone(&second));
+            first.end(Err(Diagnostic::new("the first look was refused")));
 
-            let earlier_refusal = answered.recv_timeout(Duration::from_secs(30));
-            release(2);
-            earlier.join().expect("the earlier request ends");
-            let later_refusal = later.join().expect("the second look ends");
-
-            assert_eq!(
-                earlier_refusal.ok(),
-                Some(first_refusal.to_string()),
-                "the earlier request was answered with the refusal of the look it waited for, \
-                 while the second look was still held"
-            );
-            assert!(
-                matches!(later_refusal, ProjectError::GitUnavailable { .. }),
-                "{later_refusal:?}"
-            );
+            let told = answered.recv_timeout(Duration::from_secs(30));
+            second.end(Err(Diagnostic::new("the second look was refused")));
+            let told = told.expect("the request was answered while the second look was under way");
+            assert!(told.contains("the first look was refused"), "{told}");
         });
-        assert_eq!(starts(), 2, "two looks were made, one for each need");
     }
 
     /// A child that something else in the process has collected cannot be waited on, and the answer
