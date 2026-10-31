@@ -33,28 +33,31 @@ use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 /// A small image with a shell, which every one of these starts a sleeping process in.
 const IMAGE: &str = "docker.io/library/alpine:3.20";
 
-/// Returns false and says why when this machine has no container runtime. A runtime that is there
-/// and does not answer its version is not a missing one: it fails the case, with the call named,
-/// where a skip would pass every case that needs it.
+/// Returns false and says why when this machine has no container runtime: the program is not there,
+/// or it is there and fails its version, which is no runtime this machine has. A runtime that is
+/// there and does not answer its version is not a missing one: it fails the case, with the call
+/// named, where a skip would pass every case that needs it.
 fn runtime_available(suite: &str) -> bool {
-    match run_bounded(
+    let why = match run_bounded(
         launch::CONTAINER_RUNTIME,
         &["--version".to_owned()],
         PLATFORM_LIMIT,
     ) {
         Ok(output) if output.status.success() => return true,
-        Ok(output) => panic!(
-            "{} is installed and failed its version: {}",
+        Ok(output) => format!(
+            "{} is installed and `--version` ended with {}",
             launch::CONTAINER_RUNTIME,
-            printed(&output)
+            output.status
         ),
-        Err(CallFailure::NotRun { error, .. }) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(CallFailure::NotRun { error, .. }) if error.kind() == std::io::ErrorKind::NotFound => {
+            format!(
+                "{} is not installed on this machine",
+                launch::CONTAINER_RUNTIME
+            )
+        }
         Err(failure) => panic!("{failure}"),
-    }
-    eprintln!(
-        "{suite}: skipped, because {} is not installed on this machine",
-        launch::CONTAINER_RUNTIME
-    );
+    };
+    eprintln!("{suite}: skipped, because {why}");
     false
 }
 
@@ -204,11 +207,17 @@ impl Container {
     }
 
     /// Removes the container, or says why it could not. A removal can be asked again and a loaded
-    /// machine's runtime can take longer than one call is given, so a call that does not end is
-    /// asked again until [`REMOVAL_WITHIN`]; a refusal is not.
+    /// machine's runtime can take longer than one call is given, so a call that gave no answer is
+    /// asked again until [`REMOVAL_WITHIN`] has passed, each call given no more than what is left;
+    /// a refusal is not asked again.
     fn remove(&self) -> Result<(), String> {
         let until = Instant::now() + REMOVAL_WITHIN;
+        let mut last = String::new();
         loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(last);
+            }
             match runtime_within(
                 &[
                     "rm",
@@ -219,13 +228,13 @@ impl Container {
                     "--",
                     self.target(),
                 ],
-                PLATFORM_LIMIT,
+                PLATFORM_LIMIT.min(left),
             ) {
                 Ok(output) if output.status.success() => return Ok(()),
                 Ok(output) => return Err(printed(&output)),
-                Err(why) if Instant::now() >= until => return Err(why),
-                Err(_) => std::thread::sleep(Duration::from_millis(200)),
+                Err(why) => last = why,
             }
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }

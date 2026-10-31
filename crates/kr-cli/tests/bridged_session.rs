@@ -344,29 +344,33 @@ impl World {
         .expect("writes the destination's configuration document");
 
         let log = std::fs::File::create(source.root().join("daemon.log")).expect("the log");
-        let child = std::process::Command::new(installation().join("kr-controller"))
-            .current_dir(source.root())
-            .arg("--runtime-dir")
-            .arg(source.root().join("r"))
-            .arg("--state-dir")
-            .arg(source.root().join("s"))
-            .arg("--worker")
-            .arg(installation().join("kr-worker"))
-            // The daemon runs `ssh` for a host that is asked who it is, so the stand-in is first
-            // on its path too.
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    tools.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .stdin(std::process::Stdio::null())
-            .stdout(log.try_clone().expect("duplicates the log"))
-            .stderr(log)
-            .spawn()
-            .expect("the source daemon starts");
+        // Started in its turn, so that no pipe another case has just made is handed to a daemon
+        // that outlives it.
+        let child = user_manager::spawning(|| {
+            std::process::Command::new(installation().join("kr-controller"))
+                .current_dir(source.root())
+                .arg("--runtime-dir")
+                .arg(source.root().join("r"))
+                .arg("--state-dir")
+                .arg(source.root().join("s"))
+                .arg("--worker")
+                .arg(installation().join("kr-worker"))
+                // The daemon runs `ssh` for a host that is asked who it is, so the stand-in is first
+                // on its path too.
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        tools.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .stdin(std::process::Stdio::null())
+                .stdout(log.try_clone().expect("duplicates the log"))
+                .stderr(log)
+                .spawn()
+        })
+        .expect("the source daemon starts");
         let world = Self {
             source,
             destination,
@@ -1908,32 +1912,34 @@ impl PrivateSshd {
             .expect("a free loopback port")
             .port();
         let log = std::fs::File::create(directory.join("sshd.log")).expect("a log");
-        let child = std::process::Command::new(sshd)
-            .current_dir(directory)
-            .args(["-D", "-e", "-f", "/dev/null", "-h"])
-            .arg(&host_key)
-            .arg("-p")
-            .arg(port.to_string())
-            .args(["-o", "ListenAddress=127.0.0.1", "-o", "PidFile=none"])
-            .args([
-                "-o",
-                "UsePAM=no",
-                "-o",
-                "StrictModes=no",
-                "-o",
-                "PermitUserRC=no",
-            ])
-            .arg("-o")
-            .arg(format!("AuthorizedKeysFile={}", authorised.display()))
-            .args(["-o", "PasswordAuthentication=no"])
-            .args(["-o", "KbdInteractiveAuthentication=no"])
-            .arg("-o")
-            .arg(format!("SetEnv {environment}"))
-            .stdin(std::process::Stdio::null())
-            .stdout(log.try_clone().expect("a log handle"))
-            .stderr(log)
-            .spawn()
-            .expect("sshd starts");
+        let child = user_manager::spawning(|| {
+            std::process::Command::new(sshd)
+                .current_dir(directory)
+                .args(["-D", "-e", "-f", "/dev/null", "-h"])
+                .arg(&host_key)
+                .arg("-p")
+                .arg(port.to_string())
+                .args(["-o", "ListenAddress=127.0.0.1", "-o", "PidFile=none"])
+                .args([
+                    "-o",
+                    "UsePAM=no",
+                    "-o",
+                    "StrictModes=no",
+                    "-o",
+                    "PermitUserRC=no",
+                ])
+                .arg("-o")
+                .arg(format!("AuthorizedKeysFile={}", authorised.display()))
+                .args(["-o", "PasswordAuthentication=no"])
+                .args(["-o", "KbdInteractiveAuthentication=no"])
+                .arg("-o")
+                .arg(format!("SetEnv {environment}"))
+                .stdin(std::process::Stdio::null())
+                .stdout(log.try_clone().expect("a log handle"))
+                .stderr(log)
+                .spawn()
+        })
+        .expect("sshd starts");
         let server = Self {
             child,
             port,
@@ -3470,11 +3476,17 @@ impl Container {
     /// runtime refused, or the call did not end. It does not panic for either.
     ///
     /// A removal can be asked again, and a loaded machine's runtime can take longer than one call
-    /// is given, so a call that does not end is asked again until the time a slow call is given
-    /// has passed. A refusal is not asked again: it would be refused again.
+    /// is given, so a call that gave no answer is asked again until the time a slow call is given
+    /// has passed, each call given no more than what is left. A refusal is not asked again: it
+    /// would be refused again.
     fn remove(&self) -> Result<(), String> {
         let until = Instant::now() + self.runtime.slow;
+        let mut last = String::new();
         loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(last);
+            }
             match self.runtime.run(
                 &[
                     "rm",
@@ -3485,7 +3497,7 @@ impl Container {
                     "--",
                     self.target(),
                 ],
-                self.runtime.quick,
+                self.runtime.quick.min(left),
             ) {
                 Ok(removed) if removed.status.success() => return Ok(()),
                 Ok(removed) => {
@@ -3494,9 +3506,9 @@ impl Container {
                         String::from_utf8_lossy(&removed.stderr).trim()
                     ));
                 }
-                Err(why) if Instant::now() >= until => return Err(why),
-                Err(_) => std::thread::sleep(Duration::from_millis(200)),
+                Err(why) => last = why,
             }
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }
@@ -3959,83 +3971,126 @@ fn a_call_that_waits_for_the_turn_to_start_a_process_is_bounded_from_the_call() 
     assert!(why.contains("could not be started within"), "{why}");
 }
 
+/// How long a case that ends a call by its bound gives the call before it counts the machine as too
+/// slow to say anything: the first bound is far longer than a quiet machine needs, and a case whose
+/// program was not ready by it is run again with the next.
+const BOUNDS_TO_TRY: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(45),
+];
+
 /// A call that does not end within its bound is asked to end before it is killed, so that a
 /// program that cleans up after itself, as an image build does, is given the chance: a program that
 /// is killed outright leaves what it started.
+///
+/// A program ended before it is ready to be asked is ended by a signal it has no say in, and that
+/// says nothing of the harness. So a run whose program was not ready within its bound is not
+/// counted, and the case is run again with a longer one.
 #[test]
 fn a_call_that_does_not_end_is_asked_to_end_before_it_is_killed() {
     let directory = tempfile::tempdir().expect("a directory");
-    let ready = directory.path().join("ready");
-    let asked = directory.path().join("asked-to-end");
+    for (attempt, bound) in BOUNDS_TO_TRY.into_iter().enumerate() {
+        let ready = directory.path().join(format!("ready-{attempt}"));
+        let asked = directory.path().join(format!("asked-to-end-{attempt}"));
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("trap ': > \"$2\"; kill $!; exit 0' TERM; sleep 30 & : > \"$1\"; wait")
+            .arg("program")
+            .arg(&ready)
+            .arg(&asked);
+        let why = user_manager::bounded(command, bound)
+            .expect_err("a program that never ends is ended and the call says so");
+        assert!(why.contains("did not end within"), "{why}");
+        if ready.exists() {
+            assert!(
+                asked.exists(),
+                "the program was killed without being asked to end: {why}"
+            );
+            return;
+        }
+    }
+    panic!("the program was not ready to be asked in any of the bounds it was given");
+}
+
+/// A call that ended while something it started still holds its output fails, naming the call,
+/// where an empty answer would pass a case that read only the status.
+#[test]
+fn a_call_that_ended_and_left_something_holding_its_output_fails_and_names_the_call() {
     let mut command = std::process::Command::new("/bin/sh");
     command
         .arg("-c")
-        .arg("trap ': > \"$2\"; kill $!; exit 0' TERM; sleep 30 & : > \"$1\"; wait")
-        .arg("program")
-        .arg(&ready)
-        .arg(&asked);
-    // The bound is far longer than the program takes to get ready to be asked: a program that is
-    // ended before it is ready is ended by a signal it has not got a say in.
-    let why = user_manager::bounded(command, Duration::from_secs(5))
-        .expect_err("a program that never ends is ended and the call says so");
-    assert!(why.contains("did not end within"), "{why}");
+        .arg("sleep 12 & echo answered; exit 0")
+        .arg("program");
+    let why = user_manager::bounded(command, Duration::from_secs(60))
+        .expect_err("output that is still held is a failure and not an empty answer");
     assert!(
-        ready.exists(),
-        "the program was never ready to be asked: {why}"
-    );
-    assert!(
-        asked.exists(),
-        "the program was killed without being asked to end: {why}"
+        why.contains("still holds its output") && why.contains("sleep 12"),
+        "{why}"
     );
 }
 
 /// A run of `kr` that does not end within its bound fails the case that ran it, with the call
 /// named: a `kr` that waits for an `ssh` that never answers is the one that stalls here.
+///
+/// A `kr` that was not yet at the `ssh` when its bound passed says nothing of the harness, so a run
+/// whose connection was never made is not counted, and the case is run again with a longer bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_kr_run_that_does_not_end_within_its_bound_fails_the_case_and_names_the_call() {
     let mut world = World::start().await;
     std::fs::write(world.tools.join("stalls"), "").expect("a mark for the stand-in");
-    world.kr_bound = Duration::from_secs(3);
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        world.run(&[
-            "--json",
-            "bridge",
-            "enrol",
-            "--access",
-            "ssh",
-            "--label",
-            "never",
-            "--target",
-            "build.example",
-            "--user",
-            "nobody",
-            "--helper",
-            "/bin/true",
-            "--probe",
-        ])
-    }));
-    let said = panic_message(failed.expect_err("a run that outlasts its bound fails the case"));
-    assert!(
-        said.contains("\"enrol\"") && said.contains("within"),
-        "the call is named: {said}"
-    );
-    // What `kr` was waiting for goes with it, and does not outlast the case.
-    let stalled = std::fs::read_to_string(world.tools.join("stalled.pid"))
-        .expect("the stand-in recorded the connection it became");
-    let pid = stalled
-        .trim()
-        .parse::<i32>()
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-        .expect("a process number");
-    let begun = Instant::now();
-    while rustix::process::test_kill_process(pid).is_ok() {
+    let stalled = world.tools.join("stalled.pid");
+    for bound in [
+        Duration::from_secs(3),
+        Duration::from_secs(10),
+        Duration::from_secs(30),
+    ] {
+        world.kr_bound = bound;
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            world.run(&[
+                "--json",
+                "bridge",
+                "enrol",
+                "--access",
+                "ssh",
+                "--label",
+                "never",
+                "--target",
+                "build.example",
+                "--user",
+                "nobody",
+                "--helper",
+                "/bin/true",
+                "--probe",
+            ])
+        }));
+        let said = panic_message(failed.expect_err("a run that outlasts its bound fails the case"));
         assert!(
-            begun.elapsed() < LIVENESS_DEADLINE,
-            "the connection the ended run was waiting for is still there"
+            said.contains("\"enrol\"") && said.contains("within"),
+            "the call is named: {said}"
         );
-        std::thread::sleep(Duration::from_millis(50));
+        let Ok(recorded) = std::fs::read_to_string(&stalled) else {
+            continue;
+        };
+        // What `kr` was waiting for goes with it, and does not outlast the case.
+        let pid = recorded
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .expect("a process number");
+        let begun = Instant::now();
+        while rustix::process::test_kill_process(pid).is_ok() {
+            assert!(
+                begun.elapsed() < LIVENESS_DEADLINE,
+                "the connection the ended run was waiting for is still there"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        return;
     }
+    panic!("kr did not reach the connection in any of the bounds it was given");
 }
 
 impl World {
