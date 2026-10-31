@@ -5738,6 +5738,39 @@ async fn until_a_request_waits_for_its_token(rig: &Rig) {
     .await;
 }
 
+/// Waits until the carrier's first pass has ended. The carrier asks for the account token in that
+/// pass, after the first read of the storage state, so a gate on the token raised before then can
+/// be met by the carrier and not by the call a case is about.
+async fn until_the_carriers_first_pass_has_ended(rig: &Rig) {
+    let mut passes = rig.controller.backup_runtime().expect("a carrier").passes();
+    within("the carrier's first pass", async {
+        while *passes.borrow_and_update() < 1 {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+}
+
+/// Raises the gate on the account token after the call's first request for one, and waits until the
+/// request after it is the one held. The call's check that a token can be had is that first request.
+async fn hold_the_request_after_the_first_for_its_token(
+    rig: &Rig,
+) -> kr_controller::account::TokenRequestsHeld {
+    until_the_carriers_first_pass_has_ended(rig).await;
+    rig.controller.host_account().hold_token_requests_after(1)
+}
+
+/// Waits until the request after the first is the one held at the gate, and not the first.
+async fn until_the_request_after_the_first_waits_for_its_token(rig: &Rig) {
+    until_a_request_waits_for_its_token(rig).await;
+    assert_eq!(
+        rig.controller.host_account().token_passes_left(),
+        0,
+        "the first request went through the gate"
+    );
+    assert_eq!(rig.controller.host_account().token_requests_waiting(), 1);
+}
+
 /// KR-REQ-09.09: a fence this host comes to owe while a request waits for the account token stops
 /// that request. The retention change is the last request that changes the service, and it waits
 /// for its token after the admission was last asked, so the admission is asked again once the token
@@ -5818,9 +5851,9 @@ async fn a_fence_owed_while_the_bundle_write_waits_for_its_own_token_stops_it() 
     let (rig, _) = a_host_to_set_up(&timer).await;
     let web = Arc::clone(rig.served.web());
     let made = rig.prepared_setup(archive_id(), false);
-    let tokens = rig.controller.host_account().hold_token_requests_after(1);
+    let tokens = hold_the_request_after_the_first_for_its_token(&rig).await;
     let call = rig.enable_outcome_in_the_background(&made.params);
-    until_a_request_waits_for_its_token(&rig).await;
+    until_the_request_after_the_first_waits_for_its_token(&rig).await;
     rig.controller.hold_fence(true);
     drop(tokens);
     let refusal = call
@@ -5849,9 +5882,9 @@ async fn a_deadline_that_passes_while_the_bundle_write_waits_for_its_own_token_s
     let (rig, _, clock) = a_host_to_set_up_on_a_clock(&HeldTimer::held()).await;
     let web = Arc::clone(rig.served.web());
     let made = rig.prepared_setup(archive_id(), false);
-    let tokens = rig.controller.host_account().hold_token_requests_after(1);
+    let tokens = hold_the_request_after_the_first_for_its_token(&rig).await;
     let call = rig.enable_outcome_in_the_background(&made.params);
-    until_a_request_waits_for_its_token(&rig).await;
+    until_the_request_after_the_first_waits_for_its_token(&rig).await;
     clock.advance(Duration::from_millis(
         kr_protocol::limits::DEFAULT_MUTATION_TTL.get() + 1_000,
     ));
