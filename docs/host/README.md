@@ -3209,19 +3209,19 @@ session's directory`), and otherwise a sentence made from the code. Three refusa
 reason, because their text names a place or an account: a filesystem mounted beneath the location a
 grant names and a repository whose alternates file names objects outside it, both told in terms of
 that location, and a worker that could not be started over a scheduled task under the
-environment's name that is not this installation's own. Text that already exists cannot be made again, so the rule holds where
-an error is written, whoever made it: a worker's, one a store kept, one a catalogue receipt holds,
-and one inside a result, such as the presentation error of a create. A receipt whose message was
-replaced says so in `error_withheld`. A record that holds a failure as plain text is held to the
-rule by the member that carries it, in a result and in an announcement of any kind: the `reason` of
-a privacy step that could not answer and of a session's cleanup, the `detail` of a workspace, of a
-retained item and of a repository operation, and the `refusal` of an agent instance. The rest of
-the record is sent as it is. What a closure records of a resource it left is held to the same rule
-and is replaced by the kind of resource. What the agent of a session says in refusing a prompt, a
-steer, a cancellation, an approval or a plugin's action is the agent's own words, and they quote
-what it was working on. The worker gives them as `INVALID_ARGUMENT`, `UPSTREAM_UNAVAILABLE` or
-`OUTCOME_UNKNOWN`, so on these methods a message with one of those codes is replaced by a sentence
-made from its code. The exception is the host's own reasons for refusing
+environment's name that is not this installation's own. Text that already exists cannot be made
+again, so the rule holds where an error is written, whoever made it: a worker's, one a store kept,
+one a catalogue receipt holds, and one inside a result, such as the presentation error of a create.
+A receipt whose message was replaced says so in `error_withheld`. A record that holds a failure as
+plain text is held to the rule by the member that carries it, in a result and in an announcement of
+any kind: the `reason` of a privacy step that could not answer and of a session's cleanup, the
+`detail` of a workspace, of a retained item and of a repository operation, and the `refusal` of an
+agent instance. The rest of the record is sent as it is. What a closure records of a resource it
+left is held to the same rule and is replaced by the kind of resource. What the agent of a session
+says in refusing a prompt, a steer, a cancellation, an approval or a plugin's action is the agent's
+own words, and they quote what it was working on. The worker gives them as `INVALID_ARGUMENT`,
+`UPSTREAM_UNAVAILABLE` or `OUTCOME_UNKNOWN`, so on these methods a message with one of those codes
+is replaced by a sentence made from its code. The exception is the host's own reasons for refusing
 the device's argument, which the device needs to correct what it sent, and which are told apart by
 their wording and not by their code: a prompt that names neither a draft nor inline text or names
 both, a parameter an action does not declare or does not accept, and an attachment over the size a
