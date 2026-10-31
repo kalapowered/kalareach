@@ -2664,7 +2664,7 @@ async fn turning_recovery_on_adopts_an_earlier_write_at_the_records_service_when
     );
     assert_eq!(
         kit.service_origins,
-        [ours.clone()],
+        std::slice::from_ref(&ours),
         "and the service the record names"
     );
 
