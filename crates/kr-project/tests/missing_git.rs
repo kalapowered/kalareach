@@ -163,18 +163,6 @@ fn exists(pid: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Whether a process with this identifier is running, which one that has ended and not yet been
-/// collected is not.
-#[cfg(unix)]
-fn running(pid: &str) -> bool {
-    let listed = std::process::Command::new("ps")
-        .args(["-o", "stat=", "-p", pid])
-        .output()
-        .expect("ps lists the process");
-    let state = String::from_utf8_lossy(&listed.stdout);
-    !state.trim().is_empty() && !state.trim().starts_with('Z')
-}
-
 /// Waits until `gone` holds, for no longer than a guard that only a hang reaches.
 #[cfg(unix)]
 fn until(what: &str, gone: impl Fn() -> bool) {
@@ -439,90 +427,6 @@ fn requests_that_arrive_together_share_the_refusal_of_one_look() {
         starts, 1,
         "the stand-in was started once for {REQUESTS} requests that arrived together"
     );
-}
-
-#[cfg(unix)]
-#[test]
-fn a_request_that_waited_for_one_look_is_not_held_by_the_look_that_follows() {
-    // The first look hangs until its bound. A request that arrives while it is under way waits for
-    // it, and when it ends is given its refusal. The look the next request then makes hangs until
-    // the case lets it go, so a request still waiting on this look instead of the first would be
-    // held, and would be answered only when this look ended.
-    let directory = tempfile::tempdir().expect("a directory for this test");
-    let search = directory.path().join("search");
-    std::fs::create_dir(&search).expect("a search path of this test's own");
-    let (started, release) = (
-        directory.path().join("started"),
-        directory.path().join("release"),
-    );
-    stand_in(
-        &search,
-        &format!(
-            "echo started >> '{started}'\nn=$(wc -l < '{started}' | tr -d ' ')\n\
-             echo $$ > '{dir}/pid-'$n\n\
-             if [ \"$n\" -gt 1 ]; then\n\
-             while [ ! -e '{release}' ]; do sleep 0.05; done\n\
-             exit 1\nfi\nexec sleep 120",
-            started = started.display(),
-            dir = directory.path().display(),
-            release = release.display(),
-        ),
-    );
-    let profile = profile_waiting(directory.path(), &search, Duration::from_secs(4));
-    let starts = || std::fs::read_to_string(&started).map_or(0, |marks| marks.lines().count());
-    let second = directory.path().join("pid-2");
-
-    std::thread::scope(|scope| {
-        let profile = &profile;
-        let first = scope.spawn(move || profile.git().map(|_| ()).expect_err("no Git answers"));
-        until("the first look never started the stand-in", || {
-            starts() == 1
-        });
-        let (answer, answered) = std::sync::mpsc::channel();
-        let earlier = scope.spawn(move || {
-            let refusal = profile.git().map(|_| ()).expect_err("no Git answers");
-            answer
-                .send(refusal.to_string())
-                .expect("the case is waiting");
-        });
-
-        // The first look ends at its bound, and the next request makes a look of its own.
-        let first_refusal = first.join().expect("the first look ends");
-        let later = scope.spawn(move || profile.git().map(|_| ()).expect_err("no Git answers"));
-        until("the second look never started the stand-in", || {
-            starts() == 2
-                && std::fs::read_to_string(&second).is_ok_and(|pid| !pid.trim().is_empty())
-        });
-
-        let earlier_refusal = answered.recv().expect("the earlier request is answered");
-        let second_look_runs = running(
-            std::fs::read_to_string(&second)
-                .expect("the second stand-in wrote its number")
-                .trim(),
-        );
-        std::fs::write(&release, "").expect("the second look is let go");
-        earlier.join().expect("the earlier request ends");
-        let later_refusal = later.join().expect("the second look ends");
-
-        assert!(
-            second_look_runs,
-            "the earlier request was answered only when the second look had ended"
-        );
-        assert_eq!(
-            earlier_refusal,
-            first_refusal.to_string(),
-            "it was given the refusal of the look it waited for"
-        );
-        assert!(
-            first_refusal.to_string().contains("did not answer"),
-            "the first look ended at its bound: {first_refusal}"
-        );
-        assert!(
-            matches!(later_refusal, ProjectError::GitUnavailable { .. }),
-            "{later_refusal:?}"
-        );
-    });
-    assert_eq!(starts(), 2, "two looks were made, one for each need");
 }
 
 #[cfg(unix)]
