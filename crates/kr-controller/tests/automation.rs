@@ -6579,13 +6579,15 @@ async fn a_created_session_is_kept_when_its_node_is_asked_to_stop_after_its_admi
 /// A daemon with real sessions whose configuration document names `suites` (a name, its command,
 /// and the output paths it declares), started before anything else is done.
 async fn working_host_with_suites(suites: &[(&str, &str, &[&str])]) -> Host {
-    working_host_with_suites_after(suites, |_| {}).await
+    working_host_with_suites_after(suites, Clocks::system(), |_| {}).await
 }
 
-/// [`working_host_with_suites`], with `before_the_daemon_starts` given the environment's state
-/// directory after the configuration is written and before the daemon starts.
+/// [`working_host_with_suites`], on the clocks the test gives the daemon, with
+/// `before_the_daemon_starts` given the environment's state directory after the configuration is
+/// written and before the daemon starts.
 async fn working_host_with_suites_after(
     suites: &[(&str, &str, &[&str])],
+    clocks: Clocks,
     before_the_daemon_starts: impl FnOnce(&Path),
 ) -> Host {
     let temp = teardown::Tree::create();
@@ -6610,7 +6612,7 @@ async fn working_host_with_suites_after(
     let environment = temp.environment();
     std::fs::create_dir_all(environment.state_dir()).expect("the state directory");
     before_the_daemon_starts(environment.state_dir());
-    working_host_on(temp, |supervisor| supervisor).await
+    working_host_on_clocks(temp, clocks, |supervisor| supervisor).await
 }
 
 /// Captures the workspace into a version, through a workflow run, and returns the version.
@@ -6674,6 +6676,25 @@ async fn tests_run_within(
     kr_protocol::automation::NodeReceiptSummary,
     kr_protocol::changeset::ChangesetReadResult,
 ) {
+    let document = tests_definition(control, host, number, suite, version, deadlines).await;
+    let run: WorkflowRunResult = typed(
+        &start(control, host, &document, "evt-tests")
+            .await
+            .expect("the run is admitted"),
+    );
+    tests_run_settled(control, host, &document, run, version).await
+}
+
+/// The definition of a `run_tests` node for `suite` against `version`, installed and enabled, with
+/// the deadlines it names where it names any.
+async fn tests_definition(
+    control: &mut LocalClient,
+    host: &Host,
+    number: u8,
+    suite: &str,
+    version: kr_protocol::changeset::VersionRef,
+    deadlines: Option<WorkflowDeadlines>,
+) -> WorkflowDefinition {
     host.issue(grant_id(number), &COMMAND_RIGHTS);
     let mut document = definition(
         workflow_id(number),
@@ -6695,12 +6716,23 @@ async fn tests_run_within(
     }
     install(control, host, &document).await;
     enable(control, host, &document).await;
-    let run: WorkflowRunResult = typed(
-        &start(control, host, &document, "evt-tests")
-            .await
-            .expect("the run is admitted"),
-    );
-    let receipt = receipts_of(control, &document, run.run_id).await.remove(0);
+    document
+}
+
+/// What a run of [`tests_definition`] came to, once what the tests owned has been released: the run,
+/// its node and the version as the daemon reads it afterwards.
+async fn tests_run_settled(
+    control: &mut LocalClient,
+    host: &Host,
+    document: &WorkflowDefinition,
+    run: WorkflowRunResult,
+    version: kr_protocol::changeset::VersionRef,
+) -> (
+    WorkflowRunResult,
+    kr_protocol::automation::NodeReceiptSummary,
+    kr_protocol::changeset::ChangesetReadResult,
+) {
+    let receipt = receipts_of(control, document, run.run_id).await.remove(0);
     until("what the tests owned to be released", || {
         owed_rows(host) == 0
     })
@@ -6901,23 +6933,62 @@ async fn a_suite_that_fails_is_recorded_with_the_status_the_host_observed() {
 /// against the version, the node is cancelled, and the copy it ran in is released.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_suite_that_outlives_its_wait_is_stopped_and_records_no_result() {
-    let host = working_host_with_suites(&[("long", "sleep 120", &[])]).await;
+    const WAIT_MS: u64 = 300_000;
+    // The clock the engine reads is the machine's until the case moves it: the node's wait ends
+    // once the suite's session is running, and not when the machine has run for as long as the
+    // wait, however long it took to start the session.
+    let moved = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let host = working_host_with_suites_after(
+        &[("long", "sleep 120", &[])],
+        Clocks {
+            wall: WallClock::from_fn({
+                let moved = Arc::clone(&moved);
+                move || kr_ipc::now_ms().get() + moved.load(std::sync::atomic::Ordering::SeqCst)
+            }),
+            ..Clocks::system()
+        },
+        |_| {},
+    )
+    .await;
     let mut control = client(&host).await;
     let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
     let version = captured(&mut control, &host, workspace, 70).await;
 
-    let (_, receipt, read) = tests_run_within(
+    let document = tests_definition(
         &mut control,
         &host,
         71,
         "long",
         version,
         Some(WorkflowDeadlines {
-            run_deadline_ms: U64::new(120_000),
-            action_wait_ms: U64::new(15_000),
+            run_deadline_ms: U64::new(2 * WAIT_MS),
+            action_wait_ms: U64::new(WAIT_MS),
         }),
     )
     .await;
+    let running = run_from_another_task(&host, &document, "evt-tests");
+    // The suite has started once its session is there and has not closed.
+    let started = std::time::Instant::now();
+    loop {
+        let sessions = all_sessions(&mut control).await;
+        if sessions.iter().any(|session| session.closure.0.is_none()) {
+            break;
+        }
+        assert!(
+            started.elapsed() < LIVENESS,
+            "waited {} s for the suite's session to start: {sessions:?}",
+            LIVENESS.as_secs()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    moved.store(WAIT_MS + 1, std::sync::atomic::Ordering::SeqCst);
+    let run: WorkflowRunResult = typed(
+        &running
+            .await
+            .expect("the run answers")
+            .expect("the run is answered"),
+    );
+    let (_, receipt, read) = tests_run_settled(&mut control, &host, &document, run, version).await;
     assert_eq!(receipt.status, NodeStatus::Cancelled, "{receipt:?}");
     // The suite had started: its session was closed because its node was asked to stop.
     let sessions = all_sessions(&mut control).await;
@@ -8791,6 +8862,7 @@ async fn a_daemon_starts_without_a_store_of_reports_it_cannot_use(
             &writes_report("reports/junit.xml", &A_JUNIT_REPORT, 0),
             &["reports/junit.xml"],
         )],
+        Clocks::system(),
         |state_dir| {
             state(state_dir);
             *before.borrow_mut() = Some(held(state_dir));
