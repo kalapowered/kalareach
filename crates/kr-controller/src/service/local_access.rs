@@ -24,8 +24,17 @@ use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
 use crate::grants::policy::LocalOwnerBound;
 
-/// How long the publisher waits before it looks at the workers again when nothing woke it.
+/// How long the publisher waits before it looks at the workers again when nothing woke it and a
+/// worker has not yet acknowledged the statement in force.
 const REPEAT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long the publisher waits when nothing woke it and every worker has acknowledged the
+/// statement in force.
+///
+/// Whatever changes the bound wakes the publisher, and a worker holds the lease it was told to the
+/// end the lease names, so a lease that runs out by itself needs no statement to be refused.
+/// What is left for this is a backstop for a change that no wake was made for.
+const SETTLED_REPEAT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// What this daemon has said, and what each worker has said back.
 #[derive(Debug, Default)]
@@ -35,6 +44,9 @@ pub(crate) struct LocalAccessState {
     /// highest sequence it has acknowledged.
     workers: Mutex<BTreeMap<SessionId, Worker>>,
     wake: std::sync::Arc<tokio::sync::Notify>,
+    /// How many times the publisher was woken. For this crate's own tests.
+    #[cfg(test)]
+    wakes: std::sync::atomic::AtomicU64,
     /// The launches this run of the daemon made: a worker born from one of these starts holding
     /// its local owner to the lease until it is told, so an enablement need not wait for it.
     launching: Mutex<std::collections::BTreeSet<kr_protocol::worker::ReservationId>>,
@@ -63,7 +75,15 @@ pub(crate) struct Worker {
 impl LocalAccessState {
     /// Wakes the publisher: something the bound is computed from changed.
     pub(crate) fn wake(&self) {
+        #[cfg(test)]
+        self.wakes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.wake.notify_one();
+    }
+
+    /// How many times the publisher has been woken. For this crate's own tests.
+    #[cfg(test)]
+    pub(crate) fn wakes(&self) -> u64 {
+        self.wakes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn lock_drawn(&self) -> std::sync::MutexGuard<'_, Drawn> {
@@ -130,6 +150,13 @@ impl LocalAccessState {
     /// Notes that a worker exists and has not (yet) been heard from.
     pub(crate) fn touch(&self, session_id: SessionId) {
         self.lock_workers().entry(session_id).or_default();
+    }
+
+    /// Forgets what is known of a worker, which then counts as one never reached. For this crate's
+    /// own tests.
+    #[cfg(test)]
+    pub(crate) fn forget_worker(&self, session_id: SessionId) {
+        self.lock_workers().remove(&session_id);
     }
 
     /// What is known of a worker.
@@ -341,6 +368,21 @@ impl Controller {
         }
     }
 
+    /// Whether a worker the directory lists is still owed the statement in force: one that has not
+    /// been reached, or has acknowledged an older one. A worker known to lack the capability is
+    /// owed nothing.
+    pub(crate) async fn workers_owed_the_statement(&self) -> bool {
+        let current = self.local_access_now().sequence.get();
+        self.directory.lock().await.iter().any(|worker| {
+            let known = self.local_access.worker(worker.descriptor.session_id);
+            match known.states {
+                Some(false) => false,
+                Some(true) => known.acknowledged < current,
+                None => true,
+            }
+        })
+    }
+
     /// The sessions whose workers cannot be told what the local owner may do, as the registry
     /// stands: every recorded worker that has not been told (one never reached counts as lacking
     /// it), and every claimed or fenced reservation that this run of the daemon did not make,
@@ -386,6 +428,11 @@ impl Controller {
                     return;
                 };
                 strong.tell_workers().await;
+                let repeat = if strong.workers_owed_the_statement().await {
+                    REPEAT
+                } else {
+                    SETTLED_REPEAT
+                };
                 let wake = std::sync::Arc::clone(&strong.local_access.wake);
                 // Not held across the wait: the daemon holds its environment until the last
                 // reference to it ends.
@@ -394,7 +441,7 @@ impl Controller {
                 tokio::pin!(notified);
                 // Registered before the wait, so a wake between the pass above and here is kept.
                 notified.as_mut().enable();
-                let _ = tokio::time::timeout(REPEAT, notified).await;
+                let _ = tokio::time::timeout(repeat, notified).await;
             }
         });
     }
