@@ -1345,10 +1345,10 @@ async fn turning_sync_on_starts_a_collection_and_puts_the_settings_in_it_sealed(
 /// its offers and joins at the service its own setting names. A record made while the setting
 /// named one service keeps asking for that service after the setting names another. The rest of
 /// a step's calls (choosing between versions and dropping a copy, letting go of content that says
-/// what this computer says, the first object, following content refused to settings sealed again,
-/// settling a write whose answer was lost, and the drafts' pulls, removals, copy drops and fences),
-/// and a computer that was taken out reading its offers and joining again, are held to the record's
-/// service by the cases below.
+/// what this computer says, the first object, following content refused to settings sealed again
+/// (in the step that sealed them and in the one after a stop), settling a write whose answer was
+/// lost, and the drafts' pulls, removals, copy drops and fences), and a computer that was taken
+/// out reading its offers and joining again, are held to the record's service by the cases below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_its_record_names() {
     let computer = Computer::new().await;
@@ -1635,7 +1635,7 @@ impl Forked {
     }
 
     /// As [`Self::new`], for a computer that had chosen no colour mode when sync was turned on:
-    /// its record holds no settings object yet.
+    /// it holds no settings object yet.
     async fn before_a_choice() -> Self {
         Self::made(false).await
     }
@@ -2163,11 +2163,10 @@ async fn content_that_says_what_this_computer_says_is_let_go_at_the_service_the_
     );
 }
 
-/// KR-REQ-17.14: a computer whose record holds no settings object yet asks the service what it
-/// holds before it makes the first one, and publishes it, through the client the application was
-/// given, at the service the record names, after the setting names another: sync was turned on
-/// before any mode was chosen, so the fork's service holds nothing of the settings until the
-/// choice is made.
+/// KR-REQ-17.14: a computer that holds no settings object yet asks the service what it holds
+/// before it makes the first one, and publishes it, through the client the application was given,
+/// at the service the record names, after the setting names another: sync was turned on before any
+/// mode was chosen, so the fork's service holds nothing of the settings until the choice is made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_first_object_is_asked_for_and_made_at_the_service_the_record_names() {
     let forked = Forked::before_a_choice().await;
@@ -2186,18 +2185,11 @@ async fn the_first_object_is_asked_for_and_made_at_the_service_the_record_names(
     );
 }
 
-/// KR-REQ-17.14: settings this computer was only sealing again, which the service refuses because
-/// another device wrote first, are given up for that device's, and the copy the service kept of
-/// the refused sealing is dropped, through the client the application was given, at the service
-/// the record names, after the setting names another.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_sealing_is_followed_and_its_copy_dropped_at_the_service_the_record_names() {
-    let forked = Forked::new().await;
-    let page = &forked.page;
+/// A computer whose step put the settings sealed again in the store and stopped before it heard
+/// how their publication ended, and which another device then wrote over at the fork's service.
+/// Returns that device's store of the collection.
+async fn sealing_again_when_another_device_writes(forked: &Forked) -> Elsewhere {
     let elsewhere = forked.elsewhere();
-
-    // A step put the settings sealed again in the store and stopped before it heard how their
-    // publication ended; then another device wrote.
     let own = forked.computer.client_on_its_own_store(0);
     let (client, object_id) = (&own.client, own.object_id);
     let held = client
@@ -2230,6 +2222,58 @@ async fn a_refused_sealing_is_followed_and_its_copy_dropped_at_the_service_the_r
         elsewhere.write("light").await,
         Published::Accepted { .. }
     ));
+    elsewhere
+}
+
+/// KR-REQ-17.14: settings this computer was only sealing again, which the service refuses because
+/// another device wrote first, are given up for that device's, and the copy the service kept of
+/// the refused sealing is dropped, through the client the application was given, at the service
+/// the record names, after the setting names another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_sealing_is_followed_and_its_copy_dropped_at_the_service_the_record_names() {
+    let forked = Forked::new().await;
+    let page = &forked.page;
+    let elsewhere = sealing_again_when_another_device_writes(&forked).await;
+
+    forked.before_the_step();
+    let view = page.sync_now();
+    forked.only_the_fork_was_reached();
+    assert_eq!(view["sync"]["conflicts"], 0, "{view}");
+    assert_eq!(view["colour_mode"], "light", "{view}");
+    assert!(
+        sync_record(&forked.computer).get("resealing").is_none(),
+        "the marker is spent"
+    );
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        0,
+        "the fork's service dropped the copy of the refused sealing"
+    );
+}
+
+/// KR-REQ-17.14: a following that stopped after a sealing was refused is finished by the next
+/// step, which finds the marker and the other device's settings waiting, and the copy the service
+/// kept of the refused sealing is dropped, through the client the application was given, at the
+/// service the record names, after the setting names another.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_following_that_stopped_after_a_refused_sealing_is_finished_at_the_service_the_record_names()
+ {
+    let forked = Forked::new().await;
+    let page = &forked.page;
+    let elsewhere = sealing_again_when_another_device_writes(&forked).await;
+
+    // The step stops where it takes the other device's settings. The fork's service has kept a
+    // copy of the refused sealing, and this computer the marker and the other device's settings.
+    let stopped = while_the_settings_cannot_be_written(&forked.computer, || {
+        page.call("settings_sync_now", json!({}))
+    });
+    assert!(stopped.is_err(), "the step says it stopped");
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        1,
+        "the fork's service kept a copy of the refused sealing"
+    );
 
     forked.before_the_step();
     let view = page.sync_now();
@@ -2262,9 +2306,11 @@ async fn a_draft_publication_that_never_arrived_is_fenced_at_the_service_the_rec
         .say(environment, HostPrivacy::Off { generation: 1 });
     let page = &forked.page;
     let (draft, _) = page.write_draft(Some(&studio), "sent before the host's mode moved on");
-    // The pass asks the collection once for the settings and then publishes the draft, so the
-    // publication is the second request. It never arrives.
-    forked.fork_service.web().fail(SYNC_PATH, 2, Moment::Before);
+    // The first write the pass makes is the draft's publication. It never arrived.
+    forked
+        .fork_service
+        .web()
+        .fail_with_member(SYNC_PATH, "exchange", 1, Moment::Before);
     page.drafts_on(true).expect("drafts sync is on");
     let elsewhere = forked.elsewhere();
     assert_eq!(
