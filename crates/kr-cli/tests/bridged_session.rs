@@ -281,6 +281,8 @@ struct World {
     home: PathBuf,
     tools: PathBuf,
     daemon: Option<std::process::Child>,
+    /// How long a run of `kr` is given before it fails the case that ran it.
+    kr_bound: Duration,
 }
 
 impl Drop for World {
@@ -355,6 +357,7 @@ impl World {
             home,
             tools,
             daemon: Some(child),
+            kr_bound: KR_CALL_BOUND,
         };
         let endpoint = world
             .source
@@ -411,9 +414,9 @@ impl World {
         command
     }
 
-    /// Runs `kr` on the source host to its end.
+    /// Runs `kr` on the source host to its end, within the world's bound for a run of it.
     fn run(&self, arguments: &[&str]) -> std::process::Output {
-        self.kr(arguments).output().expect("runs kr")
+        to_its_end(self.kr(arguments), self.kr_bound)
     }
 
     /// Puts a stand-in for the container runtime first on the path of `kr` and of the daemon, for
@@ -3053,8 +3056,17 @@ async fn an_export_of_a_session_on_this_host_is_the_same_file() {
     );
 }
 
+/// Whether this machine has the container runtime. A case skips itself where it has not, and says
+/// so on a line that starts with the suite's name and goes on `: skipped, because `, which is the
+/// form the conformance report reads as a case that did not run, never as one that passed.
 fn runtime_available() -> bool {
-    Runtime::podman().is_available()
+    match Runtime::podman().why_unavailable() {
+        None => true,
+        Some(why) => {
+            eprintln!("bridged_session: skipped, because {why}");
+            false
+        }
+    }
 }
 
 /// How long a call that starts, asks about or acts on one container is given: `run`, `exec`,
@@ -3064,9 +3076,18 @@ const QUICK_CALL_BOUND: Duration = Duration::from_secs(60);
 /// How long a call that fetches or builds an image is given.
 const SLOW_CALL_BOUND: Duration = Duration::from_secs(300);
 
+/// How long one run of `kr` is given in these cases: far longer than any of them takes. A `kr`
+/// that never ends fails the case that ran it, with the call named, and does not hold the suite or
+/// the turn on the container runtime.
+const KR_CALL_BOUND: Duration = Duration::from_secs(300);
+
+/// Runs `command` to its end within `bound`, or fails the case, naming the call.
+fn to_its_end(command: std::process::Command, bound: Duration) -> std::process::Output {
+    user_manager::bounded(command, bound).unwrap_or_else(|why| panic!("{why}"))
+}
+
 /// The container runtime a case drives, and how long it gives each call. A runtime that never
 /// answers fails the case that called it, with the call named, and does not hold the suite.
-#[derive(Clone)]
 struct Runtime {
     program: PathBuf,
     quick: Duration,
@@ -3097,25 +3118,42 @@ impl Runtime {
 
     /// Whether the program is there to run: a path names a file, and a bare name is on `PATH`.
     fn installed(&self) -> bool {
+        self.installed_in(std::env::var_os("PATH").as_deref())
+    }
+
+    /// [`Runtime::installed`], for the directories `path` lists.
+    fn installed_in(&self, path: Option<&std::ffi::OsStr>) -> bool {
         if self.program.components().count() > 1 {
             return self.program.is_file();
         }
-        std::env::var_os("PATH").is_some_and(|path| {
-            std::env::split_paths(&path).any(|directory| directory.join(&self.program).is_file())
+        path.is_some_and(|path| {
+            std::env::split_paths(path).any(|directory| directory.join(&self.program).is_file())
         })
     }
 
-    /// Whether this machine has the runtime. A case skips itself where it has not. A runtime that
-    /// is there and does not answer `--version` fails the case instead.
-    fn is_available(&self) -> bool {
-        let present = self.installed() && self.call(&["--version"]).status.success();
-        if !present {
-            eprintln!(
-                "skipped, because {} is not installed on this machine",
+    /// Why a case that needs this runtime cannot run here, or nothing where it can. A program
+    /// that is there and fails `--version` is no runtime this machine has. One that is there and
+    /// does not answer it fails the case instead.
+    fn why_unavailable(&self) -> Option<String> {
+        if !self.installed() {
+            return Some(format!(
+                "{} is not installed on this machine",
                 self.program.display()
-            );
+            ));
         }
-        present
+        let answered = self.call(&["--version"]);
+        (!answered.status.success()).then(|| {
+            format!(
+                "{} is installed and `--version` ended with {}",
+                self.program.display(),
+                answered.status
+            )
+        })
+    }
+
+    /// Whether this machine has the runtime: [`Runtime::why_unavailable`] has nothing to say.
+    fn is_available(&self) -> bool {
+        self.why_unavailable().is_none()
     }
 
     /// Puts the images in the runtime's store: the base image, and the one that adds Git to it.
@@ -3178,7 +3216,15 @@ impl Runtime {
 /// Puts the images in the runtime's store, once per run of this suite, before any container starts.
 fn image_present() {
     static PULLED: std::sync::Once = std::sync::Once::new();
-    PULLED.call_once(|| Runtime::podman().ensure_images());
+    images_present_once(&PULLED, &Runtime::podman());
+}
+
+/// Puts the images in `runtime`'s store the first time it is called with `once`. A call that
+/// fails, as a stalled one does, with the call named, leaves `once` open: the next case asks again
+/// and fails the same way with the call named, where a `Once` that a panic had poisoned would fail
+/// it with a word about the poisoning and nothing about the runtime.
+fn images_present_once(once: &std::sync::Once, runtime: &Runtime) {
+    once.call_once_force(|_| runtime.ensure_images());
 }
 
 /// The directory mounted into the container: `kr`, the daemon that adds the one thing a test must
@@ -3209,8 +3255,9 @@ fn programs_for_a_container() -> &'static Path {
         .1
 }
 
-/// A container this test made, removed however the test ends: by the identifier the runtime issued,
-/// and until it has issued one by the name this test gave the container.
+/// A container this test made, removed when the test ends by any way that runs destructors: by
+/// the identifier the runtime issued, and until it has issued one by the name this test gave the
+/// container. A test binary that is killed runs none, and leaves the container.
 struct Container {
     runtime: Runtime,
     id: String,
@@ -3319,21 +3366,34 @@ impl Container {
             "{}",
             String::from_utf8_lossy(&started.stderr)
         );
-        let deadline = Instant::now() + LIVENESS_DEADLINE;
-        while !self.answers() {
-            assert!(
-                Instant::now() < deadline,
-                "the daemon in the container did not answer"
-            );
-            std::thread::sleep(Duration::from_millis(200));
+        self.wait_until_it_answers(LIVENESS_DEADLINE);
+    }
+
+    /// Waits until the daemon in this container answers `kr list`, for as long as `within`, and
+    /// fails the case, saying how the last asking ended, when it does not.
+    fn wait_until_it_answers(&self, within: Duration) {
+        let deadline = Instant::now() + within;
+        loop {
+            match self.answers() {
+                Ok(()) => return,
+                Err(last) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the daemon in the container did not answer within {within:?}; the last \
+                         asking ended with {last}"
+                    );
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
         }
     }
 
-    /// Whether the daemon in this container answers `kr list` now. An asking that has not ended
-    /// within the runtime's quick bound is a stall and not a missing answer: it fails the case
-    /// with the command named, where a retry would hide it. A probe that ends with an error, as
-    /// `kr` does while the daemon is not up, is asked again.
-    fn answers(&self) -> bool {
+    /// Asks the daemon in this container for `kr list`, and says how the asking ended when the
+    /// daemon did not answer it. An asking that has not ended within the runtime's quick bound is a
+    /// stall and not a missing answer: it fails the case with the command named, where a retry
+    /// would hide it. A probe that ends with an error, as `kr` does while the daemon is not up, is
+    /// asked again.
+    fn answers(&self) -> Result<(), String> {
         let asked = self
             .runtime
             .run(
@@ -3349,7 +3409,15 @@ impl Container {
                 self.runtime.quick,
             )
             .unwrap_or_else(|why| panic!("asking the daemon in the container: {why}"));
-        asked.status.success()
+        if asked.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{}: {}",
+                asked.status,
+                String::from_utf8_lossy(&asked.stderr).trim()
+            ))
+        }
     }
 
     /// The environment identity the daemon in this container reports for itself.
@@ -3379,8 +3447,8 @@ impl Container {
         String::from_utf8_lossy(&inspected.stdout).trim().to_owned()
     }
 
-    /// Removes the container, whether or not the runtime made it. Says why when it could not, and
-    /// never panics.
+    /// Removes the container, whether or not the runtime made it. Says why when it could not: the
+    /// runtime refused, or the call did not end. It does not panic for either.
     fn remove(&self) -> Result<(), String> {
         let removed = self.runtime.run(
             &[
@@ -3407,18 +3475,22 @@ impl Container {
 
 impl Drop for Container {
     fn drop(&mut self) {
-        // A cleanup that panics while a failed assertion unwinds aborts the whole test binary and
-        // cleans up nothing after it in any case still running. So a removal that fails or stalls
-        // is recorded here and not raised. The line goes to standard error directly: the test
-        // harness drops what `eprintln!` prints for a case that passes, and a failed write must
-        // not panic here either.
-        if let Err(why) = self.remove() {
-            let _ = writeln!(
-                std::io::stderr(),
-                "the container {} ({}) was not removed and may still be running: {why}",
-                self.name,
-                self.target()
-            );
+        let Err(why) = self.remove() else {
+            return;
+        };
+        let record = format!(
+            "the container {} ({}) was not removed and may still be running: {why}",
+            self.name,
+            self.target()
+        );
+        // Written to standard error directly: the test harness drops what `eprintln!` prints for a
+        // case that passes, and a failed write must not panic here either.
+        let _ = writeln!(std::io::stderr(), "{record}");
+        // A case that passes must not leave a container behind, so it fails. A case that is
+        // already failing has said so, and a destructor that panics while one unwinds aborts the
+        // whole test binary and cleans up nothing after it in any case still running.
+        if !std::thread::panicking() {
+            panic!("{record}");
         }
     }
 }
@@ -3427,18 +3499,36 @@ impl Drop for Container {
 /// lasts, and far more than a call that answers takes.
 const STAND_IN_BOUND: Duration = Duration::from_secs(5);
 
-/// How long a stalled call of a stand-in runtime lasts: longer than [`STAND_IN_BOUND`], so that a
-/// harness that does not end the call by its bound waits for it, and a case that shows the bound
-/// fails instead of hanging.
+/// How long a stand-in runtime gives a call that fetches or builds an image: more than
+/// [`STAND_IN_BOUND`], so that a call given the wrong one of the two shows in the bound a failure
+/// names, and still less than a stall lasts.
+const STAND_IN_SLOW_BOUND: Duration = Duration::from_secs(15);
+
+/// How long a stalled call of a stand-in runtime lasts: longer than [`STAND_IN_SLOW_BOUND`], so
+/// that a harness that does not end the call by its bound waits for it, and a case that shows the
+/// bound fails instead of hanging.
 const STAND_IN_STALL_SECONDS: u32 = 40;
 
+/// What a stand-in runtime says to a call it refuses.
+const STAND_IN_REFUSAL: &str = "Error: the stand-in runtime refuses this call";
+
+/// The shell patterns that match the first arguments `words` name, or one that matches nothing.
+fn first_arguments(words: &[&str]) -> String {
+    if words.is_empty() {
+        "'-no-such-call-'".to_owned()
+    } else {
+        words.join("|")
+    }
+}
+
 /// A stand-in for the container runtime that answers every call with success and no output, and
-/// says no image exists, except the calls whose command it is told to stall (the first argument:
-/// `exec`, `run`, `rm`, `build`, `container`, `--version`): those print nothing and do not end
-/// within any bound a case gives them, as `podman exec` did on the build box. It records every
-/// call in `calls` in its directory, one line of arguments each, whether it stalls the call or
-/// not.
-fn stalling_runtime(directory: &Path, stalls: &[&str]) -> Runtime {
+/// says no image exists, except the calls whose command it is told to stall or to refuse (the
+/// first argument: `exec`, `run`, `rm`, `build`, `pull`, `container`, `image`, `--version`). A
+/// stalled call prints nothing and does not end within any bound a case gives it, as `podman exec`
+/// did on the build box. A refused call says [`STAND_IN_REFUSAL`] on standard error and ends with
+/// the runtime's own code for a call it could not do. It records every call in `calls` in its
+/// directory, one line of arguments each, whether it stalls or refuses the call or not.
+fn stand_in_runtime(directory: &Path, stalls: &[&str], refuses: &[&str]) -> Runtime {
     let text = directory.join("runtime.text");
     std::fs::write(
         &text,
@@ -3447,12 +3537,14 @@ fn stalling_runtime(directory: &Path, stalls: &[&str]) -> Runtime {
 printf '%s\n' "$*" >>'{calls}'
 case "$1" in
   {stalled}) exec sleep {STAND_IN_STALL_SECONDS} ;;
+  {refused}) echo '{STAND_IN_REFUSAL}' >&2; exit 125 ;;
   image) exit 1 ;;
 esac
 exit 0
 "##,
             calls = directory.join("calls").display(),
-            stalled = stalls.join("|"),
+            stalled = first_arguments(stalls),
+            refused = first_arguments(refuses),
         ),
     )
     .expect("the stand-in runtime");
@@ -3461,7 +3553,7 @@ exit 0
     Runtime {
         program,
         quick: STAND_IN_BOUND,
-        slow: STAND_IN_BOUND,
+        slow: STAND_IN_SLOW_BOUND,
     }
 }
 
@@ -3492,13 +3584,25 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_default()
 }
 
+/// Runs this test binary again with `arguments`, as a process of its own, and gives what it did.
+/// For a case that needs what a process writes to its own standard error, or what it does with a
+/// `PATH` of its own, which a thread of this one cannot give it.
+fn this_binary_with(arguments: &[&str], path: Option<&Path>) -> std::process::Output {
+    let mut command = std::process::Command::new(std::env::current_exe().expect("this binary"));
+    command.args(arguments);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    to_its_end(command, Duration::from_secs(120))
+}
+
 /// A removal that stalls is an error the harness reports, and one that stalls while a failed
 /// assertion unwinds aborts nothing: a destructor that panics then ends the whole test binary and
 /// leaves the cleanup of every other case in flight undone.
 #[test]
 fn a_removal_that_stalls_is_an_error_and_aborts_nothing_while_an_assertion_fails() {
     let directory = tempfile::tempdir().expect("a directory");
-    let container = held_in(stalling_runtime(directory.path(), &["rm"]));
+    let container = held_in(stand_in_runtime(directory.path(), &["rm"], &[]));
     let why = container
         .remove()
         .expect_err("a removal that never ends is an error and not a panic");
@@ -3519,12 +3623,80 @@ fn a_removal_that_stalls_is_an_error_and_aborts_nothing_while_an_assertion_fails
     assert_eq!(removals, 2, "the unwinding case tried to remove it too");
 }
 
+/// A removal the runtime refuses is an error that says what the runtime said, and not a removal.
+#[test]
+fn a_removal_the_runtime_refuses_is_an_error_that_says_what_it_said() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let container = held_in(stand_in_runtime(directory.path(), &[], &["rm"]));
+    let why = container
+        .remove()
+        .expect_err("a refused removal is an error");
+    assert!(why.contains(STAND_IN_REFUSAL), "{why}");
+    // Nothing was made, so there is nothing for the destructor to remove either.
+    std::mem::forget(container);
+}
+
+/// A case that passes while its container could not be removed fails: the container is still
+/// there, running a process, on a machine that other cases and other people share.
+#[test]
+fn a_case_that_passes_fails_when_its_container_could_not_be_removed() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let container = held_in(stand_in_runtime(directory.path(), &[], &["rm"]));
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _held = container;
+    }));
+    let said = panic_message(failed.expect_err("a container left behind fails the case"));
+    assert!(
+        said.contains("was not removed and may still be running")
+            && said.contains(STAND_IN_REFUSAL),
+        "{said}"
+    );
+}
+
+/// Run by the case below as a process of its own: a case that fails while its container cannot be
+/// removed.
+#[test]
+#[ignore = "run as a process of its own by a_container_that_cannot_be_removed_is_recorded_whatever_the_harness_captures"]
+fn a_case_fails_while_its_container_cannot_be_removed() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let _held = held_in(stand_in_runtime(directory.path(), &[], &["rm"]));
+    panic!("the case's own assertion fails");
+}
+
+/// The record of a container that could not be removed reaches standard error when the case that
+/// held it fails, though the test harness holds back what a case prints, and the binary ends with
+/// the failure and not with an abort.
+#[test]
+fn a_container_that_cannot_be_removed_is_recorded_whatever_the_harness_captures() {
+    let ran = this_binary_with(
+        &[
+            "--ignored",
+            "--exact",
+            "a_case_fails_while_its_container_cannot_be_removed",
+        ],
+        None,
+    );
+    let said = String::from_utf8_lossy(&ran.stderr);
+    assert!(
+        said.contains("was not removed and may still be running"),
+        "{said}"
+    );
+    assert_eq!(
+        ran.status.code(),
+        Some(101),
+        "the failed case ends the binary as a test failure: {}",
+        ran.status
+    );
+}
+
 /// A start that stalls after the runtime made the container leaves it removed: the guard exists
-/// before the call that makes the container, and removes it by the name just given.
+/// before the call that makes the container, and removes it by the name just given, which holds a
+/// whole random UUID so that it can name no other container, and by force, since the container may
+/// be running.
 #[test]
 fn a_container_start_that_stalls_after_the_runtime_made_the_container_removes_it() {
     let directory = tempfile::tempdir().expect("a directory");
-    let runtime = stalling_runtime(directory.path(), &["run"]);
+    let runtime = stand_in_runtime(directory.path(), &["run"], &[]);
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Container::create(runtime, directory.path())
     }));
@@ -3541,11 +3713,19 @@ fn a_container_start_that_stalls_after_the_runtime_made_the_container_removes_it
         .find(|call| call.starts_with("run "))
         .and_then(|call| call.split(' ').skip_while(|word| *word != "--name").nth(1))
         .expect("the start named the container it made");
+    let uuid = name
+        .strip_prefix("kr-acc-")
+        .expect("the name starts as a harness container's does");
+    assert!(
+        uuid.parse::<kr_protocol::scalars::Uuid>().is_ok(),
+        "the name holds a whole UUID: {name}"
+    );
     assert!(
         calls
             .iter()
-            .any(|call| call.starts_with("rm ") && call.ends_with(&format!(" -- {name}"))),
-        "the container is removed by the name it was given: {calls:?}"
+            .any(|call| call.starts_with("rm --force --ignore ")
+                && call.ends_with(&format!(" -- {name}"))),
+        "the container is removed by force, by the name it was given: {calls:?}"
     );
 }
 
@@ -3554,7 +3734,7 @@ fn a_container_start_that_stalls_after_the_runtime_made_the_container_removes_it
 #[test]
 fn a_runtime_that_never_answers_its_version_fails_the_case_and_is_not_skipped() {
     let directory = tempfile::tempdir().expect("a directory");
-    let stalled = stalling_runtime(directory.path(), &["--version"]);
+    let stalled = stand_in_runtime(directory.path(), &["--version"], &[]);
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stalled.is_available()));
     let said = panic_message(failed.expect_err("a runtime that does not answer fails the case"));
     assert!(said.contains("\"--version\""), "the call is named: {said}");
@@ -3569,14 +3749,101 @@ fn a_runtime_that_never_answers_its_version_fails_the_case_and_is_not_skipped() 
     );
 }
 
-/// An image build that never ends fails the case with the build named, and does not hold the suite.
+/// A runtime is found on the `PATH` it is looked for on, and nowhere else: a case that cannot find
+/// it skips itself, so a search that finds it nowhere would skip both real-container cases on
+/// every machine.
+#[test]
+fn a_runtime_is_found_on_the_path_it_is_looked_for_on_and_nowhere_else() {
+    let empty = tempfile::tempdir().expect("a directory");
+    let holding = tempfile::tempdir().expect("a directory");
+    std::fs::write(holding.path().join("podman"), "").expect("a file of the name");
+    let runtime = Runtime {
+        program: PathBuf::from("podman"),
+        quick: STAND_IN_BOUND,
+        slow: STAND_IN_SLOW_BOUND,
+    };
+    let path = std::env::join_paths([empty.path(), holding.path()]).expect("a path");
+    assert!(runtime.installed_in(Some(&path)));
+    assert!(!runtime.installed_in(Some(empty.path().as_os_str())));
+    assert!(!runtime.installed_in(None));
+    let by_path = Runtime {
+        program: holding.path().join("podman"),
+        ..runtime
+    };
+    assert!(
+        by_path.installed_in(None),
+        "a program named by a path is there when the file is"
+    );
+}
+
+/// A machine with no runtime says so on the line the conformance report reads as a case that did
+/// not run, for each of the two real-container cases, so that it never counts them as passed.
+#[test]
+fn a_machine_without_the_runtime_says_so_in_the_form_the_conformance_report_reads() {
+    let empty = tempfile::tempdir().expect("a directory");
+    let ran = this_binary_with(
+        &[
+            "--nocapture",
+            "--exact",
+            "an_enrolled_container_answers_a_bridge_and_a_session_made_through_it_lives_there",
+            "a_stopped_container_is_started_by_a_create_and_keeps_its_identity",
+        ],
+        Some(empty.path()),
+    );
+    assert!(ran.status.success(), "{}", ran.status);
+    let said = String::from_utf8_lossy(&ran.stderr);
+    let lines = said
+        .lines()
+        .filter(|line| line.starts_with("bridged_session: skipped, because "))
+        .count();
+    assert_eq!(lines, 2, "one line for each case: {said}");
+}
+
+/// A runtime image check that stalls fails every case that asks, each with the call named: the
+/// first fails with the call named and the next does not fail with a word about the first.
+#[test]
+fn an_image_check_that_stalls_fails_every_case_that_asks_and_names_the_call() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let runtime = stand_in_runtime(directory.path(), &["image"], &[]);
+    let once = std::sync::Once::new();
+    for case in ["first", "second"] {
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            images_present_once(&once, &runtime);
+        }));
+        let said = panic_message(failed.expect_err("a check that never ends fails the case"));
+        assert!(
+            said.contains("\"image\"") && said.contains("\"exists\""),
+            "the {case} case is told the call: {said}"
+        );
+    }
+}
+
+/// An image pull that never ends fails the case with the pull named, within the bound a call that
+/// fetches an image is given.
+#[test]
+fn an_image_pull_that_never_ends_fails_the_case_and_names_the_pull() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let runtime = stand_in_runtime(directory.path(), &["pull"], &[]);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.ensure_images()));
+    let said = panic_message(failed.expect_err("a pull that never ends fails the case"));
+    assert!(
+        said.contains("\"pull\"") && said.contains(&format!("{STAND_IN_SLOW_BOUND:?}")),
+        "the call and the bound it was given are named: {said}"
+    );
+}
+
+/// An image build that never ends fails the case with the build named, within the bound a call that
+/// builds an image is given, and does not hold the suite.
 #[test]
 fn an_image_build_that_never_ends_fails_the_case_and_names_the_build() {
     let directory = tempfile::tempdir().expect("a directory");
-    let runtime = stalling_runtime(directory.path(), &["build"]);
+    let runtime = stand_in_runtime(directory.path(), &["build"], &[]);
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.ensure_images()));
     let said = panic_message(failed.expect_err("a build that never ends fails the case"));
-    assert!(said.contains("\"build\""), "the call is named: {said}");
+    assert!(
+        said.contains("\"build\"") && said.contains(&format!("{STAND_IN_SLOW_BOUND:?}")),
+        "the call and the bound it was given are named: {said}"
+    );
     assert!(
         recorded_calls(directory.path())
             .iter()
@@ -3590,7 +3857,7 @@ fn an_image_build_that_never_ends_fails_the_case_and_names_the_build() {
 #[test]
 fn a_probe_that_stalls_fails_the_case_and_names_the_command() {
     let directory = tempfile::tempdir().expect("a directory");
-    let container = held_in(stalling_runtime(directory.path(), &["exec"]));
+    let container = held_in(stand_in_runtime(directory.path(), &["exec"], &[]));
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| container.answers()));
     let said = panic_message(failed.expect_err("a stalled probe fails the case"));
     assert!(
@@ -3599,12 +3866,28 @@ fn a_probe_that_stalls_fails_the_case_and_names_the_command() {
     );
 }
 
+/// A daemon that never answers fails the case with how the last asking ended, and not with a
+/// sentence that says nothing of what `kr` or the runtime said.
+#[test]
+fn a_daemon_that_never_answers_fails_the_case_and_says_how_the_last_asking_ended() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let container = held_in(stand_in_runtime(directory.path(), &[], &["exec"]));
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        container.wait_until_it_answers(Duration::from_secs(1));
+    }));
+    let said = panic_message(failed.expect_err("a daemon that never answers fails the case"));
+    assert!(
+        said.contains(STAND_IN_REFUSAL) && said.contains("125"),
+        "the last asking is described: {said}"
+    );
+}
+
 /// A call to the container runtime that never ends fails the case that made it, with the call
 /// named, and does not hold the suite.
 #[test]
 fn a_runtime_call_that_never_ends_fails_the_case_that_made_it_and_names_the_call() {
     let directory = tempfile::tempdir().expect("a directory");
-    let container = held_in(stalling_runtime(directory.path(), &["container"]));
+    let container = held_in(stand_in_runtime(directory.path(), &["container"], &[]));
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| container.state()));
     let said = panic_message(failed.expect_err("a call that never ends fails the case"));
     assert!(
@@ -3612,6 +3895,46 @@ fn a_runtime_call_that_never_ends_fails_the_case_that_made_it_and_names_the_call
         "the call is named: {said}"
     );
     assert!(said.contains("did not end within"), "{said}");
+}
+
+/// A call that waits for its turn to start a process is held to its bound from the call, and
+/// not from the moment the turn comes: a start that holds the turn longer than the bound fails the
+/// call, which says that the turn is why.
+#[test]
+fn a_call_that_waits_for_the_turn_to_start_a_process_is_bounded_from_the_call() {
+    let (taken, has_taken) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        user_manager::spawning(|| {
+            taken.send(()).expect("the turn was taken");
+            // Let go when the case is done with the turn, or after a time in any case.
+            let _ = released.recv_timeout(Duration::from_secs(20));
+        });
+    });
+    has_taken.recv().expect("the holder took the turn");
+    let refused = user_manager::bounded(
+        std::process::Command::new("/usr/bin/true"),
+        Duration::from_secs(1),
+    );
+    release.send(()).expect("the holder is waiting");
+    holder.join().expect("the holder ended");
+    let why = refused.expect_err("a call that could not start within its bound fails");
+    assert!(why.contains("could not be started within"), "{why}");
+}
+
+/// A run of `kr` that does not end within its bound fails the case that ran it, with the call
+/// named. A bound of nothing is one that no run of `kr` meets, so this needs no stalled program.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kr_run_that_does_not_end_within_its_bound_fails_the_case_and_names_the_call() {
+    let mut world = World::start().await;
+    world.kr_bound = Duration::ZERO;
+    let failed =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| world.run(&["--version"])));
+    let said = panic_message(failed.expect_err("a run that outlasts its bound fails the case"));
+    assert!(
+        said.contains("\"--version\"") && said.contains("within"),
+        "the call is named: {said}"
+    );
 }
 
 impl World {

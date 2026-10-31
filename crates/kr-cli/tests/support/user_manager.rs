@@ -39,6 +39,9 @@ pub fn not_tested_here(why: &str) {
 #[cfg(target_os = "linux")]
 const COMES_UP: Duration = Duration::from_secs(120);
 
+/// Starts one process at a time: the turn [`spawning`] and [`bounded`] take.
+static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Starts one process at a time.
 ///
 /// A pipe is made and only then marked to close when a program is started, and on macOS those are
@@ -47,49 +50,118 @@ const COMES_UP: Duration = Duration::from_secs(120);
 /// never reaches its end, and the command that made it looks as if it had left something holding
 /// its output. Starting one process at a time closes that window for every pipe made through it.
 pub fn spawning<T>(start: impl FnOnce() -> T) -> T {
-    static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one_at_a_time = SPAWNING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     start()
 }
 
-/// Reads a stream to its end on a thread of its own, and sends what it read.
-pub fn read_aside(mut stream: impl std::io::Read + Send + 'static) -> Receiver<Vec<u8>> {
+/// [`spawning`], for a caller that has a deadline: it gives up the turn it is waiting for at
+/// `deadline`, and says so, where [`spawning`] waits for as long as another thread's start takes.
+fn spawning_before<T>(deadline: Instant, start: impl FnOnce() -> T) -> Result<T, String> {
+    loop {
+        match SPAWNING.try_lock() {
+            Ok(_one_at_a_time) => return Ok(start()),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let _one_at_a_time = poisoned.into_inner();
+                return Ok(start());
+            }
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(
+                    "another start of a process held the turn until the time was up".into(),
+                );
+            }
+        }
+    }
+}
+
+/// Reads a stream to its end on a thread of its own, and sends what it read. Says why when the
+/// thread could not be started, which a caller that must not panic needs to know.
+pub fn read_aside(
+    mut stream: impl std::io::Read + Send + 'static,
+) -> std::io::Result<Receiver<Vec<u8>>> {
     let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    std::thread::Builder::new().spawn(move || {
         let mut bytes = Vec::new();
         let _ = stream.read_to_end(&mut bytes);
         let _ = sender.send(bytes);
-    });
-    receiver
+    })?;
+    Ok(receiver)
+}
+
+/// Ends one of this test's own children that it has not collected, and collects it within
+/// [`STREAMS_DEADLINE`]. Returns what of that failed, as text to add to a reason, or nothing.
+fn end_and_collect(child: &mut std::process::Child) -> String {
+    let mut failed = String::new();
+    if let Err(error) = child.kill() {
+        failed.push_str(&format!("; ending it failed: {error}"));
+    }
+    let begun = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return failed,
+            Ok(None) if begun.elapsed() < STREAMS_DEADLINE => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                failed.push_str(&format!(
+                    "; it was still running {STREAMS_DEADLINE:?} after it was ended"
+                ));
+                return failed;
+            }
+            Err(error) => {
+                failed.push_str(&format!("; collecting it failed: {error}"));
+                return failed;
+            }
+        }
+    }
 }
 
 /// Runs a command to its end within `bound`, ending and collecting it when it has not ended.
 ///
-/// For teardown, which must not panic: every failure is returned as what it was.
+/// For teardown, which must not panic: every failure is returned as what it was, and none waits
+/// without an end. The bound counts from the call, so the wait for the turn to start a process,
+/// the run itself and the collecting of what it printed are all inside it or inside
+/// [`STREAMS_DEADLINE`] beyond it.
 pub fn bounded(mut command: Command, bound: Duration) -> Result<Output, String> {
     let what = format!("{command:?}");
-    let mut child = spawning(|| {
+    let begun = Instant::now();
+    let mut child = spawning_before(begun + bound, || {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
     })
+    .map_err(|why| format!("{what} could not be started within {bound:?}: {why}"))?
     .map_err(|error| format!("{what} could not be started: {error}"))?;
-    let stdout = child.stdout.take().map(read_aside);
-    let stderr = child.stderr.take().map(read_aside);
-    let begun = Instant::now();
+    let streams = child
+        .stdout
+        .take()
+        .map(read_aside)
+        .transpose()
+        .and_then(|stdout| Ok((stdout, child.stderr.take().map(read_aside).transpose()?)));
+    let (stdout, stderr) = match streams {
+        Ok(streams) => streams,
+        Err(error) => {
+            let failed = end_and_collect(&mut child);
+            return Err(format!(
+                "{what} was ended because a thread to read its output could not be started: \
+                 {error}{failed}"
+            ));
+        }
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if begun.elapsed() < bound => std::thread::sleep(Duration::from_millis(20)),
             Ok(None) | Err(_) => {
                 // This test's own child, not collected yet, so the number is still its.
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{what} did not end within {bound:?}"));
+                let failed = end_and_collect(&mut child);
+                return Err(format!("{what} did not end within {bound:?}{failed}"));
             }
         }
     };
