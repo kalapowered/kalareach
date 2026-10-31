@@ -8,7 +8,7 @@
 //! Choosing an origin does not send anything there. What the service takes beside this device's
 //! signature, the account's token, goes only to the origin that account is signed in to; that rule
 //! is [`crate::recovery`]'s, where the token is presented, and it names this setting when it
-//! refuses.
+//! refuses before a record of the bundle is made. A record names the service it was made at.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
