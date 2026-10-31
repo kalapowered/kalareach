@@ -41,7 +41,11 @@
 //!   enforce rather than about what surrounds the process, so a host on such a kernel needs a
 //!   different mechanism rather than a wrapper. Every invocation there is refused as a host that
 //!   is not set up for the work, under a code a client does not send again, with the version the
-//!   kernel has and the version the boundary needs, before Git is looked for.
+//!   kernel has and the version the boundary needs, before Git is looked for. A kernel that
+//!   reports no interface at all is refused the same way. It may have the interface and still
+//!   withhold it from this process, because Landlock is not enabled at boot or a system-call filter
+//!   surrounds the process, as a container's profile can. There what surrounds the process is the
+//!   cause, and the sentence names both among the causes.
 //! * A remote operation requires the **fourth**, Linux 6.7, which is where Landlock gained the
 //!   rules that say which addresses a process may reach. Below it a remote operation is refused and
 //!   a local one still runs, because a local one reaches nothing through a different mechanism.
@@ -98,9 +102,11 @@
 
 #![expect(
     unsafe_code,
-    reason = "installing a system-call filter is a raw prctl with a pointer argument, and marking \
-              every descriptor to close on execution is a raw system call; neither has a safe \
-              form, and this module holds those calls and the constants they need"
+    reason = "installing a system-call filter is a raw prctl with a pointer argument, marking \
+              every descriptor to close on execution is a raw system call, and so is asking the \
+              kernel which Landlock interface version it offers, which the landlock crate keeps \
+              private; none has a safe form, and this module holds those calls and the constants \
+              they need"
 )]
 
 use std::collections::BTreeSet;
@@ -230,8 +236,8 @@ fn lacking(found: u32, remote: bool) -> Option<ProjectError> {
         return None;
     }
     let has = if found == 0 {
-        "this kernel has no Landlock interface (version 0: it is not built in, not enabled at \
-         boot, or not permitted to this process)"
+        "this kernel offers this process no Landlock interface (version 0: it is not built in, \
+         not enabled at boot, or blocked by a filter on this process)"
             .to_owned()
     } else {
         format!("this kernel's Landlock interface is version {found}")
@@ -239,7 +245,7 @@ fn lacking(found: u32, remote: bool) -> Option<ProjectError> {
     Some(ProjectError::GitUnavailable {
         detail: format!(
             "{has}, and the boundary around {what} needs version {needed} (Linux {release}) or \
-             later; use a host whose kernel has it"
+             later; use a host that offers it"
         )
         .into(),
     })
