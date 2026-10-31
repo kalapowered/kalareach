@@ -142,14 +142,16 @@ async fn a_logon_station_with_a_narrower_entry_is_refused_without_being_called_w
 
 /// KR-REQ-03.24: a window station that exists already, with the starter's own access list and an
 /// integrity label below the starter's own, is refused for its label, with the step named, and
-/// the refusal says that it admits more. Control: once it is gone the next start is not refused.
+/// the refusal says that it admits more. The starter would raise a label that it may change, so
+/// the station withholds that right from everyone with a denying entry, which is a further entry
+/// and admits less. Control: once it is gone the next start is not refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_logon_station_with_a_lower_integrity_label_refuses_the_start() {
     let _alone = ONE_AT_A_TIME.lock().await;
     let host = WorkerHost::start().await;
     the_starter_meets_the_stations_this_test_makes(&host).await;
 
-    let lower = HeldStation::make_labelled(|own| own.to_owned(), "S:(ML;;NW;;;LW)")
+    let lower = HeldStation::make_labelled(without_the_right_to_relabel, "S:(ML;;NW;;;LW)")
         .unwrap_or_else(|error| panic!("a station with a low integrity label: {error}"));
     assert!(
         lower.label.contains("LW"),
@@ -334,4 +336,13 @@ fn with_a_narrower_entry(own: &str) -> String {
         from = end + 1;
     }
     panic!("the interactive station has no allowing entry with a hexadecimal mask to narrow: {own}")
+}
+
+/// The station's access list with a denying entry put in front that takes the right to change the
+/// owner and the label from everyone.
+fn without_the_right_to_relabel(own: &str) -> String {
+    let at = own
+        .find('(')
+        .unwrap_or_else(|| panic!("the interactive station has no entry: {own}"));
+    format!("{}(D;;WO;;;WD){}", &own[..at], &own[at..])
 }
