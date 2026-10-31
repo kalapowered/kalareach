@@ -106,7 +106,8 @@ unsafe extern "system" {
 /// The console input this attachment reads.
 pub struct RecordReader {
     handle: std::fs::File,
-    /// The key a NUL comes out of the console as in this layout.
+    /// The key a NUL comes out of the console as in the layout of the thread that opened this
+    /// reader, which is not necessarily the console's.
     nul: Option<crate::attach::NulKey>,
     /// The first half of a character outside the basic plane whose second half has not arrived.
     ///

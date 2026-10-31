@@ -71,7 +71,7 @@ pub const fn ignore_background_write_signal() -> std::io::Result<()> {
 /// Ends the read `thread` is blocked in on the console, so that the thread goes on to see that it
 /// has been asked to stop.
 ///
-/// A read of the console's bytes cannot be woken by anything else the thread waits on. The call is a
+/// A read of the console's text cannot be woken by anything else the thread waits on. The call is a
 /// request: the thread is not joined after it, because a console that did not honour it would hold
 /// the joiner for good.
 #[cfg(not(unix))]
