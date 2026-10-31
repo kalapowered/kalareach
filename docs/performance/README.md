@@ -212,13 +212,14 @@ the processor, the processors and the memory against the reference host's, the l
 and leaving, the time a fixed piece of single-threaded work took entering and leaving (the host's
 speed, so that a figure which reads high can be told from a host that ran slow; a window opened
 inside another measurement's interval reads none and says so), the stolen share, for a figure that
-waits on a durable write the disk's time for one, and which of those fall short. Two other records give
+waits on a durable write the disk's time for one, and which of those fall short. Other records give
 less. The transport's two sections in `kr-transport-scheduling.md` give the build, the operating
 system and architecture, the processor, the processors, the memory and the load average at one
 edge, and read neither the speed nor the disk; the KR-PERF-005 section adds the stolen share, and
 the KR-PERF-006 section does not. `kr-term-output-handling.md` gives the build, the operating
 system and architecture, the processors and the processor, and reads no memory, load average,
-speed, stolen share or shortfall. For each identifier
+speed, stolen share or shortfall. The sections of `bench-all.md` start with the step's figures and
+not with a host block; its conditions sections, described next, give the host. For each identifier
 the run measured, `bench-all.md` adds a conditions section. It gives each step that measured the identifier, with its
 exit status, the load average at both edges, the other work over the ten seconds before the step and
 through it (the bound on its busiest five seconds, how much of that the allowances make up, its
