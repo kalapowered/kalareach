@@ -163,18 +163,22 @@ impl Run {
 }
 
 /// A program that appends its own name and arguments to the record, then runs `body`.
+///
+/// It is placed by a process that starts nothing else, so that no thread of this test binary
+/// holds it open for writing when another starts it.
 fn stand_in(directory: &Path, name: &str, record: &Path, body: &str) {
     let path = directory.join(name);
     fs::create_dir_all(directory).expect("a directory");
+    let text = directory.join(format!("{name}.text"));
     fs::write(
-        &path,
+        &text,
         format!(
             "#!/bin/sh\necho \"{name} $*\" >>\"{}\"\n{body}\n",
             record.display()
         ),
     )
     .expect("a stand-in");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable");
+    kr_ipc::testing::place_program(&text, &path);
 }
 
 fn copy_into(root: &Path, relative: &str) {
@@ -783,10 +787,12 @@ fn the_wait_for_the_jobs_of_a_case_sees_a_process_that_names_the_cases_directory
     stand_in(&tools, "pgrep", &record, "exec pgrep \"$@\"");
     // A job that goes on until it is let go, then does its work, and names the case's directory
     // only in its command line, as the jobs of a script do.
+    // It also goes when the test that started it does, or after a minute in any case.
     let mut job = Command::new("/bin/sh")
         .args([
             "-c",
-            "while [ ! -e \"$1\" ]; do sleep 0.05; done; : > \"$2\"",
+            "n=0; while [ ! -e \"$1\" ] && kill -0 \"$PPID\" 2>/dev/null && [ \"$n\" -lt 1200 ]; do \
+             sleep 0.05; n=$((n + 1)); done; : > \"$2\"",
             "job",
         ])
         .arg(&go)
@@ -809,13 +815,16 @@ fn the_wait_for_the_jobs_of_a_case_sees_a_process_that_names_the_cases_directory
         }
         let early = waiting.is_finished();
         fs::write(&go, "").expect("lets the job go");
-        waiting
-            .join()
-            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
-        early
+        (early, waiting.join())
     });
+    let (returned_while_the_job_ran, waited) = returned_while_the_job_ran;
     let recorded = marker.exists();
+    // The job is ended whatever the wait did, and collected, before the case goes on or fails.
+    let _ = job.kill();
     let _ = job.wait();
+    if let Err(payload) = waited {
+        std::panic::resume_unwind(payload);
+    }
     assert!(
         !returned_while_the_job_ran,
         "the wait returned before it had looked three times, with a process that names the case's \
