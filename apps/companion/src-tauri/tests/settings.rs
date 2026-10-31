@@ -1338,14 +1338,23 @@ async fn turning_sync_on_starts_a_collection_and_puts_the_settings_in_it_sealed(
 
 /// KR-REQ-17.14: settings sync reaches the sync service through the clients the application was
 /// given, at the origin its record names, for the settings, the drafts and the members alike. A
-/// fork's service in that place receives every call, a draft's publication, a device shared with
-/// and an offer read among them, and the service the setting names receives none. A record made
-/// while the setting named one service keeps asking for that service after the setting names
-/// another, whether a step settles the settings, shares with a device, takes one out, records a
-/// revocation or lets go of the outcomes.
+/// fork's service in that place receives every call, a draft's publication, a device shared with,
+/// an offer read and a join among them, and the service the setting names receives none. A record
+/// made while the setting named one service keeps asking for that service after the setting names
+/// another, whether a step settles the settings, turns sync on again, shares with a device, takes
+/// one out, records a revocation or lets go of the outcomes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_its_record_names() {
-    let (computer, other) = two_computers().await;
+    let computer = Computer::new().await;
+    let other = Computer::beside(&computer).await;
+    let third = Computer::beside(&computer).await;
+    let devices = vec![
+        computer.listed("this-mac"),
+        other.listed("the-phone"),
+        third.listed("the-tablet"),
+    ];
+    computer.hosts.list(devices.clone());
+    other.hosts.list(devices);
     let (environment, studio) = host(1, "studio");
     computer
         .hosts
@@ -1370,9 +1379,9 @@ async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_it
         computer.served.web().arrived().is_empty(),
         "the service the setting names received none"
     );
-    let ours = computer.served.origin().to_owned();
+    let recorded = computer.served.origin().to_owned();
     assert!(
-        !fork.asked().is_empty() && fork.asked().iter().all(|origin| *origin == ours),
+        !fork.asked().is_empty() && fork.asked().iter().all(|origin| *origin == recorded),
         "{:?}: the client was asked for the service the setting names",
         fork.asked()
     );
@@ -1388,20 +1397,21 @@ async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_it
         "the draft was published at the fork's service"
     );
 
-    // The setting now names another service. The record still names the first: the clients are
-    // asked for it, and the fork's service goes on receiving the calls, a draft's next version
-    // among them.
-    page.call(
-        "sync_service_set",
-        json!({ "origin": "https://other.example" }),
-    )
-    .expect("another service is chosen");
+    // The setting now names a service that is not the one the record names. The record still
+    // names the first: the clients are asked for it, the fork's service goes on receiving the
+    // calls, a draft's next version among them, and the service the setting names now receives
+    // none.
+    let chosen = serve().await;
+    page.call("sync_service_set", json!({ "origin": chosen.origin() }))
+        .expect("another service is chosen");
     let before = fork_service.web().arrived().len();
     page.sync_now();
     assert!(
         fork_service.web().arrived().len() > before,
         "a step after the setting changed reached the service the record names"
     );
+    let view = page.turn_on();
+    assert_eq!(view["sync"]["state"], "on", "{view}");
     page.rewrite_draft(
         Some(&studio),
         Some(&studio),
@@ -1417,8 +1427,8 @@ async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_it
     );
 
     // The members are asked about and changed at the service the record names. A computer that
-    // holds no record reads its offers at the service its own setting names, through its own
-    // clients.
+    // holds no record reads its offers, and joins, at the service its own setting names, through
+    // its own clients.
     let shown = page.devices_refresh();
     page.share(&reference_of(&shown["candidates"], "the-phone"))
         .expect("shared with the phone");
@@ -1430,32 +1440,49 @@ async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_it
         1,
         "the offer was read at the fork's service: {offers}"
     );
-    let phone_reference = reference_of(&page.devices()["members"], "the-phone");
-    page.unshare(&phone_reference)
-        .expect("the phone is taken out");
-    page.app
+    phone
+        .join(&first_reference(&offers["offers"]))
+        .expect("the phone joins through the fork's service");
+    page.sync_now();
+    let shown = page.devices_refresh();
+    page.share(&reference_of(&shown["candidates"], "the-tablet"))
+        .expect("shared with the tablet");
+    let tablet = reference_of(&page.devices()["members"], "the-tablet");
+    page.unshare(&tablet).expect("the tablet is taken out");
+    let recorded_revocation = page
+        .app
         .state::<AppState>()
         .settings()
         .expect("settings are open")
         .revocations_sent(&[*other.identity().keys.authorisation.public()])
         .await
         .expect("the revocation is recorded");
+    assert!(recorded_revocation, "the membership recorded it");
+    assert!(
+        page.view()["sync"]["problem"].is_null(),
+        "the step that took the phone out ended well: {}",
+        page.view()
+    );
     page.call("settings_devices_dismiss", json!({}))
         .expect("the outcomes are let go");
 
     assert!(
-        fork.asked().iter().all(|origin| *origin == ours),
+        fork.asked().iter().all(|origin| *origin == recorded),
         "{:?}: nothing was asked for the service the setting names now",
         fork.asked()
     );
     assert!(
-        phone_fork.asked().iter().all(|origin| *origin == ours),
-        "{:?}: the offer was read at the service the phone's setting names",
+        phone_fork.asked().iter().all(|origin| *origin == recorded),
+        "{:?}: the phone asked for the service its own setting names",
         phone_fork.asked()
     );
     assert!(
         computer.served.web().arrived().is_empty(),
-        "the service the setting names received none"
+        "the fork's service took the place of the service the record names"
+    );
+    assert!(
+        chosen.web().arrived().is_empty(),
+        "the service the setting names now received none"
     );
 }
 
