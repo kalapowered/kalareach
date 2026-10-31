@@ -99,9 +99,7 @@ impl Daemon {
         T: kr_protocol::wire::WireMessage,
     {
         let target = ActionTarget::environment(self.environment_id);
-        crate::bind::mutate_within(&mut self.client, method, target, params, ttl)
-            .await
-            .map_err(|error| in_the_hosts_words(method, error))
+        crate::bind::mutate_within(&mut self.client, method, target, params, ttl).await
     }
 }
 
