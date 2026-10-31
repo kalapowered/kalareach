@@ -747,6 +747,69 @@ fn a_caller_bounded_by_a_grant_clones_makes_a_working_copy_and_removes_it_throug
     assert!(!root.join("review").exists());
 }
 
+/// A repository's tree removed from under the source location a caller bounded by a grant reaches
+/// it through, with nothing put in its place, is a source that changed: the record names an object
+/// and the location holds nothing at its name.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tree_removed_from_under_its_source_location_is_a_source_that_changed() {
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let grant = GrantId::new(Uuid::from_bytes([0x69; 16]));
+    owner.knows_device(grant, device_keys(0x75));
+    let root = fixture.work().join("shared-gone");
+    std::fs::create_dir(&root).expect("a directory");
+    let project = adopt(&fixture, &root, "repo", 30);
+    let source = authorised(
+        fixture.service(),
+        &owner,
+        &authorise_params(environment, &root, LocationPurpose::Source, Some(grant)),
+        31,
+    );
+    attach(fixture.service(), &owner, project, source.location_id, 32)
+        .expect("the owner binds the repository to the grant's source location");
+    let selection = WorkspaceCreateParams {
+        project_repository_id: project,
+        label: "selected".to_owned(),
+        kind: WorkspaceKind::SharedExisting,
+        isolation: Nullable(None),
+        policy: support::include_everything(),
+        base_revision: Nullable(None),
+        base_change_set_id: Nullable(None),
+        destination: Nullable(None),
+        preview_only: false,
+    };
+    let selected = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &selection,
+            kr_project::store::Performed::from(Some(&action("workspace.create", 33)))
+                .bounded_by(grant),
+        )
+        .expect("the caller bounded by the grant selects the repository's own tree")
+        .workspace
+        .0
+        .expect("a workspace");
+    std::fs::remove_dir_all(root.join("repo")).expect("the tree is removed");
+
+    let refusal = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id: selected.workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
+            },
+            kr_project::store::Performed::from(Some(&action("workspace.remove", 34)))
+                .bounded_by(grant),
+        )
+        .expect_err("a record whose tree is gone from under its location names nothing there");
+
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged, "{refusal}");
+}
+
 /// A caller bounded by a grant selects the repository's own tree as a working copy through the
 /// source location it is bound to, and removes the selection through that location again. The
 /// tree is never removed. The controls: a working copy made by naming a path is reached through no
