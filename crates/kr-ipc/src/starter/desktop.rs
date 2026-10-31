@@ -788,6 +788,18 @@ mod tests {
     #[test]
     fn the_starters_label_is_put_on_an_object_that_has_a_lower_one() {
         let access = own_access_list();
+        let station = Station::open(
+            &name_of(current_station()).expect("the station's name"),
+            READ_CONTROL,
+        )
+        .expect("the station opens to be read");
+        println!(
+            "the label of the starter's own desktop is {:?}, and of its station {:?}",
+            own().text(LABEL_SECURITY_INFORMATION),
+            security_of(station.0)
+                .expect("the station's security")
+                .text(LABEL_SECURITY_INFORMATION)
+        );
         let model = desktop_with(&format!("{access}S:(ML;;NW;;;ME)"));
         let source = security_of(model.0).expect("the model's security");
         assert!(!source.label.is_null(), "the model has no integrity label");
