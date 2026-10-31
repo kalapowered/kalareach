@@ -31,18 +31,21 @@ Two roots, both owner-only, both checked rather than assumed on every open.
 A directory above a root that exists is left as it is and checked for nothing: `/tmp` is
 world-writable by design and `~/.cache` is usually group-readable, and neither is KalaReach's to
 change. One that is missing is created with mode 0700 on Unix, and the umask can only narrow that
-mode. On Windows it takes the access list of the directory above it, and on macOS the inheritable
-entries of that list; the check of a root below refuses those that allow an account not known to be
-this user. Each root, and each directory below it that the host makes through `create_private_tree`,
-is made with mode 0700 on Unix and verified each time the host asks for it that way. The host makes
-other directories below a root another way, among them the terminal probe's record directory, the
-backup store's staging directory, the directory of each generation staged in it and the description
-model directories. A missing one of these four is made with mode 0700 on Unix as well. One that
-exists is used as it is, with a wider mode or as a symbolic link to a larger disk, since each lies
-inside a root the host verifies; the target of a link keeps the protection it was given. The
-terminal probe verifies the runtime root before it writes a record, since the probe can come before
-the start that verifies it. The directories of an installed release are read-only (mode 0555 on
-Unix) by design.
+mode. On Windows it takes the access list of the directory above it, which the check of a root
+accepts when it names only this user, the local system and the administrators group. On macOS it
+takes the inheritable entries of that list, and the check of a root below refuses those that allow
+an account not known to be this user. Each root, and each directory below it that the host makes
+through `create_private_tree`, is made with mode 0700 on Unix and verified each time the host asks
+for it that way. The host makes other directories below a root another way, among them the terminal
+probe's record directory, the backup store's staging directory, the directory of each generation
+staged in it, the description model directories and the directory of the native bridge journals. A
+missing one of these five is made with mode 0700 on Unix as well. One that exists is used as it is,
+with a wider mode or as a symbolic link to a larger disk, since each lies inside a root the host
+verifies; the target of a link keeps the protection it was given. On Linux the directories that
+hold the configuration document under the user's configuration home are made with mode 0700 too,
+and one that exists is left as it is. The terminal probe verifies the runtime root before it writes
+a record, since the probe can come before the start that verifies it. The directories of an
+installed release are read-only (mode 0555 on Unix) by design.
 
 A verified directory that is a symbolic link, or that belongs to another user, is refused rather
 than repaired. A root given with a final separator is looked up as the name it ends in, so
@@ -57,9 +60,11 @@ that others can write to the refusal names no command, since a mode does not rem
 in it.
 
 On macOS a verified directory whose access list has an allow entry for an account that is not known
-to be this user is refused with no command, since `chmod 700` leaves the list as it is, and `kr`
-says that its owner or its access list is not known to keep other accounts out. The rule is
-conservative. An allow entry that grants nothing, an allow that a deny before it cancels, an entry
+to be this user is refused with no command, since `chmod 700` leaves the list as it is. Where `kr`
+itself meets the refusal, as `kr host startup` and `kr host install` do when they make a directory,
+it says that the directory's owner or its access list is not known to keep other accounts out.
+`session.create` shows the daemon's own text instead: the directory, and what its access list said.
+The rule is conservative. An allow entry that grants nothing, an allow that a deny before it cancels, an entry
 for a group of one and an entry that only what is made inside inherits refuse the directory as well.
 So does an entry for this user when the account's name is a number or the text of a GUID, or the
 system has no record of it, since the list names a user number or an identity without a record by
