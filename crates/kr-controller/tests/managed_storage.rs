@@ -6063,6 +6063,175 @@ async fn a_fence_owed_while_the_call_waits_on_the_service_refuses_it_and_does_no
     ));
 }
 
+/// Raises a fence and the gate on the account token while a request of the call is out, lets that
+/// request go, and returns how the call ended. A call that asks for a token meanwhile waits at the
+/// gate for good, so the wait for its end races the wait for a request at the gate, and a call that
+/// does that fails the case at once and does not time out.
+async fn the_end_of_a_call_that_meets_a_fence_and_a_held_gate(
+    rig: &Rig,
+    call: tokio::task::JoinHandle<Result<BackupEnableResult, ProtocolError>>,
+    passing: usize,
+    release: impl FnOnce(),
+) -> Result<BackupEnableResult, ProtocolError> {
+    let gate = rig
+        .controller
+        .host_account()
+        .hold_token_requests_after(passing);
+    rig.controller.hold_fence(true);
+    release();
+    let ended = tokio::select! {
+        ended = call => ended.expect("the call ends"),
+        () = until_a_request_waits_for_its_token(rig) => {
+            panic!("the call asked for a token while a fence is owed")
+        }
+    };
+    assert_eq!(rig.controller.host_account().token_requests_waiting(), 0);
+    drop(gate);
+    ended
+}
+
+/// KR-REQ-09.09: a call that meets a fence while it waits on the service is refused before its
+/// next request asks for a token, and not after: the token is not waited for, and nothing starts
+/// that the call will not use. The gate on the account token is up when the held request goes, so a
+/// call that asked for its token would wait there. The sites are the bundle write that follows
+/// another call's turn, the read that settles a bundle write, the read of the storage state that
+/// follows the enrolment, and the retention change that follows that read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_owed_while_the_call_waits_on_the_service_refuses_it_before_it_asks_for_a_token() {
+    // The bundle write of a call that waited behind another: its check that a token can be had goes
+    // through the one request let by, and the write is the next.
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    until_the_carriers_first_pass_has_ended(&rig).await;
+    let web = Arc::clone(rig.served.web());
+    let first = rig.prepared_setup(archive_id(), false);
+    let second = rig.prepared_setup(archive_two(), false);
+    web.fail(SYNC, 1, Moment::Slow);
+    let earlier = rig.enable_outcome_in_the_background(&first.params);
+    within("the first call's bundle write", web.requests_reach(SYNC, 1)).await;
+    let later = rig.enable_outcome_in_the_background(&second.params);
+    within("both calls are told", async {
+        loop {
+            if let BackupSetupState::InProgress { kit_fingerprints } =
+                rig.backup_status().await.setup
+                && kit_fingerprints.len() == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let refusal = the_end_of_a_call_that_meets_a_fence_and_a_held_gate(&rig, later, 1, || {
+        web.release_held();
+    })
+    .await
+    .expect_err("a call is refused while a fence is owed");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(refusal.message.contains("fence"), "{}", refusal.message);
+    earlier
+        .await
+        .expect("the call ends")
+        .expect_err("the first call is refused too");
+    assert_eq!(web.requests_to(SYNC), 1, "only the first call wrote");
+
+    // The read that settles a bundle write the service held and let go unanswered.
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    until_the_carriers_first_pass_has_ended(&rig).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(SYNC, 1, Moment::Hold);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the bundle write", web.requests_reach(SYNC, 1)).await;
+    let refusal = the_end_of_a_call_that_meets_a_fence_and_a_held_gate(&rig, call, 0, || {
+        web.release_held();
+    })
+    .await
+    .expect_err("a call is refused while a fence is owed");
+    assert!(refusal.message.contains("fence"), "{}", refusal.message);
+    assert_eq!(web.requests_to(SYNC), 1, "the bundle was not read");
+
+    // The read of the storage state that follows the enrolment.
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    until_the_carriers_first_pass_has_ended(&rig).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    let reads = web.requests_to(STATUS);
+    web.fail(MANIFEST, 1, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the enrolment", web.requests_reach(MANIFEST, 1)).await;
+    let refusal = the_end_of_a_call_that_meets_a_fence_and_a_held_gate(&rig, call, 0, || {
+        web.release_held();
+    })
+    .await
+    .expect_err("a call is refused while a fence is owed");
+    assert!(refusal.message.contains("fence"), "{}", refusal.message);
+    assert_eq!(
+        web.requests_to(STATUS),
+        reads,
+        "the storage state was not read"
+    );
+
+    // The retention change that follows the read of the storage state.
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    until_the_carriers_first_pass_has_ended(&rig).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(STATUS, 1, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within(
+        "the read of the storage state",
+        web.requests_reach(STATUS, 2),
+    )
+    .await;
+    let refusal = the_end_of_a_call_that_meets_a_fence_and_a_held_gate(&rig, call, 0, || {
+        web.release_held();
+    })
+    .await
+    .expect_err("a call is refused while a fence is owed");
+    assert!(refusal.message.contains("fence"), "{}", refusal.message);
+    assert_eq!(web.requests_to(RETENTION), 0, "retention was not changed");
+}
+
+/// KR-REQ-09.09: a deadline that passes while the call waits on the service refuses it and does not
+/// tell a delay that was named meanwhile, as a fence does. The read that settles a bundle write
+/// finds the bundle absent, and the answer would tell the delay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deadline_that_passes_while_the_call_waits_on_the_service_refuses_it_and_does_not_tell_a_delay_named_meanwhile()
+ {
+    let (rig, _, clock) = a_host_to_set_up_on_a_clock(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(SYNC, 1, Moment::Hold);
+    web.fail(SYNC, 2, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the bundle write", web.requests_reach(SYNC, 1)).await;
+    web.release_held();
+    within("the read that settles it", web.requests_reach(SYNC, 2)).await;
+    web.fail(
+        STATUS,
+        1,
+        Moment::Refuse {
+            status: 429,
+            code: "RATE_LIMITED",
+            retry_after_seconds: Some(30),
+        },
+    );
+    assert!(matches!(
+        rig.backup_status().await.storage,
+        BackupStorageState::Unread { .. }
+    ));
+    clock.advance(Duration::from_millis(
+        kr_protocol::limits::DEFAULT_MUTATION_TTL.get() + 1_000,
+    ));
+    web.release_held();
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("a call whose deadline has passed is refused, whatever else it meets");
+    assert!(refusal.message.contains("deadline"), "{}", refusal.message);
+    assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
+}
+
 /// KR-REQ-09.09: a delay the service named while the call waits on it holds back the request that
 /// follows: the enrolment after the bundle write, the read of the storage state after the
 /// enrolment, and the retention change after that read. The call ends as unknown with the delay and
