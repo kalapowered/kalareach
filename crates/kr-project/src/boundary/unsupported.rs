@@ -9,14 +9,17 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use super::{Confinement, Invocation};
-use crate::error::{ProjectError, Result};
+use crate::error::Result;
 
 /// What the boundary is, for a person reading a record.
 pub const MECHANISM: &str = "none: this platform has no boundary this service can build";
 
 /// Why no Git is run here.
-pub const NO_GIT: Option<&str> =
-    Some("this platform has no boundary a Git invocation can be enclosed in, so none is run");
+const WHY: &str =
+    "this platform has no boundary a Git invocation can be enclosed in, so none is run";
+
+/// Why no Git is run here, as the platform modules give it.
+pub const NO_GIT: Option<&str> = Some(WHY);
 
 /// The boundary as the parent built it, which on this platform is never built at all.
 #[derive(Debug)]
@@ -48,13 +51,10 @@ impl Prepared {
 ///
 /// # Errors
 ///
-/// Always returns [`ProjectError::GitFailed`]: this platform has no mechanism to build one from.
+/// Always returns the refusal of a platform that runs no Git: this platform has no mechanism to
+/// build one from.
 pub fn prepare(_confinement: &Confinement) -> Result<Prepared> {
-    Err(ProjectError::GitFailed {
-        detail: "this platform has no boundary a Git invocation can be enclosed in, so none is \
-                 run"
-        .into(),
-    })
+    Err(super::no_git_refusal(WHY))
 }
 
 /// Starts one Git invocation inside its boundary.

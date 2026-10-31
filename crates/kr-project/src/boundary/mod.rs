@@ -139,6 +139,19 @@ pub const MECHANISM: &str = platform::MECHANISM;
 /// whether or not one is installed.
 pub const NO_GIT: Option<&str> = platform::NO_GIT;
 
+/// The refusal a platform that runs no Git gives every request that needs it, with the reason that
+/// platform gives for running none.
+///
+/// The condition does not pass: no wait, no retry and no install changes it. So the refusal says
+/// what the platform cannot do and names no step to take, and it is the one of a host that is not
+/// set up for the work, which a client does not send again, and not the one of an upstream that
+/// may answer later.
+pub(crate) fn no_git_refusal(why: &str) -> ProjectError {
+    ProjectError::GitFailed {
+        detail: format!("Git is not run on this platform: {why}").into(),
+    }
+}
+
 /// The ports an https remote is reached on.
 ///
 /// Both, because a server may answer an https request with a redirection to the same repository
@@ -619,6 +632,30 @@ mod tests {
         assert_eq!(
             Reach::for_transport(Some(RemoteTransport::Ssh), None).ports(),
             &[22]
+        );
+    }
+
+    /// A platform that runs no Git refuses every request that needs it under a code a client does
+    /// not send again, with the platform's reason and no step to install Git, which would change
+    /// nothing there.
+    #[test]
+    fn a_platform_that_runs_no_git_refuses_under_a_code_a_client_does_not_retry() {
+        let refusal = no_git_refusal("a reason of the platform");
+
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::HostNotConfigured
+        );
+        assert!(
+            !refusal.code().retry_category().permits_automatic_retry(),
+            "{}",
+            refusal.code()
+        );
+        let said = refusal.to_string();
+        assert!(said.contains("a reason of the platform"), "{said}");
+        assert!(
+            !said.contains("try again") && !said.contains("Install"),
+            "{said}"
         );
     }
 
