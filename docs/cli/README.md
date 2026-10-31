@@ -1638,7 +1638,8 @@ An enrolment names the environment's own identity. Pass it with `--environment-i
 environment has to be running already: enrolment starts nothing, and a probe of a stopped
 environment is refused rather than starting it. A container's `--target` is resolved through the container runtime
 first, and the identifier it answers with is what the record keeps; a name, or a short prefix of an
-identifier, is not one.
+identifier, is not one. The runtime is given a minute: a call that has not ended by then is ended,
+and the refusal names it.
 
 `list` reads this host's cache. It contacts nothing and starts nothing, and every row says so:
 each carries the environment identity, when it was last observed, an explicit `running`,
