@@ -30,12 +30,14 @@
 //! the host's to avoid, as a host that holds nothing without its files does.
 //!
 //! The process is started with no environment but what the launch names, in the working directory
-//! the launch names, and it is the daemon's own child. Nothing in it outlives the daemon: its input
-//! ends when the daemon does, and its watchdog looks for the daemon by the start identity it is
-//! given, which covers a control thread that never sees that end. A process created held on
-//! Windows has run neither of them, so the job it is put in ends it with the daemon, and a start
-//! that fails or panics ends it too. A daemon killed from outside in the few calls before the
-//! process is in its job is the one case that leaves it.
+//! the launch names, and it is the daemon's own child. Its input ends when the daemon does, and its
+//! watchdog looks for the daemon by the start identity it is given, which covers a control thread
+//! that never sees that end. A process created held on Windows has run neither of them, so the job
+//! it is put in ends it with the daemon, and a start that fails or panics ends it too. One window
+//! remains: a daemon that stops without unwinding in the few calls between the process's creation
+//! and its entry into the job, or before it lets run a process the job did not take, leaves the
+//! process behind. It is killed from outside, or ended by a fault or an abort on one of its other
+//! threads.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -242,7 +244,8 @@ struct Running {
 
 /// Ends and collects a process when it is dropped, unless it was kept: what leaves no process
 /// behind when a start fails, or panics, after it created one. A process created held does not run,
-/// so it never reads that its input or its owner has gone, and nothing else would end it.
+/// so it never reads that its input or its owner has gone: only its job, once it is in one, and
+/// this guard end it.
 struct EndedUnlessKept<'a> {
     child: &'a mut Child,
     kept: bool,
@@ -1062,9 +1065,14 @@ impl Driver {
                     // pauses, as it does when the daemon's own reading finds the process over.
                     // Asked of every answer to the load or the job in hand, so that a refusal the
                     // runtime got over is forgotten and is not taken for the cause of a later end.
-                    // The system may post nothing for a later refusal of the same process, which
-                    // then reads as an ordinary failure. An answer for other work, which a late or
-                    // a repeated answer is, belongs to no refusal that the work in hand is owed.
+                    // The system's message and the process's frames reach the daemon by different
+                    // routes with no order between them, so a refusal posted just after the
+                    // runtime wrote an answer that does not say it failed is cleared with it, and
+                    // the end it leads to reads as an ordinary one: nothing the daemon reads tells
+                    // it from a refusal the runtime got over. The system may post nothing for a
+                    // later refusal of the same process, which then reads as an ordinary failure.
+                    // An answer for other work, which a late or a repeated answer is, belongs to
+                    // no refusal that the work in hand is owed.
                     if in_hand && self.the_system_refused_memory() && the_work_failed(&answer) {
                         return self.kill(ProcessEnd::MemoryCeiling, now, reports);
                     }

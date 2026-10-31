@@ -12,9 +12,10 @@
 //! The message is the only record of a refusal, and Windows does not promise to deliver it for a
 //! limit of this kind. A refusal that was not recorded reads as an ordinary end of the process, so
 //! an absent message is not proof that no commit was refused. On the build this was tried on
-//! (Windows Server 2025, build 26100) the system posts it once for a process: a process refused
-//! several commits, whatever it did between them, has only the first recorded, and every one of
-//! them was refused.
+//! (Windows Server 2025, build 26100) a process that asked for memory four times, with nothing done
+//! between the first two requests, a small commit kept for the third and given back for the fourth,
+//! was refused all four and had only the first recorded. A refusal after the first may therefore
+//! leave no record.
 //!
 //! The limit is on committed memory: the private memory the process asked the system to back,
 //! touched or not. A file mapped for reading is not committed, so the limit does not count the
@@ -26,8 +27,8 @@
 //!
 //! A process runs from the moment it is created, and a limit does not reach back to memory it has
 //! committed already. So a process that is to be held to a limit is created held ([`start_held`]),
-//! put behind the limit, and only then let run ([`resume`]): it does not run before it is behind
-//! the limit.
+//! put behind the limit, and only then let run ([`resume`]): it does not run before the limit has
+//! been tried. A caller that is told the limit was not applied may let it run all the same.
 //!
 //! The job ends the processes in it when its last handle closes. A process that was created held
 //! never runs, so it never reads the end of its input or the end of its owner, and nothing in it
