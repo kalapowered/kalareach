@@ -5524,12 +5524,30 @@ mod tests {
         );
     }
 
+    /// Ends the look it borrows when it goes out of scope, if nothing has ended it, so that a case
+    /// that stops early leaves no request waiting for a look nothing else will end.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct EndsWhenDropped<'a>(&'a Look);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for EndsWhenDropped<'_> {
+        fn drop(&mut self) {
+            self.0.end(Err(Diagnostic::new(
+                "the case stopped before the look ended",
+            )));
+        }
+    }
+
     /// A request that arrived while a look was under way is answered with that look's refusal when
     /// it ends, and is not held by the look that follows: the look it joined is the one it waited
     /// for, and no other. The second look is in the slot, and stays under way, before the first one
     /// ends, so a request that went on to wait for whatever stands in the slot would be answered
     /// only when the case let the second go. Nothing here waits for a time: the case moves when a
     /// condition holds, and the bound on its one wait is only a guard for a request that is held.
+    ///
+    /// A platform that runs no Git refuses a request before it reaches the slot, so the case is for
+    /// the platforms that look for it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_request_that_waited_for_one_look_is_not_held_by_the_look_that_follows() {
         let installation = Installation::looked_for_on(None, PROBE_BOUND);
@@ -5539,6 +5557,9 @@ mod tests {
 
         std::thread::scope(|scope| {
             let installation = &installation;
+            // Both looks end however the case ends, so the request, and with it this scope, is
+            // never left waiting for a look that a failed assertion skipped.
+            let _ends_first = EndsWhenDropped(&first);
             scope.spawn(move || {
                 let refusal = installation.program().map(|_| ()).expect_err("no Git");
                 answer
@@ -5558,12 +5579,13 @@ mod tests {
 
             // The second look takes the slot and stays under way while the first one ends.
             let second = Arc::new(Look::default());
+            let _ends_second = EndsWhenDropped(&second);
             *installation.current.lock().expect("the slot") = Some(Arc::clone(&second));
             first.end(Err(Diagnostic::new("the first look was refused")));
 
-            let told = answered.recv_timeout(Duration::from_secs(30));
-            second.end(Err(Diagnostic::new("the second look was refused")));
-            let told = told.expect("the request was answered while the second look was under way");
+            let told = answered
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the request was answered while the second look was under way");
             assert!(told.contains("the first look was refused"), "{told}");
         });
     }
