@@ -3730,12 +3730,6 @@ fn ask(
     };
     let status = loop {
         heard.take_in(deadline);
-        // At the limit, not when the program ends: what a program writes without end is not an
-        // answer, and reading it on would hold this look for as long as the program writes.
-        if heard.overflowed() {
-            end_if_own(child);
-            return Err(too_much());
-        }
         match has_ended(&mut child) {
             Ended::No => {}
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3764,6 +3758,14 @@ fn ask(
                     "{described} could not be waited on: {error}"
                 ))));
             }
+        }
+        // At the limit, not when the program ends: what a program writes without end is not an
+        // answer, and reading it on would hold this look for as long as the program writes. Only
+        // a child that was just seen to be under way reaches here, so it is this process's own and
+        // ending it by its number is safe.
+        if heard.overflowed() {
+            end_probe(child);
+            return Err(too_much());
         }
         if Instant::now() >= deadline {
             end_probe(child);
@@ -3797,7 +3799,8 @@ fn ask(
         )))
     })?;
     // Before the status: what an answer holds beyond the limit is not an answer, whatever the
-    // program then exited with.
+    // program then exited with. On Unix the drain has already refused an answer past the limit, so
+    // this is reached for it by the reader thread of the other platforms.
     if answer.truncated {
         return Err(too_much());
     }
@@ -4054,8 +4057,8 @@ fn end_group(child: &std::process::Child) {
     let _ = child;
 }
 
-/// Ends a probe that is to be refused before the loop has asked after its child in this pass, but
-/// only once the child is seen to be this process's own.
+/// Ends a probe that is to be refused before the loop has asked after its child, but only once the
+/// child is seen to be this process's own.
 ///
 /// A child that cannot be waited on, or that has been collected, may have a number that belongs to
 /// another process by now, so nothing is signalled by it.
@@ -5114,7 +5117,7 @@ mod tests {
     #[cfg(unix)]
     thread_local! {
         /// Set by a case to make the switch to nonblocking reads fail on its own thread, once the
-        /// file it names exists.
+        /// file it names holds a number.
         pub(super) static SWITCH_FAILS: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
         /// Set by a case to make the question whether a child has ended fail on its own thread, as
         /// it does for a child that something else in the process has collected.
@@ -5128,12 +5131,22 @@ mod tests {
         reads: usize,
         lasts: usize,
         each: usize,
+        /// When set, the first read waits until this moment has passed, so that a deadline that
+        /// was ahead when the pass began is behind it by the time the read returns.
+        until: Option<Instant>,
     }
 
     #[cfg(unix)]
     impl std::io::Read for NeverEmpty {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             self.reads += 1;
+            if self.reads == 1
+                && let Some(until) = self.until
+            {
+                while Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
             if self.reads > self.lasts {
                 return Err(std::io::ErrorKind::WouldBlock.into());
             }
@@ -5150,6 +5163,7 @@ mod tests {
             reads: 0,
             lasts: 100_000,
             each: 4096,
+            until: None,
         };
         let mut seen = Bounded::default();
 
@@ -5172,23 +5186,56 @@ mod tests {
         );
     }
 
+    /// The deadline is checked after every read and not only before the first: it comes during the
+    /// pass here, because the first read does not return until it has. A pass that checked once
+    /// would go on to the end of a writer that is never behind.
     #[cfg(unix)]
     #[test]
     fn a_writer_faster_than_the_reader_is_read_only_until_the_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(50);
         let mut pipe = NeverEmpty {
             reads: 0,
             lasts: 1_000_000,
             each: 1,
+            until: Some(deadline),
         };
         let mut seen = Bounded::default();
 
-        gather(&mut pipe, &mut seen, Instant::now());
+        gather(&mut pipe, &mut seen, deadline);
 
         assert!(
             pipe.reads <= 1,
-            "a pass that began at the deadline ended with it, after {} reads",
+            "a pass whose deadline came during it ended with the read it came in, after {} reads",
             pipe.reads
         );
+    }
+
+    /// An answer of exactly the limit is kept whole and is an answer; one byte more is too much.
+    #[cfg(unix)]
+    #[test]
+    fn an_answer_of_exactly_the_limit_is_kept_whole_and_one_byte_more_is_too_much() {
+        for (length, too_much) in [(PROBE_OUTPUT_LIMIT, false), (PROBE_OUTPUT_LIMIT + 1, true)] {
+            let mut pipe = std::io::Cursor::new(vec![b'x'; length]);
+            let mut seen = Bounded::default();
+
+            let left = gather(
+                &mut pipe,
+                &mut seen,
+                Instant::now() + Duration::from_secs(60),
+            );
+
+            assert_eq!(seen.truncated, too_much, "{length} bytes");
+            assert_eq!(
+                seen.bytes.len(),
+                length.min(PROBE_OUTPUT_LIMIT),
+                "{length} bytes"
+            );
+            assert_eq!(
+                matches!(left, Gathered::Closed),
+                !too_much,
+                "the end of {length} bytes is reached only when they are all an answer"
+            );
+        }
     }
 
     /// Whether a process with this identifier is running, which one that has ended and not yet been
@@ -5203,21 +5250,31 @@ mod tests {
         !state.trim().is_empty() && !state.trim().starts_with('Z')
     }
 
-    /// A stand-in that writes its number to `own` and then waits for `seconds`, placed as the
-    /// program a case asks.
+    /// A stand-in that writes its number to `own` and then waits until a case lets it go with
+    /// [`let_go`], placed as the program a case asks. It ends by itself only when it is let go; a
+    /// guard of two minutes ends one that a failed case forgot.
     #[cfg(unix)]
-    fn waiting_stand_in(directory: &Path, own: &Path, seconds: u32) -> PathBuf {
+    fn waiting_stand_in(directory: &Path, own: &Path) -> PathBuf {
         let (text, program) = (directory.join("git.text"), directory.join("git"));
         std::fs::write(
             &text,
             format!(
-                "#!/bin/sh\necho $$ > '{}'\nexec sleep {seconds}\n",
-                own.display()
+                "#!/bin/sh\necho $$ > '{own}'\ni=0\n\
+                 while [ ! -e '{release}' ] && [ $i -lt 2400 ]; do sleep 0.05; i=$((i+1)); done\n",
+                own = own.display(),
+                release = directory.join("release").display(),
             ),
         )
         .expect("the stand-in's text");
         kr_ipc::testing::place_program(&text, &program);
         program
+    }
+
+    /// Lets go what a case holds in `directory`, which ends it by its own means: no process is
+    /// signalled by a number that may belong to another by now.
+    #[cfg(unix)]
+    fn let_go(directory: &Path) {
+        std::fs::write(directory.join("release"), "").expect("what the case holds is let go");
     }
 
     /// The number a stand-in wrote, which it does when it starts, and so may be after a refusal.
@@ -5238,21 +5295,12 @@ mod tests {
         }
     }
 
-    /// Ends what a case left running, by the number the stand-in wrote.
-    #[cfg(unix)]
-    fn end_by_number(pid: &str) {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", pid])
-            .stderr(Stdio::null())
-            .status();
-    }
-
     #[cfg(unix)]
     #[test]
     fn a_pipe_that_cannot_be_read_without_blocking_refuses_the_probe() {
         let directory = tempfile::tempdir().expect("a directory for this test");
         let own = directory.path().join("own");
-        let program = waiting_stand_in(directory.path(), &own, 6);
+        let program = waiting_stand_in(directory.path(), &own);
 
         SWITCH_FAILS.with(|fails| *fails.borrow_mut() = Some(own.clone()));
         let asked = ask(
@@ -5271,9 +5319,7 @@ mod tests {
         );
         let pid = number_of(&own);
         let alive = running(&pid);
-        if alive {
-            end_by_number(&pid);
-        }
+        let_go(directory.path());
         assert!(!alive, "the stand-in was ended with the refusal");
     }
 
@@ -5286,7 +5332,7 @@ mod tests {
     fn a_child_that_cannot_be_waited_on_is_refused_and_nothing_is_signalled_by_number() {
         let directory = tempfile::tempdir().expect("a directory for this test");
         let own = directory.path().join("own");
-        let program = waiting_stand_in(directory.path(), &own, 120);
+        let program = waiting_stand_in(directory.path(), &own);
 
         WAIT_FAILS.with(|fails| fails.set(true));
         let asked = ask(
@@ -5305,7 +5351,7 @@ mod tests {
         );
         let pid = number_of(&own);
         let left_alone = running(&pid);
-        end_by_number(&pid);
+        let_go(directory.path());
         assert!(left_alone, "the stand-in was signalled by its number");
     }
 
@@ -5317,7 +5363,7 @@ mod tests {
     fn a_probe_ended_for_its_pipe_signals_nothing_by_number_when_its_child_cannot_be_waited_on() {
         let directory = tempfile::tempdir().expect("a directory for this test");
         let own = directory.path().join("own");
-        let program = waiting_stand_in(directory.path(), &own, 120);
+        let program = waiting_stand_in(directory.path(), &own);
 
         SWITCH_FAILS.with(|fails| *fails.borrow_mut() = Some(own.clone()));
         WAIT_FAILS.with(|fails| fails.set(true));
@@ -5338,7 +5384,7 @@ mod tests {
         );
         let pid = number_of(&own);
         let left_alone = running(&pid);
-        end_by_number(&pid);
+        let_go(directory.path());
         assert!(left_alone, "the stand-in was signalled by its number");
     }
 
@@ -5394,6 +5440,70 @@ mod tests {
         assert_eq!(state(&pid), "", "the child was collected");
     }
 
+    /// A probe whose child has ended, and whose output a process in a session of its own still
+    /// holds, is refused when the short wait for the end of its output has run out and not when the
+    /// deadline has: ending the child's group did not reach a process that left it. The deadline
+    /// is far off here, and the case decides by whether the probe was refused before a guard that
+    /// only a wait as long as the deadline would pass.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn a_probe_whose_output_a_process_outside_its_group_holds_is_refused_after_the_drain() {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let (own, release) = (
+            directory.path().join("own"),
+            directory.path().join("release"),
+        );
+        let (holder, program) = (
+            directory.path().join("holder.pl"),
+            directory.path().join("git"),
+        );
+        std::fs::write(
+            &holder,
+            "use POSIX ();\nPOSIX::setsid();\nopen(my $out, '>', $ARGV[0]) or die;\n\
+             print $out $$;\nclose($out);\nmy $i = 0;\n\
+             while (!-e $ARGV[1] && $i++ < 2400) { select(undef, undef, undef, 0.05); }\n",
+        )
+        .expect("the holder's text");
+        // The stand-in ends once the holder has left the group, so that ending the group cannot
+        // reach it, and the holder goes on holding the pipe the stand-in was started with.
+        let text = directory.path().join("git.text");
+        std::fs::write(
+            &text,
+            format!(
+                "#!/bin/sh\n/usr/bin/perl '{holder}' '{own}' '{release}' &\ni=0\n\
+                 while [ ! -s '{own}' ] && [ $i -lt 2400 ]; do sleep 0.02; i=$((i+1)); done\n",
+                holder = holder.display(),
+                own = own.display(),
+                release = release.display(),
+            ),
+        )
+        .expect("the stand-in's text");
+        kr_ipc::testing::place_program(&text, &program);
+
+        let (done, ended) = std::sync::mpsc::channel();
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = done.send(
+                    ask(
+                        &program,
+                        &["--version"],
+                        Instant::now() + Duration::from_secs(120),
+                    )
+                    .map_err(|asked| asked.into_error().to_string()),
+                );
+            });
+            let outcome = ended.recv_timeout(Duration::from_secs(30));
+            // The holder ends by itself, whatever the outcome, and the pipe closes with it.
+            let_go(directory.path());
+            outcome
+        });
+
+        let refusal = outcome
+            .expect("the probe was refused after the drain and not held until the deadline")
+            .expect_err("a probe whose output is still held is refused");
+        assert!(refusal.contains("left its output open"), "{refusal}");
+    }
+
     #[test]
     fn a_look_whose_request_stops_is_ended_for_every_request_waiting_for_it() {
         let installation = Installation::looked_for_on(None, PROBE_BOUND);
@@ -5415,6 +5525,143 @@ mod tests {
         assert!(
             installation.current.lock().expect("the slot").is_none(),
             "and the next request makes a look of its own"
+        );
+    }
+
+    /// A request that arrived while a look was under way is answered with that look's refusal when
+    /// it ends, and is not held by the look the next request makes: the look it joined is the one it
+    /// waited for, and no other. The case ends the first look and holds the second, so a request
+    /// that went on waiting would be answered only when the case let the second go. The stand-in
+    /// ends each look when the case writes the file named for its number, and the bound is only a
+    /// guard for a case that hangs.
+    #[cfg(unix)]
+    #[test]
+    fn a_request_that_waited_for_one_look_is_not_held_by_the_look_that_follows() {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let search = directory.path().join("search");
+        std::fs::create_dir(&search).expect("a search path of this test's own");
+        let started = directory.path().join("started");
+        let text = directory.path().join("git.text");
+        std::fs::write(
+            &text,
+            format!(
+                "#!/bin/sh\necho started >> '{started}'\nn=$(wc -l < '{started}' | tr -d ' ')\n\
+                 i=0\nwhile [ ! -e '{dir}/release-'$n ] && [ $i -lt 2400 ]; do sleep 0.05; \
+                 i=$((i+1)); done\nexit 1\n",
+                started = started.display(),
+                dir = directory.path().display(),
+            ),
+        )
+        .expect("the stand-in's text");
+        kr_ipc::testing::place_program(&text, &search.join("git"));
+        let installation =
+            Installation::looked_for_on(Some(OsString::from(&search)), Duration::from_secs(60));
+        let starts = || std::fs::read_to_string(&started).map_or(0, |marks| marks.lines().count());
+        let release = |number: u32| {
+            std::fs::write(directory.path().join(format!("release-{number}")), "")
+                .expect("a look is let go");
+        };
+        let guarded = |what: &str, mut holds: Box<dyn FnMut() -> bool + '_>| {
+            let guard = Instant::now() + Duration::from_secs(30);
+            while !holds() {
+                assert!(Instant::now() < guard, "{what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // How many hold the look under way: the request that made it, the slot, and each request
+        // that joined it.
+        let holding = || {
+            installation
+                .current
+                .try_lock()
+                .ok()
+                .and_then(|slot| slot.as_ref().map(Arc::strong_count))
+        };
+
+        std::thread::scope(|scope| {
+            let installation = &installation;
+            let first = scope.spawn(move || {
+                installation
+                    .program()
+                    .map(|_| ())
+                    .expect_err("no Git answers")
+            });
+            guarded(
+                "the first look never started the stand-in",
+                Box::new(|| starts() == 1),
+            );
+            let (answer, answered) = std::sync::mpsc::channel();
+            let earlier = scope.spawn(move || {
+                let refusal = installation
+                    .program()
+                    .map(|_| ())
+                    .expect_err("no Git answers");
+                answer
+                    .send(refusal.to_string())
+                    .expect("the case is waiting");
+            });
+            guarded(
+                "the earlier request never joined the first look",
+                Box::new(|| holding() == Some(3)),
+            );
+
+            // The first look ends, and the next request makes a look of its own, which the case
+            // holds.
+            release(1);
+            let first_refusal = first.join().expect("the first look ends");
+            let later = scope.spawn(move || {
+                installation
+                    .program()
+                    .map(|_| ())
+                    .expect_err("no Git answers")
+            });
+            guarded(
+                "the second look never started the stand-in",
+                Box::new(|| starts() == 2),
+            );
+
+            let earlier_refusal = answered.recv_timeout(Duration::from_secs(30));
+            release(2);
+            earlier.join().expect("the earlier request ends");
+            let later_refusal = later.join().expect("the second look ends");
+
+            assert_eq!(
+                earlier_refusal.ok(),
+                Some(first_refusal.to_string()),
+                "the earlier request was answered with the refusal of the look it waited for, \
+                 while the second look was still held"
+            );
+            assert!(
+                matches!(later_refusal, ProjectError::GitUnavailable { .. }),
+                "{later_refusal:?}"
+            );
+        });
+        assert_eq!(starts(), 2, "two looks were made, one for each need");
+    }
+
+    /// A child that something else in the process has collected cannot be waited on, and the answer
+    /// says so: the number may be another process's by now, so the caller signals nothing by it.
+    /// The collecting is done here, with a real child, so the mapping from what the system says to
+    /// what `has_ended` answers is the one that runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_collected_by_something_else_is_one_that_cannot_be_waited_on() {
+        use rustix::process::{Pid, WaitOptions, waitpid};
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the shell starts");
+        let pid = Pid::from_raw(i32::try_from(child.id()).expect("a process number"))
+            .expect("a process number");
+        waitpid(Some(pid), WaitOptions::empty()).expect("the child is collected here");
+
+        assert!(
+            matches!(has_ended(&mut child), Ended::Failed(_)),
+            "a child that was collected elsewhere is neither still running nor ended and waiting"
         );
     }
 
