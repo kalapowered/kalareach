@@ -262,7 +262,9 @@ struct HostReading {
 /// session does it on every pass of its maintenance, so twenty sessions made twenty times as many
 /// reads of the same directory each minute. A session whose own retained bytes are what they were
 /// has nothing new to give up for the host's cap unless another session has grown past it, and
-/// that session measures the host itself, on every pass that its own bytes have changed.
+/// that session measures the host itself, on every pass that its own bytes have changed. A reading
+/// that found the host over its cap, or was taken while the files lacked bytes the session counts,
+/// does not stand.
 const HOST_READING_STANDS_FOR: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// Whether the host's retained output is to be measured again: it has not been, the session's own
@@ -962,8 +964,11 @@ impl OutputHistory {
     ///
     /// The figure is a reading of `spools`, the directory that holds every session's spool, and
     /// not an authority: [`retained_bytes_under`] sizes each file by asking the file, and a file it
-    /// cannot read counts as nothing, which evicts less and not more. The control daemon applies
-    /// the same cap to the sessions that have closed, from the same reading.
+    /// cannot read counts as nothing, which evicts less and not more. A reading that found the
+    /// host under its cap stands for five minutes while the session's own retained
+    /// bytes are unchanged, since only a session whose bytes grow can take the host over its cap,
+    /// and it measures the host itself. The control daemon applies the same cap to the sessions
+    /// that have closed, from a reading of its own.
     pub fn apply_retention_to_host(
         &mut self,
         spools: &Path,
@@ -974,12 +979,21 @@ impl OutputHistory {
         let session_bytes = self.retained_bytes();
         let now = std::time::Instant::now();
         let host_bytes = if host_reading_due(self.host_reading, session_bytes, now) {
+            // Asked before the files are read. The session is held, so no write is owed after this
+            // and one that is in flight now is counted here, whether or not it ends while the files
+            // are read.
+            let files_hold_the_count = self.spool.as_ref().is_none_or(Spool::files_hold_the_count);
             let host_bytes = retained_bytes_under(spools);
-            self.host_reading = Some(HostReading {
-                at: now,
-                session_bytes,
-                host_bytes,
-            });
+            // A reading stands only when the next pass can rely on it. One taken while the files
+            // lack bytes the session counts leaves them out, and they arrive with the session's
+            // own figure unchanged. One that finds the host over its cap is the pass that gives
+            // output up, which may find nothing it can give; the next pass looks again.
+            self.host_reading = (files_hold_the_count && host_bytes <= retention.host_cap_bytes)
+                .then_some(HostReading {
+                    at: now,
+                    session_bytes,
+                    host_bytes,
+                });
             host_bytes
         } else {
             self.host_reading
@@ -1548,6 +1562,13 @@ impl OwedWrite {
         ticket
     }
 
+    /// Whether every write the spool owed has been made and settled: none is in flight, and none
+    /// has failed and left its failure for the next pass to settle.
+    fn settled(&self) -> bool {
+        let state = self.lock();
+        state.in_flight.is_none() && state.failed.is_none()
+    }
+
     /// Waits until no write is in flight. The write needs nothing of the session to finish, so
     /// this may be waited for with the session held.
     fn wait_idle(&self) {
@@ -2047,6 +2068,14 @@ impl Spool {
         };
         self.count_written(len);
         Some(write)
+    }
+
+    /// Whether the files hold what the spool counts as held. A write still to be made, one that
+    /// failed and is not yet settled, and a spool that has stopped taking output while its window
+    /// holds the bytes it could not write, are each bytes the count has and the files do not, and
+    /// the files take them without the count moving.
+    fn files_hold_the_count(&self) -> bool {
+        self.suspended.is_none() && self.owed.settled()
     }
 
     /// Settles the failure the last owed write left, if it left one.
@@ -3768,6 +3797,126 @@ mod tests {
             host_reading_due(Some(reading), 4_096, started + HOST_READING_STANDS_FOR),
             "and an idle one does when the measure has stood long enough"
         );
+    }
+
+    /// KR-PERF-003: through the retention a live session applies, a session whose own output has
+    /// not moved does not measure the host again, and one whose output moves does.
+    #[test]
+    fn kr_perf_003_a_session_measures_the_host_again_only_when_its_own_output_has_moved() {
+        let root = spool_directory("host-reading");
+        let retention = OutputRetention::new(
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            100,
+            1 << 20,
+        );
+        let layout = || SpoolLayout::new(8, 1 << 20);
+        let mut quiet =
+            OutputHistory::with_spool(8, root.join("quiet.log"), layout()).expect("a spool");
+        quiet.append(&[b'q'; 8]);
+        let mut busy =
+            OutputHistory::with_spool(8, root.join("busy.log"), layout()).expect("a spool");
+        busy.append(&[b'b'; 64]);
+        let now = kr_ipc::now_ms();
+        assert!(
+            quiet
+                .apply_retention_to_host(&root, retention, now, true)
+                .is_empty(),
+            "72 bytes are under a cap of 100"
+        );
+        // Another session grows past the cap. It measures the host itself, so the quiet one,
+        // whose own output has not moved, does not.
+        busy.append(&[b'b'; 60]);
+        assert!(
+            quiet
+                .apply_retention_to_host(&root, retention, now, true)
+                .is_empty(),
+            "the reading stands while the session's own output has not moved"
+        );
+        quiet.append(&[b'q'; 1]);
+        assert!(
+            !quiet
+                .apply_retention_to_host(&root, retention, now, true)
+                .is_empty(),
+            "and its own output moving is measured at once, over the cap now"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// KR-PERF-003: a reading taken while a write to the spool is still to be made does not stand.
+    /// The session counts the bytes of that write as held and the files do not have them yet, so
+    /// the files outgrow the reading once it is made, with the session's own figure unchanged.
+    #[test]
+    fn kr_perf_003_a_reading_taken_with_a_write_still_to_be_made_does_not_stand() {
+        let root = spool_directory("host-reading-owed");
+        let retention = OutputRetention::new(
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            100,
+            1 << 20,
+        );
+        let layout = || SpoolLayout::new(8, 1 << 20);
+        let mut other =
+            OutputHistory::with_spool(8, root.join("other.log"), layout()).expect("a spool");
+        other.append(&[b'o'; 86]);
+        let mut owing =
+            OutputHistory::with_spool(8, root.join("owing.log"), layout()).expect("a spool");
+        owing.append(&[b'a'; 12]);
+        let (_, owed) = owing.append_deferred(b"efgh");
+        let write = owed.expect("the bytes continue the newest segment, so their write is owed");
+        let now = kr_ipc::now_ms();
+        assert!(
+            owing
+                .apply_retention_to_host(&root, retention, now, true)
+                .is_empty(),
+            "the files hold 98 bytes, under a cap of 100"
+        );
+        assert!(write.perform(b"efgh"), "the write is made");
+        assert!(
+            !owing
+                .apply_retention_to_host(&root, retention, now, true)
+                .is_empty(),
+            "the files hold 102 bytes, which the next pass finds although the session's own figure \
+             has not moved"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// KR-PERF-003: nor does a reading taken after a write to the spool failed and before the
+    /// failure is settled. The spool then stops, and takes the output its window holds when the
+    /// pass resumes it, which grows the files with the session's own figure unchanged.
+    #[test]
+    fn kr_perf_003_a_reading_taken_before_a_failed_write_is_settled_does_not_stand() {
+        let root = spool_directory("host-reading-failed");
+        let retention = OutputRetention::new(
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            100,
+            1 << 20,
+        );
+        let layout = || SpoolLayout::new(8, 1 << 20);
+        let mut other =
+            OutputHistory::with_spool(8, root.join("other.log"), layout()).expect("a spool");
+        other.append(&[b'o'; 86]);
+        let mut failing =
+            OutputHistory::with_spool(8, root.join("failing.log"), layout()).expect("a spool");
+        failing.append(&[b'a'; 12]);
+        let (_, owed) = failing.append_deferred(b"efgh");
+        // The write is dropped without being made, which is how one that cannot be made ends.
+        drop(owed.expect("the bytes continue the newest segment, so their write is owed"));
+        let now = kr_ipc::now_ms();
+        assert!(
+            failing
+                .apply_retention_to_host(&root, retention, now, true)
+                .is_empty(),
+            "the files hold 98 bytes, under a cap of 100, and the pass settles the failure and \
+             writes the bytes its window held"
+        );
+        assert!(
+            !failing
+                .apply_retention_to_host(&root, retention, now, true)
+                .is_empty(),
+            "the files hold 102 bytes, which the next pass finds although the session's own \
+             figure has not moved"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// KR-REQ-20.20, the part about the host cap's measure on Windows: a segment held open and

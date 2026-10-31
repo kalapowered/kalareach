@@ -17,10 +17,12 @@
 //! worker it never saw end, no descriptor naming a live process. A session whose crash is being
 //! recovered is left to that recovery, and one whose lock another holds is left to the next pass.
 //!
-//! Live sessions apply the same bounds themselves, on their own tick, from the same measure of the
-//! host's spools ([`kr_worker::history::retained_bytes_under`]). The two parties act on their own
-//! sessions and each reads the whole environment's bytes, so the host can be briefly under the cap
-//! by what both gave up in the same minute, and never over it for longer than a pass.
+//! Live sessions apply the same bounds themselves, on their own tick, from a measure of the host's
+//! spools ([`kr_worker::history::retained_bytes_under`]) that a session whose own output has not
+//! moved keeps for minutes, since the session that grew past the cap measures it at once. The two
+//! parties act on their own sessions and each reads the whole environment's bytes, so the host can
+//! be briefly under the cap by what both gave up in the same minute, and is over it for no longer
+//! than the next pass of the session that grew.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
