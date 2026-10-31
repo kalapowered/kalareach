@@ -24,6 +24,9 @@ use crate::modes;
 /// The Tab key, whose shifted form is a sequence rather than the character the console reports.
 const VK_TAB: u16 = 0x09;
 
+/// The Alt key.
+const VK_MENU: u16 = 0x12;
+
 /// What a session's keyboard asks of the legacy spelling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Keyboard {
@@ -114,10 +117,19 @@ impl Text {
     }
 }
 
+/// Returns whether a record is an Alt coming up with the character composed on the numeric keypad.
+///
+/// The console reports that character on the release of the Alt and on no other record, so it is
+/// the one key coming up that carries text.
+const fn composed_with_alt(record: &KeyRecord) -> bool {
+    !record.key_down && record.virtual_key == VK_MENU && record.unicode != 0
+}
+
 /// Spells a run of key records as legacy VT input, in the order they were read.
 ///
 /// A key coming up produces nothing: legacy input has no way to say so, and the encoder refuses to
-/// invent one. A key the encoder cannot spell produces nothing rather than something else. A repeat
+/// invent one. The one exception is an Alt coming up with the character composed on the numeric
+/// keypad, which is that character. A key the encoder cannot spell produces nothing rather than something else. A repeat
 /// count is applied to whatever the key produced, character or sequence. A character outside the
 /// basic plane is two records, the high surrogate then the low one, and the pair is repeated as one
 /// character.
@@ -143,7 +155,8 @@ pub fn legacy_within(
     let mut output = Output::new(limit);
     let mut text = Text { units: Vec::new() };
     for key in records {
-        if !key.key_down {
+        let composed = composed_with_alt(key);
+        if !key.key_down && !composed {
             continue;
         }
         // Half of a character outside the basic plane. Both halves are gathered and the pair is
@@ -172,6 +185,15 @@ pub fn legacy_within(
                     output.push_slice(spelled)?;
                 }
             } else {
+                text.push(key.unicode, &output)?;
+            }
+            continue;
+        }
+        // A character composed with Alt on the numeric keypad. The console reports it on the Alt
+        // coming up, and what the Alt carries is the Alt itself rather than a modifier of the
+        // character, so it is text whatever state the record is in.
+        if composed {
+            for _ in 0..key.repeat.max(1) {
                 text.push(key.unicode, &output)?;
             }
             continue;

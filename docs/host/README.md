@@ -2081,9 +2081,11 @@ sends what a terminal doing the translation would have sent: the text, the contr
 made for a key held with Control, and the key's own sequence otherwise, with the arrows in the form
 the application's DEC mode 1 asks for, for Home and End as well. That spelling comes from the one
 encoder every client uses.
-It sends nothing for a key coming up, since legacy input cannot say so, and nothing for a key it has
-no spelling for, such as a function key past F12, because another key would be wrong. A batch of
-key-ups alone is accepted and forwards no bytes.
+It sends nothing for a key coming up, since legacy input cannot say so, except an Alt coming up with
+the character composed on the numeric keypad, which the console reports on that record alone and
+which is sent as that character. It sends nothing for a key it has no spelling for, such as a
+function key past F12, because another key would be wrong. A batch of key-ups alone, none of them
+such an Alt, is accepted and forwards no bytes.
 
 The choice is made from the state the last batch of the application's output left, which the
 session publishes before it delivers that batch, so a write that follows output a person has seen is
