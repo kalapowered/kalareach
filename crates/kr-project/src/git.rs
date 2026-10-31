@@ -861,7 +861,7 @@ impl Drop for Making<'_> {
             .current
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.look.end(Err(Unfound::Unusable(Diagnostic::new(
+        self.look.end(Err(Unfound::Passing(Diagnostic::new(
             "the look for Git ended without an answer",
         ))));
     }
@@ -912,12 +912,9 @@ impl Installation {
         if let Some(under_way) = current.as_ref().map(Arc::clone) {
             drop(current);
             return match under_way.wait() {
-                Ok(()) => self
-                    .found
-                    .get()
-                    .ok_or_else(|| ProjectError::GitUnavailable {
-                        detail: Diagnostic::new("the look for Git ended without an answer"),
-                    }),
+                Ok(()) => self.found.get().ok_or_else(|| ProjectError::GitFailed {
+                    detail: Diagnostic::new("the look for Git ended without an answer"),
+                }),
                 Err(unfound) => Err(unfound.into_error()),
             };
         }
