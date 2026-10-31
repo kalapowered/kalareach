@@ -52,7 +52,7 @@ fn refused_for_the_station(said: &str) -> bool {
 }
 
 /// What a refused start says when it was refused for a window station that is not one the starter
-/// accepts and that the lists alone do not show to admit more.
+/// accepts and whose entries do not show that it admits more.
 fn not_accepted_for_the_station(said: &str) -> bool {
     said.contains("check the window station's security")
         && said.contains("is not one the starter accepts")
@@ -109,8 +109,8 @@ async fn a_logon_station_that_admits_more_than_the_starters_own_refuses_the_star
 
 /// KR-REQ-03.24: a window station that exists already and whose list is the starter's own with the
 /// mask of one entry narrowed is refused, and the refusal says that the station is not one the
-/// starter accepts and not that it admits more: a narrower mask admits less, which the lists alone
-/// do not show. Control: once it is gone the next start is not refused.
+/// starter accepts and not that it admits more: a narrower mask admits less, and the comparison
+/// does not evaluate rights. Control: once it is gone the next start is not refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_logon_station_with_a_narrower_entry_is_refused_without_being_called_wider() {
     let _alone = ONE_AT_A_TIME.lock().await;

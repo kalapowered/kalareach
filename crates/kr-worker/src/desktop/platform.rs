@@ -1335,11 +1335,11 @@ mod tests {
         );
         assert_eq!(listing_of(&listed, session), Listing::Holds);
 
-        // Numbers that no session of a host has. The first three the system answers with the error
-        // that says there is no such session, and the others with another error, which only the
-        // list of sessions settles. The case reads the list and fails, and says so, if the host
-        // lists one of them, rather than passing without having shown anything. None is
-        // 4294967295, which the system reads as the caller's own session.
+        // Numbers this case expects no session of the host to have. The first three the system
+        // answers with the error that says there is no such session, and the others with another
+        // error, which only the list of sessions settles. The case reads the list and fails, and
+        // says so, if the host lists one of them, rather than passing without having shown
+        // anything. None is 4294967295, which the system reads as the caller's own session.
         let nobody = [
             1_048_576_u32,
             123_456_789,

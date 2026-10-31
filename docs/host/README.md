@@ -1289,26 +1289,28 @@ back the security of each station and desktop. Where the interactive object has 
 the starter applies it to the station or desktop it uses, and reads the label back whether or not
 the change was allowed. It refuses to start a worker on an object that admits more than its own: an
 allowing entry for a trustee that the starter's own allows nothing (other than the owner's rights),
-a denying entry it lacks, a null or absent list where there are entries, or a lower integrity level
-or a weaker policy. These are readings of the entries, not an evaluation of which entry decides for
-a given process. The text of an access list is read only when it holds as many entries as the list
-itself does. It refuses an object that differs in any other way as one it does not accept, and the
-refusal does not say that it admits more, because the comparison weighs neither rights nor order: an
-entry with other rights or another condition, entries in another order, an entry more or less often,
-an entry for the owner's rights left out. It starts the worker on one whose list is the starter's
-own with allowing entries left out (other than one for the owner's rights) and denying entries put
-in, in the starter's order, and whose label is no lower and refuses no less. The flags that say
-which children inherit an entry, and entries that only children inherit, are not compared, except in
-an allowing entry for the owner's rights, which is compared whole. That matters when the interactive
-station gains an entry while a logon lasts, as a person's "Run as different user" may make it. The
-station the headless workers already hold has not that entry. If it is an allowing entry that is not
-for the owner's rights, the next headless worker is started on that station all the same. If it is a
-denying entry or one for the owner's rights, or if an entry of the interactive station changes its
-rights, the station the workers hold is no longer one the starter accepts, and every headless start
-of that logon is refused until all its headless workers have ended. The same holds the other way
-round: a station made while the interactive one had an allowing entry that it has since lost admits
-more than the interactive one does. A worker an earlier release started stays where it was started
-until it ends.
+a denying entry whose trustee has none left, a null or absent list where there are entries, or a
+lower integrity level or a weaker policy. These are readings of the entries, not an evaluation of
+which entry decides for a given process. The text of an access list is read only when it holds as
+many entries as the list itself does, and a text that holds a string in a condition only when it is
+the starter's own; any other is not read, and the start stops with an error that says so. It refuses
+an object that differs in any other way as one it does not accept, and the refusal does not say that
+it admits more, because the comparison does not evaluate what a difference in rights or in order
+does to access: an entry with other rights or another condition, entries in another order, an entry
+more or less often, an allowing entry for the owner's rights left out. It starts the worker on one
+whose list is the starter's own with allowing entries left out (other than one for the owner's
+rights) and denying entries put in, in the starter's order, and whose label is no lower and refuses
+no less. The flags that say which children inherit an entry, and entries that only children inherit,
+are not compared, except in an allowing entry for the owner's rights, which is compared whole. That
+matters when the interactive station gains an entry while a logon lasts, as a person's "Run as
+different user" may make it. The station the headless workers already hold has not that entry. If it
+is an allowing entry that is not for the owner's rights, the next headless worker is started on that
+station all the same. If it is a denying entry or one for the owner's rights, or if an entry of the
+interactive station changes its rights, the station the workers hold is no longer one the starter
+accepts, and every headless start of that logon is refused until all its headless workers have
+ended. The same holds the other way round: a station made while the interactive one had an allowing
+entry that it has since lost admits more than the interactive one does. A worker an earlier release
+started stays where it was started until it ends.
 
 Two limits belong to that placement. All the processes of one headless session share the desktop
 heap the system gives a desktop on a window station that shows nothing (the third value of
