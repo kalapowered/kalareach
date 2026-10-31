@@ -331,7 +331,7 @@ const HOST_PATHS: [HostPath; 5] = [
 /// these is the upstream's. A shape does not show where its words came from: a `{}` stands for any
 /// one word, which the upstream could have written, and so could the digits of a size. So no word
 /// or number of a message reaches a device. The device is given the sentence beside the shape, a
-/// closed set of this host's own text, or the shape itself where it has no `{}` and so is one
+/// closed set of this host's own text, or the shape itself where it has no slot and so is one
 /// fixed sentence already.
 const OWN_ARGUMENT_REASONS: [(&str, Option<&str>); 13] = [
     ("a prompt names either a draft or inline text", None),
@@ -348,8 +348,10 @@ const OWN_ARGUMENT_REASONS: [(&str, Option<&str>); 13] = [
         "the parameter {} of {} does not accept this value",
         Some("the action does not accept the value given for a parameter"),
     ),
+    // A media type carries parameters, which hold spaces (`text/plain; charset=utf-8`), so the
+    // type is the rest of the message up to the end of the sentence.
     (
-        "the package does not accept {} as an attachment",
+        "the package does not accept {..} as an attachment",
         Some("the package does not accept this kind of attachment"),
     ),
     (
@@ -686,8 +688,9 @@ fn disabled_component(message: &str) -> Option<&'static str> {
 
 /// Whether `message` is `shape` with one word of the argument, up to the next space, apostrophe or
 /// comma, in place of each `{}`, and the rest of the message, if it is not empty, in place of a
-/// closing `{..}`. An apostrophe or a comma ends a word so that a shape can say `{}'s` or `{},`; no
-/// name of an action or a parameter holds either.
+/// closing `{..}`, which the end of the shape may follow (`accept {..} as an attachment`). An
+/// apostrophe or a comma ends a word so that a shape can say `{}'s` or `{},`; no name of an action
+/// or a parameter holds either.
 fn fits_shape(shape: &str, message: &str) -> bool {
     let (mut shape, mut rest) = (shape, message);
     while let Some(open) = shape.find("{}") {
@@ -703,9 +706,10 @@ fn fits_shape(shape: &str, message: &str) -> bool {
         rest = &after[word..];
         shape = &shape[open + "{}".len()..];
     }
-    match shape.strip_suffix("{..}") {
-        Some(literal) => rest
+    match shape.split_once("{..}") {
+        Some((literal, end)) => rest
             .strip_prefix(literal)
+            .and_then(|more| more.strip_suffix(end))
             .is_some_and(|more| !more.is_empty()),
         None => rest == shape,
     }
@@ -3695,5 +3699,31 @@ mod tests {
             let told = read_by_a_device(&left_out(reason, &said));
             assert_eq!(told, left_out(reason, &kept), "{said}");
         }
+    }
+
+    #[test]
+    fn a_media_type_with_parameters_is_refused_as_a_kind_of_attachment() {
+        for said in [
+            "the package does not accept text/plain; charset=utf-8 as an attachment",
+            "the package does not accept text/plain; name=marguerite as an attachment",
+            "the package does not accept text/plain;charset=\"utf 8\" as an attachment",
+        ] {
+            let told = told_on(Method::PluginActionInvoke, ErrorCode::InvalidArgument, said);
+            assert_eq!(told.code, ErrorCode::InvalidArgument);
+            assert!(
+                told.message
+                    .contains("does not accept this kind of attachment")
+                    && !told.message.contains("charset")
+                    && !told.message.contains("marguerite"),
+                "{said}: {told:?}"
+            );
+        }
+        // A message that names no type is not the reason.
+        let told = told_on(
+            Method::PluginActionInvoke,
+            ErrorCode::InvalidArgument,
+            "the package does not accept  as an attachment",
+        );
+        assert!(!told.message.contains("kind of attachment"), "{told:?}");
     }
 }
