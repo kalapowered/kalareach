@@ -126,6 +126,50 @@ pub struct Supervisor {
     pub service: Box<dyn WorkerSupervisor>,
     /// What a test adds to the arguments the daemon chose for the plugin host it starts.
     pub host_arguments: Vec<String>,
+    /// Whether it still starts services, and how many starts are under way.
+    pub gate: StartGate,
+}
+
+/// Whether a supervisor still starts services, and how many starts are under way.
+#[derive(Debug, Default)]
+pub struct StartGate {
+    state: Mutex<StartState>,
+    /// Signalled whenever a start has been recorded.
+    recorded: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct StartState {
+    closed: bool,
+    under_way: usize,
+}
+
+impl Supervisor {
+    /// Starts nothing from here on, and waits, within `bound`, for the starts already under way to
+    /// have been recorded in [`Supervisor::services`].
+    ///
+    /// The daemon is still running when a test ends, and a request it was answering can have
+    /// begun a start that the record does not hold yet; read then, the record misses a host that
+    /// goes on running after the test.
+    pub fn close(&self, bound: Duration) {
+        let deadline = std::time::Instant::now() + bound;
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closed = true;
+        while state.under_way > 0 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            state = match self.gate.recorded.wait_timeout(state, left) {
+                Ok((state, _)) => state,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    }
 }
 
 /// The supervisor a daemon is given, which a daemon started again on the same tree is given again.
@@ -162,6 +206,19 @@ impl WorkerSupervisor for Supervisor {
     }
 
     fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
+        {
+            let mut state = self
+                .gate
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.closed {
+                return LaunchOutcome::NotStarted {
+                    detail: "this world is being taken down, so it starts nothing".to_owned(),
+                };
+            }
+            state.under_way += 1;
+        }
         let mut launch = launch.clone();
         if launch
             .program
@@ -179,6 +236,13 @@ impl WorkerSupervisor for Supervisor {
             .lock()
             .expect("the record is not poisoned")
             .push((launch.label.clone(), process));
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.under_way -= 1;
+        self.gate.recorded.notify_all();
         outcome
     }
 
@@ -264,10 +328,16 @@ pub async fn until_the_work_stops<T>(mut look: impl FnMut() -> (Option<T>, usize
 pub struct HostEnding {
     pub services: Services,
     pub environment: EnvironmentPaths,
+    /// The supervisor that started them, which starts nothing more once the hosts are being
+    /// ended, where there is one.
+    pub supervisor: Option<Arc<Supervisor>>,
 }
 
 impl Drop for HostEnding {
     fn drop(&mut self) {
+        if let Some(supervisor) = &self.supervisor {
+            supervisor.close(Duration::from_secs(30));
+        }
         let mut hosts: Vec<ProcessStartIdentity> = Vec::new();
         let mut labels: Vec<String> = Vec::new();
         if let Ok(services) = self.services.lock() {
@@ -826,6 +896,7 @@ pub async fn hosted_running(
         services: Arc::clone(&services),
         service,
         host_arguments,
+        gate: StartGate::default(),
     });
     let (controller, serving) =
         start_daemon(&environment, environment_id, &worker, &supervisor).await;
@@ -1001,7 +1072,6 @@ pub async fn hosted_running(
         serving,
         services: Arc::clone(&services),
         counted_from: 0,
-        supervisor,
         session_id,
         environment_id,
         worker,
@@ -1013,7 +1083,9 @@ pub async fn hosted_running(
         _hosts: HostEnding {
             services,
             environment,
+            supervisor: Some(Arc::clone(&supervisor)),
         },
+        supervisor,
         tree,
     }
 }
