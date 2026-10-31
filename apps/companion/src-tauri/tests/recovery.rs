@@ -1999,6 +1999,11 @@ async fn a_record_is_read_and_covered_at_its_own_service_when_the_setting_names_
         computer.served.web().bundle(&kit.bundle_locator),
         "the offline copy is the bundle as the service the record names holds it"
     );
+    assert_eq!(
+        export.service_origin,
+        computer.served.origin(),
+        "and it names that service, as a restore reads it"
+    );
 
     let host = Host::new(&computer, computer.served.origin());
     host.sets_up();
