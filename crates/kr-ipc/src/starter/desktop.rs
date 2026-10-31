@@ -16,11 +16,12 @@
 //! the starter does, is admitted to them exactly as it would be to the starter's desktop. A
 //! station that exists already keeps what it has, because creating it again ignores the security
 //! asked for, so the starter reads the access list and label of each object it is about to use
-//! and refuses to start a child on one that admits more than its own does. An object whose list is
-//! the starter's own with allowing entries left out and denying entries put in is used: a station
-//! made before an entry was added to the interactive one (a "Run as different user" may add one)
-//! has not that entry, and the worker, which runs as the starter does, is admitted to it all the
-//! same. [`super::security`] says exactly what is used and what is refused.
+//! and refuses to start a child on one that admits more than its own does, or that it cannot show
+//! to admit no more. An object whose list is the starter's own with allowing entries left out and
+//! denying entries put in is used: a station made before an entry was added to the interactive one
+//! (a "Run as different user" may add one) has not that entry, and the worker, which runs as the
+//! starter does, is admitted to it all the same. [`super::security`] says exactly what is used and
+//! what is refused.
 //!
 //! A desktop on a window station that shows nothing has the heap the system gives such a desktop,
 //! which is much smaller than the interactive one's, and all the processes of one headless session
@@ -40,7 +41,7 @@
 use std::io;
 use std::os::windows::ffi::OsStrExt as _;
 
-use super::security::{access_list, access_list_admits_more, label, label_admits_more};
+use super::security::{Texts, require_no_more};
 
 use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
@@ -389,50 +390,45 @@ impl Source {
         }
     }
 
-    /// Requires `target` to admit no more than this object does, by its access list and by its
-    /// integrity label.
+    /// Requires `target` to be one the starter uses, given that this object is the starter's own:
+    /// by its access list and by its integrity label.
     ///
     /// An object whose security is the starter's own with entries left out that only narrow it, or
-    /// put in that only narrow it, is used. One that admits more, or whose security cannot be shown
-    /// to admit no more, is refused, and a child is not started on it.
+    /// put in that only narrow it, is used. One that admits more, or whose security differs in a
+    /// way that cannot be shown to admit no more, is refused, and a child is not started on it.
     ///
     /// # Errors
     ///
-    /// Returns a permission error naming what the target admits more of, or the operating system's
-    /// error when the target's security cannot be read.
+    /// Returns a permission error saying whether the target admits more or is only not one the
+    /// starter accepts, or the operating system's error when the target's security cannot be read.
     fn require_no_more_on(&self, target: HANDLE) -> io::Result<()> {
         let there = security_of(target)?;
-        let unread = |what: &str, why: String| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("its {what} could not be read: {why}"),
-            )
-        };
-        let refused = |what: &str, why: String| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("its {what} admits more than the starter's own does: {why}"),
-            )
-        };
-        let (own, found) = (
-            access_list(&self.text(DACL_SECURITY_INFORMATION)?)
-                .map_err(|why| unread("access list", why))?,
-            access_list(&there.text(DACL_SECURITY_INFORMATION)?)
-                .map_err(|why| unread("access list", why))?,
+        let (own_access, own_label) = (
+            self.text(DACL_SECURITY_INFORMATION)?,
+            self.text(LABEL_SECURITY_INFORMATION)?,
         );
-        if let Some(why) = access_list_admits_more(&own, &found) {
-            return Err(refused("access list", why));
-        }
-        let (own, found) = (
-            label(&self.text(LABEL_SECURITY_INFORMATION)?)
-                .map_err(|why| unread("integrity label", why))?,
-            label(&there.text(LABEL_SECURITY_INFORMATION)?)
-                .map_err(|why| unread("integrity label", why))?,
+        let (found_access, found_label) = (
+            there.text(DACL_SECURITY_INFORMATION)?,
+            there.text(LABEL_SECURITY_INFORMATION)?,
         );
-        match label_admits_more(own, found) {
-            Some(why) => Err(refused("integrity label", why)),
-            None => Ok(()),
-        }
+        require_no_more(
+            &Texts {
+                access: &own_access,
+                label: &own_label,
+            },
+            &Texts {
+                access: &found_access,
+                label: &found_label,
+            },
+        )
+        .map_err(|stop| {
+            let kind = if stop.is_unreadable() {
+                io::ErrorKind::InvalidData
+            } else {
+                io::ErrorKind::PermissionDenied
+            };
+            io::Error::new(kind, stop.to_string())
+        })
     }
 
     /// The text of one of this object's lists, as security descriptors are written in.
