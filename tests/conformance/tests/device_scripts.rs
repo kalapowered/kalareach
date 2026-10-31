@@ -247,7 +247,7 @@ fn to_its_end(mut command: Command, bound: Duration) -> std::process::Output {
     let rest = bound
         .saturating_sub(begun.elapsed())
         .max(Duration::from_secs(1));
-    let mut collect = |stream: &std::sync::mpsc::Receiver<Vec<u8>>| {
+    let collect = |stream: &std::sync::mpsc::Receiver<Vec<u8>>| {
         stream.recv_timeout(rest).unwrap_or_else(|_| {
             panic!("{what} ended and something it started still holds its output after {rest:?}")
         })
