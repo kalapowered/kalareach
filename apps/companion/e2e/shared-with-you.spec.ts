@@ -190,15 +190,18 @@ async function withPill(page: Page, how: { invitations?: number; depth?: number 
 /**
  * Waits until the engine has called for a few animation frames of the page, which are its own and
  * not the page's clock (these cases replace that). A press is judged steady by comparing two of
- * them, and an engine that has just opened a page on a busy machine can call for none for seconds.
+ * them, and an engine on a busy machine can call for none for seconds, in which a press that is
+ * given two seconds is not told whether its target is covered but how slow the machine is.
  */
 async function framesDrawn(page: Page): Promise<void> {
   await page.waitForFunction((seen) => ++seen.polls >= 3, { polls: 0 }, { polling: 'raf' })
 }
 
-/** Every control a person can touch under `selector`, scrolled to and pressed in a trial. */
+/**
+ * Every control a person can touch under `selector`, scrolled to and pressed in a trial, each once
+ * the engine is drawing.
+ */
 async function unreachable(page: Page, scope: string): Promise<string[]> {
-  await framesDrawn(page)
   const controls = page.locator(scope).locator('button:visible:not([disabled])')
   const count = await controls.count()
   expect(count, `controls found under ${scope}`).toBeGreaterThan(0)
@@ -209,6 +212,7 @@ async function unreachable(page: Page, scope: string): Promise<string[]> {
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 40)
+    await framesDrawn(page)
     try {
       await control.click({ trial: true, timeout: 2_000 })
     } catch (failure) {
