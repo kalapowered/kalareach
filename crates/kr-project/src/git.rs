@@ -3937,12 +3937,6 @@ impl Heard {
             let Some(pipe) = self.pipe.as_mut() else {
                 return;
             };
-            #[cfg(test)]
-            if tests::READ_FAILS.with(std::cell::Cell::get) {
-                self.pipe = None;
-                self.unreadable = Some(std::io::Error::from(rustix::io::Errno::IO));
-                return;
-            }
             match gather(pipe, &mut self.seen, deadline) {
                 Gathered::Open => {}
                 Gathered::Closed => self.pipe = None,
@@ -4020,7 +4014,16 @@ enum Gathered {
 fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) -> Gathered {
     let mut buffer = [0_u8; 4096];
     while !seen.truncated {
-        match pipe.read(&mut buffer) {
+        let read = pipe.read(&mut buffer);
+        // A case that asks for it has the read fail, as one does for a pipe the system can no
+        // longer read, and the arm that handles the failure is the real one.
+        #[cfg(test)]
+        let read = if tests::READ_FAILS.with(std::cell::Cell::get) {
+            Err(std::io::Error::from(rustix::io::Errno::IO))
+        } else {
+            read
+        };
+        match read {
             Ok(0) => return Gathered::Closed,
             Ok(read) => {
                 let room = PROBE_OUTPUT_LIMIT.saturating_sub(seen.bytes.len());
@@ -5693,20 +5696,24 @@ mod tests {
         );
     }
 
-    /// A program that could not start because the host is out of descriptors is the host's fault
-    /// and passes, and the look is refused; one that is not there is not Git this host can run work
-    /// through, and the caller goes on without it.
+    /// A program that could not start because the host is out of descriptors, processes or memory is
+    /// the host's fault and passes, and the look is refused; one that is not there is not Git this
+    /// host can run work through, and the caller goes on without it.
     #[cfg(unix)]
     #[test]
-    fn a_program_that_could_not_start_for_want_of_descriptors_is_a_fault_that_passes() {
-        let short = std::io::Error::from_raw_os_error(libc::EMFILE);
-        let Asked::Overran(refusal) = could_not_run("git --version", &short) else {
-            panic!("a host out of descriptors refuses the look");
-        };
-        assert!(
-            matches!(refusal, ProjectError::GitFailed { .. }),
-            "{refusal:?}"
-        );
+    fn a_program_that_could_not_start_for_want_of_what_it_needs_is_a_fault_that_passes() {
+        for number in [libc::EMFILE, libc::ENFILE, libc::EAGAIN, libc::ENOMEM] {
+            let short = std::io::Error::from_raw_os_error(number);
+            let Asked::Overran(refusal) = could_not_run("git --version", &short) else {
+                panic!(
+                    "a host short of what it needs to start a program refuses the look: {short}"
+                );
+            };
+            assert!(
+                matches!(refusal, ProjectError::GitFailed { .. }),
+                "{short}: {refusal:?}"
+            );
+        }
 
         let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
         let Asked::Declined(refusal) = could_not_run("git --version", &missing) else {
