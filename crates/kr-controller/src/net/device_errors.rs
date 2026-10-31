@@ -57,11 +57,12 @@ const ACCOUNT_WORDS: [&str; 7] = ["user", "owner", "uid", "gid", "group", "accou
 /// The programs whose use on this host a message can tell a person to repeat.
 const COMMAND_WORDS: [&str; 6] = ["chmod", "chown", "sudo", "doas", "systemctl", "launchctl"];
 
-/// Refusals whose reason a device is told without the place or the account: what the host says
-/// begins to name them where every one of the markers stands, and the device is given the sentence
-/// beside them. The first two are refusals of the project service, in terms of the location the
-/// device's grant names, which is all of the place the device has. The third is the refusal to
-/// start a worker over a scheduled task another account holds, whose text names that account.
+/// Refusals whose reason a device is told without the place or the account: a text that holds every
+/// one of the markers is told as the sentence beside them. The first two are refusals of the
+/// project service, in terms of the location the device's grant names, which is all of the place
+/// the device has. The third is the refusal to start a worker over a scheduled task under the
+/// environment's name that is not this installation's own, whose text can name the account it is
+/// registered for, or quote what the Task Scheduler said.
 const KNOWN_REASONS: [(&[&str], &str); 3] = [
     (
         &["a filesystem is mounted at "],
@@ -192,11 +193,13 @@ fn message_for_a_device(code: ErrorCode, message: &str) -> Option<String> {
 fn told_in_place(text: &str, fixed: impl Fn() -> String) -> Option<String> {
     let without_commands = without_quoted_commands(text);
     let text = without_commands.as_deref().unwrap_or(text);
-    let told = match first_naming(text) {
-        None => without_commands?,
-        Some(at) => match known_reason(text) {
-            Some(reason) => reason.to_owned(),
-            None => match clause_before(text, at) {
+    // A refusal that is known by its wording is told by its reason whether or not the rule finds a
+    // name in it: it can name an account that has no form the rule can find.
+    let told = match known_reason(text) {
+        Some(reason) => reason.to_owned(),
+        None => match first_naming(text) {
+            None => without_commands?,
+            Some(at) => match clause_before(text, at) {
                 Some(clause) => format!("{clause}; {WHY_NOT_SHOWN}"),
                 None => fixed(),
             },
@@ -1594,34 +1597,52 @@ mod tests {
     }
 
     #[test]
-    fn a_task_the_scheduler_holds_for_another_account_is_told_to_a_device_without_the_account() {
+    fn a_task_the_scheduler_holds_that_is_not_the_environments_own_is_told_to_a_device_without_the_account()
+     {
         use crate::supervision::windows::{Foreign, ForeignReason, task_name};
         let environment_id = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
-        for user in [
+        let described = "KalaReach environment".to_owned();
+        let reasons = [
             "marguerite",
             "marguerite@example.com",
             "DESKTOP-4F2\\marguerite",
-        ] {
+        ]
+        .map(|user| ForeignReason::Account {
+            user: user.to_owned(),
+            description: described.clone(),
+        })
+        .into_iter()
+        .chain([
+            ForeignReason::Unreadable {
+                said: "Access is denied for marguerite".to_owned(),
+            },
+            ForeignReason::Environment {
+                description: described.clone(),
+            },
+        ]);
+        for reason in reasons {
             let foreign = Foreign {
                 name: task_name(environment_id),
                 environment_id,
-                reason: ForeignReason::Account {
-                    user: user.to_owned(),
-                    description: "KalaReach environment".to_owned(),
-                },
+                reason,
             };
             // The create route's text: the supervisor's refusal, then the command that mends it.
-            let said = format!(
-                "could not start a worker: {foreign}: run kr host startup --set standalone for \
-                 this environment"
-            );
-            let shown =
-                error_for_a_device(&error(ErrorCode::ResourceUnavailable, &said)).into_owned();
-            assert_eq!(shown.code, ErrorCode::ResourceUnavailable);
-            assert!(
-                !shown.message.contains("marguerite") && !shown.message.contains("kr host"),
-                "{user}: {shown:?}"
-            );
+            // The refusal is told the same without the command, which is not what holds it.
+            for said in [
+                format!(
+                    "could not start a worker: {foreign}: run kr host startup --set standalone \
+                     for this environment"
+                ),
+                format!("could not start a worker: {foreign}"),
+            ] {
+                let shown =
+                    error_for_a_device(&error(ErrorCode::ResourceUnavailable, &said)).into_owned();
+                assert_eq!(shown.code, ErrorCode::ResourceUnavailable);
+                assert!(
+                    !shown.message.contains("marguerite") && !shown.message.contains("kr host"),
+                    "{said}: {shown:?}"
+                );
+            }
         }
     }
 
