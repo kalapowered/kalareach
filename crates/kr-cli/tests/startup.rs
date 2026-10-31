@@ -759,8 +759,10 @@ fn start(mut command: Command) -> Running {
             .spawn()
     })
     .expect("kr starts");
-    let stdout = read_aside(child.stdout.take().expect("its standard output"));
-    let stderr = read_aside(child.stderr.take().expect("its standard error"));
+    let stdout = read_aside(child.stdout.take().expect("its standard output"))
+        .expect("a thread to read its standard output");
+    let stderr = read_aside(child.stderr.take().expect("its standard error"))
+        .expect("a thread to read its standard error");
     Running {
         child: Some(child),
         stdout,
