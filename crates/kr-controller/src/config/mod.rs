@@ -614,12 +614,19 @@ fn write(paths: &EnvironmentPaths, edited: &Edited) -> Result<()> {
     // second writer may have applied its own edit, and writing over it would lose a choice
     // somebody made rather than change one.
     configuration::still_current(edited, &kr_worker::config::load(paths)).map_err(refused)?;
-    let path = kr_worker::config::document_path(paths);
+    write_document(
+        &kr_worker::config::document_path(paths),
+        edited.contents.as_bytes(),
+    )
+}
+
+/// Writes the configuration document at `path`. The directories it needs are made owner-only
+/// whatever the mask of the process, and so is the document: it decides how this host behaves.
+fn write_document(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         let _ = kr_ipc::paths::create_dir_all_owner_only(parent);
     }
-    kr_ipc::paths::write_owner_only_file(&path, edited.contents.as_bytes())
-        .map_err(ControllerError::Ipc)
+    kr_ipc::paths::write_owner_only_file(path, contents).map_err(ControllerError::Ipc)
 }
 
 /// Turns a refusal into this crate's error.
