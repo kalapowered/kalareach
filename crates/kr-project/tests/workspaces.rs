@@ -1190,7 +1190,7 @@ fn a_request_against_an_opened_independent_clone_does_not_search_above_its_tree(
 /// A workspace whose tree was removed with nothing in its place is one whose record names an object
 /// that is gone from its path, which is the answer for a tree that was replaced, and not an
 /// argument the caller got wrong.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_workspace_tree_removed_with_nothing_in_its_place_is_a_source_that_changed() {
     let fixture = Fixture::create();

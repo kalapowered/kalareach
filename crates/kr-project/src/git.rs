@@ -5785,7 +5785,7 @@ mod tests {
     /// for, and no other. The second look is in the slot, and stays under way, before the first one
     /// ends, so a request that went on to wait for whatever stands in the slot would be answered
     /// only when the case let the second go. Nothing here waits for a time: the case moves when a
-    /// condition holds, and the bound on its one wait is only a guard for a request that is held.
+    /// condition holds, and the bounds on its two waits are only guards for a request that is held.
     ///
     /// A platform that runs no Git refuses a request before it reaches the slot, so the case is for
     /// the platforms that look for it.
