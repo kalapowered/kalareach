@@ -32,9 +32,45 @@ const REPEAT: std::time::Duration = std::time::Duration::from_secs(2);
 /// statement in force.
 ///
 /// Whatever changes the bound wakes the publisher, and a worker holds the lease it was told to the
-/// end the lease names, so a lease that runs out by itself needs no statement to be refused.
-/// What is left for this is a backstop for a change that no wake was made for.
+/// end the lease names, so a lease that runs out by itself needs no statement to be refused. What
+/// is left for this is a backstop for a change that no wake was made for. A lease that runs out
+/// does change the statement, and what a worker withdraws when it is told so (an attachment, a
+/// subscription, an input lease) it withdraws on being told, so a host that holds a lease looks
+/// again for the end of it ([`settled_wait`]).
 const SETTLED_REPEAT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// The longest the publisher waits while the statement carries a lease. A wait is counted by a
+/// clock that stops while the machine sleeps and does not see the wall clock step, and a lease
+/// ends by clocks that do both, so a long wait could outlast the end of the lease by the time the
+/// machine slept.
+const LEASE_LOOK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long past the end of a lease the publisher looks again, so that the look finds the lease
+/// ended and the bound changed. It is also the shortest wait on a lease, which keeps a clock that
+/// reads a moment before the end of a lease it never reaches from being looked at in a loop.
+const LEASE_END_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long the publisher waits when every worker has the statement in force: [`SETTLED_REPEAT`]
+/// without a lease; with one, until the lease ends at the earlier of its two ends (another lease
+/// may be live when one ends) and no longer than [`LEASE_LOOK`].
+fn settled_wait(
+    bound: LocalOwnerBound,
+    now: kr_transport::clock::ContinuousInstant,
+    now_ms: u64,
+) -> std::time::Duration {
+    match bound {
+        LocalOwnerBound::Until { continuous, utc_ms } => {
+            let to_end =
+                continuous
+                    .saturating_duration_since(now)
+                    .min(std::time::Duration::from_millis(
+                        utc_ms.saturating_sub(now_ms),
+                    ));
+            (to_end + LEASE_END_MARGIN).min(LEASE_LOOK)
+        }
+        LocalOwnerBound::Open | LocalOwnerBound::Closed => SETTLED_REPEAT,
+    }
+}
 
 /// What this daemon has said, and what each worker has said back.
 #[derive(Debug, Default)]
@@ -383,6 +419,20 @@ impl Controller {
         })
     }
 
+    /// How long the publisher waits when every worker has the statement in force and nothing
+    /// wakes it ([`settled_wait`]).
+    fn settled_repeat(&self) -> std::time::Duration {
+        // The continuous clock first, then the wall clock: see `protocol_bound`.
+        let now = self.clock.now();
+        let now_ms = self.settled_utc_now();
+        let bound = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .local_owner_bound(self.local_owner_device(), now, now_ms);
+        settled_wait(bound, now, now_ms)
+    }
+
     /// The sessions whose workers cannot be told what the local owner may do, as the registry
     /// stands: every recorded worker that has not been told (one never reached counts as lacking
     /// it), and every claimed or fenced reservation that this run of the daemon did not make,
@@ -418,8 +468,8 @@ impl Controller {
     }
 
     /// Starts the publisher: it tells the workers what the local owner may do whenever the bound
-    /// changes, and again every few seconds until each has acknowledged, so a worker that was
-    /// away when a frame was sent is told when it can be.
+    /// changes or a lease ends, and again every few seconds until each has acknowledged, so a
+    /// worker that was away when a frame was sent is told when it can be.
     pub(crate) fn start_local_access_publisher(self: &std::sync::Arc<Self>) {
         let controller = std::sync::Arc::downgrade(self);
         tokio::spawn(async move {
@@ -428,10 +478,14 @@ impl Controller {
                     return;
                 };
                 strong.tell_workers().await;
+                // The wait is read before the workers are asked, so a lease that ends between the
+                // two leaves a worker owed the statement that follows it, and not a long wait that
+                // was chosen for a lease that has gone.
+                let settled = strong.settled_repeat();
                 let repeat = if strong.workers_owed_the_statement().await {
                     REPEAT
                 } else {
-                    SETTLED_REPEAT
+                    settled
                 };
                 let wake = std::sync::Arc::clone(&strong.local_access.wake);
                 // Not held across the wait: the daemon holds its environment until the last
@@ -483,5 +537,46 @@ mod tests {
         assert_eq!(renewed.sequence.get(), first.sequence.get() + 1);
         let closed = state.draw(LocalOwnerBound::Closed, || LocalBound::Closed);
         assert_eq!(closed.sequence.get(), renewed.sequence.get() + 1);
+    }
+
+    /// KR-PERF-003: once every worker has the statement the publisher waits for minutes; while the
+    /// statement carries a lease it looks again at the lease's end, at either of its two ends, and
+    /// no later than half a minute on: a worker withdraws what its local owner holds when it is
+    /// told the lease has ended, or that another lease is live.
+    #[test]
+    fn kr_perf_003_the_publisher_looks_again_when_the_lease_it_settled_on_ends() {
+        use std::time::Duration;
+        let clock = ManualClock::new();
+        let now = clock.now();
+        let at = |seconds: u64| {
+            now.checked_add(Duration::from_secs(seconds))
+                .expect("a time")
+        };
+        assert_eq!(settled_wait(LocalOwnerBound::Open, now, 0), SETTLED_REPEAT);
+        assert_eq!(
+            settled_wait(LocalOwnerBound::Closed, now, 0),
+            SETTLED_REPEAT
+        );
+        let lease = |continuous, utc_ms| LocalOwnerBound::Until { continuous, utc_ms };
+        assert_eq!(
+            settled_wait(lease(at(3_600), 3_600_000), now, 0),
+            LEASE_LOOK,
+            "a lease with an hour left is looked at again in half a minute"
+        );
+        assert_eq!(
+            settled_wait(lease(at(10), 3_600_000), now, 0),
+            Duration::from_secs(10) + LEASE_END_MARGIN,
+            "the end on the continuous clock, when it comes first"
+        );
+        assert_eq!(
+            settled_wait(lease(at(3_600), 7_000), now, 0),
+            Duration::from_secs(7) + LEASE_END_MARGIN,
+            "and the end in UTC, when it comes first"
+        );
+        assert_eq!(
+            settled_wait(lease(at(10), 10_000), now, 10_000),
+            LEASE_END_MARGIN,
+            "a lease whose end a clock reads as reached is not looked at in a loop"
+        );
     }
 }
