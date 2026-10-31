@@ -84,7 +84,8 @@ mod overtake;
 ///
 /// Half the window's validity, which is the schedule the transport uses: an attached terminal that
 /// stays open for hours never has to ask for a window, and never holds one that expired while its
-/// replacement was in flight.
+/// replacement was in flight. A connection that cannot first-admit a mutation keeps no such clock
+/// ([`ConnectionFacts::admits_mutations`]).
 pub const WINDOW_RENEWAL: std::time::Duration =
     std::time::Duration::from_millis(MAX_WINDOW_VALIDITY.as_millis() as u64 / 2);
 
@@ -98,7 +99,8 @@ pub const WINDOW_RENEWAL: std::time::Duration =
 /// helper makes is sent one on a clock. Every other connection is sent none on a clock: the
 /// control daemon holds three to each session and a view can be attached for days, and a clock on
 /// each would wake an idle host several times in ten seconds. When such a connection is idle, the
-/// window renewal is the only clock the connection loop keeps.
+/// window renewal is the only clock the connection loop keeps, and the daemon's attention,
+/// descriptions and checks connections, which admit no mutation, keep none.
 pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How often the host looks at its own clocks while it is idle.
@@ -291,6 +293,8 @@ pub struct WorkerService {
     build_id: kr_protocol::ids::BuildId,
     /// How often a connection a process bridge made is sent a keepalive.
     keepalive: std::time::Duration,
+    /// How often a live connection that can admit a mutation is sent a replacement window.
+    window_renewal: std::time::Duration,
     /// Capabilities this worker leaves out of its answer to the hello, as a worker of an earlier
     /// release does by serving nothing they name, which this host's own tests use. It is compiled
     /// away in every shipped build.
@@ -709,6 +713,7 @@ impl WorkerService {
             recoveries: crate::recovery::RecoveryCopies::new(),
             build_id: binding.build_id,
             keepalive: LOCAL_KEEPALIVE,
+            window_renewal: WINDOW_RENEWAL,
             #[cfg(feature = "testing")]
             withheld_capabilities: Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
@@ -765,6 +770,15 @@ impl WorkerService {
     #[must_use]
     pub const fn with_keepalive(mut self, period: std::time::Duration) -> Self {
         self.keepalive = period;
+        self
+    }
+
+    /// Replaces a connection's action window every `period` rather than every [`WINDOW_RENEWAL`],
+    /// so a test sees several of them without waiting for two and a half minutes each.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn with_window_renewal(mut self, period: std::time::Duration) -> Self {
+        self.window_renewal = period;
         self
     }
 
@@ -1952,9 +1966,12 @@ impl WorkerService {
         state.facts.attachments = Arc::clone(&registration.attachments);
         state.withdrawn = Arc::clone(&registration.withdrawn);
         // The timer fires once immediately; that first tick is consumed here so a connection is
-        // not handed a replacement window before it has read the one in its acknowledgement.
-        let mut renewal = tokio::time::interval(WINDOW_RENEWAL);
-        renewal.tick().await;
+        // not handed a replacement window before it has read the one in its acknowledgement. It is
+        // let go of when the connection turns out to be one that admits no mutation, so that such
+        // a connection keeps no clock at all.
+        let mut every = tokio::time::interval(self.window_renewal);
+        every.tick().await;
+        let mut renewal = Some(every);
         // When the next keepalive is due, on a connection a process bridge made, and never on any
         // other: nothing else reads this stream for silence, so another connection keeps no
         // keepalive clock and its host is not woken for it. The hello is what says which it is,
@@ -1979,6 +1996,9 @@ impl WorkerService {
         loop {
             if keepalive_due.is_none() && state.owes_keepalive() {
                 keepalive_due = Some(tokio::time::Instant::now() + self.keepalive);
+            }
+            if renewal.is_some() && !state.facts.admits_mutations() {
+                renewal = None;
             }
             let next: Next = if let Some(queued) = backlog.pop_front() {
                 match queued {
@@ -2027,7 +2047,12 @@ impl WorkerService {
                     // before a mutation. A connection whose registration has been withdrawn is no
                     // longer that: a replacement window for it would be a freshness resource issued
                     // to authority that has gone, so the renewal stops with the registration.
-                    _ = renewal.tick(), if state.facts.negotiated => {
+                    _ = async {
+                        match renewal.as_mut() {
+                            Some(every) => every.tick().await,
+                            None => std::future::pending().await,
+                        }
+                    }, if state.facts.negotiated => {
                         if self.check_authority(&state.facts).is_err() {
                             continue;
                         }
@@ -9921,6 +9946,20 @@ pub struct ConnectionFacts {
 }
 
 impl ConnectionFacts {
+    /// Whether this connection can first-admit a mutation under an action window of its own.
+    ///
+    /// The control daemon's attention, descriptions and checks connections carry one kind of read
+    /// each and are refused anything else, so a window renewed on one is never presented.
+    fn admits_mutations(&self) -> bool {
+        !(self.controller
+            && matches!(
+                self.controller_role,
+                ControllerConnectionRole::Attention
+                    | ControllerConnectionRole::Descriptions
+                    | ControllerConnectionRole::Checks
+            ))
+    }
+
     /// Records an attachment this connection now owns.
     fn add_attachment(&self, attachment_id: AttachmentId) {
         self.attachments
