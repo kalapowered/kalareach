@@ -408,10 +408,12 @@ const SPELL_PROBE: &str = "KR_ATTACH_SPELL_PROBE";
 /// writes the keys in the documented record sequence, and expects the records first and the text
 /// after. A switch that changed nothing leaves the arrow a record, a reader that turned the records
 /// of the keys going down into bytes loses the NUL, one that reads the console's bytes loses the
-/// Ctrl+Z and gives `é` in the console's code page. Last, the test presses Ctrl on its own and the
-/// Apps key, which the console keeps as records that make no text, and the probe stops the reader
-/// and reads one more key itself: a reader left in a read of the console, or cancelled in the middle of one, leaves a
-/// pending read behind, and the console gives that read the next key.
+/// Ctrl+Z and gives `é` in the console's code page. The test then presses Ctrl+Space again as the
+/// only key the console holds, and expects its NUL: a reader that takes the record off the queue
+/// with those that make no text loses the key. Last, the test presses Ctrl on its own and the Apps
+/// key, which the console keeps as records that make no text, and the probe stops the reader and
+/// reads one more key itself: a reader left in a read of the console, or cancelled in the middle of
+/// one, leaves a pending read behind, and the console gives that read the next key.
 #[test]
 fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_records() {
     if std::env::var_os(SPELL_PROBE).is_some() {
@@ -494,6 +496,13 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
     press(b"\x1b[66;48;98;1;0;1_");
     press(b"\x1b[66;48;98;0;0;1_");
     waits_for("kr-probe:bytes:", &mut child);
+    // Ctrl+Space as the only key the console holds. The console keeps it as a key going down with no
+    // character, which a read of the console's text passes over unless the reader has told it apart
+    // from a modifier: a reader that took it off the queue with the records that make no text never
+    // sends its byte, and the person's key is gone.
+    press(b"\x1b[32;57;32;1;8;1_");
+    press(b"\x1b[32;57;32;0;8;1_");
+    waits_for("kr-probe:alone:", &mut child);
     // Ctrl on its own, and the Apps key, once the reader has the letter: the console keeps each as a
     // key going down and coming up that make no text, and a read of the console's text would wait
     // for the next key. (Behind the letter in the same burst they are taken by the read that
@@ -529,9 +538,22 @@ fn a_console_asked_to_spell_its_keys_hands_the_reader_bytes_where_it_handed_reco
         "the keys came back as the text the console spells for them, the NUL and the Ctrl+Z among \
          them: {after:?}"
     );
+    let alone = after
+        .lines()
+        .find_map(|line| line.strip_prefix("kr-probe:alone:"))
+        .expect("the probe shows the bytes of the lone Ctrl+Space");
+    assert_eq!(
+        alone.trim_end(),
+        "00",
+        "Ctrl+Space, as the only key the console held, reached the reader as its NUL: {after:?}"
+    );
     assert!(
         !after.contains("kr-probe:key:"),
         "a key was handed on as a record after the console spelled its keys: {after:?}"
+    );
+    assert!(
+        after.contains("kr-probe:stopped:ended"),
+        "the stop saw the reader end: {after:?}"
     );
     assert!(
         after.contains("kr-probe:next:63"),
@@ -599,6 +621,20 @@ fn spell_probe_in_the_console() {
         }
     }
     println!("kr-probe:bytes:{}", hex(&spelled));
+    // The test now presses Ctrl+Space again, as the only key in the console: its byte is all the
+    // reader has to wait for.
+    let mut alone = Vec::new();
+    while alone.is_empty() {
+        match next() {
+            TerminalInput::Bytes(bytes) => alone.extend(bytes),
+            TerminalInput::Keys(keys) => {
+                for key in keys {
+                    println!("kr-probe:key:{}:{}", key.virtual_key, key.unicode);
+                }
+            }
+        }
+    }
+    println!("kr-probe:alone:{}", hex(&alone));
     // The test now presses Ctrl on its own and the Apps key. The reader is stopped once the console
     // has been quiet for a second and holds no input, which is when the reader has seen them.
     let waiting = kr_cli::windows::records::RecordReader::over(
@@ -616,8 +652,15 @@ fn spell_probe_in_the_console() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    stop.stop();
-    println!("kr-probe:stopped");
+    let stopped = stop.stop();
+    println!(
+        "kr-probe:stopped:{}",
+        if stopped.still_running {
+            "running"
+        } else {
+            "ended"
+        }
+    );
     let mut next = [0_u8; 1];
     let mut input_handle = console.handle();
     input_handle
