@@ -504,8 +504,9 @@ impl Recovery {
     ///
     /// # Errors
     ///
-    /// Returns a refusal when the account cannot be used at the service the record names (the one
-    /// the setting names, when there is no record yet), nothing having been made or sent; `OUTCOME_UNKNOWN` when the write was not answered, which has to be
+    /// Returns a refusal when a record not yet kept cannot be used by the account, at the service
+    /// the record names (the one the setting names, when there is no record yet), nothing having
+    /// been made or sent; `OUTCOME_UNKNOWN` when the write was not answered, which has to be
     /// settled before anything else is written; and a local failure otherwise.
     pub async fn turn_on(&self, account: &Account) -> Result<RecoveryView> {
         let _step = self.step().await?;
@@ -787,7 +788,7 @@ impl Recovery {
         )
         .map_err(|error| {
             CommandError::local_failure(format!(
-                "this computer cannot reach the sync service: {error}"
+                "this computer cannot reach the service the bundle is kept at: {error}"
             ))
         })?;
         let tokens: Arc<dyn AccountTokenSource> = account.tokens();
@@ -1095,10 +1096,10 @@ fn refuse_if_blocked(account: &Account, used: &GatewayOrigin, named: Named) -> R
                  Choose {account} as the sync service to keep recovery data"
             ),
             Named::ByRecord => format!(
-                "this computer's recovery bundle is kept at {sync_service}, but this device is \
-                 signed in to {account}, and the account's sign-in is not sent to another service. \
-                 Recovery waits until this device is signed in to {sync_service}; choosing another \
-                 sync service does not move the bundle"
+                "this computer's recovery record names {sync_service} as the service for its \
+                 bundle, but this device is signed in to {account}, and the account's sign-in is \
+                 not sent to another service. Recovery waits until this device is signed in to \
+                 {sync_service}; choosing another sync service does not move the bundle"
             ),
         })),
     }
@@ -1109,8 +1110,8 @@ fn said(error: RecoveryError) -> CommandError {
     match error {
         RecoveryError::BundleOutcomeUnknown { .. } => CommandError::new(
             ErrorCode::OutcomeUnknown,
-            "the sync service did not answer the write to the recovery bundle, so it is not known \
-             whether it landed. Settle it before anything else is written",
+            "the service the bundle is kept at did not answer the write to the recovery bundle, so \
+             it is not known whether it landed. Settle it before anything else is written",
         ),
         RecoveryError::HostOutcomeUnknown { .. } => CommandError::new(
             ErrorCode::OutcomeUnknown,

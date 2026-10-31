@@ -1022,7 +1022,7 @@ it was made for, and the Account sheet says so. The same check is made for the r
 before each later step that would reach it (going on with a start that did not finish, settling a
 write, covering the host, listing the archives and making the offline copy): a record kept at one
 service is refused when the account is signed in at another, whatever the setting names. That
-refusal names the service the record is kept at and the one the account is signed in to, and says
+refusal names the service the record names and the one the account is signed in to, and says
 that recovery waits for a sign-in at the record's service; it does not ask for a change of the
 setting, which cannot move the bundle. Saving the kit reaches no service, and the kit goes on naming
 the service the record names. A phone shows the setting and offers no recovery.

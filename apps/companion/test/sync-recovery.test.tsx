@@ -175,15 +175,16 @@ describe('recovery', () => {
         'wrong_service'
       )
     })
-    // With no bundle kept, both services are named, so the person knows which setting to change and
-    // to what.
+    // With no record of a bundle, both services are named, so the person knows which setting to
+    // change and to what.
     const words = within(recovery).getByTestId('recovery-blocker')
     expect(words).toHaveTextContent('sync.example')
     expect(words).toHaveTextContent('reach.kala.to')
+    expect(words).toHaveTextContent(/change the setting/i)
     expect(within(recovery).queryByRole('button')).toBeNull()
 
-    // With a bundle kept, the service is the one it is kept at, which the setting cannot move: both
-    // services are named, and the person is not asked to change the setting.
+    // With a record of a bundle, the service is the one the record names, which the setting cannot
+    // move: both services are named, and the person is not asked to change the setting.
     act(() => {
       controls.recovery.set({
         state: 'unfinished',
@@ -194,7 +195,7 @@ describe('recovery', () => {
     })
     await waitFor(() => {
       expect(within(recovery).getByTestId('recovery-blocker')).toHaveTextContent(
-        'keeps its bundle at sync.example'
+        'names sync.example as the service for its bundle'
       )
     })
     const kept = within(recovery).getByTestId('recovery-blocker')
