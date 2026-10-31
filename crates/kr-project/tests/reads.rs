@@ -291,6 +291,27 @@ mod linux {
         );
     }
 
+    /// A kernel without the interface the rules need does not qualify, and the doctor is told that
+    /// cause and not that the host cannot name its Git's libraries. The kernel is not changed: the
+    /// answer to the boundary's own probe is, on this thread only.
+    #[test]
+    fn a_kernel_without_the_interface_does_not_qualify_and_is_not_taken_for_a_missing_library() {
+        use kr_project::service::Refusal;
+
+        let fixture = Fixture::create();
+
+        let refused =
+            kr_project::boundary::with_kernel_interface(2, || fixture.service().qualify());
+
+        assert!(!refused.qualifies());
+        assert_eq!(refused.refusal(), Some(Refusal::Invocation));
+        assert!(
+            refused.detail().contains("version 2") && refused.detail().contains("version 3"),
+            "the daemon's own log is told what the kernel has and what the rules need: {}",
+            refused.detail()
+        );
+    }
+
     #[test]
     fn a_bounded_caller_can_status_clone_check_out_and_add_a_worktree() {
         let fixture = Fixture::create();
