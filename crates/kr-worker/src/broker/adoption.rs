@@ -67,9 +67,9 @@ use crate::broker::image::HashedFiles;
 /// session's traffic.
 pub const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The longest the watch waits between two looks: the session's beat, which the supervision's sweep
-/// and the host's other idle clocks fall on as well.
-pub const IDLE_LOOK: Duration = crate::lifecycle::BEAT;
+/// The longest the watch waits between two looks: the slow cadence the supervision keeps for what
+/// no event reports.
+pub const IDLE_LOOK: Duration = crate::lifecycle::IDLE_SWEEP_INTERVAL;
 
 /// How the wait between two looks grows while nothing happens: it is this fraction of the time since
 /// the watch last had a reason to look.
@@ -604,8 +604,8 @@ pub async fn watch_foreground(
         if command || identifying.is_some() || adoptions.holds_any() {
             pace.reason_at_look();
         }
-        // A look as slow as the beat falls on it, where the supervision's sweep and the host's
-        // other idle clocks fall as well, so they wake the host once.
+        // A look as slow as the supervision's sweep falls on the session's beat, which the sweep
+        // keeps, so the two wake the host once.
         let due = tokio::time::Instant::from_std(
             activity.on_the_beat(pace.due().into_std(), pace.looked.into_std()),
         );
