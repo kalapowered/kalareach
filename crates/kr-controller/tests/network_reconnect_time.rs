@@ -23,10 +23,11 @@
 //! recorded with the shortfall named and the target cannot fail the case. A run whose restored
 //! screen passes the case's checks records the figure beside the host it was taken on, in the form
 //! the other performance records take, before the target is asserted. The target is not the case's
-//! only limit on time: each of its own waits for the host (to serve the worker's session, the
-//! attach and the subscription inside the timed span, and the screen after them) is bounded as a
-//! whole, the request to the host included, at 120 seconds, and the harness's dial and set-up have
-//! limits of their own, so a host that never answers fails the case whatever it lacks.
+//! only limit on time: each of its own waits for the host (to pair the device, to serve the worker's
+//! session, the attach and the subscription inside the timed span, and the screen after them) is
+//! bounded as a whole, the request to the host included, at 120 seconds, so a host that stops
+//! answering one of them fails the case there. The harness's dial has a limit of its own, and the
+//! start-up of the host and of the worker is the harness's and is not timed here.
 
 #![cfg(unix)]
 
@@ -238,11 +239,14 @@ async fn a_paired_device_that_comes_back_has_a_painted_screen_inside_the_reconne
     .await;
 
     let device = Device::create().await;
-    let record = pair_with(
-        &host,
-        &device,
-        &owner,
-        proposal(&[ActionRight::SessionView]),
+    let record = within_liveness(
+        "the host to pair the device",
+        pair_with(
+            &host,
+            &device,
+            &owner,
+            proposal(&[ActionRight::SessionView]),
+        ),
     )
     .await;
     let dial = paired_dial(&host, &device, &record);
@@ -369,8 +373,8 @@ where
 }
 
 /// Runs one whole wait inside the liveness bound, and fails the case when the bound runs out. A
-/// request to the host has no timer of its own, so every wait for a host's answer goes through
-/// here.
+/// request to the host has no timer of its own, so each of this case's waits for a host's answer
+/// goes through here.
 async fn within_liveness<T>(what: &str, wait: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(LIVENESS, wait)
         .await
