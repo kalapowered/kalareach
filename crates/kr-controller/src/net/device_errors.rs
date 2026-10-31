@@ -22,7 +22,9 @@
 //! an error in a response, a receipt, or anywhere inside a result or an announcement. The places
 //! where this host's failures are written as plain text and not as an error are held to the same
 //! rule: a closure's list of what it left behind, and the members of the records in
-//! [`FAILURE_TEXTS`].
+//! [`FAILURE_TEXTS`]. The places that hold a place on this host and no failure ([`HOST_PATHS`])
+//! are withheld as a path is, and the reason an agent instance's rich mutations wait is told by
+//! what it says of the wait ([`suspension_for_a_device`]).
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -64,8 +66,10 @@ const COMMAND_WORDS: [&str; 6] = ["chmod", "chown", "sudo", "doas", "systemctl",
 /// project service, in terms of the location the device's grant names, which is all of the place
 /// the device has. The third is the refusal to start a worker over a scheduled task under the
 /// environment's name that is not this installation's own, whose text can name the account it is
-/// registered for, or quote what the Task Scheduler said.
-const KNOWN_REASONS: [(&[&str], &str); 3] = [
+/// registered for, or quote what the Task Scheduler said. The last four are the Task Scheduler's own
+/// refusals of a command this host gave it, each of which carries what the scheduler printed after
+/// it: that is a program's output, which can hold an account's name in a form the rule cannot find.
+const KNOWN_REASONS: [(&[&str], &str); 7] = [
     (
         &["a filesystem is mounted at "],
         "a filesystem is mounted inside the location the grant names",
@@ -79,6 +83,26 @@ const KNOWN_REASONS: [(&[&str], &str); 3] = [
         "a task under this environment's name is not this installation's own, so the host left it \
          as it is",
     ),
+    (
+        &["the Task Scheduler did not register "],
+        "the Task Scheduler did not register the environment's task; what it reported is not sent \
+         to a paired device",
+    ),
+    (
+        &["the Task Scheduler did not remove "],
+        "the Task Scheduler did not remove the environment's task; what it reported is not sent \
+         to a paired device",
+    ),
+    (
+        &["the Task Scheduler could not list "],
+        "the Task Scheduler could not list the environment's task; what it reported is not sent \
+         to a paired device",
+    ),
+    (
+        &["the Task Scheduler did not run "],
+        "the Task Scheduler did not run the environment's task; what it reported is not sent to a \
+         paired device",
+    ),
 ];
 
 /// The ends of the three refusals that name where in a message a field is, as a JSON pointer.
@@ -89,6 +113,36 @@ const POINTER_ENDS: [&str; 3] = [
     " carries a field it does not declare",
     " names a variant in ",
     " carries a member of an extension that is not negotiated there",
+];
+
+/// Why rich mutations wait while a request of the terminal's that selects or leaves a conversation
+/// has not been answered, as the worker writes it.
+const SELECTION_IN_FLIGHT: &str = "the terminal has asked to change its conversation and the \
+                                   server has not answered, so which conversation it is in is \
+                                   unknown";
+
+/// Why rich mutations wait after such a request ended in a way that does not say what became of it,
+/// as the worker writes it.
+const SELECTION_UNKNOWN: &str = "what became of the terminal's last request to change its \
+                                 conversation is unknown, so which conversation it is in is \
+                                 unknown";
+
+/// What the worker says before why it could not take the conversation the terminal selected.
+const CONVERSATION_NOT_BOUND: &str = "the conversation the terminal selected cannot be bound here";
+
+/// What the worker says after the method of a request that its connector's table does not
+/// classify, and what a device is told in place of the method and those words.
+const UNCLASSIFIED_METHODS: [(&str, &str); 2] = [
+    (
+        " is not classified by this connector's table, so what the terminal asked for is unknown",
+        "a request of a method this connector's table does not classify was made, so what the \
+         terminal asked for is unknown",
+    ),
+    (
+        " is not classified by this connector's table, so what it changed is unknown",
+        "a request of a method this connector's table does not classify was made, so what it \
+         changed is unknown",
+    ),
 ];
 
 /// A member of a protocol record that holds a failure as plain text, found by its key.
@@ -106,7 +160,7 @@ struct FailureText {
 /// privacy step could not answer, what a workspace or a repository operation records of its own
 /// state, and why an agent instance's bridges are refused. A device reads them in results and in
 /// announcements, so they are held to the rule as an error's message is.
-const FAILURE_TEXTS: [FailureText; 6] = [
+const FAILURE_TEXTS: [FailureText; 7] = [
     FailureText {
         key: "reason",
         beside: &[("subsystem", None)],
@@ -137,6 +191,38 @@ const FAILURE_TEXTS: [FailureText; 6] = [
         beside: &[("application_instance_id", None)],
         of: "why the instance's bridges are refused",
     },
+    FailureText {
+        key: "failure",
+        beside: &[("download", Some("failed"))],
+        of: "why the fetch of the description model failed",
+    },
+];
+
+/// A member of a protocol record that holds a place on this host as plain text, found by its key.
+struct HostPath {
+    /// The member's key. Its value is a text, or a list of texts.
+    key: &'static str,
+    /// The members beside it that say which record it belongs to.
+    beside: &'static [&'static str],
+}
+
+/// The members that hold a place on this host and no failure: where a repository or a working copy
+/// is, and the staging paths an operation kept or removed. A path under a home directory names the
+/// account, and a device cannot use one, so a device is given each as the withheld record of a path
+/// (the form the directory of a materialisation has), with the list of paths as long as it was.
+const HOST_PATHS: [HostPath; 3] = [
+    HostPath {
+        key: "display_path",
+        beside: &["project_repository_id", "environment_id"],
+    },
+    HostPath {
+        key: "retained_staging_paths",
+        beside: &["action_id", "destination_state"],
+    },
+    HostPath {
+        key: "removed_staging_paths",
+        beside: &["action_id", "destination_state"],
+    },
 ];
 
 /// The host's own reasons for refusing the argument of a call that reaches the agent of a session,
@@ -149,7 +235,7 @@ const FAILURE_TEXTS: [FailureText; 6] = [
 /// or number of a message reaches a device. The device is given the sentence beside the shape, a
 /// closed set of this host's own text, or the shape itself where it has no `{}` and so is one
 /// fixed sentence already.
-const OWN_ARGUMENT_REASONS: [(&str, Option<&str>); 6] = [
+const OWN_ARGUMENT_REASONS: [(&str, Option<&str>); 13] = [
     ("a prompt names either a draft or inline text", None),
     ("a prompt names a draft or inline text, not both", None),
     (
@@ -167,6 +253,107 @@ const OWN_ARGUMENT_REASONS: [(&str, Option<&str>); 6] = [
     (
         "the package does not accept {} as an attachment",
         Some("the package does not accept this kind of attachment"),
+    ),
+    (
+        "{}'s parameters: the required parameter {} is absent",
+        Some("a parameter the action requires is absent"),
+    ),
+    (
+        "{}'s parameters: the value of {} is outside its declared bound",
+        Some("the value given for a parameter is outside the bound the action declares"),
+    ),
+    (
+        "{}'s parameters: the parameter {} is supplied more than once",
+        Some("a parameter is supplied more than once"),
+    ),
+    (
+        "{}'s parameters: the parameter {} does not accept this value",
+        Some("the action does not accept the value given for a parameter"),
+    ),
+    (
+        "{}'s parameters name a member more than once, and two readers of them could disagree",
+        Some("the parameters of the action name a member more than once"),
+    ),
+    (
+        "{} names no attachment to offer",
+        Some("the action names no attachment to offer"),
+    ),
+    (
+        "{} is not prepared by a component",
+        Some("the action is not prepared by a component"),
+    ),
+];
+
+/// The refusals of a plugin's action under the codes the plugin runtime's words come under, by
+/// their wording, and the sentence a device is told of each. Most are the host's own and say what
+/// kind of thing stopped the action; the worker writes the runtime's own words, or the component's,
+/// after the colon of several of them, and those are another program's. A `{..}` stands for the
+/// rest of the message, whatever it says. A sentence with no slot at all is the host's own text and
+/// is sent as it is.
+const PLUGIN_ACTION_REASONS: [(&str, Option<&str>); 17] = [
+    ("the plugin runtime is not connected", None),
+    (
+        "the component is disabled; the runtime's words are withheld for privacy mode",
+        None,
+    ),
+    (
+        "the plugin runtime refused to ask the component to prepare the action; its words are \
+         withheld for privacy mode",
+        None,
+    ),
+    (
+        "this worker has no control daemon to read a draft from",
+        None,
+    ),
+    (
+        "reports of earlier offers are still waiting for the control daemon",
+        None,
+    ),
+    ("preparations are no longer accepted", None),
+    (
+        "the time to prepare this action ran out before the component was asked",
+        None,
+    ),
+    (
+        "{} declares no single parameter that names its attachment",
+        Some("the action declares no single parameter that names its attachment"),
+    ),
+    (
+        "{} offers an attachment and its package declares no attachments",
+        Some("the action offers an attachment and its package declares no attachments"),
+    ),
+    (
+        "{}'s package inserts an attachment by {}, and a worker offers one only by an upload to the \
+         upstream",
+        Some("the action's package inserts an attachment in a way a worker does not offer"),
+    ),
+    (
+        "{} actions are being prepared already, and this one was not reached in time",
+        Some("other actions are being prepared already, and this one was not reached in time"),
+    ),
+    (
+        "{}'s component is not registered with the plugin runtime yet",
+        Some("the action's component is not registered with the plugin runtime yet"),
+    ),
+    (
+        "{}'s component is not registered with the plugin runtime yet: {..}",
+        Some("the action's component is not registered with the plugin runtime yet"),
+    ),
+    (
+        "{}'s component cannot be prepared: {..}",
+        Some("the action's component cannot be prepared"),
+    ),
+    (
+        "the component is disabled: {..}",
+        Some("the component is disabled"),
+    ),
+    (
+        "the component could not be asked to prepare the action: {..}",
+        Some("the component could not be asked to prepare the action"),
+    ),
+    (
+        "this binding's rich capabilities are disabled: {..}",
+        Some("this binding's rich capabilities are disabled"),
     ),
 ];
 
@@ -294,18 +481,23 @@ pub(crate) fn too_large_for_the_device(frame: &ControlFrame) -> Option<ControlFr
     }))
 }
 
-/// The answer to `method` as a device is given it, when the method puts a prompt, a steer, a
-/// cancellation, an approval or a plugin's action to the agent a session runs.
+/// The worker's answer to `method` as a device is given it, when the method puts a prompt, a steer,
+/// a cancellation, an approval or a plugin's action to the agent a session runs.
 ///
 /// An agent's refusal is the agent's own words about what it was asked, and they quote what it
 /// was working on. The worker gives them under the same code as its own refusals of the argument,
 /// so a refusal of the argument is told as it is, or by its kind, when it is one of the host's own
 /// reasons ([`OWN_ARGUMENT_REASONS`]), which a device needs to correct what it sent, and every
 /// other refusal of the argument, of the agent itself, or an end that left the outcome unknown,
-/// is replaced by a sentence composed from its code. The code and the retry category stay.
+/// is replaced by a sentence composed from its code. A plugin's action also meets the plugin
+/// runtime, whose words come under two more codes and are told the same way
+/// ([`PLUGIN_ACTION_REASONS`]). The code and the retry category stay.
+///
+/// This is for what a worker answered. The daemon's own refusals of the same call are its own
+/// sentences, made before any worker is asked, and are not given to it.
 #[must_use]
-pub(crate) fn upstream_words(method: Option<Method>, frame: ControlFrame) -> ControlFrame {
-    if !method.is_some_and(puts_to_the_agent) {
+pub(crate) fn upstream_words(method: Method, frame: ControlFrame) -> ControlFrame {
+    if !puts_to_the_agent(method) {
         return frame;
     }
     let ControlFrame::Response(Response {
@@ -315,7 +507,7 @@ pub(crate) fn upstream_words(method: Option<Method>, frame: ControlFrame) -> Con
     else {
         return frame;
     };
-    let error = match told_in_place_of_the_upstreams(&error) {
+    let error = match told_in_place_of_the_upstreams(method, &error) {
         Some(message) => with_message(&error, message),
         None => error,
     };
@@ -325,13 +517,12 @@ pub(crate) fn upstream_words(method: Option<Method>, frame: ControlFrame) -> Con
     })
 }
 
-/// What a device is told in place of the message of `error`, the refusal of a call that reaches
-/// the agent of a session, or `None` when it is told the message itself.
-fn told_in_place_of_the_upstreams(error: &ProtocolError) -> Option<String> {
+/// What a device is told in place of the message of `error`, the worker's refusal of a call of
+/// `method` that reaches the agent of a session, or `None` when it is told the message itself.
+fn told_in_place_of_the_upstreams(method: Method, error: &ProtocolError) -> Option<String> {
     let from_the_code = || sentence_for(error.code, WHY_WHATEVER_IT_SAYS);
-    match error.code {
-        ErrorCode::UpstreamUnavailable | ErrorCode::OutcomeUnknown => Some(from_the_code()),
-        ErrorCode::InvalidArgument => match OWN_ARGUMENT_REASONS
+    let of_the_hosts = |reasons: &[(&str, Option<&str>)]| {
+        match reasons
             .iter()
             .find(|(shape, _)| fits_shape(shape, &error.message))
         {
@@ -339,27 +530,46 @@ fn told_in_place_of_the_upstreams(error: &ProtocolError) -> Option<String> {
             // A shape with no `{}` is its own sentence, and the message is that sentence.
             Some((_, Some(sentence))) => Some((*sentence).to_owned()),
             Some((_, None)) => None,
-        },
+        }
+    };
+    match error.code {
+        ErrorCode::UpstreamUnavailable | ErrorCode::OutcomeUnknown => Some(from_the_code()),
+        ErrorCode::InvalidArgument => of_the_hosts(&OWN_ARGUMENT_REASONS),
+        // The plugin runtime is another program, and what it says comes under these two codes.
+        ErrorCode::ResourceUnavailable | ErrorCode::UnsupportedCapability
+            if method == Method::PluginActionInvoke =>
+        {
+            of_the_hosts(&PLUGIN_ACTION_REASONS)
+        }
         _ => None,
     }
 }
 
-/// Whether `message` is `shape` with one word of the argument, up to the next space, in place of
-/// each `{}`.
+/// Whether `message` is `shape` with one word of the argument, up to the next space, apostrophe or
+/// comma, in place of each `{}`, and the rest of the message, if it is not empty, in place of a
+/// closing `{..}`. An apostrophe or a comma ends a word so that a shape can say `{}'s` or `{},`; no
+/// name of an action or a parameter holds either.
 fn fits_shape(shape: &str, message: &str) -> bool {
     let (mut shape, mut rest) = (shape, message);
     while let Some(open) = shape.find("{}") {
         let Some(after) = rest.strip_prefix(&shape[..open]) else {
             return false;
         };
-        let word = after.find(char::is_whitespace).unwrap_or(after.len());
+        let word = after
+            .find(|character: char| character.is_whitespace() || matches!(character, '\'' | ','))
+            .unwrap_or(after.len());
         if word == 0 {
             return false;
         }
         rest = &after[word..];
         shape = &shape[open + "{}".len()..];
     }
-    rest == shape
+    match shape.strip_suffix("{..}") {
+        Some(literal) => rest
+            .strip_prefix(literal)
+            .is_some_and(|more| !more.is_empty()),
+        None => rest == shape,
+    }
 }
 
 /// Whether `method` hands words to the agent of a session and takes its refusal back.
@@ -523,7 +733,96 @@ fn shown_member(map: &CanonicalMap, key: &str, child: &CanonicalValue) -> Option
         let fixed = || format!("{of}; {WHY_NOT_SHOWN}");
         return told_in_place(text, fixed).map(CanonicalValue::Text);
     }
+    if let CanonicalValue::Text(text) = child
+        && is_why_mutations_wait(map, key)
+    {
+        return suspension_for_a_device(text).map(CanonicalValue::Text);
+    }
+    if is_a_host_path(map, key) {
+        return withheld_paths(child);
+    }
     shown_value(child)
+}
+
+/// Whether the text under `key` in `map` is why an agent instance's rich mutations wait: the
+/// `suspension_reason` of a binding state, which also says whether they do.
+fn is_why_mutations_wait(map: &CanonicalMap, key: &str) -> bool {
+    key == "suspension_reason"
+        && map.get("rich_mutations_suspended").is_some()
+        && map.get("binding_revision").is_some()
+}
+
+/// Whether the member under `key` in `map` holds a place on this host ([`HOST_PATHS`]).
+fn is_a_host_path(map: &CanonicalMap, key: &str) -> bool {
+    HOST_PATHS
+        .iter()
+        .any(|path| path.key == key && path.beside.iter().all(|beside| map.get(beside).is_some()))
+}
+
+/// `value`, a text or a list of texts that are places on this host, with each of them withheld as
+/// the directory of a materialisation is, or `None` when it holds none.
+fn withheld_paths(value: &CanonicalValue) -> Option<CanonicalValue> {
+    let withheld = |text: &str| {
+        kr_protocol::hostinfo::export::withheld(
+            kr_protocol::hostinfo::export::ContentClass::Path,
+            text,
+        )
+    };
+    match value {
+        CanonicalValue::Text(text) => Some(CanonicalValue::Text(withheld(text))),
+        CanonicalValue::Array(items) => {
+            let mut changed = false;
+            let shown = items
+                .iter()
+                .map(|item| match item {
+                    CanonicalValue::Text(text) => {
+                        changed = true;
+                        CanonicalValue::Text(withheld(text))
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            changed.then_some(CanonicalValue::Array(shown))
+        }
+        _ => None,
+    }
+}
+
+/// Why an agent instance's rich mutations wait, with nothing of this host or of the application's
+/// upstream in it, or `None` when the host's own sentence says it and names nothing.
+///
+/// The worker writes the reason from the host's own sentences, and from two things it did not
+/// make: the method of a request that its connector's table does not classify, which is the
+/// upstream's, and what stopped it taking a conversation, which can quote a lock file under a home
+/// directory. A device is told which of those it was and not the words. A reason the host does not
+/// know is not sent.
+fn suspension_for_a_device(reason: &str) -> Option<String> {
+    if [
+        kr_worker::broker::THREAD_NOT_READ,
+        kr_worker::broker::bridge::UNVERIFIED_THREAD,
+        SELECTION_IN_FLIGHT,
+        SELECTION_UNKNOWN,
+    ]
+    .contains(&reason)
+    {
+        return None;
+    }
+    if let Some(why) = reason
+        .strip_prefix(CONVERSATION_NOT_BOUND)
+        .and_then(|rest| rest.strip_prefix(": "))
+    {
+        // The one reason of those that names nothing is the conversation being held elsewhere.
+        return (why != kr_worker::broker::BrokerError::ConversationHeldElsewhere.to_string())
+            .then(|| format!("{CONVERSATION_NOT_BOUND}; {WHY_NOT_SHOWN}"));
+    }
+    for (end, told) in UNCLASSIFIED_METHODS {
+        if reason.ends_with(end) {
+            return Some((*told).to_owned());
+        }
+    }
+    Some(format!(
+        "rich mutations are suspended; {WHY_WHATEVER_IT_SAYS}"
+    ))
 }
 
 /// What the text under `key` in `map` says, when it is a failure a record holds as plain text.
@@ -857,7 +1156,7 @@ mod tests {
     ];
 
     /// Text that is the host's own sentence, or the device's own words back, and names nothing.
-    const NAMES_NOTHING: [&str; 20] = [
+    const NAMES_NOTHING: [&str; 21] = [
         "the invitation expired",
         "session 0193 has closed",
         "src/main.rs is not tracked",
@@ -879,6 +1178,7 @@ mod tests {
         "the page read 42 users and 7 groups",
         // Holds one marker of a refusal this module knows by its wording, and not the others.
         "a task named backup was not run",
+        "this device is registered with the relay",
     ];
 
     fn error(code: ErrorCode, message: &str) -> ProtocolError {
@@ -1224,16 +1524,10 @@ mod tests {
         let ControlFrame::Notification(closed) = closed(&record) else {
             unreachable!("a notification");
         };
-        for event in ["session.closed", "session.output", "session.agent.instance"] {
-            let announced = ControlFrame::Notification(Notification {
-                event_type: EventType::new(event).expect("an event type"),
-                ..closed.clone()
-            });
-            assert!(
-                matches!(frame_for_a_device(&announced), Cow::Borrowed(_)),
-                "{event}"
-            );
-        }
+        assert!(matches!(
+            frame_for_a_device(&ControlFrame::Notification(closed)),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
@@ -1249,7 +1543,7 @@ mod tests {
             outcome: Outcome::Error(shown),
             ..
         }) = upstream_words(
-            Some(Method::AgentPromptSubmit),
+            Method::AgentPromptSubmit,
             refused(ErrorCode::InvalidArgument, said),
         )
         else {
@@ -1259,8 +1553,8 @@ mod tests {
         assert_eq!(shown.code, ErrorCode::InvalidArgument);
 
         for (method, code) in [
-            (Some(Method::PluginActionInvoke), ErrorCode::InvalidArgument),
-            (Some(Method::AgentTurnSteer), ErrorCode::OutcomeUnknown),
+            (Method::PluginActionInvoke, ErrorCode::InvalidArgument),
+            (Method::AgentTurnSteer, ErrorCode::OutcomeUnknown),
         ] {
             let ControlFrame::Response(Response {
                 outcome: Outcome::Error(shown),
@@ -1284,10 +1578,9 @@ mod tests {
         }
 
         for (method, code) in [
-            (Some(Method::AgentPromptSubmit), ErrorCode::DraftConflict),
-            (Some(Method::AgentSnapshot), ErrorCode::InvalidArgument),
-            (Some(Method::SessionCreate), ErrorCode::InvalidArgument),
-            (None, ErrorCode::InvalidArgument),
+            (Method::AgentPromptSubmit, ErrorCode::DraftConflict),
+            (Method::AgentSnapshot, ErrorCode::InvalidArgument),
+            (Method::SessionCreate, ErrorCode::InvalidArgument),
         ] {
             let frame = refused(code, said);
             assert_eq!(upstream_words(method, frame.clone()), frame, "{method:?}");
@@ -1527,10 +1820,10 @@ mod tests {
             "{:?}",
             device.retained
         );
-        // What is not a failure is as it was: the workspace's place is given to a device by design.
+        // What is not a failure is as it was, and the workspace's place is withheld as a path is.
         assert_eq!(
             device.workspace.display_path,
-            removed.workspace.display_path
+            withheld_path(&removed.workspace.display_path)
         );
         assert_eq!(device.workspace.state, removed.workspace.state);
 
@@ -1649,7 +1942,7 @@ mod tests {
         let ControlFrame::Response(Response {
             outcome: Outcome::Error(told),
             ..
-        }) = frame_for_a_device(&upstream_words(Some(method), answer)).into_owned()
+        }) = frame_for_a_device(&upstream_words(method, answer)).into_owned()
         else {
             panic!("an error");
         };
@@ -1776,5 +2069,724 @@ mod tests {
             !told.message.contains("marguerite") && !told.message.contains('/'),
             "{told:?}"
         );
+    }
+
+    /// What `text` becomes when this host withholds a path, as the materialisation's directory is.
+    fn withheld_path(text: &str) -> String {
+        kr_protocol::hostinfo::export::withheld(
+            kr_protocol::hostinfo::export::ContentClass::Path,
+            text,
+        )
+    }
+
+    /// `carrier` as a device is given it in the result of a call, whether or not that changes it.
+    fn read_by_a_device<T: serde::Serialize + serde::de::DeserializeOwned>(carrier: &T) -> T {
+        let frame = ControlFrame::Response(Response {
+            request_id: RequestId::new(9),
+            outcome: Outcome::Ok(ParamsValue::from_typed(carrier).expect("encodes")),
+        });
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Ok(value),
+            ..
+        }) = frame_for_a_device(&frame).into_owned()
+        else {
+            panic!("a result");
+        };
+        kr_cbor::from_canonical_value(value.as_value()).expect("decodes")
+    }
+
+    fn binding(reason: Option<&str>) -> kr_protocol::agent::AgentBindingState {
+        kr_protocol::agent::AgentBindingState {
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(3),
+            thread_id: Nullable::null(),
+            turn_id: Nullable::null(),
+            profile_id: Nullable::null(),
+            mode: kr_protocol::broker::IntegrationMode::Gateway,
+            rich_mutations_suspended: reason.is_some(),
+            suspension_reason: Nullable::from(reason.map(str::to_owned)),
+        }
+    }
+
+    /// `binding` as a device reads it in each of the three answers that carry one:
+    /// `agent.capabilities`, `agent.commands` and `agent.snapshot`.
+    fn bindings_a_device_reads(
+        binding: &kr_protocol::agent::AgentBindingState,
+    ) -> [kr_protocol::agent::AgentBindingState; 3] {
+        use kr_protocol::agent::{
+            AgentCapabilitiesResult, AgentCommandsResult, AgentSnapshotResult,
+        };
+        [
+            read_by_a_device(&AgentCapabilitiesResult {
+                binding: binding.clone(),
+                capabilities: kr_protocol::broker::CapabilityMap {
+                    records: Vec::new(),
+                },
+            })
+            .binding,
+            read_by_a_device(&AgentCommandsResult {
+                binding: binding.clone(),
+                commands: Vec::new(),
+            })
+            .binding,
+            read_by_a_device(&AgentSnapshotResult {
+                binding: binding.clone(),
+                entries: Vec::new(),
+                continuation: Nullable::null(),
+                history_gap: false,
+                withheld_entries: U64::ZERO,
+            })
+            .binding,
+        ]
+    }
+
+    /// A failed conversation lock, as the worker words it: the place of the lock file under the
+    /// home directory of an account.
+    const A_CONVERSATION_LOCK_THAT_FAILED: &str = "the conversation the terminal selected cannot be \
+         bound here: the claim on the saved conversation could not be made: \
+         /Users/marguerite/.local/state/kr/claims/9f2c41.lock: Permission denied (os error 13)";
+
+    #[test]
+    fn why_rich_mutations_wait_is_told_to_a_device_without_what_the_host_or_the_upstream_put_in_it()
+    {
+        for (reason, kind) in [
+            (
+                A_CONVERSATION_LOCK_THAT_FAILED.to_owned(),
+                "the conversation the terminal selected cannot be bound here",
+            ),
+            // An upstream's method, quoted whole: a bare name, an address, a command.
+            (
+                "marguerite is not classified by this connector's table, so what the terminal \
+                 asked for is unknown"
+                    .to_owned(),
+                "does not classify",
+            ),
+            (
+                "marguerite@example.com is not classified by this connector's table, so what it \
+                 changed is unknown"
+                    .to_owned(),
+                "does not classify",
+            ),
+            (
+                "net user marguerite is not classified by this connector's table, so what it \
+                 changed is unknown"
+                    .to_owned(),
+                "does not classify",
+            ),
+            // A reason of nobody's that this host knows.
+            ("marguerite asked for this".to_owned(), "suspended"),
+        ] {
+            let owner = binding(Some(&reason));
+            for device in bindings_a_device_reads(&owner) {
+                let told = device.suspension_reason.0.as_deref().expect("a reason");
+                assert!(!tells_the_owner_alone(told), "{reason}: {told}");
+                assert!(!told.contains("example.com"), "{reason}: {told}");
+                assert!(!told.contains("net user"), "{reason}: {told}");
+                assert!(told.contains(kind), "{reason}: {told}");
+                // Nothing else of the binding changes, and the owner's own copy is as it was.
+                assert!(device.rich_mutations_suspended);
+                assert_eq!(
+                    kr_protocol::agent::AgentBindingState {
+                        suspension_reason: owner.suspension_reason.clone(),
+                        ..device
+                    },
+                    owner
+                );
+            }
+            assert_eq!(owner.suspension_reason.0.as_deref(), Some(reason.as_str()));
+        }
+    }
+
+    #[test]
+    fn why_rich_mutations_wait_is_told_as_it_is_when_the_host_wrote_it_and_it_names_nothing() {
+        let held_elsewhere = format!(
+            "the conversation the terminal selected cannot be bound here: {}",
+            kr_worker::broker::BrokerError::ConversationHeldElsewhere
+        );
+        for reason in [
+            kr_worker::broker::THREAD_NOT_READ,
+            kr_worker::broker::bridge::UNVERIFIED_THREAD,
+            "the terminal has asked to change its conversation and the server has not answered, \
+             so which conversation it is in is unknown",
+            "what became of the terminal's last request to change its conversation is unknown, \
+             so which conversation it is in is unknown",
+            held_elsewhere.as_str(),
+        ] {
+            let owner = binding(Some(reason));
+            for device in bindings_a_device_reads(&owner) {
+                assert_eq!(device, owner, "{reason}");
+            }
+        }
+        let free = binding(None);
+        for device in bindings_a_device_reads(&free) {
+            assert_eq!(device, free);
+        }
+    }
+
+    #[test]
+    fn what_the_task_scheduler_said_is_not_told_to_a_device() {
+        use crate::supervision::windows::{Asked, Outcome as Ran, ReadBack, TaskError, task_name};
+        let name = task_name(kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()));
+        // What each command of the Task Scheduler's failure begins with, and what it was doing.
+        let failures = [
+            (
+                format!("the Task Scheduler did not register {name}"),
+                "register",
+            ),
+            (
+                format!("the Task Scheduler did not remove {name}"),
+                "remove",
+            ),
+            (
+                "the Task Scheduler could not list its tasks".to_owned(),
+                "list",
+            ),
+            (format!("the Task Scheduler could not list {name}"), "list"),
+            (format!("the Task Scheduler did not run {name}"), "run"),
+        ];
+        // What it may say after: a bare account, an address, a line of an identity, a command.
+        let said = [
+            "ERROR: Access is denied for marguerite",
+            "ERROR: the user marguerite@example.com has no right to this task",
+            "uid: 501\ngid: 20",
+            "the account is not known; list it with net user marguerite",
+        ];
+        for (what, verb) in &failures {
+            for said in said {
+                let scheduler = TaskError::Scheduler {
+                    asked: Asked::Register,
+                    outcome: Ran::Ended(Some(1)),
+                    detail: format!("{what}: {said}"),
+                };
+                // The create route's text, and the text of a task that could not be read back.
+                let texts = [
+                    scheduler.to_string(),
+                    format!("could not start a worker: {scheduler}"),
+                    TaskError::ReadBack {
+                        name: name.clone(),
+                        found: ReadBack::Unread(scheduler.to_string()),
+                        undone: true,
+                    }
+                    .to_string(),
+                ];
+                for text in texts {
+                    // The owner is told the whole of it.
+                    assert!(text.contains(said), "{text}");
+                    let shown = error_for_a_device(&error(ErrorCode::ResourceUnavailable, &text))
+                        .into_owned();
+                    assert_eq!(shown.code, ErrorCode::ResourceUnavailable);
+                    assert!(
+                        ["marguerite", "example.com", "501", "uid", "net user"]
+                            .iter()
+                            .all(|local| !shown.message.contains(local)),
+                        "{text}: {shown:?}"
+                    );
+                    assert!(
+                        shown.message.starts_with("the Task Scheduler did not")
+                            || shown.message.starts_with("the Task Scheduler could not"),
+                        "{text}: {shown:?}"
+                    );
+                    assert!(shown.message.contains(verb), "{text}: {shown:?}");
+                }
+            }
+        }
+    }
+
+    fn project(display_path: &str) -> kr_protocol::project::ProjectSummary {
+        use kr_protocol::ids::{EnvironmentId, ProjectRepositoryId};
+        use kr_protocol::project::{
+            FilesystemIdentity, ProjectOrigin, ProjectState, ProjectSummary,
+        };
+        use kr_protocol::scalars::{TimestampMs, Uuid};
+        ProjectSummary {
+            project_repository_id: ProjectRepositoryId::new(Uuid::from_bytes([2; 16])),
+            environment_id: EnvironmentId::new(Uuid::from_bytes([3; 16])),
+            label: "a label the caller chose".to_owned(),
+            origin: ProjectOrigin::Adopted,
+            state: ProjectState::Ready,
+            filesystem_identity: FilesystemIdentity {
+                device: U64::new(1),
+                file_id: U64::new(2),
+            },
+            display_path: display_path.to_owned(),
+            remote: Nullable::null(),
+            created_at_ms: TimestampMs::new(1),
+            workspace_count: U64::new(1),
+        }
+    }
+
+    fn project_read(
+        project: kr_protocol::project::ProjectSummary,
+        workspace: kr_protocol::project::WorkspaceSummary,
+        operation: kr_protocol::project::OperationRecord,
+    ) -> kr_protocol::project::ProjectReadResult {
+        kr_protocol::project::ProjectReadResult {
+            project,
+            workspaces: vec![workspace],
+            operation: Nullable::some(operation),
+        }
+    }
+
+    #[test]
+    fn the_place_of_a_repository_is_withheld_from_a_device() {
+        let place = "/Users/marguerite/work/repo";
+        let owner = project_read(
+            project(place),
+            workspace("it is ready", "nothing held"),
+            operation("it ended"),
+        );
+        let device = read_by_a_device(&owner);
+        assert_eq!(device.project.display_path, withheld_path(place));
+        // Nothing else of the repository changes, and the owner's own copy is as it was.
+        assert_eq!(
+            device.project,
+            kr_protocol::project::ProjectSummary {
+                display_path: withheld_path(place),
+                ..owner.project.clone()
+            }
+        );
+        assert_eq!(owner.project.display_path, place);
+    }
+
+    #[test]
+    fn the_place_of_a_working_copy_is_withheld_from_a_device() {
+        let place = "/Users/marguerite/work/tree";
+        let mut tree = workspace("it is ready", "nothing held");
+        tree.display_path = place.to_owned();
+        let owner = project_read(project("a repository"), tree, operation("it ended"));
+        let device = read_by_a_device(&owner);
+        assert_eq!(device.workspaces[0].display_path, withheld_path(place));
+        assert_eq!(
+            device.workspaces[0],
+            kr_protocol::project::WorkspaceSummary {
+                display_path: withheld_path(place),
+                ..owner.workspaces[0].clone()
+            }
+        );
+        assert_eq!(owner.workspaces[0].display_path, place);
+    }
+
+    #[test]
+    fn the_staging_paths_an_operation_kept_are_withheld_from_a_device() {
+        let kept = [
+            "/Users/marguerite/work/.kr-stage-1",
+            "/Users/marguerite/work/.kr-stage-2",
+        ];
+        let mut recorded = operation("it ended");
+        recorded.retained_staging_paths = kept.map(str::to_owned).to_vec();
+        let owner = kr_protocol::project::ProjectOperationCancelResult {
+            operation: recorded,
+            stopped_processes: U64::new(0),
+        };
+        let device = read_by_a_device(&owner);
+        // The list keeps its length, and each entry is withheld as a path is.
+        assert_eq!(
+            device.operation.retained_staging_paths,
+            kept.map(withheld_path).to_vec()
+        );
+        assert_eq!(
+            device.operation,
+            kr_protocol::project::OperationRecord {
+                retained_staging_paths: kept.map(withheld_path).to_vec(),
+                ..owner.operation.clone()
+            }
+        );
+        assert_eq!(owner.operation.retained_staging_paths, kept);
+    }
+
+    #[test]
+    fn the_staging_paths_an_operation_removed_are_withheld_from_a_device() {
+        let removed = ["/Users/marguerite/work/.kr-stage-0"];
+        let mut recorded = operation("it ended");
+        recorded.removed_staging_paths = removed.map(str::to_owned).to_vec();
+        let owner = kr_protocol::project::ProjectOperationCancelResult {
+            operation: recorded,
+            stopped_processes: U64::new(0),
+        };
+        let device = read_by_a_device(&owner);
+        assert_eq!(
+            device.operation.removed_staging_paths,
+            removed.map(withheld_path).to_vec()
+        );
+        assert_eq!(owner.operation.removed_staging_paths, removed);
+    }
+
+    #[test]
+    fn why_a_fetch_of_the_description_model_failed_is_held_to_the_rule_by_its_key() {
+        use kr_protocol::describe::{DescriptionDownload, DescriptionSetup, DescriptionState};
+        let setup = |failure: &str| DescriptionSetup {
+            offered: true,
+            enabled: true,
+            on_battery: false,
+            profile_id: Nullable::some("small".to_owned()),
+            asset_bytes: U64::new(10),
+            sources: vec!["models.example.com".to_owned()],
+            download: DescriptionDownload::Failed,
+            fetched_bytes: U64::new(0),
+            failure: Nullable::some(failure.to_owned()),
+            can_cancel: false,
+            can_disable: true,
+            needs_hosted_account: false,
+            unavailable: Nullable::null(),
+            state: DescriptionState::ResourcePaused,
+            paused: Nullable::null(),
+        };
+        let owner = setup(
+            "the folder for the model's files could not be made: create \
+             /Users/marguerite/.local/share/kr/models/small: Permission denied (os error 13)",
+        );
+        let device = written_in_a_result(&owner);
+        let told = device.failure.0.as_deref().expect("a failure");
+        assert!(!tells_the_owner_alone(told), "{told}");
+        assert!(
+            told.starts_with("the folder for the model's files could not be made"),
+            "{told}"
+        );
+        assert_eq!(
+            device,
+            DescriptionSetup {
+                failure: device.failure.clone(),
+                ..owner
+            }
+        );
+        // A failure that names nothing is told as it was.
+        let plain = setup("the disk is full");
+        assert_eq!(read_by_a_device(&plain), plain);
+    }
+
+    #[test]
+    fn a_failure_with_nothing_to_keep_is_told_by_what_it_is_about() {
+        use kr_protocol::describe::{DescriptionDownload, DescriptionSetup, DescriptionState};
+        use kr_protocol::privacy::{PrivacyCompletion, PrivacySessionStanding};
+        let told = |of: &str| format!("{of}; {WHY_NOT_SHOWN}");
+
+        let privacy = read_by_a_device(&privacy_report(A_FAILURE_AT_A_PATH));
+        let PrivacyCompletion::Unavailable { unavailable, .. } = &privacy.completion else {
+            panic!("{:?}", privacy.completion);
+        };
+        let PrivacySessionStanding::Unavailable { reason } = &privacy.sessions[0].standing else {
+            panic!("{:?}", privacy.sessions);
+        };
+        assert_eq!(
+            unavailable[0].reason,
+            told("what the subsystem's store reported")
+        );
+        assert_eq!(reason, &told("why the session's cleanup is unavailable"));
+
+        let tree = read_by_a_device(&workspace(A_FAILURE_AT_A_PATH, A_FAILURE_AT_A_PATH));
+        assert_eq!(
+            tree.detail.0.as_deref(),
+            Some(told("why the workspace is in this state").as_str())
+        );
+        assert_eq!(tree.retained[0].detail, told("what the workspace holds"));
+
+        let recorded = operation(A_FAILURE_AT_A_PATH);
+        let recorded = read_by_a_device(&kr_protocol::project::ProjectOperationCancelResult {
+            operation: recorded,
+            stopped_processes: U64::new(0),
+        });
+        assert_eq!(
+            recorded.operation.detail.0.as_deref(),
+            Some(told("why the operation ended").as_str())
+        );
+
+        let refused = read_by_a_device(&kr_protocol::projection::AgentInstanceList {
+            sequence: U64::new(2),
+            instances: vec![instance(A_FAILURE_AT_A_PATH)],
+        });
+        assert_eq!(
+            refused.instances[0].refusal.0.as_deref(),
+            Some(told("why the instance's bridges are refused").as_str())
+        );
+
+        let fetch = read_by_a_device(&DescriptionSetup {
+            offered: true,
+            enabled: true,
+            on_battery: false,
+            profile_id: Nullable::null(),
+            asset_bytes: U64::new(0),
+            sources: Vec::new(),
+            download: DescriptionDownload::Failed,
+            fetched_bytes: U64::new(0),
+            failure: Nullable::some(A_FAILURE_AT_A_PATH.to_owned()),
+            can_cancel: false,
+            can_disable: true,
+            needs_hosted_account: false,
+            unavailable: Nullable::null(),
+            state: DescriptionState::ResourcePaused,
+            paused: Nullable::null(),
+        });
+        assert_eq!(
+            fetch.failure.0.as_deref(),
+            Some(told("why the fetch of the description model failed").as_str())
+        );
+    }
+
+    #[test]
+    fn a_member_that_shares_the_key_of_a_failure_but_not_its_record_is_left_alone() {
+        use kr_protocol::privacy::PrivacySessionStanding;
+        // A standing that is not the unavailable one carries no reason to hold.
+        let other = kr_cbor::to_canonical_value(&PrivacySessionStanding::Unavailable {
+            reason: A_FAILURE_AT_A_PATH.to_owned(),
+        })
+        .expect("encodes");
+        let CanonicalValue::Map(map) = other else {
+            panic!("a record");
+        };
+        let relabelled = rebuilt(
+            map.entries()
+                .iter()
+                .map(|(key, value)| match (key.as_str(), value) {
+                    ("state", CanonicalValue::Text(_)) => {
+                        (key.clone(), CanonicalValue::Text("ready".to_owned()))
+                    }
+                    _ => (key.clone(), value.clone()),
+                })
+                .collect(),
+        );
+        assert_eq!(shown_value(&relabelled), None);
+    }
+
+    /// The six methods that put words to the agent of a session.
+    const THE_AGENT_METHODS: [Method; 6] = [
+        Method::AgentPromptSubmit,
+        Method::AgentPromptQueue,
+        Method::AgentTurnSteer,
+        Method::AgentTurnCancel,
+        Method::AgentApprovalRespond,
+        Method::PluginActionInvoke,
+    ];
+
+    #[test]
+    fn what_the_agent_said_is_withheld_on_each_of_the_methods_that_put_words_to_it() {
+        let mut leaked = Vec::new();
+        for method in THE_AGENT_METHODS {
+            for code in [
+                ErrorCode::InvalidArgument,
+                ErrorCode::UpstreamUnavailable,
+                ErrorCode::OutcomeUnknown,
+            ] {
+                // A bare name is not a path, a number or a command, so only the rule for the
+                // agent's words holds it.
+                let told = told_on(method, code, "marguerite refused this request");
+                assert_eq!(told.code, code, "{method:?}");
+                if told.message.contains("marguerite") {
+                    leaked.push(format!("{method:?} {code:?}"));
+                }
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "the agent's words reach a device: {leaked:?}"
+        );
+    }
+
+    #[test]
+    fn a_reason_of_the_hosts_is_told_only_when_the_whole_message_is_that_reason() {
+        for method in [Method::AgentPromptSubmit, Method::PluginActionInvoke] {
+            for said in [
+                "a prompt names either a draft or inline text, said marguerite",
+                "marguerite: a prompt names a draft or inline text, not both",
+                "a prompt names either a draft or inline text a prompt names either a draft or \
+                 inline text",
+            ] {
+                let told = told_on(method, ErrorCode::InvalidArgument, said);
+                assert!(!told.message.contains("marguerite"), "{said}: {told:?}");
+                assert_ne!(told.message, said);
+            }
+        }
+    }
+
+    #[test]
+    fn a_slot_of_a_shape_holds_a_word_and_not_nothing() {
+        let shape = "{} does not declare a parameter named {}";
+        assert!(fits_shape(
+            shape,
+            "summarise does not declare a parameter named depth"
+        ));
+        assert!(!fits_shape(
+            shape,
+            " does not declare a parameter named depth"
+        ));
+        assert!(!fits_shape(
+            shape,
+            "summarise does not declare a parameter named "
+        ));
+        // An apostrophe ends a word, so a name that holds one fits no shape that says `{}'s`.
+        assert!(fits_shape(
+            "{}'s parameters are bad",
+            "summarise's parameters are bad"
+        ));
+        assert!(!fits_shape("{} is bad", "marguerite's is bad"));
+        assert!(fits_shape("{}, and more", "word, and more"));
+        assert!(!fits_shape("{} and more", "word, and more"));
+        // The rest of a message is more than nothing.
+        assert!(fits_shape(
+            "the component is disabled: {..}",
+            "the component is disabled: off"
+        ));
+        assert!(!fits_shape(
+            "the component is disabled: {..}",
+            "the component is disabled: "
+        ));
+    }
+
+    #[test]
+    fn what_the_plugin_runtime_said_is_withheld_from_a_device_whatever_the_code() {
+        for (code, said, kind) in [
+            (
+                ErrorCode::ResourceUnavailable,
+                "summarise's component is not registered with the plugin runtime yet: the \
+                 runtime said marguerite may not",
+                "is not registered with the plugin runtime yet",
+            ),
+            (
+                ErrorCode::ResourceUnavailable,
+                "summarise's component is not registered with the plugin runtime yet",
+                "is not registered with the plugin runtime yet",
+            ),
+            (
+                ErrorCode::UnsupportedCapability,
+                "summarise's component cannot be prepared: the component of marguerite is not \
+                 signed",
+                "cannot be prepared",
+            ),
+            (
+                ErrorCode::UnsupportedCapability,
+                "the component is disabled: marguerite turned it off",
+                "is disabled",
+            ),
+            (
+                ErrorCode::ResourceUnavailable,
+                "the component could not be asked to prepare the action: permission denied for \
+                 marguerite",
+                "could not be asked to prepare the action",
+            ),
+            (
+                ErrorCode::UnsupportedCapability,
+                "this binding's rich capabilities are disabled: marguerite turned them off",
+                "rich capabilities are disabled",
+            ),
+            (
+                ErrorCode::ResourceUnavailable,
+                "12 actions are being prepared already, and this one was not reached in time",
+                "are being prepared already",
+            ),
+            (
+                ErrorCode::UnsupportedCapability,
+                "summarise offers an attachment and its package declares no attachments",
+                "package declares no attachments",
+            ),
+            (
+                ErrorCode::UnsupportedCapability,
+                "summarise's package inserts an attachment by Paste, and a worker offers one \
+                 only by an upload to the upstream",
+                "inserts an attachment in a way a worker does not offer",
+            ),
+        ] {
+            let told = told_on(Method::PluginActionInvoke, code, said);
+            assert_eq!(told.code, code, "{said}");
+            assert!(told.message.contains(kind), "{said}: {told:?}");
+            assert!(
+                !told.message.contains("marguerite") && !told.message.contains("summarise"),
+                "{said}: {told:?}"
+            );
+        }
+        // The host's own sentences, which say nothing of the runtime's words, are told as they are.
+        for (code, said) in [
+            (
+                ErrorCode::ResourceUnavailable,
+                "the plugin runtime is not connected",
+            ),
+            (
+                ErrorCode::UnsupportedCapability,
+                "the component is disabled; the runtime's words are withheld for privacy mode",
+            ),
+            (
+                ErrorCode::ResourceUnavailable,
+                "the plugin runtime refused to ask the component to prepare the action; its \
+                 words are withheld for privacy mode",
+            ),
+            (
+                ErrorCode::UnsupportedCapability,
+                "this worker has no control daemon to read a draft from",
+            ),
+            (
+                ErrorCode::ResourceUnavailable,
+                "reports of earlier offers are still waiting for the control daemon",
+            ),
+            (
+                ErrorCode::ResourceUnavailable,
+                "preparations are no longer accepted",
+            ),
+            (
+                ErrorCode::ResourceUnavailable,
+                "the time to prepare this action ran out before the component was asked",
+            ),
+        ] {
+            assert_eq!(
+                told_on(Method::PluginActionInvoke, code, said).message,
+                said
+            );
+        }
+    }
+
+    #[test]
+    fn the_useful_reasons_for_refusing_the_arguments_of_an_action_are_told_without_the_arguments() {
+        for (said, kind) in [
+            (
+                "summarise's parameters: the required parameter depth is absent",
+                "requires is absent",
+            ),
+            (
+                "summarise's parameters: the value of depth is outside its declared bound",
+                "outside the bound",
+            ),
+            (
+                "summarise's parameters: the parameter depth is supplied more than once",
+                "supplied more than once",
+            ),
+            (
+                "summarise's parameters name a member more than once, and two readers of them \
+                 could disagree",
+                "name a member more than once",
+            ),
+            (
+                "summarise's parameters: the parameter depth does not accept this value",
+                "does not accept the value",
+            ),
+            (
+                "summarise names no attachment to offer",
+                "names no attachment",
+            ),
+            (
+                "summarise is not prepared by a component",
+                "not prepared by a component",
+            ),
+        ] {
+            let told = told_on(Method::PluginActionInvoke, ErrorCode::InvalidArgument, said);
+            assert_eq!(told.code, ErrorCode::InvalidArgument, "{said}");
+            assert!(told.message.contains(kind), "{said}: {told:?}");
+            assert!(
+                !told.message.contains("depth") && !told.message.contains("summarise"),
+                "{said}: {told:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_candidate_is_told_nothing_of_the_rendezvous_setting_either() {
+        let peer = ConnectionPeer::new(
+            kr_protocol::scalars::EndpointKey::from_bytes([1; 32]),
+            false,
+            kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
+        );
+        let refused = ForACandidate(Arc::new(Failing(error(
+            ErrorCode::RendezvousConfigError,
+            "the rendezvous setting is malformed",
+        ))))
+        .call(PairingMethod::Status, &peer, &ParamsValue::empty())
+        .expect_err("the surface fails");
+        assert!(!refused.message.contains("malformed"), "{refused:?}");
+        assert_eq!(refused.code, ErrorCode::RendezvousConfigError);
     }
 }

@@ -415,10 +415,16 @@ impl RemoteConnection {
                         Err(error) => return failure(request_id, error),
                     }
                 }
-                ControlFrame::Response(Response {
-                    request_id,
-                    outcome: answered.response.outcome,
-                })
+                // What an agent said in refusing what a device put to it is the agent's, not this
+                // host's. It is held where the worker's answer arrives, so the daemon's own
+                // refusals of the same call are told as they are written.
+                super::super::device_errors::upstream_words(
+                    answering,
+                    ControlFrame::Response(Response {
+                        request_id,
+                        outcome: answered.response.outcome,
+                    }),
+                )
             }
             Ok(Err(error)) => failure(request_id, error.to_protocol_error()),
             Err(_) => failure(request_id, outcome_unknown()),

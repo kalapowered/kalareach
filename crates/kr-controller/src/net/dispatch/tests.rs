@@ -5842,6 +5842,66 @@ async fn an_agents_refusal_of_what_a_device_put_to_it_is_not_shown_to_the_device
     world.serving.abort();
 }
 
+/// What this daemon says in refusing what a device put to the agent of a session is the daemon's
+/// own sentence, and the device is told it as it is written; only what the agent said is replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_daemons_own_refusal_of_what_a_device_put_to_an_agent_reaches_it_as_written() {
+    use std::sync::Arc;
+
+    use kr_protocol::agent::{AgentCancelParams, AgentMutationTarget, AgentSubject};
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    let world = answering_worker(Arc::new(|_| None), Arc::default(), reads_scopes()).await;
+    let controller = &world.controller;
+    fake::acknowledged(controller, world.session_id);
+    let connection = super::RemoteConnection::for_test(
+        controller,
+        paired(controller, 16, |grant| {
+            grant.actions = [ActionRight::SessionView, ActionRight::AgentCancel]
+                .into_iter()
+                .collect();
+        }),
+    );
+    let mut cancel = device_mutation(
+        &world,
+        &connection,
+        Method::AgentTurnCancel,
+        1,
+        ParamsValue::from_typed(&AgentCancelParams {
+            target: AgentMutationTarget {
+                subject: AgentSubject {
+                    session_id: world.session_id,
+                    application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                        Uuid::from_bytes([5; 16]),
+                    ),
+                },
+                binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+            },
+            turn_id: kr_protocol::ids::AgentTurnId::new("turn-1").expect("a turn"),
+        })
+        .expect("encodes"),
+    );
+    // A lifetime longer than any mutation may ask for is the daemon's own refusal, made before
+    // the worker is asked anything.
+    cancel.requested_ttl_ms =
+        kr_protocol::scalars::DurationMs::new(kr_protocol::limits::MAX_MUTATION_TTL.get() + 1);
+    let answer = connection
+        .answer_now(ControlFrame::Mutation(Box::new(cancel)))
+        .await
+        .expect("the cancellation is answered");
+    let told = error_of(answer.frame());
+    assert_eq!(told.code, ErrorCode::InvalidArgument, "{told:?}");
+    assert!(
+        told.message.contains("a mutation lifetime is at most"),
+        "{told:?}"
+    );
+    world.serving.abort();
+}
+
 /// What a closure left behind and could not establish, when it names the host, reaches a device as
 /// the kind of thing it was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
