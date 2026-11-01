@@ -113,6 +113,16 @@ const SAME: &[Same] = &[
              writes it, and this build reads a record without it as one that records no such \
              work, so what that level writes is read as before.",
     },
+    Same {
+        root: "Sentence",
+        digest: "423f7e31f152001115ead12955b5c3e2eb0b960ddf22eaf43497f413300ae634",
+        reason: "Only a row of the export table changed: the class of a desktop context's account \
+                 number is a name where it was a number, so a sentence that quoted the field \
+                 would withhold it. No sentence quotes it, and the export of a desktop context \
+                 writes the number as none. The retained level carries no desktop context, so \
+                 nothing it reads or writes changes, and the rules by which a sentence is read \
+                 are as that level has them.",
+    },
 ];
 
 /// The rules of the surface, as the roots the walker follows them from:
