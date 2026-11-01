@@ -1,7 +1,7 @@
 {
   "name": "console-legacy-input",
   "profile": "kr-vt/1",
-  "description": "KR-REQ-08.53. The legacy VT input a session is sent for the console's key records when its backend did not ask for them, written by hand from xterm's control sequence documentation and the console API's key state, except the records of Alt and 0233 in Windows Terminal and of U+1F600 written to a console as text, which were recorded from Windows Server 2025 build 26100. Every field of every record is written. A case with `bytes` is the exact spelling, and an empty `bytes` is a record that spells nothing; a case with `refused` is a write the worker must not spell, because the application negotiated an encoding legacy input cannot express. `keyboard` is the session's state: DEC mode 1, and the keyboard protocol negotiated. The records have the six fields `input-encodings.json` gives each of its own.",
+  "description": "KR-REQ-08.53. The legacy VT input a session is sent for the console's key records when its backend did not ask for them, written by hand from xterm's control sequence documentation and the console API's key state, except the records of Alt and 0233 in Windows Terminal 1.24 and of U+1F600 written to a console as text, which were recorded from Windows Server 2025 build 26100, as the `why` of each such case says. Every field of every record is written. A case with `bytes` is the exact spelling, and an empty `bytes` is a record that spells nothing; a case with `refused` is a write the worker must not spell, because the application negotiated an encoding legacy input cannot express. `keyboard` is the session's state: DEC mode 1, and the keyboard protocol negotiated. The records have the six fields `input-encodings.json` gives each of its own.",
   "cases": [
     {
       "id": "text-repeated",
@@ -378,7 +378,7 @@
     {
       "id": "alt-keypad-composed-surrogate-halves-are-one-character",
       "covers": "KR-REQ-08.53",
-      "why": "A character outside the basic plane that is written to a console as text (here U+1F600) is twelve records, six for each half: the Alt going down, the keypad digits 6 and 3 going down and coming up, and the Alt coming up with the half and no modifier in its state. The halves are one character, and the Alt and the digits spell nothing.",
+      "why": "Recorded from Windows Server 2025 build 26100 with U+1F600 written to a pseudo-console as UTF-8 and pasted into a classic console. A character outside the basic plane that is written to a console as text (here U+1F600) is twelve records, six for each half: the Alt going down, the keypad digits 6 and 3 going down and coming up, and the Alt coming up with the half and no modifier in its state. The halves are one character, and the Alt and the digits spell nothing.",
       "keyboard": {
         "application_cursor_keys": false,
         "negotiated": "legacy"
@@ -486,7 +486,7 @@
     {
       "id": "alt-keypad-composed-surrogate-pair-is-repeated-as-one-character",
       "covers": "KR-REQ-08.53",
-      "why": "The repeat count of the record that carries the second half repeats the pair as one character, not the second half alone.",
+      "why": "The records of the pair are the recorded ones; the repeat count of the second half is written by hand, since no console was seen to repeat it. The repeat count of the record that carries the second half repeats the pair as one character, not the second half alone.",
       "keyboard": {
         "application_cursor_keys": false,
         "negotiated": "legacy"
@@ -594,7 +594,7 @@
     {
       "id": "alt-keypad-composed-character-in-windows-terminal-is-the-character-once",
       "covers": "KR-REQ-08.53",
-      "why": "Windows Terminal sends Alt and 0233 as the Alt going down with no character and then the character on a key going down and coming up with no virtual key, no scan code and no modifier. It is spelled once, and the Alt spells nothing.",
+      "why": "Recorded from Windows Terminal 1.24 on Windows Server 2025 build 26100, with the keys sent by SendInput. Windows Terminal sends Alt and 0233 as the Alt going down with no character and then the character on a key going down and coming up with no virtual key, no scan code and no modifier. It is spelled once, and the Alt spells nothing.",
       "keyboard": {
         "application_cursor_keys": false,
         "negotiated": "legacy"
@@ -630,7 +630,7 @@
     {
       "id": "alt-keypad-composed-pair-between-text-keeps-the-order",
       "covers": "KR-REQ-08.53",
-      "why": "A pair composed with Alt between two letters, one after another, is one character in its place.",
+      "why": "The records of the pair are the recorded ones; the records of the letters are written by hand. A pair composed with Alt between two letters, one after another, is one character in its place.",
       "keyboard": {
         "application_cursor_keys": false,
         "negotiated": "legacy"
@@ -770,7 +770,7 @@
     {
       "id": "shift-between-the-halves-of-a-character-changes-nothing",
       "covers": "KR-REQ-08.53",
-      "why": "A key that spells nothing between the halves of a character does not end the character.",
+      "why": "Written by hand. A key that spells nothing between the halves of a character does not end the character.",
       "keyboard": {
         "application_cursor_keys": false,
         "negotiated": "legacy"
