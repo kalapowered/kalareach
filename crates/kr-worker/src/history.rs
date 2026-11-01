@@ -254,6 +254,10 @@ pub struct OutputHistory {
     /// made to take it after another pass has removed output, holding the reading it made before.
     #[cfg(test)]
     before_host_cap_lock: Option<TestHook>,
+    /// Called by a test just before a pass gives up output for a byte cap, so that it can look at
+    /// what the pass holds while the output goes.
+    #[cfg(test)]
+    while_giving_up_for_a_cap: Option<TestHook>,
 }
 
 /// A call a test makes at a point of a pass.
@@ -337,6 +341,8 @@ impl OutputHistory {
             after_host_reading: None,
             #[cfg(test)]
             before_host_cap_lock: None,
+            #[cfg(test)]
+            while_giving_up_for_a_cap: None,
         }
     }
 
@@ -968,6 +974,10 @@ impl OutputHistory {
                 RetentionLimit::SessionCap
             };
             let start = spool.oldest_cursor().unwrap_or(self.resident_start);
+            #[cfg(test)]
+            if let Some(hook) = self.while_giving_up_for_a_cap.as_ref() {
+                (hook.0)();
+            }
             let (dropped, left_behind) = spool.drop_at_least(over);
             if dropped > 0 {
                 let after = spool.oldest_cursor().unwrap_or(self.resident_start);
@@ -4401,6 +4411,67 @@ mod tests {
         assert!(
             !root.join("host-cap.lock").exists(),
             "and it took no lock to find that out"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// KR-REQ-20.20: the lock on the host's cap is held while the session gives up output for it,
+    /// so that no other session gives up output for the same excess meanwhile, and is let go once
+    /// the output has gone.
+    #[test]
+    fn a_session_holds_the_host_cap_lock_while_it_gives_up_output_for_the_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = spool_directory("host-cap-held-while-removing");
+        let retention = OutputRetention::new(
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            100,
+            1 << 20,
+        );
+        let layout = || SpoolLayout::new(8, 1 << 20);
+        let mut other =
+            OutputHistory::with_spool(8, root.join("other.log"), layout()).expect("a spool");
+        other.append(&[b'o'; 80]);
+        let mut this =
+            OutputHistory::with_spool(8, root.join("this.log"), layout()).expect("a spool");
+        this.append(&[b't'; 64]);
+
+        // Another session's handle on the lock file, which asks for the lock as output goes.
+        let asking = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(HOST_CAP_LOCK))
+            .expect("the lock file");
+        let asked = Arc::new(AtomicUsize::new(0));
+        let hook_asking = asking.try_clone().expect("a second handle");
+        this.while_giving_up_for_a_cap = Some(TestHook(Arc::new({
+            let asked = Arc::clone(&asked);
+            move || {
+                asked.fetch_add(1, Ordering::SeqCst);
+                let got = kr_flush::lock::try_exclusive(&hook_asking);
+                assert!(
+                    matches!(got, Err(std::fs::TryLockError::WouldBlock)),
+                    "no other session can take the lock while output goes for the cap: {got:?}"
+                );
+            }
+        })));
+
+        let given_up: u64 = this
+            .apply_retention_to_host(&root, retention, kr_ipc::now_ms(), true)
+            .iter()
+            .map(|eviction| eviction.bytes)
+            .sum();
+        assert_eq!(given_up, 48, "the 44 the host is over by, to the segment");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "and the other session asked while it went"
+        );
+        assert!(
+            kr_flush::lock::try_exclusive(&asking).is_ok(),
+            "the lock is let go once the output has gone"
         );
         std::fs::remove_dir_all(&root).ok();
     }
