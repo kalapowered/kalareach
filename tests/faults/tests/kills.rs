@@ -758,6 +758,13 @@ impl Host {
     /// it is attached and holds the input lease, as a connection of its own that attaches to
     /// nothing reads the session's state. The programs run are the built `kr` and its guard, copied
     /// to the internal disk with everything else a launched process touches.
+    ///
+    /// The command asks its terminal what it is and gives up on the answer after one second. A host
+    /// that is slow to run the thread that answers can make it refuse a terminal that was never at
+    /// fault, which is a failure of this setup and no verdict on what the case does after it. A
+    /// refusal that says so is therefore followed by another start on a fresh pseudo-terminal, and
+    /// the starts together are bounded by [`LIVENESS`]. The case goes on only once the command is
+    /// attached.
     async fn attach_process(
         &self,
         session_id: SessionId,
@@ -795,6 +802,42 @@ impl Host {
             version_of("kr-attach-guard"),
             "`kr` and its guard report different versions; build both with `cargo build -p kr-cli`"
         );
+        let limit = tokio::time::Instant::now() + LIVENESS;
+        let mut starts = 0_u32;
+        loop {
+            starts += 1;
+            match self
+                .start_attach(&kr, session_id, work, dimensions, limit, starts)
+                .await
+            {
+                Start::Attached(attach) => return attach,
+                Start::Refused(shown) => {
+                    assert!(
+                        tokio::time::Instant::now() < limit,
+                        "`kr attach` was refused its terminal {starts} times within {LIVENESS:?}; \
+                         the last terminal was sent: {shown}"
+                    );
+                    eprintln!(
+                        "start {starts} of `kr attach` was refused its terminal because the \
+                         probe's second passed; starting it again on a fresh one; the terminal was \
+                         sent: {shown}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// One start of the built `kr attach` on a pseudo-terminal of its own, up to `limit`: attached
+    /// and holding the keys, or refused its terminal because the probe's second passed.
+    async fn start_attach(
+        &self,
+        kr: &Path,
+        session_id: SessionId,
+        work: &Path,
+        dimensions: Dimensions,
+        limit: tokio::time::Instant,
+        start: u32,
+    ) -> Start {
         let pty = portable_pty::native_pty_system()
             // The session's own size: a terminal of another size is drawn a window of the screen,
             // and every terminal of the session is then sent screens in place of the application's
@@ -843,8 +886,9 @@ impl Host {
         // The command asks the terminal what it is as soon as it starts, and gives up on an answer
         // after one second. The thread that answers is therefore running before the command
         // exists: started after it, a delay of a second between the two would make `kr attach`
-        // refuse a terminal that was never at fault, and the case would fail before it reached the
-        // kill.
+        // refuse a terminal that was never at fault. A delay of that length after the thread has
+        // read the question is not prevented by the order, and `attach_process` starts the
+        // command again on a fresh terminal when it is refused for it.
         ready
             .recv_timeout(LIVENESS)
             .expect("the thread that answers the command's terminal queries started");
@@ -868,26 +912,48 @@ impl Host {
             shown,
             _terminal: pty.master,
         };
-        let pid = until("the shell to start the attach command", || {
-            child_running(shell_pid, &kr)
-        })
-        .await;
-        attach.attach = Some(process_start_identity(pid).expect("the attach process's identity"));
-        let started = tokio::time::Instant::now();
+        let mut state = String::from("the shell has not started `kr attach`");
         loop {
-            let snapshot = self.snapshot_of(session_id).await;
-            if snapshot.attachments.len() == 2 && snapshot.lease.holder.0.is_some() {
-                return attach;
+            // The command that a refused terminal ends may be gone before it is looked for, so its
+            // refusal is read from what the terminal was sent as well.
+            if attach.attach.is_none()
+                && let Some(pid) = child_running(shell_pid, kr)
+            {
+                attach.attach = process_start_identity(pid).ok();
+            }
+            if attach.attach.is_some() {
+                let read = self.snapshot_of(session_id).await;
+                if read.attachments.len() == 2 && read.lease.holder.0.is_some() {
+                    return Start::Attached(attach);
+                }
+                state = format!("{read:?}");
+            }
+            let shown = attach.shown();
+            if shown.contains(PROBE_TIMED_OUT) {
+                return Start::Refused(shown);
             }
             assert!(
-                started.elapsed() < LIVENESS,
-                "`kr attach` was not attached and holding the keys within {LIVENESS:?}: {snapshot:?}; \
-                 the terminal was sent: {}",
-                attach.shown()
+                tokio::time::Instant::now() < limit,
+                "`kr attach` was not attached and holding the keys within {LIVENESS:?} (start \
+                 {start}): {state}; the terminal was sent: {shown}"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
+}
+
+/// What `kr attach` says when the probe's one second passed before the terminal had answered what
+/// it was asked: the one refusal of a terminal that is about the answers arriving late, and so
+/// about how soon the host ran the thread that gives them, and not about the command.
+const PROBE_TIMED_OUT: &str = "the one-second bound passed with answers outstanding";
+
+/// How one start of `kr attach` ended.
+enum Start {
+    /// It is attached and holds the keys.
+    Attached(AttachProcess),
+    /// It was refused its terminal because the probe's second passed. What the terminal was sent
+    /// is kept for the failure of a setup that never gets past it.
+    Refused(String),
 }
 
 /// The client half this test started, killed however the test ends.
