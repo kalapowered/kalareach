@@ -311,8 +311,8 @@ fn a_dispatched_job_carries_the_thread_count_and_bounds_the_profile_records() {
 }
 
 /// KR-REQ-22.10: a job is held to four threads, a context of 4,096 tokens and at most 128 tokens of
-/// output, whatever a profile asks for. The control is a profile that asks for fewer threads, which
-/// is given what it asked for.
+/// output, whatever a profile asks for. The controls are a profile that asks for fewer threads and
+/// one that asks for a smaller window and a shorter answer, each given what it asked for.
 #[test]
 fn a_profile_that_asks_for_more_is_held_to_four_threads_4096_tokens_and_128_of_output() {
     let job_of = |edits: &[(&str, &str)]| {
@@ -342,6 +342,12 @@ fn a_profile_that_asks_for_more_is_held_to_four_threads_4096_tokens_and_128_of_o
 
     let asking_for_less = job_of(&[("\"cpu_threads\": 4", "\"cpu_threads\": 2")]);
     assert_eq!(asking_for_less.cpu_threads, 2);
+    let asking_for_a_smaller_job = job_of(&[
+        ("\"context_tokens\": 4096", "\"context_tokens\": 3072"),
+        ("\"max_output_tokens\": 128", "\"max_output_tokens\": 96"),
+    ]);
+    assert_eq!(asking_for_a_smaller_job.context_tokens, 3_072);
+    assert_eq!(asking_for_a_smaller_job.max_output_tokens, 96);
 }
 
 /// KR-REQ-22.10: a change to a session's context settles into a job two seconds after the change,
