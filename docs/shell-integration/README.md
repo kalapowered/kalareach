@@ -14,7 +14,7 @@ against their own readers:
 | Zsh 5.9+ | `key_sequence_boundary_mailbox`: the published ZLE patch checks a mailbox at key-sequence boundaries, with immediate line acceptance and non-destructive cancellation | `native_hook`, in the same patch, immediately before ZLE's empty-EOF branch |
 | Bash 5.2+ | `idle_reader_mailbox`: the published patch to the bundled Readline runs a callback after buffered input is consumed | `native_hook`, immediately before Readline's own EOF decision, after the next character has been selected |
 | Fish 4.x | `reader_event_bridge` against the Rust reader | `named_reader_binding`: a named binding that receives the actual reader context |
-| PowerShell 7.4+ | `reader_thread_queue`: the qualified PSReadLine module's request queue and signal | `reader_state_handler` over PSReadLine's buffer and invocation state, under the terminal's end-of-file character (a Windows console has none, so there the module reports no gesture); in the Vi edit mode the module binds into the insert table only |
+| PowerShell 7.4+ (7.5+ on Linux and macOS, see [PSReadLine](#psreadline)) | `reader_thread_queue`: the qualified PSReadLine module's request queue and signal | `reader_state_handler` over PSReadLine's buffer and invocation state, under the terminal's end-of-file character (a Windows console has none, so there the module reports no gesture); in the Vi edit mode the module binds into the insert table only |
 
 The mechanisms are per package, and the handshake checks them that way: a declaration naming another
 shell's mailbox or pre-EOF mechanism describes a reader this package does not have.
@@ -899,7 +899,7 @@ method, and that is exactly what it cannot do:
   where the module reads its mailbox (the first point above), against the state it has then.
 - **The buffer belongs to the read that is in progress.** Between one line being accepted and the
   next read starting, the editor still holds the line that has gone; the module reports the buffer
-  it is about to have, which is empty, and counts no change the person did not make.
+  it is about to have, which is empty, and does not read the line that has gone as that buffer.
 - **Bytes ahead of the cursor reply are read as part of it.** After its prompt the editor asks the
   terminal where the cursor is (`CSI 6 n`), and the .NET runtime reads the reply from the same
   input as everything else the terminal sends, one byte at a time. It anchors on the first `;` and
