@@ -26,18 +26,6 @@ use super::{RemoteConnection, failure, outcome_unknown};
 /// answering is told, and the effect goes on to whatever end it reaches.
 pub const EFFECT_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
 
-/// The wait the daemon being started holds: [`EFFECT_WAIT`], or the one a suite gave it.
-#[cfg(not(any(test, feature = "testing")))]
-pub(crate) fn effect_wait_for_start() -> std::time::Duration {
-    EFFECT_WAIT
-}
-
-/// The wait the daemon being started holds: [`EFFECT_WAIT`], or the one a suite gave it.
-#[cfg(any(test, feature = "testing"))]
-pub(crate) fn effect_wait_for_start() -> std::time::Duration {
-    crate::testing::effect_wait().unwrap_or(EFFECT_WAIT)
-}
-
 /// How this host answers one read a paired device may make: which service answers it, or the
 /// reason it is refused.
 ///

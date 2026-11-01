@@ -721,7 +721,9 @@ pub struct Controller {
     /// origin an owed revocation is asked at when no credential is held for it. Read once at start.
     gateway_origin: String,
     /// How long a paired device's request waits for its effect before it is told the outcome is
-    /// unknown. Read once at start.
+    /// unknown, where a suite gave this host's daemon a wait of its own. Read once at start.
+    /// Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
     effect_wait: std::time::Duration,
     /// The paired devices, for the device method group.
     ///
@@ -1139,10 +1141,19 @@ impl Controller {
     }
 
     /// How long a paired device's request waits for its effect before it is told the outcome is
-    /// unknown.
+    /// unknown: the wait a suite gave this daemon.
+    #[cfg(feature = "testing")]
     #[must_use]
     pub(crate) const fn effect_wait(&self) -> std::time::Duration {
         self.effect_wait
+    }
+
+    /// How long a paired device's request waits for its effect before it is told the outcome is
+    /// unknown: [`net::dispatch::EFFECT_WAIT`], in every shipped build.
+    #[cfg(not(feature = "testing"))]
+    #[must_use]
+    pub(crate) const fn effect_wait(&self) -> std::time::Duration {
+        net::dispatch::EFFECT_WAIT
     }
 
     /// Returns the loop that drives delivery, and the credentials it delivers under.
