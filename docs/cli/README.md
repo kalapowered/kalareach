@@ -175,7 +175,8 @@ The part of the command that reads the terminal's keys while the session is atta
 terminal and for a pipe at once, and the end of the attachment closes the pipe. That part has ended
 before the wait begins, whether the command reads the terminal through its standard input or through
 `/dev/tty`, on macOS and on Linux, so the first key pressed is the wait's and not one the attachment
-read and dropped.
+read and dropped. The one exception is a terminal that another process reads as well: the command
+does not wait more than a second for a reader that process kept in a read, and says nothing of it.
 
 It waits only when standard input and standard output are terminals and the run is not `--json`.
 Anywhere else it never waits, so a script that reads the output of `kr new` does not stop for a key

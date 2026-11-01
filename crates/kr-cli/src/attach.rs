@@ -815,7 +815,8 @@ const CANCEL_AFTER: std::time::Duration = std::time::Duration::from_millis(10);
 ///
 /// Only the reader of a Windows console learns anything. A Unix reader hands every key it reads to
 /// the channel before it looks again, and the stop ends it before it returns, so there is nothing
-/// to say.
+/// to say; the one thread it leaves is the one inside a read of a terminal that another process
+/// also reads, and the stop does not wait for that for good.
 #[derive(Debug, Default)]
 pub struct Stopped {
     /// Whether the reader was still running when the stop gave up waiting for it, so that it may
@@ -1195,9 +1196,10 @@ impl std::fmt::Debug for TerminalInput {
 /// input. [`InputStop::stop`] closes the pipe's other end, which wakes the thread wherever it is
 /// waiting, so the thread has ended by the time the stop returns and is never inside a read that
 /// the next key typed would end. That holds for every way this command gets its terminal, an open
-/// of `/dev/tty` included. The thread also ends when the terminal's input does, and when a batch
-/// has nowhere to go: dropping the receiver alone does not end it, and the thread takes the next
-/// key for itself.
+/// of `/dev/tty` included, unless another process reads the same terminal and takes the input the
+/// thread was told was there, which leaves the thread in a read the stop does not wait for. The
+/// thread also ends when the terminal's input does, and when a batch has nowhere to go: dropping
+/// the receiver alone does not end it, and the thread takes the next key for itself.
 ///
 /// # Errors
 ///
@@ -1212,13 +1214,18 @@ pub fn spawn_input_reader(
     InputStop,
 )> {
     // Nothing is ever written to the pipe: closing its write end, which `InputStop::stop` does, is
-    // what wakes the thread.
-    let (woken, wake) = rustix::pipe::pipe().map_err(|error| {
+    // what wakes the thread. Both ends close when a program is started, so that a child never
+    // holds the write end open and keeps the stop from waking the thread.
+    let (woken, wake) = std::io::pipe().map_err(|error| {
         CliError::Terminal(shown!(
             "make the pipe that ends the reading of the terminal's keys: {}",
-            crate::shown::errno(error)
+            Shown::io(&error)
         ))
     })?;
+    let (woken, wake) = (
+        std::os::fd::OwnedFd::from(woken),
+        std::os::fd::OwnedFd::from(wake),
+    );
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     // Dropped as the last thing the thread does, which is how the stop sees the thread has ended.
     let (ended_by, ended) = std::sync::mpsc::channel::<()>();
@@ -1390,7 +1397,7 @@ pub struct InputStop {
 
 #[cfg(unix)]
 impl InputStop {
-    /// Ends the thread, which has ended when this returns.
+    /// Ends the thread, which has ended when this returns, except as the end of this says.
     ///
     /// The thread is waiting for the terminal and the pipe together, or has read what the terminal
     /// had and is about to look again, so closing the pipe ends it a moment later, and a key typed
