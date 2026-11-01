@@ -137,7 +137,7 @@ anything is assembled or signed. The Developer ID signature is put on the progra
 startup customisations are pinned for two of the four targets (Apple silicon macOS and x86-64
 Linux); they run in no release-tree job, and the Apple silicon pins run in no workflow. A Windows
 release tree carries the PowerShell package as plain files, which `kr-release` holds to the
-repository's; no step of the Windows release workflow requalifies it. Its qualification runs in the
+repository's; no step of the Windows release workflow requalifies it. No macOS or Linux release tree carries the PowerShell package, and no Windows host release is published, so no published release carries it. Its qualification runs in the
 core workflow, on x86-64 Linux against a pinned PowerShell and in the Windows jobs against the
 PowerShell the runner has. No release workflow reads the core workflow's result for the commit it
 builds, so the whole corpus is not a gate of a release tree.
@@ -213,6 +213,7 @@ date, with the choices above) or `not-affected`. `not-affected` speaks of the pi
 | 2026-11-01 | zsh-5.9.1, the first release after 5.9; released 2026-05-31 | zsh | The package rebuilt from the 5.9.2 sources, which carry every fix of 5.9.1, is published in the tester pre-release host/v0.1.0+8cd1adf5c8bf of 2026-10-30, after its target. That release's signed `release.json` names the zsh package at 5.9.2 under the identity a9d36dc99bd5c5bb on both macOS targets and 93588a6b82b922a9 on both Linux targets. | 2026-06-14 | released |
 | 2026-11-01 | zsh-5.9.2, the newest release; released 2026-07-12 | zsh | The package built from the 5.9.2 sources is published in the tester pre-release host/v0.1.0+8cd1adf5c8bf of 2026-10-30, after its target. That release's signed `release.json` names the zsh package at 5.9.2 under the identity a9d36dc99bd5c5bb on both macOS targets and 93588a6b82b922a9 on both Linux targets. | 2026-07-26 | released |
 | 2026-11-01 | bash-5.3, the series after 5.2, and its patches bash53-001 to bash53-020; released 2025-07-05 | bash | The package rebuilt from the 5.3 sources with all twenty patches is published in the tester pre-release host/v0.1.0+8cd1adf5c8bf of 2026-10-30, after its target. That release's signed `release.json` names the bash package at 5.3.20 under the identity 3fed963d0d807f26 on both macOS targets and b2a023fa2fb93a4e on both Linux targets. | 2025-07-19 | released |
+| 2026-11-01 | The PowerShell package, whose module refuses the PowerShell releases and .NET runtimes that the advisories above affect | psreadline | No published release carries the PowerShell package: a macOS or Linux release tree holds none, and no Windows host release is published. The module with the bounds of the rows above is qualified in the core workflow against a pinned PowerShell and reaches people only from a checkout, so the package is past its target and flagged. The choices: keep the pinned package, run that shell in `native_compat`, or run a different managed shell. | 2026-10-27 | flagged |
 <!-- /kr:triage -->
 
 ## The .NET servicing of 2026-10-13
