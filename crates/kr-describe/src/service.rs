@@ -2355,11 +2355,9 @@ impl DescriptionService {
                     return self.requeue_unless_cancelled(dispatched);
                 }
                 // The daemon's request at the deadline is the only thing that stopped it: a caller
-                // who cancelled it, or a stop of the service's own, has it end cancelled.
-                if dispatched.deadline_stop
-                    && stopped(&dispatched).is_none()
-                    && !self.cancelled_by_caller(&dispatched)
-                {
+                // who cancelled it (which cancels the job's token at once, before any turn), or a
+                // stop of the service's own, has it end cancelled.
+                if dispatched.deadline_stop && stopped(&dispatched).is_none() {
                     self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
                     self.restart.late(now);
                     return Outcome::DeadlineExceeded { session_id };

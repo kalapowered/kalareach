@@ -269,14 +269,11 @@ struct Running {
 }
 
 impl Running {
-    /// Whether the control thread has said it has read a request to stop the job in hand: the
-    /// daemon's own at the deadline, or a caller's.
+    /// Whether the control thread has said it has read the daemon's request, at the deadline, to
+    /// stop the job in hand.
     fn job_stop_read(&self, id: u64) -> bool {
         self.job_stop
             .is_some_and(|stop| stop.id == id && stop.asked && stop.acknowledged)
-            || self
-                .cancel
-                .is_some_and(|cancel| cancel.id == id && cancel.acknowledged)
     }
 
     /// When the work in hand has run too long: its deadline and the grace after it, or for a job

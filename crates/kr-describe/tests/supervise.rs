@@ -894,8 +894,8 @@ fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_
         .expect("a turn");
     assert!(!the_process_ended(&reports), "{reports:?}");
     assert_eq!(rig.driver.pid(), pid);
-    // At the deadline's grace the process is left alone: the caller's cancellation was read, and
-    // the daemon's own request at the deadline, made in this turn, has had no time to be.
+    // The first turn past the deadline asks the job to stop, and does not end the process for the
+    // grace: the process has had no time to answer, and the grace counts from the request.
     let reports = rig
         .driver
         .turn(&roomy(), at(3_000 + DEADLINE_MS + ANSWER_GRACE_MS))
