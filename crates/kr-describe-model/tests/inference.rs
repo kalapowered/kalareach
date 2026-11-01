@@ -434,6 +434,14 @@ fn the_largest_contexts_are_sent_to_the_real_process_and_none_is_refused_for_its
 /// the job to its end would answer `produced`: the daemon's outcome would still be a cancellation,
 /// because the daemon's own token is cancelled, so only the process's answer tells the two apart.
 /// Spoken to over its own pipes, as the daemon's driver speaks to it.
+///
+/// What it does not show, in two ways. The real process leaves no mark when its model begins a job,
+/// so the wait before the cancellation stands for the model's entry and does not prove it: a host
+/// that starts the model thread later than the wait gets the same answer from the process's own
+/// check before the model begins, and the case passes without the model having looked at its
+/// token. And the one cancellation lands in one phase of the job, the prompt's chunks or the
+/// output's tokens, so only the check of the phase it lands in is exercised: a model that dropped
+/// the check of the other phase would pass.
 #[test]
 fn the_real_model_stops_a_job_it_is_told_to_cancel() {
     let Some(placed) = Placed::real_weights("the_real_model_stops_a_job_it_is_told_to_cancel")
@@ -530,7 +538,8 @@ fn the_real_model_stops_a_job_it_is_told_to_cancel() {
         deadline_ms: U64::new(u64::try_from(CANCEL_HUNG.as_millis()).unwrap_or(u64::MAX)),
         ceiling_bytes: U64::new(4 * GIB),
     });
-    // Long enough for the model thread to be inside the job, well short of the job's end.
+    // Stands for the model thread being inside the job, well short of the job's end: the process
+    // leaves no mark of it, so nothing here shows that the model had begun.
     std::thread::sleep(Duration::from_millis(500));
     send(&Request::Cancel { id: U64::new(2) });
     let asked = Instant::now();
