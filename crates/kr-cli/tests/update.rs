@@ -208,6 +208,60 @@ fn no_program_of_a_release_being_removed_starts() {
     );
 }
 
+/// KR-REQ-27.05, full disks: the bridge of a release that is being removed refuses to start, and
+/// when standard error has no room to say why, nothing is written on standard output, which a
+/// bridge's invoker reads as frames. The refusal comes before the command line is read, so the
+/// stream is named for the bridge from the arguments alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_bridge_of_a_release_being_removed_writes_no_text_on_its_stream_when_standard_error_is_full()
+{
+    let host = Host::create();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let _installed = host.put(&one);
+    let removing = host.store.trash().join(format!("{}-leaving", one.name()));
+    one.write(&removing);
+    let kr = removing.join("bin").join(Program::Kr.file_name());
+
+    let control = host.run(&kr, &["bridge", "--stdio"]);
+    assert!(
+        !control.status.success(),
+        "a release being removed does not start"
+    );
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("is being removed from this host"),
+        "with room, it says why on standard error"
+    );
+    assert!(
+        control.stdout.is_empty(),
+        "and writes nothing on its stream"
+    );
+
+    let child = host
+        .command(&kr, &["bridge", "--stdio"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .expect("opens the device that has no room"),
+        ))
+        .spawn()
+        .unwrap_or_else(|error| panic!("{} did not start: {error}", kr.display()));
+    let refused = finish_within(child, Duration::from_secs(300));
+    assert_eq!(
+        refused.status.code(),
+        control.status.code(),
+        "it ends as it ended with room"
+    );
+    assert!(
+        refused.stdout.is_empty(),
+        "and with no room for the reason it writes no text on its stream: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+}
+
 /// KR-REQ-26.06: a daemon of a release states it, records the roots it serves, holds its release,
 /// and starts its own release's worker, which states the release too; the release stays for as
 /// long as either runs.
