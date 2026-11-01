@@ -1036,8 +1036,9 @@ fn plaintext(length: usize) -> Vec<u8> {
         .collect()
 }
 
-/// A generation admitted to a running daemon is uploaded, published and recorded as published,
-/// and the doctor says the service is reached.
+/// KR-REQ-17.14: a generation admitted to a running daemon is uploaded, published and recorded as
+/// published through the clients the daemon holds for the storage service, and the doctor says the
+/// service is reached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_generation_admitted_to_a_running_daemon_reaches_the_service_and_settles() {
     let rig = Rig::start(Arrangement::NORMAL, HeldTimer::automatic()).await;

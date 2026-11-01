@@ -916,10 +916,11 @@ async fn ready(
     (device, session, session_id, prepared)
 }
 
-/// KR-REQ-15.01 and 15.19: a host whose document names a broker reads the service's terms for a
-/// device that asks what a call would be, starts the call there under the account an operator
-/// signed in on the host and the rate the device was shown, and tells the broker when the call
-/// ends.
+/// KR-REQ-15.01, KR-REQ-15.19 and KR-REQ-17.14: a host whose document names a broker reads the
+/// service's terms for a device that asks what a call would be, starts the call there under the
+/// account an operator signed in on the host and the rate the device was shown, and tells the
+/// broker when the call ends, all through the client the daemon holds for the managed voice
+/// service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_whose_document_names_a_broker_brokers_a_call_through_it() {
     let broker = Broker::start().await;

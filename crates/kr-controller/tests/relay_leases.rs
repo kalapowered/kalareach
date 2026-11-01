@@ -820,10 +820,12 @@ fn grace_seconds(detail: &str) -> Option<u64> {
         .ok()
 }
 
-/// KR-REQ-17.40, KR-REQ-17.50, KR-REQ-17.52: an allowance that is spent is an answer about
-/// capacity and not a fault. The host holds the leases it has, issues no new one, tells the owner
-/// how much grace is left and that a direct connection and a relay of their own still work, asks
-/// again no sooner than the standing interval, and issues the lease when the allowance is back.
+/// KR-REQ-17.40, KR-REQ-17.50, KR-REQ-17.52, KR-REQ-17.14: an allowance that is spent is an answer
+/// about capacity and not a fault. The host holds the leases it has, issues no new one, tells the
+/// owner how much grace is left and that a direct connection and a relay of their own still work,
+/// asks again no sooner than the standing interval, and issues the lease when the allowance is
+/// back. The leases are asked of the client the daemon holds for the relay lease service: with a
+/// client that answers nothing in that place, the allowance is never read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_allowance_that_is_spent_is_shown_to_the_owner_and_asked_again() {
     let rig = Rig::start().await;
