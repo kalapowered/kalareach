@@ -32,10 +32,15 @@ fn a_case_that_asks_the_packages_host_starts_it_with_the_launch_environment_its_
     shellpkg::the_packages_host_is_started_with_the_launch_environment_its_record_holds();
 }
 
-/// KR-REQ-08.49: bytes the host put into the terminal are input the reader has not taken.
+/// KR-REQ-08.49: two steps and the first byte of a character, typed into the terminal of an idle
+/// editor, are input the reader has not taken, counted from the bytes the decoder holds. The editor
+/// is given no device-attributes answers here, because ahead of its cursor reply they break it; the
+/// count of what the runtime has read from the terminal and not handed on is shown by
+/// `the_reader_counts_bytes_the_runtime_has_read_from_the_terminal_as_input_it_has_not_taken`.
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
-fn the_reader_counts_what_the_host_put_into_its_terminal_as_input_it_has_not_taken() {
+fn the_reader_counts_two_steps_and_half_a_character_typed_into_its_terminal_as_input_it_has_not_taken()
+ {
     shellpkg::bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(PWSH);
 }
 

@@ -229,9 +229,9 @@ impl Package {
     /// printed `marker`, types `typed` at that terminal. Returns what the terminal showed once the
     /// host had ended.
     ///
-    /// The script reads nothing from its terminal, so what is typed stays in the terminal's queue
-    /// for as long as the script runs. A terminal is read in lines until a program says otherwise,
-    /// so `typed` is a line.
+    /// What is typed stays in the terminal's queue until the script reads it, and a script that
+    /// reads nothing leaves all of it there for as long as it runs. A terminal is read in lines
+    /// until a program says otherwise, so `typed` is a line.
     ///
     /// # Panics
     ///

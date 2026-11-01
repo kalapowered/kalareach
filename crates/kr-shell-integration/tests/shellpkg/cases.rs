@@ -429,8 +429,8 @@ pub fn a_child_shell_has_nothing_to_activate_from(kind: ShellKind) {
 /// A stop is over when the shell is stopped, not when `kill` has sent the signal: a shell that has
 /// not stopped yet reads what is typed at it and runs its keys before the request that was meant
 /// to be waiting for them is sent. The kernel tells a parent that its child has stopped only once
-/// every thread of it has, so the wait is on that report; the state `ps` shows is the main thread's
-/// alone.
+/// every thread of it has, so the wait is on that report; on Linux the state `ps` shows is the
+/// main thread's alone.
 ///
 /// # Panics
 ///
@@ -492,8 +492,8 @@ fn signal_the_shell(session: &Session, signal: &str) {
 /// is the count of the bytes the decoder holds. It draws every printable key it takes, and a draw
 /// after it was continued asks the terminal where the cursor is, from the same input its key thread
 /// is reading: the key thread takes the reply for keys, and the draw waits for good, or the draw
-/// takes keys ahead of the reply for part of it, and a device-attributes answer ahead of the reply
-/// gives .NET a column of 226222621 and the editor an exception. Its key thread also queues every
+/// takes keys ahead of the reply for part of it, and three device-attributes answers ahead of the
+/// reply give .NET a column of 226222621 and the editor an exception. Its key thread also queues every
 /// key that is waiting in the first two milliseconds, so whether the editor is at a step with
 /// input left to read depends on how fast that went. A step draws nothing, and half a character is
 /// no key at all, so it stays unread whatever the timing: the editor meets the request at a step
@@ -588,7 +588,8 @@ pub fn a_byte_waiting_in_the_terminals_queue_is_input_the_reader_has_not_taken(k
 ///
 /// # Panics
 ///
-/// Panics when the count after the key is nothing, or the terminal shows no count.
+/// Panics when the count after the key is no more than the terminal's queue alone gives, or the
+/// terminal shows no count.
 #[cfg(unix)]
 pub fn bytes_the_runtime_has_read_from_the_terminal_are_input_the_reader_has_not_taken(
     kind: ShellKind,
@@ -613,8 +614,10 @@ pub fn bytes_the_runtime_has_read_from_the_terminal_are_input_the_reader_has_not
         .nth(1)
         .and_then(|rest| rest.split(']').next())
         .and_then(|count| count.parse::<u64>().ok());
+    // The terminal's queue is one of the counts and gives at most one, so more than one is the
+    // runtime's buffer: the case fails when the reader leaves that out.
     assert!(
-        count.is_some_and(|count| count > 0),
+        count.is_some_and(|count| count > 1),
         "the answer and the line end the runtime read and has not handed on are input the reader \
          has not taken: {shown:?}"
     );
