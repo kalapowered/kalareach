@@ -609,11 +609,11 @@ impl GitProgram {
     /// # Errors
     ///
     /// Returns [`ProjectError::GitUnavailable`] when Git is not installed, cannot be resolved to
-    /// an absolute path, answers with more than it was asked, or is older than
-    /// [`MINIMUM_GIT_VERSION`]. The message ends with the step that installs Git on this platform.
-    /// Returns [`ProjectError::GitFailed`] when Git does not answer within [`PROBE_BOUND`] or the
-    /// host is short of what it needs to ask: a fault that passes, and says nothing of the Git
-    /// that was being asked.
+    /// an absolute path, answers with more than it was asked, ends and leaves its output open for
+    /// a second inside [`PROBE_BOUND`], or is older than [`MINIMUM_GIT_VERSION`]. The message ends
+    /// with the step that installs Git on this platform. Returns [`ProjectError::GitFailed`] when
+    /// Git does not answer within [`PROBE_BOUND`] or the host is short of what it needs to ask or
+    /// to resolve it: a fault that passes, and says nothing of the Git that was being asked.
     pub fn discover() -> Result<Self> {
         Self::discover_on(std::env::var_os("PATH").as_deref(), PROBE_BOUND)
     }
@@ -634,9 +634,10 @@ impl GitProgram {
     /// # Errors
     ///
     /// Returns [`ProjectError::GitUnavailable`] when the path cannot be resolved, when the answer
-    /// is more than a version and a directory, or when the version is older than
-    /// [`MINIMUM_GIT_VERSION`], and [`ProjectError::GitFailed`] when Git does not answer within
-    /// [`PROBE_BOUND`] or the host is short of what it needs to ask.
+    /// is more than a version and a directory, when Git ends and leaves its output open for a
+    /// second inside [`PROBE_BOUND`], or when the version is older than [`MINIMUM_GIT_VERSION`],
+    /// and [`ProjectError::GitFailed`] when Git does not answer within [`PROBE_BOUND`] or the host
+    /// is short of what it needs to ask or to resolve it.
     pub fn at(path: &Path) -> Result<Self> {
         Self::at_within(path, PROBE_BOUND)
     }
@@ -644,12 +645,14 @@ impl GitProgram {
     /// As [`Self::at`], giving Git `bound` in all to answer everything it is asked.
     fn at_within(path: &Path, bound: Duration) -> Result<Self> {
         let deadline = Instant::now() + bound;
-        let program = resolved(path).map_err(|error| ProjectError::GitUnavailable {
-            detail: format!(
-                "{} could not be resolved: {error}",
-                redact(&path.display().to_string())
+        let program = resolved(path).map_err(|error| {
+            could_not_resolve(
+                format!(
+                    "{} could not be resolved: {error}",
+                    redact(&path.display().to_string())
+                ),
+                &error,
             )
-            .into(),
         })?;
         if !program.is_absolute() {
             return Err(ProjectError::GitUnavailable {
@@ -681,13 +684,15 @@ impl GitProgram {
         // directory through a link has Git report its helper directory through that link, and a
         // boundary that names the directory by path is judged by the path an execution resolves
         // to: named through the link, it would name no helper Git starts from it.
-        let exec_path = resolved(&reported).map_err(|error| ProjectError::GitUnavailable {
-            detail: format!(
-                "{} reports a helper directory {} that could not be resolved: {error}",
-                redact(&program.display().to_string()),
-                redact(&reported.display().to_string())
+        let exec_path = resolved(&reported).map_err(|error| {
+            could_not_resolve(
+                format!(
+                    "{} reports a helper directory {} that could not be resolved: {error}",
+                    redact(&program.display().to_string()),
+                    redact(&reported.display().to_string())
+                ),
+                &error,
             )
-            .into(),
         })?;
         let version = ask(&program, &["--version"], deadline)
             .map_err(Asked::into_error)?
@@ -774,12 +779,13 @@ struct Installation {
 #[derive(Clone, Debug)]
 enum Unfound {
     /// There is no Git this host can run work through: none is installed, or the one that is does
-    /// not run, is too old, or answers with more than it was asked. It stays so until the host
-    /// changes, which is a host that is not set up for the work.
+    /// not run, is too old, answers with more than it was asked, or ends and leaves its output
+    /// open. It stays so until the host changes, which is a host that is not set up for the work.
     Unusable(Diagnostic),
     /// The look was cut short by something that passes: the time it was given ran out, the host was
-    /// short of what it needs to ask, it could not wait on, collect or read from the program, or
-    /// the look ended without an answer. Nothing is known of the Git that was being asked, and
+    /// short of what it needs to ask or to resolve it, it could not wait on, collect or read from
+    /// the program, or the look ended without an answer. Nothing is known of the Git that was
+    /// being asked, and
     /// asking again later can find it.
     Passing(Diagnostic),
 }
@@ -3690,14 +3696,15 @@ enum Asked {
     /// no. A copy of Git that does this is not the program, and the caller goes on without it.
     Declined(ProjectError),
     /// The look is refused. What the program did, answering with more than a version and a
-    /// directory or leaving its output open past the second it is given, as a read made inside the
-    /// time the probe was given found it, is [`ProjectError::GitUnavailable`], since it is not a
-    /// program this host can run work through. What the host did, or the time that ran out, is
-    /// [`ProjectError::GitFailed`], which passes: the look was not made because the time was used
-    /// up, because the host was short of descriptors, processes or memory to start the program,
-    /// because the program did not answer in time or its output was not read to the end when the
-    /// time ran out, including when the poll that found out came only after it, or because the host
-    /// could not wait on it, collect it, or switch or read its output.
+    /// directory or leaving its output open past the second it is given, as a read that began
+    /// after that second and returned inside the time the probe was given found it, is
+    /// [`ProjectError::GitUnavailable`], since it is not a program this host can run work through.
+    /// What the host did, or the time that ran out, is [`ProjectError::GitFailed`], which passes:
+    /// the look was not made because the time was used up, because the host was short of
+    /// descriptors, processes or memory to start the program, because the program did not answer
+    /// in time, or its end or its output was seen only after the time ran out, including when the
+    /// poll that found out came only after it, or because the host could not wait on it, collect
+    /// it, or switch or read its output.
     Overran(ProjectError),
 }
 
@@ -3775,10 +3782,9 @@ fn ask(
         }
     };
     let status = loop {
-        // On Unix nothing is read once the time has run out, so a poll that wakes late and finds
-        // the program ended has read none of what it wrote after the time, and the drain below
-        // refuses the look as the clock's. Elsewhere a thread reads the pipe and the clock does
-        // not stop it.
+        // On Unix nothing is taken in once the time has run out, so a poll that wakes late has
+        // taken in none of what the program wrote after the time, and none of its end. Elsewhere
+        // a thread reads the pipe and the clock does not stop it.
         heard.take_in(deadline);
         match has_ended(&mut child) {
             Ended::No => {}
@@ -3825,6 +3831,16 @@ fn ask(
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    // A program found to have ended at or after the time it was given is not known to have ended
+    // in it: the poll that found out may have come late, and the program may have written and
+    // closed its output in time or after. So whatever it exited with, and whatever it wrote, is
+    // not weighed, and the look is refused as the clock's, as it is for output that was not read
+    // to its end.
+    if time_is_up(deadline) {
+        return Err(Asked::Overran(passing(format!(
+            "{described} was not seen to end in the time it is given"
+        ))));
+    }
     drain(&mut heard, &described, deadline)?;
     let answer = heard.answer(&described, deadline).map_err(|error| {
         Asked::Overran(passing(format!(
@@ -3859,15 +3875,21 @@ fn too_much(described: &str) -> Asked {
 ///
 /// A process that left the probe's group may still hold the pipe, so the wait for the end is
 /// short: [`PROBE_DRAIN`], and never past the probe's own `deadline`. When the second runs out
-/// with the pipe still open, the moment of the refusal decides what it says. Before the probe's own
-/// time has run out, the pipe was read in that time and left open, which is the program's: it left
-/// its output open. At the probe's own time or after it nothing was read, since nothing is read
-/// once the time has run out, so the end may have come in time: that is the clock's and says
-/// nothing of the program, so it is a fault that passes. A poll that wakes late is the clock's too,
-/// whichever limit it passed first.
+/// with the pipe still open, what the refusal says depends on the read that found it so. The
+/// program is blamed, as one that left its output open, only by a read that began at or after the
+/// second and returned before the probe's own time had run out: it had its whole second, and the
+/// read was made, and finished, in the time it was given. Every other refusal is the clock's and
+/// says nothing of the program, so it is a fault that passes. A read that began at or after the
+/// probe's time took in nothing, since nothing is taken in then, so the end may have come in time.
+/// A read that returned at or after it is not known to have found the pipe as it was, since it may
+/// have waited for it. And a read that began before the second does not decide, however long the
+/// pause after it: the end may have come during the pause, so another read follows.
 fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::Result<(), Asked> {
     let drain = drain_until(Instant::now(), deadline);
     loop {
+        // Dated by the moment before the read, which is the moment the pipe was last known to be
+        // as it is read, and not by the clock after it, which a pause between the two can move.
+        let began = Instant::now();
         // Read for as long as the probe's own time allows, not only for the drain's second: the
         // second is how long the wait goes on, and a poll that comes after it, and before the
         // probe's time, still reads an end that arrived before it. A poll that comes after the
@@ -3879,11 +3901,8 @@ fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::
         if heard.ended() {
             return Ok(());
         }
-        let now = Instant::now();
-        if now >= drain {
-            // At the probe's own time or after it the read above was not made, or was made too
-            // late to count, so the pipe that looks open says nothing of the program.
-            return Err(Asked::Overran(if now >= deadline {
+        if began >= drain {
+            return Err(Asked::Overran(if Instant::now() >= deadline {
                 ProjectError::GitFailed {
                     detail: format!(
                         "{described} was not read to the end of its output in the time it is given"
@@ -4065,9 +4084,10 @@ enum Gathered {
 ///
 /// The time is checked before a read, so a pass that begins after the time has run out reads
 /// nothing. A poll that wakes late therefore takes in neither what was written after the time ran
-/// out nor the end that follows it, and the end is first seen by a pass that began in time. An end
-/// that a read returns after the time has run out is not taken as the end either, since the read
-/// may have waited for it.
+/// out nor the end that follows it, and the end is first seen by a pass that began in time. What a
+/// read returns after the time has run out, bytes or the end, is not taken either, since the read
+/// may have waited for it: neither was known to be in the pipe in time, so neither makes an
+/// answer, and bytes that pass the limit that way are not too much output.
 #[cfg(unix)]
 fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) -> Gathered {
     let mut buffer = [0_u8; 4096];
@@ -4093,10 +4113,10 @@ fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) 
             read
         };
         match read {
-            // The end counts only if it was read in time. The time was checked before this read,
-            // and a read that returns after the deadline may have waited for it, so what it found
-            // is not known to have been there in time.
-            Ok(0) if Instant::now() >= deadline => return Gathered::Open,
+            // Bytes and the end count only if they were read in time. The time was checked before
+            // this read, and a read that returns after the deadline may have waited for what it
+            // found, so it is not known to have been there in time.
+            Ok(_) if Instant::now() >= deadline => return Gathered::Open,
             Ok(0) => return Gathered::Closed,
             Ok(read) => {
                 let room = PROBE_OUTPUT_LIMIT.saturating_sub(seen.bytes.len());
@@ -4279,6 +4299,19 @@ fn resolved(path: &Path) -> std::io::Result<PathBuf> {
         tests::RESOLUTION_FAILS.with(|fails| fails.set(Some((passing - 1, error))));
     }
     path.canonicalize()
+}
+
+/// Returns what a failure to resolve a path that names Git is. A path that leads nowhere is the
+/// program's, which cannot be used. A host that is out of descriptors, processes or memory says
+/// nothing of the program, as for a failure to start it, so the look is refused as a fault that
+/// passes.
+fn could_not_resolve(detail: String, error: &std::io::Error) -> ProjectError {
+    let detail = Diagnostic::new(detail);
+    if short_of_resources(error) {
+        ProjectError::GitFailed { detail }
+    } else {
+        ProjectError::GitUnavailable { detail }
+    }
 }
 
 /// Reads the major and minor version out of `git --version`.
