@@ -7954,6 +7954,26 @@ async fn a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_agai
 #[cfg(unix)]
 const END_OF_INPUT: &[u8] = &[0x04];
 
+/// How many end-of-input bytes the terminal's writer has written to the pseudo-terminal for a
+/// lease's input: the deliveries the shell was given, whatever it did with them.
+#[cfg(unix)]
+fn end_of_input_writes(shell: &RealShell) -> usize {
+    shell
+        .runtime
+        .input()
+        .terminal_writes()
+        .iter()
+        .filter(|write| write.of_a_lease)
+        .map(|write| {
+            write
+                .bytes
+                .iter()
+                .filter(|byte| **byte == END_OF_INPUT[0])
+                .count()
+        })
+        .sum()
+}
+
 /// How many times a real session's retained output says what a bridge prints when it consumes an
 /// end-of-input gesture it cannot attribute.
 #[cfg(unix)]
@@ -8000,6 +8020,40 @@ impl RealShell {
         .unwrap_or_else(|_| panic!("the reader never proved a fence for {attachment}"));
     }
 
+    /// Waits until the reader has proved a fence for `attachment` and the fence has been written to
+    /// the terminal, and returns the session, held.
+    ///
+    /// The fence is written by the connection's writer, which takes the session, and a byte queued
+    /// while the fence is unwritten waits behind it. A case that holds the session across a byte
+    /// takes the hold only when no fence is unwritten: taken earlier, the byte would wait for a
+    /// writer that waits for the case.
+    async fn hold_when_fenced_for(
+        &self,
+        attachment: AttachmentId,
+    ) -> std::sync::MutexGuard<'_, Session> {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                {
+                    let session = self.runtime.session();
+                    let ready = {
+                        let driver = session.fence().expect("a driver");
+                        driver.state() == FenceState::Fenced
+                            && driver
+                                .fence()
+                                .is_some_and(|fence| fence.originating_attachment == attachment)
+                            && driver.unwritten_fence().is_none()
+                    };
+                    if ready {
+                        return session;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the reader never proved a written fence for {attachment}"))
+    }
+
     /// Waits until the session no longer holds `attachment`.
     async fn until_gone(&self, attachment: AttachmentId) {
         tokio::time::timeout(Duration::from_secs(60), async {
@@ -8011,28 +8065,64 @@ impl RealShell {
         .unwrap_or_else(|_| panic!("{attachment} was not taken off the session"));
     }
 
-    /// Types a command whose output the shell's own echo of the line cannot make, and waits for it:
-    /// the shell is at its prompt and takes what it is typed.
+    /// Types a command whose output the shell's own echo of the line cannot make, and waits for it
+    /// and for the prompt after it: the shell took what it was typed and is back at an empty prompt
+    /// whose fence the reader has proved anew for `keys`.
+    ///
+    /// The output comes before the prompt that follows it. A byte typed between the two reaches a
+    /// reader that has not yet proved its queues, which is a different case from the one under test.
     async fn answers_a_command(&self, keys: &mut RealKeys, word: &str) {
+        let before = {
+            let session = self.runtime.session();
+            let driver = session.fence().expect("a driver");
+            driver.fence().map(|fence| fence.fence_id)
+        };
         keys.type_line(self, &format!("printf 'kr-%s-ran\\n' {word}"));
         // The terminal writes the line end it is asked for as a carriage return and a line feed.
         self.produced(format!("kr-{word}-ran\r\n").as_bytes(), 1)
             .await;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                {
+                    let session = self.runtime.session();
+                    let driver = session.fence().expect("a driver");
+                    if driver.state() == FenceState::Fenced
+                        && driver.fence().is_some_and(|fence| {
+                            fence.originating_attachment == keys.attachment_id
+                                && Some(fence.fence_id) != before
+                        })
+                    {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no prompt followed the command {word}"));
     }
 }
 
 /// KR-REQ-27.05, ownership transfer during an end of input: an end of input typed at the empty
-/// prompt of a real root shell, in each of the three ways a takeover can meet it. The end of input is the shell's: it reaches it once, from the attachment
-/// that held the lease, and removes that attachment alone; or it does not reach it, and the refusal
-/// is recorded. It is never the next holder's, and it never ends the shell.
+/// prompt of a real root shell, in each of the three ways a takeover can meet it. The end of input
+/// is the shell's: it reaches it once, from the attachment that held the lease, and removes that
+/// attachment alone; or it does not reach it, and the refusal is recorded. It is never the next
+/// holder's, and it never ends the shell.
+///
+/// "Once" is the number of end-of-input bytes the terminal's writer wrote for a lease's input, which
+/// the case reads after each step: the bridge prints one hint for a prompt whatever the number of
+/// gestures it consumed there, so the hint alone cannot tell one delivery from two.
 ///
 /// * The takeover first: the old holder's end of input carries a lease it no longer holds and is
-///   refused at the worker (`LeaseLost`), so the shell is given nothing, prints no hint, and takes
+///   refused at the worker (`LeaseLost`), so none is written, the shell prints no hint, and takes
 ///   the next holder's command.
 /// * The end of input reached the terminal and the takeover came before the shell's detach was
 ///   handled (the session is held across both, so the order is the case's): the detach names a
 ///   fence the takeover invalidated, so it is refused, nobody is taken off, the shell consumes the
-///   gesture and prints the hint once, and the next holder's command runs.
+///   gesture and prints the hint once, and the next holder's command runs. The takeover's
+///   invalidation goes out under the same hold, so a bridge that reads it before it reads the
+///   gesture finds the gesture without a fence and consumes it as a missing one; the outcome is the
+///   same, and the case holds the outcome.
 /// * The detach handled first: the holder is taken off the session once and the attachment that
 ///   waited is untouched; its own end of input, typed after it takes the keys and the reader proves
 ///   a fence for it, takes it off and nothing else.
@@ -8093,6 +8183,11 @@ async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_on
             shell.until_fenced_for(second.attachment_id).await;
             shell.answers_a_command(&mut second, "first").await;
             assert_eq!(
+                end_of_input_writes(&shell),
+                0,
+                "{kind:?}: a refused end of input was written to the terminal"
+            );
+            assert_eq!(
                 hints_printed(&shell),
                 0,
                 "{kind:?}: the shell was given an end of input that was refused"
@@ -8114,11 +8209,11 @@ async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_on
             let shell = start().await;
             let first = shell.keys();
             let second = shell.terminal_attached();
-            shell.until_fenced_for(first.attachment_id).await;
             let epoch = {
                 // Held across the write and the takeover: the bridge handles the shell's detach
-                // under this hold, so it is handled after the takeover whatever the shell does.
-                let mut session = shell.runtime.session();
+                // under this hold, so it is handled after the takeover whatever the shell does. The
+                // hold is taken once the fence is written, so the byte has nothing to wait behind.
+                let mut session = shell.hold_when_fenced_for(first.attachment_id).await;
                 session
                     .write_input(
                         first.attachment_id,
@@ -8133,13 +8228,7 @@ async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_on
                 // The byte is the terminal's before the lease moves, so what the takeover leaves
                 // behind is nothing, and the shell has been given the gesture.
                 let started = std::time::Instant::now();
-                while !shell
-                    .runtime
-                    .input()
-                    .terminal_writes()
-                    .iter()
-                    .any(|write| write.of_a_lease && write.bytes.contains(&END_OF_INPUT[0]))
-                {
+                while end_of_input_writes(&shell) == 0 {
                     assert!(
                         started.elapsed() < Duration::from_secs(60),
                         "{kind:?}: the end of input was never written to the terminal"
@@ -8176,6 +8265,11 @@ async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_on
             });
             shell.until_fenced_for(second.attachment_id).await;
             shell.answers_a_command(&mut second, "second").await;
+            assert_eq!(
+                end_of_input_writes(&shell),
+                1,
+                "{kind:?}: the holder's end of input reached the terminal once"
+            );
             assert_eq!(
                 hints_printed(&shell),
                 1,
@@ -8220,6 +8314,11 @@ async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_on
                 "{kind:?}: the end of input took the holder off, and nothing else"
             );
             assert_eq!(
+                end_of_input_writes(&shell),
+                1,
+                "{kind:?}: the holder's end of input reached the terminal once"
+            );
+            assert_eq!(
                 hints_printed(&shell),
                 0,
                 "{kind:?}: a detach that was accepted printed the hint"
@@ -8228,6 +8327,11 @@ async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_on
             let mut next = shell.takes_the_keys(waiting);
             shell.until_fenced_for(waiting).await;
             shell.answers_a_command(&mut next, "third").await;
+            assert_eq!(
+                hints_printed(&shell),
+                0,
+                "{kind:?}: the shell consumed the first gesture as one it could not attribute"
+            );
             shell
                 .runtime
                 .session()
@@ -8246,6 +8350,16 @@ async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_on
                 shell.attached(),
                 Vec::<AttachmentId>::new(),
                 "{kind:?}: each gesture took off the attachment that typed it"
+            );
+            assert_eq!(
+                end_of_input_writes(&shell),
+                2,
+                "{kind:?}: each holder's end of input reached the terminal once"
+            );
+            assert_eq!(
+                hints_printed(&shell),
+                0,
+                "{kind:?}: an accepted detach printed the hint"
             );
             assert_eq!(
                 shell.runtime.state(),
