@@ -29,8 +29,8 @@
 //! an agent instance's rich mutations wait is told by what it says of the wait
 //! ([`suspension_for_a_device`]), in a result and in the refusal of a rich mutation.
 //!
-//! What the general rule does not find, and so passes whole, unless the refusal is one this module
-//! knows by its wording: a number that follows a word for an account across a separator the rule
+//! Examples of what the general rule does not find, and so passes whole, unless the refusal is one
+//! this module knows by its wording: a number that follows a word for an account across a separator the rule
 //! does not read, or through a longer name for one (`uid: 501`, `owner: 502`, `user id 501`,
 //! `user  501`, `uid(501)`, `uid_501`); a path of which every slash follows a name (`~name/work`,
 //! `Users/name/work`, `.config/kalareach/x`); a command of a program the rule does not know,
@@ -1195,8 +1195,9 @@ fn survivor(map: &CanonicalMap) -> Option<CanonicalValue> {
 
 /// Whether the words of a subject, ahead of a clause that is the host's own, are held to the rule:
 /// they name something of this host anywhere in them, or they hold a backtick, which begins a
-/// quotation of a command that can end beyond the clause. A subject is a package and its hash, and
-/// has neither.
+/// quotation of a command that can end beyond the clause. A subject is a package and its hash,
+/// which hold no backtick; a package identifier that reads as an account's number is held by the
+/// first test.
 fn is_held_to_the_rule(subject: &str) -> bool {
     naming_outside(subject, None).is_some() || subject.contains('`')
 }
@@ -1223,7 +1224,7 @@ fn naming_outside(text: &str, set_aside: Option<std::ops::Range<usize>>) -> Opti
             note(*at);
         }
     }
-    if let Some(at) = account_number(text) {
+    if let Some(at) = account_number(text, &outside) {
         note(at);
     }
     found
@@ -1318,7 +1319,10 @@ fn is_command_word(word: &str) -> bool {
 ///
 /// The digits are a number when no letter or hyphen follows them: `user 501` and `user-1000.slice`
 /// are, and `group 0193abcd-...`, the start of an identifier, is not.
-fn account_number(text: &str) -> Option<usize> {
+///
+/// Only a match that `outside` admits is a match, so one inside a place that is set aside does not
+/// hide a later one.
+fn account_number(text: &str, outside: &impl Fn(usize) -> bool) -> Option<usize> {
     let lower = text.to_ascii_lowercase();
     let boundary = |at: usize| {
         text[..at]
@@ -1356,6 +1360,7 @@ fn account_number(text: &str) -> Option<usize> {
                 .match_indices(word)
                 .filter(|(at, _)| boundary(*at) && digits_after(at + word.len(), true))
                 .map(|(at, _)| at)
+                .filter(|at| outside(*at))
                 .collect::<Vec<_>>()
         })
         .chain(
@@ -1366,15 +1371,21 @@ fn account_number(text: &str) -> Option<usize> {
                         && lower[at + "s-1-".len()..]
                             .starts_with(|digit: char| digit.is_ascii_digit())
                 })
-                .map(|(at, _)| at),
+                .map(|(at, _)| at)
+                .filter(|at| outside(*at)),
         )
         .min()
 }
 
-/// Whether `character` would run into the word `a command` that replaces a quotation, as the rest
-/// of a name or a path.
+/// Whether `character`, beside a quotation that is replaced, would run into the words `a command`
+/// and make one word of them and its neighbour: anything but white space and the marks that end a
+/// clause or close a bracket.
 fn joins_a_word(character: char) -> bool {
-    character.is_alphanumeric() || matches!(character, '/' | '\\' | '~' | '_')
+    !character.is_whitespace()
+        && !matches!(
+            character,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}'
+        )
 }
 
 /// `text` with every command quoted in backticks (more than one word between a pair of them)
@@ -4144,7 +4155,13 @@ mod tests {
     #[test]
     fn a_command_quoted_against_a_word_does_not_hide_the_word() {
         let nothing = format!("why the admissions leave the installation out; {WHY_NOT_SHOWN}");
-        for beside in ["/Users/marguerite/p", "uid 501", "sudo x"] {
+        for beside in [
+            "/Users/marguerite/p",
+            "uid 501",
+            "sudo x",
+            "(chmod 700 q)",
+            "\"sudo x\"",
+        ] {
             // In a message the rule reads whole, and in the subject of a left-out detail.
             let said = format!("`a b`{beside} failed");
             let told = message_for_a_device(ErrorCode::InvalidArgument, &said)
@@ -4158,9 +4175,33 @@ mod tests {
                 assert_eq!(left_out_detail_told_to_a_device(&said), nothing, "{said}");
             }
         }
-        let said = "sudo`a b` failed";
-        let told = message_for_a_device(ErrorCode::InvalidArgument, said).expect("told");
-        assert!(!told.contains("sudo"), "{told}");
+        // The word before the quotation is read too: its digits do not run into `a command`.
+        for (said, name) in [
+            ("sudo`a b` failed", "sudo"),
+            ("uid 501`a b` failed", "501"),
+            ("(chmod 700 q)`a b` failed", "chmod"),
+        ] {
+            let told = message_for_a_device(ErrorCode::InvalidArgument, said).expect("told");
+            assert!(!told.contains(name), "{said}: {told}");
+        }
+    }
+
+    /// A pointer's refusal sets its place aside, and an account's number inside that place does
+    /// not hide one beyond it: the first account match is chosen from those outside the place.
+    #[test]
+    fn an_account_beyond_a_pointers_place_is_found_past_one_inside_it() {
+        for said in [
+            "Params at /field uid 501 carries a field it does not declare; user 502",
+            "Params at /field `a b`uid 501 carries a field it does not declare; user 502",
+        ] {
+            let told = message_for_a_device(ErrorCode::InvalidArgument, said)
+                .unwrap_or_else(|| panic!("{said} was told as it was"));
+            assert!(!told.contains("502"), "{said}: {told}");
+        }
+        // The place alone names nothing of the host, as before.
+        assert!(!names_the_host(
+            "Params at /field uid 501 carries a field it does not declare"
+        ));
     }
 
     #[test]
