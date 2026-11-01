@@ -6084,10 +6084,10 @@ async fn a_deadline_that_passes_while_the_bundle_write_waits_for_its_own_token_s
 /// answered in: after that the call goes on without the case, and what fails is another step.
 ///
 /// A look that says the read failed, owes nothing and took less than the shortest bound the look
-/// keeps (the connection's) was cut by none of them: it met the fault and lost the delay, and the
-/// case fails there and does not go on to a look that owes it. A look that says it read is made
-/// again too, because the request of a look that was cut can take the fault late. The delay owed is
-/// the one the service named.
+/// keeps (the connection's) was cut by none of them: either it reached the service and lost the
+/// delay it was given, or it never reached the service, and the case fails there and does not go on
+/// to a look that owes it. A look that says it read is made again too, because the request of a look
+/// that was cut can take the fault late. The delay owed is the one the service named.
 async fn the_service_names_a_delay_to_a_look_at_its_storage_state(rig: &Rig, delay: Moment) {
     let Moment::Refuse {
         retry_after_seconds: Some(named),
@@ -6112,7 +6112,7 @@ async fn the_service_names_a_delay_to_a_look_at_its_storage_state(rig: &Rig, del
                     && quiet.left().is_none()
                     && began.elapsed() < STORAGE_DEADLINES.connect),
                 "a look that no bound it keeps can have cut said the read failed and the host owes \
-                 nothing, though the service named {named} seconds"
+                 nothing, though the fault armed for it names {named} seconds"
             );
             said = Some(storage);
         }
