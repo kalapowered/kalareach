@@ -4428,6 +4428,26 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// KR-REQ-20.20: a session lets go of the lock on the host's cap by releasing the lock itself,
+    /// and not only by closing its own handle. A program started meanwhile holds a copy of the open
+    /// file description until it replaces itself, and would hold the lock with it.
+    #[test]
+    fn the_host_cap_lock_is_released_whatever_copies_of_its_descriptor_remain() {
+        let root = spool_directory("host-cap-copies");
+        std::fs::create_dir_all(&root).expect("a directory");
+        let lock = take_host_cap_lock(&root)
+            .ok()
+            .expect("nobody holds the lock");
+        let copy = lock.file.try_clone().expect("a copy of the descriptor");
+        drop(lock);
+        assert!(
+            take_host_cap_lock(&root).is_ok(),
+            "another session takes the lock though a copy of the descriptor remains"
+        );
+        drop(copy);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// KR-REQ-20.20: the lock on the host's cap is held while the session gives up output for it,
     /// so that no other session gives up output for the same excess meanwhile, and is let go once
     /// the output has gone.
