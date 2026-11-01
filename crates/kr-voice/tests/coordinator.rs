@@ -3,21 +3,6 @@
 //! No test here makes a live provider call. The provider seam is filled twice — once by a fake
 //! managed broker and once by a backend of the person's own — which is what proves the interface
 //! stays modular rather than asserting it.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-15.01 | `a_call_runs_on_either_provider_through_one_interface`, `an_unknown_creation_is_a_state_and_leaves_no_grant`, `a_start_names_the_rate_the_person_was_shown`, `a_changed_rate_leaves_nothing_behind_and_carries_the_new_rate` |
-//! | KR-REQ-15.02 | `stopping_a_voice_session_leaves_the_terminal_sessions_running` |
-//! | KR-REQ-15.09 | `the_terms_a_person_reads_before_a_call_are_the_services_own`, `the_context_for_a_call_goes_under_the_services_words_for_it` |
-//! | KR-REQ-15.11 | `a_delegation_runs_under_the_intersection_of_both_grants`, `a_delegation_outside_this_calls_timeline_or_already_spent_is_refused`, `a_delegation_spent_in_a_call_that_ended_is_not_a_new_action_in_a_later_one`, `a_proposal_is_built_from_the_words_as_the_host_read_them`, `a_session_said_by_its_number_is_found_among_the_calls_own`, `a_number_the_call_does_not_reach_names_no_session`, `words_the_grammar_does_not_hold_reach_nothing`, `a_set_of_fragments_that_breaks_a_rule_is_refused_whole_and_spends_nothing` |
-//! | KR-REQ-15.13 | `the_five_unlocked_screen_classes_are_refused_without_a_confirmation`, `provider_text_cannot_create_a_confirmation`, `a_confirmation_for_one_action_does_not_authorise_another`, `a_challenge_gives_the_identifier_back_and_the_signed_delegation_spends_it`, `a_confirmation_for_one_utterance_does_not_confirm_another` |
-//! | KR-REQ-15.14 | `stopping_a_voice_session_revokes_its_grant_before_the_broker_is_told` |
-//! | KR-REQ-15.17 | `a_result_that_was_admitted_and_not_performed_is_reported_as_admitted` |
-//! | KR-REQ-15.19 | `the_terms_a_person_reads_before_a_call_are_the_services_own`, `a_host_without_the_services_terms_says_why`, `a_preparation_is_refused_where_a_start_would_be` |
-//! | KR-REQ-15.20 | `context_selection_uses_the_requesting_devices_scope_and_nothing_wider` |
-//! | KR-REQ-15.21 | `the_default_voice_grant_permits_four_things_and_names_them`, `submitting_a_prompt_needs_the_spoken_destination` |
-//! | KR-REQ-15.22 | `cancelling_a_turn_needs_the_typed_request_and_the_current_turn` |
-//! | KR-REQ-23.51 | `every_voice_method_needs_the_voice_grant`, `a_delegation_answered_before_is_answered_again_under_the_authority_that_stands_now` |
 
 use std::sync::{Arc, Mutex};
 

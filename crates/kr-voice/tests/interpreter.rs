@@ -4,11 +4,6 @@
 //! written as a provider's transcript writes it, and what the host reads of it. A request is one of
 //! the four the grammar holds; anything else is not a request, and a number that cannot be read
 //! is its own answer.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-15.11 | `the_grammar_reads_the_requests_it_holds_and_nothing_else`, `a_mark_in_or_beside_a_number_leaves_no_number` |
-//! | KR-REQ-15.21 | `no_spoken_form_submits_a_prompt_or_answers_an_approval` |
 
 use kr_protocol::scalars::U64;
 use kr_protocol::voice::{FragmentText, TranscriptFragment, VoiceAction};
