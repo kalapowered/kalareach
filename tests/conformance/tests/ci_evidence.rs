@@ -11,7 +11,8 @@
 //! after the step that writes last, none of them cut short or kept for less than the repository's
 //! default; and the table of those jobs in the conformance document. It reads the workflow as text,
 //! line by line, which holds its layout (jobs at two spaces, steps at six, a trigger or a key on a
-//! line of its own, no comment after a compared value): a reformatting fails it loudly. What it
+//! line of its own, no comment after a compared value, though a comment after a job's name is read
+//! as that job's header): a reformatting fails it loudly. What it
 //! does not read is what a step's command does: a step that swallows its failure (`|| true`),
 //! runs no test (`--no-run`), leaves early or changes the shell it runs in is not looked for.
 
@@ -70,6 +71,12 @@ fn a_run_that_kept_no_screenshot_in_the_evidence_directory_fails() {
     assert_eq!(check(evidence.path(), strays.path()), Some(1));
 }
 
+/// A line without a comment after its content, and without the space before the comment: the same
+/// reading of a trailing ` #` the compared values get.
+fn without_comment(line: &str) -> &str {
+    line.split(" #").next().unwrap_or_default().trim_end()
+}
+
 /// The text of one job of the landing workflow: its header line to the next job's, with the
 /// comment lines left out so that a step named only in a comment is not found.
 fn job(workflow: &str, name: &str) -> String {
@@ -77,16 +84,18 @@ fn job(workflow: &str, name: &str) -> String {
     let header = format!("  {name}:");
     let start = lines
         .iter()
-        .position(|line| *line == header)
+        .position(|line| without_comment(line) == header)
         .unwrap_or_else(|| panic!("the workflow has a {name} job"));
     // A comment line is no job's header, whatever it ends with: a job key below one belongs to the
-    // job above it.
+    // job above it. A header with a comment after its colon is still one, so the job above it ends
+    // there.
     let is_job = |line: &str| {
+        let line = without_comment(line);
         line.len() > 3
             && line.starts_with("  ")
             && !line.starts_with("   ")
             && !line.trim_start().starts_with('#')
-            && line.trim_end().ends_with(':')
+            && line.ends_with(':')
     };
     let end = lines[start + 1..]
         .iter()
@@ -450,7 +459,10 @@ const CLASSES: [ClassOfTest; 10] = [
         runner: &["runs-on: macos-15"],
         runs_on: "macos-15",
         job_when: Some("github.event_name != 'workflow_dispatch' || inputs.macos"),
-        tool: "cargo test --locked --workspace",
+        // The whole text of the step's command line, to its end: the step after it that runs the
+        // timed cases starts with the shorter words, and with the same condition, so a prefix
+        // would hold the class with the whole-workspace step deleted.
+        tool: "cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --",
         when: Some("${{ !cancelled() && matrix.part == 'tests' }}"),
     },
 ];
