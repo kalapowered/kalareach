@@ -15,8 +15,7 @@ const HOLD_LINE: &str =
     "kr: this window stays open so the error above can be read; press any key to close it\r\n";
 
 /// Whether [`for_a_key`] waits: standard input and standard output are both terminals.
-#[must_use]
-pub fn waits() -> bool {
+fn waits() -> bool {
     std::io::stdin().is_terminal() && crate::output::is_terminal()
 }
 
