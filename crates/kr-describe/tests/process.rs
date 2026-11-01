@@ -695,11 +695,13 @@ struct Due {
 }
 
 /// A model that records what it was asked for, the deadline it was given, and what a read on the
-/// thread that runs its jobs reports of its background class.
+/// thread that runs its loads and its jobs reports of its background class.
 #[derive(Clone, Default)]
 struct Recording {
     asked: Arc<Mutex<Vec<Asked>>>,
     due: Arc<Mutex<Vec<Due>>>,
+    #[cfg(unix)]
+    held_at_load: Arc<Mutex<Vec<support::Held>>>,
     #[cfg(unix)]
     held: Arc<Mutex<Vec<support::Held>>>,
 }
@@ -713,6 +715,11 @@ impl Recording {
 
 impl Model for Recording {
     fn load(&mut self, _work: &LoadWork<'_>, _token: &Cancellation, _deadline: Instant) -> Loading {
+        #[cfg(unix)]
+        self.held_at_load
+            .lock()
+            .expect("the record")
+            .push(support::held_by_this_thread());
         Loading::Loaded
     }
 
@@ -896,16 +903,25 @@ fn the_thread_that_runs_a_job_is_in_the_background_class_the_system_reports() {
         &[load(1, &profile, 300_000), generate(2, 1, 30_000)],
         || recording.jobs() == 1,
     );
+    // The load is the one place the I/O class acts on a read: the model's weights are read once
+    // there, and a resident model does no I/O after it. So the class is read at the load as well as
+    // at the job.
+    let at_load = recording.held_at_load.lock().expect("the record").clone();
+    let [at_load] = at_load[..] else {
+        panic!("one load reached the model: {at_load:?}");
+    };
     let held = recording.held.lock().expect("the record").clone();
     let [held] = held[..] else {
         panic!("one job reached the model: {held:?}");
     };
-    assert!(
-        held.cpu_is_lowered(),
-        "the job's thread holds no lowered processor class: {held:?}"
-    );
-    assert!(
-        held.io_is_lowered(),
-        "the job's thread holds no lowered I/O class: {held:?}"
-    );
+    for (when, held) in [("load", at_load), ("job", held)] {
+        assert!(
+            held.cpu_is_lowered(),
+            "the thread holds no lowered processor class at its {when}: {held:?}"
+        );
+        assert!(
+            held.io_is_lowered(),
+            "the thread holds no lowered I/O class at its {when}: {held:?}"
+        );
+    }
 }
