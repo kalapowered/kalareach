@@ -1654,7 +1654,9 @@ environment has to be running already: enrolment starts nothing, and a probe of 
 environment is refused rather than starting it. A container's `--target` is resolved through the container runtime
 first, and the identifier it answers with is what the record keeps; a name, or a short prefix of an
 identifier, is not one. The runtime is given a minute: a call that has not ended by then is ended,
-and the refusal names it.
+and the refusal names it. A runtime that cannot be run, that does not answer or that fails for any
+reason but not knowing the container is a failure of an outside program and exits 1; a container
+the runtime says it does not know is a usage failure (exit 2).
 
 `list` reads this host's cache. It contacts nothing and starts nothing, and every row says so:
 each carries the environment identity, when it was last observed, an explicit `running`,
