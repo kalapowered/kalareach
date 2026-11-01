@@ -5694,16 +5694,39 @@ mod tests {
             .collect()
     }
 
-    /// A diagnostics stream that refuses every write, as a full volume does.
-    struct Refusing;
+    /// A diagnostics stream that takes writes while it is open to them, as a volume does until it
+    /// is full.
+    struct Draining {
+        open: bool,
+        taken: Vec<u8>,
+    }
 
-    impl std::io::Write for Refusing {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("no space left on device"))
+    impl Default for Draining {
+        fn default() -> Self {
+            Self {
+                open: true,
+                taken: Vec::new(),
+            }
+        }
+    }
+
+    impl Draining {
+        fn lines(&self) -> usize {
+            self.taken.iter().filter(|&&byte| byte == b'\n').count()
+        }
+    }
+
+    impl std::io::Write for Draining {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.open {
+                return Err(std::io::Error::other("no space left on device"));
+            }
+            self.taken.extend_from_slice(bytes);
+            Ok(bytes.len())
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            Err(std::io::Error::other("no space left on device"))
+            Ok(())
         }
     }
 
@@ -5738,15 +5761,48 @@ mod tests {
     #[test]
     fn a_reason_that_could_not_be_written_is_said_at_the_next_pass_that_can_write_it() {
         let mut said = None;
-        say_output_reason(&mut said, Some("the lock"), true, &mut Refusing);
+        let mut full = Draining {
+            open: false,
+            taken: Vec::new(),
+        };
+        say_output_reason(&mut said, Some("the lock"), true, &mut full);
         assert_eq!(said, None, "a reason that was not written is not said");
-        say_output_reason(&mut said, Some("the lock"), true, &mut Refusing);
+        say_output_reason(&mut said, Some("the lock"), true, &mut full);
         assert_eq!(
             said_by(&mut said, Some("the lock"), true).len(),
             1,
             "the next pass that can write it says it"
         );
         assert!(said_by(&mut said, Some("the lock"), true).is_empty());
+    }
+
+    /// A reason refused after another was said is not taken as said: the stream that refused it
+    /// takes it later, and it is said then, once.
+    #[test]
+    fn a_reason_refused_after_another_was_said_is_said_once_it_can_be_written() {
+        let mut said = None;
+        let mut stream = Draining::default();
+        say_output_reason(&mut said, Some("the lock"), true, &mut stream);
+        assert_eq!(stream.lines(), 1, "the first reason is said");
+
+        stream.open = false;
+        say_output_reason(&mut said, Some("the boundary"), true, &mut stream);
+        assert_eq!(stream.lines(), 1, "the stream refuses the second");
+        assert_eq!(
+            said.as_deref(),
+            Some("the lock"),
+            "so the second is not taken as said"
+        );
+
+        stream.open = true;
+        say_output_reason(&mut said, Some("the boundary"), true, &mut stream);
+        assert_eq!(
+            stream.lines(),
+            2,
+            "the second is said when the stream takes it"
+        );
+        say_output_reason(&mut said, Some("the boundary"), true, &mut stream);
+        assert_eq!(stream.lines(), 2, "and not again while it stands");
     }
 
     /// A pass that removed nothing by age cannot tell that a reason the age bound left has gone, so
