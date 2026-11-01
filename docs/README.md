@@ -121,9 +121,10 @@ stops, so a limit that a part has is written in that part's own document.
   state, and the control daemon can restart without ending a session: [host](host/README.md),
   [terminal](terminal/README.md) and [cli](cli/README.md).
 - **Agent interfaces.** The official plugin packages for Codex, Claude Code, OpenCode, Gemini CLI, Kimi
-  and Qoder CLI recognise those agents in a session where the worker finds the agent's own executable
-  running (a build that a runtime starts, such as the npm `codex` and `gemini` or the PyPI
-  `kimi-cli`, is found as the runtime and is not recognised), a package of any publisher recognises
+  and Qoder CLI recognise those agents in a session where the worker finds running a file that one of their rules
+  names (a build that a runtime starts, such as the npm `codex` and `gemini` or the PyPI `kimi-cli`,
+  is found as the runtime, and a build kept under a versioned file name is recognised only by a rule
+  that names that file; neither is recognised otherwise), a package of any publisher recognises
   another application the same way, and the broker in each worker holds each binding,
   the evidence for what it can do, and the approvals. Typed requests to submit or queue a prompt,
   steer or cancel a turn and answer an approval act only where a binding has evidence for them, so
