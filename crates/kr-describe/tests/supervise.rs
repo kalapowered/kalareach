@@ -919,6 +919,16 @@ fn a_stop_asked_late_is_given_its_time_from_the_request() {
                 "{late_by} ms late, {after_the_request} ms after the request: {reports:?}"
             );
             assert_eq!(rig.driver.pid(), pid);
+            // The driver asks to be woken at a time to come and never at one that has gone by: a
+            // daemon that sleeps until the time it is given would otherwise look again at once,
+            // over and over, for as long as the job takes to answer.
+            assert!(
+                rig.driver
+                    .due_ms()
+                    .is_some_and(|due| due > asked + after_the_request),
+                "{late_by} ms late, {after_the_request} ms after the request: {:?}",
+                rig.driver.due_ms()
+            );
         }
         let reports = rig
             .driver
@@ -963,6 +973,16 @@ fn a_stop_asked_late_is_given_its_time_from_the_request() {
                 "{late_by} ms late, {after_the_request} ms after the request: {reports:?}"
             );
             assert_eq!(rig.driver.pid(), pid);
+            // The driver asks to be woken at a time to come and never at one that has gone by: a
+            // daemon that sleeps until the time it is given would otherwise look again at once,
+            // over and over, for as long as the job takes to answer.
+            assert!(
+                rig.driver
+                    .due_ms()
+                    .is_some_and(|due| due > asked + after_the_request),
+                "{late_by} ms late, {after_the_request} ms after the request: {:?}",
+                rig.driver.due_ms()
+            );
         }
         let reports = rig
             .driver
@@ -980,9 +1000,10 @@ fn a_stop_asked_late_is_given_its_time_from_the_request() {
 /// KR-REQ-22.11: the driver says it has something to do at the job's deadline, when the process is
 /// to be asked to stop the job, even when its next sample comes later, and after the request at the
 /// end of the time the request gives, counted from the request and not from the deadline. It never
-/// says a time that has gone by: a daemon that sleeps until the time it is given would wake at once,
-/// again and again, for as long as the job takes to answer. The process here reads the job and
-/// nothing after it, so nothing but the daemon's own clock decides what comes next.
+/// says a time that has gone by: a daemon that sleeps until the time it is given would wake at
+/// once, again and again, for as long as the job takes to answer (the cases above hold that for a
+/// process that read the stop). The process here reads the job and nothing after it, so nothing
+/// but the daemon's own clock decides what comes next.
 #[test]
 fn the_driver_wakes_at_a_jobs_deadline_and_at_the_end_of_the_time_its_stop_is_given() {
     let mut rig = Rig::new(&Script {
@@ -1012,10 +1033,12 @@ fn the_driver_wakes_at_a_jobs_deadline_and_at_the_end_of_the_time_its_stop_is_gi
     assert_eq!(rig.driver.stopping_at_its_deadline(), Some(false));
     assert_eq!(rig.driver.due_ms(), Some(asked + SAMPLE_MS));
 
-    // At that sample the soonest thing is the end of the grace, counted from the request.
+    // A look half a sample after that sample was due takes it, and puts the next one past the end of
+    // the grace: the soonest thing is the end of the grace, counted from the request, which the
+    // sample cannot be mistaken for.
     let reports = rig
         .driver
-        .turn(&roomy(), at(asked + SAMPLE_MS))
+        .turn(&roomy(), at(asked + SAMPLE_MS + SAMPLE_MS / 2))
         .expect("a turn");
     assert!(!the_process_ended(&reports), "{reports:?}");
     assert_eq!(rig.driver.due_ms(), Some(asked + ANSWER_GRACE_MS));
@@ -1077,6 +1100,15 @@ fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_
             "{after_the_request} ms after the request: {reports:?}"
         );
         assert_eq!(rig.driver.pid(), pid);
+        // An acknowledged cancellation of a job is not a timer: the driver is never woken for a
+        // time that has gone by.
+        assert!(
+            rig.driver
+                .due_ms()
+                .is_some_and(|due| due > deadline + 10_000 + after_the_request),
+            "{after_the_request} ms after the request: {:?}",
+            rig.driver.due_ms()
+        );
     }
     // The stop bound after the request ends the process, as running past its deadline. The job
     // was cancelled by a caller first, so it ends cancelled.
@@ -1098,6 +1130,75 @@ fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_
         "{reports:?}"
     );
     assert_eq!(rig.driver.pid(), None);
+}
+
+/// KR-REQ-22.11: a process whose control thread has said it read the daemon's request to stop a
+/// job at its deadline has shown that it listens, so a caller's cancellation of the job sent after
+/// that is not held to the cancellation's own two seconds: the job's answer is bounded by the stop
+/// bound after the request, as the process's watchdog bounds it, and the process is ended then and
+/// not before. The control thread here reads the request at the deadline and nothing after it, so
+/// the caller's cancellation is never acknowledged. The job a caller cancelled ends cancelled.
+#[test]
+fn a_cancellation_after_an_acknowledged_stop_is_held_to_the_stop_bound() {
+    let mut rig = Rig::new(&Script {
+        ignore_token_ms: 120_000,
+        wedge_input_after: Some(4),
+        mark_work: true,
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    stub::wait_until_began(&rig.placed.directory("runtime"), "job");
+    let pid = rig.driver.pid();
+    let deadline = 3_000 + DEADLINE_MS;
+    rig.until(
+        &roomy(),
+        at(deadline),
+        "the acknowledgement of the stop",
+        |_, driver| driver.stopping_at_its_deadline() == Some(true),
+    );
+    // The caller cancels the job. Nothing reads it, so it is never acknowledged.
+    assert!(rig.driver.service().cancel_running(&session(1)));
+    let reports = rig.driver.turn(&roomy(), at(deadline + 1)).expect("a turn");
+    assert!(!the_process_ended(&reports), "{reports:?}");
+    assert!(matches!(rig.driver.cancelling(), Some((_, false))));
+    // Past the cancellation's own bound the process is left alone, and so up to the stop bound
+    // after the request.
+    for after_the_request in [CANCEL_MS + 1, STOP_BOUND - 1] {
+        let reports = rig
+            .driver
+            .turn(&roomy(), at(deadline + after_the_request))
+            .expect("a turn");
+        assert!(
+            !the_process_ended(&reports),
+            "{after_the_request} ms after the request: {reports:?}"
+        );
+        assert_eq!(rig.driver.pid(), pid);
+        assert!(
+            rig.driver
+                .due_ms()
+                .is_some_and(|due| due > deadline + after_the_request),
+            "{after_the_request} ms after the request: {:?}",
+            rig.driver.due_ms()
+        );
+    }
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(deadline + STOP_BOUND))
+        .expect("a turn");
+    let ended = outcomes(&reports);
+    assert!(
+        ended.contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::PastDeadline
+        }),
+        "{reports:?}"
+    );
+    assert!(
+        ended.contains(&&Outcome::Cancelled {
+            session_id: session(1)
+        }),
+        "{reports:?}"
+    );
 }
 
 /// A load that was told to stop, said it had read it and keeps going is held to the cancellation's

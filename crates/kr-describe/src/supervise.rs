@@ -292,6 +292,17 @@ impl Running {
                 .is_some_and(|cancel| cancel.id == id && cancel.acknowledged)
     }
 
+    /// The cancellation sent that is held to its own timer. One of a job is not once the control
+    /// thread has said it read it, nor when the control thread has already said it read the
+    /// request to stop that job at its deadline: it listens, and the job's answer is bounded by the
+    /// stop bound ([`Self::work_ends_at_ms`]), so a second cancellation it has not yet read is no
+    /// reason to end it sooner.
+    fn timed_cancel(&self) -> Option<Cancel> {
+        self.cancel.filter(|cancel| {
+            cancel.timed() && !(matches!(cancel.kind, Kind::Job) && self.job_stop_read(cancel.id))
+        })
+    }
+
     /// When the work in hand has run too long. A load's is its deadline and the grace after it. A
     /// job's is the grace after the request to stop it, or for a job whose stop the control thread
     /// has read, the stop bound after the request. The request is made at the job's deadline, or at
@@ -517,7 +528,7 @@ impl Driver {
                     soonest = soonest.min(stop.deadline_at_ms);
                 }
             }
-            if let Some(cancel) = running.cancel.filter(|cancel| cancel.timed()) {
+            if let Some(cancel) = running.timed_cancel() {
                 soonest = soonest.min(cancel.at_ms);
             }
             if let Some(due) = running.check {
@@ -1228,10 +1239,7 @@ impl Driver {
         };
         let why = if !running.ready && at >= running.hello_at_ms.saturating_add(HANDSHAKE_MS) {
             Some(ProcessEnd::SilentAtStart)
-        } else if let Some(cancel) = running
-            .cancel
-            .filter(|cancel| cancel.timed() && at >= cancel.at_ms)
-        {
+        } else if let Some(cancel) = running.timed_cancel().filter(|cancel| at >= cancel.at_ms) {
             Some(if cancel.acknowledged {
                 ProcessEnd::StopOverdue
             } else {
