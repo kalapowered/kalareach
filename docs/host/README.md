@@ -1152,8 +1152,9 @@ Every local host process states its build in its answer to a hello: its build id
 `packages/protocol/package.json` sets and the build compiles in. A worker outlives an upgrade, so a
 client can meet one of another build, and the statement is how it tells before it meets a frame it
 cannot read. `kr attach` reads a worker's screens only when the two versions share a compatibility
-level, and refuses any other worker before it asks the session for anything; the
-[`kr attach` reference](../cli/README.md#kr-attach) has the rule and the refusal. A process of a
+level. For a worker at another level it hands over to the `kr` of that worker's release when the
+store holds it, and refuses the worker before it asks the session for anything when the store does
+not; the [`kr attach` reference](../cli/README.md#kr-attach) has the rule and the refusal. A process of a
 build before the statement states none. The daemon still reads its answer, because it goes on
 speaking to the workers that outlived its upgrade, and `kr attach` takes it for an earlier build.
 
@@ -4106,7 +4107,7 @@ The caller that performs an action always gets its state in the first answer: th
 
 Answering a question needs more than the right to answer. The worker refuses a question the caller's history does not reach, with the refusal it gives for a question it does not hold, so the refusal says nothing about the question's state or text. An approval answer is held the same way: the worker refuses an approval the caller's history does not reach, and that its grant does not name while it can still be decided, with the refusal it gives for an approval it does not hold, before anything is claimed.
 
-The archive follows the same rule for a closed session: its receipts go whole to the owner at this machine and as state to anyone else. A close's description of the session reaches a device only when its history reaches back to the session's start, while the daemon keeps the whole description for its own directory. A control daemon speaks to a worker only at its own compatibility level, so a worker at another compatibility level never answers a device through it. [Updating a host](updates.md) says what an update does about that worker's session.
+The archive follows the same rule for a closed session: its receipts go whole to the owner at this machine and as state to anyone else. A close's description of the session reaches a device only when its history reaches back to the session's start, while the daemon keeps the whole description for its own directory. A control daemon speaks to a worker only at its own compatibility level or at one it retains, so a worker at any other compatibility level is left running and never answers a device through it. [Updating a host](updates.md) says what an update does about that worker's session.
 
 ### What each store promises
 
