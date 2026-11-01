@@ -144,33 +144,6 @@ pub fn ending(ended: std::process::ExitCode) -> std::process::ExitCode {
     }
 }
 
-/// The failure a command ends with instead of replacing itself by another program, when a stream
-/// has refused a line it wrote before that point.
-///
-/// A replaced process never reaches [`ending`]: the program that takes its place starts with no
-/// memory of what this one could not write, and ends 0 without it. Where the output is plain text,
-/// that loss is the failure the command ends with, so the command is not run and the failure is
-/// returned. Standard output that belongs to a document or to frames (`output::is_claimed`) takes
-/// a refused standard error silently, here as at the end of any command, and the replacement runs.
-#[must_use]
-pub fn unwritten_before_replacement() -> Option<CliError> {
-    if let Some(why) = output::unwritten_output() {
-        return Some(CliError::Terminal(shown!(
-            "standard output could not be written: {}, and this command did not run",
-            *why
-        )));
-    }
-    if output::is_claimed() {
-        return None;
-    }
-    ERROR_UNWRITTEN.get().map(|why| {
-        CliError::Terminal(shown!(
-            "standard error could not be written: {}, and this command did not run",
-            *why
-        ))
-    })
-}
-
 /// Prints the preview of a content export on standard error, and flushes it.
 ///
 /// This is the one place content a person asked to read reaches the error stream. The export's

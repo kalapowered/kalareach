@@ -99,10 +99,10 @@ pub fn run_as_current() -> Result<()> {
 /// Starts the store's `kr` on this command's arguments, in place of this process. It returns only
 /// the failure to do so.
 fn start_stores_kr(store: &Store) -> CliError {
-    // A line this process could not write is not carried into the program that replaces it.
-    if let Some(unwritten) = crate::report::unwritten_before_replacement() {
-        return unwritten;
-    }
+    // A line that standard error refused before this point (the notice that this release is no
+    // newer than the current one, or the reason an update waits) is lost: the program that replaces
+    // this process knows nothing of it, and the command goes on in that program, as it does after
+    // any line that standard error refuses.
     let error = std::process::Command::new(store.stable(Program::Kr))
         .args(std::env::args_os().skip(1))
         .exec();

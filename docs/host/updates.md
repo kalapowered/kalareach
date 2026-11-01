@@ -134,9 +134,11 @@ unless an earlier failed update is still recorded: `kr host rollback` settles th
 release can always be taken with its archive and `kr host update --archive`.
 A release that is already in the store and not staged, as one is after a rollback, or that is no
 newer than the current one is not offered again: the command goes on with the release that is
-current, and a rollback stands. A release that carries no update channel root, or cannot be checked, is refused
-with the reason, and the command does not run. Two first commands at once take the store's locks
-in turn, and the one that does not get them goes on with the release that is current.
+current, and a rollback stands. The notice that says so goes to standard error. Where that stream
+refuses it, the command goes on and the notice is lost. A release that carries no update channel
+root, or cannot be checked, is refused with the reason, and the command does not run. Two first
+commands at once take the store's locks in turn, and the one that does not get them goes on with
+the release that is current.
 
 `kr host rollback`, `kr host versions` and `kr doctor` admit nothing. They run as the store's copy
 of the release that is current, so a release that the current one refuses cannot hold back the
