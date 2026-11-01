@@ -303,11 +303,14 @@ struct HostPath {
 /// is, the staging paths an operation kept or removed, the repository a clone was made from, the
 /// socket of a session's worker. A session's own working directory and shell, and the executable a
 /// question's source runs, are not among them: the product shows them to the person on purpose, as
-/// part of how a session or a question is described (the specification names a question's verified
-/// executable), and a device that may see the session sees its terminal. A path under a home
-/// directory names the account, and a device cannot use one, so a device is given each as the
-/// withheld record of a path (the form the directory of a materialisation has), with the list of
-/// paths as long as it was.
+/// part of how a session or a question is described (the specification names a session's working
+/// directory and a question's verified executable). A grant that leaves out the live screen cannot
+/// attach to the terminal and can still read the session's summary, so the directory and the shell
+/// are shown as the session's description. The staged path of an attachment's read grant is shown
+/// on purpose too: the companion gives it to the person for the manual terminal workflow. A path
+/// under a home directory names the account, and a device cannot use one, so a device is given each
+/// as the withheld record of a path (the form the directory of a materialisation has), with the
+/// list of paths as long as it was.
 const HOST_PATHS: [HostPath; 5] = [
     HostPath {
         key: "display_path",

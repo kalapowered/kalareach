@@ -3283,21 +3283,27 @@ desktop a session is bound to (`desktop_session_id` in the session's `desktop`) 
 account's name and number, so a device is given the marker the capability answers use, which says
 the session is bound to a desktop and not which one. The `actor_id` of the owner's own local caller
 (`local:` and the number of an account) is sent as `local`; no request a device makes carries an
-actor, so nothing needs the number back. A session's `cwd` and `shell_path`, the `command` and `cwd`
-of its last command block, a question's `executable`, an attachment's staged `host_path`, the
-`command` of a materialisation (`changeset.read`) and in the offer of `shell.launch.surface`, and
-the `metadata_url` and `targets_url` of a catalogue are sent as they are. The specification names a
-question's verified executable, the command blocks of a session with their working directory, and
-the command a materialisation ran. A session's directory and shell and an attachment's staged path
-are how the product describes a session and a manual attachment, and a device that may see a
-session sees its terminal. The command in the launch offer comes from an admitted package, the
-companion shows it before the person chooses the launch, and the launch sends that command back to
-the host. A catalogue's two locations are a directory on this host when the catalogue is a local
-one; they are sent because an owner device rebuilds the digest of a trust plan from them and
-because the companion shows where the metadata is. Each reaches a device that holds the right of
-the method that reads it, and a catalogue's locations only a device that holds `host.manage`; the
-command block reaches only a device whose grant keeps history from the moment the command started
-or earlier. The `disabled_reason` of a capability record in `plugin.capabilities` is a sentence of
+actor, so nothing needs the number back. A session's `cwd` and `shell_path`, the
+`session_description` and `working_directory` of `voice.context` (which repeat them), the `command`
+and `cwd` of its last command block, a question's `executable`, an attachment's staged `host_path`,
+the `command` of a materialisation (`changeset.read`) and in the offer of `shell.launch.surface`,
+and the `metadata_url` and `targets_url` of a catalogue are sent as they are. The specification
+names a question's verified executable, the command blocks of a session with their working
+directory, and the command a materialisation ran. A session's directory and shell are facts of the
+session that the specification shows the person: a session's description and the voice context's
+default both name the working directory. A grant that leaves out the live screen cannot attach to
+the terminal and can still read the session's summary, so these two are shown as the session's
+description. An attachment's staged `host_path` is the path of the narrow read grant an adapter
+obtains for an agent-readable staging location. The companion shows it only for the manual terminal
+workflow, so that the person can give it to the agent in the session's terminal. It lies in the
+environment's staging area, outside every repository, and is valid only while its grant is. The
+command in the launch offer comes from an admitted package, the companion shows it before the
+person chooses the launch, and the launch sends that command back to the host. A catalogue's two locations are a directory on this host when the
+catalogue is a local one; they are sent because an owner device rebuilds the digest of a trust plan
+from them and because the companion shows where the metadata is. Each reaches a device that holds
+the right of the method that reads it, and a catalogue's locations only a device that holds
+`host.manage`; the command block reaches only a device whose grant keeps history from the moment
+the command started or earlier. The `disabled_reason` of a capability record in `plugin.capabilities` is a sentence of
 the host's. For a signed qualification that the host accepted and whose state is not usable, it is
 followed by the statement of that qualification, which is the publisher's published text and not
 this host's, and is sent as it is. A qualification the host refused is reported as not tested, with
