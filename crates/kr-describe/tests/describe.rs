@@ -369,51 +369,46 @@ fn a_context_change_settles_into_a_job_two_seconds_after_it() {
 }
 
 /// KR-REQ-22.10: a session is described again no sooner than thirty seconds after its last job was
-/// sent, and the host waits until then and no longer.
+/// sent, and the host waits until then and no longer, whether the second description is an ordinary
+/// job or a foreground one.
 #[test]
 fn a_session_is_described_again_thirty_seconds_after_its_last_job_was_sent() {
-    let mut service = service();
-    queue_one(
-        &mut service,
-        &session(1),
-        "kalareach",
-        Priority::Ordinary,
-        at(0),
-    );
-    let (id, _, request) = dispatch_one(&mut service, at(3_000));
-    assert!(matches!(
-        service
-            .finished(id, produced(&request), at(3_500))
-            .expect("the answer"),
-        Outcome::Published { .. }
-    ));
-    service.observe(
-        &session(1),
-        ContextSignal::WorkingDirectory {
-            directory: "crates".to_owned(),
-            repository: None,
-        },
-        at(4_000),
-    );
-    assert!(
-        service
-            .settle(&session(1), Priority::Ordinary, at(6_000))
-            .is_some(),
-        "the change is queued for a second description"
-    );
-    assert_eq!(
-        service.next(&roomy(), at(32_999)).expect("an instruction"),
-        Instruction::Wait {
-            until_ms: Some(33_000)
-        },
-        "thirty seconds after the job was sent, to the millisecond"
-    );
-    let Instruction::Generate { session_id, .. } =
-        service.next(&roomy(), at(33_000)).expect("an instruction")
-    else {
-        panic!("the second description is sent when the cooldown ends");
-    };
-    assert_eq!(session_id, session(1));
+    for priority in [Priority::Ordinary, Priority::Foreground] {
+        let mut service = service();
+        queue_one(&mut service, &session(1), "kalareach", priority, at(0));
+        let (id, _, request) = dispatch_one(&mut service, at(3_000));
+        assert!(matches!(
+            service
+                .finished(id, produced(&request), at(3_500))
+                .expect("the answer"),
+            Outcome::Published { .. }
+        ));
+        service.observe(
+            &session(1),
+            ContextSignal::WorkingDirectory {
+                directory: "crates".to_owned(),
+                repository: None,
+            },
+            at(4_000),
+        );
+        assert!(
+            service.settle(&session(1), priority, at(6_000)).is_some(),
+            "the change is queued for a second description ({priority:?})"
+        );
+        assert_eq!(
+            service.next(&roomy(), at(32_999)).expect("an instruction"),
+            Instruction::Wait {
+                until_ms: Some(33_000)
+            },
+            "thirty seconds after the job was sent, to the millisecond ({priority:?})"
+        );
+        let Instruction::Generate { session_id, .. } =
+            service.next(&roomy(), at(33_000)).expect("an instruction")
+        else {
+            panic!("the second description is sent when the cooldown ends ({priority:?})");
+        };
+        assert_eq!(session_id, session(1));
+    }
 }
 
 /// KR-REQ-22.10: one job is in the process at a time. A second session whose description is due
