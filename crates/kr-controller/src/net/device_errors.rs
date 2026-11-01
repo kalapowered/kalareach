@@ -33,7 +33,8 @@
 //! knows by its wording: a number that follows a word for an account across a separator the rule
 //! does not read, or through a longer name for one (`uid: 501`, `owner: 502`, `user id 501`,
 //! `user  501`, `uid(501)`, `uid_501`); a path of which every slash follows a name (`~name/work`,
-//! `Users/name/work`, `.config/kalareach/x`); a place in the words of a pointer's refusal, whatever
+//! `Users/name/work`, `.config/kalareach/x`); a command of a program the rule does not know,
+//! written without backticks (`rm -rf x`); a place in the words of a pointer's refusal, whatever
 //! stands ahead of `at` (`x at /Users/name/p carries a field it does not declare`), which the rule
 //! sets aside; and an account's bare name in a clause that holds no path, number or command of its
 //! own (the error output of `systemctl` that `supervision.rs` quotes can hold one), even when a
@@ -310,7 +311,7 @@ struct HostPath {
 /// the product shows them to the person on purpose, as part of how a session or a question is
 /// described (the specification names a session's working directory and a question's verified
 /// executable). A grant that leaves out the live screen cannot attach to the terminal and can still
-/// read the session's summary, so the directory and the shell are shown as the session's
+/// read the session's summary. The directory and the shell are shown as the session's
 /// description. A path under a home directory names the account, and a device cannot use one, so a
 /// device is given each as the withheld record of a path (the form the directory of a
 /// materialisation has), with the list of paths as long as it was.
@@ -917,12 +918,13 @@ fn shown_member(map: &CanonicalMap, key: &str, child: &CanonicalValue) -> Option
                 // pointer's refusal set aside (a subject is a package and its hash, and has none),
                 // and so does the check of what the rule kept: when the rule over the text through
                 // the clause finds nothing (a path the pointer rule hides, or a clause that
-                // completes a pointer's refusal), or what it kept still names something, what
-                // stands for it is the fixed sentence. A plugin identifier that reads as an
+                // completes a pointer's refusal), or what it kept still names something or holds a
+                // backtick (a quotation the cut left open), what stands for it is the fixed
+                // sentence. A plugin identifier that reads as an
                 // account's number (`acme/user-1`) is held too.
                 Some((at, end)) if is_held_to_the_rule(&text[..at]) => Some(
                     told_in_place(&text[..end], fixed)
-                        .filter(|told| naming_outside(told, None).is_none())
+                        .filter(|told| naming_outside(told, None).is_none() && !told.contains('`'))
                         .unwrap_or_else(fixed),
                 ),
                 Some((_, end)) => (end < text.len()).then(|| text[..end].to_owned()),
@@ -1369,6 +1371,12 @@ fn account_number(text: &str) -> Option<usize> {
         .min()
 }
 
+/// Whether `character` would run into the word `a command` that replaces a quotation, as the rest
+/// of a name or a path.
+fn joins_a_word(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '/' | '\\' | '~' | '_')
+}
+
 /// `text` with every command quoted in backticks (more than one word between a pair of them)
 /// replaced by `a command`, or `None` when it quotes none.
 fn without_quoted_commands(text: &str) -> Option<String> {
@@ -1383,7 +1391,14 @@ fn without_quoted_commands(text: &str) -> Option<String> {
         let quoted = &rest[opening + 1..closing];
         shown.push_str(&rest[..opening]);
         if quoted.chars().any(char::is_whitespace) {
+            // A word beside the quotation stays a word of its own, so the rule can still read it.
+            if shown.ends_with(joins_a_word) {
+                shown.push(' ');
+            }
             shown.push_str("a command");
+            if rest[closing + 1..].starts_with(joins_a_word) {
+                shown.push(' ');
+            }
             replaced = true;
         } else {
             shown.push_str(&rest[opening..=closing]);
@@ -4114,10 +4129,38 @@ mod tests {
             for said in [
                 format!("`rm -rf x{clause}`: marguerite wrote this"),
                 format!("`rm -rf x{clause}"),
+                // The backtick is not the first character, and a quotation before it is replaced
+                // while this one stays open.
+                format!("x `rm -rf y{clause}`: marguerite wrote this"),
+                format!("`echo ok` `rm -rf x{clause}`: marguerite wrote this"),
             ] {
                 assert_eq!(left_out_detail_told_to_a_device(&said), nothing, "{said}");
             }
         }
+    }
+
+    /// A quotation that is replaced leaves the words beside it words of their own, so a path, a
+    /// number or a program that touches its backticks is still read.
+    #[test]
+    fn a_command_quoted_against_a_word_does_not_hide_the_word() {
+        let nothing = format!("why the admissions leave the installation out; {WHY_NOT_SHOWN}");
+        for beside in ["/Users/marguerite/p", "uid 501", "sudo x"] {
+            // In a message the rule reads whole, and in the subject of a left-out detail.
+            let said = format!("`a b`{beside} failed");
+            let told = message_for_a_device(ErrorCode::InvalidArgument, &said)
+                .unwrap_or_else(|| panic!("{said} was told as it was"));
+            assert!(
+                !told.contains("marguerite") && !told.contains("501") && !told.contains("sudo"),
+                "{said}: {told}"
+            );
+            for clause in LEFT_OUT_CLAUSES {
+                let said = format!("`a b`{beside}{clause}: marguerite wrote this");
+                assert_eq!(left_out_detail_told_to_a_device(&said), nothing, "{said}");
+            }
+        }
+        let said = "sudo`a b` failed";
+        let told = message_for_a_device(ErrorCode::InvalidArgument, said).expect("told");
+        assert!(!told.contains("sudo"), "{told}");
     }
 
     #[test]
