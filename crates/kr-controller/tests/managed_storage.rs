@@ -6657,11 +6657,7 @@ async fn a_delay_named_by_a_request_that_is_out_when_a_fence_lands_stays_owed_th
 
     rig.controller.hold_fence(false);
     let told = rig.enable(&made.params).await;
-    assert!(
-        matches!(&told, BackupEnableResult::Unknown { retry_after_seconds }
-            if retry_after_seconds.0.map(|seconds| seconds.get()) == Some(30)),
-        "{told:?}"
-    );
+    assert_eq!(the_seconds_a_call_is_told(&told), Some(30));
     assert_eq!(
         web.requests_to(SYNC),
         1,
