@@ -8,12 +8,6 @@
 //! cancellation. The package validator every host, publisher and pipeline runs decides whether
 //! a table says that completely and in a way the host can read. These cases build the example
 //! connector package around each declaration and break it one way at a time.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-11.33 | a table that answers an approval as the response to its request, with each decision mapped to its own value, is accepted; each way it can say that wrongly (both ways at once, no message members, a request the application never asks, an unrouted or unsupported request, a duplicated value, a result member that is one the table reads a message by, responses matched by order, an answer action that offers a decision the table does not map, a package that does not ask for the approval grants) is named |
-//! | KR-REQ-12.06 | a table whose observation names the selection, leave, turn and cleared-request places the host reads is accepted; a route that is unrouted, travels the other way, reads outside the member the table names for that kind of message, gives one method two roles or reads a thread and a turn at overlapping places, and an observation with no message members, are each named |
-//! | KR-REQ-12.12 | a table that spells the core's operations, each as a routed host-to-application mutation with a bounded template that fills in exactly the thread, turn and text the operation has, is accepted; an unrouted method, one that travels the other way or is not a mutation, two operations on one method, a malformed or unknown hole, a missing or surplus hole, an oversized or control-character template (in a text or in the name of a member), a reply turn outside the result member and operations with no message members are each named |
 
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::connector::{
@@ -254,6 +248,9 @@ fn observation(table: &mut ConnectorManifest) -> &mut Observation {
         .expect("the table declares an observation")
 }
 
+/// KR-REQ-11.33 and KR-REQ-12.06, the part about a table that is accepted: a table that answers an
+/// approval as a response and reads the stream's places validates, and it reads back as written.
+/// Not shown here: the ways a table can say either wrongly.
 #[test]
 fn a_table_that_answers_as_a_response_and_reads_the_stream_validates() {
     let report = validated(&server_table());

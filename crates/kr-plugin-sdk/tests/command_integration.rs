@@ -5,12 +5,6 @@
 //! package declares its integration in its manifest, beside its native bridge, and the validator
 //! every host, publisher and pipeline runs decides what a declaration may say. These cases build a
 //! whole package directory around the example manifest and run that validator on it.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-12.07 | a declared integration is read from the verified manifest with its capability; one without it, or with a reserved, loader, search-path or startup variable, an empty flag or an over-long list, is refused |
-//! | KR-REQ-12.20 | Gemini CLI's `GEMINI_CLI_NO_RELAUNCH=true` is a variable a package may set |
-//! | KR-REQ-12.22 | Qoder CLI's two launch flags, as core pins them, are flags a package may add |
 
 use std::path::{Path, PathBuf};
 
