@@ -6542,19 +6542,23 @@ async fn the_storage_state_the_owner_is_told(rig: &Rig) -> BackupStorageState {
 /// KR-REQ-09.09: a delay the service names in an answer that ends the call before the place that
 /// usually owes it is owed all the same, for as long as the service named, and holds back what asks
 /// the service next. The owner's next look at the service is what shows it: it sends nothing and
-/// says the service asked to be left alone. Two such answers. The first is the refusal of the
+/// says the service asked to be left alone. Three such answers. The first is the refusal of the
 /// enrolment, which carries no token and so leaves under the account the call began under after
 /// another account has signed in; the call ends as another account's. The second is the refusal of
 /// the read that settles a bundle write, which carries the code of a token the service does not
-/// take; the call ends as a decline for it. The control for each: the same answer naming no delay
-/// leaves the host owing none, so the delay owed is the service's and not one the host adds.
+/// take; the call ends as a decline for it. The third is the same read refused as unavailable; the
+/// call ends as unknown with the delay, and the read is not sent again. The control for each: the
+/// same answer naming no delay leaves the host owing none, so the delay owed is the service's and
+/// not one the host adds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delay_named_in_an_answer_that_ends_the_call_at_once_is_owed() {
     let delayed = BackupStorageState::Unread {
         why: BackupStorageUnread::Delayed,
     };
-    // Five seconds is less than the longest delay a client waits out by itself, so a client that
-    // did not leave the delay to the caller would send the request again and see no refusal.
+    // Five seconds is less than the longest delay a client waits out by itself. A client sends a
+    // request that is safe to repeat again after the delay of a 503 it is given, so at the sites that
+    // refuse with a 503 a client that did not leave the delay to the caller would send the request
+    // again and see no refusal. The 404 at the second site is not sent again by any client.
     for named in [Some(5_u64), None] {
         let refusal = |status: u16, code: &'static str| Moment::Refuse {
             status,
@@ -6605,6 +6609,24 @@ async fn a_delay_named_in_an_answer_that_ends_the_call_at_once_is_owed() {
                 cause: BackupEnableCause::TokenNotAccepted {}
             }
         );
+        assert_eq!(the_delay_the_host_owes(&rig), owed);
+        if named.is_some() {
+            assert_eq!(the_storage_state_the_owner_is_told(&rig).await, delayed);
+        }
+
+        // The same read, refused as unavailable. It is safe to repeat and the delay is short, so a
+        // sync client that did not leave the delay to the caller would send it again.
+        let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+        let web = Arc::clone(rig.served.web());
+        let made = rig.prepared_setup(archive_id(), false);
+        web.fail(SYNC, 1, Moment::Hold);
+        web.fail(SYNC, 2, refusal(503, "SERVICE_UNAVAILABLE"));
+        let call = rig.enable_in_the_background(&made.params);
+        within("the bundle write", web.requests_reach(SYNC, 1)).await;
+        web.release_held();
+        let answer = call.await.expect("the call ends");
+        assert_eq!(the_seconds_a_call_is_told(&answer), named);
+        assert_eq!(web.requests_to(SYNC), 2, "the read was not sent again");
         assert_eq!(the_delay_the_host_owes(&rig), owed);
         if named.is_some() {
             assert_eq!(the_storage_state_the_owner_is_told(&rig).await, delayed);
