@@ -3773,6 +3773,10 @@ fn ask(
         }
     };
     let status = loop {
+        // On Unix nothing is read once the time has run out, so a poll that wakes late and finds
+        // the program ended has read none of what it wrote after the time, and the drain below
+        // refuses the look as the clock's. Elsewhere a thread reads the pipe and the clock does
+        // not stop it.
         heard.take_in(deadline);
         match has_ended(&mut child) {
             Ended::No => {}
@@ -3955,7 +3959,8 @@ impl Heard {
     }
 
     /// Takes in what has arrived, for no longer than `deadline` and no further than
-    /// [`PROBE_OUTPUT_LIMIT`] bytes, past which [`Self::overflowed`] says so.
+    /// [`PROBE_OUTPUT_LIMIT`] bytes, past which [`Self::overflowed`] says so. On Unix, once
+    /// `deadline` has come nothing more is taken in.
     fn take_in(&mut self, deadline: Instant) {
         #[cfg(unix)]
         {
@@ -4032,13 +4037,21 @@ enum Gathered {
 /// `seen`.
 ///
 /// The pass ends when the pipe is empty or closed, and also when `seen` has passed the limit or
-/// `deadline` has come, checked after every read. A writer that is never behind the reader keeps
+/// `deadline` has come, checked before every read. A writer that is never behind the reader keeps
 /// the pipe from ever being empty, so without those two the pass would last as long as the writer
 /// does, and so would the memory it is given. Nothing is read once the limit is passed.
+///
+/// The time is checked before a read and not after it, so a pass that begins after the time has run
+/// out reads nothing. A poll that wakes late therefore takes in neither what was written after the
+/// time ran out nor the end that follows it, and the end is first seen by a pass that began in
+/// time.
 #[cfg(unix)]
 fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) -> Gathered {
     let mut buffer = [0_u8; 4096];
     while !seen.truncated {
+        if Instant::now() >= deadline {
+            break;
+        }
         let read = pipe.read(&mut buffer);
         // A case that asks for it has the read fail, as one does for a pipe the system can no
         // longer read, and the arm that handles the failure is the real one.
@@ -4066,9 +4079,6 @@ fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) 
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Gathered::Unreadable(error),
-        }
-        if Instant::now() >= deadline {
-            break;
         }
     }
     Gathered::Open
