@@ -4388,3 +4388,68 @@ async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_re
     );
     start(false);
 }
+
+/// The platform's time service as a host reads it: keeping the wall clock, or not.
+#[cfg(unix)]
+fn unix_time_service(keeping_the_clock: bool) -> kr_worker::action::time::TimeSources {
+    use kr_worker::action::adapter::{RecordedTimeAdapter, UnixTimex, classify_unix, unix_model};
+    use kr_worker::action::time::{ManualActiveClock, ManualWallClock, TimeSources};
+
+    let (status, time_state) = if keeping_the_clock {
+        (unix_model::STA_PLL, unix_model::TIME_OK)
+    } else {
+        (unix_model::STA_UNSYNC, unix_model::TIME_ERROR)
+    };
+    let reading = classify_unix(
+        "linux",
+        "ntp_adjtime(2)",
+        UnixTimex {
+            time_state,
+            status,
+            maxerror_us: 62_192,
+            esterror_us: 500,
+        },
+        TimestampMs::new(1_700_000_000_000),
+    );
+    TimeSources {
+        continuous: Arc::new(kr_ipc::clock::ManualSharedClock::new()),
+        active: Arc::new(ManualActiveClock::new()),
+        wall: Arc::new(ManualWallClock::new(1_700_000_000_000)),
+        adapter: Arc::new(RecordedTimeAdapter::new(reading)),
+        floor: None,
+    }
+}
+
+/// Section 9, KR-REQ-20.20: the pass a host makes on its tick removes output for its age only
+/// while the host can prove its wall clock. Both hosts hold a segment a week and a day old; the
+/// platform's time service keeps the clock of the first and has stopped keeping the second's.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pass_removes_output_by_age_only_while_the_hosts_wall_clock_can_be_proved() {
+    let proved = host_started(
+        |_| {},
+        a_segment_written(8),
+        unix_time_service(true),
+        "sleep 30",
+    )
+    .await;
+    let unproved = host_started(
+        |_| {},
+        a_segment_written(8),
+        unix_time_service(false),
+        "sleep 30",
+    )
+    .await;
+    proved.service.maintain_now();
+    unproved.service.maintain_now();
+    assert_eq!(
+        kr_worker::history::retained_bytes_under(&proved._temp.environment().spool_dir()),
+        0,
+        "a clock that can be proved calls the segment expired"
+    );
+    assert_eq!(
+        kr_worker::history::retained_bytes_under(&unproved._temp.environment().spool_dir()),
+        4096,
+        "and one that cannot is not trusted to"
+    );
+}
