@@ -120,8 +120,9 @@ stops, so a limit that a part has is written in that part's own document.
 - **Durable sessions.** A worker process for each session owns the pseudo-terminal and the terminal
   state, and the control daemon can restart without ending a session: [host](host/README.md),
   [terminal](terminal/README.md) and [cli](cli/README.md).
-- **Agent interfaces.** Plugin packages for Codex, Claude Code, OpenCode, Gemini CLI, Kimi and
-  Qoder CLI recognise those agents in a session, and the broker in each worker holds each binding,
+- **Agent interfaces.** The official plugin packages for Codex, Claude Code, OpenCode, Gemini CLI, Kimi
+  and Qoder CLI recognise those agents in a session, a package of any publisher recognises another
+  application the same way, and the broker in each worker holds each binding,
   the evidence for what it can do, and the approvals. Typed requests to submit or queue a prompt,
   steer or cancel a turn and answer an approval act only where a binding has evidence for them, so
   what an agent offers depends on its package and its build. The Claude Code and Gemini CLI
