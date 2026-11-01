@@ -137,7 +137,51 @@ static STANDARD_ERROR: OnceLock<Writer> = OnceLock::new();
 
 /// Returns the writer of this process's standard error, starting it if no line has been said.
 pub(crate) fn standard_error() -> &'static Writer {
-    STANDARD_ERROR.get_or_init(|| Writer::start(std::io::stderr()))
+    STANDARD_ERROR.get_or_init(|| Writer::start(destination()))
+}
+
+/// Where the writer of this process's standard error writes.
+#[cfg(not(feature = "testing"))]
+fn destination() -> impl Write + Send + 'static {
+    std::io::stderr()
+}
+
+/// Names a file in the environment of a process a test starts; the writer's thread writes nothing
+/// until the file exists.
+#[cfg(feature = "testing")]
+const HOLD_VARIABLE: &str = "KR_TEST_HOLD_DIAGNOSTICS";
+
+/// Where the writer of this process's standard error writes: its standard error, which a test can
+/// make late. A test that is to read a line the thread has not written yet cannot otherwise catch
+/// that moment, so it names a file in [`HOLD_VARIABLE`], and the first write waits until the file
+/// exists. Without the variable nothing waits, and the feature that compiles this in is one no
+/// shipped build enables.
+#[cfg(feature = "testing")]
+fn destination() -> impl Write + Send + 'static {
+    struct HeldForATest {
+        inner: std::io::Stderr,
+        release: Option<std::path::PathBuf>,
+    }
+
+    impl Write for HeldForATest {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Some(release) = self.release.take() {
+                while !release.exists() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            self.inner.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    HeldForATest {
+        inner: std::io::stderr(),
+        release: std::env::var_os(HOLD_VARIABLE).map(std::path::PathBuf::from),
+    }
 }
 
 /// Says one line to this process's standard error, and lets it go if it cannot be written or the
