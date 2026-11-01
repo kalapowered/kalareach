@@ -1154,9 +1154,11 @@ client can meet one of another build, and the statement is how it tells before i
 cannot read. `kr attach` reads a worker's screens only when the two versions share a compatibility
 level. For a worker at another level it hands over to the `kr` of that worker's release when the
 store holds it, and refuses the worker before it asks the session for anything when the store does
-not; the [`kr attach` reference](../cli/README.md#kr-attach) has the rule and the refusal. A process of a
-build before the statement states none. The daemon still reads its answer, because it goes on
-speaking to the workers that outlived its upgrade, and `kr attach` takes it for an earlier build.
+not; a worker of another public major than the `kr`'s refuses its hello, so nothing is handed over
+([the support window](../releases/support-window.md#sessions-that-outlive-an-update)). The
+[`kr attach` reference](../cli/README.md#kr-attach) has the rule and the refusal. A process of a
+build before the statement states none. The daemon reads its answer, finds no level in it and leaves
+that worker running and unreached, and `kr attach` takes it for an earlier build.
 
 Boot and process-start identities come from the kernel:
 
