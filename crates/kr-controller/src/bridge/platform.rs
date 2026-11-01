@@ -462,16 +462,21 @@ fn run_within(
 }
 
 /// Whether what a container runtime printed says that it knows no such container, in the form the
-/// runtimes say it: a diagnostic one of whose parts, set off by a colon, begins with the words
-/// (`podman`: `Error: no such container "x"`; `docker`: `Error response from daemon: No such
-/// container: x`). The words anywhere else, as in the path of a file that could not be read, are
-/// another failure that names a path. The text is read and not repeated.
+/// runtimes say it: a diagnostic one of whose parts, set off by a colon, begins with the words and
+/// ends there or goes on with a word of its own (`podman`: `Error: no such container "x"`;
+/// `docker`: `Error response from daemon: No such container: x`). The words anywhere else, or as
+/// the start of a name, as in the path of a file that could not be read (`reading config: no such
+/// container/storage.conf: permission denied`), are another failure that names a path. The text is
+/// read and not repeated.
 #[must_use]
 pub fn says_there_is_no_such_container(printed: &str) -> bool {
     printed.lines().any(|line| {
         line.to_lowercase().split(": ").any(|part| {
             let part = part.trim_start();
-            part.starts_with("no such container") || part.starts_with("no such object")
+            ["no such container", "no such object"]
+                .into_iter()
+                .filter_map(|words| part.strip_prefix(words))
+                .any(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
         })
     })
 }
@@ -630,6 +635,9 @@ mod tests {
             "Error response from daemon: No such container: abc",
             "Error: No such object: abc",
             "Warning: something\nError: no such container abc\n",
+            // A diagnostic on a line of its own, and one set off by more than one space.
+            "Warning: something\nno such container abc",
+            "Error:  no such container abc",
         ] {
             assert!(super::says_there_is_no_such_container(said), "{said}");
         }
@@ -637,6 +645,10 @@ mod tests {
             "Error: reading /tmp/no such container/storage.conf: permission denied",
             "Error: cannot connect to the store",
             "Error: open /var/lib/no such object: permission denied",
+            // A name that begins with the words, after a colon, is a name and not a diagnostic.
+            "Error: reading config: no such container/storage.conf: permission denied",
+            "Error: open /tmp/cache: no such container/storage.conf: permission denied",
+            "Error: no such objects directory: permission denied",
             "",
         ] {
             assert!(!super::says_there_is_no_such_container(said), "{said}");
