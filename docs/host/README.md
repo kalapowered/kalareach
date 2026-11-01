@@ -1619,7 +1619,8 @@ same ceremony on both doors, and a device cannot stand in for it.
 What a session may bind is the daemon's to decide and the worker's to enforce. The daemon computes
 the environment's plugin admissions from the catalogue's current records: every installation that
 is enabled, supported on this host's operating system and architecture, whole in the store, within
-the package limits in force and not revoked. Every change that could alter them raises an admission
+the package limits in force, not revoked and named by the adapter allowlist in force where an
+applied policy states one ([Applying a policy](#applying-a-policy)). Every change that could alter them raises an admission
 revision in the catalogue's own transaction. Each worker is handed the admissions with its launch
 specification, and a round on its authority connection after every such change and every 30
 seconds while it has not answered at the current revision or holds a release no installation
@@ -5180,7 +5181,7 @@ archive takes that content out when it recovers or collects the session, whether
 still owes cleanup and whatever the daemon's privacy mode says by then, and it serves no result from
 a journal with such a record before then.
 
-Privacy mode does not reach two stores. The canonical grid keeps its own scrollback, which a client
+Privacy mode does not reach these two stores, and the last list in this section names others. The canonical grid keeps its own scrollback, which a client
 can still page through, and the worker keeps a bounded log of the semantic entries that a bound
 agent's bridge or gateway observed (up to 4,096 for each instance, the text of notifications and
 details included, at most 64 KiB for each entry), which `agent.snapshot` serves and the privacy cleanup does not clear. Neither is
@@ -5195,14 +5196,15 @@ both, because an enabling that was interrupted leaves content behind and nothing
 whether it did.
 
 What stays is named rather than silently retained, in two places. The report's `kept` list names
-what the daemon's own services keep, each with its reason: the record of each backup generation
+what the three services that privacy mode takes through the steps keep, each with its reason: the record of each backup generation
 this host produced, the enrolment of each backup writer, the session names people pinned, which are
 kept locally unless explicitly cleared and are left out of sync while privacy mode is on, the
 delivery journal's own records, and each destination's spent rate allowance. A session's worker
 keeps more, which the report does not carry and this guide names: the receipt journal's operation
 metadata, the minimal local authority this host holds, the envelope of an action that has not
 settled, and live pending questions and approvals, which keep working under the grants they already
-have without their bodies being exported as historical content. A host that claimed a functioning
+have. The attention store serves none of their text, but their ledgers keep it, as the last list in
+this section says. A host that claimed a functioning
 durable control system wrote no state at all would be claiming something untrue.
 
 The same boundary applies when exporting session content as part of a support bundle:
@@ -5348,7 +5350,9 @@ offered, because the destination is kept as history with no rule and this host n
 credential, and neither is a row recorded with no digest: it matches no destination. An external
 message that its destination took, called a duplicate or left unknown is listed and is not
 deletable, because this host holds no way to ask the service it went to to forget it. A message
-that its destination read and refused is not listed, although its content reached that service.
+that its destination read and refused is not listed, although its content reached that service, and
+nor is one still retrying after an answer this host could not read, which has left too, until
+turning privacy mode on settles it as uncertain.
 Backup does not silently delete unrelated collections and does not claim a copy
 somebody else holds can be recalled. Local deletion is logical cleanup of this host's own records
 rather than a claim of physical secure erase: the files are unlinked and the rows are cleared, and
@@ -5493,6 +5497,12 @@ what it removes is exactly the thing a person cannot check for themselves.
   invitation's record in the sharing store. The sharing store is not one of the subsystems privacy
   cleanup takes through the steps, so it removes none of this, and the record keeps it after the
   invitation is redeemed, withdrawn or has expired.
+* **A session's questions and approvals keep their text.** The question ledger in the session's
+  store keeps each question's context, text, choices and answer in any state, and the broker's
+  ledger keeps what each approval asked. Privacy cleanup removes none of this. The attention store
+  serves none of it from before the change, but `question.read` is not fenced by privacy mode: while
+  the mode is on and after it, the local owner reads every question, and a device that holds
+  `session.view` reads the questions its grant's history reaches.
 
 ## Session names and descriptions
 
@@ -6601,7 +6611,7 @@ whose text was withheld.
 
 ### Privacy mode and the text an item carries
 
-A session serves a record's text only while privacy mode is off, and only for a record written
+A session serves the attention store a record's text only while privacy mode is off, and only for a record written
 after the last privacy transition: the transition writes down where each source stood, in the same
 transaction, and nothing at or before that point is served again, live or from the session's
 journal once it has closed. So text from before privacy mode was enabled, and text written while it
