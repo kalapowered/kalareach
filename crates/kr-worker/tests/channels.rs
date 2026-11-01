@@ -1768,6 +1768,10 @@ async fn kr_req_12_18_an_application_that_goes_after_the_marker_leaves_the_appro
         .await
         .expect_err("an answer that may have gone is not answered a second time");
     assert_eq!(again.code(), ErrorCode::QuestionResolved, "{again}");
+    assert!(
+        matches!(gone.ended().await, ChannelEnd::Ended { .. }),
+        "the channel ended because its connection did, and no one retired it"
+    );
     eventually("the failed transmission is counted", || {
         !adapter_failures(&broker).is_empty()
     })
@@ -1780,10 +1784,6 @@ async fn kr_req_12_18_an_application_that_goes_after_the_marker_leaves_the_appro
             1
         )],
         "and it is one failure of the application's adapter"
-    );
-    assert!(
-        matches!(gone.ended().await, ChannelEnd::Ended { .. }),
-        "the channel ended because its connection did, and no one retired it"
     );
 }
 
