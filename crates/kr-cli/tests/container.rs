@@ -12,6 +12,7 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::error::ErrorCode;
@@ -27,18 +28,57 @@ const IMAGE: &str = "docker.io/library/debian:stable-slim";
 /// Where the command is mounted inside the container.
 const MOUNTED_HELPER: &str = "/kr/kr";
 
+/// How long the runtime is given to answer `--version`, and then to be collected when it has not.
+const VERSION_BOUND: Duration = Duration::from_secs(60);
+
+/// Returns false and says why when this machine has no container runtime.
 fn runtime_available(suite: &str) -> bool {
-    let present = Command::new(RUNTIME)
+    available_through(RUNTIME, suite)
+}
+
+/// [`runtime_available`], for the program `runtime`. Only a program that is not there is a reason
+/// to skip: one that is there and fails its `--version` is a broken install, and one that does not
+/// answer it is a stall. Both fail the case, where a skip would pass every case that needs the
+/// runtime.
+fn available_through(runtime: &str, suite: &str) -> bool {
+    let mut asked = match Command::new(runtime)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if !present {
-        eprintln!("{suite}: skipped, because {RUNTIME} is not installed on this machine");
-    }
-    present
+        .spawn()
+    {
+        Ok(asked) => asked,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("{suite}: skipped, because {runtime} is not installed on this machine");
+            return false;
+        }
+        Err(error) => panic!("{runtime} is installed and could not be started: {error}"),
+    };
+    let begun = Instant::now();
+    let status = loop {
+        match asked.try_wait().expect("the state of the runtime's answer") {
+            Some(status) => break status,
+            None if begun.elapsed() < VERSION_BOUND => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None => {
+                // Collected within a bound too: a program the kernel does not let go is reported,
+                // and not waited for.
+                let _ = asked.kill();
+                let collected_by = Instant::now() + VERSION_BOUND;
+                while matches!(asked.try_wait(), Ok(None)) && Instant::now() < collected_by {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                panic!("{runtime} `--version` did not end within {VERSION_BOUND:?}");
+            }
+        }
+    };
+    assert!(
+        status.success(),
+        "{runtime} is installed and `--version` ended with {status}"
+    );
+    true
 }
 
 /// The command, copied to a directory of this run's own so it can be mounted read-only.
@@ -129,6 +169,40 @@ fn the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_act
         status.code(),
         Some(0),
         "a refused bridge does not exit zero"
+    );
+}
+
+/// Only a runtime that is not there is a reason to skip the suite. One that is there and fails its
+/// `--version` is a broken install, and fails the case that asks.
+#[test]
+fn only_a_runtime_that_is_not_there_is_a_reason_to_skip() {
+    assert!(!available_through(
+        "/nonexistent-runtime/podman",
+        "the_cases_of_a_machine_with_none"
+    ));
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let runtime_that = |name: &str, body: &str| {
+        let text = directory.path().join(format!("{name}.text"));
+        std::fs::write(&text, format!("#!/bin/sh\n{body}\n")).expect("the stand-in runtime");
+        let program = directory.path().join(name);
+        kr_ipc::testing::place_program(&text, &program);
+        program.display().to_string()
+    };
+    let working = runtime_that("working", "exit 0");
+    assert!(available_through(
+        &working,
+        "the_cases_of_a_machine_with_one"
+    ));
+
+    let broken = runtime_that("broken", "exit 3");
+    let failed =
+        std::panic::catch_unwind(|| available_through(&broken, "the_cases_of_a_broken_one"));
+    let said = failed.expect_err("a runtime that fails its version fails the case");
+    let said = said.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        said.contains("is installed and `--version` ended with"),
+        "{said}"
     );
 }
 
