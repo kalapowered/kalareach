@@ -513,9 +513,7 @@ impl BackupSetup {
                 deleted_still_charged_bytes: U64::new(status.tombstoned.bytes),
             },
             Ok(Err(error)) => {
-                if let Some(delay) = Hold::of(&error).retry_after {
-                    self.quiet.owe(delay);
-                }
+                self.owe(Hold::of(&error));
                 BackupStorageState::Unread {
                     why: BackupStorageUnread::Failed,
                 }
