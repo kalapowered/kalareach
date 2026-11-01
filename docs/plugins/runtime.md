@@ -472,8 +472,9 @@ Every frame of `kr-plugin-host/3` is closed before its first release, because no
 frames of a released host protocol other than its name, and a request, a response or a notice
 variant, or a member added to a record of one, would meet a worker or a host of the release before
 that adopted it: it ends the connection, and every binding on it, over a frame it cannot read. A
-change to a frame, or to one of the rules a host reads a request under, takes a new protocol. The
-rules are these.
+change to a frame, or to one of the rules a host reads a request under, would need a new protocol, and no
+release can make one today: a retained level must record this release's protocol name ([the support
+window](../releases/support-window.md)). The rules are these.
 
 - The reading task answers `hello`, `verify`, `event`, `health`, `revise_facts`, `revise_attachments`
   and `privacy` without entering a component. The other requests that name a binding run in a task of
