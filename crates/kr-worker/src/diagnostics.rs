@@ -187,6 +187,9 @@ fn destination() -> impl Write + Send + 'static {
 /// Says one line to this process's standard error, and lets it go if it cannot be written or the
 /// writer is behind. The line is handed over whole, and the thread writes it with `write_all`: a
 /// volume that is nearly full can take part of it. This never waits for the write.
+///
+/// A line is also let go when the thread could not be started, and then every line is, for as long
+/// as the process lives: the writer is started once.
 pub fn tell(line: std::fmt::Arguments<'_>) {
     let _ = standard_error().offer(format!("kr-worker: {line}\n"), None);
 }
@@ -643,17 +646,27 @@ mod tests {
     fn a_drain_waits_for_the_lines_taken_and_gives_up_at_its_bound() {
         let (begun, begun_at) = mpsc::channel();
         let (release, released) = mpsc::channel();
-        let writer = Writer::start(Stalled {
+        let writer = std::sync::Arc::new(Writer::start(Stalled {
             begun,
             release: released,
             taken: std::sync::Arc::default(),
-        });
+        }));
         assert!(writer.drain(Duration::ZERO), "nothing was taken");
 
         assert!(writer.offer("first\n".to_owned(), None));
         begun_at.recv_timeout(DEADLINE).expect("the write began");
-        assert!(
-            !writer.drain(Duration::from_millis(20)),
+        // A drain with no bound would not return while the write waits, so it runs on a thread of
+        // its own and the case waits for its answer for a limited time.
+        let (answered, answer) = mpsc::channel();
+        std::thread::spawn({
+            let writer = std::sync::Arc::clone(&writer);
+            move || {
+                let _ = answered.send(writer.drain(Duration::from_millis(20)));
+            }
+        });
+        assert_eq!(
+            answer.recv_timeout(DEADLINE),
+            Ok(false),
             "a write that waits for a reader holds a drain to its bound"
         );
         release.send(true).expect("lets the write end");
@@ -813,6 +826,10 @@ mod tests {
         );
         release.send(true).expect("lets the write end");
         until(|| reasons.said().is_some());
+        assert!(
+            writer.drain(DEADLINE),
+            "the line the writer dropped is not counted as unfinished"
+        );
     }
 
     /// Fills this process's standard error, a pipe, to the last byte, so that the next write to it
@@ -866,6 +883,12 @@ mod tests {
             }
             for number in 0..WAITING * 3 {
                 super::tell(format_args!("a line to a standard error, number {number}"));
+            }
+            if mode == "full" {
+                assert!(
+                    !super::drain(Duration::from_millis(20)),
+                    "a write that waits for a reader is not drained"
+                );
             }
             println!("told");
             return;
