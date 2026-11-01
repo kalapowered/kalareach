@@ -810,3 +810,26 @@ fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
         "the conformance document does not say where the WSL2 acceptance is"
     );
 }
+
+/// The tests that start a daemon through the user's service manager stand down, and pass, on a
+/// machine that has none. The Linux runs that report on the workspace's tests set
+/// `KR_REQUIRE_SERVICE_MANAGER`, which turns that standing down into a failure, so that a runner
+/// without a manager does not report those tests as passed without having run them.
+#[test]
+fn the_linux_runs_of_the_workspace_tests_require_a_user_service_manager() {
+    let variable = "KR_REQUIRE_SERVICE_MANAGER: \"1\"";
+    let landing = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let tests = steps_running(&job(&landing, "rust"), "cargo test --locked --workspace");
+    assert!(
+        tests.iter().all(|step| step.contains(variable)),
+        "the step of the landing workflow's rust job that runs the workspace's tests does not \
+         require a user service manager"
+    );
+    let report = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
+        .expect("the conformance workflow");
+    assert!(
+        job(&report, "linux").contains(variable),
+        "the Linux job of the conformance workflow does not require a user service manager"
+    );
+}
