@@ -1191,8 +1191,12 @@ impl Session {
             Err(why) => {
                 // The shell is told only that no launch could be integrated, and the invocation
                 // runs as typed. Why goes to this worker's own diagnostics, where a person looking
-                // into a command that ran without its integration finds it.
-                eprintln!("kr-worker: {command} is not integrated for this launch: {why}");
+                // into a command that ran without its integration finds it. The session is held
+                // while it is written, and the volume that made the launch fail may refuse the
+                // write as well: a write that fails costs the invocation nothing.
+                tell_diagnostics(format_args!(
+                    "{command} is not integrated for this launch: {why}"
+                ));
                 None
             }
         }
@@ -5677,11 +5681,24 @@ pub(crate) fn say_output_reason(
     }
 }
 
+/// Says one line to this worker's standard error, for a person looking into a host that did less
+/// than it was asked to, and lets go of a write that fails. A volume that is full refuses the line
+/// as it refused what made the host say it, and a line to a diagnostic is not worth the session
+/// that is held while it is written.
+fn tell_diagnostics(line: std::fmt::Arguments<'_>) {
+    tell(&mut std::io::stderr(), line);
+}
+
+/// Writes `line` to `diagnostics` as one write, and ignores the result.
+fn tell(diagnostics: &mut impl std::io::Write, line: std::fmt::Arguments<'_>) {
+    let _ = diagnostics.write_all(format!("kr-worker: {line}\n").as_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use kr_protocol::root::{CommandBypassReason, PromptGeneration};
 
-    use super::{Answered, StartTerms, say_output_reason};
+    use super::{Answered, StartTerms, say_output_reason, tell};
 
     /// What the pass said, one reason to a line.
     fn said_by(said: &mut Option<String>, reason: Option<&str>, age_applied: bool) -> Vec<String> {
@@ -5829,6 +5846,21 @@ mod tests {
             1,
             "and then the reason is new again"
         );
+    }
+
+    /// A line to the diagnostics is one write, and a write that fails is let go.
+    #[test]
+    fn a_line_to_the_diagnostics_is_let_go_when_it_cannot_be_written() {
+        let mut stream = Draining::default();
+        tell(&mut stream, format_args!("{} is not integrated", "claude"));
+        assert_eq!(stream.taken, b"kr-worker: claude is not integrated\n");
+
+        let mut full = Draining {
+            open: false,
+            taken: Vec::new(),
+        };
+        tell(&mut full, format_args!("{} is not integrated", "claude"));
+        assert!(full.taken.is_empty(), "the full stream took nothing");
     }
 
     /// An adoption is given the bypass its own line was answered with, and none of an earlier
