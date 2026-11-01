@@ -90,6 +90,16 @@ mod teardown;
 /// How long a test waits for something the machine has to do before it calls it a failure.
 const PATIENCE: Duration = Duration::from_secs(30);
 
+/// Runs one whole step inside [`PATIENCE`], and fails the case naming the step when the bound runs
+/// out. A request to the host or the worker has no timer of its own, so a step that is a request
+/// goes through here: a peer that holds its connection open and never answers would otherwise hold
+/// the case for good.
+async fn within_patience<T>(step: &str, work: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(PATIENCE, work)
+        .await
+        .unwrap_or_else(|_| panic!("waited {PATIENCE:?} for {step}"))
+}
+
 /// What the shell prints when it has actually run what was typed.
 ///
 /// The command's own text does not contain it, so a terminal that merely echoed the keystrokes
@@ -967,8 +977,9 @@ async fn type_and_wait_for(
     text: &str,
     wanted: &str,
 ) -> String {
-    let acquired: InputAcquireResult = session
-        .mutate(
+    let acquired: InputAcquireResult = within_patience(
+        "the host to settle the input lease",
+        session.mutate(
             Method::InputAcquire,
             ActionTarget {
                 environment_id,
@@ -985,14 +996,16 @@ async fn type_and_wait_for(
                 expected_epoch: Nullable::null(),
             },
             DurationMs::new(120_000),
-        )
-        .await
-        .expect("the lease is settled")
-        .to_typed()
-        .expect("a lease");
+        ),
+    )
+    .await
+    .expect("the lease is settled")
+    .to_typed()
+    .expect("a lease");
     let mut events = session.events();
-    let written: InputWriteResult = session
-        .write_input(&InputWriteParams {
+    let written: InputWriteResult = within_patience(
+        "the host to accept the typed input",
+        session.write_input(&InputWriteParams {
             session_id,
             attachment_id,
             epoch: acquired.lease.epoch,
@@ -1001,9 +1014,10 @@ async fn type_and_wait_for(
             input: InputContent::Bytes {
                 bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
             },
-        })
-        .await
-        .expect("the input is accepted");
+        }),
+    )
+    .await
+    .expect("the input is accepted");
     assert!(
         written.forwarded_bytes.get() > 0,
         "the bytes reached the application"
@@ -1565,8 +1579,10 @@ async fn a_host_on_every_interface_hints_the_addresses_it_found_there() {
 /// The device has read everything the session produced before it is revoked. Were a frame still on
 /// its way, the relay's own authority check would end the connection when that frame reached it,
 /// and the wait could not tell that apart from the revocation's fence. The case shows that the
-/// connection ends with no request from the device, and not how soon: its waits are bounded by
-/// the suite's patience.
+/// connection ends with no request from the device, and not how soon: the word step (the lease
+/// request, the typed input and the read up to the word), the revoke call and the two waits after
+/// the revocation are each bounded by the suite's patience, with the step named. The set-up
+/// requests (create, pair, attach) and the closing of the session have no timer of their own.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_device_is_fenced_before_it_is_served_again() {
@@ -1601,20 +1617,22 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
 
     // The device is revoked while its connection is authorised and its subscription is running,
     // by the owner at the machine through `device.revoke`: the call a person makes.
-    let _: kr_protocol::sharing::RevocationResult = local
-        .mutate(
+    let _: kr_protocol::sharing::RevocationResult = within_patience(
+        "the daemon to answer the owner's device.revoke",
+        local.mutate(
             Method::DeviceRevoke,
             ActionId::new(kr_ipc::new_uuid()),
             ActionTarget::environment(host.environment_id),
             &kr_protocol::sharing::DeviceRevokeParams {
                 device_id: record.device_id,
             },
-        )
-        .await
-        .expect("the call reaches the daemon")
-        .expect("the owner revokes the device")
-        .to_typed()
-        .expect("a revocation result");
+        ),
+    )
+    .await
+    .expect("the call reaches the daemon")
+    .expect("the owner revokes the device")
+    .to_typed()
+    .expect("a revocation result");
 
     // The fence is not a recorded state the next request happens to notice: withdrawing the
     // registration takes the connection's write boundary with it and ends the connection. The

@@ -23,11 +23,14 @@
 //! recorded with the shortfall named and the target cannot fail the case. A run whose restored
 //! screen passes the case's checks records the figure beside the host it was taken on, in the form
 //! the other performance records take, before the target is asserted. The target is not the case's
-//! only limit on time: each of its own waits for the host (to pair the device, to serve the worker's
-//! session, the attach and the subscription inside the timed span, and the screen after them) is
-//! bounded as a whole, the request to the host included, at 120 seconds, so a host that stops
-//! answering one of them fails the case there. The harness's dial has a limit of its own, and the
-//! start-up of the host and of the worker is the harness's and is not timed here.
+//! only limit on time: the case's waits for the host's answers (the pairing as a whole, the
+//! worker's session, the attach and the subscription inside the timed span) are each bounded as a
+//! whole, the request to the host included, at 120 seconds, and the screen after them has a
+//! deadline of the same length, so a host that stops answering one of them fails the case there.
+//! The pairing's bound is shorter than the harness's own limit for reaching a host (300 seconds), so
+//! a host that no dial reaches fails the case at 120 seconds. The dials of the paired connection
+//! keep the harness's limit, and the start-up of the host and of the worker is the harness's and
+//! is not timed here.
 
 #![cfg(unix)]
 
@@ -373,8 +376,8 @@ where
 }
 
 /// Runs one whole wait inside the liveness bound, and fails the case when the bound runs out. A
-/// request to the host has no timer of its own, so each of this case's waits for a host's answer
-/// goes through here.
+/// request to the host has no timer of its own, so the waits the module comment lists go through
+/// here; the dials and the screen loop have limits of their own.
 async fn within_liveness<T>(what: &str, wait: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(LIVENESS, wait)
         .await
