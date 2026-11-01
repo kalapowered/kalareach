@@ -3545,7 +3545,7 @@ and the session content they carry is narrowed exactly as the listings' is.
 
 **A paired device is served the five repository operations on a Linux host that has proved it can confine Git, and is refused them on every other host.** The five are `project.init`, `project.clone`, `project.adopt`, `workspace.create` and `workspace.remove`, and each runs the Git program. This host bounds every name it resolves itself to the directories the owner authorised, each reached through a handle it holds. It bounds what Git reaches once Git is running only where it can show that it does. The daemon shows it when it starts and again at each `host.doctor`, by running one Git invocation under the rules a device's invocations run under. That one run needs four things at once: Landlock at filesystem version 3, rules with no ambient read, the loaders and libraries of this host's Git named object by object, and a mount table with nothing mounted beneath a directory the invocation is granted. The door reads the last answer.
 
-A host that has not proved it refuses the five before the project service is reached. That covers macOS and Windows, a kernel older than 6.2, a host that cannot name its support set, and a host whose mount table puts a filesystem beneath a granted directory. The refusal is `PERMISSION_DENIED` with one sentence, which says that this host cannot confine what the Git program reads and so does not run it for a paired device. It names no library, path or mount. `host.doctor` says which of three causes stopped the proof, in sentences this build wrote, and the daemon's own log carries the detail.
+A host that has not proved it refuses the five before the project service is reached. That covers macOS and Windows, a kernel older than 6.2, a machine this host holds no system-call numbers for, a host that cannot name its support set, and a host whose mount table puts a filesystem beneath a granted directory. The refusal is `PERMISSION_DENIED` with one sentence, which says that this host cannot confine what the Git program reads and so does not run it for a paired device. It names no library, path or mount. `host.doctor` says which of three causes stopped the proof, in sentences this build wrote, and the daemon's own log carries the detail.
 
 Where the five are served, a device reaches only the locations the owner authorised for its own grant. The owner authorises each one on the local socket, and the confirmation is bound to the four public keys of the device that holds the grant, so a device that has not declared all four keys has no location until it declares them with `device.keys.complete`. A device names a location and a name beneath it, never a path. The owner's own locations, another device's locations and a path the device spells out are each refused with the project service's own sentence, and a device never clones a remote, because no location says which providers this host may reach for it. Every Git invocation such an operation causes reads only the directories it is lent and a support set named for this host's Git, and the admission the operation was accepted under is asked again inside the transaction that begins its effect.
 
@@ -5759,7 +5759,8 @@ for the life of the daemon. The first use can be a request, work the daemon resu
 start that this host confines Git for a paired device. That proof finds none and is refused with its
 reason in the daemon's own log, and the start goes on. Git counts as missing when none is on that
 `PATH`, when it cannot answer `--exec-path` or `--version`, when it, or the copy of it under its
-helper directory, answers with more than a version and a directory, and when it is older than 2.32.
+helper directory, answers with more than a version and a directory or ends and leaves its output
+open, and when it is older than 2.32.
 The `/usr/bin/git` of a Mac without the Command Line Tools is the second case: it asks to install
 them and exits with status 1 whatever it is asked. A Git that does not answer both within ten
 seconds is not counted as missing, since nothing is known of it yet: the look is refused as a fault
@@ -5776,21 +5777,21 @@ daemon closes its end of the pipe, so the daemon holds nothing of the process. I
 write it makes to the closed pipe fails. A child the daemon cannot wait on is refused, and nothing
 is signalled by its number. A program that never answers, a child the daemon cannot wait on or
 collect, output the daemon cannot read, and a daemon too short of descriptors, processes or memory
-to ask, or to resolve the path to the program, are faults that pass, as is the time running out
-before the program's end or the end of its output is seen, even when the wait is not looked at again
-until the time is out, and whatever a read returns after it, bytes or an end, is not taken: the look
-is refused with `UPSTREAM_UNAVAILABLE`. The other refusals above are `HOST_NOT_CONFIGURED`, among
-them a program that has ended and left its output open for a second inside the ten seconds, as a
-read made after that second and inside the ten seconds found it. Nothing is kept. In a daemon that
-has started, what needs no Git is answered on every other connection while a look is under way; a
-connection whose request waits for the look waits with it. A request that needs Git waits for that
-look, and no other, and is refused with it, so the stand-in is started once for all of them. A
-request that arrives when no look is under way makes a look of its own. A start that needs Git makes
-one look for each need: on Linux the proof, and each interrupted apply that left staged paths. The
-daemon answers nothing until each has ended, so it can take ten seconds for each. An interrupt ends
-a daemon that has started once the look under way has ended; a termination signal ends it at once,
-as an interrupt or a termination signal ends one that is still starting, and leaves a stand-in then
-under way to end by itself.
+to look for the program, to ask it, or to resolve the path to it, are faults that pass, as is the
+time running out before the program's end or the end of its output is seen, even when the wait is
+not looked at again until the time is out, and whatever a read returns after it, bytes or an end, is
+not taken: the look is refused with `UPSTREAM_UNAVAILABLE`. The other refusals above are
+`HOST_NOT_CONFIGURED`, among them a program that has ended and left its output open for a second
+inside the ten seconds, as a read made after that second and inside the ten seconds found it.
+Nothing is kept. In a daemon that has started, what needs no Git is answered on every other
+connection while a look is under way; a connection whose request waits for the look waits with it. A
+request that needs Git waits for that look, and no other, and is refused with it, so the stand-in is
+started once for all of them. A request that arrives when no look is under way makes a look of its
+own. A start that needs Git makes one look for each need: on Linux the proof, and each interrupted
+apply that left staged paths. The daemon answers nothing until each has ended, so it can take ten
+seconds for each. An interrupt ends a daemon that has started once the look under way has ended; a
+termination signal ends it at once, as an interrupt or a termination signal ends one that is still
+starting, and leaves a stand-in then under way to end by itself.
 
 A request that runs Git is refused with `HOST_NOT_CONFIGURED` when the host has no usable Git,
 before it makes a repository, an operation row, a workspace or a directory. Those are
