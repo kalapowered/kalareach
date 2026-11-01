@@ -6701,17 +6701,23 @@ async fn a_delay_named_while_the_call_waits_on_the_service_holds_back_the_reques
 
     // During the enrolment: the read of the storage state. The read asks for the account's token as
     // it begins, and the gate on the token is up when the enrolment goes, so a call that began it
-    // would wait there. Requests to the status route are not counted: a look of the helper that was
-    // cut can still reach the stand-in after the helper has returned.
+    // would wait there. The gate holds only the requests made under an account fixed when a call
+    // began. A look that a bound cut leaves a task that asks for the sign-in's token later, and the
+    // carrier asks for tokens of its own; neither is held or counted. The read of the storage state
+    // that a look makes is held, and it ends with the look, so once the helper has returned the
+    // requests that wait are the call's. Requests to the status route are not counted: a look that
+    // was cut can still reach the stand-in after the helper has returned.
     let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
-    until_the_carriers_first_pass_has_ended(&rig).await;
     let web = Arc::clone(rig.served.web());
     let made = rig.prepared_setup(archive_id(), false);
     web.fail(MANIFEST, 1, Moment::Slow);
     let call = rig.enable_in_the_background(&made.params);
     within("the enrolment", web.requests_reach(MANIFEST, 1)).await;
     the_service_names_a_delay_to_a_look_at_its_storage_state(&rig, delay).await;
-    let gate = rig.controller.host_account().hold_token_requests();
+    let gate = rig
+        .controller
+        .host_account()
+        .hold_token_requests_fixed_to_an_account();
     web.release_held();
     let ended = tokio::select! {
         ended = call => ended.expect("the call ends"),

@@ -183,6 +183,10 @@ struct Inner {
     /// How many requests for a token pass the gate a test raised before the rest wait at it.
     #[cfg(feature = "testing")]
     passing: std::sync::atomic::AtomicUsize,
+    /// Whether the gate a test raised holds only the requests made under an account fixed when a
+    /// call began, and lets every other request for a token go by.
+    #[cfg(feature = "testing")]
+    holds_fixed_only: std::sync::atomic::AtomicBool,
     #[cfg(feature = "testing")]
     loopback: Mutex<Option<std::net::SocketAddr>>,
 }
@@ -275,6 +279,8 @@ impl HostAccount {
                 #[cfg(feature = "testing")]
                 passing: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(feature = "testing")]
+                holds_fixed_only: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(feature = "testing")]
                 loopback: Mutex::new(None),
             }),
         };
@@ -347,6 +353,21 @@ impl HostAccount {
         TokenRequestsHeld {
             inner: Arc::clone(&self.inner),
         }
+    }
+
+    /// As [`Self::hold_token_requests`], for the requests made under an account fixed when a call
+    /// began ([`Self::tokens_fixed_to`]) alone. Every other request for a token goes through and is
+    /// not counted by [`Self::token_requests_waiting`]: the check of the sign-in that `backup.status`
+    /// makes in a task that outlives a look which a bound cut, and the carrier's requests, can come
+    /// at any moment. Besides a call's, the only request held is the read of the storage state that
+    /// `backup.status` makes, which ends with the look.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_token_requests_fixed_to_an_account(&self) -> TokenRequestsHeld {
+        self.inner
+            .holds_fixed_only
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.hold_token_requests_after(0)
     }
 
     /// How many requests for a token the gate raised with [`Self::hold_token_requests_after`] has
@@ -645,8 +666,9 @@ impl HostAccount {
     }
 }
 
-/// The gate a test raised with [`HostAccount::hold_token_requests`]: requests for a token wait
-/// while this is held.
+/// The gate a test raised with [`HostAccount::hold_token_requests`] or
+/// [`HostAccount::hold_token_requests_fixed_to_an_account`]: the requests for a token that the gate
+/// holds wait while this is held.
 #[cfg(feature = "testing")]
 pub struct TokenRequestsHeld {
     inner: Arc<Inner>,
@@ -667,6 +689,9 @@ impl Drop for TokenRequestsHeld {
         self.inner
             .passing
             .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .holds_fixed_only
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.inner.changing.send_replace(false);
     }
 }
@@ -691,6 +716,17 @@ impl Drop for Change<'_> {
 }
 
 impl Inner {
+    /// Whether a request made under `held_to` goes through the gate a test raised: it is not one the
+    /// gate holds, or it is one of the requests the gate was raised to let by.
+    #[cfg(feature = "testing")]
+    fn lets_by(&self, held_to: &HeldTo) -> bool {
+        (self
+            .holds_fixed_only
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && !matches!(held_to, HeldTo::Account(_)))
+            || self.lets_one_pass()
+    }
+
     /// Whether this request goes through a gate a test raised with a number of requests to let by.
     #[cfg(feature = "testing")]
     fn lets_one_pass(&self) -> bool {
@@ -1057,7 +1093,7 @@ impl HostTokens {
         let mut changing = self.inner.changing.subscribe();
         if *changing.borrow() {
             #[cfg(feature = "testing")]
-            let passes = self.inner.lets_one_pass();
+            let passes = self.inner.lets_by(&self.held_to);
             #[cfg(not(feature = "testing"))]
             let passes = false;
             if !passes {
