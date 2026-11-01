@@ -2762,7 +2762,7 @@ mod tests {
             if calls[..at].ends_with("fn ") {
                 let body = calls[at..].split("\n    }\n").next().expect("its body");
                 assert!(
-                    body.contains("{what}"),
+                    body.contains("format!(\"{what}: "),
                     "the refusal begins with its words: {body}"
                 );
                 continue;
