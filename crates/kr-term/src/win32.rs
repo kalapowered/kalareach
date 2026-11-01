@@ -229,20 +229,28 @@ pub fn records_within(records: &[KeyRecord], limit: usize) -> Result<Vec<u8>, To
     Ok(out)
 }
 
+/// How many records after a high half [`PairHold`] holds back while it waits for the low half.
+///
+/// A console that was given a character as text puts at most a dozen records between the halves
+/// (the Alt going down and up to five keypad digits going down and up), so a half that is followed
+/// by more than this has nothing to wait for.
+const MAX_HELD: usize = 64;
+
 /// Keeps a character outside the basic plane in one write when a console is read in pieces.
 ///
 /// The console reports such a character as two records that carry its halves, a high surrogate and
-/// then a low one, and one read can end between them. A console writes a character it was given as
-/// text as the Alt coming up with each half, each after its own Alt going down and keypad digits;
-/// one that was typed arrives as a key going down and coming up for each half. The translation of
-/// a write is stateless, so a producer passes each batch it reads through here before it sends: the
-/// records from the last high half that is still waiting for its low one, to the end of the batch,
-/// wait for the next batch, so that the records after the half are kept in their order. A half is
-/// still waiting while every record after it is one the translation passes over without a trace (a
-/// key coming up, a modifier, the Alt going down and the keypad digits of the second half). The
-/// next batch completes the pair, or starts something else, and then the waiting records go out as
-/// they were: a high half with no low one is replaced by the translation, as it would be without
-/// any of this.
+/// then a low one, and one read can end between them. A console that was given a character as
+/// text, by a paste or by a terminal that writes it, records it as the Alt coming up with each
+/// half, each after its own Alt going down and keypad digits (twelve records); a half can also
+/// arrive on a key going down. The translation of a write is stateless, so a producer passes each
+/// batch it reads through here before it sends: the records from the last high half that is still
+/// waiting for its low one, to the end of the batch, wait for the next batch, so that the records
+/// after the half are kept in their order. A half is still waiting while every record after it is
+/// one the translation passes over without a trace (a key coming up, a modifier, the Alt going
+/// down and the keypad digits of the second half), and while no more than [`MAX_HELD`] records
+/// follow the half. The next batch completes the pair, or starts something else, and then the
+/// waiting records go out as they were: a high half with no low one is replaced by the translation, as it
+/// would be without any of this.
 ///
 /// Only key records pass through. A producer that also reads mouse, resize and focus records hands
 /// this the keys between them and sends the rest in its own order, so a half that waits stays
@@ -267,11 +275,13 @@ impl PairHold {
         let mut records = std::mem::take(&mut self.waiting);
         records.extend_from_slice(batch);
         // Only a high half that is the last record the translation takes notice of is still
-        // waiting for its low half: any such record after it has started something else.
+        // waiting for its low half: any such record after it has started something else. What
+        // follows it is held while it is not more than a pair can have between its halves.
         if let Some(last) = records
             .iter()
             .rposition(|record| !legacy::passes_without_trace(record))
             && records[last].is_high_surrogate()
+            && records.len() - last <= MAX_HELD
         {
             self.waiting = records.split_off(last);
         }

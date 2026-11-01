@@ -179,6 +179,9 @@ fn step(key: &KeyRecord, application_cursor_keys: bool) -> Step {
 /// A key coming up, the Alt going down and the keypad digits of a character composed with it, a
 /// modifier and a key with no spelling are such records. They come between the halves of a
 /// character without breaking it.
+///
+/// Whether a key has a spelling does not depend on the session's cursor keys, which change only
+/// what a spelled key is written as, so the answer holds for every keyboard the translation takes.
 pub(super) fn passes_without_trace(record: &KeyRecord) -> bool {
     matches!(step(record, false), Step::Passed)
 }

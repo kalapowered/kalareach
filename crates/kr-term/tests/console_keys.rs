@@ -13,7 +13,8 @@ use kr_protocol::input::ConsoleKey;
 use kr_term::conformance::WIN32_INPUT_CASES;
 use kr_term::modes::KeyboardEncoding;
 use kr_term::win32::{
-    KeyRecord, Keyboard, PairHold, Refused, TooLong, encode_all, legacy_within, records_within,
+    KeyRecord, Keyboard, PairHold, Refused, TooLong, control_keys, encode_all, legacy_within,
+    records_within,
 };
 use serde_json::Value;
 
@@ -293,6 +294,38 @@ fn the_halves_of_a_character_are_kept_in_one_write() {
     // waits.
     assert_eq!(hold.take(&[high(), high()]), [high()]);
     assert_eq!(hold.take(&[low()]), [high(), low()]);
+
+    // What waits is handed over by `release`, the half and the records after it, once.
+    assert!(hold.take(&[high(), released(high())]).is_empty());
+    assert_eq!(hold.release(), [high(), released(high())]);
+    assert!(hold.release().is_empty());
+}
+
+/// A half does not wait for more records than a character written to a console can have between
+/// its halves: a Shift held down after it repeats without end, and the hold would grow with it.
+#[test]
+fn a_half_is_not_held_behind_more_records_than_a_pair_can_have_between_its_halves() {
+    let shift = KeyRecord {
+        virtual_key: 0x10,
+        scan_code: 0x2a,
+        unicode: 0,
+        key_down: true,
+        control_keys: control_keys::SHIFT_PRESSED,
+        repeat: 1,
+    };
+    let mut hold = PairHold::new();
+    let mut within = vec![high()];
+    within.extend(std::iter::repeat_n(shift, 10));
+    assert!(
+        hold.take(&within).is_empty(),
+        "a few modifiers do not end the wait"
+    );
+    assert_eq!(hold.release(), within);
+
+    let mut beyond = vec![high()];
+    beyond.extend(std::iter::repeat_n(shift, 100));
+    assert_eq!(hold.take(&beyond), beyond, "a hundred of them do");
+    assert!(hold.release().is_empty());
 }
 
 /// Cuts `run` into two reads at every place, passes each read through the hold and spells what
