@@ -6059,14 +6059,39 @@ async fn a_deadline_that_passes_while_the_bundle_write_waits_for_its_own_token_s
 /// the host owes a delay. A look that meets the fault and is not cut owes it, so this ends at the
 /// first look that does. The guard is shorter than the time a request the case holds has to be
 /// answered in: after that the call goes on without the case, and what fails is another step.
+///
+/// A look that says the read failed, owes nothing and took less than the shortest bound the look
+/// keeps (the connection's) was cut by none of them: it met the fault and lost the delay, and the
+/// case fails there and does not go on to a look that owes it. A look that says it read is made
+/// again too, because the request of a look that was cut can take the fault late. The delay owed is
+/// the one the service named.
 async fn the_service_names_a_delay_to_a_look_at_its_storage_state(rig: &Rig, delay: Moment) {
+    let Moment::Refuse {
+        retry_after_seconds: Some(named),
+        ..
+    } = delay
+    else {
+        panic!("a delay is named by a refusal that asks for one");
+    };
     let quiet = rig.controller.backup_runtime().expect("a carrier").quiet();
     let mut said = None;
     let guard = STORAGE_DEADLINES.read - Duration::from_secs(10);
     let owed = tokio::time::timeout(guard, async {
         while quiet.left().is_none() {
             rig.served.web().fail(STATUS, 1, delay);
-            said = Some(rig.backup_status().await.storage);
+            let began = std::time::Instant::now();
+            let storage = rig.backup_status().await.storage;
+            assert!(
+                !(storage
+                    == BackupStorageState::Unread {
+                        why: BackupStorageUnread::Failed
+                    }
+                    && quiet.left().is_none()
+                    && began.elapsed() < STORAGE_DEADLINES.connect),
+                "a look that no bound it keeps can have cut said the read failed and the host owes \
+                 nothing, though the service named {named} seconds"
+            );
+            said = Some(storage);
         }
     })
     .await;
@@ -6074,6 +6099,11 @@ async fn the_service_names_a_delay_to_a_look_at_its_storage_state(rig: &Rig, del
         owed.is_ok(),
         "the looks at the storage state did not leave the delay the service named owed; the last \
          said {said:?}"
+    );
+    assert_eq!(
+        quiet.left(),
+        Some(Duration::from_secs(named)),
+        "the delay the host owes is not the one the service named"
     );
 }
 
