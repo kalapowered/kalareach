@@ -5982,14 +5982,16 @@ mod tests {
         assert!(refusal.code().retry_category().permits_automatic_retry());
     }
 
-    /// A probe whose time has run out is not waited on past it, and what it wrote is not taken for
-    /// its answer, though all of it is already in the pipe with its end: the pass over the pipe
-    /// stops at the time after the read that finds the bytes, before it reads the end. The writer
-    /// has ended before the pipe is read, so nothing here depends on a clock or on how fast a
-    /// process runs.
+    /// What a late poll does. The loop that watches a probe wakes after the time it was given has
+    /// run out, takes in what the pipe holds and finds the program ended, and then waits for the
+    /// end of its output. Everything the program wrote is already in the pipe with its end, so
+    /// nothing here depends on a clock or on how fast a process runs, and none of it was read
+    /// before the time ran out: it is not the program's answer, and is not read as one. The refusal
+    /// is a fault that passes, which a client sends the request again after, and not the one of a
+    /// program that gave an empty answer.
     #[cfg(unix)]
     #[test]
-    fn what_a_probe_wrote_after_its_time_ran_out_is_not_taken_for_its_answer() {
+    fn a_late_poll_does_not_read_what_a_probe_wrote_after_its_time_ran_out() {
         let mut writer = std::process::Command::new("sh")
             .args(["-c", "echo git version 2.50.1"])
             .stdout(Stdio::piped())
@@ -5998,8 +6000,10 @@ mod tests {
         let pipe = writer.stdout.take();
         writer.wait().expect("the writer ends");
         let mut heard = Heard::of(pipe).expect("the pipe is read without blocking");
+        let deadline = Instant::now();
 
-        let outcome = drain(&mut heard, "git --version", Instant::now());
+        heard.take_in(deadline);
+        let outcome = drain(&mut heard, "git --exec-path", deadline);
 
         let Err(Asked::Overran(refusal)) = outcome else {
             panic!("an answer that was read past the time the probe was given is no answer");
@@ -6007,6 +6011,10 @@ mod tests {
         assert!(
             matches!(refusal, ProjectError::GitFailed { .. }),
             "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::UpstreamUnavailable
         );
     }
 
