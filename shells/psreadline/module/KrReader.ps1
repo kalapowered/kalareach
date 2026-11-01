@@ -160,10 +160,15 @@ function Get-KrRuntimeReader {
 #
 # A Windows console is read through its own records, which this does not see: there the editor's
 # queue is the only count.
+function Write-KrProbe {
+    param([string]$Line)
+    Write-KrTrace ("{0} reader {1}" -f [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(), $Line)
+}
+
 function Read-KrRuntimeUnread {
     if ($IsWindows) { return [uint64]0 }
     $members = Get-KrRuntimeReader
-    if ($null -eq $members) { return $null }
+    if ($null -eq $members) { Write-KrProbe 'unread: no runtime reader'; return $null }
     try {
         $unread = [uint64]0
         if ([bool]$members.Ready.Invoke($null, @())) { $unread = [uint64]1 }
@@ -184,6 +189,7 @@ function Read-KrRuntimeUnread {
         }
         $unread
     } catch {
+        Write-KrProbe ("unread threw: " + $_.Exception.Message)
         $null
     }
 }
@@ -271,6 +277,9 @@ function Get-KrReaderState {
     $terminalKnown = $null -ne $known -and $null -ne $unread
     if ($null -eq $unread) { $unread = [uint64]0 }
     $typeahead = $queued + $unread
+    if (-not $terminalKnown -or $typeahead -ne 0 -or $script:Pending.macro_input -ne 0 -or $script:Pending.multikey_sequence -ne 0) {
+        Write-KrProbe ("state: known=$known queued=$queued unread=$unread terminalKnown=$terminalKnown macro=$($script:Pending.macro_input) multikey=$($script:Pending.multikey_sequence)")
+    }
     $modes = Get-KrEditorModes
 
     @{

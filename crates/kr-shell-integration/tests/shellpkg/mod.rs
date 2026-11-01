@@ -1976,6 +1976,7 @@ impl Session {
     /// is what this bound is for: the wait fails at the instant it was given rather than lasting
     /// as long as the shell stays wedged.
     fn type_bytes_before(&mut self, bytes: &[u8], deadline: Instant) {
+        probe_trace(&format!("types {bytes:02x?}"));
         if let Err(reason) = self.terminal.write_before(bytes, deadline) {
             panic!("{reason}\nterminal output:\n{}", self.terminal_output());
         }
@@ -2880,3 +2881,21 @@ pub use launch::*;
 pub use lines::*;
 #[allow(unused_imports)]
 pub use stacks::*;
+
+/// Diagnostic: one line in the shell's trace file, with the test's name and the time.
+pub fn probe_trace(line: &str) {
+    if let Some(path) = std::env::var_os("KR_SHELL_BRIDGE_TRACE") {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis());
+            let name = std::thread::current().name().unwrap_or("?").to_owned();
+            let _ = writeln!(file, "{now} harness [{name}] {line}");
+        }
+    }
+}

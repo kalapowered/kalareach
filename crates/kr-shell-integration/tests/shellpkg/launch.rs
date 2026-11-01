@@ -50,9 +50,11 @@ fn launch_vector_at(
         expected_cwd_revision: enter.cwd_revision,
         deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
     }));
+    probe_trace(&format!("asked launch {id:?}"));
     let BridgeAnswer::Launch(decision) = session.answer(id) else {
         panic!("the reader answered a launch with something else")
     };
+    probe_trace(&format!("decision {:?}", decision.rejection()));
     decision
 }
 

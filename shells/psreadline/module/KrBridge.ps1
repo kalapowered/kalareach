@@ -1137,6 +1137,7 @@ function Invoke-KrAnswerLaunch {
     if (-not $reader.tty_typeahead_drained -or -not $reader.macro_input_drained -or
         -not $reader.partial_key_drained -or $reader.queued_keys -gt 0 -or
         $reader.pending_bytes -gt 0 -or $reader.pending.macro_input) {
+        Write-KrProbe ("launch refused queued_prior_input: tty=$($reader.tty_typeahead_drained) macro=$($reader.macro_input_drained) partial=$($reader.partial_key_drained) queued=$($reader.queued_keys) bytes=$($reader.pending_bytes) pendingmacro=$($reader.pending.macro_input)")
         Send-KrLaunchRejection $Id $transaction $fenceId 'queued_prior_input' $reader; return
     }
     if ($reader.prompt_generation -ne $expectedPrompt) {
