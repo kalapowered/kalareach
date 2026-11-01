@@ -814,11 +814,12 @@ impl Controller {
     /// Admits one mutation that arrived at `received_at` and performs it on an owner that outlives
     /// this connection.
     ///
-    /// A connection task is dropped the moment its control stream ends, and dropping a future is a
-    /// cancellation: destructors run, but nothing after an outstanding `await` finishes. A durable
-    /// commit cannot be left half done by a peer going away, so the effect runs in its own task.
-    /// Dropping the handle this awaits does not stop that task; it only stops this connection
-    /// hearing the answer.
+    /// This door awaits the call in line, so the end of the control stream does not cancel it: the
+    /// connection, and its registration, are retired only after the call has ended. The effect runs
+    /// in its own task all the same, because dropping a future is a cancellation, destructors run
+    /// and nothing after an outstanding `await` finishes, and a durable commit cannot be left half
+    /// done by a task that is dropped. Dropping the handle this awaits does not stop that task; it
+    /// only stops this connection hearing the answer.
     ///
     /// The reply says which it is: a refusal made before anything ran, which carries no result, or
     /// an answer, which does.
