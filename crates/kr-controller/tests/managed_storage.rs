@@ -5118,6 +5118,27 @@ async fn the_last_attempt_follows_the_answers_and_is_left_as_it_was_by_a_call_th
         BackupEnableResult::Enabled { .. }
     ));
     assert_eq!(rig.backup_status().await.last_attempt.0, None);
+
+    // So does a repeat answered from the record, after another kit was declined for the archive.
+    let other = rig.prepared_setup(archive_id(), false);
+    assert_eq!(
+        rig.enable(&other.params).await,
+        BackupEnableResult::Declined {
+            cause: BackupEnableCause::AlreadySetUp {}
+        }
+    );
+    assert_eq!(
+        rig.backup_status().await.last_attempt.0,
+        Some(BackupLastAttempt {
+            kit_fingerprint: other.params.kit_fingerprint.clone(),
+            cause: Nullable::some(BackupEnableCause::AlreadySetUp {}),
+        })
+    );
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+    assert_eq!(rig.backup_status().await.last_attempt.0, None);
 }
 
 /// A call goes on when the client that made it closes its connection: the daemon serves the call in
