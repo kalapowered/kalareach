@@ -415,7 +415,9 @@ fn run(profile: &ModelProfile, cache: &Path) -> Result<(), String> {
     });
 
     // The class is applied on the thread that loads and runs the model, before the model starts a
-    // thread of its own, as the description process applies it on its model thread.
+    // thread of its own, as the description process applies it on its model thread. On macOS and
+    // Windows it is the whole process's, so the terminal workload this process runs for the
+    // contention case is in it too.
     let applied = enter_background();
     let cold = Instant::now();
     let budgets = Budgets::DEFAULTS;

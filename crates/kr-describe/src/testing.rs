@@ -1275,7 +1275,7 @@ pub fn stub_main() -> i32 {
     #[cfg(target_os = "macos")]
     if let Err(error) = kr_ipc::background::leave_priority_class() {
         eprintln!("kr-describe-stub: {error}");
-        return 71;
+        return 64;
     }
     let _committed = match commit_at_start(&script, &runtime_dir) {
         Ok(held) => held,

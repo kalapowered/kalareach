@@ -27,6 +27,34 @@ pub fn cache_directory() -> Option<PathBuf> {
     })
 }
 
+/// Takes this process out of the darwin background class while it is held, and puts it back as it
+/// found it. A test run under `taskpolicy -b` is in the class, and so is every process it starts,
+/// so a case that reads the class of a process it starts begins outside it and fails to start when
+/// it cannot leave: otherwise the process would read the class whether or not the product applied
+/// it.
+#[cfg(target_os = "macos")]
+pub struct OutsideTheClass(Option<kr_ipc::background::Saved>);
+
+#[cfg(target_os = "macos")]
+impl OutsideTheClass {
+    /// Notes the classes of this process and takes it out of the background class.
+    pub fn enter() -> Self {
+        let saved = kr_ipc::background::save();
+        kr_ipc::background::leave_priority_class()
+            .expect("this process leaves the background class it began in");
+        Self(Some(saved))
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for OutsideTheClass {
+    fn drop(&mut self) {
+        if let Some(saved) = self.0.take() {
+            let _ = saved.restore();
+        }
+    }
+}
+
 /// Says, in the test's own output, that it did not run and why.
 ///
 /// A test that returns early passes, so the harness's summary reads "ok" and says nothing more. The

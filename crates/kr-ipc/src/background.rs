@@ -40,12 +40,12 @@
 //! quality-of-service class, passes neither to the threads it starts, and a model runtime starts
 //! its compute threads from the thread that loads it. The darwin background policy
 //! (`setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`) holds every thread of the process, those
-//! that exist and those started later, at the lowest priority the scheduler gives, throttles its
-//! disk requests, and on Apple silicon keeps it to the efficiency cores. That last effect is a
-//! large share of what the policy costs a job: a job that takes about two seconds in the ordinary
-//! class took more than thirty on a busy machine. The kernel's own account of the policy is read
-//! back (`getpriority(PRIO_DARWIN_PROCESS, 0)`), and the process's control thread and watchdog are in
-//! the class too.
+//! that exist and those started later, at the lowest priority the scheduler gives, and throttles
+//! its disk requests. It costs a job most of its speed on a busy machine: a job that took about two
+//! seconds in the ordinary class ran into its 30-second deadline in 11 of 12 runs on the Mac it was
+//! measured on, and the description process's guide gives the figures and what they leave out. The
+//! kernel's own account of the policy is read back (`getpriority(PRIO_DARWIN_PROCESS, 0)`), and the
+//! process's control thread and watchdog are in the class too.
 //!
 //! The system applies an I/O class only through the I/O scheduler that serves the disk. Under the
 //! `none` scheduler of most NVMe disks no I/O class has an effect: the class is kept and acts on
@@ -151,8 +151,9 @@ pub fn set_thread_io_class_normal() -> std::result::Result<(), Refusal> {
         .map_err(|()| "this host refused the normal I/O priority for the thread")
 }
 
-/// The scheduling priority the kernel gives every thread of a process in the darwin background
-/// class, as `ps -M` shows it (`4T`): a thread at the ordinary priority shows 31.
+/// The base scheduling priority the kernel gives every thread of a process in the darwin background
+/// class (`ps -M` shows it as `4T` for a thread that is not lent a higher priority): a thread at
+/// the ordinary priority has 31.
 #[cfg(all(target_os = "macos", any(test, feature = "testing")))]
 pub const BACKGROUND_THREAD_PRIORITY: i32 = 4;
 
@@ -174,11 +175,10 @@ pub fn leave_priority_class() -> std::result::Result<(), Refusal> {
     platform::leave_priority_class()
 }
 
-/// Reads the base scheduling priority the kernel holds for the calling thread, which is what `ps -M`
-/// shows for a thread that no waiting thread is lending its priority to, and not what the thread
-/// library records: setting a thread's priority through the thread library can succeed and leave
-/// the kernel's priority where it was. A thread that holds a lock another thread waits on can show a
-/// higher current priority for a moment, so the base priority is read.
+/// Reads the base scheduling priority the kernel holds for the calling thread, and not what the
+/// thread library records: setting a thread's priority through the thread library can succeed and
+/// leave the kernel's priority where it was. `ps -M` shows the thread's current priority beside it,
+/// which can be higher than the base while another thread lends it priority, so the base is read.
 #[cfg(all(target_os = "macos", any(test, feature = "testing")))]
 #[must_use]
 pub fn thread_priority() -> Option<i32> {
@@ -186,10 +186,11 @@ pub fn thread_priority() -> Option<i32> {
 }
 
 /// Reads the base scheduling priority the kernel holds for each thread of the process `pid`, as
-/// [`thread_priority`] does for the calling thread, in no particular order. A thread that ends while
-/// they are read is left out.
+/// [`thread_priority`] does for the calling thread, in no particular order. A thread whose report
+/// the system refuses, such as one that ends while they are read, is left out.
 ///
-/// Nothing when the process is not there or the system will not tell.
+/// Nothing when the process is not there, the system will not tell, or no thread's report came
+/// back, so that a check over the priorities never passes over an empty list.
 #[cfg(all(target_os = "macos", any(test, feature = "testing")))]
 #[must_use]
 pub fn thread_priorities_of(pid: u32) -> Option<Vec<i32>> {
@@ -408,7 +409,14 @@ mod platform {
         // SAFETY: the call takes three integers and takes the calling process out of the darwin
         // background class; it reads no memory of this process.
         let set = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, 0) };
-        if set == 0 && !in_background() {
+        // The call undoes the class this process asked for. A class that something else holds it
+        // for (a quality-of-service clamp its starter put on it) stays, and the calling thread then
+        // reads the background priority still.
+        if set == 0
+            && !in_background()
+            && thread_priority()
+                .is_some_and(|priority| priority > super::BACKGROUND_THREAD_PRIORITY)
+        {
             Ok(())
         } else {
             Err("this host did not take the process out of the background class")
@@ -465,13 +473,12 @@ mod platform {
         if count == 0 {
             return None;
         }
-        Some(
-            handles[..count]
-                .iter()
-                .filter_map(|handle| report(pid, libc::PROC_PIDTHREADINFO, *handle))
-                .map(|report| report.pth_priority)
-                .collect(),
-        )
+        let priorities: Vec<i32> = handles[..count]
+            .iter()
+            .filter_map(|handle| report(pid, libc::PROC_PIDTHREADINFO, *handle))
+            .map(|report| report.pth_priority)
+            .collect();
+        (!priorities.is_empty()).then_some(priorities)
     }
 }
 
@@ -795,8 +802,8 @@ mod tests {
     /// KR-REQ-22.11: the process enters the darwin background class, and the kernel holds every
     /// thread of it there: a thread that was running before the class was set, and a thread started
     /// after it, both read the background priority from the kernel, where they read the ordinary
-    /// priority before. The kernel's priority is what `ps -M` shows, and not the thread library's
-    /// record of a thread, which a thread-level call can leave unchanged. The process is put back as
+    /// priority before. The priority is the kernel's base priority of the thread, and not the
+    /// thread library's record of it, which a thread-level call can leave unchanged. The process is put back as
     /// it was found, so the tests that run beside this one are not left in the class; a process that
     /// began in the class (one started under `taskpolicy -b`) is taken out of it first, so the case
     /// sees the class this module sets and not the one it inherited.

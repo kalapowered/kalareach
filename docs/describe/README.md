@@ -266,29 +266,49 @@ the system does not hold is reported as not applied, with the reason.
   priority nor a quality-of-service class passes from a thread to the threads it starts, and the
   model runtime starts its compute threads from the thread that loads it. With the class on the
   model thread alone, `ps -M` showed that thread at priority 15 and the three decoding threads at
-  the ordinary 31, each using 48 to 68 percent of a core. Under the process's policy every thread
-  reads 4, those that exist and those started later, and the control thread and the watchdog are
-  in the class too.
+  the ordinary 31, each using 48 to 68 percent of a core. Under the process's policy the kernel
+  holds every thread at the base priority 4, those that exist and those started later, and the
+  control thread and the watchdog are in the class too.
 
-  The policy has a price, and the deadline does not move for it. It keeps the process to the
-  efficiency cores of Apple silicon, at the lowest priority. Measured with the real MiniCPM5-2B
-  weights on a Mac with an M4 Pro (12 cores, macOS 26.6.2) that other work kept busy (load average
-  6 to 10, including builds that run in the same class), a job of about 195 prompt tokens, four
-  threads and 128 output tokens took 1.95 to 2.0 seconds in the ordinary class, and the load took
-  1.5 to 2.3 seconds. In the background class the same jobs ran into the 30-second deadline: 11 of
-  12 ended there, answered by the process itself at 30.1 to 30.8 seconds, and the twelfth took 29.2
-  seconds (9.8 of them reading the prompt and 17.4 decoding). The load took about 7 seconds. No
-  process was ended for it. The deadline stays the 30 seconds that section 22 fixes. A job that
-  misses it gives the delayed or stale description that section 22 prescribes when demand exceeds
-  capacity, as on Linux and Windows, so the cost falls on the description and not on the terminal.
+  The policy has a price, and the deadline does not move for it. It runs the process at the
+  lowest priority, which on Apple silicon Apple documents as running it on the efficiency cores
+  (this guide did not measure that part). Measured with the real MiniCPM5-2B weights on one Mac,
+  an M4 Pro (12 cores, macOS 26.6.2), that other work kept busy (load average 6 to 10, including
+  builds that run in the same class), through the process's own pipes and with the same binary
+  started with and without the class: a job of about 195 prompt tokens, four threads and an
+  output limit of 128 tokens took 1.95 to 2.0 seconds in the ordinary class, and the load took 1.5
+  to 2.3 seconds. In the background class 11 of 12 of the same jobs ended at the 30-second
+  deadline, answered by the process itself at 30.1 to 30.8 seconds, and the twelfth took 29.2
+  seconds (9.8 of them reading the prompt and 17.4 decoding). The load took about 7 seconds. An
+  ordinary run came before each background run, so the weights were in the file cache, and what
+  the throttled disk policy costs a cold read of them was not measured.
+
+  The deadline stays the 30 seconds that section 22 fixes, and a job that misses it gives the
+  delayed or stale description that section 22 prescribes when demand exceeds capacity, as on
+  Linux and Windows. That is not all it costs on this Mac. In a run of the real weights driven by
+  the daemon's driver (the `inference` tests of `kr-describe-model`), the first job and each of
+  the four largest contexts ended at the deadline, and the daemon ended the process after each of
+  those four for passing the deadline by its two seconds of grace; each restart loaded the model
+  again, in 8.0 to 14.9 seconds. No job in that run published a description. The log does not say
+  which phase of the job the model was in. The model looks at its deadline between chunks of 128
+  prompt tokens and between output tokens, and a cancellation was acknowledged in 5 ms and
+  answered after 7.8 and 15 seconds. By the service's rules, a job that misses its deadline and a
+  process ended for it each count as a failure of inference, three in a row show the host as
+  paused for `inference_failed`, and the wait before the next load doubles from one second to five
+  minutes until a description is published. So on a Mac whose efficiency cores stay busy,
+  descriptions can stop for minutes at a time, and the terminal does not pay for it. No daemon in
+  use was observed in this state, and no measurement was taken on a Mac with its efficiency cores
+  idle.
+
   The process's control thread and watchdog are in the class too, so the ends listed for Windows
   below can follow on a Mac whose efficiency cores stay busy for longer than a few seconds: a late
-  acknowledgement of a cancellation, the watchdog's bound on one request, and a late `ready`. None
-  of them happened in the runs above, and in a run of the real weights a cancellation was
-  acknowledged in 5 ms and answered in 15 seconds.
-  A utility quality-of-service clamp gave 2.0 to 3.3 seconds, but only the process that starts the
-  description process can set it, through an interface the system does not publish, so it is not
-  used. No measurement here was taken on a Mac with its efficiency cores idle.
+  acknowledgement of a cancellation, the watchdog's bound on one request, and a late `ready`. The
+  one run of the real weights above saw the daemon end the process for a deadline and none of
+  those three.
+
+  A utility quality-of-service clamp gave 2.0 to 3.3 seconds in the first measurement, but only
+  the process that starts the description process can set it, through an interface the system does
+  not publish, so it is not used.
 - **Windows:** the whole process takes the idle priority class and the very low I/O priority. It is
   the process and not the thread, because a thread that another thread starts begins at the normal
   priority, and the compute threads of the model runtime are started by the thread that loads it.
@@ -618,7 +638,10 @@ keeping inference switched off, so the pause is measured beside real production 
 of it.
 
 Every figure is of one process, which holds the runtime, the harness and the terminal workload the
-contention case needs, and each line says so. What that process grew by over a baseline is reported
+contention case needs, and each line says so. On macOS and Windows the model's background class is
+the whole process's, so in this process the terminal workload runs in the class with the model: the
+contention figure there is of two threads in one class, and not of a terminal beside a model in the
+background. On Linux the class is the model thread's, which the workload does not share. What that process grew by over a baseline is reported
 as an estimate of the model and its runtime rather than as a measurement of them: the baselines are
 real (the process before the model was loaded, and the terminal workload running with no job
 admitted), but subtracting one peak from another does not separate threads that share a process.

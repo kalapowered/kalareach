@@ -112,10 +112,10 @@ pub fn a_pin_not_yet_committed(
 }
 
 /// What a read on the calling thread reports of its background class. On Linux: its scheduling
-/// policy and priority, its niceness and its I/O class, all the thread's own. On macOS: the
-/// priority the kernel reports for the thread, as `ps -M` shows it and not the thread library's
-/// record of it, and the I/O class, which is the process's there, as the processor class is. On the
-/// other Unix systems: its scheduling policy and priority.
+/// policy and priority, its niceness and its I/O class, all the thread's own. On macOS: the base
+/// priority the kernel holds for the thread, and not the thread library's record of it, and the I/O
+/// class, which is the process's there, as the processor class is. On the other Unix systems: its
+/// scheduling policy and priority.
 /// The server does not hand out the model thread's identifier, so a case reads the class on the
 /// thread that runs the work.
 #[cfg(unix)]

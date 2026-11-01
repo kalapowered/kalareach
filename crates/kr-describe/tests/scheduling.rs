@@ -688,6 +688,10 @@ fn this_host_names_the_background_mechanism_it_actually_applied() {
     // read it.
     let (applied, held) = std::thread::spawn(|| {
         let saved = kr_ipc::background::save();
+        // A binary run under `taskpolicy -b` is in the class, and would read it without the product.
+        #[cfg(target_os = "macos")]
+        kr_ipc::background::leave_priority_class()
+            .expect("this process leaves the background class it began in");
         let applied = enter_background();
         #[cfg(unix)]
         let held = support::held_by_this_thread();

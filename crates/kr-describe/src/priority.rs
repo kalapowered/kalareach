@@ -32,12 +32,13 @@
 //! so the ends listed below for Windows can follow on a Mac whose efficiency cores stay busy for
 //! longer than a few seconds; none was seen in the measurement below.
 //!
-//! On macOS the class costs a job most of its speed on a busy machine: it keeps the process to
-//! the efficiency cores of Apple silicon and at the lowest priority, and a job that takes about two
-//! seconds in the ordinary class took more than thirty, past its deadline, while other work kept
-//! the machine busy. That is the background class doing what it is for, and a job that misses its
-//! deadline gives the delayed or stale description that section 22 prescribes when demand exceeds
-//! capacity, so the cost falls on the description and not on the terminal.
+//! On macOS the class costs a job most of its speed on a busy machine: it runs the process at the
+//! lowest priority, and a job of 195 prompt tokens that took about two seconds in the ordinary class
+//! ran into its 30-second deadline in 11 of 12 runs while other work kept the machine busy (the
+//! guide gives the figures and what they leave out). A job that misses its deadline gives the
+//! delayed or stale description that section 22 prescribes when demand exceeds capacity, and the
+//! service counts a miss, and a process ended for one, as a failure of inference, so the cost falls
+//! on the description and not on the terminal.
 //!
 //! Putting the control thread and the watchdog in the idle class has four consequences on Windows
 //! when other work keeps every core busy for longer than a few seconds (Windows lifts a thread that
@@ -145,8 +146,8 @@ impl Applied {
 /// Puts the calling thread, and on the platforms that hold the class for a process (macOS and
 /// Windows) the calling process, into the background class this platform offers.
 ///
-/// It is called by the inference thread and by nothing else, before the model starts a thread of its
-/// own. On Linux the threads it starts inherit the class; on macOS and Windows every thread of the
+/// It is called by the inference thread of the description process and by the benchmark, before the
+/// model starts a thread of its own. On Linux the threads it starts inherit the class; on macOS and Windows every thread of the
 /// process is in it. A failure is reported rather than propagated: a host whose scheduler refuses
 /// the change still runs descriptions, at ordinary priority, and says so.
 #[must_use]

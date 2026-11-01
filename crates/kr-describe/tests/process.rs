@@ -814,6 +814,10 @@ fn serve_in_process(
     let runtime = tempfile::tempdir().expect("a directory on the internal disk");
     let found = classes();
     let saved = kr_ipc::background::save();
+    // A binary run under `taskpolicy -b` is in the class, and would read it without the product.
+    #[cfg(target_os = "macos")]
+    kr_ipc::background::leave_priority_class()
+        .expect("this process leaves the background class it began in");
     let serving = {
         let output = Shared(output.clone());
         let runtime = runtime.path().to_path_buf();
@@ -908,7 +912,7 @@ fn a_job_runs_with_the_limits_sent_and_the_loaded_profiles_sampler() {
 /// KR-REQ-22.11: the thread that runs a load and a job is in the background class while it runs
 /// them: a read on that thread finds the processor class this build lowers a model thread to
 /// (Linux: the batch policy at niceness 19; macOS: the background priority the kernel reports for
-/// the thread, as `ps -M` shows it) and the I/O class it lowers to (Linux: idle; macOS: the
+/// the thread) and the I/O class it lowers to (Linux: idle; macOS: the
 /// throttled disk policy of the process). The server does not hand out the model thread's
 /// identifier, so the case reads it on that thread. It shows the model thread and no thread that
 /// thread starts: on macOS the threads a model starts are read from outside in the next case, and
@@ -951,7 +955,7 @@ fn the_thread_that_runs_a_job_is_in_the_background_class_the_system_reports() {
 /// kernel reports while a job runs, the threads the model starts during the job as well as the
 /// thread that runs it. The model here starts three threads of its own with the default
 /// attributes, as a runtime with a pool of compute threads does, and holds the job. The case reads
-/// the kernel's priority of every thread of the process from outside, as `ps -M` does, and not a
+/// the kernel's base priority of every thread of the process from outside, and not a
 /// record the thread library keeps: a thread that took the lowest priority through the thread
 /// library reads 15 there, and the threads it starts read 31. The stub begins outside the class
 /// whatever class its starter ran in, so a process the class was never applied to reads 31 on every
@@ -973,14 +977,15 @@ fn the_threads_a_model_starts_during_a_job_are_in_the_class_the_kernel_reports()
     process.hello();
     process.send(&load(1, &default_profile(), 300_000));
     process.expect_answer(SOON, "the load");
+    let before = thread_priorities_of(process.pid()).expect("the kernel lists the threads");
     process.send(&generate(2, 1, 30_000));
     wait_until_began(&runtime, "threads");
 
     let priorities = thread_priorities_of(process.pid()).expect("the kernel lists the threads");
-    // The control thread, the model thread and the watchdog, and the three the job started.
+    // The three threads the job started are among those the kernel lists now.
     assert!(
-        priorities.len() >= 6,
-        "the job's threads are among those the kernel lists: {priorities:?}"
+        priorities.len() >= before.len() + 3,
+        "the job's threads are not among those the kernel lists: {before:?} before, {priorities:?}"
     );
     assert!(
         priorities

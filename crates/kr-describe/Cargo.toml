@@ -45,8 +45,9 @@ serde_json.workspace = true
 # reported beside the separated model and runtime ones.
 sysinfo.workspace = true
 thiserror.workspace = true
-# Background scheduling for the inference thread, through the one mechanism this build can apply
-# on each platform. What it cannot apply, it reports as unqualified rather than assuming.
+# Background scheduling for the inference thread on Linux and the other Unix systems, through the one
+# mechanism this build can apply there. On macOS and Windows the class is the whole process's and
+# comes from kr-ipc. What it cannot apply, it reports as unqualified rather than assuming.
 thread-priority.workspace = true
 # The end of an answer that ran out of room falls on a boundary between characters a person sees.
 unicode-segmentation.workspace = true
