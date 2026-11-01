@@ -56,7 +56,8 @@ use crate::wire::{
 /// The longest the control thread may spend on one request before the process ends itself. The
 /// bound is real time and no reading the daemon takes moves it: a control thread kept on one
 /// request past it, by a daemon that does not read the process's answers or by a host too busy to
-/// run the thread, ends the process as [`Exit::ControlStalled`].
+/// run the thread, ends the process as [`Exit::ControlStalled`]. The wait of the first `hello` for
+/// the model thread's report of its class is outside it.
 pub const CONTROL_BOUND_MS: u64 = 2_000;
 
 /// How far past its deadline a load or a job may run before the process ends itself. It is real

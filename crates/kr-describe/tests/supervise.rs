@@ -5,9 +5,9 @@
 //! Every turn takes a reading the test chooses, as the host's thread passes its own, so a thirty
 //! second deadline or a ten second handshake is crossed by the reading rather than waited out. The
 //! process answers in real time, and the tests wait for its answers in real time. The process keeps
-//! two real-time bounds of its own that no reading moves, `CONTROL_BOUND_MS` for its control thread
-//! on one request and `OVERDUE_GRACE_MS` for work past its deadline, and a stall past either ends
-//! it.
+//! real-time bounds of its own that no reading moves: the deadline it is sent for each piece of
+//! work, `CONTROL_BOUND_MS` for its control thread on one request and `OVERDUE_GRACE_MS` for work
+//! past its deadline, and a stall past the last two ends it.
 
 mod stub;
 mod support;
@@ -1649,13 +1649,14 @@ fn a_late_answer_is_dropped_and_counted() {
 }
 
 /// A load that takes more than a job's thirty seconds, and the grace after them, happens before
-/// the job is dequeued: the cold start is reported apart, and the job is then published. The job
-/// takes a moment in the process, which a deadline the load had used up would end, so the process
-/// was sent the job's whole deadline. The control is a job whose answer arrives past that deadline,
-/// which is refused.
+/// the job is dequeued: the load is not held to the job's deadline, the cold start is reported
+/// apart, and the job is then published. The job takes a moment in the process, which a deadline
+/// the load had used up would end, so the load did not use up the deadline the process was sent.
+/// The control is a job whose answer arrives past that deadline, which is refused.
 ///
-/// The process holds its load until the case has seen the handshake, so the load's answer is told
-/// at the reading after the handshake's, whatever time the daemon's thread takes between them.
+/// The process holds its load until the case has seen the handshake and has taken a turn at the
+/// reading past the job's deadline and its grace, so the load's answer is told at that reading,
+/// whatever time the daemon's thread takes between them.
 #[test]
 fn a_load_over_thirty_seconds_is_followed_by_a_published_job() {
     let mut rig = Rig::new(&Script {
@@ -1667,8 +1668,13 @@ fn a_load_over_thirty_seconds_is_followed_by_a_published_job() {
     rig.until(&roomy(), at(3_000), "the handshake", |_, driver| {
         driver.background().is_some()
     });
-    release_held_work(&rig.placed.directory("runtime"));
     let loaded_at = 3_000 + DEADLINE_MS + ANSWER_GRACE_MS + 1_000;
+    let reports = rig.driver.turn(&roomy(), at(loaded_at)).expect("a turn");
+    assert!(
+        outcomes(&reports).is_empty(),
+        "a load still running is not held to a job's deadline: {reports:?}"
+    );
+    release_held_work(&rig.placed.directory("runtime"));
     let reports = rig.until(&roomy(), at(loaded_at), "the load", |reports, _| {
         outcomes(reports)
             .iter()
@@ -1684,7 +1690,6 @@ fn a_load_over_thirty_seconds_is_followed_by_a_published_job() {
         !the_process_ended(&reports),
         "a long load is not a job past its deadline"
     );
-    rig.answer_arrives();
     let reports = rig.until(
         &roomy(),
         at(loaded_at + 500),
@@ -2486,10 +2491,10 @@ fn a_job_refused_for_its_size_leaves_the_process_and_counts_no_failure() {
 /// A resource pause while a job is in the process cancels it, keeps its place in the queue and
 /// ends the process; when the pause clears the job is described. Thermal pressure is the pause.
 ///
-/// The process holds the job until the pause cancels it, the case releases it, or its thirty
-/// second deadline passes in real time. The case releases it once it has seen the pause end the
-/// process, so a daemon that is slow to reach the pause does not let the job finish; a case held up
-/// for the whole deadline fails at the result. The next process is not held.
+/// The process holds the job until the pause cancels it or its thirty second deadline passes in
+/// real time, so a daemon that is slow to reach the pause does not let the job finish; a case held
+/// up for the whole deadline fails at the result. The case makes the release mark once the pause
+/// has ended the job, and the mark lets the next process's job go.
 #[test]
 fn a_pause_while_a_job_runs_cancels_it_and_keeps_its_place() {
     let hot = HostConditions::measured(
@@ -2593,10 +2598,10 @@ fn a_cancelled_job_whose_process_crashes_is_not_retried() {
 /// process stays, and the new revision is described once the session's cooldown has passed. The
 /// control is a change still inside its debounce, which leaves the job to publish.
 ///
-/// The process holds the job until the change cancels it, the case releases it, or its thirty
-/// second deadline passes in real time. The case releases it once it has seen the cancellation end
-/// the job, so a daemon that is slow to reach the change does not let the job finish; a case held
-/// up for the whole deadline fails at the result. The job of the new revision is not held.
+/// The process holds the job until the change cancels it or its thirty second deadline passes in
+/// real time, so a daemon that is slow to reach the change does not let the job finish; a case held
+/// up for the whole deadline fails at the result. The case makes the release mark once the
+/// cancellation has ended the job, and the mark lets the job of the new revision go.
 #[test]
 fn a_change_that_settles_while_a_job_runs_cancels_it_in_the_process() {
     let mut rig = Rig::new(&Script {
