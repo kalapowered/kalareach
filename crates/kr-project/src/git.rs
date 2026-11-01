@@ -3909,8 +3909,9 @@ fn too_much(described: &str) -> Asked {
 /// pause after it: the end may have come during the pause, so another read follows. All of this
 /// is Unix's, where this host reads the pipe itself. Elsewhere a thread takes in the output and
 /// nothing stops it at the time: the wait there ends when that thread has, one still running at
-/// the second is blamed on the program, and what it took in after the time is not told from what
-/// came before. No request reaches that, since a platform that reads that way runs no Git.
+/// the second is blamed on the program while the probe's time has not run out and is the clock's
+/// once it has, and what it took in after the time is not told from what came before. No request
+/// reaches that, since a platform that reads that way runs no Git.
 fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::Result<(), Asked> {
     let drain = drain_until(Instant::now(), deadline);
     loop {
@@ -3976,7 +3977,8 @@ fn could_not_run(described: &str, error: &std::io::Error) -> Asked {
     }
 }
 
-/// Whether a failure to start a program says the host, and not the program, is short of something.
+/// Whether a failure to start a program, or to resolve the path that names it, says the host, and
+/// not the program, is short of something.
 fn short_of_resources(error: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
@@ -6269,8 +6271,8 @@ mod tests {
     /// the ask is held back until the stand-in has ended and waits to be collected, so what it said
     /// is in the pipe when that poll comes, and so is the end of its output unless `body` leaves a
     /// process that holds the pipe open. The release is given once `time` has run out when
-    /// `after_the_time` is set, and at once otherwise. The directory the stand-in ran in comes back
-    /// with the outcome, with the numbers the stand-in wrote in it.
+    /// `after_the_time` is set, and at once otherwise. The directory that holds the stand-in comes
+    /// back with the outcome, with the numbers the stand-in wrote in it.
     #[cfg(unix)]
     fn ask_with_the_first_poll_after_the_stand_in_ended(
         body: &str,
@@ -6336,9 +6338,10 @@ mod tests {
     /// this case, and the loss of the exit check with either of the others does. Each guard has a
     /// case of its own that fails when it alone is lost: the late-exit case beside this one, the
     /// case that holds the wait for the end of the output past the look's time, and, for the
-    /// poll's time, the case that has the stand-in write more than the limit. That case raises a
-    /// pipe's size, which is Linux's, so on other systems no case fails when the poll is given a
-    /// later time to read to.
+    /// poll's time, the case that has the stand-in write more than the limit. The first two run on
+    /// Linux and macOS only. The third raises a pipe's size, which is Linux's, so on macOS no case
+    /// fails when the poll is given a later time to read to. Other Unix systems run none of the
+    /// three, and no request reaches Git there.
     #[cfg(unix)]
     #[test]
     fn a_first_poll_after_the_time_ran_out_reads_nothing_of_an_answer_that_came_after_it() {
