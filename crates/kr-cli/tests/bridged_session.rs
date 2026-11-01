@@ -4451,11 +4451,12 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
         eprintln!("this machine has no systemd, so a manager of the test's own cannot be tried");
         return;
     }
-    let place = |directory: &Path, body: &str| {
-        let text = directory.join("systemctl.text");
+    let place_named = |directory: &Path, name: &str, body: &str| {
+        let text = directory.join(format!("{name}.text"));
         std::fs::write(&text, format!("#!/bin/sh\n{body}\n")).expect("the stand-in");
-        kr_ipc::testing::place_program(&text, &directory.join("systemctl"));
+        kr_ipc::testing::place_program(&text, &directory.join(name));
     };
+    let place = |directory: &Path, body: &str| place_named(directory, "systemctl", body);
 
     // The case runs with that `systemctl` first on its `PATH` and no runtime directory of the
     // person's, so that the teardown of its tree does not ask the stand-in about units too.
@@ -4539,6 +4540,48 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
     ] {
         let failing = tempfile::tempdir().expect("a directory");
         place(failing.path(), body);
+        let ran = run_with(ordinary, failing.path());
+        let stderr = String::from_utf8_lossy(&ran.stderr);
+        assert_eq!(
+            ran.status.code(),
+            Some(101),
+            "{what} fails the case and is not skipped: {stderr}"
+        );
+        assert!(stderr.contains(said), "{what}: {stderr}");
+    }
+
+    // A manager that answers, and then cannot be run, does not come up, or will not take its
+    // runtime directory for its units, has failed the start: those fail the case too, where an
+    // error returned would read as a machine that cannot run it and pass it without running it.
+    // The `systemctl` of each answers who it is when it is asked as the machine's own manager is,
+    // with no runtime directory of its own, and says its scope is inactive when asked about it.
+    for (what, systemd_run, systemctl, said) in [
+        (
+            "a systemd-run that is not there",
+            None,
+            "case \"$*\" in *ActiveState*) echo inactive; exit 0 ;; esac; echo 255",
+            "systemd-run could not be started",
+        ),
+        (
+            "a manager that ends before it answers",
+            Some("exit 1"),
+            "case \"$*\" in *ActiveState*) echo inactive; exit 0 ;; esac; \
+             if [ -n \"$XDG_RUNTIME_DIR\" ]; then exit 1; fi; echo 255",
+            "the test's user manager did not come up",
+        ),
+        (
+            "a manager that will not take its runtime directory for its units",
+            Some("exec /bin/sleep 120"),
+            "case \"$*\" in *ActiveState*) echo inactive; exit 0 ;; \
+             *set-environment*) echo refused >&2; exit 1 ;; esac; echo 255",
+            "would not take its own runtime directory",
+        ),
+    ] {
+        let failing = tempfile::tempdir().expect("a directory");
+        place(failing.path(), systemctl);
+        if let Some(body) = systemd_run {
+            place_named(failing.path(), "systemd-run", body);
+        }
         let ran = run_with(ordinary, failing.path());
         let stderr = String::from_utf8_lossy(&ran.stderr);
         assert_eq!(
