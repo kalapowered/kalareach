@@ -16,7 +16,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-11.62 | every test below but `a_helper_created_under_the_previous_helpers_identifier_within_one_second_is_refused_its_token` |
+//! | KR-REQ-11.62 | `a_launched_agents_questions_are_application_scoped_and_end_with_its_instance`, `a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_the_binding_it_left`, `a_request_identifier_two_questions_of_one_instance_share_places_neither_in_a_thread` |
 
 use std::sync::Arc;
 
@@ -565,8 +565,8 @@ fn a_request_identifier_two_questions_of_one_instance_share_places_neither_in_a_
 ///
 /// KR-REQ-11.52 and KR-REQ-23.31, the part about a helper's identity being checked against the
 /// broker's record of the agent it belongs to: without the broker's word it is refused as outside
-/// the session, and with it the helper is bound to the instance. Not shown here: the caller token,
-/// or the four tools.
+/// the session, and with it the helper is bound to the instance. Not shown here: a connection's
+/// peer credentials, a private question method, the caller token or the four tools.
 #[cfg(unix)]
 #[test]
 fn a_helper_under_an_agent_the_broker_launched_is_bound_through_the_broker() {
@@ -656,9 +656,11 @@ fn a_helper_under_an_agent_the_broker_launched_is_bound_through_the_broker() {
 /// hides no helper under the live one: the helper is admitted to the session and bound to the
 /// live agent, whichever of the two records the broker walks first.
 ///
-/// KR-REQ-11.52 and KR-REQ-23.31, the part about a helper being known by its process and start
-/// value: a record whose start value differs from the live agent's, under the same identifier,
-/// binds the helper to nothing. Not shown here: the caller token, or the four tools.
+/// KR-REQ-11.52 and KR-REQ-23.31, the part about an agent being known by its process and start
+/// value: a record under the same identifier with another start value does not take the helper,
+/// which is bound to the live agent's instance whichever record the broker reads first. Not shown
+/// here: a helper with another start value, a connection's peer credentials, a private question
+/// method, the caller token or the four tools.
 #[cfg(unix)]
 #[test]
 fn an_ended_agents_record_hides_no_live_agent_that_holds_its_identifier() {
@@ -827,7 +829,8 @@ fn an_empty_session(root: u32) -> (Arc<kr_worker::windows::job::SessionJob>, Ses
 ///
 /// KR-REQ-11.52 and KR-REQ-23.31, the part about a helper being known by its process and start
 /// value: the helper's identifier with another start value is placed nowhere, and a process the
-/// agent did not start is outside. Not shown here: the caller token, or the four tools.
+/// agent did not start is outside. Not shown here: a connection's peer credentials, a private
+/// question method, the caller token or the four tools.
 #[cfg(windows)]
 #[test]
 fn a_helper_an_agent_started_is_bound_through_the_job_the_agent_was_started_in() {
