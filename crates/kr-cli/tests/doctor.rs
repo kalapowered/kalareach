@@ -670,8 +670,8 @@ fn functions(source: &str) -> Vec<(String, String)> {
 /// KR-REQ-29.04: the export's preview is the only place content a person asked to read reaches the
 /// error stream, and it gets there through one reporter function. In the reporter, `write_line`
 /// and `write_prompt` are called only by `write_preview`, which `show_preview` alone calls with the
-/// error stream; the error stream is named by nothing else but the reporter's own `ready` and
-/// `is_terminal`; and no other source file calls `write_line`, `write_prompt` or `write_preview`
+/// error stream; the error stream is named by nothing else but the reporter's own `ready`,
+/// `is_terminal` and the handle `say` writes its lines through; and no other source file calls `write_line`, `write_prompt` or `write_preview`
 /// but the output module that defines them, the pairing command's terminal, and the crate's tests.
 #[test]
 fn only_the_reporters_preview_writes_content_to_the_error_stream() {
@@ -720,18 +720,21 @@ fn only_the_reporters_preview_writes_content_to_the_error_stream() {
                     names(&in_report, "write_preview("),
                     ["show_preview", "write_preview"]
                 );
+                // `error_stream` is the handle `say` writes its lines through, so that a line the
+                // stream refuses is kept for the end of the command and not a panic.
                 assert_eq!(
                     names(&in_report, "stderr()"),
-                    ["is_terminal", "ready", "show_preview"]
+                    ["error_stream", "is_terminal", "ready", "show_preview"]
                 );
-                assert_eq!(names(&in_report, "eprintln!"), ["say"]);
+                assert_eq!(names(&in_report, "error_stream()"), ["error_stream", "say"]);
+                assert!(names(&in_report, "eprintln!").is_empty());
                 // The counts over the whole file, so a function this reading cannot parse, a macro
                 // or a closure is counted too.
                 assert_eq!(calls("write_line("), 1, "{name}");
                 assert_eq!(calls("write_prompt("), 0, "{name}");
                 assert_eq!(calls("write_preview("), 2, "{name}");
-                assert_eq!(calls("stderr()"), 3, "{name}");
-                assert_eq!(calls("eprintln!"), 1, "{name}");
+                assert_eq!(calls("stderr()"), 4, "{name}");
+                assert_eq!(calls("eprintln!"), 0, "{name}");
             }
             "doctor/content.rs" | "doctor/content/tests.rs" => {
                 assert_eq!(calls("write_line("), 0, "{name}");
