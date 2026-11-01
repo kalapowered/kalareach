@@ -2325,19 +2325,20 @@ fn deadlines_missed_in_a_row_make_the_next_job_wait_and_never_show_inference_fai
 }
 
 /// KR-REQ-22.11: the wait after jobs that pass their deadline in a row doubles to five minutes and
-/// stays there, as the delay after failures does, while the misses go on.
+/// stays there, as the delay after failures does, while the misses go on, however many of them
+/// there are: a host that stays busy for hours keeps being told to wait five minutes.
 #[test]
 fn the_wait_after_deadlines_missed_in_a_row_stops_at_five_minutes() {
     let mut service = service();
-    // Twelve jobs that miss, and one left waiting for the wait to be shown.
-    for seed in 1..=13 {
+    // Seventy jobs that miss, and one left waiting for the wait to be shown.
+    for seed in 1..=71 {
         queue(&mut service, &session(seed), "kalareach", at(0));
     }
     let mut now = at(3_000);
     // One second, written out with the five minutes, so that a case that counts in them fails when
     // either changes.
     let mut expected = 1_000;
-    for round in 1..=12 {
+    for round in 1..=70 {
         now = overrun(&mut service, now, Overran::Said);
         assert_eq!(
             service.next(&roomy(), now).expect("an instruction"),
@@ -2360,8 +2361,8 @@ fn the_wait_after_deadlines_missed_in_a_row_stops_at_five_minutes() {
 /// cancels it past its deadline puts it back in the queue; a session that closed, or a change that
 /// made its description stale, or a fence on its session, ends it cancelled, whether the service
 /// had cancelled the job already or the closure, the change or the fence came before the answer
-/// was read. None of those leaves the next job waiting. The control is a job the daemon never asked to stop, which the process
-/// stopped and answered cancelled.
+/// was read. None of those leaves the next job waiting. The control is a job the daemon never
+/// asked to stop, which the process stopped and answered cancelled.
 #[test]
 fn a_job_stopped_at_its_deadline_ends_past_it_unless_something_else_stopped_it() {
     let hot = HostConditions::measured(

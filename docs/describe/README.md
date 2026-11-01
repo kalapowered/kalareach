@@ -318,7 +318,8 @@ the system does not hold is reported as not applied, with the reason.
     description stale or a privacy fence reject it.
   - A job that misses its deadline makes the next job wait, one second after the first miss and
     twice as long after each one in a row, up to five minutes, until a description or a summary
-    is published.
+    is published. A publication that the process made after passing its memory ceiling does not
+    end it: the model is unloaded and inference pauses for memory instead.
     The cadence a client is shown does not count this wait. It does not by itself show the host
     as paused: `inference_failed` is for a process or a model that fails. No pause reason that
     exists names a busy host, so the wait shows only as the delayed description; a reason of its
@@ -645,8 +646,9 @@ cancellation and a passed deadline publish nothing.
 A process that exits, breaks the wire or is ended for breaking a bound takes the model with it and
 nothing else. The store, the pins, the provenance, every session and every deterministic title
 survive. The job it was running is queued again once, with its aging position, unless the daemon
-ended the process for passing its deadline or its memory ceiling, which ends the job past its
-deadline or failed (a process that ends itself for passing its deadline reads as one that
+ended the process for passing its deadline or its memory ceiling, or the process exited while
+the system had refused it memory, which the daemon reads as the ceiling; those end the job past
+its deadline or failed (a process that ends itself for passing its deadline reads as one that
 exited, and the job is queued again), and if the next process fails it as well it is not
 retried, however many pauses come between. A job a caller or
 privacy mode cancelled is never queued again, even when its process ends before the cancellation is
@@ -656,7 +658,7 @@ outside, and the job's token never leaves the service. The moment the service de
 that did not finish comes to is the moment a cancellation stops counting, so a cancellation that
 comes first is honoured, and one that comes after finds nothing running and says so. The next load
 waits a second after the first failure, twice as long after each failure that follows, up to five
-minutes, and a published description resets the wait.
+minutes, and a published description or summary resets the wait.
 
 The runtime is a crate of its own, `kr-describe-model`, built on the description service in
 `kr-describe`, which holds no model: a process that links the service alone, as the control daemon

@@ -34,7 +34,7 @@
 //! job or is ended by the host takes the loaded model with it and nothing else. The store, the pins,
 //! the trackers and every session are untouched; the job it was running is queued again once with
 //! its aging position; and the next load waits a second, doubling to five minutes while failures
-//! repeat, until a description is published.
+//! repeat, until a description or a summary is published.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -1625,8 +1625,10 @@ impl DescriptionService {
     /// Takes the news that the description process ended without this service asking.
     ///
     /// The model goes with it and nothing else. The work in flight ends: a job the process was
-    /// cancelling ends cancelled, a job past its deadline ends so, and any other job is queued
-    /// again once with its aging position. The next load waits out the restart delay.
+    /// cancelling ends cancelled, a job whose process the daemon ended for passing its deadline
+    /// ends so, and any other job is queued again once with its aging position (a process that
+    /// ended itself for passing its deadline reads as one that exited). The next load waits out
+    /// the restart delay.
     ///
     /// # Errors
     ///
