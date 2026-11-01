@@ -3852,12 +3852,14 @@ fn too_much(described: &str) -> Asked {
 /// Reads what a probe wrote to its end, once the probe has ended.
 ///
 /// A process that left the probe's group may still hold the pipe, so the wait for the end is
-/// short: [`PROBE_DRAIN`], and never past the probe's own `deadline`. When the wait runs out, whose
-/// time it was decides what it says. The probe's own time running out is the clock's, and says
-/// nothing of the program, so it is a fault that passes. The second the drain is given running out
-/// first is the program's: it left its output open.
+/// short: [`PROBE_DRAIN`], and never past the probe's own `deadline`. When the wait runs out, the
+/// limit that set it decides what it says. The probe's own time is the clock's, and says nothing of
+/// the program, so it is a fault that passes, and so is a tie. The second the drain is given is the
+/// program's: it left its output open. Which limit it was is fixed when the wait begins, so a late
+/// wake-up does not change it.
 fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::Result<(), Asked> {
     let drain = drain_until(Instant::now(), deadline);
+    let clocks_own = drain == deadline;
     loop {
         heard.take_in(drain);
         if heard.overflowed() {
@@ -3866,9 +3868,8 @@ fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::
         if heard.ended() {
             return Ok(());
         }
-        let now = Instant::now();
-        if now >= drain {
-            return Err(Asked::Overran(if now >= deadline {
+        if Instant::now() >= drain {
+            return Err(Asked::Overran(if clocks_own {
                 ProjectError::GitFailed {
                     detail: format!(
                         "{described} had not finished answering when the time it is given ran out"
