@@ -110,3 +110,78 @@ pub fn a_pin_not_yet_committed(
         .expect("a pin, not yet committed");
     other
 }
+
+/// What a read on the calling thread reports of its background class: its scheduling policy and
+/// priority, its niceness on Linux, and the I/O class that is the thread's on Linux and the
+/// process's on macOS. `kr_ipc` reads the class of the calling thread, and the server does not hand
+/// out the model thread's identifier, so a case reads it on the thread that runs the work.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Held {
+    pub policy: thread_priority::unix::ThreadSchedulePolicy,
+    pub priority: i32,
+    #[cfg(target_os = "linux")]
+    pub nice: i32,
+    pub io: Option<kr_ipc::background::IoClass>,
+}
+
+/// Reads the background class of the calling thread.
+#[cfg(unix)]
+pub fn held_by_this_thread() -> Held {
+    let (policy, params) =
+        thread_priority::unix::thread_schedule_policy_param(thread_priority::thread_native_id())
+            .expect("the system reports the thread's scheduling class");
+    Held {
+        policy,
+        priority: params.sched_priority,
+        #[cfg(target_os = "linux")]
+        nice: nice_of_this_thread(),
+        io: kr_ipc::background::io_class(),
+    }
+}
+
+/// The niceness the system reports for the calling thread: field 19 of its stat. The name in field
+/// 2 may hold spaces and brackets, so the fields are counted from its closing bracket.
+#[cfg(target_os = "linux")]
+fn nice_of_this_thread() -> i32 {
+    let stat = std::fs::read_to_string("/proc/thread-self/stat").expect("the thread's stat");
+    let after_name = stat.rsplit_once(')').expect("a name in the stat").1;
+    after_name
+        .split_whitespace()
+        .nth(16)
+        .expect("a niceness in the stat")
+        .parse()
+        .expect("a whole number")
+}
+
+#[cfg(unix)]
+impl Held {
+    /// Whether the thread holds the processor class this build lowers a model thread to: the batch
+    /// policy at niceness 19 on Linux, and the lowest priority its policy has on macOS.
+    pub fn cpu_is_lowered(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            use thread_priority::unix::{NormalThreadSchedulePolicy, ThreadSchedulePolicy};
+            self.policy == ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Batch)
+                && self.nice == 19
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            thread_priority::ThreadPriority::Min
+                .to_posix(self.policy)
+                .is_ok_and(|lowest| self.priority == lowest)
+        }
+    }
+
+    /// Whether the thread holds the I/O class this build lowers to: idle on Linux, and the
+    /// throttled disk policy of the process on macOS.
+    pub fn io_is_lowered(&self) -> bool {
+        use kr_ipc::background::IoClass;
+        self.io
+            == Some(if cfg!(target_os = "linux") {
+                IoClass::Idle
+            } else {
+                IoClass::Throttled
+            })
+    }
+}

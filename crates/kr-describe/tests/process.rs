@@ -8,7 +8,7 @@ mod support;
 use std::io::Read;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use kr_describe::context::ContextRevision;
@@ -171,8 +171,8 @@ fn a_load_the_process_does_not_hold_is_refused() {
     ));
 }
 
-/// KR-REQ-22.11: a cancellation reaches a load and a job while they run, and each answers at once
-/// that it was cancelled; the control is the same work left alone, which finishes.
+/// KR-REQ-22.11: a cancellation reaches a load and a job while they run, and each answers that it
+/// was cancelled; the control is the same work left alone, which finishes.
 #[test]
 fn a_cancellation_reaches_a_load_and_a_job_while_they_run() {
     let placed = Placed::stub();
@@ -691,17 +691,47 @@ struct Asked {
     ceiling_bytes: u64,
 }
 
-/// A model that records what it was asked for.
+/// When a job reached a model, and when the process was to be done with it.
+#[derive(Clone, Copy, Debug)]
+struct Due {
+    reached_at: Instant,
+    deadline: Instant,
+}
+
+/// A model that records what it was asked for, the deadline it was given, and what a read on the
+/// thread that runs its jobs reports of its background class.
 #[derive(Clone, Default)]
-struct Recording(Arc<Mutex<Vec<Asked>>>);
+struct Recording {
+    asked: Arc<Mutex<Vec<Asked>>>,
+    due: Arc<Mutex<Vec<Due>>>,
+    #[cfg(unix)]
+    held: Arc<Mutex<Vec<support::Held>>>,
+}
+
+impl Recording {
+    /// How many jobs have reached the model.
+    fn jobs(&self) -> usize {
+        self.asked.lock().expect("the record").len()
+    }
+}
 
 impl Model for Recording {
     fn load(&mut self, _work: &LoadWork<'_>, _token: &Cancellation, _deadline: Instant) -> Loading {
         Loading::Loaded
     }
 
-    fn generate(&mut self, job: &Job<'_>, _token: &Cancellation, _deadline: Instant) -> Generating {
-        self.0.lock().expect("the record").push(Asked {
+    fn generate(&mut self, job: &Job<'_>, _token: &Cancellation, deadline: Instant) -> Generating {
+        let reached_at = Instant::now();
+        #[cfg(unix)]
+        self.held
+            .lock()
+            .expect("the record")
+            .push(support::held_by_this_thread());
+        self.due.lock().expect("the record").push(Due {
+            reached_at,
+            deadline,
+        });
+        self.asked.lock().expect("the record").push(Asked {
             context_tokens: job.context_tokens,
             max_output_tokens: job.max_output_tokens,
             cpu_threads: job.cpu_threads,
@@ -739,10 +769,24 @@ fn classes() -> impl PartialEq + std::fmt::Debug {
     }
 }
 
-/// KR-REQ-22.10: a job runs with the thread count and bounds it was sent and with the sampler of
-/// the profile the process loaded.
-#[test]
-fn a_job_runs_with_the_limits_sent_and_the_loaded_profiles_sampler() {
+/// The turn that cases serving inside this process take.
+static SERVING: Mutex<()> = Mutex::new(());
+
+/// Serves `model` inside this process: sends it `requests` in order, ends its input once `done`
+/// holds, and returns how the server ended, with the moment before each request was sent.
+///
+/// The server's model thread takes the background class, and on macOS and Windows the I/O class it
+/// takes is the whole process's, which every later case of this binary would run in. So the case
+/// notes the class it found and puts it back, and the cases that serve here take turns, since one
+/// that puts the class back while another reads it would fail the second for the first's sake. The
+/// server keeps its real watchdog (`CONTROL_BOUND_MS`), so a host that stalls one of its threads
+/// past it ends the whole test binary, and not a named case.
+fn serve_in_process(
+    model: impl Model,
+    requests: &[Request],
+    done: impl Fn() -> bool,
+) -> (Exit, Vec<Instant>) {
+    let _turn = SERVING.lock().unwrap_or_else(PoisonError::into_inner);
     let (write, read): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = std::sync::mpsc::channel();
     let output = Arc::new(Mutex::new(Vec::<u8>::new()));
     struct Shared(Arc<Mutex<Vec<u8>>>);
@@ -755,15 +799,10 @@ fn a_job_runs_with_the_limits_sent_and_the_loaded_profiles_sampler() {
             Ok(())
         }
     }
-    let recording = Recording::default();
     let runtime = tempfile::tempdir().expect("a directory on the internal disk");
-    // The server runs inside this process, and on macOS and Windows the background class its model
-    // thread takes is the whole process's, which every later case of this binary would run in. So
-    // the case notes the class it found and puts it back where it was.
     let found = classes();
     let saved = kr_ipc::background::save();
     let serving = {
-        let recording = recording.clone();
         let output = Shared(output.clone());
         let runtime = runtime.path().to_path_buf();
         std::thread::spawn(move || {
@@ -774,20 +813,21 @@ fn a_job_runs_with_the_limits_sent_and_the_loaded_profiles_sampler() {
                     catalogue: Catalogue::builtin().expect("the catalogue"),
                     daemon: None,
                 },
-                recording,
+                model,
                 Input(read, Vec::new()),
                 output,
             )
         })
     };
-    let profile = default_profile();
-    for request in [load(1, &profile, 300_000), generate(2, 1, 30_000)] {
+    let mut sent_at = Vec::new();
+    for request in requests {
+        sent_at.push(Instant::now());
         write
-            .send(frame_of(&request).expect("a frame"))
+            .send(frame_of(request).expect("a frame"))
             .expect("sent");
     }
     let until = Instant::now() + SOON;
-    while recording.0.lock().expect("the record").is_empty() && Instant::now() < until {
+    while !done() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(5));
     }
     drop(write);
@@ -798,8 +838,23 @@ fn a_job_runs_with_the_limits_sent_and_the_loaded_profiles_sampler() {
         found,
         "the process is left in the class it found"
     );
+    (ended, sent_at)
+}
+
+/// KR-REQ-22.10: a job runs with the thread count and bounds it was sent and with the sampler of
+/// the profile the process loaded, and the job's deadline is thirty seconds from a moment between
+/// the job's being sent and its reaching the model.
+#[test]
+fn a_job_runs_with_the_limits_sent_and_the_loaded_profiles_sampler() {
+    let recording = Recording::default();
+    let profile = default_profile();
+    let (ended, sent_at) = serve_in_process(
+        recording.clone(),
+        &[load(1, &profile, 300_000), generate(2, 1, 30_000)],
+        || recording.jobs() == 1,
+    );
     assert_eq!(ended, Exit::Ended);
-    let recorded = recording.0.lock().expect("the record").clone();
+    let recorded = recording.asked.lock().expect("the record").clone();
     assert_eq!(
         recorded,
         vec![Asked {
@@ -810,5 +865,51 @@ fn a_job_runs_with_the_limits_sent_and_the_loaded_profiles_sampler() {
             ceiling_bytes: 4 << 30,
         }],
         "the job ran with what it was sent and with the loaded profile's sampler"
+    );
+
+    // The deadline is thirty seconds from a moment between the job's being sent and its reaching
+    // the model, which orders the three moments and waits for none of them.
+    let due = recording.due.lock().expect("the record").clone();
+    let [due] = due[..] else {
+        panic!("one job reached the model: {due:?}");
+    };
+    let thirty_seconds = Duration::from_millis(30_000);
+    assert!(
+        sent_at[1] + thirty_seconds <= due.deadline,
+        "the deadline is no sooner than thirty seconds after the job was sent"
+    );
+    assert!(
+        due.deadline <= due.reached_at + thirty_seconds,
+        "the deadline is no later than thirty seconds after the job reached the model"
+    );
+}
+
+/// KR-REQ-22.11: the thread that runs a job is in the background class while it runs one: a read
+/// on that thread finds the processor class this build lowers a model thread to (Linux: the batch
+/// policy at niceness 19; macOS: the lowest thread priority) and the I/O class it lowers to (Linux:
+/// idle; macOS: the throttled disk policy). `kr_ipc` reads the class of the calling thread, and the
+/// server does not hand out the model thread's identifier, so the case reads it on that thread.
+/// Windows reads the process's class from outside, in `tests/supervise.rs`.
+#[cfg(unix)]
+#[test]
+fn the_thread_that_runs_a_job_is_in_the_background_class_the_system_reports() {
+    let recording = Recording::default();
+    let profile = default_profile();
+    serve_in_process(
+        recording.clone(),
+        &[load(1, &profile, 300_000), generate(2, 1, 30_000)],
+        || recording.jobs() == 1,
+    );
+    let held = recording.held.lock().expect("the record").clone();
+    let [held] = held[..] else {
+        panic!("one job reached the model: {held:?}");
+    };
+    assert!(
+        held.cpu_is_lowered(),
+        "the job's thread holds no lowered processor class: {held:?}"
+    );
+    assert!(
+        held.io_is_lowered(),
+        "the job's thread holds no lowered I/O class: {held:?}"
     );
 }

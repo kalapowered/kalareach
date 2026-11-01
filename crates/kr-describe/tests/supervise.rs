@@ -278,8 +278,9 @@ fn the_process_ended(reports: &[Report]) -> bool {
 
 /// KR-REQ-22.11: the description process runs its model in the background class and reports what
 /// the system holds of it. Asked from outside, the system agrees where the platform lets a parent
-/// ask: on Windows the process's priority class and I/O priority, and on Linux
-/// the scheduling policy of the process's threads.
+/// ask: on Windows the process's priority class and I/O priority, and on Linux the scheduling
+/// policy of the process's threads. The model thread's class on macOS and its I/O class on Linux
+/// have no read from outside here, and are read on the thread itself, in `tests/process.rs`.
 #[test]
 fn the_process_runs_its_model_in_the_background_class_the_system_reports() {
     let mut rig = Rig::new(&Script::default());
