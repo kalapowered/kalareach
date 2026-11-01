@@ -187,7 +187,9 @@ the same flags. `kr doctor` shows what a new session gets of the integration.
 
 ## A Claude Code the integration did not launch
 
-Claude Code started any other way is adopted rather than launched: by absolute path, with its
+Claude Code started any other way is adopted rather than launched, on macOS and Linux and where the
+file the kernel names for the process is `claude` (the package's rules name no versioned file, so a
+build an installer keeps under `~/.local/share/claude/versions/<version>` is not recognised): by absolute path, with its
 integration off, after a refused or retired launch, in a pipeline or another form the shell does not
 ask about, or from a shell that does not ask. Four times a second, while a command has the terminal,
 the worker looks at the terminal's foreground process group. It adopts a process there that the
