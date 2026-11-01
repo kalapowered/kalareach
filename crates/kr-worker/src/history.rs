@@ -250,6 +250,21 @@ pub struct OutputHistory {
     /// reading, so that the passes of several sessions read the same total.
     #[cfg(test)]
     after_host_reading: Option<Arc<std::sync::Barrier>>,
+    /// Called by a test just before the lock on the host's cap is taken, so that a pass can be
+    /// made to take it after another pass has removed output, holding the reading it made before.
+    #[cfg(test)]
+    before_host_cap_lock: Option<TestHook>,
+}
+
+/// A call a test makes at a point of a pass.
+#[cfg(test)]
+struct TestHook(Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TestHook")
+    }
 }
 
 /// A measure of what every session on the host retains, and when it was taken.
@@ -320,6 +335,8 @@ impl OutputHistory {
             awaits_the_host_cap_lock: false,
             #[cfg(test)]
             after_host_reading: None,
+            #[cfg(test)]
+            before_host_cap_lock: None,
         }
     }
 
@@ -1054,6 +1071,10 @@ impl OutputHistory {
             .spool
             .as_ref()
             .is_some_and(|spool| spool.total_bytes > 0);
+        #[cfg(test)]
+        if can_give_up && let Some(before) = self.before_host_cap_lock.as_ref() {
+            (before.0)();
+        }
         let _lock = match can_give_up.then(|| take_host_cap_lock(spools)) {
             Some(Ok(lock)) => lock,
             refused => {
@@ -4091,6 +4112,78 @@ mod tests {
             "the host is brought to its cap and not below it"
         );
         assert_eq!(given_up, 24, "and the excess was given up once");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// KR-REQ-20.20, KR-PERF-003: a session that takes the lock after another removed output reads
+    /// the host again, and finds nothing to give up. Both sessions read the 128 bytes the host
+    /// holds under a cap of 100 before either removes anything; the second takes the lock only
+    /// after the first has removed what it was over by and let go.
+    #[test]
+    fn kr_perf_003_a_session_that_takes_the_lock_after_another_removed_output_gives_up_nothing() {
+        use std::sync::{Condvar, Mutex};
+
+        let root = spool_directory("host-cap-handoff");
+        let retention = OutputRetention::new(
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            100,
+            1 << 20,
+        );
+        let layout = || SpoolLayout::new(8, 1 << 20);
+        let mut first =
+            OutputHistory::with_spool(8, root.join("first.log"), layout()).expect("a spool");
+        first.append(&[b'f'; 64]);
+        let mut second =
+            OutputHistory::with_spool(8, root.join("second.log"), layout()).expect("a spool");
+        second.append(&[b's'; 64]);
+        assert_eq!(retained_bytes_under(&root), 128);
+
+        let both_read = Arc::new(std::sync::Barrier::new(2));
+        first.after_host_reading = Some(Arc::clone(&both_read));
+        second.after_host_reading = Some(both_read);
+        let first_has_removed = Arc::new((Mutex::new(false), Condvar::new()));
+        second.before_host_cap_lock = Some(TestHook(Arc::new({
+            let first_has_removed = Arc::clone(&first_has_removed);
+            move || {
+                let (done, signal) = &*first_has_removed;
+                let mut done = done.lock().expect("not poisoned");
+                while !*done {
+                    done = signal.wait(done).expect("not poisoned");
+                }
+            }
+        })));
+
+        let now = kr_ipc::now_ms();
+        let spools = root.as_path();
+        let (given_by_first, given_by_second) = std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                let taken = first.apply_retention_to_host(spools, retention, now, true);
+                let (done, signal) = &*first_has_removed;
+                *done.lock().expect("not poisoned") = true;
+                signal.notify_all();
+                taken.iter().map(|eviction| eviction.bytes).sum::<u64>()
+            });
+            let second = scope.spawn(move || {
+                second
+                    .apply_retention_to_host(spools, retention, now, true)
+                    .iter()
+                    .map(|eviction| eviction.bytes)
+                    .sum::<u64>()
+            });
+            (
+                first.join().expect("the first pass ran"),
+                second.join().expect("the second pass ran"),
+            )
+        });
+        assert_eq!(
+            given_by_first, 32,
+            "the first gives up the 28 it is over by"
+        );
+        assert_eq!(
+            given_by_second, 0,
+            "and the second, reading the host again under the lock, finds it under its cap"
+        );
+        assert_eq!(retained_bytes_under(&root), 96);
         std::fs::remove_dir_all(&root).ok();
     }
 
