@@ -874,7 +874,7 @@ names for the owner.
 | `UPSTREAM_UNAVAILABLE` | A Git invocation failed, ran past its deadline, or produced more output than the host accepts; a look for Git that ran out of its time or of the host's descriptors, processes or memory |
 | `QUOTA_EXCEEDED` | An inclusion that would copy more than the host moves without being asked |
 | `OWNER_CONFIRMATION_REQUIRED` | A location decision whose proof is not an owner device's answer to the challenge it was given, whose owner device is no longer one, or whose named device no longer holds the keys the confirmation names |
-| `HOST_NOT_CONFIGURED` | Installed Git is missing or older than the profile needs, or answers with more than it was asked, or the platform runs no Git at all, or a Linux kernel lacks the Landlock interface the boundary needs, which no wait or install changes; a location decision on a host with no owner device to confirm it |
+| `HOST_NOT_CONFIGURED` | Installed Git is missing, older than the profile needs, answers with more than it was asked, or has ended and left its output open for a second inside the time it was given; the platform runs no Git at all, a Linux kernel lacks the Landlock interface the boundary needs, or the machine is one this host holds no system-call numbers for, which no wait or install changes; a location decision on a host with no owner device to confirm it |
 | `STORAGE_UNAVAILABLE` | The journal or the service's own directories |
 
 ## Change sets

@@ -988,8 +988,9 @@ impl Controller {
                     .stated(", so a paired device is refused repository operations"),
             },
             matches!(refusal, Some(Refusal::SupportSet | Refusal::Invocation)).then_some(
-                "This daemon's own log says what it could not do. A paired device is refused \
-                 until a later check proves it.",
+                "This daemon's own log says what it could not do, such as the kernel's interface \
+                 version or a machine it holds no system-call numbers for. A paired device is \
+                 refused until a later check proves it.",
             ),
         )];
         if refusal == Some(Refusal::Platform) {

@@ -4748,8 +4748,9 @@ pub enum Refusal {
     /// This host cannot name the loaders and libraries Git needs.
     SupportSet,
     /// An invocation of Git under the rules for such a caller did not run here: the kernel has no
-    /// Landlock at the version the rules need, a filesystem is mounted beneath a directory the
-    /// invocation is granted, or the rules could not be applied.
+    /// Landlock at the version the rules need, the machine is one this host holds no system-call
+    /// numbers for, a filesystem is mounted beneath a directory the invocation is granted, or the
+    /// rules could not be applied.
     Invocation,
 }
 
@@ -4765,8 +4766,9 @@ impl Refusal {
             }
             Self::Invocation => {
                 "an invocation of Git under the rules for such a caller did not run on this \
-                 host: its kernel may lack the confinement they need, or a filesystem may be \
-                 mounted beneath a directory the invocation is granted"
+                 host: its kernel may lack the confinement they need, the machine may be one \
+                 this host holds no system-call numbers for, or a filesystem may be mounted \
+                 beneath a directory the invocation is granted"
             }
         }
     }
