@@ -3751,6 +3751,19 @@ mod tests {
         command: &str,
         body: serde_json::Value,
     ) -> Option<String> {
+        error_of(window, command, body).map(|error| match error["code"].as_str() {
+            Some(code) => code.to_owned(),
+            None => error.to_string(),
+        })
+    }
+
+    /// Calls `command` the way the page does, and returns the error it was refused with, whole, or
+    /// nothing when the call succeeded.
+    fn error_of(
+        window: &tauri::WebviewWindow<tauri::test::MockRuntime>,
+        command: &str,
+        body: serde_json::Value,
+    ) -> Option<serde_json::Value> {
         tauri::test::get_ipc_response(
             window,
             tauri::webview::InvokeRequest {
@@ -3764,10 +3777,6 @@ mod tests {
             },
         )
         .err()
-        .map(|error| match error["code"].as_str() {
-            Some(code) => code.to_owned(),
-            None => error.to_string(),
-        })
     }
 
     /// The commands that reach a session are all commands the application registers, and none is
@@ -4620,6 +4629,67 @@ mod tests {
             Some("PERMISSION_DENIED"),
             "one dialog is one write"
         );
+    }
+
+    /// KR-REQ-27.05, full disks: an export whose destination has no room left is refused with the
+    /// filesystem's own error, and the command does not report a file written.
+    ///
+    /// `/dev/full` answers every write with ENOSPC, the error a full filesystem gives. The case
+    /// registers it as the destination the save dialog returned, so each export passes the gate that
+    /// a path the page names does not and meets the refusal at the write.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_export_to_a_destination_with_no_room_is_refused_and_reports_no_file_written() {
+        use tauri::Manager as _;
+
+        let (app, window) = page_with(tauri::generate_handler![
+            export_semantic_json,
+            export_asciicast
+        ]);
+        let state = app.state::<AppState>();
+        let full = std::path::PathBuf::from("/dev/full");
+        let path = full.display().to_string();
+        let exports = [
+            (
+                "export_semantic_json",
+                serde_json::json!({
+                    "path": path,
+                    "sessionId": "44444444-4444-4444-8444-444444444444",
+                    "exportedAtMs": 1,
+                    "dimensions": { "columns": 80, "rows": 24 },
+                    "nodes": [],
+                    "omissions": []
+                }),
+            ),
+            (
+                "export_asciicast",
+                serde_json::json!({
+                    "path": path,
+                    "title": "a session",
+                    "startedAtUnixSeconds": 1,
+                    "dimensions": { "columns": 80, "rows": 24 },
+                    "frames": [],
+                    "omissions": []
+                }),
+            ),
+        ];
+        for (command, body) in exports {
+            state.allow_export_to(full.clone());
+            let error = error_of(&window, command, body).unwrap_or_else(|| {
+                panic!("{command} reported a file written to a destination that takes no byte")
+            });
+            assert_eq!(
+                error["code"].as_str(),
+                Some("RESOURCE_UNAVAILABLE"),
+                "{command}: the write was refused, and the page is told so: {error}"
+            );
+            assert!(
+                error["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("No space left on device")),
+                "{command}: the person is told why: {error}"
+            );
+        }
     }
 
     /// KR-REQ-10.01: the two commands whose calls native code builds itself read what the page sent
