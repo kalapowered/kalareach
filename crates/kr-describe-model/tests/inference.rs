@@ -435,6 +435,10 @@ fn the_largest_contexts_are_sent_to_the_real_process_and_none_is_refused_for_its
 /// because the daemon's own token is cancelled, so only the process's answer tells the two apart.
 /// Spoken to over its own pipes, as the daemon's driver speaks to it.
 ///
+/// On macOS it also reads the kernel's priority of every thread of the real process while the job
+/// runs, the threads the runtime starts to decode included when the model has begun by then, and
+/// they are all in the background class (KR-REQ-22.11's background priority).
+///
 /// What it does not show, in two ways. The real process leaves no mark when its model begins a job,
 /// so the wait before the cancellation stands for the model's entry and does not prove it: a host
 /// that starts the model thread later than the wait gets the same answer from the process's own
@@ -541,6 +545,24 @@ fn the_real_model_stops_a_job_it_is_told_to_cancel() {
     // Stands for the model thread being inside the job, well short of the job's end: the process
     // leaves no mark of it, so nothing here shows that the model had begun.
     std::thread::sleep(Duration::from_millis(500));
+    // On macOS the kernel's priority of every thread of the real process is read while the job
+    // runs: the threads the runtime starts to decode are among them once the model has begun, and
+    // a class held by the model thread alone leaves them at the ordinary priority.
+    #[cfg(target_os = "macos")]
+    {
+        let priorities = kr_ipc::background::thread_priorities_of(child.id())
+            .expect("the kernel lists the threads of the process");
+        assert!(
+            priorities
+                .iter()
+                .all(|priority| *priority <= kr_ipc::background::BACKGROUND_THREAD_PRIORITY),
+            "a thread of the real process is outside the background class: {priorities:?}"
+        );
+        eprintln!(
+            "the real process had {} threads, all in the background class",
+            priorities.len()
+        );
+    }
     send(&Request::Cancel { id: U64::new(2) });
     let asked = Instant::now();
     // The control thread says it has read the cancellation before it cancels, and the model thread
