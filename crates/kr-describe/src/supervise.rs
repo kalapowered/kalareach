@@ -74,19 +74,19 @@ pub const ANSWER_GRACE_MS: u64 = 2_000;
 /// A job past its deadline is asked to stop at the deadline. The grace after it ends a process that
 /// has not said it read the request: its control thread is not listening. A process that has said
 /// so is listening and has not yet reached a place where the model can stop, which a busy host in
-/// the background class takes a while to do: the longest stop seen there was 15 seconds. Ending it costs a new load of the model, 8 to 15
-/// seconds, and a failure of inference. So it is given twice the longest stop seen, which is also
-/// a session's cooldown, 30 seconds: a session is not described again sooner than that, so a
-/// stop within it delays no other description of that session.
+/// the background class takes a while to do: the longest stop seen there was 15 seconds. Ending it
+/// costs a new load of the model, 8 to 15 seconds, and a failure of inference. So it is given twice
+/// the longest stop seen, which is also a session's cooldown, 30 seconds. The process holds one job
+/// at a time, so a stop that takes the whole bound delays the next job of every session by as much.
 pub const STOP_BOUND_MS: u64 = 30_000;
 
 /// How long a process has to say it has read a cancellation, and how long a load or a check of a
 /// file has to answer one.
 ///
 /// A job's cancellation is held to the first alone: the control thread says at once that it has
-/// read it, and the job's own answer is then bounded by the job's deadline and the process's own
-/// watchdog, so a busy host that takes a moment to stop a job is not mistaken for a process that is
-/// not listening. A load and a check of a file lose nothing when the process is ended, so each is
+/// read it, and the job's own answer is then bounded by the job's deadline and, for a stop that
+/// was read, [`STOP_BOUND_MS`] after it, and by the process's own watchdog, so a busy host that
+/// takes a moment to stop a job is not mistaken for a process that is not listening. A load and a check of a file lose nothing when the process is ended, so each is
 /// held to this bound for its own answer too. A process that said it had read the cancellation and
 /// then did not stop the load or the check is ended without a failure of inference
 /// ([`ProcessEnd::StopOverdue`]); one that did not say so is not listening, which is one
@@ -1125,7 +1125,6 @@ impl Driver {
                 let Some(id) = answer.id() else {
                     return Ok(());
                 };
-                let mut stopped_for_its_deadline = false;
                 if Some(tag) == current {
                     let Some(running) = self.process.as_mut() else {
                         return Ok(());
@@ -1136,14 +1135,6 @@ impl Driver {
                         return self.kill(ProcessEnd::BrokenWire, now, reports);
                     }
                     let in_hand = running.work.is_some_and(|due| due.id == id);
-                    // A job that stopped when the daemon asked it to at its deadline, and that no
-                    // caller asked to stop, is one that passed its deadline, whatever the process
-                    // calls the stop.
-                    stopped_for_its_deadline = in_hand
-                        && running
-                            .job_stop
-                            .is_some_and(|stop| stop.id == id && stop.asked)
-                        && !running.cancel.is_some_and(|cancel| cancel.id == id);
                     if in_hand {
                         running.work = None;
                         running.job_stop = None;
@@ -1176,16 +1167,7 @@ impl Driver {
                 }
                 // An answer from a process that has been ended is still given to the service,
                 // which drops it: its work ended with the process.
-                let mut answer = answered(answer);
-                if stopped_for_its_deadline
-                    && let Answered::Ended {
-                        why: why @ crate::wire::JobEnd::Cancelled,
-                        ..
-                    } = &mut answer
-                {
-                    *why = crate::wire::JobEnd::DeadlineExceeded;
-                }
-                let outcome = self.service.finished(id, answer, now)?;
+                let outcome = self.service.finished(id, answered(answer), now)?;
                 reports.push(Report::Outcome(outcome));
             }
         }
@@ -1209,10 +1191,12 @@ impl Driver {
                     && running.work.is_some_and(|due| due.id == stop.id)
             })
             .map(|stop| stop.id);
+        let asked_now = stop.is_some();
         if let Some(id) = stop {
             if let Some(stop) = running.job_stop.as_mut() {
                 stop.asked = true;
             }
+            self.service.job_asked_to_stop_at_its_deadline(id);
             if !self.send(&Request::Cancel { id: U64::new(id) }, now, reports)? {
                 return Ok(());
             }
@@ -1231,10 +1215,13 @@ impl Driver {
             } else {
                 ProcessEnd::CancelUnanswered
             })
-        } else if running
-            .work
-            .is_some_and(|due| at >= running.work_ends_at_ms(due))
+        } else if !asked_now
+            && running
+                .work
+                .is_some_and(|due| at >= running.work_ends_at_ms(due))
         {
+            // Not in the turn that asked, which the process has had no time to answer: the grace
+            // counts from the request.
             Some(ProcessEnd::PastDeadline)
         } else if running.check.is_some_and(|due| at >= due.at_ms) {
             Some(ProcessEnd::CheckOverdue)

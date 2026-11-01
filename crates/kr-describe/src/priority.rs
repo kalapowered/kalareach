@@ -30,7 +30,7 @@
 //! model thread alone leaves the decoding threads at the ordinary priority, and only the policy of
 //! the process holds them. It puts the process's control thread and its watchdog in the class too,
 //! so the ends listed below for Windows can follow on a Mac whose efficiency cores stay busy for
-//! longer than a few seconds; none was seen in the measurement below.
+//! longer than a few seconds; none was seen in the measurements the guide gives.
 //!
 //! On macOS the class costs a job most of its speed on a busy machine: it runs the process at the
 //! lowest priority, and a job of 195 prompt tokens that took about two seconds in the ordinary class

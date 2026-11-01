@@ -750,7 +750,6 @@ fn model_thread<M: Model>(
                 ceiling_bytes,
                 token,
             } => {
-                shared.job_in_hand.store(id, Ordering::Release);
                 shared.job_stop_due.store(
                     shared.stamp_of(due + Duration::from_millis(STOP_BOUND_MS)),
                     Ordering::Release,
@@ -759,6 +758,9 @@ fn model_thread<M: Model>(
                     shared.stamp_of(due + Duration::from_millis(OVERDUE_GRACE_MS)),
                     Ordering::Release,
                 );
+                // Last, so that a stop read before the job is in hand finds the one before it
+                // gone and extends nothing.
+                shared.job_in_hand.store(id, Ordering::Release);
                 let answer = match (&loaded, token.is_cancelled()) {
                     (_, true) => Generating::Ended {
                         why: JobEnd::Cancelled,
@@ -927,7 +929,8 @@ fn watchdog(shared: &Shared, daemon: Option<&ProcessStartIdentity>) {
         let due = shared.work_due.load(Ordering::Acquire);
         if due != 0 && now > due {
             eprintln!(
-                "kr-describe: work ran more than {OVERDUE_GRACE_MS} ms past its deadline, so this \
+                "kr-describe: work ran past its deadline and its grace of {OVERDUE_GRACE_MS} ms (or, \
+                 for a job whose stop was read, of {STOP_BOUND_MS} ms), so this \
                  process ends"
             );
             std::process::exit(Exit::Overdue.code());

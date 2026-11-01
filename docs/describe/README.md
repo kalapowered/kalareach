@@ -290,27 +290,36 @@ the system does not hold is reported as not applied, with the reason.
 
   - At the job's deadline the daemon asks the process to stop the job. A process whose control
     thread says it has read the request is listening, and is given 30 seconds after the deadline
-    to answer: twice the longest stop seen in the class (15 seconds), and a session's cooldown,
-    so a stop within it delays no other description of that session. The process's own watchdog gives a job whose stop it has read the same
-    bound, where other work is overdue two seconds after its deadline. The job answers as past
-    its deadline, the model stays loaded, and no new load follows. A process whose control thread
-    does not say it has read the request is ended two seconds after the deadline, and one that
-    has read it and has not answered by the bound is ended then; each is a failure of inference.
+    to answer: twice the longest stop seen in the class (15 seconds), and a session's cooldown.
+    The process holds one job at a time, so a stop that takes the whole bound delays the next job
+    of every session by as much. The process's own watchdog gives a job whose stop it has read
+    the same bound, where other work is overdue two seconds after its deadline. The job answers
+    as past its deadline, the model stays loaded, and no new load follows. A process whose
+    control thread does not say it has read the request is ended two seconds after the request,
+    and one that has read it and has not answered by the bound is ended then; each is a failure
+    of inference. A caller who cancels the job, or a pause or a closed session that stops it,
+    decides what it comes to, and not the deadline.
   - A job that misses its deadline makes the next job wait, one second after the first miss and
     twice as long after each one in a row, up to five minutes, until a description is published.
-    It does not by itself show the host as paused: `inference_failed` is for a process or a model
-    that fails. No pause reason that exists names a busy host, so the wait shows only as the
-    delayed description; a reason of its own waits for the next protocol cut.
+    The cadence a client is shown does not count this wait. It does not by itself show the host
+    as paused: `inference_failed` is for a process or a model that fails. No pause reason that
+    exists names a busy host, so the wait shows only as the delayed description; a reason of its
+    own waits for the next protocol cut.
 
   Measured on this Mac with the real weights, driven by the daemon's driver (the `inference`
-  tests of `kr-describe-model`), while a build in the same class kept the machine busy: the
-  four largest contexts each missed the deadline (31 to 44 seconds), and none ended the process
-  or loaded the model again. Before the stop was given time, the same cases on this Mac ended the
-  process four times out of four for passing the deadline by its two seconds of grace, each
-  followed by a load of 8.0 to 14.9 seconds, with no description published; a cancellation was
-  acknowledged in 5 ms and answered after 7.8 and 15 seconds. When the machine was not busy, the
-  same cases published their descriptions in 9 to 22 seconds. No daemon in use was observed, and
-  no measurement was taken on a Mac with its efficiency cores idle.
+  tests of `kr-describe-model`), while a build in the same class kept the machine busy: the four
+  largest contexts each ended at the deadline, and none ended the process or loaded the model
+  again. The cases lasted 31 to 44 seconds, which includes the first load and the waits between
+  misses; the test's output gives no job time, and from the case's own time the longest job ran
+  about 40 seconds, the others a fraction of a second past 30. So one
+  job in this run went past the old two-second grace, and the daemon, which would have ended the
+  process there, did not. Before the stop was given time, the same cases on this Mac ended the
+  process four times out of four in a run on a heavily loaded machine (load average 14) and two
+  times out of four in one at load 6.5; each end but the last of the four was followed by a load
+  of 8.0 to 14.9 seconds, with no description published in the first of those runs. A
+  cancellation was acknowledged in 5 ms and answered after 7.8 and 15 seconds. When the machine
+  was not busy, the same cases published their descriptions in 9 to 22 seconds. No daemon in
+  use was observed, and no measurement was taken on a Mac with its efficiency cores idle.
 
   The process's control thread and watchdog are in the class too, so the ends listed for Windows
   below can follow on a Mac whose efficiency cores stay busy for longer than a few seconds: a late
@@ -363,7 +372,8 @@ in four however busy the host is.
 The cadence is the measured service time multiplied by the number of eligible sessions, floored at
 the thirty-second cooldown, and it is also when an ordinary session is described again: not before
 the cadence has passed since its last job. So the cadence a client is shown is the one the queue
-runs at. Foreground and attention work waits for the cooldown alone.
+runs at, but for the wait after a job that passed its deadline, which the cadence does not count.
+Foreground and attention work waits for the cooldown alone.
 
 Thirty seconds is a *minimum*, not a promise: when demand exceeds
 capacity, a client is shown how long its job has been queued, when it last succeeded, and whether

@@ -533,6 +533,10 @@ struct Dispatched {
     queue_wait_ms: u64,
     cancellation: Cancellation,
     stopping: Option<Stop>,
+    /// Whether the daemon asked the process to stop the job because its deadline passed. That is
+    /// not one of the service's own stops: whatever else stops the job still decides what it comes
+    /// to, and a job the process answers as stopped, that nothing else stopped, passed its deadline.
+    deadline_stop: bool,
     requeued_before: bool,
     /// Whether its session closed, or was opened again, while it ran. Such a job is stopped,
     /// publishes nothing, is never queued again, and leaves no mark on the session there now.
@@ -912,6 +916,16 @@ impl DescriptionService {
         self.running.cancel(session_id)
     }
 
+    /// Notes that the job with this identifier, when it is the one in the process, was asked to stop
+    /// because its deadline passed.
+    pub fn job_asked_to_stop_at_its_deadline(&mut self, id: u64) {
+        if let Some(dispatched) = self.job.as_mut()
+            && dispatched.id == id
+        {
+            dispatched.deadline_stop = true;
+        }
+    }
+
     /// Returns what cleanup privacy mode is still owed.
     #[must_use]
     pub const fn cleanup_debt(&self) -> &CleanupDebt {
@@ -968,7 +982,8 @@ impl DescriptionService {
         self.policy.budgets().process_memory_ceiling_bytes
     }
 
-    /// Returns the next load's earliest time after a failure, when one is waiting.
+    /// Returns the next load's earliest time after a failure, when one is waiting. The wait before
+    /// the next job after one that passed its deadline is not in it.
     #[must_use]
     pub const fn restart_not_before_ms(&self) -> Option<u64> {
         if self.restart.waiting() {
@@ -1941,6 +1956,7 @@ impl DescriptionService {
                 queue_wait_ms,
                 cancellation,
                 stopping: None,
+                deadline_stop: false,
                 requeued_before,
                 outlived: false,
             });
@@ -2337,6 +2353,16 @@ impl DescriptionService {
             JobEnd::Cancelled => {
                 if stopped(&dispatched).is_some_and(Stop::requeues) {
                     return self.requeue_unless_cancelled(dispatched);
+                }
+                // The daemon's request at the deadline is the only thing that stopped it: a caller
+                // who cancelled it, or a stop of the service's own, has it end cancelled.
+                if dispatched.deadline_stop
+                    && stopped(&dispatched).is_none()
+                    && !self.cancelled_by_caller(&dispatched)
+                {
+                    self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
+                    self.restart.late(now);
+                    return Outcome::DeadlineExceeded { session_id };
                 }
                 self.counts.cancelled = self.counts.cancelled.saturating_add(1);
                 Outcome::Cancelled { session_id }

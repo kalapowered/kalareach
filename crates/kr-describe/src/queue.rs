@@ -16,7 +16,8 @@
 //! * *Use measured service time and eligible session count to adapt cadence.* [`Scheduler::cadence_ms`]
 //!   is exactly that product, floored at the cooldown, never fixed at it. It also gates dispatch: an
 //!   ordinary session is described again once the cadence has passed since its last job, so the
-//!   cadence a client is shown is the one the queue runs at. Foreground and attention work keeps
+//!   cadence a client is shown is the one the queue runs at, but for the wait after a job that
+//!   passed its deadline, which the cadence does not count. Foreground and attention work keeps
 //!   the cooldown alone.
 //! * *30 seconds is a minimum cooldown, not a refresh SLA for every session.* Nothing here promises
 //!   a refresh. A session's next description arrives when the queue reaches it.

@@ -2215,8 +2215,6 @@ fn overrun(service: &mut DescriptionService, from: Reading, how: Overran) -> Rea
 /// failures: three in a row leave inference failed.
 #[test]
 fn deadlines_missed_in_a_row_make_the_next_job_wait_and_never_show_inference_failed() {
-    use kr_describe::service::RESTART_FIRST_MS;
-
     for forms in [
         [
             Overran::Said,
@@ -2282,6 +2280,122 @@ fn deadlines_missed_in_a_row_make_the_next_job_wait_and_never_show_inference_fai
             "processes ended for their deadlines: inference is failed after the third, not before"
         );
     }
+
+    // A miss between failures clears none of them: the third process ended still shows it.
+    let mut service = self::service();
+    let mut now = at(3_000);
+    for (round, how) in [
+        Overran::Ended,
+        Overran::Ended,
+        Overran::Said,
+        Overran::Ended,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        queue(&mut service, &session(1 + round as u8), "kalareach", now);
+        now = overrun(&mut service, now, how);
+        service.next(&roomy(), now).expect("an instruction");
+        assert_eq!(
+            inference_failed(&service),
+            round == 3,
+            "two processes ended, a miss, and a third ended: failed after the last, not before"
+        );
+    }
+}
+
+/// KR-REQ-22.11: a job the daemon asked to stop because its deadline passed ends past its deadline
+/// when the process answers that it stopped, and the next job waits. It does not when something
+/// else stopped it, or asked to: a caller who cancelled it after the daemon's request, before the
+/// driver handled the answer, has it end cancelled; a pause that cancels it past its deadline puts
+/// it back in the queue; a closed session ends it cancelled. The control is a job the daemon never
+/// asked to stop, which the process stopped and answered cancelled.
+#[test]
+fn a_job_stopped_at_its_deadline_ends_past_it_unless_something_else_stopped_it() {
+    let hot = HostConditions::measured(
+        16 * GIB,
+        12 * GIB,
+        PowerSource::Mains,
+        ThermalState::Critical,
+    );
+    let stopped = Answered::Ended {
+        why: JobEnd::Cancelled,
+        detail: None,
+    };
+    let sent = |service: &mut DescriptionService| {
+        queue(service, &session(1), "kalareach", at(0));
+        let Instruction::Generate { id, .. } = loaded(service, at(3_000)) else {
+            panic!("the job is sent");
+        };
+        id
+    };
+    let after = at(3_000).after_ms(Budgets::DEFAULTS.execution_deadline_ms);
+
+    // The daemon's request at the deadline, and the process's answer that it stopped.
+    let mut service = service();
+    let id = sent(&mut service);
+    service.job_asked_to_stop_at_its_deadline(id);
+    assert_eq!(
+        service
+            .finished(id, stopped.clone(), after)
+            .expect("the answer"),
+        Outcome::DeadlineExceeded {
+            session_id: session(1)
+        }
+    );
+    assert_eq!(service.counts().deadline_exceeded, 1);
+    assert_eq!(service.counts().cancelled, 0);
+    queue(&mut service, &session(2), "kalareach", after);
+    assert_eq!(
+        service.next(&roomy(), after).expect("an instruction"),
+        Instruction::Wait {
+            until_ms: Some(after.monotonic_ms() + RESTART_FIRST_MS)
+        }
+    );
+
+    // A caller cancels after the request and before anything else is handled.
+    let mut service = self::service();
+    let id = sent(&mut service);
+    service.job_asked_to_stop_at_its_deadline(id);
+    assert!(service.cancel_running(&session(1)));
+    assert_eq!(
+        service
+            .finished(id, stopped.clone(), after)
+            .expect("the answer"),
+        Outcome::Cancelled {
+            session_id: session(1)
+        }
+    );
+
+    // A pause that cancels the job past its deadline keeps it in the queue.
+    let mut service = self::service();
+    let id = sent(&mut service);
+    service.job_asked_to_stop_at_its_deadline(id);
+    assert_eq!(
+        service.next(&hot, after).expect("an instruction"),
+        Instruction::Cancel {
+            id,
+            work: Work::Job
+        }
+    );
+    assert_eq!(
+        service
+            .finished(id, stopped.clone(), after)
+            .expect("the answer"),
+        Outcome::Requeued {
+            session_id: session(1)
+        }
+    );
+
+    // The control: the daemon never asked, and the process stopped the job.
+    let mut service = self::service();
+    let id = sent(&mut service);
+    assert_eq!(
+        service.finished(id, stopped, after).expect("the answer"),
+        Outcome::Cancelled {
+            session_id: session(1)
+        }
+    );
 }
 
 /// A session whose changes wait for its job to end reports no time to settle at, so a host that
