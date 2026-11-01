@@ -210,7 +210,8 @@ fn collection_of(origin: &str, locator: &str) -> String {
 /// installation holding the kit, the origin and the account's token finds and authenticates the
 /// bundle, and the same bytes served under another locator or as another origin's fail
 /// authentication. Not shown here: a substituted bundle that holds a writer key (this one holds
-/// none), a lost service, or a migration and the updated kit after it.
+/// none), a lost service, a migration and the updated kit after it, or the checkpoint generation of
+/// a recovery-only restore.
 #[tokio::test]
 async fn a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin() {
     let Some(deployment) = Deployment::from_environment() else {

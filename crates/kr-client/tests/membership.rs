@@ -907,6 +907,10 @@ async fn nothing_is_sealed_to_a_device_its_host_has_not_committed() {
 
 /// Check 3: a record whose issuer any host reports revoked is refused, even while another host
 /// still reports it paired.
+///
+/// KR-REQ-20.11, the part about a record whose issuer a host reports revoked: it is refused even
+/// while another host still reports the issuer paired, its key is never stored, and the issuer is
+/// rotated out.
 #[tokio::test]
 async fn a_record_from_an_issuer_any_host_reports_revoked_is_refused() {
     let world = World::default();
@@ -1642,7 +1646,7 @@ async fn a_member_cannot_remove_itself() {
 /// is installed, at every crash point on the way.
 ///
 /// KR-REQ-20.11, the sync-collection half: from the moment a removal is recorded until a record
-/// without the device is installed, the device does not publish, at every crash point on the way.
+/// without the device is installed, this device does not publish, at every crash point on the way.
 #[tokio::test]
 async fn publication_stays_fenced_from_a_recorded_removal_until_its_record_is_installed() {
     // One run for each point a crash can fall at: before the first step, and after each step.
@@ -1700,6 +1704,9 @@ async fn publication_stays_fenced_from_a_recorded_removal_until_its_record_is_in
 }
 
 /// A removal the owner records while a rotation is under way is carried into the next candidate.
+///
+/// KR-REQ-20.11, the part about a removal recorded during a rotation: it is carried into the next
+/// candidate, and both removed devices are absent from the final record.
 #[tokio::test]
 async fn a_removal_arriving_during_a_rotation_is_carried_into_the_next_candidate() {
     let world = World::default();
@@ -1778,6 +1785,9 @@ async fn a_revoked_winner_that_keeps_this_device_is_rotated_out_and_its_key_neve
 }
 
 /// A rotation away from a refused record keeps nothing the refused record added.
+///
+/// KR-REQ-20.11, the part about a rotation away from a refused record: the final record excludes
+/// the revoked issuer and keeps nothing the refused record added.
 #[tokio::test]
 async fn a_rotation_away_from_a_refused_record_keeps_nothing_it_added() {
     let world = World::default();
@@ -1852,6 +1862,10 @@ async fn a_lost_rekey_reply_is_settled_by_status_or_fence_before_anything_is_sen
 
 /// A candidate that loses to another member's record is dropped with its key, which never
 /// reaches the store.
+///
+/// KR-REQ-20.11, the part about a candidate that loses to another member's record: the removed
+/// device stays excluded and the key installed is the winning record's, not the dropped
+/// candidate's.
 #[tokio::test]
 async fn a_losing_candidate_key_is_never_installed() {
     let world = World::default();
@@ -1907,6 +1921,9 @@ async fn a_losing_candidate_key_is_never_installed() {
 }
 
 /// Two members removing two devices at once: both removals end in the chain.
+///
+/// KR-REQ-20.11, the part about concurrent removals: two members removing two devices at once both
+/// end in the chain, and neither device is in the final record.
 #[tokio::test]
 async fn two_concurrent_removals_both_end_in_the_chain() {
     let world = World::default();
@@ -2067,6 +2084,10 @@ async fn an_addition_survives_a_removal_that_arrives_before_it_is_sent() {
 /// A key a refused issuer opened an epoch with, wrapped again by a later addition from an
 /// issuer that passes, is never installed, across a restart and the rotation that removes the
 /// refused issuer.
+///
+/// KR-REQ-20.11, the part about a revoked issuer's key: a key a refused issuer opened an epoch
+/// with, wrapped again by a later addition from an issuer that passes, is never installed, across a
+/// restart and the rotation that removes the refused issuer.
 #[tokio::test]
 async fn a_refused_issuers_key_wrapped_again_by_a_later_addition_is_never_installed() {
     let world = World::default();
@@ -2120,6 +2141,10 @@ async fn a_refused_issuers_key_wrapped_again_by_a_later_addition_is_never_instal
 /// A removal recorded while an addition of the same device is unsettled is carried out
 /// across dispatch, settlement, installation and restarts, and the device stays bound to remove
 /// it until an installed record excludes it.
+///
+/// KR-REQ-20.11, the part about a removal recorded while an addition of the same device is
+/// unsettled: it is carried out across dispatch, settlement, installation and restarts, and
+/// publication stays fenced until an installed record excludes the device.
 #[tokio::test]
 async fn a_removal_recorded_while_an_addition_of_that_device_is_unsettled_is_carried_out() {
     let world = World::default();
@@ -2900,6 +2925,10 @@ async fn a_change_the_installed_head_carries_out_builds_no_candidate_while_it_wa
 
 /// The write that confirms a join records the host answers and the removals they require,
 /// before anything is installed.
+///
+/// KR-REQ-20.11, the part about a join: the write that confirms it records the removals the host
+/// answers require, and publication is allowed only after a record without the revoked member is
+/// installed.
 #[tokio::test]
 async fn a_join_records_the_host_answers_and_the_removals_they_require() {
     let world = World::default();

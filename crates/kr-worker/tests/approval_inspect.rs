@@ -893,10 +893,6 @@ async fn a_paired_devices_read_without_a_scope_is_refused_with_its_reason() {
 /// The host's one intersection of a grant with a request holds this method to the right its entry
 /// names: a grant without `session.view` is refused for it, whatever else it carries, and one with
 /// it passes that rule, on the local socket and from a paired device alike.
-///
-/// KR-REQ-23.39, the part about the right an agent read needs: a grant without `session.view` is
-/// refused for an approval inspection, whatever else it carries, on the local socket and from a
-/// paired device alike. Not shown here: the exact instance or the evidence the read returns.
 #[test]
 fn a_grant_without_session_view_is_refused_by_the_methods_rights() {
     use kr_controller::grants::{AccessRequest, GrantRecord, HostPolicy, Refusal, decide};

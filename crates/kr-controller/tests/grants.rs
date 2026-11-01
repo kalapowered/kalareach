@@ -813,10 +813,6 @@ fn a_spent_delegation_stays_spent_until_the_caller_says_it_may_be_forgotten() {
 /// A claim whose attempt ended before it recorded anything is settled from what the daemon's own
 /// record shows, once: never over an answer or a refusal the claim already holds, never under an
 /// attempt that still holds the claim, and never for an action nobody claimed.
-///
-/// KR-REQ-09.08, the part about settling an unfinished action: a claim whose attempt ended without
-/// recording anything takes a settlement once and never again, never over an answer or a refusal
-/// the claim holds and never under an attempt that still holds it.
 #[test]
 fn a_claim_left_unfinished_is_settled_once_and_only_where_nothing_holds_it() {
     use kr_controller::grants::{ActionClaim, ActionRecord};
@@ -2704,8 +2700,9 @@ fn a_grant_at_an_older_revision_still_decides_and_one_at_a_revision_nothing_issu
 ///
 /// KR-REQ-09.18, the part about a wall clock wound back: a grant the host has refused as expired is
 /// not revived by a smaller reading, and the floor never goes down. Not shown here: wall-clock
-/// trust marked unresolved after a rollback beyond five seconds, or the stop of expiry-based
-/// garbage collection.
+/// trust marked unresolved after a rollback beyond five seconds, objects whose expiry cannot
+/// otherwise be proved, the stop of expiry-based garbage collection, or the non-expiring grants
+/// that keep working.
 #[test]
 fn a_clock_that_goes_backwards_does_not_revive_an_expiry_the_host_already_decided() {
     let held = grant(

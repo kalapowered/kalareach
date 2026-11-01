@@ -414,7 +414,7 @@ async fn a_paired_device_pages_the_output_its_grant_reaches_and_none_before_it()
 /// share was issued, and none before it.
 ///
 /// KR-REQ-10.49, the part about a share's history scope: the output the device reads through the
-/// share begins at the moment the share was issued and carries nothing written before it.
+/// share is what was written after the share was issued, and none of what was written before it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_holding_a_share_is_served_the_output_written_after_the_share_was_issued() {
     let rig = Rig::start().await;

@@ -874,6 +874,11 @@ fn qoder(flags: Vec<String>) -> CommandIntegration {
 /// installed forwarder's path, establishes, and the answer adds those flags. An entry holding the
 /// package's text as declared, the path of another forwarder, or a worker that can name no
 /// forwarder, establishes nothing.
+///
+/// KR-REQ-12.07, the part about a session entry whose flags are not the package's: an entry holding
+/// the package's text as declared, the path of another forwarder, or a worker that can name no
+/// forwarder establishes nothing, while the entry the daemon wrote with the installed forwarder's
+/// path establishes.
 #[tokio::test]
 async fn kr_req_12_22_flags_that_name_the_forwarder_are_compared_after_it_is_written() {
     let setup = Setup::shaped(
