@@ -4057,9 +4057,12 @@ async fn a_listing_names_only_the_sessions_a_grant_admits() {
 /// KR-REQ-23.25, KR-REQ-23.34, in part, and KR-REQ-26.44 for the host reads.
 ///
 /// Two doors. A session's answers are the same on both once the grant admits the subject, but for
-/// the socket of the session's worker: the grant decides what a device may ask about, and a filter
-/// on one door beyond the held socket would make the two ingresses disagree about what the same
-/// method means. Two things each door reads differently, on purpose. The owner at their own machine
+/// what a device is held back from on purpose: the socket of the session's worker, which this case
+/// shows, and the name of the desktop a session is bound to, which this session has none of. A
+/// grant's history bound can narrow a read too (the last command block), and this session has no
+/// block to narrow. The grant decides what a device may ask about, and a filter on one door beyond
+/// those the host guide lists would make the two ingresses disagree about what the same method
+/// means. Two things each door reads differently here, on purpose. The owner at their own machine
 /// is told whose account the environment belongs to, where its directories are and the path of a
 /// worker's socket, and a paired device reads the same answers with every account name, local path
 /// and platform message held to its class and its length.
