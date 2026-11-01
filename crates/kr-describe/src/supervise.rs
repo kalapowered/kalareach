@@ -17,7 +17,7 @@
 //! | The handshake | [`HANDSHAKE_MS`] for `ready` |
 //! | A load | its own deadline, plus [`ANSWER_GRACE_MS`] |
 //! | A job | its execution deadline, when the daemon asks the process to stop it; then [`ANSWER_GRACE_MS`] after the request, or for a process whose control thread has said it read the request or a cancellation of the job [`STOP_BOUND_MS`] after it |
-//! | A cancellation | [`CANCEL_MS`] for the process to say it has read it; a load's or a check's own answer is then held to the same bound |
+//! | A cancellation | [`CANCEL_MS`] for the process to say it has read it, unless it has said it read the request to stop that job; a load's or a check's own answer is then held to the same bound |
 //! | A check of a file | its deadline, plus [`ANSWER_GRACE_MS`] |
 //! | The ceiling | the process's resident set, read every [`SAMPLE_MS`] while it loads or runs a job, so a process over it is ended by the first reading after it passed, and on Windows the system's own limit on its committed memory ([`Launch::system_memory_limit`]) |
 //!

@@ -303,8 +303,10 @@ the system does not hold is reported as not applied, with the reason.
     its deadline, the model stays loaded, and no new load follows. A process whose control
     thread has read neither the request nor a cancellation of the job is ended two seconds after
     the request, and one that has read either and has not answered by the bound is ended then;
-    each is a failure of inference. The bound is about twice the longest stop seen, so a host
-    busier than that one brings a stop to the bound.
+    each is a failure of inference. A caller's cancellation sent after the control thread has
+    read the request to stop the job is held to the same bound, and not to the two seconds a
+    cancellation is given: that control thread has shown that it listens. The bound is about
+    twice the longest stop seen, so a host busier than that one brings a stop to the bound.
 
     A job a caller cancelled before the service decided what it came to is never counted as a
     miss, whichever way it would have ended past its deadline. A pause the service has applied, a
@@ -575,7 +577,7 @@ The daemon holds the process to its bounds, and ends it outright when it breaks 
 | Answering hello | 10 s |
 | A load | its own deadline of five minutes, and 2 s more |
 | A job | its thirty seconds from dequeue, which is when the daemon asks the process to stop it; 2 s after that request, or 30 s after it for a process whose control thread has said it read the request or a cancellation of the job |
-| Answering a cancellation | 2 s |
+| Answering a cancellation | 2 s, unless the control thread has said it read the request to stop that job |
 | The resident set, read every second during a load or a job | 4 GiB |
 
 The process holds itself to them as well, so no end depends on the daemon alone. Its watchdog ends
