@@ -3689,13 +3689,14 @@ enum Asked {
     /// no. A copy of Git that does this is not the program, and the caller goes on without it.
     Declined(ProjectError),
     /// The look is refused. What the program did, answering with more than a version and a
-    /// directory or leaving its output open after the second it is given, is
-    /// [`ProjectError::GitUnavailable`], since it is not a program this host can run work through.
-    /// What the host did, or the time that ran out, is [`ProjectError::GitFailed`], which passes:
-    /// the look was not made because the time was used up, because the host was short of
-    /// descriptors, processes or memory to start the program, because the program did not answer in
-    /// time or its output was not read to the end when the time ran out, or because the host could
-    /// not wait on it, collect it, or switch or read its output.
+    /// directory or leaving its output open past the second it is given, as a read made inside the
+    /// time the probe was given found it, is [`ProjectError::GitUnavailable`], since it is not a
+    /// program this host can run work through. What the host did, or the time that ran out, is
+    /// [`ProjectError::GitFailed`], which passes: the look was not made because the time was used
+    /// up, because the host was short of descriptors, processes or memory to start the program,
+    /// because the program did not answer in time or its output was not read to the end when the
+    /// time ran out, including when the poll that found out came only after it, or because the host
+    /// could not wait on it, collect it, or switch or read its output.
     Overran(ProjectError),
 }
 
@@ -3856,17 +3857,20 @@ fn too_much(described: &str) -> Asked {
 /// Reads what a probe wrote to its end, once the probe has ended.
 ///
 /// A process that left the probe's group may still hold the pipe, so the wait for the end is
-/// short: [`PROBE_DRAIN`], and never past the probe's own `deadline`. When the wait runs out, the
-/// limit that set it decides what it says. The probe's own time is the clock's, and says nothing of
-/// the program, so it is a fault that passes, and so is a tie. The second the drain is given is the
-/// program's: it left its output open. Which limit it was is fixed when the wait begins, so a late
-/// wake-up does not change it.
+/// short: [`PROBE_DRAIN`], and never past the probe's own `deadline`. When the second runs out
+/// with the pipe still open, the moment of the refusal decides what it says. Before the probe's own
+/// time has run out, the pipe was read in that time and left open, which is the program's: it left
+/// its output open. At the probe's own time or after it nothing was read, since nothing is read
+/// once the time has run out, so the end may have come in time: that is the clock's and says
+/// nothing of the program, so it is a fault that passes. A poll that wakes late is the clock's too,
+/// whichever limit it passed first.
 fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::Result<(), Asked> {
     let drain = drain_until(Instant::now(), deadline);
     loop {
         // Read for as long as the probe's own time allows, not only for the drain's second: the
-        // second is how long the wait goes on, and a poll that comes after it still reads an end
-        // that arrived before it.
+        // second is how long the wait goes on, and a poll that comes after it, and before the
+        // probe's time, still reads an end that arrived before it. A poll that comes after the
+        // probe's time reads nothing.
         heard.take_in(deadline);
         if heard.overflowed() {
             return Err(too_much(described));
@@ -3876,6 +3880,8 @@ fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::
         }
         let now = Instant::now();
         if now >= drain {
+            // At the probe's own time or after it the read above was not made, or was made too
+            // late to count, so the pipe that looks open says nothing of the program.
             return Err(Asked::Overran(if now >= deadline {
                 ProjectError::GitFailed {
                     detail: format!(
@@ -6125,7 +6131,8 @@ mod tests {
     /// this host's.
     #[cfg(unix)]
     #[test]
-    fn an_end_that_arrived_before_the_drains_second_is_read_by_a_poll_that_comes_after_it() {
+    fn a_poll_after_the_drains_second_and_inside_the_probes_time_reads_an_end_that_came_before_it()
+    {
         let outcome = drain_with_a_stall_after_the_end_arrives(
             Duration::from_secs(60),
             PROBE_DRAIN + Duration::from_millis(50),

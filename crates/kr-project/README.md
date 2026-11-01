@@ -26,15 +26,16 @@ the process. It may go on, and a write it makes to the closed pipe fails. A chil
 waited on is refused, and nothing is signalled by its number, which may be another process's by now.
 A program that does not answer in time, a child that cannot be waited on or collected, output that
 cannot be read, and a host too short of descriptors, processes or memory to ask are faults that
-pass, as is the time running out while the output of a program that has ended is waited for, and the
-look is refused as `UPSTREAM_UNAVAILABLE`; the other refusals are `HOST_NOT_CONFIGURED`, among them
-a program that has ended and left its output open for a second. A look is made by one request at a
-time, and a request that arrives while one is under way waits for that look and shares its result,
-so a program that hangs is started once for all of them. A copy of Git under the helper directory
-that does not answer in time, or answers with more, refuses the whole look. One that cannot run, or
-answers differently, leaves the program on the search path as the one that runs. A host that is
-short of descriptors, processes or memory when a copy is started refuses the look rather than taking
-the copy for one that cannot run.
+pass, as is the time running out while the output of a program that has ended is waited for, even
+when the wait is not looked at again until the time is out, and the look is refused as
+`UPSTREAM_UNAVAILABLE`; the other refusals are `HOST_NOT_CONFIGURED`, among them a program that has
+ended and left its output open for a second inside the time it was given. A look is made by one
+request at a time, and a request that arrives while one is under way waits for that look and shares
+its result, so a program that hangs is started once for all of them. A copy of Git under the helper
+directory that does not answer in time, or answers with more, refuses the whole look. One that
+cannot run, or answers differently, leaves the program on the search path as the one that runs. A
+host that is short of descriptors, processes or memory when a copy is started refuses the look
+rather than taking the copy for one that cannot run.
 
 ## Why there is one
 
