@@ -2875,13 +2875,17 @@ jobs:
   # internals the reader reads can change between runner images, so a gate that took the image's
   # release would turn on the image's date. Every step has a limit of its own, and the limits add
   # up to less than the job's. The step that builds and the step that runs the cases have a limit
-  # of at least twice the longest each has taken.
+  # of at least twice the longest each is expected to take on this runner. The build took 682
+  # seconds from nothing on a Mac at background priority with four build jobs, which is 910 with
+  # this runner's three. The cases took 263 seconds on a Mac and 389 on a Linux build machine, and
+  # this workflow's process-heavy suites have taken up to 4.7 times as long on a hosted runner as
+  # on that machine, which is 1830 seconds here.
   macos-powershell:
     name: macos-powershell
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
     if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 125
     steps:
       - name: Check out
         timeout-minutes: 5
@@ -2936,11 +2940,11 @@ jobs:
             Publish-KalaReachQualification | Format-List'
 
       - name: Build the PowerShell package's test program
-        timeout-minutes: 30
+        timeout-minutes: 35
         run: cargo test --locked -p kr-shell-integration --test pwsh --no-run
 
       - name: Drive the PowerShell package through the contract
-        timeout-minutes: 75
+        timeout-minutes: 65
         run: cargo test --locked -p kr-shell-integration --test pwsh -- --test-threads=1 --include-ignored
 
   # The idle measurement on a host that meets section 27's reference host: four processors and
