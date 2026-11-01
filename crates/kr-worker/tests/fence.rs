@@ -58,6 +58,12 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 
+/// How long a case that runs a real shell package waits for a condition before it takes the wait
+/// for lost. It is a liveness bound and decides nothing: two minutes is outside the range a loaded
+/// host reaches when the real-package cases run beside the rest of the suite, which the thirty and
+/// sixty seconds these waits had were not.
+const REAL_SHELL_LIVENESS: Duration = Duration::from_secs(120);
+
 /// How long a test waits for something that should already have happened.
 const SOON: Duration = Duration::from_secs(5);
 
@@ -3017,7 +3023,7 @@ impl RealShell {
     /// Waits until the session's retained output carries `marker` `count` times.
     #[cfg(unix)]
     async fn produced(&self, marker: &[u8], count: usize) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + REAL_SHELL_LIVENESS;
         loop {
             let seen = retained(&self.runtime.session());
             let times = seen
@@ -3044,7 +3050,7 @@ impl RealShell {
             .close(ClosureReason::CloseRequested)
             .1
             .release();
-        let closed = tokio::time::timeout(Duration::from_secs(30), self.runtime.wait_closed())
+        let closed = tokio::time::timeout(REAL_SHELL_LIVENESS, self.runtime.wait_closed())
             .await
             .is_ok();
         self.bridge_task.abort();
@@ -8000,7 +8006,7 @@ impl RealShell {
     /// Waits until the reader has proved a fence for `attachment`: the shell is at an empty prompt
     /// and the worker holds the proof that the keys reaching it are that attachment's.
     async fn until_fenced_for(&self, attachment: AttachmentId) {
-        tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::time::timeout(REAL_SHELL_LIVENESS, async {
             loop {
                 {
                     let session = self.runtime.session();
@@ -8031,7 +8037,7 @@ impl RealShell {
         &self,
         attachment: AttachmentId,
     ) -> std::sync::MutexGuard<'_, Session> {
-        tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::time::timeout(REAL_SHELL_LIVENESS, async {
             loop {
                 {
                     let session = self.runtime.session();
@@ -8056,7 +8062,7 @@ impl RealShell {
 
     /// Waits until the session no longer holds `attachment`.
     async fn until_gone(&self, attachment: AttachmentId) {
-        tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::time::timeout(REAL_SHELL_LIVENESS, async {
             while self.attached().contains(&attachment) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -8081,7 +8087,7 @@ impl RealShell {
         // The terminal writes the line end it is asked for as a carriage return and a line feed.
         self.produced(format!("kr-{word}-ran\r\n").as_bytes(), 1)
             .await;
-        tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::time::timeout(REAL_SHELL_LIVENESS, async {
             loop {
                 {
                     let session = self.runtime.session();
@@ -8132,7 +8138,7 @@ impl RealShell {
 /// fails the first case that sees it.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them"]
 async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_once_from_its_holder_or_not_at_all()
  {
     for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
@@ -8230,7 +8236,7 @@ async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_on
                 let started = std::time::Instant::now();
                 while end_of_input_writes(&shell) == 0 {
                     assert!(
-                        started.elapsed() < Duration::from_secs(60),
+                        started.elapsed() < REAL_SHELL_LIVENESS,
                         "{kind:?}: the end of input was never written to the terminal"
                     );
                     std::thread::sleep(Duration::from_millis(5));
@@ -8251,7 +8257,7 @@ async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_on
                 sequence: 0,
             };
             // The shell consumes the gesture and says once how to detach by hand.
-            tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::time::timeout(REAL_SHELL_LIVENESS, async {
                 while hints_printed(&shell) == 0 {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -8423,7 +8429,7 @@ async fn a_real_root_shell_killed_at_its_prompt_closes_its_session_with_the_sign
         )
         .expect("kills the shell");
 
-        let closure = tokio::time::timeout(Duration::from_secs(60), shell.runtime.wait_closed())
+        let closure = tokio::time::timeout(REAL_SHELL_LIVENESS, shell.runtime.wait_closed())
             .await
             .unwrap_or_else(|_| {
                 panic!("{kind:?}: the session did not close when its shell was killed")
