@@ -114,16 +114,18 @@ fn withheld(error: &ClientError) -> bool {
 /// How long a mutation asks for. A clone reaches the filesystem and a materialisation copies it.
 const LIFETIME: DurationMs = DurationMs::new(120_000);
 
-/// How many cases of this file run at once.
+/// How many cases of this file run at once. Every case takes a place with its first statement.
 ///
-/// The cases are threads of one process and each starts a daemon of its own. Every Git invocation a
-/// daemon makes forks that process, and while the kernel copies the process's memory map it holds
-/// the map against every other thread of the process, for longer the more daemons and threads the
-/// process holds. With all the cases running at once, as the standard harness runs them on a
-/// machine with many processors, the process spends most of its time waiting for its own memory
-/// map, and a case's first mutation can outlast the daemon's bound on an effect, which the daemon
-/// answers by saying it cannot report what happened. A case alone takes about a second, and a few
-/// at a time keep each fork short.
+/// The cases are threads of one process and each starts a daemon of its own. The Git invocations a
+/// daemon runs for a request fork that process, and while the kernel copies the process's memory
+/// map it holds the map against every other thread of the process, for longer the more daemons and
+/// threads the process holds. Each invocation also writes three lines to the daemon's record of its
+/// temporary directories, each synchronised to the disk under one lock the whole process shares, so
+/// a busy disk holds every daemon behind the one that writes. With all the cases running at once,
+/// as the standard harness runs them on a machine with many processors, a mutation can outlast the
+/// daemon's bound on an effect, which the daemon answers by saying it cannot report what happened.
+/// A case alone takes a few seconds at most, and a few at a time keep the forks and that lock's
+/// queue short.
 const CASES_AT_ONCE: usize = 4;
 
 static PLACES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CASES_AT_ONCE);
@@ -2169,9 +2171,9 @@ async fn a_device_reads_a_recorded_version_and_has_it_written_out_without_the_ho
     ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
 )]
 async fn a_device_is_refused_a_recorded_version_its_grant_does_not_reach() {
-    let _place = take_a_place().await;
     use kr_protocol::grant::{EnvironmentSelector, SessionSelector};
 
+    let _place = take_a_place().await;
     let recorded = Recorded::start().await;
     let env = recorded.host.environment_id;
     let elsewhere = EnvironmentId::new(kr_ipc::new_uuid());
@@ -2346,9 +2348,9 @@ async fn a_device_is_refused_a_recorded_version_its_grant_does_not_reach() {
     ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
 )]
 async fn a_read_that_names_no_version_is_held_to_the_latest_one() {
-    let _place = take_a_place().await;
     use kr_protocol::grant::SessionSelector;
 
+    let _place = take_a_place().await;
     let mut recorded = Recorded::start().await;
     // A second version of the change set that holds the one captured for the session, captured
     // for no session.
@@ -2434,9 +2436,9 @@ async fn a_read_that_names_no_version_is_held_to_the_latest_one() {
     ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
 )]
 async fn a_read_of_one_version_lists_no_other_version_the_grant_does_not_reach() {
-    let _place = take_a_place().await;
     use kr_protocol::grant::SessionSelector;
 
+    let _place = take_a_place().await;
     let mut recorded = Recorded::start().await;
     let change_set_id = recorded.for_a_session.change_set_id;
     // A second version of the change set that holds the one captured for the session, captured
@@ -2520,7 +2522,6 @@ async fn a_read_of_one_version_lists_no_other_version_the_grant_does_not_reach()
     ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
 )]
 async fn a_read_of_a_derived_version_names_no_source_the_grant_does_not_reach() {
-    let _place = take_a_place().await;
     use kr_changeset::{binding, materialise};
     use kr_protocol::changeset::{
         AffectedVersion, ChangesetReadParams, ChangesetReadResult, DestinationClass,
@@ -2528,6 +2529,7 @@ async fn a_read_of_a_derived_version_names_no_source_the_grant_does_not_reach() 
     };
     use kr_protocol::scalars::{TimestampMs, U64};
 
+    let _place = take_a_place().await;
     let mut recorded = Recorded::start().await;
     let env = recorded.host.environment_id;
     let source = recorded.plain;
@@ -3061,7 +3063,6 @@ async fn a_connection_authorised_before_authority_was_withdrawn_is_not_served_af
 /// other ingress that is not the local one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn owner_methods_reject_every_nonlocal_ingress() {
-    let _place = take_a_place().await;
     use kr_protocol::actor::ActorIngress;
     use kr_protocol::authority::AuthorityDecision;
     use kr_protocol::project::{
@@ -3069,6 +3070,7 @@ async fn owner_methods_reject_every_nonlocal_ingress() {
         ProjectLocationListParams, ProjectLocationListResult, ProjectLocationWithdrawParams,
     };
 
+    let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let mut control = host.client().await;
@@ -3275,9 +3277,9 @@ async fn authorised_with(
 /// challenge names no device.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_owners_confirmation_of_a_devices_location_names_that_devices_four_keys() {
-    let _place = take_a_place().await;
     use kr_protocol::project::LocationPurpose;
 
+    let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let mut control = host.client().await;
@@ -3352,9 +3354,9 @@ async fn the_owners_confirmation_of_a_devices_location_names_that_devices_four_k
 /// verify as the confirmation of another device's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_confirmation_issued_for_one_devices_location_does_not_verify_for_anothers() {
-    let _place = take_a_place().await;
     use kr_project::policy::{Enlargement, OwnerAuthority as _};
 
+    let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let first = net_support::Device::create().await;
@@ -3416,9 +3418,9 @@ async fn a_confirmation_issued_for_one_devices_location_does_not_verify_for_anot
 /// owner confirms again. The control is the same proof before the rotation, which verifies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_confirmation_for_a_device_that_then_rotated_its_keys_is_not_spent() {
-    let _place = take_a_place().await;
     use kr_project::policy::{Enlargement, OwnerAuthority as _};
 
+    let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let device = net_support::Device::create().await;
@@ -3478,9 +3480,9 @@ async fn a_confirmation_for_a_device_that_then_rotated_its_keys_is_not_spent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_location_confirmation_is_recorded_as_spent_only_while_the_device_holds_the_keys_it_names()
  {
-    let _place = take_a_place().await;
     use kr_project::policy::{Enlargement, OwnerAuthority as _};
 
+    let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let device = net_support::Device::create().await;
@@ -3601,12 +3603,12 @@ async fn a_location_confirmation_is_recorded_as_spent_only_while_the_device_hold
 /// is told to have it declare them first. Once it has, the same request is given its challenge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_that_has_not_declared_its_keys_is_refused_a_confirmation_until_it_does() {
-    let _place = take_a_place().await;
     use kr_protocol::project::LocationPurpose;
     use kr_protocol::sharing::{
         DEVICE_KEYS_DOMAIN, DeviceKeysCompleteParams, DeviceKeysDeclaration,
     };
 
+    let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let mut control = host.client().await;
@@ -4568,9 +4570,9 @@ async fn granted_for_one_session(test: &str, session: SessionId) -> Option<Grant
 /// and reverts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_applies_and_reverts_no_version_its_grant_does_not_reach() {
-    let _place = take_a_place().await;
     use kr_protocol::changeset::{ApplyOutcomeClass, DestinationClass, DiffApplyResult};
 
+    let _place = take_a_place().await;
     let session = SessionId::new(kr_ipc::new_uuid());
     let Some(mut granted) = granted_for_one_session(
         "a_device_applies_and_reverts_no_version_its_grant_does_not_reach",
@@ -4750,9 +4752,9 @@ async fn a_device_adds_no_version_to_a_change_set_its_grant_does_not_reach() {
 /// is a new capture appended on the same change set, which the grant now refuses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repeat_of_an_appended_capture_is_held_to_the_version_it_recorded() {
-    let _place = take_a_place().await;
     use kr_protocol::changeset::ChangesetCaptureResult;
 
+    let _place = take_a_place().await;
     let session = SessionId::new(kr_ipc::new_uuid());
     let Some(mut granted) = granted_for_one_session(
         "a_repeat_of_an_appended_capture_is_held_to_the_version_it_recorded",
@@ -4982,9 +4984,9 @@ async fn owners_copy_in_its_own_location(
 /// the device's own working copy, which it captures and reads before the withdrawal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_reaches_no_working_copy_in_the_owners_location_or_a_withdrawn_one() {
-    let _place = take_a_place().await;
     use kr_protocol::project::ProjectLocationWithdrawParams;
 
+    let _place = take_a_place().await;
     let Some(mut granted) = Granted::on_a_qualified_host_holding(
         "a_device_reaches_no_working_copy_in_the_owners_location_or_a_withdrawn_one",
         CHANGE_RIGHTS,
@@ -5208,9 +5210,9 @@ fn states_of(
 /// The control is the same apply with the location standing, which writes both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_location_withdrawn_between_two_paths_of_an_apply_receives_the_second_no_write() {
-    let _place = take_a_place().await;
     use kr_protocol::changeset::{ApplyOutcomeClass, DiffApplyResult, PathProgressState};
 
+    let _place = take_a_place().await;
     let Some((outcome, written, granted)) = apply_two_paths_while_the_owner_withdraws_the_location(
         "a_location_withdrawn_between_two_paths_of_an_apply_receives_the_second_no_write",
         WithdrawnAt::BetweenPaths,
@@ -5245,9 +5247,9 @@ async fn a_location_withdrawn_between_two_paths_of_an_apply_receives_the_second_
 /// first is written; the second is not written and its directory is not made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_location_withdrawn_between_two_paths_of_an_apply_makes_no_directory_for_the_second() {
-    let _place = take_a_place().await;
     use kr_protocol::changeset::{ApplyOutcomeClass, DiffApplyResult, PathProgressState};
 
+    let _place = take_a_place().await;
     let Some((outcome, written, granted)) = apply_two_paths_while_the_owner_withdraws_the_location(
         "a_location_withdrawn_between_two_paths_of_an_apply_makes_no_directory_for_the_second",
         WithdrawnAt::BetweenPaths,
@@ -5284,9 +5286,9 @@ async fn a_location_withdrawn_between_two_paths_of_an_apply_makes_no_directory_f
 /// not yet published. The path is not published, and nothing of the apply is in the working copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_location_withdrawn_while_a_path_is_staged_has_nothing_published_into_it() {
-    let _place = take_a_place().await;
     use kr_protocol::changeset::{ApplyOutcomeClass, DiffApplyResult, PathProgressState};
 
+    let _place = take_a_place().await;
     let Some((outcome, written, granted)) = apply_two_paths_while_the_owner_withdraws_the_location(
         "a_location_withdrawn_while_a_path_is_staged_has_nothing_published_into_it",
         WithdrawnAt::BeforePublishing,
@@ -5320,9 +5322,9 @@ async fn a_location_withdrawn_while_a_path_is_staged_has_nothing_published_into_
 /// with the location standing, which removes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_location_withdrawn_before_a_removal_leaves_the_path_where_it_is() {
-    let _place = take_a_place().await;
     use kr_protocol::changeset::{ApplyOutcomeClass, DiffApplyResult, PathProgressState};
 
+    let _place = take_a_place().await;
     let Some(granted) = Granted::on_a_qualified_host_holding(
         "a_location_withdrawn_before_a_removal_leaves_the_path_where_it_is",
         CHANGE_RIGHTS,
@@ -5405,9 +5407,9 @@ async fn a_location_withdrawn_before_a_removal_leaves_the_path_where_it_is() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repeat_of_a_capture_an_apply_and_a_revert_on_a_new_connection_gets_the_retained_result()
 {
-    let _place = take_a_place().await;
     use kr_protocol::changeset::{ApplyOutcomeClass, ChangesetCaptureResult, DiffApplyResult};
 
+    let _place = take_a_place().await;
     let Some(granted) = Granted::on_a_qualified_host_holding(
         "a_repeat_of_a_capture_an_apply_and_a_revert_on_a_new_connection_gets_the_retained_result",
         CHANGE_RIGHTS,
@@ -5883,9 +5885,9 @@ async fn a_refusal_of_a_working_tree_request_names_no_directory_of_this_host() {
 /// remote are each refused, and nothing is created.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_reaches_nothing_outside_the_locations_the_owner_authorised_for_it() {
-    let _place = take_a_place().await;
     use kr_protocol::project::{DestinationParent, LocationPurpose};
 
+    let _place = take_a_place().await;
     let Some(mut granted) = Granted::on_a_qualified_host(
         "a_device_reaches_nothing_outside_the_locations_the_owner_authorised_for_it",
     )
@@ -6148,9 +6150,9 @@ async fn a_device_reads_nothing_outside_its_location_through_repository_content(
 /// what was asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grant_withdrawn_before_the_write_stops_each_of_the_five_operations() {
-    let _place = take_a_place().await;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    let _place = take_a_place().await;
     let Some(mut granted) = Granted::on_a_qualified_host(
         "a_grant_withdrawn_before_the_write_stops_each_of_the_five_operations",
     )
@@ -6552,10 +6554,10 @@ async fn a_filesystem_mounted_beneath_a_granted_directory_refuses_a_devices_clon
 /// where the platform confines Git's reads at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn host_doctor_says_whether_a_paired_device_is_served_repository_operations() {
-    let _place = take_a_place().await;
     use kr_project::service::Refusal;
     use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
 
+    let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let mut control = host.client().await;
@@ -6612,9 +6614,9 @@ async fn host_doctor_says_whether_a_paired_device_is_served_repository_operation
 /// service decides it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_door_follows_the_last_proof_and_the_doctor_proves_again() {
-    let _place = take_a_place().await;
     use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
 
+    let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
     let Some(host) = qualified_host(
         &owner,
