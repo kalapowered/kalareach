@@ -281,6 +281,11 @@ the system does not hold is reported as not applied, with the reason.
   process was ended for it. The deadline stays the 30 seconds that section 22 fixes. A job that
   misses it gives the delayed or stale description that section 22 prescribes when demand exceeds
   capacity, as on Linux and Windows, so the cost falls on the description and not on the terminal.
+  The process's control thread and watchdog are in the class too, so the ends listed for Windows
+  below can follow on a Mac whose efficiency cores stay busy for longer than a few seconds: a late
+  acknowledgement of a cancellation, the watchdog's bound on one request, and a late `ready`. None
+  of them happened in the runs above, and in a run of the real weights a cancellation was
+  acknowledged in 5 ms and answered in 15 seconds.
   A utility quality-of-service clamp gave 2.0 to 3.3 seconds, but only the process that starts the
   description process can set it, through an interface the system does not publish, so it is not
   used. No measurement here was taken on a Mac with its efficiency cores idle.

@@ -28,7 +28,9 @@
 //! started by the thread that loads it. On macOS neither the lowest thread priority nor a
 //! quality-of-service class passes from a thread to the threads it starts, so a class set on the
 //! model thread alone leaves the decoding threads at the ordinary priority, and only the policy of
-//! the process holds them. It puts the process's control thread and its watchdog in the class too.
+//! the process holds them. It puts the process's control thread and its watchdog in the class too,
+//! so the ends listed below for Windows can follow on a Mac whose efficiency cores stay busy for
+//! longer than a few seconds; none was seen in the measurement below.
 //!
 //! On macOS the class costs a job most of its speed on a busy machine: it keeps the process to
 //! the efficiency cores of Apple silicon and at the lowest priority, and a job that takes about two
@@ -37,9 +39,9 @@
 //! deadline gives the delayed or stale description that section 22 prescribes when demand exceeds
 //! capacity, so the cost falls on the description and not on the terminal.
 //!
-//! On Windows, putting the control thread and the watchdog in the idle class has four
-//! consequences when other work keeps every core busy for longer than a few seconds (Windows
-//! lifts a thread that has waited that long, so the wait is bounded):
+//! Putting the control thread and the watchdog in the idle class has four consequences on Windows
+//! when other work keeps every core busy for longer than a few seconds (Windows lifts a thread that
+//! has waited that long, so the wait is bounded):
 //!
 //! - the daemon can wait past its bound for the process to acknowledge a cancellation, and ends a
 //!   process that does not acknowledge in time;
