@@ -835,7 +835,7 @@ one fails the build's own tests on the day it is added. A form the walk cannot a
 refused rather than passed over: a value of any shape, a map, whose keys are text nothing classes,
 and a keyword that holds a schema the walk does not follow. Nothing may be classed that no export
 reaches, which keeps the list a record of what leaves rather than a place entries accumulate.
-Three values leave without their content. The boot identity is opaque bytes that identify one boot
+Some values leave without their content. The boot identity is opaque bytes that identify one boot
 of one machine, so an export says which kernel facility this platform reads it from and carries
 none of the value. The derived identity of a desktop leaves as a fixed marker that says there is a
 desktop and not which one. The number of the account a desktop belongs to names that account on a
@@ -3288,9 +3288,9 @@ the `metadata_url` and `targets_url` of a catalogue are sent as they are. The sp
 question's verified executable, the command blocks of a session with their working directory, and
 the command a materialisation ran. A session's directory and shell and an attachment's staged path
 are how the product describes a session and a manual attachment, and a device that may see a
-session sees its terminal. The command in the launch offer is the one an admitted package declares
-for starting its agent, and the companion shows it so that the person can read it before choosing
-the launch. A catalogue's two locations are a directory on this host when the catalogue is a local
+session sees its terminal. The command in the launch offer comes from an admitted package, the
+companion shows it before the person chooses the launch, and the launch sends that command back to
+the host. A catalogue's two locations are a directory on this host when the catalogue is a local
 one; they are sent because an owner device rebuilds the digest of a trust plan from them and
 because the companion shows where the metadata is. Each reaches a device that holds the right of
 the method that reads it, and a catalogue's locations only a device that holds `host.manage`; the
