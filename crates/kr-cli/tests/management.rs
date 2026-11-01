@@ -636,6 +636,13 @@ async fn a_host_that_cannot_run_git_is_said_in_its_own_words_and_not_asked_for_a
             "kr {} asks for no setting: {said}",
             line.join(" ")
         );
+        // Nothing at all follows the sentence: not the line for this code, and not the one any
+        // other code calls for, such as the line that tells a person to wait.
+        assert!(
+            said.trim_end().ends_with(SAID),
+            "kr {} says nothing after the host's sentence: {said}",
+            line.join(" ")
+        );
         // The code is still the one a script reads.
         let (status, document) = json(&temp, &line);
         assert_eq!(status, Some(8), "{document}");
