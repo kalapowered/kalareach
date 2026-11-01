@@ -4226,7 +4226,7 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
     let run_with = |path: &Path| {
         let mut command = std::process::Command::new(std::env::current_exe().expect("this binary"));
         command
-            .args(["--ignored", "--exact", case])
+            .args(["--ignored", "--exact", case, "--nocapture"])
             .env("PATH", path)
             .env_remove("XDG_RUNTIME_DIR");
         to_its_end(command, Duration::from_secs(120))
