@@ -984,6 +984,8 @@ fn a_stop_asked_late_is_given_its_time_from_the_request() {
                 rig.driver.due_ms()
             );
         }
+        // A millisecond before the stop bound ends, the end is the soonest thing.
+        assert_eq!(rig.driver.due_ms(), Some(asked + STOP_BOUND));
         let reports = rig
             .driver
             .turn(&roomy(), at(asked + STOP_BOUND))
@@ -1110,6 +1112,12 @@ fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_
             rig.driver.due_ms()
         );
     }
+    // A millisecond before the stop bound ends, the end is the soonest thing.
+    assert_eq!(
+        rig.driver.due_ms(),
+        Some(deadline + 10_000 + STOP_BOUND),
+        "the end of the stop bound"
+    );
     // The stop bound after the request ends the process, as running past its deadline. The job
     // was cancelled by a caller first, so it ends cancelled.
     let reports = rig
@@ -1182,6 +1190,12 @@ fn a_cancellation_after_an_acknowledged_stop_is_held_to_the_stop_bound() {
             rig.driver.due_ms()
         );
     }
+    // A millisecond before the stop bound ends, the end is the soonest thing.
+    assert_eq!(
+        rig.driver.due_ms(),
+        Some(deadline + STOP_BOUND),
+        "the end of the stop bound"
+    );
     let reports = rig
         .driver
         .turn(&roomy(), at(deadline + STOP_BOUND))
