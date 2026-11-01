@@ -64,9 +64,28 @@ pub const SENT_DEADLINE_PREFIX: &str = "stub-sent-deadline-";
 /// The start of the name of the file a stub whose script marks work leaves in its runtime
 /// directory for each job it is given, followed by the job's identifier. It holds the two bounds
 /// the process's watchdog holds the job to, as the process recorded them when it took the job in
-/// hand: the grace after the job's deadline, and the stop bound after it for a job whose stop the
-/// control thread reads, both in milliseconds.
+/// hand, both in milliseconds past the job's deadline: the bound the job is held to as it comes
+/// into hand, which is the grace for a job nothing has asked to stop and the stop bound for one
+/// whose stop was read before it came into hand, and the stop bound itself, which a stop read
+/// afterwards extends the job to.
 pub const JOB_BOUNDS_PREFIX: &str = "stub-job-bounds-";
+
+/// The name of the file a stub whose script marks work leaves in its runtime directory each time
+/// its watchdog finds work overdue, holding what [`watchdog_found`] reads.
+pub const WATCHDOG_FOUND: &str = "stub-watchdog-found";
+
+/// The name of the file a stub whose script marks work leaves in its runtime directory when its
+/// watchdog found work overdue and left the process alone, because the bound it had read no longer
+/// stood when it came to decide.
+pub const WATCHDOG_SPARED: &str = "stub-watchdog-spared";
+
+/// How long a held watchdog waits to be released, so that a case that never releases it leaves no
+/// process waiting for good.
+const WATCHDOG_HOLD: Duration = Duration::from_secs(60);
+
+/// Whether the watchdog of this process waits, when it finds work overdue, for
+/// [`release_held_work`]: set by a stub whose script holds its watchdog.
+static HOLD_WATCHDOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The start of the name of the file a stub whose script marks work leaves in its runtime
 /// directory as its control thread begins to write the acknowledgement of a cancellation of the
@@ -104,13 +123,15 @@ pub fn job_bounds(runtime_dir: &Path, id: u64) -> Option<(u64, u64)> {
 /// of a cancellation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Acknowledging {
-    /// Whether the work's token was cancelled.
+    /// Whether the work's token was cancelled when the control thread looked for the job in hand,
+    /// which it does after cancelling it: a look made before the cancellation shows it not.
     pub cancelled: bool,
     /// When the watchdog holds the work overdue, in the process's stamps (milliseconds since its
     /// origin, plus one).
     pub work_due: u64,
-    /// When the watchdog holds the job overdue once its stop is read, in the same stamps, or
-    /// nought for work that is not a job.
+    /// When the watchdog holds the job overdue once its stop is read, in the same stamps: the stop
+    /// bound of the job last taken in hand, or nought if the process has taken none, so for work
+    /// that is not a job it is the last job's.
     pub job_stop_due: u64,
 }
 
@@ -141,6 +162,66 @@ pub fn acknowledging_state(runtime_dir: &Path, id: u64) -> Option<Acknowledging>
     })
 }
 
+/// What the watchdog of a stub process found when it last found work overdue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WatchdogFound {
+    /// When the look before it was made, in the process's stamps (milliseconds since its origin,
+    /// plus one): the last look that did not end the process.
+    pub previous_look: u64,
+    /// When this look was made, in the same stamps.
+    pub look: u64,
+    /// The bound the work was found overdue against, in the same stamps.
+    pub due: u64,
+}
+
+/// Records that the watchdog found work overdue against `due` at `look`, when the process is a stub
+/// whose script marks work, and holds the watchdog there when the script holds it, until
+/// [`release_held_work`].
+pub(crate) fn watchdog_found_overdue(previous_look: u64, look: u64, due: u64) {
+    let Some(directory) = RECORDS_DIRECTORY.get() else {
+        return;
+    };
+    let _ = std::fs::write(
+        directory.join(WATCHDOG_FOUND),
+        format!("{previous_look} {look} {due}"),
+    );
+    if HOLD_WATCHDOG.load(std::sync::atomic::Ordering::Acquire) {
+        let released = directory.join(RELEASE_MARK);
+        let until = Instant::now() + WATCHDOG_HOLD;
+        while !released.exists() && Instant::now() < until {
+            std::thread::sleep(LOOK);
+        }
+    }
+}
+
+/// Records that the watchdog left the process alone after it found work overdue, when the process
+/// is a stub whose script marks work.
+pub(crate) fn watchdog_spared() {
+    if let Some(directory) = RECORDS_DIRECTORY.get() {
+        let _ = std::fs::write(directory.join(WATCHDOG_SPARED), "spared");
+    }
+}
+
+/// Returns what the watchdog of the stub process with `runtime_dir` as its runtime directory found
+/// when it last found work overdue, once it has.
+#[must_use]
+pub fn watchdog_found(runtime_dir: &Path) -> Option<WatchdogFound> {
+    let text = std::fs::read_to_string(runtime_dir.join(WATCHDOG_FOUND)).ok()?;
+    let mut parts = text.split_whitespace();
+    Some(WatchdogFound {
+        previous_look: parts.next()?.parse().ok()?,
+        look: parts.next()?.parse().ok()?,
+        due: parts.next()?.parse().ok()?,
+    })
+}
+
+/// Returns whether the watchdog of the stub process with `runtime_dir` as its runtime directory
+/// has found work overdue and left the process alone.
+#[must_use]
+pub fn watchdog_has_spared(runtime_dir: &Path) -> bool {
+    runtime_dir.join(WATCHDOG_SPARED).exists()
+}
+
 /// Returns the deadline, in milliseconds, that each job a recording process ([`Raw::Recording`])
 /// has been sent carried on the wire, with the job's identifier, in order of identifier.
 #[must_use]
@@ -165,8 +246,9 @@ pub fn job_deadlines_sent(runtime_dir: &Path) -> Vec<(u64, u64)> {
 }
 
 /// Lets the loads and the jobs run that stub processes with `runtime_dir` as their runtime
-/// directory hold ([`Script::load_until_released`] and [`Script::generate_until_released`]): the
-/// ones waiting now end, and the ones that begin afterwards are not held.
+/// directory hold ([`Script::load_until_released`] and [`Script::generate_until_released`]), and
+/// the watchdog a script holds ([`Script::hold_watchdog`]): the ones waiting now end, and the ones
+/// that begin afterwards are not held.
 ///
 /// # Panics
 ///
@@ -417,6 +499,15 @@ pub struct Script {
     /// runtime directory as it starts, holding the daemon's start identity it was given as JSON, so
     /// a test can tell whether it was ever started and what it was told.
     pub mark_start: bool,
+    /// Whether the process's watchdog waits for [`release_held_work`] when it finds work overdue,
+    /// before it decides what to do about it: what lets a case make a cancellation arrive between
+    /// the finding and the decision, by an event it has seen and not by a delay. It needs
+    /// `mark_work`, which it leaves its marks by.
+    pub hold_watchdog: bool,
+    /// Whether the process fills its standard error as it starts, with a write that waits for good
+    /// when nothing reads it: what a standard error that nobody reads comes to once its pipe is
+    /// full. A case that sets it starts the process with that pipe and leaves it unread.
+    pub fill_standard_error: bool,
 }
 
 /// Memory a job holds that the system is kept from taking back.
@@ -616,6 +707,8 @@ impl Script {
         flag("crash-in-generate", self.crash_in_generate);
         flag("panic-in-generate", self.panic_in_generate);
         flag("mark-start", self.mark_start);
+        flag("hold-watchdog", self.hold_watchdog);
+        flag("fill-standard-error", self.fill_standard_error);
         flag("spin", self.spin);
         match &self.output {
             Output::WellFormed => {}
@@ -694,6 +787,8 @@ impl Script {
                 "crash-in-generate" => script.crash_in_generate = true,
                 "panic-in-generate" => script.panic_in_generate = true,
                 "mark-start" => script.mark_start = true,
+                "hold-watchdog" => script.hold_watchdog = true,
+                "fill-standard-error" => script.fill_standard_error = true,
                 "spin" => script.spin = true,
                 "output" => {
                     script.output = match value {
@@ -1404,6 +1499,14 @@ pub fn stub_main() -> i32 {
     };
     if script.mark_work {
         let _ = RECORDS_DIRECTORY.set(runtime_dir.clone());
+    }
+    HOLD_WATCHDOG.store(script.hold_watchdog, std::sync::atomic::Ordering::Release);
+    if script.fill_standard_error {
+        // More than any pipe holds. The write waits with the lock on standard error held, so every
+        // other write to it waits too.
+        std::thread::spawn(|| {
+            let _ = std::io::stderr().write_all(&vec![b' '; 1 << 20]);
+        });
     }
     let options = Options {
         build: stub_build(),

@@ -20,13 +20,15 @@ use kr_describe::serve::{
     Verifying,
 };
 use kr_describe::supervise::STOP_BOUND_MS;
-use kr_describe::testing::{Script, acknowledging_state, job_bounds};
+use kr_describe::testing::{
+    Script, acknowledging_state, job_bounds, release_held_work, watchdog_found, watchdog_has_spared,
+};
 use kr_describe::wire::{Answer, JobEnd, LoadEnd, Request, WIRE_VERSION, frame_of};
 use kr_protocol::ids::SessionEpoch;
 use kr_protocol::scalars::U64;
 use kr_worker::privacy::PrivacyGeneration;
 
-use stub::{Placed, Process, generate, load, wait_until_began, wait_until_started};
+use stub::{Placed, Process, generate, load, wait_for, wait_until_began, wait_until_started};
 use support::{binding, default_profile};
 
 const SOON: Duration = Duration::from_secs(10);
@@ -249,8 +251,10 @@ fn a_cancellation_reaches_a_load_and_a_job_while_they_run() {
 /// A cancellation that reaches work in hand is acknowledged before the work's own answer, for a
 /// load and for a job, every time: the control thread cancels and acknowledges under the lock the
 /// model thread takes to forget the work before it answers, so a model that sees the cancellation
-/// at once still cannot answer ahead of the acknowledgement. The control is a cancellation that
-/// arrives after the answer, which is acknowledged by nothing.
+/// at once still cannot answer ahead of the acknowledgement. The rounds show that the answer is
+/// never ahead in the orders they reach; that the lock is held through the write is the code's
+/// own, since the function that writes takes the guard that holds it. The control is a
+/// cancellation that arrives after the answer, which is acknowledged by nothing.
 #[test]
 fn a_cancelled_load_and_job_are_acknowledged_before_they_answer() {
     let placed = Placed::stub();
@@ -592,6 +596,29 @@ fn a_process_whose_job_does_not_stop_ends_itself() {
     assert!(process.exit_within(Duration::from_millis(500)).is_none());
 }
 
+/// A process whose standard error nobody reads still ends itself when its job does not stop: the
+/// watchdog says why on a thread of its own and does not wait behind a write that has filled the
+/// pipe. The control is the process with its standard error read by whoever started it (above).
+#[test]
+fn a_process_whose_standard_error_is_full_still_ends_when_its_job_does_not_stop() {
+    let placed = Placed::stub();
+    let runtime = placed.directory("full-standard-error");
+    let script = Script {
+        ignore_token_ms: 60_000,
+        fill_standard_error: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    process.expect_answer(SOON, "the load");
+    process.send(&generate(2, 1, 200));
+    let status = process
+        .exit_within(SOON * 3)
+        .expect("the process ends itself, though it cannot say why");
+    assert_eq!(status.code(), Some(Exit::Overdue.code()));
+}
+
 /// KR-REQ-22.11: a job that is past its deadline and has been told to stop, with the stop read by
 /// the control thread, is given until the stop bound to stop, and the process does not end itself
 /// for it at the usual grace after the deadline. The model here does not look at its token for
@@ -636,9 +663,10 @@ fn a_job_past_its_deadline_that_was_told_to_stop_is_given_time_to_stop() {
 /// it, so no elapsed time holds how much later than the bound the process ends. What holds the
 /// figure is the process's own record of the bounds it sets for the job as it comes into hand,
 /// compared with the guide's two seconds and thirty (the case below holds that the extension to
-/// the stop bound is made); that the watchdog compares the clock with those bounds and no others
-/// is held by the lower limit and by the end, and not to the second. It runs as long as the bound
-/// it holds.
+/// the stop bound is made), and its record of the look that ended it: that look was made against
+/// the stop bound the control thread set and no other, and was the first look after it, which the
+/// process's own stamps order and no delay of this case's can move. It runs as long as the bound it
+/// holds.
 #[test]
 fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
     let placed = Placed::stub();
@@ -670,6 +698,20 @@ fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
         .expect("the process ends itself at the stop bound");
     assert_eq!(status.code(), Some(Exit::Overdue.code()));
     assert!(sent.elapsed() >= Duration::from_millis(STOP_DEADLINE_MS + STOP_BOUND_MS));
+
+    // The look that ended it.
+    let stop_bound = acknowledging_state(&runtime, 2)
+        .expect("the control thread's record")
+        .job_stop_due;
+    let found = watchdog_found(&runtime).expect("the watchdog's record of the look");
+    assert_eq!(
+        found.due, stop_bound,
+        "the watchdog ended the process against the bound the stop gave the job: {found:?}"
+    );
+    assert!(
+        found.previous_look <= found.due && found.due < found.look,
+        "the first look after the bound ended the process: {found:?}"
+    );
 }
 
 /// KR-REQ-22.11: a job the control thread has read the stop of is cancelled, and has the stop
@@ -677,11 +719,13 @@ fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
 /// on a daemon that is slow to read or a thread the system has set aside, and the watchdog reads
 /// the job's bound without a lock, so a write ahead of the extension would carry the watchdog past
 /// the grace before the job had its extension and the process would end as overdue. The process
-/// records what its control thread had done as it began to write, and the case reads that back
-/// once the acknowledgement has arrived: the job's token cancelled, and the bound the watchdog
-/// holds the job to the stop bound that was set as the job began, and not the grace. No delay
-/// decides it, and the job's deadline is far off. Written first, the acknowledgement shows a token
-/// not yet cancelled and the grace; extending by more than the stop bound shows a bound past it.
+/// records what its control thread had done as the write begins, in the function that writes, and
+/// the case reads that back once the acknowledgement has arrived: the job's token cancelled when
+/// the control thread looked for the job in hand, and the bound the watchdog holds the job to the
+/// stop bound that was set as the job began, and not the grace. No delay decides it, and the job's
+/// deadline is far off. Written first, the acknowledgement shows a token not yet cancelled and the
+/// grace; a look made before the cancellation shows a token not yet cancelled; extending by more
+/// than the stop bound shows a bound past it.
 #[test]
 fn a_job_told_to_stop_is_cancelled_and_has_its_bound_before_the_acknowledgement_is_written() {
     let placed = Placed::stub();
@@ -713,6 +757,91 @@ fn a_job_told_to_stop_is_cancelled_and_has_its_bound_before_the_acknowledgement_
         process.expect_terminal(SOON, "the stopped job"),
         Answer::Ended { id, why: JobEnd::Cancelled, .. } if id.get() == 2
     ));
+}
+
+/// KR-REQ-22.11: a stop the control thread reads after the watchdog has found a job overdue, and
+/// before it has decided to end the process, is not missed: the watchdog ends the process only on
+/// the bound as it stands when it decides, and a job whose stop has been read since has the stop
+/// bound. The script holds the watchdog between its finding, which it records, and its decision;
+/// the case sends the stop once it has seen the record, reads the acknowledgement, which is written
+/// after the extension, and lets the watchdog go. The watchdog then leaves the process alone, and
+/// says so. No delay decides it. A watchdog that decides on the bound it read ends the process as
+/// overdue, with the stop it was told of read.
+#[test]
+fn a_stop_read_after_the_watchdog_found_the_job_overdue_is_not_missed() {
+    let placed = Placed::stub();
+    let runtime = placed.directory("held-watchdog");
+    let script = Script {
+        ignore_token_ms: 60_000,
+        mark_work: true,
+        hold_watchdog: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    process.expect_answer(SOON, "the load");
+    process.send(&generate(2, 1, 200));
+    wait_for("the watchdog to find the job overdue", || {
+        watchdog_found(&runtime).is_some()
+    });
+    process.send(&Request::Cancel { id: U64::new(2) });
+    assert_eq!(
+        process.expect_answer(SOON, "the acknowledgement"),
+        Answer::Cancelling { id: U64::new(2) }
+    );
+    release_held_work(&runtime);
+    wait_for("the watchdog to decide", || {
+        watchdog_has_spared(&runtime) || process.exit_within(Duration::ZERO).is_some()
+    });
+    assert_eq!(
+        process.exit_within(Duration::ZERO),
+        None,
+        "the process ended for a job whose stop was read before the watchdog decided"
+    );
+    assert!(watchdog_has_spared(&runtime));
+}
+
+/// KR-REQ-22.11: a job whose stop the control thread read before the model thread took it in hand
+/// is held to the stop bound from the start, as one whose stop is read after. The cancellation
+/// finds no job in hand, and the model thread answers the job cancelled without running it; its
+/// answer waits for the lock the acknowledgement is written under, and a watchdog holding the job
+/// to the grace would end the process if the write outlasted it. The model thread is in a load the
+/// case holds while the job and its cancellation are sent, and releases once the acknowledgement
+/// has arrived. The bound the process set for the job is read back from its own record.
+#[test]
+fn a_job_cancelled_before_it_is_in_hand_is_held_to_the_stop_bound_from_the_start() {
+    let placed = Placed::stub();
+    let runtime = placed.directory("queued");
+    let script = Script {
+        load_until_released: true,
+        mark_work: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    wait_until_began(&runtime, "load");
+    process.send(&generate(2, 1, 60_000));
+    process.send(&Request::Cancel { id: U64::new(2) });
+    assert_eq!(
+        process.expect_answer(SOON, "the acknowledgement"),
+        Answer::Cancelling { id: U64::new(2) }
+    );
+    release_held_work(&runtime);
+    assert!(matches!(
+        process.expect_terminal(SOON, "the load"),
+        Answer::Loaded { id, .. } if id.get() == 1
+    ));
+    assert!(matches!(
+        process.expect_terminal(SOON, "the cancelled job"),
+        Answer::Ended { id, why: JobEnd::Cancelled, .. } if id.get() == 2
+    ));
+    assert_eq!(
+        job_bounds(&runtime, 2),
+        Some((GUIDE_STOP_BOUND_MS, GUIDE_STOP_BOUND_MS)),
+        "the job is held to the stop bound as it comes into hand, in milliseconds past its deadline"
+    );
 }
 
 /// A process whose model fails inside a job ends itself, so the daemon restarts inference rather

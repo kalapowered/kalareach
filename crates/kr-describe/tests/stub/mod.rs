@@ -112,6 +112,17 @@ pub fn wait_until_began(runtime_dir: &Path, kind: &str) {
     }
 }
 
+/// Waits until `condition` holds, which is an event a stub is to bring about and no delay of the
+/// case's own; the wait gives up, and the case fails saying what it waited for, only when the event
+/// has not come in a time that no host takes.
+pub fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
+    let give_up = Instant::now() + Duration::from_secs(20);
+    while !condition() {
+        assert!(Instant::now() < give_up, "{what} did not come");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// One running stub, spoken to directly.
 pub struct Process {
     child: Child,
@@ -145,7 +156,13 @@ impl Process {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            // A script that fills standard error leaves the pipe unread, as a daemon that never
+            // reads it does.
+            .stderr(if script.fill_standard_error {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            })
             .spawn()
             .expect("the stub starts");
         let input = child.stdin.take();

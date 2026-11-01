@@ -575,47 +575,65 @@ impl Shared {
     /// All three happen under the lock the model thread takes to forget the work before it
     /// answers. The model thread can see the work cancelled before it is acknowledged, but cannot
     /// answer it until the lock is free, so the acknowledgement is still written before the work's
-    /// own answer.
+    /// own answer. The write takes the guard that holds the lock, so no code can release the lock
+    /// ahead of it.
     ///
     /// The cancellation comes before the job is looked for. A job the model thread has taken in
     /// hand before the cancellation is found there, and extended; one it takes in hand after reads
-    /// the cancelled token and does not start generating. Looking first would leave a job that
-    /// starts between the look and the cancellation running, cancelled and not extended.
+    /// the cancelled token, and gives itself the stop bound as it starts. Looking first would leave
+    /// a job that starts between the look and the cancellation running, cancelled and not
+    /// extended.
     ///
     /// The extension comes before the acknowledgement because the write can take long, when the
     /// daemon is slow to read or the system has set the thread aside, and the watchdog reads the
     /// bound without the lock: a write ahead of the extension can carry the watchdog past the old
-    /// bound. Two windows stay open, and each costs one process failure, a reload and a job queued
-    /// again. A watchdog that has already read the old bound when the extension is made can still
-    /// end the process: the window is the time between its read and its exit, which includes the
-    /// message it writes first. A job cancelled before the model thread takes it in hand is not
-    /// extended, since the model thread sets its bound as it starts, and a write that outlasts that
-    /// bound still ends the process. A lock in the watchdog would wait behind a write that has
-    /// stuck, and one it only tries would leave the first window the time between the control
-    /// thread's read and its taking the lock, at the price of a race no case can hold.
+    /// bound. The watchdog takes no lock, since a lock in it would wait behind a write that has
+    /// stuck. It ends the process on a bound only by taking that bound as it stands, so an
+    /// extension made before its decision is never missed, and one made after it comes too late
+    /// for a process that has decided to end.
     fn cancel_and_acknowledge(&self, id: U64) {
         let tokens = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(token) = tokens.get(&id.get()) {
-            token.cancel();
-            // A job whose stop has been read is not stuck, and is given the stop bound after its
-            // deadline to reach a place where the model can stop, where other work is overdue at
-            // the grace. The lock held here is the one the model thread takes to forget the job
-            // before it answers, so the job is still in hand and the model thread sets the bound
-            // back to nought after this.
-            if id.get() != 0 && self.job_in_hand.load(Ordering::Acquire) == id.get() {
-                self.work_due
-                    .fetch_max(self.job_stop_due.load(Ordering::Acquire), Ordering::AcqRel);
-            }
-            // What has been done by the time the write begins, for a test to read back.
-            #[cfg(feature = "testing")]
-            crate::testing::acknowledging(
-                id.get(),
-                token.is_cancelled(),
-                self.work_due.load(Ordering::Acquire),
-                self.job_stop_due.load(Ordering::Acquire),
-            );
-            self.answer(&Answer::Cancelling { id });
+        let Some(token) = tokens.get(&id.get()) else {
+            return;
+        };
+        token.cancel();
+        // Pairs with the fence the model thread puts between taking a job in hand and reading its
+        // token.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        // What the token shows as the look is made, for a test to read back: a look made before the
+        // cancellation shows it not made.
+        let cancelled_at_the_look = token.is_cancelled();
+        // A job whose stop has been read is not stuck, and is given the stop bound after its
+        // deadline to reach a place where the model can stop, where other work is overdue at the
+        // grace. The lock held here is the one the model thread takes to forget the job before it
+        // answers, so the job is still in hand and the model thread sets the bound back to nought
+        // after this.
+        if id.get() != 0 && self.job_in_hand.load(Ordering::SeqCst) == id.get() {
+            self.work_due
+                .fetch_max(self.job_stop_due.load(Ordering::Acquire), Ordering::AcqRel);
         }
+        self.acknowledge(&tokens, id, cancelled_at_the_look);
+    }
+
+    /// Writes the acknowledgement of a cancellation, with `held` the guard of the lock it is
+    /// written under. What a test reads of the cancellation is recorded as the write begins, so it
+    /// shows the state the write is made in and no other.
+    fn acknowledge(
+        &self,
+        _held: &std::sync::MutexGuard<'_, BTreeMap<u64, Cancellation>>,
+        id: U64,
+        cancelled_at_the_look: bool,
+    ) {
+        #[cfg(feature = "testing")]
+        crate::testing::acknowledging(
+            id.get(),
+            cancelled_at_the_look,
+            self.work_due.load(Ordering::Acquire),
+            self.job_stop_due.load(Ordering::Acquire),
+        );
+        #[cfg(not(feature = "testing"))]
+        let _ = cancelled_at_the_look;
+        self.answer(&Answer::Cancelling { id });
     }
 
     fn cancel_all(&self) {
@@ -777,31 +795,35 @@ fn model_thread<M: Model>(
                 ceiling_bytes,
                 token,
             } => {
-                shared.job_stop_due.store(
-                    shared.stamp_of(due + Duration::from_millis(STOP_BOUND_MS)),
-                    Ordering::Release,
-                );
-                shared.work_due.store(
-                    shared.stamp_of(due + Duration::from_millis(OVERDUE_GRACE_MS)),
-                    Ordering::Release,
-                );
-                // The bounds as the watchdog holds them, before a stop can extend one, for a test
-                // to read back.
+                let grace_due = shared.stamp_of(due + Duration::from_millis(OVERDUE_GRACE_MS));
+                let stop_due = shared.stamp_of(due + Duration::from_millis(STOP_BOUND_MS));
+                shared.job_stop_due.store(stop_due, Ordering::Release);
+                // The job is in hand before its token is read, and a cancellation cancels the
+                // token before it looks for the job in hand, with a fence between the two on each
+                // side: either the cancellation finds the job in hand and extends it, or this
+                // finds the token cancelled.
+                shared.job_in_hand.store(id, Ordering::SeqCst);
+                std::sync::atomic::fence(Ordering::SeqCst);
+                // A job found cancelled is given the stop bound at once, as one whose stop is read
+                // after it is in hand. The bound is set in one step, so the watchdog is never
+                // shown the grace over a job that is cancelled, which a write of the
+                // acknowledgement that outlasted it would carry the process past: this thread
+                // waits for that write's lock to forget the job. `fetch_max`, since a
+                // cancellation that finds the job in hand may have extended the bound already.
+                let bound = if token.is_cancelled() {
+                    stop_due
+                } else {
+                    grace_due
+                };
+                shared.work_due.fetch_max(bound, Ordering::AcqRel);
+                // The bounds as the watchdog holds the job as it comes into hand, before a stop
+                // read since can extend it, for a test to read back.
                 #[cfg(feature = "testing")]
                 crate::testing::job_bounds_held(
                     id,
-                    shared
-                        .work_due
-                        .load(Ordering::Acquire)
-                        .saturating_sub(shared.stamp_of(due)),
-                    shared
-                        .job_stop_due
-                        .load(Ordering::Acquire)
-                        .saturating_sub(shared.stamp_of(due)),
+                    bound.saturating_sub(shared.stamp_of(due)),
+                    stop_due.saturating_sub(shared.stamp_of(due)),
                 );
-                // Last, so that a stop read before the job is in hand finds the one before it
-                // gone and extends nothing.
-                shared.job_in_hand.store(id, Ordering::Release);
                 let answer = match (&loaded, token.is_cancelled()) {
                     (_, true) => Generating::Ended {
                         why: JobEnd::Cancelled,
@@ -942,8 +964,18 @@ fn resolve(
 
 /// Ends the process when the control thread is stuck on one request, work is overdue, or the
 /// daemon that started it has gone.
+///
+/// Work is overdue when the clock passes the bound the model thread set for it, or the bound a
+/// stop read since has moved it to. The process ends on a bound only by taking it as it stands at
+/// the decision, in one step: a bound that has moved since it was read, to a later one or to
+/// nought, is not the one the work was found overdue against, and the process is left alone. The
+/// bound then reads [`ENDING`], so that nothing moves it out from under a process that has
+/// decided.
 fn watchdog(shared: &Shared, daemon: Option<&ProcessStartIdentity>) {
     let mut looks: u32 = 0;
+    // When the last look was made, for a test to read what a decision to end followed.
+    #[cfg(feature = "testing")]
+    let mut last_look = shared.stamp();
     while !shared.returned.load(Ordering::Acquire) {
         std::thread::sleep(WATCH_INTERVAL);
         // The end of the input is how the process usually learns its daemon has gone. A control
@@ -954,29 +986,77 @@ fn watchdog(shared: &Shared, daemon: Option<&ProcessStartIdentity>) {
             && looks.is_multiple_of(DAEMON_LOOK_EVERY)
             && kr_ipc::identity::process_state(daemon) == kr_ipc::identity::ProcessState::Ended
         {
-            eprintln!("kr-describe: the daemon that started this process has gone, so it ends");
-            std::process::exit(Exit::DaemonGone.code());
+            end_process(
+                Exit::DaemonGone,
+                "the daemon that started this process has gone, so it ends",
+            );
         }
         let now = shared.stamp();
         let since = shared.control_since.load(Ordering::Acquire);
         // A stall past the bound ends the process, whatever readings the daemon takes meanwhile.
         if since != 0 && now.saturating_sub(since) > CONTROL_BOUND_MS {
-            eprintln!(
-                "kr-describe: the control thread has been on one request for more than \
-                 {CONTROL_BOUND_MS} ms, so this process ends"
+            end_process(
+                Exit::ControlStalled,
+                &format!(
+                    "the control thread has been on one request for more than \
+                     {CONTROL_BOUND_MS} ms, so this process ends"
+                ),
             );
-            std::process::exit(Exit::ControlStalled.code());
         }
         let due = shared.work_due.load(Ordering::Acquire);
         if due != 0 && now > due {
-            eprintln!(
-                "kr-describe: work ran past its deadline and its grace of {OVERDUE_GRACE_MS} ms (or, \
-                 for a job whose stop was read, of {STOP_BOUND_MS} ms), so this \
-                 process ends"
-            );
-            std::process::exit(Exit::Overdue.code());
+            #[cfg(feature = "testing")]
+            crate::testing::watchdog_found_overdue(last_look, now, due);
+            if shared
+                .work_due
+                .compare_exchange(due, ENDING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                end_process(
+                    Exit::Overdue,
+                    &format!(
+                        "work ran past its deadline and its grace of {OVERDUE_GRACE_MS} ms (or, \
+                         for a job whose stop was read, of {STOP_BOUND_MS} ms), so this process \
+                         ends"
+                    ),
+                );
+            }
+            #[cfg(feature = "testing")]
+            crate::testing::watchdog_spared();
+        }
+        #[cfg(feature = "testing")]
+        {
+            last_look = now;
         }
     }
+}
+
+/// The bound the watchdog leaves in place of the one it ended the process on.
+const ENDING: u64 = u64::MAX;
+
+/// How long [`end_process`] waits for its message to reach standard error.
+const NOTICE_WAIT: Duration = Duration::from_millis(250);
+
+/// Ends the process with `exit`, after saying why on standard error for as long as
+/// [`NOTICE_WAIT`] allows.
+///
+/// The message is written on a thread of its own. Standard error is read by whoever started the
+/// process, and one that does not read it fills the pipe, after which a write waits for good: the
+/// end of a process that has decided to end must not wait behind it. A write that fails is of no
+/// concern to it either.
+fn end_process(exit: Exit, why: &str) -> ! {
+    let (written, wrote) = std::sync::mpsc::channel();
+    let message = format!("kr-describe: {why}\n");
+    let spawned = std::thread::Builder::new()
+        .name("describe-notice".to_owned())
+        .spawn(move || {
+            let _ = std::io::stderr().write_all(message.as_bytes());
+            let _ = written.send(());
+        });
+    if spawned.is_ok() {
+        let _ = wrote.recv_timeout(NOTICE_WAIT);
+    }
+    std::process::exit(exit.code())
 }
 
 /// The lock one description process holds for its environment, for the rest of its life.
