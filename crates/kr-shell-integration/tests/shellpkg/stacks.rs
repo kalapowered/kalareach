@@ -2276,8 +2276,11 @@ impl Session {
     /// that ask it for something. One that is slower to act on a key than the harness is to type
     /// the next judges the fence with a key still unread, and reports an input queue as holding
     /// input: keys typed first go first, as the contract says. On such a reader a fence whose
-    /// answer reports a queue so is asked again, about the same prompt, until the reader judges it
-    /// with its keys taken or the window of the exchange ends. A reader that never takes its keys,
+    /// answer reports the terminal's or the macro queue so is asked again, about the same prompt,
+    /// until the reader judges it with its keys taken or the reply window of that prompt ends. The
+    /// first fence is written under a reply window of its own, whatever the wait for the entry
+    /// took. The reply window of the prompt starts once that fence is written: its answer, and
+    /// every fence asked again, answer to it and buy no other. A reader that never takes its keys,
     /// or stays slower than the harness types them, reports them for that long and fails on it. A
     /// reader that reports a partial key sequence is not asked again, since no key typed here
     /// leaves one, and neither is a reader that is given no keys: their report is the one that
@@ -2286,7 +2289,8 @@ impl Session {
     /// # Panics
     ///
     /// Panics when that reader reports a queue still holding input at an empty prompt, and keeps
-    /// reporting it until the window ends where it is asked again.
+    /// reporting it until the window ends where it is asked again, and when it does not answer a
+    /// fence inside the window.
     pub fn fenced_latest(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
         // A reader can leave between reporting itself and being asked — a prompt redrawn, a
         // nested read returning — and the reader's answer to that is honest: this is not the
@@ -2295,45 +2299,50 @@ impl Session {
         // What ends the asking is the clock; the count is kept for the failure to report.
         let deadline = self.deadline_for(FENCE);
         let may_ask_again = dialect(self.package_kind).answers_at_the_next_step;
-        // The prompt a fence was asked about whose answer found input unread: the reader is the one
-        // that is running still, so it is asked about again and no new entry is waited for.
+        // The prompt a fence was asked about whose answer found input unread, with the end of the
+        // reply window of that prompt: the reader is the one that is running still, so it is asked
+        // about again and no new entry is waited for.
         let mut asked_about = None;
         let mut attempts = 0;
         loop {
             attempts += 1;
-            let enter = match asked_about.take() {
-                Some(enter) => enter,
-                None => self.latest_prompt(),
+            let (enter, window) = match asked_about.take() {
+                Some((enter, until)) => (enter, Some(until)),
+                None => (self.latest_prompt(), None),
             };
             let fence = fence_for(&enter, fence_id(index), attachment_id(1), epoch(4));
-            // Every wait of the exchange answers to the one window, so a fence asked again late in
-            // it cannot be answered after it.
-            let until = deadline.earlier(self.deadline_for(REPLY)).0;
-            let asked = self.ask_before(
-                WorkerRequest::Fence(RootEditorFenceParams {
-                    session_id: self.session_id,
-                    fence_id: fence.fence_id,
-                    prompt_generation: enter.prompt_generation,
-                    reader_revision: enter.reader_revision,
-                    deadline_ms: FENCE_EXCHANGE_TIMEOUT,
-                    cause: FenceCause::EditorEntry,
-                }),
-                until,
-            );
+            let request = WorkerRequest::Fence(RootEditorFenceParams {
+                session_id: self.session_id,
+                fence_id: fence.fence_id,
+                prompt_generation: enter.prompt_generation,
+                reader_revision: enter.reader_revision,
+                deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+                cause: FenceCause::EditorEntry,
+            });
+            // The first fence for a prompt is written under a reply window of its own, and the
+            // window the answers answer to starts once it is written: the write is not taken from
+            // the reader's time to answer.
+            let (asked, until) = match window {
+                Some(until) => (self.ask_before(request, until), until),
+                None => (self.ask(request), self.deadline_for(REPLY).0),
+            };
             match self.answer_before(asked, until) {
                 BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement)) => {
                     let queues = acknowledgement.queues;
-                    if !(queues.tty_typeahead_drained && queues.macro_input_drained)
-                        && may_ask_again
-                        && !deadline.passed()
+                    if may_ask_again
+                        && queues.partial_key_drained
+                        && !(queues.tty_typeahead_drained && queues.macro_input_drained)
+                        && Instant::now() < until
                     {
                         eprintln!(
                             "a fence found input the reader had not taken; asking again \
                              ({attempts})"
                         );
-                        asked_about = Some(enter);
-                        self.pump(Duration::from_millis(50));
-                        continue;
+                        self.pump_before(self.bounded(Duration::from_millis(50)), until);
+                        if Instant::now() < until {
+                            asked_about = Some((enter, until));
+                            continue;
+                        }
                     }
                     assert!(
                         queues.all_drained(),
