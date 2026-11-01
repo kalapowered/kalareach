@@ -23,10 +23,12 @@
 //! among themselves give up output for the cap one at a time, under a lock. The daemon takes no
 //! part in that lock: the two parties act on their own sessions and each reads the whole
 //! environment's bytes, so the host can be briefly under the cap by what both gave up in the same
-//! minute. It is over the cap for no longer than the first pass in which the session that grew
-//! gets the lock, unless that session cannot give up the excess, as when it holds less than the
-//! excess or has ended: the other sessions then find it when their measures, five to six minutes
-//! old, are taken again.
+//! minute. A worker that finds the host over the cap and does not get the lock looks again after a
+//! few seconds, until it gets the lock or the cap is met. The host is over the cap for no longer
+//! than a few rounds of that after the pass of the session that grew, unless that session cannot
+//! give up the excess, as when it holds less than the excess while the other sessions have taken
+//! no output, or has ended: the other sessions then find it when their measures, five to six
+//! minutes old, are taken again.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError, Weak};

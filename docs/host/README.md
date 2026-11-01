@@ -4292,14 +4292,17 @@ that records where a spool's output got to is not counted, and neither is anythi
 segments. Both parties read the whole environment's bytes and each acts on its own sessions, so in
 the minute the daemon and a worker both find the host over the cap they can both give up output,
 and the host is then under the cap by what both took. A worker that does not get the lock leaves
-the cap to the one that holds it, which gives up only its own output: when that is less than the
-excess the host stays over the cap by the rest until a later beat, at which another worker may hold
-the lock. A worker that cannot open or take the lock file at all gives up nothing for the cap and
-says why in the reason its pass left output behind. The host is over the cap for no longer than the
-first pass in which the session that grew gets the lock, unless that session cannot give up the
-excess, as when its worker has ended, it holds less than the excess, or it cannot write its
-boundary: the other workers keep a reading that found the host under the cap while they take no
-output, and find it over the cap when that reading, five to six minutes old, is taken again.
+the cap to the one that holds it, and looks again after two to five seconds, drawn at random, until
+it gets the lock or the cap is met, and no later than its next pass. It never waits for
+the lock, so a session's own work waits on no other worker. The holder gives up only its own
+output, so when that is less than the excess the workers that look again give up the rest, one at a
+time. A worker that cannot open or take the lock file at all gives up nothing for the cap and keeps
+the reason with the others its pass left output behind for. The host is over the cap for no longer
+than a few rounds of looking again after the pass of the session that grew, unless that session
+cannot give up the excess, as when its worker has ended, it holds less than the excess while the
+other workers have taken no output, or it cannot write its boundary: the other workers keep a
+reading that found the host under the cap while they take no output, and find it over the cap when
+that reading, five to six minutes old, is taken again.
 
 Eviction is not quiet. A retention pass records the cursor range it took and the bound that took
 it, and a reader asking for a cursor inside that range is told both: `history.page` returns the

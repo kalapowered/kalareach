@@ -4776,6 +4776,13 @@ impl Session {
         self.collect_output_under(crate::persistence::retention::OutputRetention::DEFAULT)
     }
 
+    /// Returns whether the last output retention pass found the host over its cap while another
+    /// session held the lock on it, so that it gave up nothing for the cap.
+    #[must_use]
+    pub const fn output_awaits_the_host_cap_lock(&self) -> bool {
+        self.history.awaits_the_host_cap_lock()
+    }
+
     /// Applies output retention under `retention`, which is section 20's own figures for the
     /// host's pass and other ones for a test.
     pub fn collect_output_under(

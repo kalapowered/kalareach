@@ -112,6 +112,50 @@ pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(
 /// would otherwise wait for the next request.
 pub const HOST_MAINTENANCE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The shortest a host waits before it looks again at the host's output cap, when it found the host
+/// over the cap and another host holding the lock on it. The wait is drawn between this and this
+/// plus [`HOST_CAP_RETRY_SPREAD`], so that hosts waiting on the same lock do not look again
+/// together.
+const HOST_CAP_RETRY_FROM: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How much longer than [`HOST_CAP_RETRY_FROM`] a host may wait before it looks again at the cap.
+const HOST_CAP_RETRY_SPREAD: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// When a host that found the host over its output cap and did not get the lock on it looks again:
+/// `delay` from `now`, unless its next pass on the beat comes first, and never when it was not
+/// kept from the cap by the lock.
+fn host_cap_retry_at(
+    awaits_the_lock: bool,
+    now: tokio::time::Instant,
+    next_pass: tokio::time::Instant,
+    delay: impl FnOnce() -> std::time::Duration,
+) -> Option<tokio::time::Instant> {
+    if !awaits_the_lock {
+        return None;
+    }
+    let at = now + delay();
+    (at < next_pass).then_some(at)
+}
+
+/// A wait of a few seconds, drawn at random, before a host looks again at the host's output cap.
+fn host_cap_retry_delay() -> std::time::Duration {
+    let draw = u32::from_le_bytes(
+        kr_ipc::new_uuid().as_bytes()[..4]
+            .try_into()
+            .unwrap_or_default(),
+    );
+    let spread = u32::try_from(HOST_CAP_RETRY_SPREAD.as_millis()).unwrap_or(u32::MAX);
+    HOST_CAP_RETRY_FROM + std::time::Duration::from_millis(u64::from(draw % spread.max(1)))
+}
+
+/// What one pass of the host's maintenance found.
+struct MaintenancePass {
+    /// Whether the session has closed.
+    closed: bool,
+    /// Whether the pass found the host over its output cap while another host held the lock on it.
+    awaits_the_host_cap_lock: bool,
+}
+
 /// The event stream name output notifications carry.
 pub const OUTPUT_STREAM: &str = "session.output";
 
@@ -1827,18 +1871,53 @@ impl WorkerService {
     /// say decides the second thing: a wake, a reboot or a step of the wall clock revalidates the
     /// freshness resources this host issued, and a clock that cannot be proved stops collection
     /// outright. Then the records past the retention period are collected, on the schedule the
-    /// journal itself keeps rather than on this one.
+    /// journal itself keeps rather than on this one. A host that found the host over its output cap
+    /// while another host held the lock on it looks at the cap again sooner than the next tick.
     async fn maintain(self: Arc<Self>) {
         // The first pass happens at once, so a host that has just come up collects, looks at its
         // clocks before it waits a minute to do either.
         loop {
             // The pass commits to the journal under the dispatch barrier and the session, on a
             // thread the executor can do without.
-            if self.maintain_pass() {
+            let pass = self.maintain_pass();
+            if pass.closed {
                 break;
             }
-            tokio::time::sleep_until(self.on_the_beat(HOST_MAINTENANCE)).await;
+            let next = self.on_the_beat(HOST_MAINTENANCE);
+            if self
+                .look_again_at_the_host_cap(pass.awaits_the_host_cap_lock, next)
+                .await
+            {
+                break;
+            }
+            tokio::time::sleep_until(next).await;
         }
+    }
+
+    /// Looks again at the host's output cap, for a host that found the host over it while another
+    /// held the lock on it and so gave up nothing for it. It looks after a few seconds, and again
+    /// until it gets the lock or the cap is met, and no later than `next_pass`; it never waits for
+    /// the lock, so the session's own work waits on no other host. A host that was not kept from
+    /// the cap by the lock keeps to its beat. Returns whether the session has closed.
+    async fn look_again_at_the_host_cap(
+        &self,
+        mut awaits_the_lock: bool,
+        next_pass: tokio::time::Instant,
+    ) -> bool {
+        while let Some(retry) = host_cap_retry_at(
+            awaits_the_lock,
+            tokio::time::Instant::now(),
+            next_pass,
+            host_cap_retry_delay,
+        ) {
+            tokio::time::sleep_until(retry).await;
+            let again = off_the_executor(|| self.retry_output_once());
+            if again.closed {
+                return true;
+            }
+            awaits_the_lock = again.awaits_the_host_cap_lock;
+        }
+        false
     }
 
     /// Returns when something that is due in `wait` from now is waited for: on the session's beat
@@ -1851,15 +1930,35 @@ impl WorkerService {
         )
     }
 
-    /// One pass of the host's maintenance, made on a thread the executor can do without. Returns
-    /// whether the session has closed.
-    fn maintain_pass(&self) -> bool {
+    /// One pass of the host's maintenance, made on a thread the executor can do without.
+    fn maintain_pass(&self) -> MaintenancePass {
         off_the_executor(|| self.maintain_once())
     }
 
-    /// One pass of the host's maintenance. Returns whether the session has closed.
-    fn maintain_once(&self) -> bool {
-        let (closed, times) = {
+    /// Applies output retention again, for a host that found the host over its output cap and did
+    /// not get the lock on it. It takes the session's lock for the pass and waits for nothing else.
+    fn retry_output_once(&self) -> MaintenancePass {
+        let (closed, awaits_the_host_cap_lock, times) = {
+            let mut session = self.runtime.session();
+            session.collect_output();
+            (
+                session.state() == kr_protocol::session::SessionState::Closed,
+                session.output_awaits_the_host_cap_lock(),
+                session.output_time_index(),
+            )
+        };
+        if let Some(times) = times {
+            let _ = times.flush();
+        }
+        MaintenancePass {
+            closed,
+            awaits_the_host_cap_lock,
+        }
+    }
+
+    /// One pass of the host's maintenance.
+    fn maintain_once(&self) -> MaintenancePass {
+        let (closed, awaits_the_host_cap_lock, times) = {
             // Maintenance passes through the same serial boundary a mutation does. Section 9
             // puts the revalidation a discontinuity owes *before* the host serves a mutation,
             // and this barrier is what "before" means here: a mutation either sees the
@@ -1889,6 +1988,7 @@ impl WorkerService {
                 session.collect_output();
                 (
                     session.state() == kr_protocol::session::SessionState::Closed,
+                    session.output_awaits_the_host_cap_lock(),
                     session.output_time_index(),
                 )
             }
@@ -1907,7 +2007,10 @@ impl WorkerService {
         // here even when nobody is reading them, so the feed the daemon's attention store reads
         // and every client that follows it hear of it on this tick rather than at the next read.
         let _ = self.questions.sweep(self.question_clock());
-        closed
+        MaintenancePass {
+            closed,
+            awaits_the_host_cap_lock,
+        }
     }
 
     /// Runs one pass of the host's maintenance now, for this host's own tests.
@@ -1918,6 +2021,19 @@ impl WorkerService {
     #[cfg(feature = "testing")]
     pub fn maintain_now(&self) {
         self.maintain_pass();
+    }
+
+    /// Runs one pass of the host's maintenance now and then looks again at the host's output cap as
+    /// maintenance does, until the host is not kept from the cap by the lock on it or a minute has
+    /// passed, for this host's own tests. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub async fn maintain_and_look_again_now(&self) {
+        let pass = self.maintain_pass();
+        self.look_again_at_the_host_cap(
+            pass.awaits_the_host_cap_lock,
+            tokio::time::Instant::now() + HOST_MAINTENANCE,
+        )
+        .await;
     }
 
     /// Runs the storage half of one maintenance pass now: the journal first, then the broker.
@@ -11755,6 +11871,45 @@ mod tests {
         notification, send_stream, vouched_deadline, write_frame, write_frame_unless, write_within,
     };
     use crate::output::OutputDelivery;
+
+    /// KR-PERF-003: a host that found the host over its output cap while another held the lock on
+    /// it looks again after a few seconds, and no later than its next pass on the beat; a host that
+    /// was not kept from the cap by the lock keeps to the beat and draws no delay.
+    #[test]
+    fn kr_perf_003_a_host_kept_from_the_cap_by_the_lock_looks_again_before_its_next_pass() {
+        use super::{
+            HOST_CAP_RETRY_FROM, HOST_CAP_RETRY_SPREAD, host_cap_retry_at, host_cap_retry_delay,
+        };
+
+        let now = tokio::time::Instant::now();
+        let beat = now + Duration::from_secs(60);
+        let delay = || Duration::from_secs(3);
+        assert_eq!(
+            host_cap_retry_at(true, now, beat, delay),
+            Some(now + Duration::from_secs(3)),
+            "a host kept from the cap looks again after the delay, before the beat"
+        );
+        assert_eq!(
+            host_cap_retry_at(true, now, now + Duration::from_secs(2), delay),
+            None,
+            "unless the beat comes first"
+        );
+        assert_eq!(
+            host_cap_retry_at(false, now, beat, || panic!("no delay is drawn")),
+            None,
+            "a host that was not kept from the cap keeps to the beat"
+        );
+        let drawn: Vec<Duration> = (0..64).map(|_| host_cap_retry_delay()).collect();
+        assert!(
+            drawn.iter().all(|delay| *delay >= HOST_CAP_RETRY_FROM
+                && *delay < HOST_CAP_RETRY_FROM + HOST_CAP_RETRY_SPREAD),
+            "the delay is a few seconds: {drawn:?}"
+        );
+        assert!(
+            drawn.iter().any(|delay| *delay != drawn[0]),
+            "and is drawn at random, so that hosts waiting on one lock do not look together"
+        );
+    }
 
     /// One reader's snapshot of the instance numbered `number`.
     fn reading(reader: &str, number: u8) -> SnapshotReading {

@@ -4131,3 +4131,74 @@ async fn kr_req_07_60_a_request_to_be_told_that_comes_while_a_refused_record_wai
     drop(journal);
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }
+
+/// KR-REQ-20.20, KR-PERF-003: a host that finds the host over its output cap while another host
+/// holds the lock on it gives up nothing at first, looks again within seconds and not at its pass a
+/// minute on, and gives up the output once the lock is let go. It never waits for the lock: its
+/// maintenance pass returns while the lock is held.
+///
+/// Another session's spool holds the cap exactly, as a sparse file, so this session's output is
+/// what puts the host over it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_host_kept_from_the_output_cap_by_the_lock_gives_up_output_when_it_looks_again() {
+    use std::time::Duration;
+
+    let host = host().await;
+    let spools = host._temp.environment().spool_dir();
+    let cap = OutputRetention::DEFAULT.host_cap_bytes;
+    let other = spools.join("other.log");
+    std::fs::create_dir_all(&other).expect("another session's spool directory");
+    std::fs::File::create(other.join("0.out"))
+        .and_then(|segment| segment.set_len(cap))
+        .expect("a segment that holds the cap");
+    host.runtime.session().ingest_output(&[b'x'; 4096]);
+    assert_eq!(
+        kr_worker::history::retained_bytes_under(&spools),
+        cap + 4096,
+        "this session's output puts the host over its cap"
+    );
+
+    // Another host is giving up output for the cap, under the lock every host of the environment
+    // takes, by the name every build agrees on.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(spools.join("host-cap.lock"))
+        .expect("the lock file");
+    kr_flush::lock::try_exclusive(&held).expect("nobody holds the lock");
+
+    let service = Arc::clone(&host.service);
+    let maintaining = tokio::spawn(async move { service.maintain_and_look_again_now().await });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !host.runtime.session().output_awaits_the_host_cap_lock() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pass found the host over its cap and the lock held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !maintaining.is_finished(),
+        "and the host is looking again, not waiting for the lock"
+    );
+    assert_eq!(
+        kr_worker::history::retained_bytes_under(&spools),
+        cap + 4096,
+        "it gave up nothing"
+    );
+
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(30), maintaining)
+        .await
+        .expect("the host looked again within seconds, and not at its pass a minute on")
+        .expect("the maintenance task ran");
+    assert_eq!(
+        kr_worker::history::retained_bytes_under(&spools),
+        cap,
+        "and gave up the output it was over by"
+    );
+    assert!(!host.runtime.session().output_awaits_the_host_cap_lock());
+}

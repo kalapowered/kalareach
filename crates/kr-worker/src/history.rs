@@ -243,6 +243,9 @@ pub struct OutputHistory {
     clock_proven: bool,
     /// What the environment's spools held when they were last measured for the host-wide cap.
     host_reading: Option<HostReading>,
+    /// Whether the last pass found the host over its cap and another session holding the lock on
+    /// it, so that this one gave up nothing for the cap and is to look again soon.
+    awaits_the_host_cap_lock: bool,
     /// Waited at by a test after the host has been read and before anything is decided from the
     /// reading, so that the passes of several sessions read the same total.
     #[cfg(test)]
@@ -278,7 +281,9 @@ const HOST_READING_STANDS_FOR: std::time::Duration = std::time::Duration::from_s
 /// stands.
 ///
 /// A standing measure is never over the cap it was taken under, so the pass that uses it never
-/// removes output for the host's cap, and a pass that does takes the lock.
+/// removes output for the host's total, and a pass that does takes the lock. (A session that alone
+/// holds more than the cap gives up its own excess whatever the host holds; the session cap keeps
+/// a shipped host from it.)
 fn host_reading_due(
     last: Option<HostReading>,
     output_end: u64,
@@ -312,6 +317,7 @@ impl OutputHistory {
             times: None,
             clock_proven: false,
             host_reading: None,
+            awaits_the_host_cap_lock: false,
             #[cfg(test)]
             after_host_reading: None,
         }
@@ -615,6 +621,14 @@ impl OutputHistory {
     #[must_use]
     pub fn suspended(&self) -> Option<(u64, &str)> {
         self.spool.as_ref().and_then(Spool::suspension)
+    }
+
+    /// Returns whether the last pass against the host's spools found the host over its cap and
+    /// another session holding the lock on it, so that it gave up nothing for the cap and is to
+    /// look again soon rather than at its next pass in a minute.
+    #[must_use]
+    pub const fn awaits_the_host_cap_lock(&self) -> bool {
+        self.awaits_the_host_cap_lock
     }
 
     /// Returns why the last retention pass left output it was asked to remove, when it did.
@@ -987,12 +1001,14 @@ impl OutputHistory {
     /// of the host takes, so that sessions whose passes fall together give up the excess once and
     /// not once each. It reads the host again with the lock held, since whoever held it before may
     /// have given up what the first reading found over. A session that does not get the lock gives
-    /// up nothing for the host's cap on this pass, and measures again on its next; the holder gives
-    /// up only its own output, so when that is less than the excess the rest waits for a later
-    /// pass. A lock that cannot be opened or taken at all is not another session holding it: the
-    /// pass says why in [`Self::left_behind`]. A worker of an earlier release takes no lock, so the
-    /// exclusion is among the workers of this one. The control daemon applies the same cap to the
-    /// sessions that have closed, from a reading of its own.
+    /// up nothing for the host's cap on this pass and says so in
+    /// [`Self::awaits_the_host_cap_lock`], and its caller looks again after a short delay, until it
+    /// gets the lock or the cap is met; the holder gives up only its own output, so when that is
+    /// less than the excess the rest goes to the sessions that look again. A lock that cannot be
+    /// opened or taken at all is not another session holding it: the pass says why in
+    /// [`Self::left_behind`]. A worker of an earlier release takes no lock, so the exclusion is
+    /// among the workers of this one. The control daemon applies the same cap to the sessions that
+    /// have closed, from a reading of its own.
     pub fn apply_retention_to_host(
         &mut self,
         spools: &Path,
@@ -1003,6 +1019,7 @@ impl OutputHistory {
         let session_bytes = self.retained_bytes();
         let output_end = self.next_cursor;
         let now = std::time::Instant::now();
+        self.awaits_the_host_cap_lock = false;
         if !host_reading_due(self.host_reading, output_end, retention.host_cap_bytes, now) {
             let host_bytes = self
                 .host_reading
@@ -1045,13 +1062,17 @@ impl OutputHistory {
                 // next. A lock that cannot be taken at all is not another session holding it, so
                 // the pass says why it left output it was asked to remove.
                 let taken = self.apply_retention(retention, session_bytes, now_ms, age_permitted);
-                if let Some(Err(HostCapLockRefused::Unavailable(detail))) = refused
-                    && self.left_behind.is_none()
-                {
-                    self.left_behind = Some(format!(
-                        "the lock for the host's output cap could not be taken, so nothing was \
-                         removed for the cap: {detail}"
-                    ));
+                match refused {
+                    Some(Err(HostCapLockRefused::Held)) => self.awaits_the_host_cap_lock = true,
+                    Some(Err(HostCapLockRefused::Unavailable(detail)))
+                        if self.left_behind.is_none() =>
+                    {
+                        self.left_behind = Some(format!(
+                            "the lock for the host's output cap could not be taken, so no output \
+                             was removed for the host's total: {detail}"
+                        ));
+                    }
+                    _ => {}
                 }
                 return taken;
             }
@@ -4017,10 +4038,10 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// KR-REQ-20.20, KR-PERF-003: sessions whose passes fall together give up the host's excess once. Six
-    /// sessions of 64 bytes hold 384 under a cap of 360. Every pass reads the 384 before any pass
-    /// gives anything up, as passes on one beat can, and each session on its own would give up the
-    /// 24 bytes the host is over by.
+    /// KR-REQ-20.20, KR-PERF-003: sessions whose passes fall together give up the host's excess
+    /// once. Six sessions of 64 bytes hold 384 under a cap of 360. Every pass reads the 384 before
+    /// any pass gives anything up, as passes on one beat can, and each session on its own would
+    /// give up the 24 bytes the host is over by.
     #[test]
     fn kr_perf_003_passes_that_find_the_host_over_its_cap_together_give_up_its_excess_once() {
         let root = spool_directory("host-cap-together");
@@ -4114,6 +4135,14 @@ mod tests {
                 .is_empty(),
             "the host holds 144 bytes under a cap of 100, and this session leaves it to the holder"
         );
+        assert!(
+            this.awaits_the_host_cap_lock(),
+            "and says it is to look again soon"
+        );
+        assert!(
+            this.left_behind().is_none(),
+            "a lock that is held is not a lock that cannot be taken, and leaves no reason"
+        );
         assert_eq!(retained_bytes_under(&root), 144);
 
         // The host grows meanwhile, and the lock is let go.
@@ -4128,6 +4157,78 @@ mod tests {
             given_up, 64,
             "the next pass reads the host as it is now, 160 bytes, and gives up the 60 it is over by \
              to the segment"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// KR-REQ-20.20, KR-PERF-003: the holder of the lock gives up only its own output. When that is
+    /// less than the excess, the sessions that did not get the lock look again, and the excess is
+    /// gone within a few rounds of looking, with no session having waited for the lock: each pass
+    /// below returns at once, with the lock held elsewhere or not.
+    #[test]
+    fn kr_perf_003_a_small_holder_that_wins_the_lock_first_leaves_the_rest_to_those_that_look_again()
+     {
+        let root = spool_directory("host-cap-small-holder");
+        let retention = OutputRetention::new(
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            100,
+            1 << 20,
+        );
+        let layout = || SpoolLayout::new(8, 1 << 20);
+        let mut sessions: Vec<OutputHistory> = [("small", 16), ("large", 64), ("larger", 64)]
+            .into_iter()
+            .map(|(name, bytes)| {
+                let mut history =
+                    OutputHistory::with_spool(8, root.join(format!("{name}.log")), layout())
+                        .expect("a spool");
+                history.append(&vec![b'x'; bytes]);
+                history
+            })
+            .collect();
+        assert_eq!(
+            retained_bytes_under(&root),
+            144,
+            "44 bytes over a cap of 100"
+        );
+        let now = kr_ipc::now_ms();
+        let given_up =
+            |taken: Vec<Eviction>| taken.iter().map(|eviction| eviction.bytes).sum::<u64>();
+
+        // The two large sessions pass while another session is giving up output for the cap.
+        let held = the_host_cap_lock_held_elsewhere(&root);
+        for session in &mut sessions[1..] {
+            assert_eq!(
+                given_up(session.apply_retention_to_host(&root, retention, now, true)),
+                0
+            );
+            assert!(session.awaits_the_host_cap_lock());
+        }
+        drop(held);
+
+        // The small session gets the lock, and gives up all it has, which is less than the excess.
+        assert_eq!(
+            given_up(sessions[0].apply_retention_to_host(&root, retention, now, true)),
+            16
+        );
+        assert!(!sessions[0].awaits_the_host_cap_lock());
+        assert_eq!(retained_bytes_under(&root), 128, "still 28 bytes over");
+
+        // The two that did not get the lock look again, as the host's maintenance has them do,
+        // until none is waiting.
+        let mut rounds = 0;
+        while sessions.iter().any(OutputHistory::awaits_the_host_cap_lock) {
+            rounds += 1;
+            assert!(rounds <= 3, "the excess is gone within a few rounds");
+            for session in &mut sessions {
+                if session.awaits_the_host_cap_lock() {
+                    session.apply_retention_to_host(&root, retention, now, true);
+                }
+            }
+        }
+        assert_eq!(
+            retained_bytes_under(&root),
+            96,
+            "the host is under its cap, having given up only what it was over by to the segment"
         );
         std::fs::remove_dir_all(&root).ok();
     }
