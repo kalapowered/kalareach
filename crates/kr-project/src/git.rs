@@ -6267,9 +6267,10 @@ mod tests {
     /// Asks `--version` of a stand-in that writes its number to a file, waits for the release, and
     /// then runs `body`, a shell command, and ends, giving the question `time`. The first poll of
     /// the ask is held back until the stand-in has ended and waits to be collected, so what it said
-    /// and the end of its output are in the pipe when that poll comes. The release is given once
-    /// `time` has run out when `after_the_time` is set, and at once otherwise. The directory the
-    /// stand-in ran in comes back with the outcome, with the numbers the stand-in wrote in it.
+    /// is in the pipe when that poll comes, and so is the end of its output unless `body` leaves a
+    /// process that holds the pipe open. The release is given once `time` has run out when
+    /// `after_the_time` is set, and at once otherwise. The directory the stand-in ran in comes back
+    /// with the outcome, with the numbers the stand-in wrote in it.
     #[cfg(unix)]
     fn ask_with_the_first_poll_after_the_stand_in_ended(
         body: &str,
@@ -6357,59 +6358,84 @@ mod tests {
         assert!(refusal.code().retry_category().permits_automatic_retry());
     }
 
-    /// An exit that is seen after the time the look was given is the clock's, even when the output
-    /// was read to its end in time, and whatever the program exited with. The stand-in answers and
+    /// An exit that is seen after the time the look was given is the clock's, whatever the program
+    /// exited with and whether or not its output was read to its end. The stand-in answers and
     /// ends, with a failure and then with success, and the poll that finds it ended comes when the
     /// time is used up (the case has the time read as used up from the loop's first look at it,
     /// and the output is read by the real clock, far inside the time). A refusal made on the exit
     /// code would blame the program, with the step to install Git, and a success would be
-    /// accepted, for an exit that this host saw only after its time. The stand-in leaves a process
-    /// in its group, which holds the pipe open, so the case also shows that the group is ended and
-    /// the stand-in collected before the look is refused.
+    /// accepted, for an exit that this host saw only after its time.
+    ///
+    /// Each status is run with a process left in the stand-in's group, which holds the pipe open,
+    /// and without it. Without it the first poll reads the end of the output as well as the
+    /// answer, in time, so the exit is the only reason left to refuse the look: a check that
+    /// refused a late exit only while the output was still open would pass the rows with the
+    /// process, where the end is not read, and fail these. The rows with the process also show
+    /// that the group is ended and the stand-in collected before the look is refused.
     #[cfg(unix)]
     #[test]
     fn an_exit_seen_after_the_time_ran_out_is_the_clocks_and_not_the_programs() {
         for exit in [1, 0] {
-            TIME_IS_UP.with(|up| up.set(true));
-            let (outcome, directory) = ask_with_the_first_poll_after_the_stand_in_ended(
-                &format!(
-                    "sleep 120 &\necho $! > \"$(dirname \"$0\")/sleeper\"\n\
-                     echo git version 2.50.1\nexit {exit}"
-                ),
-                Duration::from_secs(60),
-                false,
-            );
-            TIME_IS_UP.with(|up| up.set(false));
+            for leaves_a_process in [true, false] {
+                let row = format!(
+                    "exit {exit}, {} process left in the group",
+                    if leaves_a_process { "a" } else { "no" }
+                );
+                let body = if leaves_a_process {
+                    format!(
+                        "sleep 120 &\necho $! > \"$(dirname \"$0\")/sleeper\"\n\
+                         echo git version 2.50.1\nexit {exit}"
+                    )
+                } else {
+                    format!("echo git version 2.50.1\nexit {exit}")
+                };
+                TIME_IS_UP.with(|up| up.set(true));
+                let (outcome, directory) = ask_with_the_first_poll_after_the_stand_in_ended(
+                    &body,
+                    Duration::from_secs(60),
+                    false,
+                );
+                TIME_IS_UP.with(|up| up.set(false));
 
-            let refusal = match outcome {
-                Err(Asked::Overran(refusal)) => refusal,
-                other => panic!(
-                    "an exit ({exit}) seen after the time is not an answer: {:?}",
-                    other.map_err(Asked::into_error)
-                ),
-            };
-            assert!(
-                matches!(refusal, ProjectError::GitFailed { .. }),
-                "{refusal:?}"
-            );
-            assert!(
-                refusal.to_string().contains("was not seen to end"),
-                "it is refused for the exit, which is the guard under test: {refusal}"
-            );
-            assert_eq!(
-                refusal.code(),
-                kr_protocol::error::ErrorCode::UpstreamUnavailable
-            );
-            assert!(refusal.code().retry_category().permits_automatic_retry());
-            let sleeper = std::fs::read_to_string(directory.path().join("sleeper"))
-                .expect("the stand-in recorded the process it left in its group")
-                .trim()
-                .to_owned();
-            assert!(!running(&sleeper), "the group the stand-in led was ended");
-            assert!(
-                collected(&number_of(&directory.path().join("own"))),
-                "and the stand-in was collected"
-            );
+                let refusal = match outcome {
+                    Err(Asked::Overran(refusal)) => refusal,
+                    other => panic!(
+                        "an exit seen after the time is not an answer ({row}): {:?}",
+                        other.map_err(Asked::into_error)
+                    ),
+                };
+                assert!(
+                    matches!(refusal, ProjectError::GitFailed { .. }),
+                    "{row}: {refusal:?}"
+                );
+                assert!(
+                    refusal.to_string().contains("was not seen to end"),
+                    "{row}: it is refused for the exit, which is the guard under test: {refusal}"
+                );
+                assert_eq!(
+                    refusal.code(),
+                    kr_protocol::error::ErrorCode::UpstreamUnavailable,
+                    "{row}"
+                );
+                assert!(
+                    refusal.code().retry_category().permits_automatic_retry(),
+                    "{row}"
+                );
+                if leaves_a_process {
+                    let sleeper = std::fs::read_to_string(directory.path().join("sleeper"))
+                        .expect("the stand-in recorded the process it left in its group")
+                        .trim()
+                        .to_owned();
+                    assert!(
+                        !running(&sleeper),
+                        "{row}: the group the stand-in led was ended"
+                    );
+                    assert!(
+                        collected(&number_of(&directory.path().join("own"))),
+                        "{row}: the stand-in was collected"
+                    );
+                }
+            }
         }
     }
 
