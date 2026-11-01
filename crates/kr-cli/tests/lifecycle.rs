@@ -5079,15 +5079,17 @@ fn end_the_container_runtimes_pause_process(runtime: &Path) -> Result<(), String
     end_the_pause_process_through(
         runtime,
         |identity| kr_ipc::identity::stop_process(identity, kr_ipc::identity::Stop::Kill),
+        |number| std::fs::read(format!("/proc/{number}/environ")),
         PAUSE_PROCESS_ENDS_WITHIN,
     )
 }
 
-/// [`end_the_container_runtimes_pause_process`], ending the process by `stop` and waiting
-/// `ends_within` for it to be gone.
+/// [`end_the_container_runtimes_pause_process`], ending the process by `stop`, reading the
+/// environment of a process by `environment_of`, and waiting `ends_within` for it to be gone.
 fn end_the_pause_process_through(
     runtime: &Path,
     stop: impl Fn(&ProcessStartIdentity) -> kr_ipc::identity::Stopped,
+    environment_of: impl Fn(u32) -> std::io::Result<Vec<u8>>,
     ends_within: Duration,
 ) -> Result<(), String> {
     use kr_ipc::identity::Stopped;
@@ -5110,11 +5112,21 @@ fn end_the_pause_process_through(
         }
     };
     let wanted = format!("XDG_RUNTIME_DIR={}", runtime.display());
-    let started_here = std::fs::read(format!("/proc/{number}/environ")).is_ok_and(|environment| {
-        environment
+    // A process whose environment cannot be read is not known to be another's: it is not left to a
+    // guess, and not taken for one that is not the case's. One that has gone since is the end the
+    // case wants.
+    let started_here = match environment_of(number) {
+        Ok(environment) => environment
             .split(|byte| *byte == 0)
-            .any(|variable| variable == wanted.as_bytes())
-    });
+            .any(|variable| variable == wanted.as_bytes()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "the environment of the container runtime's pause process {number} could not be \
+                 read: {error}"
+            ));
+        }
+    };
     if !started_here {
         return Ok(());
     }
@@ -5141,6 +5153,12 @@ fn end_the_pause_process_through(
             }
         }
     }
+}
+
+/// The environment of the process `number`, as the kernel keeps it.
+#[cfg(target_os = "linux")]
+fn the_environment_of_a_process(number: u32) -> std::io::Result<Vec<u8>> {
+    std::fs::read(format!("/proc/{number}/environ"))
 }
 
 /// A process that stands for the pause process of a runtime whose runtime directory is
@@ -5203,12 +5221,37 @@ fn a_stop_that_is_refused_leaves_the_pause_process_and_is_reported() {
     let result = end_the_pause_process_through(
         runtime.path(),
         |_| kr_ipc::identity::Stopped::Refused("not allowed".to_owned()),
+        the_environment_of_a_process,
         Duration::from_secs(1),
     );
     let _ = pause.kill();
     let _ = pause.wait();
     let why = result.expect_err("a refusal is an error");
     assert!(why.contains("was not ended"), "{why}");
+}
+
+/// A live pause process whose environment cannot be read is not known to be another's, so the
+/// case does not pass over it: the teardown says that it could not tell.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_pause_process_whose_environment_cannot_be_read_is_reported() {
+    let runtime = tempfile::tempdir().expect("a directory");
+    let mut pause = a_pause_process(runtime.path(), runtime.path());
+    let result = end_the_pause_process_through(
+        runtime.path(),
+        |_| panic!("a process that is not known to be the case's is not stopped"),
+        |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "not allowed",
+            ))
+        },
+        Duration::from_secs(1),
+    );
+    let _ = pause.kill();
+    let _ = pause.wait();
+    let why = result.expect_err("an environment that cannot be read is an error");
+    assert!(why.contains("could not be read"), "{why}");
 }
 
 /// A number the runtime left in its file for a process that has gone is the end the case wants: it
@@ -5223,6 +5266,7 @@ fn a_pause_process_that_has_already_gone_is_not_reported_and_nothing_is_stopped(
     end_the_pause_process_through(
         runtime.path(),
         |_| panic!("there is nothing to stop"),
+        the_environment_of_a_process,
         Duration::from_secs(1),
     )
     .expect("a process that has gone is the end that was wanted");
@@ -5237,6 +5281,7 @@ fn a_pause_process_that_is_still_there_after_the_stop_is_reported() {
     let result = end_the_pause_process_through(
         runtime.path(),
         |_| kr_ipc::identity::Stopped::Signalled,
+        the_environment_of_a_process,
         Duration::from_millis(300),
     );
     let _ = pause.kill();
