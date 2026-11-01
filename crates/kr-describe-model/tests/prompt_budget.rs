@@ -125,10 +125,10 @@ fn the_largest_contexts_are_made_to_fit_the_prompt_bound() {
 /// characters a person sees of the text the model would have written, which for the sessions whose
 /// names are copied is Arabic, Persian with its non-joiner, and a family of emoji with its joiners.
 ///
-/// KR-REQ-22.10: the answer is within each output bound the job was sent with, counted by the
-/// model's own tokenizer, so the real runtime ends an answer at the bound it is given. The 128
-/// tokens the daemon sends are held at the model seam, in `kr-describe`'s `tests/process.rs`; no
-/// case here reads the number of threads the runtime uses.
+/// The real runtime ends an answer at the output bound it is given, counted by the model's own
+/// tokenizer. The 128 tokens the daemon sends are held at the model seam, in `kr-describe`'s
+/// `tests/process.rs`, and not here; and no case here reads the number of threads the runtime
+/// uses, so the four threads the daemon sends are held there too and not in the runtime.
 #[test]
 fn an_answer_the_output_bound_stops_is_ended_inside_its_activity_text() {
     let Some((profile, runtime)) =
