@@ -6643,10 +6643,12 @@ async fn a_delay_named_by_a_request_that_is_out_when_a_fence_lands_stays_owed_th
 /// the request does not leave. There is no fence in any of them, so it is the delay that decides.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delay_named_while_the_call_waits_on_the_service_holds_back_the_request_that_follows() {
+    // Not the rate limit's code and not 30 seconds, which the other cases name: the delay owed is
+    // the one the service named, whatever it was refused with.
     let delay = Moment::Refuse {
-        status: 429,
-        code: "RATE_LIMITED",
-        retry_after_seconds: Some(30),
+        status: 503,
+        code: "SERVICE_UNAVAILABLE",
+        retry_after_seconds: Some(45),
     };
 
     // During the bundle write: the enrolment.
