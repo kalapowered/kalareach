@@ -173,8 +173,9 @@ impl WorkerSupervisor for RecordingSupervisor {
 struct HeldStandardError {
     /// The end the workers write to, kept so that the case can fill the pipe.
     writer: std::io::PipeWriter,
-    /// The end nothing reads, kept so that a write waits for a reader and is not refused.
-    _reader: std::io::PipeReader,
+    /// The end nothing reads while a case holds the pipe full, kept so that a write waits for a
+    /// reader and is not refused. A case that lets the workers' lines drain reads what is there.
+    reader: std::io::PipeReader,
     /// The workers this pipe was given to.
     workers: std::sync::Mutex<Vec<std::process::Child>>,
 }
@@ -182,29 +183,53 @@ struct HeldStandardError {
 #[cfg(unix)]
 impl HeldStandardError {
     fn new() -> Arc<Self> {
+        use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
         let (reader, writer) = std::io::pipe().expect("a pipe");
+        // Only the end this case reads is made to return when the pipe is empty: the workers
+        // write to the other end, which stays as it is.
+        let flags = fcntl_getfl(&reader).expect("the flags of the pipe");
+        fcntl_setfl(&reader, flags | OFlags::NONBLOCK).expect("a read that does not wait");
         Arc::new(Self {
             writer,
-            _reader: reader,
+            reader,
             workers: std::sync::Mutex::default(),
         })
     }
 
     /// Fills the pipe to the last byte, so that the next write to it waits for a reader.
     ///
-    /// The pipe's flags are shared with the workers that hold its other end, so this is done while
-    /// a worker has nothing to say.
+    /// The workers hold the same end of the pipe as `writer`, so its flags are theirs too. This is
+    /// done while a worker has nothing to say, and `fill_pipe` restores the flags before it
+    /// returns.
     fn fill(&self) {
         fill_pipe(&self.writer);
     }
 
-    /// Whether every worker started with this pipe has ended.
-    fn every_worker_has_ended(&self) -> bool {
-        self.workers
-            .lock()
-            .expect("the list is not poisoned")
-            .iter_mut()
-            .all(|worker| worker.try_wait().expect("polls the worker").is_some())
+    /// What the workers have written to the pipe and nothing has read.
+    fn said(&self) -> String {
+        let mut said = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match rustix::io::read(&self.reader, &mut chunk) {
+                Ok(0) | Err(rustix::io::Errno::AGAIN) => break,
+                Ok(count) => said.extend_from_slice(&chunk[..count]),
+                Err(error) => panic!("reading the pipe: {error}"),
+            }
+        }
+        String::from_utf8_lossy(&said).into_owned()
+    }
+
+    /// Whether a worker was started with this pipe and every one has ended with success.
+    fn every_worker_ended_well(&self) -> bool {
+        let mut workers = self.workers.lock().expect("the list is not poisoned");
+        !workers.is_empty()
+            && workers.iter_mut().all(|worker| {
+                worker
+                    .try_wait()
+                    .expect("polls the worker")
+                    .is_some_and(|status| status.success())
+            })
     }
 }
 
@@ -1551,42 +1576,54 @@ async fn a_worker_the_detached_start_launches_leads_a_session_of_its_own() {
     close(&mut client, &host, created.session.session_id).await;
 }
 
-/// KR-REQ-20.20: a standard error that has stopped draining, a pipe nobody reads, does not hold the
-/// end of a worker whose session has closed. The worker program says on that standard error that an
-/// attachment had not been sent the closure, and ends.
+/// KR-REQ-07.52: a worker whose session has closed waits for an attachment it still owes the
+/// closure, says on its standard error that it ends without sending it, and ends, whether that
+/// standard error is read or has stopped draining, a pipe nobody reads.
 ///
 /// A terminal that attached and never subscribed is owed the closure, which the worker waits for
-/// until its bound before it says so. The worker program's standard error is full by then, so a
-/// line it writes where it stands would wait for a reader that never comes.
+/// until its bound before it says so. With the pipe full by then, a line the program wrote where it
+/// stood would wait for a reader that never comes. With the pipe left to drain, the line is there
+/// to read once the worker has ended.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_worker_whose_standard_error_has_stopped_draining_ends_after_its_session_closes() {
-    let host = Host::create().with_a_standard_error_nobody_reads();
-    let _daemon = host.start().await;
-    let mut client = host.client().await;
-    let created = create(&mut client, &host).await;
-    let session_id = created.session.session_id;
-    let _silent = LocalTerminal::attached(
-        &host,
-        session_id,
-        kr_protocol::session::Dimensions::new(80, 24),
-        false,
-    )
-    .await;
+async fn a_worker_that_waited_out_an_attachment_ends_whether_or_not_its_standard_error_drains() {
+    for drained in [true, false] {
+        let host = Host::create().with_a_standard_error_nobody_reads();
+        let _daemon = host.start().await;
+        let mut client = host.client().await;
+        let created = create(&mut client, &host).await;
+        let session_id = created.session.session_id;
+        let _silent = LocalTerminal::attached(
+            &host,
+            session_id,
+            kr_protocol::session::Dimensions::new(80, 24),
+            false,
+        )
+        .await;
 
-    host.held_standard_error().fill();
-    close(&mut client, &host, session_id).await;
-    until("the worker to end with its standard error full", || {
-        host.held_standard_error()
-            .every_worker_has_ended()
-            .then_some(())
-    })
-    .await;
+        if !drained {
+            host.held_standard_error().fill();
+        }
+        close(&mut client, &host, session_id).await;
+        until("the worker to end", || {
+            host.held_standard_error()
+                .every_worker_ended_well()
+                .then_some(())
+        })
+        .await;
+        if drained {
+            let said = host.held_standard_error().said();
+            assert!(
+                said.contains("closure"),
+                "the worker said it ended without sending a closure: {said}"
+            );
+        }
+    }
 }
 
-/// KR-REQ-20.20: a worker that cannot reach its controller says why on its standard error and ends
-/// with a failure, whether that standard error is read or has stopped draining. What it says is
-/// there to read when the standard error drains, however soon the program ends after saying it.
+/// A worker that cannot reach its controller says why on its standard error and ends with a
+/// failure, whether that standard error is read or has stopped draining. What it says is there to
+/// read when the standard error drains.
 ///
 /// The worker program is started with a rendezvous no controller listens on. It says that it has
 /// no clock floor to prove authority by, then that it could not connect.
