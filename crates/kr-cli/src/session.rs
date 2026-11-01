@@ -180,6 +180,16 @@ impl AttachOutcome {
             ))),
         }
     }
+
+    /// Returns whether a command run to hold its window on failure waits for a key after this
+    /// ending: a failure, other than the session's shell exiting, which is how the person ended it.
+    #[must_use]
+    pub fn holds_the_window(&self) -> bool {
+        self.is_failure()
+            && !self
+                .closure()
+                .is_some_and(|record| matches!(record.reason, ClosureReason::RootExit))
+    }
 }
 
 /// How an attachment ends when its session's closure arrives.
@@ -264,6 +274,13 @@ pub struct AttachOptions {
     /// attachment that follows delivers it in front of its own handshake's typing, in the order
     /// it was typed.
     pub typed_before: Vec<u8>,
+    /// Whether the command reads this terminal itself when the attachment ends in a failure: it
+    /// waits for a key so that a window opened for the command alone shows the error.
+    ///
+    /// A reader thread that cannot be woken, on a terminal that cannot be waited for, is then in a
+    /// read of the terminal and takes that key, and the attachment says so. Where the command reads
+    /// nothing, the thread ends with the process and there is nothing to say.
+    pub then_reads: bool,
 }
 
 impl std::fmt::Debug for AttachOptions {
@@ -275,6 +292,7 @@ impl std::fmt::Debug for AttachOptions {
             .field("no_probe", &self.no_probe)
             .field("follow_live", &self.follow_live)
             .field("typed_before", &self.typed_before.len())
+            .field("then_reads", &self.then_reads)
             .finish()
     }
 }
@@ -1437,11 +1455,13 @@ where
     // The reader stops before anything else reads this terminal: a command that goes on after the
     // attachment must be the only reader of it.
     // What it had read and the loop had not taken is dropped, and a typed key in it was lost.
-    said_after.extend(after_the_reader_stops(
-        input_stop.stop(),
-        &mut fallback,
-        &mut input,
-    ));
+    // Whether the command reads this terminal itself next, which a reader that cannot be woken
+    // would get in the way of; only a Unix reader can be in that state.
+    #[cfg(unix)]
+    let stopped = input_stop.stop(options.then_reads && outcome.holds_the_window());
+    #[cfg(not(unix))]
+    let stopped = input_stop.stop();
+    said_after.extend(after_the_reader_stops(stopped, &mut fallback, &mut input));
 
     // The terminal comes back here on every path out of the loop, and the guard is released only
     // once it has.
@@ -1521,6 +1541,12 @@ const READER_STILL_RUNNING: &str = "kr: the part of this command that reads the 
      not ended when the terminal came back, so the next key you type may be lost, the console's \
      input mode may change, and the keys it had already taken were not counted.";
 
+/// What an attachment says when the thread that reads its terminal is still waiting for a key that
+/// the terminal cannot wake it from, and the command is about to read the terminal itself.
+const READER_WAITING_FOR_A_KEY: &str = "kr: the part of this command that reads the terminal's \
+     keys is still waiting for one, and this terminal cannot wake it, so the next key you press \
+     is taken by it and lost.";
+
 /// What an attachment says when that thread ended only after the command asked the system to cancel
 /// its read of the console, which hands the next key typed to a read that was cancelled.
 const READER_CANCEL_ASKED: &str = "kr: the part of this command that reads the console's keys had \
@@ -1559,7 +1585,9 @@ fn after_the_reader_stops(
     input: &mut tokio::sync::mpsc::UnboundedReceiver<TerminalInput>,
 ) -> Vec<Shown> {
     let mut said: Vec<Shown> = fallback.finish(input, &stopped.left).into_iter().collect();
-    if stopped.still_running {
+    if stopped.waits_for_a_key {
+        said.push(Shown::said(READER_WAITING_FOR_A_KEY));
+    } else if stopped.still_running {
         said.push(Shown::said(READER_STILL_RUNNING));
     } else if stopped.cancel_asked {
         said.push(Shown::said(READER_CANCEL_ASKED));
@@ -3237,6 +3265,27 @@ mod tests {
             .map_or(0, |error| error.exit_code())
     }
 
+    /// A command run to hold its window on failure waits for a key after an attachment that ended
+    /// in a failure, and not after a detach, a clean close or its shell exiting, which is how the
+    /// person ended it, whatever the status.
+    #[test]
+    fn only_a_failure_that_is_not_the_shell_exiting_holds_the_window() {
+        let closed = |record| AttachOutcome::Closed {
+            record: Box::new(record),
+            undelivered: false,
+        };
+        assert!(!AttachOutcome::Detached.holds_the_window());
+        assert!(!closed(closure(ClosureReason::CloseRequested, None, None)).holds_the_window());
+        assert!(!closed(closure(ClosureReason::RootExit, Some(0), None)).holds_the_window());
+        assert!(
+            !closed(closure(ClosureReason::RootExit, Some(7), None)).holds_the_window(),
+            "a shell that exited with a status is how the person ended the session"
+        );
+        assert!(closed(closure(ClosureReason::WorkerCrash, None, None)).holds_the_window());
+        assert!(AttachOutcome::Disconnected.holds_the_window());
+        assert!(AttachOutcome::LeaseLost.holds_the_window());
+    }
+
     /// KR-REQ-07.52: an attachment ends with the status its session's closure implies, and says
     /// how the session closed in one line.
     #[test]
@@ -4214,6 +4263,36 @@ mod tests {
         assert!(
             said.len() == 1 && !said[0].as_str().contains("lost"),
             "a modifier left at the stop is no typing: {said:?}"
+        );
+    }
+
+    /// A reader that waits in a read of a terminal that cannot wake it is said in words of its own,
+    /// which are not the words for a Windows reader that had not ended: that reader holds keys it
+    /// took and the console's input mode, and this one holds the next key.
+    #[test]
+    fn a_reader_waiting_for_a_key_is_said_in_its_own_words() {
+        use crate::attach::Stopped;
+
+        let (_keep, mut input) = tokio::sync::mpsc::unbounded_channel();
+        let waiting = Stopped {
+            still_running: true,
+            waits_for_a_key: true,
+            ..Stopped::default()
+        };
+        let said = after_the_reader_stops(waiting, &mut Fallback::default(), &mut input);
+        assert!(
+            said.len() == 1
+                && said[0]
+                    .as_str()
+                    .contains("next key you press is taken by it")
+                && !said[0].as_str().contains("input mode"),
+            "{said:?}"
+        );
+        let nothing =
+            after_the_reader_stops(Stopped::default(), &mut Fallback::default(), &mut input);
+        assert!(
+            nothing.is_empty(),
+            "a reader that ended says nothing: {nothing:?}"
         );
     }
 

@@ -290,6 +290,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 presentation,
                 kr_cli::session::UndeliveredTyping::new(typed_while_asking.len()),
                 typed_while_asking,
+                arguments.hold_on_failure && !cli.json,
             )
             .await;
             Ok(creation_report(
@@ -361,6 +362,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                     // Attaching asks this terminal nothing before its own handshake, so there is
                     // nothing owed from before it.
                     typed_before: Vec::new(),
+                    then_reads: false,
                 },
             )
             .await?;
@@ -1491,6 +1493,7 @@ async fn present(
     presentation: Presentation,
     owed: kr_cli::session::UndeliveredTyping,
     typed_before: Vec<u8>,
+    then_reads: bool,
 ) -> Result<Option<kr_cli::session::AttachOutcome>> {
     match presentation {
         Presentation::Invisible => Ok(None),
@@ -1512,6 +1515,7 @@ async fn present(
                     // What the person typed while the creation was asking this terminal for its
                     // colours. It is theirs, and this attachment is where it goes.
                     typed_before,
+                    then_reads,
                 },
             )
             .await?;
@@ -1618,14 +1622,12 @@ fn creation_report(
             // The shell's own exit, with any status, is how the person ended the session. A close on
             // request and a detach, whatever its origin, are no failure at all: they are `Done`,
             // and so is no reason to hold the window.
-            let by_its_shell = outcome.closure().is_some_and(|record| {
-                matches!(record.reason, kr_protocol::session::ClosureReason::RootExit)
-            });
+            let holds_the_window = outcome.holds_the_window();
             outcome.into_error().map_or(Completion::Done, |error| {
-                if by_its_shell {
-                    Completion::Ended(error)
-                } else {
+                if holds_the_window {
                     Completion::Reported(error)
+                } else {
+                    Completion::Ended(error)
                 }
             })
         }
@@ -1877,6 +1879,7 @@ async fn new_in_enrolled(
                     no_probe: false,
                     follow_live: false,
                     typed_before: typed_while_asking,
+                    then_reads: arguments.hold_on_failure && !json,
                 },
                 owed,
             )
@@ -1918,6 +1921,7 @@ async fn attach_in_enrolled(
             no_probe: arguments.no_probe,
             follow_live: arguments.follow_live,
             typed_before: Vec::new(),
+            then_reads: false,
         },
         kr_cli::session::UndeliveredTyping::new(0),
     )

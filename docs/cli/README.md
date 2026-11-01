@@ -171,6 +171,12 @@ from another place closes the window as well. In each of these cases the command
 status the attachment ends with at once, and the window closes as its terminal application normally
 closes it.
 
+On a terminal that cannot be waited for (macOS answers a poll of `/dev/tty` at once with an error),
+the part of the command that reads the keys cannot be woken when the attachment ends: it stays in its
+read of the terminal and takes the next key. When the command is about to wait for a key, it says
+so before the wait, and the first key pressed is that reader's and is lost. Where the command waits
+for nothing, the reader ends with the process and the command says nothing.
+
 It waits only when standard input and standard output are terminals and the run is not `--json`.
 Anywhere else it never waits, so a script that reads the output of `kr new` does not stop for a key
 nobody will press. While it waits, the terminal is in single-key mode with its signal keys off, so
