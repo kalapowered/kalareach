@@ -614,10 +614,12 @@ fn a_job_past_its_deadline_that_was_told_to_stop_is_given_time_to_stop() {
 }
 
 /// KR-REQ-22.11: the process gives a job whose stop its control thread has read the stop bound after
-/// the job's deadline, and no longer: a model that acknowledges the cancellation and never returns
-/// ends the process as overdue at that bound. Not a moment before, which the lower bound of the
-/// elapsed time shows (the process cannot end itself sooner than its own bound, whatever the load),
-/// and not never, which the wait for the end shows. It runs as long as the bound it holds.
+/// the job's deadline: a model that acknowledges the cancellation and never returns ends the process
+/// as overdue, and not before that bound, which the lower limit of the elapsed time shows (the
+/// process cannot end itself sooner than its own bound, whatever the load), and not never, which
+/// the wait for the end shows. The wait allows twice the bound so that a loaded host does not fail
+/// it, so the case does not hold how much later than the bound the process ends. It runs as long as
+/// the bound it holds.
 #[test]
 fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
     let placed = Placed::stub();

@@ -65,8 +65,9 @@ use crate::wire::{
 /// How long a process has to answer `hello`.
 pub const HANDSHAKE_MS: u64 = 10_000;
 
-/// How far past its own deadline a load may go before the process is ended, and how long after the
-/// request to stop a job a process that has not said it read the request is given.
+/// How far past its own deadline a load or a check of a file may go before the process is ended,
+/// and how long after the request to stop a job a process that has not said it read the request is
+/// given.
 pub const ANSWER_GRACE_MS: u64 = 2_000;
 
 /// How long a job whose control thread has said it has read a stop is given to answer, from the
@@ -84,6 +85,9 @@ pub const ANSWER_GRACE_MS: u64 = 2_000;
 /// The time counts from the request and not from the deadline. The daemon reads a clock that counts
 /// the time a Mac sleeps, and the process reads one that does not, so the daemon's first look after
 /// a sleep can be long after the deadline while the process has not had its own time to answer.
+/// A sleep after the request still counts against the process, since the daemon's clock moves and
+/// the process's does not: the first look after the wake ends a process whose answer has not
+/// arrived, at the cost of a failure of inference and a new load.
 pub const STOP_BOUND_MS: u64 = 30_000;
 
 /// How long a process has to say it has read a cancellation, and how long a load or a check of a
@@ -91,12 +95,13 @@ pub const STOP_BOUND_MS: u64 = 30_000;
 ///
 /// A job's cancellation is held to the first alone: the control thread says at once that it has
 /// read it, and the job's own answer is then bounded by the job's deadline and, for a stop that
-/// was read, [`STOP_BOUND_MS`] after it, and by the process's own watchdog, so a busy host that
-/// takes a moment to stop a job is not mistaken for a process that is not listening. A load and a
-/// check of a file lose nothing when the process is ended, so each is held to this bound for its
-/// own answer too. A process that said it had read the cancellation and then did not stop the load
-/// or the check is ended without a failure of inference ([`ProcessEnd::StopOverdue`]); one that did
-/// not say so is not listening, which is one ([`ProcessEnd::CancelUnanswered`]).
+/// was read, [`STOP_BOUND_MS`] after the request to stop it, and by the process's own watchdog, so
+/// a busy host that takes a moment to stop a job is not mistaken for a process that is not
+/// listening. A load and a check of a file lose nothing when the process is ended, so each is held
+/// to this bound for its own answer too. A process that said it had read the cancellation and then
+/// did not stop the load or the check is ended without a failure of inference
+/// ([`ProcessEnd::StopOverdue`]); one that did not say so is not listening, which is one
+/// ([`ProcessEnd::CancelUnanswered`]).
 pub const CANCEL_MS: u64 = 2_000;
 
 /// How often the process's resident set is read while it loads or runs a job.
@@ -276,8 +281,9 @@ struct Running {
 }
 
 impl Running {
-    /// Whether the control thread has said it has read the daemon's request, at the deadline, to
-    /// stop the job in hand.
+    /// Whether the control thread has said it has read a request to stop the job in hand, the
+    /// daemon's own at the deadline or any cancellation of the job: the process's watchdog gives the
+    /// job the stop bound in either case.
     fn job_stop_read(&self, id: u64) -> bool {
         self.job_stop
             .is_some_and(|stop| stop.id == id && stop.asked_at_ms.is_some() && stop.acknowledged)
@@ -291,9 +297,9 @@ impl Running {
     /// has read, the stop bound after the request. The request is made at the job's deadline, or at
     /// the daemon's first look after it, and the time the process is given counts from the request
     /// and not from the deadline, so that a look that comes late does not end a process before it
-    /// has had time to answer. A caller's cancellation that the control thread has read gives the
-    /// job the stop bound from its deadline, before the daemon has asked, as the process's watchdog
-    /// does.
+    /// has had time to answer. A cancellation of the job that the control thread has read, a
+    /// caller's for one, gives the job the stop bound from its deadline until the daemon has asked,
+    /// as the process's watchdog does.
     fn work_ends_at_ms(&self, due: Due) -> u64 {
         let Some(stop) = self.job_stop.filter(|stop| stop.id == due.id) else {
             return due.at_ms;
@@ -304,7 +310,7 @@ impl Running {
         } else {
             ANSWER_GRACE_MS
         };
-        due.at_ms.max(from.saturating_add(given))
+        from.saturating_add(given)
     }
 }
 
