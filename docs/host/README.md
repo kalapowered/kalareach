@@ -5484,9 +5484,12 @@ what it removes is exactly the thing a person cannot check for themselves.
   under file grants, and stopping it would stop the completion, test and review workflow under
   privacy mode; the "outboxes and captures" privacy mode fences are session content: output,
   descriptions and the queues that carry them off this host.
-* **Transfer previews and sync are not driven.** The transfer service keeps no preview store for
-  privacy mode to reach, and sync is the clients' own record; neither is one of the subsystems the
-  daemon takes through the steps.
+* **The transfer service and sync are not driven.** Neither is one of the subsystems the daemon
+  takes through the steps, and the worker's steps do not touch the transfer store. The transfer
+  service keeps each published attachment's file, the PNG thumbnail it made of an image and the text
+  of each draft, while the mode is on and after it, and privacy cleanup removes none of this. An
+  attachment goes by the transfer sweep, as the [transfer reference](../transfer/README.md) says, and
+  a paired device is refused `download.begin`. Sync is the clients' own record.
 * **The canonical grid keeps its scrollback.** Retention stops at the spool and the resident window;
   the projection's own history is not reached, because removing rows from it while keeping the live
   screen needs an interface the projection does not have.
@@ -5505,11 +5508,11 @@ what it removes is exactly the thing a person cannot check for themselves.
   `agent.approval.inspect` are not fenced by privacy mode: while the mode is on and after it, the
   local owner reads every question and the record of every interpreted approval, its original bytes
   included, and a device that holds `session.view` reads the questions and approvals its grant's
-  history reaches, and those its grant names while they are open. Nothing serves an alert's text to
-  a reader.
+  history reaches, and those its grant names while they are open. Only an exact repeat from the
+  same source reads an alert's text back.
 * **A receipt keeps its error message.** Cleanup takes out a settled receipt's intent envelope and
   result and leaves the message of its error, which can quote the upstream or the session. A device
-  is shown that message withheld, and the local owner reads it.
+  is shown that message withheld, and the local owner reads the message of its own receipts.
 
 ## Session names and descriptions
 
