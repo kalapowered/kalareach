@@ -3506,7 +3506,16 @@ impl Container {
                         String::from_utf8_lossy(&removed.stderr).trim()
                     ));
                 }
-                Err(why) => last = why,
+                Err(why) => {
+                    // A call that stalls and is answered the next time leaves no other trace, and
+                    // a stall of the runtime is what this evidence is for.
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "the removal of the container {} did not answer ({why}); asking again",
+                        self.name
+                    );
+                    last = why;
+                }
             }
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -3673,6 +3682,65 @@ fn a_removal_that_stalls_is_an_error_and_aborts_nothing_while_an_assertion_fails
     assert!(
         removals(directory.path()) > asked,
         "the unwinding case tried to remove it too"
+    );
+}
+
+/// A stand-in runtime whose first removal never answers and whose second is answered.
+fn stand_in_runtime_that_stalls_its_first_removal(directory: &Path) -> Runtime {
+    let text = directory.join("runtime.text");
+    std::fs::write(
+        &text,
+        format!(
+            r##"#!/bin/sh
+printf '%s\n' "$*" >>'{calls}'
+case "$1" in
+  rm) if [ "$(grep -c '^rm ' '{calls}')" -le 1 ]; then exec sleep {STAND_IN_STALL_SECONDS}; fi ;;
+  image) exit 1 ;;
+esac
+exit 0
+"##,
+            calls = directory.join("calls").display(),
+        ),
+    )
+    .expect("the stand-in runtime");
+    let program = directory.join("podman");
+    kr_ipc::testing::place_program(&text, &program);
+    Runtime {
+        program,
+        quick: STAND_IN_BOUND,
+        slow: STAND_IN_SLOW_BOUND,
+    }
+}
+
+/// Run by the case below as a process of its own: a container whose first removal stalls and whose
+/// second is answered.
+#[test]
+#[ignore = "run as a process of its own by a_removal_that_is_asked_again_leaves_a_line_on_standard_error"]
+fn a_removal_that_stalls_once_and_is_then_answered() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let _held = held_in(stand_in_runtime_that_stalls_its_first_removal(
+        directory.path(),
+    ));
+}
+
+/// A removal that stalls and is answered when it is asked again lets the case pass, and leaves a
+/// line on standard error that says the runtime did not answer, though the test harness holds back
+/// what a case that passes prints: without it a stall of the runtime on a removal leaves no trace.
+#[test]
+fn a_removal_that_is_asked_again_leaves_a_line_on_standard_error() {
+    let ran = this_binary_with(
+        &[
+            "--ignored",
+            "--exact",
+            "a_removal_that_stalls_once_and_is_then_answered",
+        ],
+        None,
+    );
+    assert!(ran.status.success(), "{}", ran.status);
+    let said = String::from_utf8_lossy(&ran.stderr);
+    assert!(
+        said.contains("did not answer") && said.contains("asking again"),
+        "{said}"
     );
 }
 

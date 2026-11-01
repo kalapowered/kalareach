@@ -232,7 +232,16 @@ impl Container {
             ) {
                 Ok(output) if output.status.success() => return Ok(()),
                 Ok(output) => return Err(printed(&output)),
-                Err(why) => last = why,
+                Err(why) => {
+                    // A call that stalls and is answered the next time leaves no other trace, and
+                    // a stall of the runtime is what this evidence is for.
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "the removal of the container {} did not answer ({why}); asking again",
+                        self.name
+                    );
+                    last = why;
+                }
             }
             std::thread::sleep(Duration::from_millis(200));
         }
