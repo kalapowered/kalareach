@@ -6670,25 +6670,32 @@ async fn a_delay_named_while_the_call_waits_on_the_service_holds_back_the_reques
     ));
     assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
 
-    // During the enrolment: the read of the storage state.
+    // During the enrolment: the read of the storage state. The read asks for the account's token as
+    // it begins, and the gate on the token is up when the enrolment goes, so a call that began it
+    // would wait there. Requests to the status route are not counted: a look of the helper that was
+    // cut can still reach the stand-in after the helper has returned.
     let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    until_the_carriers_first_pass_has_ended(&rig).await;
     let web = Arc::clone(rig.served.web());
     let made = rig.prepared_setup(archive_id(), false);
     web.fail(MANIFEST, 1, Moment::Slow);
     let call = rig.enable_in_the_background(&made.params);
     within("the enrolment", web.requests_reach(MANIFEST, 1)).await;
     the_service_names_a_delay_to_a_look_at_its_storage_state(&rig, delay).await;
-    let reads = web.requests_to(STATUS);
+    let gate = rig.controller.host_account().hold_token_requests();
     web.release_held();
+    let ended = tokio::select! {
+        ended = call => ended.expect("the call ends"),
+        () = until_a_request_waits_for_its_token(&rig) => {
+            panic!("the call began the read of the storage state while a delay is owed")
+        }
+    };
+    assert_eq!(rig.controller.host_account().token_requests_waiting(), 0);
+    drop(gate);
     assert!(matches!(
-        call.await.expect("the call ends"),
+        ended,
         BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
     ));
-    assert_eq!(
-        web.requests_to(STATUS),
-        reads,
-        "the storage state was not read"
-    );
 
     // During the read of the storage state: the retention change.
     let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
