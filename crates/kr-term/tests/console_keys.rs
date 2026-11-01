@@ -301,8 +301,9 @@ fn the_halves_of_a_character_are_kept_in_one_write() {
     assert!(hold.release().is_empty());
 }
 
-/// A half does not wait for more records than a character written to a console can have between
-/// its halves: a Shift held down after it repeats without end, and the hold would grow with it.
+/// A half is not held behind more records than a pair can have between its halves: a Shift held
+/// down after it repeats without end, and the hold would grow with it. The hold keeps the half and
+/// the 63 records after it, and lets go of the half with 64.
 #[test]
 fn a_half_is_not_held_behind_more_records_than_a_pair_can_have_between_its_halves() {
     let shift = KeyRecord {
@@ -315,16 +316,20 @@ fn a_half_is_not_held_behind_more_records_than_a_pair_can_have_between_its_halve
     };
     let mut hold = PairHold::new();
     let mut within = vec![high()];
-    within.extend(std::iter::repeat_n(shift, 10));
+    within.extend(std::iter::repeat_n(shift, 63));
     assert!(
         hold.take(&within).is_empty(),
-        "a few modifiers do not end the wait"
+        "the half and 63 modifiers are held"
     );
     assert_eq!(hold.release(), within);
 
     let mut beyond = vec![high()];
-    beyond.extend(std::iter::repeat_n(shift, 100));
-    assert_eq!(hold.take(&beyond), beyond, "a hundred of them do");
+    beyond.extend(std::iter::repeat_n(shift, 64));
+    assert_eq!(
+        hold.take(&beyond),
+        beyond,
+        "the half and 64 of them are not"
+    );
     assert!(hold.release().is_empty());
 }
 

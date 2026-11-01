@@ -276,7 +276,7 @@ impl RecordReader {
     /// keystroke could not dispatch either of them honestly. The first half of a character outside
     /// the basic plane that ends a run of keys waits for the keys that complete it, across a mouse,
     /// resize, focus or menu record if one comes between, and goes out as it was with the next key
-    /// that spells something.
+    /// that spells something, or when the half and what follows it pass the hold's bound.
     ///
     /// # Errors
     ///
