@@ -6525,7 +6525,7 @@ mod tests {
     /// exited with and whether or not its output was read to its end. The stand-in answers and
     /// ends, with a failure and then with success, and the poll that finds it ended comes when the
     /// time is used up (the case has the time read as used up from the loop's first look at it,
-    /// and the output is read by the real clock, far inside the time). A refusal made on the exit
+    /// and the output is read by the standing clock, far inside the time). A refusal made on the exit
     /// code would blame the program, with the step to install Git, and a success would be
     /// accepted, for an exit that this host saw only after its time.
     ///
@@ -6779,15 +6779,52 @@ mod tests {
         );
     }
 
-    /// A pipe with no process behind it: the end a probe's output is read from, and the end a case
-    /// writes to and closes.
+    /// A pipe with no process behind it: the end a probe's output is read from, the end a case
+    /// writes to and closes, and a second read end of the pipe, for the case to ask whether the
+    /// first has been told that no writer is left ([`close_and_wait_for_the_end`]).
     #[cfg(unix)]
-    fn a_pipe_without_a_process() -> (std::process::ChildStdout, std::io::PipeWriter) {
+    fn a_pipe_without_a_process() -> (
+        std::process::ChildStdout,
+        std::io::PipeWriter,
+        std::io::PipeReader,
+    ) {
         let (reader, writer) = std::io::pipe().expect("a pipe");
+        let watch = reader.try_clone().expect("a second read end");
         (
             std::process::ChildStdout::from(std::os::fd::OwnedFd::from(reader)),
             writer,
+            watch,
         )
+    }
+
+    /// Closes the writing end of a pipe from [`a_pipe_without_a_process`] and returns once its
+    /// readers are told that no writer is left. That is not the moment this end is closed: a
+    /// process that another thread of the test program is starting holds a copy of it until the
+    /// process runs its program. The pipe has been made to read without blocking, by `Heard::of`,
+    /// and the second read end shares that, so this asks again until it is told. It counts asks
+    /// and not seconds, so a machine that is stopped cannot trip it.
+    #[cfg(unix)]
+    fn close_and_wait_for_the_end(writer: std::io::PipeWriter, watch: &mut std::io::PipeReader) {
+        use std::io::Read as _;
+
+        drop(writer);
+        let mut buffer = [0_u8; 256];
+        for _ in 0..30_000 {
+            match watch.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("the pipe could not be watched: {error}"),
+            }
+        }
+        panic!("the last writer of the pipe never let go of it");
     }
 
     /// Drains the output of a pipe that has said something and has not ended, with the probe's time
@@ -6805,7 +6842,7 @@ mod tests {
         use std::io::Write as _;
 
         let clock = StandingClock::start();
-        let (pipe, mut said) = a_pipe_without_a_process();
+        let (pipe, mut said, mut watch) = a_pipe_without_a_process();
         said.write_all(b"/a/helper/directory\n")
             .expect("something is said");
         let mut heard = Heard::of(Some(pipe)).expect("the pipe is read without blocking");
@@ -6815,7 +6852,7 @@ mod tests {
             let clock = clock.handle();
             stall.set(Some(Box::new(move |limits| {
                 held.set(Some(limits));
-                drop(said);
+                close_and_wait_for_the_end(said, &mut watch);
                 clock.advance_to(limits.second + after_the_second);
             })));
         });
@@ -6933,14 +6970,14 @@ mod tests {
     #[test]
     fn a_read_that_returns_after_the_probes_time_does_not_blame_the_program() {
         let clock = StandingClock::start();
-        let (pipe, said) = a_pipe_without_a_process();
+        let (pipe, said, mut watch) = a_pipe_without_a_process();
         let mut heard = Heard::of(Some(pipe)).expect("the pipe is read without blocking");
         let held = std::rc::Rc::new(std::cell::Cell::new(None));
         BEFORE_THE_NEXT_POLL.with(|stall| {
             let held = std::rc::Rc::clone(&held);
             let clock = clock.handle();
             stall.set(Some(Box::new(move |limits: Limits| {
-                drop(said);
+                close_and_wait_for_the_end(said, &mut watch);
                 clock.advance_to(limits.second);
                 // The next poll begins now, inside the probe's time, and its read returns after it.
                 AFTER_THE_READ.with(|pause| {
@@ -6987,7 +7024,7 @@ mod tests {
         use std::io::Write as _;
 
         let clock = StandingClock::start();
-        let (pipe, mut writer) = a_pipe_without_a_process();
+        let (pipe, mut writer, _watch) = a_pipe_without_a_process();
         writer.write_all(b"x").expect("one byte more is said");
         let mut heard = Heard::of(Some(pipe)).expect("the pipe is read without blocking");
         heard.seen.bytes = vec![b'x'; PROBE_OUTPUT_LIMIT];
