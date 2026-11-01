@@ -2703,6 +2703,87 @@ mod tests {
         assert_eq!(unread, vec!["12".to_owned()]);
     }
 
+    /// The code of this module, without the lines that are comments, which quote the words.
+    fn code_without_comments() -> String {
+        include_str!("windows.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the code of this module")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The code of the submodule `name` in `code`.
+    fn section_of<'a>(code: &'a str, name: &str) -> &'a str {
+        code.split(&format!("\nmod {name} {{"))
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .unwrap_or_else(|| panic!("the code of {name}"))
+    }
+
+    /// How many calls in `calls` refuse a command the Task Scheduler ran, when every one of them
+    /// writes its words with one of the functions beside the markers; otherwise the first that
+    /// does not.
+    fn refusals_in(calls: &str) -> Result<usize, String> {
+        let mut refusals = 0;
+        for (at, _) in calls.match_indices("refused(") {
+            let named = calls[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|before| before.is_alphanumeric() || before == '_');
+            if named {
+                continue;
+            }
+            if calls[..at].ends_with("fn ") {
+                let body = calls[at..].split("\n    }\n").next().expect("its body");
+                if !body.contains("format!(\"{what}: ") {
+                    return Err(format!("the refusal begins with its words: {body}"));
+                }
+                continue;
+            }
+            let words = calls[at + "refused(".len()..]
+                .split_once(',')
+                .expect("the question that was asked")
+                .1
+                .trim_start();
+            let first_line = words.lines().next().unwrap_or_default();
+            let Some(call) = [
+                "&did_not_register(",
+                "&did_not_remove(",
+                "&could_not_list(",
+                "&could_not_list_tasks(",
+            ]
+            .into_iter()
+            .find(|shared| words.starts_with(shared)) else {
+                return Err(format!(
+                    "a refusal is written with words of its own: {first_line}"
+                ));
+            };
+            // The value of the call is the whole of the argument: only the comma that ends the
+            // argument follows the call's closing parenthesis.
+            let mut open = 1_usize;
+            let end = words[call.len()..]
+                .char_indices()
+                .find_map(|(at, character)| {
+                    match character {
+                        '(' => open += 1,
+                        ')' => open -= 1,
+                        _ => {}
+                    }
+                    (open == 0).then_some(call.len() + at + 1)
+                });
+            if !end.is_some_and(|end| words[end..].trim_start().starts_with(',')) {
+                return Err(format!(
+                    "the words of a refusal are changed after the call that writes them: {first_line}"
+                ));
+            }
+            refusals += 1;
+        }
+        Ok(refusals)
+    }
+
     /// The Task Scheduler's refusals that a paired device is told by their reason are known to the
     /// device rule by the words their functions write, and the calls that make them run only on
     /// Windows, where no case of another platform reaches them. So the source is read: each call
@@ -2712,22 +2793,8 @@ mod tests {
     /// after it, which can hold an account's name, would reach a device.
     #[test]
     fn the_calls_to_the_task_scheduler_write_their_refusals_with_the_words_of_the_markers() {
-        let source = include_str!("windows.rs");
-        // The code of this module, without the lines that are comments, which quote the words.
-        let code = source
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("the code of this module")
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let section = |name: &str| {
-            code.split(&format!("\nmod {name} {{"))
-                .nth(1)
-                .and_then(|rest| rest.split("\n}\n").next())
-                .unwrap_or_else(|| panic!("the code of {name}"))
-        };
+        let code = code_without_comments();
+        let section = |name: &str| section_of(&code, name);
 
         // The words of each marker are in the code once, in the constant that holds them.
         for (name, words) in [
@@ -2750,44 +2817,9 @@ mod tests {
         // Each failure of a command the scheduler ran is written by one of the functions, and the
         // refusal puts those words first.
         let calls = section("platform");
-        let mut refusals = 0;
-        for (at, _) in calls.match_indices("refused(") {
-            let named = calls[..at]
-                .chars()
-                .next_back()
-                .is_some_and(|before| before.is_alphanumeric() || before == '_');
-            if named {
-                continue;
-            }
-            if calls[..at].ends_with("fn ") {
-                let body = calls[at..].split("\n    }\n").next().expect("its body");
-                assert!(
-                    body.contains("format!(\"{what}: "),
-                    "the refusal begins with its words: {body}"
-                );
-                continue;
-            }
-            let words = calls[at + "refused(".len()..]
-                .split_once(',')
-                .expect("the question that was asked")
-                .1
-                .trim_start();
-            assert!(
-                [
-                    "&did_not_register(",
-                    "&did_not_remove(",
-                    "&could_not_list(",
-                    "&could_not_list_tasks(",
-                ]
-                .iter()
-                .any(|shared| words.starts_with(shared)),
-                "a refusal is written with words of its own: {}",
-                words.lines().next().unwrap_or_default()
-            );
-            refusals += 1;
-        }
         assert_eq!(
-            refusals, 4,
+            refusals_in(calls),
+            Ok(4),
             "the calls that refuse a command the scheduler ran"
         );
 
@@ -2802,6 +2834,30 @@ mod tests {
             section("launching").contains("task_differs("),
             "a launch that finds the task differing says so with the shared words"
         );
+    }
+
+    /// The device rule knows a refusal by the exact words of its marker, so the value of the
+    /// function that writes them reaches the refusal as it is. A call that changes it, here by
+    /// lower-casing the words or cutting them, writes words the rule no longer knows.
+    #[test]
+    fn a_refusal_whose_shared_words_are_changed_after_the_call_is_not_the_shared_words() {
+        let code = code_without_comments();
+        let calls = section_of(&code, "platform");
+        assert_eq!(refusals_in(calls), Ok(4), "the calls as they are");
+        for (call, changed) in [
+            ("&did_not_register(&definition.name)", ".to_lowercase()"),
+            ("&did_not_remove(&definition.name)", ".trim_end()"),
+        ] {
+            let mutated = calls.replacen(call, &format!("{call}{changed}"), 1);
+            assert_ne!(
+                mutated, calls,
+                "{call} is a call in the code of the platform"
+            );
+            assert!(
+                refusals_in(&mutated).is_err(),
+                "a refusal written with {call}{changed} is not written with the shared words"
+            );
+        }
     }
 
     /// KR-REQ-07.58: a process the kernel does not establish is read by what this account can read
