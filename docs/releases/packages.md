@@ -486,7 +486,7 @@ Windows release tree carries the PowerShell package as plain files that `kr-rele
 repository's, and no step of its workflow requalifies it. No release workflow reads the core
 workflow's result for the commit it builds.
 
-A package whose fourteen days pass without a requalified build is flagged in the register, a row of
+A package whose fourteen days pass with no published release that carries a requalified build is flagged in the register, a row of
 `docs/shell-integration/upstream.md` that no code reads, and the flag names the choices rather than
 leaving a stale package as a silent default: keep the pinned package, which a session does when the
 person selects nothing, run that
