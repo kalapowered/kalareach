@@ -145,9 +145,10 @@ suites=(
 )
 
 # The network suite starts a worker process, and the only place it can look for one is beside its
-# own binary. Building it first is what makes the suite run rather than say it could not.
-echo "building the worker the suites launch"
-CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build -p kr-worker --bin kr-worker
+# own binary. Building it first is what makes the suite run rather than say it could not. The kill
+# suite also starts the built `kr attach` and its guard, which are looked for the same way.
+echo "building the programs the suites launch"
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build -p kr-worker --bin kr-worker -p kr-cli --bin kr --bin kr-attach-guard
 # The build is started once, now, and waited for, before any suite's deadline counts. The operating
 # system checks a newly written executable the first time it starts, which on a loaded machine can
 # take long enough to spend a create's rendezvous. The check is made again for every new copy, so

@@ -711,7 +711,19 @@ impl Host {
 
     /// The session's state as its worker answers it to a connection that attaches to nothing, so
     /// that asking leaves every terminal's stream as it was.
+    ///
+    /// The connection, the worker's proof of its descriptor and the snapshot are one wait, bounded
+    /// as a whole: a worker that holds the connection open and never answers fails here, naming the
+    /// step, and does not hold the caller's own deadline off.
     async fn snapshot_of(&self, session_id: SessionId) -> EventsSnapshotResult {
+        tokio::time::timeout(LIVENESS, self.read_snapshot_of(session_id))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("waited {LIVENESS:?} for the worker to answer the snapshot of its session")
+            })
+    }
+
+    async fn read_snapshot_of(&self, session_id: SessionId) -> EventsSnapshotResult {
         let descriptor = kr_ipc::descriptor::read_all(&self.environment())
             .expect("reads the runtime directory")
             .into_iter()
@@ -762,6 +774,23 @@ impl Host {
             );
         }
         let kr = programs.join("kr");
+        // The guard is the program `kr attach` hands the terminal to, and the two must be of one
+        // build: a guard of another release restores a terminal by another release's rules.
+        let version_of = |name: &str| {
+            let said = std::process::Command::new(programs.join(name))
+                .arg("--version")
+                .env_clear()
+                .output()
+                .expect("the program says its version");
+            let said = String::from_utf8_lossy(&said.stdout).trim().to_owned();
+            said.split_once(' ')
+                .map_or_else(|| said.clone(), |(_, rest)| rest.to_owned())
+        };
+        assert_eq!(
+            version_of("kr"),
+            version_of("kr-attach-guard"),
+            "`kr` and its guard are of different builds; build both with `cargo build -p kr-cli`"
+        );
         let pty = portable_pty::native_pty_system()
             // The session's own size: a terminal of another size is drawn a window of the screen,
             // and every terminal of the session is then sent screens in place of the application's
