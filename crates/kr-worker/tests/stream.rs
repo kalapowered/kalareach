@@ -1790,9 +1790,9 @@ async fn kr_req_12_06_a_conversation_another_execution_owns_is_never_published()
         "the owned conversation is not published"
     );
     assert!(
-        world
-            .waiting()
-            .is_some_and(|reason| reason.contains("cannot be bound")),
+        world.waiting().is_some_and(|reason| {
+            reason.starts_with(&format!("{}: ", kr_worker::broker::CONVERSATION_NOT_BOUND))
+        }),
         "{:?}",
         world.waiting()
     );

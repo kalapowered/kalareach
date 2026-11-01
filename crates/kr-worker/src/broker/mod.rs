@@ -348,6 +348,12 @@ impl Binding {
 pub const THREAD_NOT_READ: &str = "the terminal's conversation is not read from its stream, so \
                                    which thread it has selected is unknown";
 
+/// How the reason rich mutations wait begins when the conversation the terminal selected cannot be
+/// taken, because another live execution owns it or for another cause, which follows after a
+/// colon.
+pub const CONVERSATION_NOT_BOUND: &str =
+    "the conversation the terminal selected cannot be bound here";
+
 /// What the broker holds that says what a session's application is doing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ApplicationFacts {

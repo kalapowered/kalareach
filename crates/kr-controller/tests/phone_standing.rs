@@ -301,23 +301,25 @@ async fn the_reason_rich_mutations_wait_reaches_the_owner_whole_and_a_device_by_
     // so meets nothing that holds the reason back.
     let mut owner = worker.client().await;
 
+    // The words the worker begins the refusal to take a conversation with, which are its own.
+    let not_bound = kr_worker::broker::CONVERSATION_NOT_BOUND;
     for (reason, device_is_told) in [
         // A reason the host does not know.
         (
-            "could not lock /Users/marguerite/.codex/sessions/0193.lock: held by another process",
-            "rich mutations are suspended",
+            "could not lock /Users/marguerite/.codex/sessions/0193.lock: held by another process"
+                .to_owned(),
+            "rich mutations are suspended".to_owned(),
         ),
         // The worker's refusal to take a conversation, which quotes what stopped it.
         (
-            "the conversation the terminal selected cannot be bound here: could not lock \
-             /Users/marguerite/.codex/sessions/0193.lock",
-            "the conversation the terminal selected cannot be bound here; ",
+            format!("{not_bound}: could not lock /Users/marguerite/.codex/sessions/0193.lock"),
+            format!("{not_bound}; "),
         ),
     ] {
         worker
             .service
             .broker()
-            .suspend_rich_mutations(instance, reason)
+            .suspend_rich_mutations(instance, &reason)
             .expect("the instance is registered");
 
         let owners: AgentCapabilitiesResult = owner
@@ -330,7 +332,7 @@ async fn the_reason_rich_mutations_wait_reaches_the_owner_whole_and_a_device_by_
         assert!(owners.binding.rich_mutations_suspended);
         assert_eq!(
             owners.binding.suspension_reason.0.as_deref(),
-            Some(reason),
+            Some(reason.as_str()),
             "the owner is told the reason as the worker wrote it"
         );
 
@@ -348,7 +350,9 @@ async fn the_reason_rich_mutations_wait_reaches_the_owner_whole_and_a_device_by_
             .clone()
             .expect("a device is told that the mutations wait for a reason");
         assert!(
-            told.starts_with(device_is_told) && !told.contains("marguerite") && !told.contains('/'),
+            told.starts_with(&device_is_told)
+                && !told.contains("marguerite")
+                && !told.contains('/'),
             "{told}"
         );
         assert_eq!(

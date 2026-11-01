@@ -50,7 +50,7 @@ use crate::broker::connectors::DECISION_SCHEMA;
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::gateway::{identifier_of, member_at};
 use crate::broker::ledger::TransitionCause;
-use crate::broker::{Broker, BrokerState, OnStoreFault, THREAD_NOT_READ};
+use crate::broker::{Broker, BrokerState, CONVERSATION_NOT_BOUND, OnStoreFault, THREAD_NOT_READ};
 use kr_protocol::gateway::DownstreamRequestId;
 
 /// Why rich mutations wait while a request of the terminal's that selects or leaves a conversation
@@ -327,9 +327,7 @@ impl BrokerState {
                     // never published as this instance's binding: the binding becomes none, and
                     // the instance says why it waits.
                     let _ = self.advance_binding(application_instance_id, None, now);
-                    refusal = Some(format!(
-                        "the conversation the terminal selected cannot be bound here: {error}"
-                    ));
+                    refusal = Some(format!("{CONVERSATION_NOT_BOUND}: {error}"));
                     if let Some(instance) = self.instances.get_mut(&application_instance_id)
                         && let Some(left) = current.as_ref()
                     {

@@ -173,8 +173,9 @@ const RICH_MUTATIONS_SUSPENDED: &str = kr_worker::broker::error::MUTATIONS_SUSPE
 /// sent.
 const SUSPENDED_BY: &str = "rich mutations are suspended";
 
-/// What the worker says before why it could not take the conversation the terminal selected.
-const CONVERSATION_NOT_BOUND: &str = "the conversation the terminal selected cannot be bound here";
+/// What the worker says before why it could not take the conversation the terminal selected: the
+/// wording the worker writes it with, so a change there is a change here.
+const CONVERSATION_NOT_BOUND: &str = kr_worker::broker::CONVERSATION_NOT_BOUND;
 
 /// What the worker says after the method of a request that its connector's table does not
 /// classify, and what a device is told in place of the method and those words.
@@ -2414,10 +2415,15 @@ mod tests {
     #[test]
     fn why_rich_mutations_wait_is_told_to_a_device_without_what_the_host_or_the_upstream_put_in_it()
     {
+        // The failed lock is worded as the worker words the refusal to take a conversation.
+        assert!(
+            A_CONVERSATION_LOCK_THAT_FAILED.starts_with(&format!("{CONVERSATION_NOT_BOUND}: ")),
+            "{A_CONVERSATION_LOCK_THAT_FAILED}"
+        );
         for (reason, kind) in [
             (
                 A_CONVERSATION_LOCK_THAT_FAILED.to_owned(),
-                "the conversation the terminal selected cannot be bound here",
+                CONVERSATION_NOT_BOUND,
             ),
             // An upstream's method, quoted whole: a bare name, an address, a command.
             (
@@ -2464,7 +2470,7 @@ mod tests {
     #[test]
     fn why_rich_mutations_wait_is_told_as_it_is_when_the_host_wrote_it_and_it_names_nothing() {
         let held_elsewhere = format!(
-            "the conversation the terminal selected cannot be bound here: {}",
+            "{CONVERSATION_NOT_BOUND}: {}",
             kr_worker::broker::BrokerError::ConversationHeldElsewhere
         );
         for reason in [
