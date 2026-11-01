@@ -11,11 +11,6 @@
 //! origin from [`kr_sync_integration::ORIGIN_VARIABLE`] and run against a local deployment or a
 //! deployed one alike; `scripts/e2e-backup.sh` runs them on a local Worker.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-20.11 and KR-REQ-18.05, the settings part: revocation | `a_device_taken_out_while_another_is_away_is_answered_as_missing_and_the_other_seals_again_under_the_new_epoch` |
-//! | KR-REQ-20.13 and KR-REQ-18.05, across devices | `two_devices_that_change_a_setting_from_one_revision_keep_both_and_neither_is_chosen_by_a_clock` |
-//!
 //! # What they leave
 //!
 //! Against a deployment: the collections the devices made, with the objects they wrote, owned by

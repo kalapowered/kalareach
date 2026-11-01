@@ -13,11 +13,6 @@
 //! issued for the restore alone, `backup.restore`, which is what a device restoring from the kit
 //! is. The run's token file names both for each origin ([`kr_backup_integration::TOKENS_VARIABLE`]).
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-ACC-033, KR-REQ-20.18 and KR-REQ-20.19 against a service | `a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin` |
-//! | KR-REQ-20.18 several services, KR-REQ-20.19 a lost service | `a_kit_naming_two_services_reads_the_bundle_at_either`, then, once the first service is gone, `with_one_service_gone_the_same_kit_still_reads_at_the_other` |
-//!
 //! # What they leave
 //!
 //! Against a deployment: the bundle collection at the run's locator, owned by the account whose
@@ -210,6 +205,12 @@ fn collection_of(origin: &str, locator: &str) -> String {
 /// KR-REQ-20.18, the part about a bundle update that adds a trusted writer key: it uses the stable
 /// locator, and the kit already printed reads it. Not shown here: the kit's version and checksum,
 /// several services, the offline export, or a stale write refused.
+///
+/// KR-REQ-20.19, the part about a restore that authenticates the bundle with the kit: a new
+/// installation holding the kit, the origin and the account's token finds and authenticates the
+/// bundle, and the same bytes served under another locator or from another origin fail
+/// authentication and bring in no writer. Not shown here: a service or collection migration, or an
+/// updated kit after one.
 #[tokio::test]
 async fn a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin() {
     let Some(deployment) = Deployment::from_environment() else {
