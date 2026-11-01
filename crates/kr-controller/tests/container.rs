@@ -263,7 +263,7 @@ impl Container {
     /// [`Container::remove`], writing the line for a call that gave no answer to `told`.
     fn remove_telling(&self, told: &mut dyn std::io::Write) -> Result<(), String> {
         let until = Instant::now() + self.runtime.removal;
-        let mut last = String::new();
+        let mut last: String;
         let mut left = self.runtime.removal;
         loop {
             match self.runtime.within(
