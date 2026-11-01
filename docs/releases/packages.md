@@ -239,8 +239,10 @@ never published from origin and from every clone, and tag the corrected commit.
 
 The package publishes every type of the schema, and a client built from one release meets a host of
 another across a level move. Until public 1.0 freezes, which happens at the first client release
-(a host, command line, desktop or mobile build published for people to install), the public
-contract may change with a level move.
+(a host, command line, desktop or mobile build published for people to install on the production
+channel or in a store), the public contract may change with a level move. A pre-release on the
+tester channel, such as the `host/v*` pre-releases of the macOS and Linux hosts, is not a client
+release and freezes nothing.
 
 `kr-protocol-gen --public-contract` compares the commit's whole schema, every definition a root,
 with the releases a client may have been built from, and reports what an earlier reader cannot read.
