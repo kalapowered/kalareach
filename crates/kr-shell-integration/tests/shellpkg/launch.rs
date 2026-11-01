@@ -11,8 +11,7 @@ use kr_protocol::scalars::Uuid;
 use kr_shell_integration::contract::events::BridgeEvent;
 use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::contract::requests::{
-    BridgeAnswer, LaunchDecision, LaunchMailboxRequest, LaunchRejectionReason, LaunchTransactionId,
-    WorkerRequest,
+    LaunchDecision, LaunchMailboxRequest, LaunchRejectionReason, LaunchTransactionId,
 };
 
 use super::commands::{Probes, a_session_with_probes_and};
@@ -40,7 +39,7 @@ fn launch_vector_at(
     vector: Vec<String>,
     transaction_seed: u8,
 ) -> LaunchDecision {
-    let id = session.ask(WorkerRequest::Launch(LaunchMailboxRequest {
+    session.launched(LaunchMailboxRequest {
         session_id: session.session_id,
         transaction: LaunchTransactionId::new(Uuid::from_bytes([transaction_seed; 16])),
         fence_id: fence.fence_id,
@@ -49,11 +48,7 @@ fn launch_vector_at(
         expected_buffer_revision: enter.editor.buffer_revision,
         expected_cwd_revision: enter.cwd_revision,
         deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
-    }));
-    let BridgeAnswer::Launch(decision) = session.answer(id) else {
-        panic!("the reader answered a launch with something else")
-    };
-    decision
+    })
 }
 
 /// Launches `vector` at the next fenced prompt, and returns the reader's decision.

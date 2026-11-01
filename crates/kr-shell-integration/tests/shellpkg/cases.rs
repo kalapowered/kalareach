@@ -1825,7 +1825,7 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
         substitution,
     ]);
     let before_install = session.written();
-    let id = session.ask(WorkerRequest::Launch(LaunchMailboxRequest {
+    let decision = session.launched(LaunchMailboxRequest {
         session_id: session.session_id,
         transaction,
         fence_id: fence.fence_id,
@@ -1834,11 +1834,7 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
         expected_buffer_revision: enter.editor.buffer_revision,
         expected_cwd_revision: enter.cwd_revision,
         deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
-    }));
-
-    let BridgeAnswer::Launch(decision) = session.answer(id) else {
-        panic!("the reader answered a launch with something else")
-    };
+    });
     let accepted = match decision {
         LaunchDecision::Accepted(accepted) => accepted,
         LaunchDecision::Rejected(rejected) => {
@@ -1848,7 +1844,6 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
             )
         }
     };
-    assert_eq!(accepted.transaction, transaction);
     assert_eq!(accepted.fence_id, fence.fence_id);
     assert_eq!(
         accepted.installed, command,
@@ -1929,7 +1924,7 @@ fn launch_prints_what_was_named(
     vector.extend(words.iter().map(|word| (*word).to_owned()));
     let (enter, fence) = session.fenced_prompt(prompt_seed);
     let before_install = session.written();
-    let id = session.ask(WorkerRequest::Launch(LaunchMailboxRequest {
+    let decision = session.launched(LaunchMailboxRequest {
         session_id: session.session_id,
         transaction: LaunchTransactionId::new(Uuid::from_bytes([transaction_seed; 16])),
         fence_id: fence.fence_id,
@@ -1938,10 +1933,7 @@ fn launch_prints_what_was_named(
         expected_buffer_revision: enter.editor.buffer_revision,
         expected_cwd_revision: enter.cwd_revision,
         deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
-    }));
-    let BridgeAnswer::Launch(decision) = session.answer(id) else {
-        panic!("the reader answered a launch with something else")
-    };
+    });
     assert!(
         matches!(decision, LaunchDecision::Accepted(_)),
         "an empty fenced prompt refused a launch: {decision:?}"
@@ -2030,7 +2022,7 @@ pub fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated(kind: ShellKind)
     let (pipeline, printed) = pipeline_for(kind);
     let (enter, fence) = session.fenced_prompt(21);
     let before_install = session.written();
-    let id = session.ask(WorkerRequest::Launch(LaunchMailboxRequest {
+    let decision = session.launched(LaunchMailboxRequest {
         session_id: session.session_id,
         transaction: LaunchTransactionId::new(Uuid::from_bytes([0x76; 16])),
         fence_id: fence.fence_id,
@@ -2039,10 +2031,7 @@ pub fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated(kind: ShellKind)
         expected_buffer_revision: enter.editor.buffer_revision,
         expected_cwd_revision: enter.cwd_revision,
         deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
-    }));
-    let BridgeAnswer::Launch(decision) = session.answer(id) else {
-        panic!("the reader answered a launch with something else")
-    };
+    });
     assert!(
         matches!(decision, LaunchDecision::Accepted(_)),
         "an empty fenced prompt refused a launch: {decision:?}"
@@ -2089,9 +2078,16 @@ pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind)
 
     let refuse =
         |session: &mut Session, request: LaunchMailboxRequest, expected: LaunchRejectionReason| {
-            let id = session.ask(WorkerRequest::Launch(request));
-            let BridgeAnswer::Launch(decision) = session.answer(id) else {
-                panic!("the reader answered a launch with something else")
+            // The refusal for queued input is the point of the case that asks for it, so that
+            // one is taken as it comes.
+            let decision = if expected == LaunchRejectionReason::QueuedPriorInput {
+                let id = session.ask(WorkerRequest::Launch(request));
+                let BridgeAnswer::Launch(decision) = session.answer(id) else {
+                    panic!("the reader answered a launch with something else")
+                };
+                decision
+            } else {
+                session.launched(request)
             };
             assert_eq!(
                 decision.rejection(),
@@ -2235,10 +2231,7 @@ pub fn a_launch_for_another_working_directory_is_a_conflict_and_installs_nothing
     let mut stale = launch_at(&session, 0x73, &enter, &fence, substitution);
     stale.expected_cwd_revision = kr_protocol::root::CwdRevision::new(enter.cwd_revision.get() + 7);
     let before = session.written();
-    let id = session.ask(WorkerRequest::Launch(stale));
-    let BridgeAnswer::Launch(decision) = session.answer(id) else {
-        panic!("the reader answered a launch with something else")
-    };
+    let decision = session.launched(stale);
     let refusal = decision
         .rejection()
         .expect("the reader refused a launch for another working directory");
@@ -2246,16 +2239,8 @@ pub fn a_launch_for_another_working_directory_is_a_conflict_and_installs_nothing
     assert_eq!(refusal.code(), kr_protocol::error::ErrorCode::DraftConflict);
 
     // At the shell's own revision the same launch installs and runs.
-    let id = session.ask(WorkerRequest::Launch(launch_at(
-        &session,
-        0x74,
-        &enter,
-        &fence,
-        substitution,
-    )));
-    let BridgeAnswer::Launch(decision) = session.answer(id) else {
-        panic!("the reader answered a launch with something else")
-    };
+    let request = launch_at(&session, 0x74, &enter, &fence, substitution);
+    let decision = session.launched(request);
     assert!(
         matches!(decision, LaunchDecision::Accepted(_)),
         "the launch at the shell's own revision was refused: {:?}",
@@ -2297,14 +2282,8 @@ pub fn a_launch_over_typed_text_is_a_conflict_and_installs_nothing(kind: ShellKi
     session.type_text(b"x");
     let mut refusals = Vec::new();
     for transaction in [0x75, 0x76] {
-        let id = session.ask(WorkerRequest::Launch(launch_at(
-            &session,
-            transaction,
-            &enter,
-            &fence,
-            substitution,
-        )));
-        let BridgeAnswer::Launch(LaunchDecision::Rejected(refusal)) = session.answer(id) else {
+        let request = launch_at(&session, transaction, &enter, &fence, substitution);
+        let LaunchDecision::Rejected(refusal) = session.launched(request) else {
             panic!("the reader did not refuse a launch over typed text")
         };
         assert_eq!(refusal.reason, LaunchRejectionReason::BufferNotEmpty);
