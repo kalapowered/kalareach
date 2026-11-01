@@ -321,7 +321,7 @@ pub enum Handled {
     /// The service has not begun on the request: it does when it is released, and answers then.
     /// The count is as for [`Handled::Held`].
     Gated(u64),
-    /// The service acted on the request and gives its answer when it is released.
+    /// The service has its answer to the request and gives it when it is released.
     Slow(u64, ServiceHttpAnswer),
 }
 
