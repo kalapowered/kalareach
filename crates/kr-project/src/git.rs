@@ -5923,6 +5923,50 @@ mod tests {
         );
     }
 
+    /// The time a probe is given can run out while its output is waited for: the probe has ended,
+    /// and what it wrote has no end yet. That is the clock and not the program, so the refusal is a
+    /// fault that passes, which a client sends the request again after, and not the refusal of a
+    /// program that is not Git, which ends with the step that installs it. The pipe here is held
+    /// open and has said something, as a process that outlived the probe leaves it, and the time
+    /// is far shorter than the wait the drain is given, so the time is what ends the wait.
+    #[cfg(unix)]
+    #[test]
+    fn a_probes_time_that_runs_out_while_its_output_is_awaited_is_a_fault_that_passes() {
+        use std::io::Write as _;
+
+        let mut holder = std::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat holds a pipe open for as long as its input is");
+        let mut said = holder.stdin.take().expect("cat's input");
+        said.write_all(b"git version 2.50.1\n")
+            .expect("something is said");
+        let mut heard = Heard::of(holder.stdout.take()).expect("the pipe is read without blocking");
+
+        let outcome = drain(
+            &mut heard,
+            "git --version",
+            Instant::now() + Duration::from_millis(200),
+        );
+
+        // cat ends when its input does, and the pipe it held goes with it.
+        drop(said);
+        holder.wait().expect("cat ends");
+        let Err(Asked::Overran(refusal)) = outcome else {
+            panic!("a pipe still open when the time runs out is not the end of an answer");
+        };
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::UpstreamUnavailable
+        );
+        assert!(refusal.code().retry_category().permits_automatic_retry());
+    }
+
     #[test]
     fn a_look_whose_request_stops_is_ended_for_every_request_waiting_for_it() {
         let installation = Installation::looked_for_on(None, PROBE_BOUND);
