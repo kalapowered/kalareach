@@ -525,9 +525,10 @@ The frames this release reads from or writes to a host that another release star
 it presents to its launcher, the acknowledgement, the descriptor file, and the `hello` and `verify`
 requests and their answers. They are recorded from the real program of the release before, under
 `crates/kr-protocol/retained/<level>/plugin-host-frames.json`, and the protocol keeps no other
-reader of an earlier version. A change to a released protocol takes a new name: a request, a
-response or notice variant, or a member added to any record of it after a release exists would meet
-a host or a worker of that release, which the level records by the protocol's name alone.
+reader of an earlier version. A change to a released protocol would need a new name, which no release can make today (a
+retained level must record this release's protocol name): a request, a response or notice variant,
+or a member added to any record of it after a release exists would meet a host or a worker of that
+release, which the level records by the protocol's name alone.
 
 A component's bytes travel as a location rather than as a payload: a control frame is bounded at
 1 MiB and a component may be sixteen times that. The worker sends the payload's path and the digest
