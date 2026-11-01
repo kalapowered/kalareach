@@ -4563,20 +4563,38 @@ async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_re
     );
 }
 
-/// Stops the session through the endpoint once a pass has left a reason to write, with the
-/// standard error of this process full and read by no one, says whether the stop was answered, and
-/// ends the process: the pass is still held in its write, and ends with the process.
+/// With the standard error of this process full and read by no one, and a reason waiting for its
+/// write: runs a later pass, which has to do its work, and then stops the session through the
+/// endpoint, which has to be answered. Says what it found on the standard output.
+///
+/// The lock on the host's cap is a directory where the lock file goes, so the reason is that the
+/// lock cannot be taken. The later pass finds it a file again and gives the host's excess up.
 #[cfg(unix)]
-async fn stop_the_session_while_the_standard_error_is_stalled(host: &Host) -> ! {
-    // The report of a pass can be read once the pass has let go of the session.
+async fn pass_and_stop_while_the_standard_error_is_stalled(host: &Host) {
+    // The line for the reason is handed to the thread that writes it, and that thread is in its
+    // write: it waits for a reader that never comes.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    while host.runtime.session().output_pass_report().reason.is_none() {
+    while !host.service.output_reason_being_written() {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "a pass left output behind"
+            "a pass left output behind and handed its reason on"
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+
+    let spools = host._temp.environment().spool_dir();
+    let cap = OutputRetention::DEFAULT.host_cap_bytes;
+    std::fs::remove_dir(spools.join("host-cap.lock")).expect("the place is free again");
+    host.service.maintain_now();
+    println!(
+        "{}",
+        if kr_worker::history::retained_bytes_under(&spools) == cap {
+            "a later pass ran"
+        } else {
+            "a later pass did not give up the excess"
+        }
+    );
+
     let stopped = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         let mut client = cli(host).await;
         close(&mut client, host).await
@@ -4590,17 +4608,40 @@ async fn stop_the_session_while_the_standard_error_is_stalled(host: &Host) -> ! 
             "the stop was not answered"
         }
     );
-    std::process::exit(0);
+}
+
+/// What a worker process that stalled on its standard error has to have done, and that it ended.
+#[cfg(unix)]
+fn assert_the_stalled_worker_went_on_and_ended(worker: &WorkerProcess) {
+    assert!(
+        worker.standard_output.contains("a later pass ran"),
+        "a pass after the stalled write did its work: {}",
+        worker.standard_output
+    );
+    assert!(
+        worker.standard_output.contains("the stop was answered"),
+        "the stop of the session was answered: {}",
+        worker.standard_output
+    );
+    assert!(
+        worker.ended_well && worker.standard_output.contains("1 passed"),
+        "the process ended after the stop, the standard error still full (ended well: {}): {}",
+        worker.ended_well,
+        worker.standard_output
+    );
 }
 
 /// Section 24 and section 20, KR-REQ-20.20: a standard error that has stopped draining, a pipe
-/// nobody reads, holds the write of a reason and nothing else: the person's stop of the session is
-/// answered. A write made while the session's lock and the dispatch barrier are held would hold
-/// the stop for as long as the pipe stands full.
+/// nobody reads, holds the thread that writes the worker's diagnostics and nothing else. The
+/// passes that follow do their work, the person's stop of the session is answered, and the process
+/// ends. A write made while the session's lock or the dispatch barrier is held would hold the
+/// stop; one made by a task of the runtime would hold the passes, or the end of the process, for as
+/// long as the pipe stands full.
 ///
 /// The worker is this test's own program with its standard error filled to the last byte and read
 /// by no one. Its host's first pass finds the lock on the host's cap unavailable and has a reason
-/// to write; once that pass has let go of the session, the session is stopped through the endpoint.
+/// to write. The test then runs a pass, stops the session through the endpoint, and returns, which
+/// ends the process.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_standard_error_that_stops_draining_does_not_hold_up_the_stop_of_a_session() {
@@ -4613,21 +4654,20 @@ async fn a_standard_error_that_stops_draining_does_not_hold_up_the_stop_of_a_ses
         }));
         fill_standard_error();
         let host = host_that_cannot_take_the_cap_lock().await;
-        stop_the_session_while_the_standard_error_is_stalled(&host).await;
+        pass_and_stop_while_the_standard_error_is_stalled(&host).await;
+        return;
     }
 
-    let worker = run_in_a_worker_process(NAME, StandardError::NotRead);
-    assert!(
-        worker.ended_well && worker.standard_output.contains("the stop was answered"),
-        "the stop of the session waited for the standard error (ended well: {}): {}",
-        worker.ended_well,
-        worker.standard_output
-    );
+    assert_the_stalled_worker_went_on_and_ended(&run_in_a_worker_process(
+        NAME,
+        StandardError::NotRead,
+    ));
 }
 
 /// As the case above, for the reason a look at the host's cap finds: the host's first pass has
 /// nothing to say because another host holds the lock on the cap, and the look that follows finds
-/// the lock unavailable. The look's write waits for the pipe; the stop of the session is answered.
+/// the lock unavailable. The look's write waits for the pipe; the passes that follow do their work,
+/// the stop of the session is answered, and the process ends.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_standard_error_that_stops_draining_does_not_hold_up_the_stop_of_a_session_during_a_look()
@@ -4681,16 +4721,14 @@ async fn a_standard_error_that_stops_draining_does_not_hold_up_the_stop_of_a_ses
         std::fs::rename(spools.join("host-cap.lock"), spools.join("lock-held"))
             .expect("the held lock file is moved aside");
         std::fs::create_dir(spools.join("host-cap.lock")).expect("a directory where the lock goes");
-        stop_the_session_while_the_standard_error_is_stalled(&host).await;
+        pass_and_stop_while_the_standard_error_is_stalled(&host).await;
+        return;
     }
 
-    let worker = run_in_a_worker_process(NAME, StandardError::NotRead);
-    assert!(
-        worker.ended_well && worker.standard_output.contains("the stop was answered"),
-        "the stop of the session waited for the standard error (ended well: {}): {}",
-        worker.ended_well,
-        worker.standard_output
-    );
+    assert_the_stalled_worker_went_on_and_ended(&run_in_a_worker_process(
+        NAME,
+        StandardError::NotRead,
+    ));
 }
 
 /// What the platform's time service reports: keeping the wall clock, or not.
