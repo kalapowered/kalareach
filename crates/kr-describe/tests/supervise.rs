@@ -1408,8 +1408,9 @@ fn a_load_whose_file_is_not_the_profiles_ends_as_assets_and_is_no_failure() {
     }
 }
 
-/// A cancellation reaches the process during a load and during a decode, and each ends at once
-/// with the process still running. The control is the same work left alone, which finishes.
+/// KR-REQ-22.11: a cancellation reaches the process during a load and during a decode, and each
+/// ends at once with the process still running. The control is the same work left alone, which
+/// finishes.
 #[test]
 fn a_cancellation_reaches_the_process_during_a_load_and_a_decode() {
     let mut rig = Rig::new(&Script {

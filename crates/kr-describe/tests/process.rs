@@ -171,8 +171,8 @@ fn a_load_the_process_does_not_hold_is_refused() {
     ));
 }
 
-/// A cancellation reaches a load and a job while they run, and each answers at once that it was
-/// cancelled; the control is the same work left alone, which finishes.
+/// KR-REQ-22.11: a cancellation reaches a load and a job while they run, and each answers at once
+/// that it was cancelled; the control is the same work left alone, which finishes.
 #[test]
 fn a_cancellation_reaches_a_load_and_a_job_while_they_run() {
     let placed = Placed::stub();

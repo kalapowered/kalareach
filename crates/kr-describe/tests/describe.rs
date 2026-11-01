@@ -460,7 +460,7 @@ fn a_load_longer_than_a_jobs_deadline_leaves_the_job_its_whole_deadline() {
     );
 }
 
-/// KR-REQ-22.11: a model load that is cancelled is abandoned and publishes nothing.
+/// A model load that is cancelled is abandoned and publishes nothing.
 #[test]
 fn a_model_load_that_is_cancelled_is_abandoned_and_publishes_nothing() {
     let behaviour = SharedBehaviour::new();
