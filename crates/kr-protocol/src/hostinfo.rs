@@ -6737,7 +6737,8 @@ pub mod export {
         field("DesktopContext", "os_user", ContentClass::Name),
         // The number of the account the desktop belongs to. It names the account on a platform
         // that numbers its users, and the type holds a number rather than a shape, so the export
-        // carries none of it, as it carries none of a boot identity's value.
+        // carries none of it, as it carries none of a boot identity's value. The class is what
+        // decides: `desktop_context` keeps the number only for a class that carries its text.
         field("DesktopContext", "uid", ContentClass::Name),
         field("DesktopContext", "boot_identity", ContentClass::Structure),
         field("BootIdentity", "source", ContentClass::Term),
@@ -7715,8 +7716,8 @@ pub mod export {
     /// length. The derived identity is a typed identifier with nowhere to put such a record, so a
     /// present one leaves as a fixed marker: whether there is a desktop is not a secret, and what
     /// it is called is. The number of the account is a number with nowhere to put such a record
-    /// either, and it leaves as none. The context this host keeps for its own comparisons is
-    /// untouched.
+    /// either, and it leaves as none unless its class carries its text. The context this host keeps
+    /// for its own comparisons is untouched.
     #[must_use]
     pub fn desktop_context(
         context: crate::desktop::DesktopContext,
@@ -7735,7 +7736,11 @@ pub mod export {
                     .as_ref()
                     .map(|_| withheld_identity()),
             ),
-            uid: crate::scalars::Nullable::null(),
+            uid: if class("DesktopContext", "uid").carries_its_text() {
+                context.uid
+            } else {
+                crate::scalars::Nullable::null()
+            },
             boot_identity: boot_identity(&context.boot_identity),
             ..context
         }
