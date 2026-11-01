@@ -4439,6 +4439,21 @@ fn fill_standard_error() {
     fcntl_setfl(&standard_error, flags).expect("a write that waits again");
 }
 
+/// Waits until the line for the reason a pass left output behind has been written to this
+/// process's standard error, or refused by it. The pass hands the line to a thread of its own and
+/// does not wait for it.
+#[cfg(unix)]
+async fn wait_for_the_reason_to_be_written(host: &Host) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    while host.service.output_reason_being_written() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the line for the reason was written or refused"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// Section 24 and section 20, KR-REQ-20.20: a worker says why a pass left output behind to its
 /// standard error, once while the reason stands, and a standard error that refuses the write
 /// costs the session nothing. A volume that is full is a cause of output left behind, and it
@@ -4486,6 +4501,7 @@ async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_re
         // Two passes find the host over its cap and the lock unavailable.
         host.service.maintain_now();
         host.service.maintain_now();
+        wait_for_the_reason_to_be_written(&host).await;
         // The lock can be taken: the pass gives up the first segment, and no reason stands.
         std::fs::remove_dir(&lock).expect("the place is free again");
         host.service.maintain_now();
@@ -4504,6 +4520,7 @@ async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_re
         std::fs::remove_file(&lock).expect("the lock file made by the pass");
         std::fs::create_dir(&lock).expect("a directory where the lock goes");
         host.service.maintain_now();
+        wait_for_the_reason_to_be_written(&host).await;
         let mut client = cli(&host).await;
         close(&mut client, &host).await;
         println!("said {}", host.service.output_reason_said().is_some());

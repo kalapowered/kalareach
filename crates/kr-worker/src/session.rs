@@ -5648,39 +5648,6 @@ pub struct OutputPassReport {
     pub age_applied: bool,
 }
 
-/// Says to `diagnostics` why an output retention pass left output behind, when it is not the
-/// reason last said.
-///
-/// `said` is the reason last written, and follows `reason`: one that goes and comes back is said
-/// again. A write that fails is let go, and its reason is not taken as said, so that the next pass
-/// that can write it says it. A pass that applied no age bound (`age_applied` is false) keeps what
-/// was said when it finds no reason, since it cannot tell that a reason the age bound left has
-/// gone; the same holds for a reason of the byte caps, which an unproved wall clock leaves said
-/// until a pass that applies age finds none.
-///
-/// The line is one write, so that nothing else writing to the same stream breaks it.
-pub(crate) fn say_output_reason(
-    said: &mut Option<String>,
-    reason: Option<&str>,
-    age_applied: bool,
-    diagnostics: &mut impl std::io::Write,
-) {
-    if said.as_deref() == reason || (reason.is_none() && !age_applied) {
-        return;
-    }
-    match reason {
-        None => *said = None,
-        Some(reason) => {
-            let line = format!(
-                "kr-worker: output retention left output it was asked to remove: {reason}\n"
-            );
-            if diagnostics.write_all(line.as_bytes()).is_ok() {
-                *said = Some(reason.to_owned());
-            }
-        }
-    }
-}
-
 /// Says one line to this worker's standard error, for a person looking into a host that did less
 /// than it was asked to, and lets go of a write that fails. A volume that is full refuses the line
 /// as it refused what made the host say it, and a line to a diagnostic is not worth the session
@@ -5698,18 +5665,7 @@ fn tell(diagnostics: &mut impl std::io::Write, line: std::fmt::Arguments<'_>) {
 mod tests {
     use kr_protocol::root::{CommandBypassReason, PromptGeneration};
 
-    use super::{Answered, StartTerms, say_output_reason, tell};
-
-    /// What the pass said, one reason to a line.
-    fn said_by(said: &mut Option<String>, reason: Option<&str>, age_applied: bool) -> Vec<String> {
-        let mut diagnostics = Vec::new();
-        say_output_reason(said, reason, age_applied, &mut diagnostics);
-        String::from_utf8(diagnostics)
-            .expect("text")
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    }
+    use super::{Answered, StartTerms, tell};
 
     /// A diagnostics stream that takes writes while it is open to them, as a volume does until it
     /// is full.
@@ -5745,107 +5701,6 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
-    }
-
-    /// A reason an output retention pass left output behind is said when it first stands, once
-    /// while it goes on, and again if it goes and comes back or changes.
-    #[test]
-    fn a_reason_output_was_left_behind_is_said_once_while_it_stands() {
-        let mut said = None;
-        assert!(said_by(&mut said, None, true).is_empty());
-        let first = said_by(&mut said, Some("the lock"), true);
-        assert_eq!(first.len(), 1, "a new reason is said");
-        assert!(first[0].ends_with("the lock"), "{first:?}");
-        assert!(
-            said_by(&mut said, Some("the lock"), true).is_empty(),
-            "and not again while it stands"
-        );
-        assert!(said_by(&mut said, None, true).is_empty(), "it goes");
-        assert_eq!(
-            said_by(&mut said, Some("the lock"), true).len(),
-            1,
-            "and is said again when it comes back"
-        );
-        assert_eq!(
-            said_by(&mut said, Some("the boundary"), true).len(),
-            1,
-            "as is another"
-        );
-    }
-
-    /// A stream that refuses the write costs the pass nothing: it returns, and the reason is not
-    /// taken as said, so the next pass that can write it does.
-    #[test]
-    fn a_reason_that_could_not_be_written_is_said_at_the_next_pass_that_can_write_it() {
-        let mut said = None;
-        let mut full = Draining {
-            open: false,
-            taken: Vec::new(),
-        };
-        say_output_reason(&mut said, Some("the lock"), true, &mut full);
-        assert_eq!(said, None, "a reason that was not written is not said");
-        say_output_reason(&mut said, Some("the lock"), true, &mut full);
-        assert_eq!(
-            said_by(&mut said, Some("the lock"), true).len(),
-            1,
-            "the next pass that can write it says it"
-        );
-        assert!(said_by(&mut said, Some("the lock"), true).is_empty());
-    }
-
-    /// A reason refused after another was said is not taken as said: the stream that refused it
-    /// takes it later, and it is said then, once.
-    #[test]
-    fn a_reason_refused_after_another_was_said_is_said_once_it_can_be_written() {
-        let mut said = None;
-        let mut stream = Draining::default();
-        say_output_reason(&mut said, Some("the lock"), true, &mut stream);
-        assert_eq!(stream.lines(), 1, "the first reason is said");
-
-        stream.open = false;
-        say_output_reason(&mut said, Some("the boundary"), true, &mut stream);
-        assert_eq!(stream.lines(), 1, "the stream refuses the second");
-        assert_eq!(
-            said.as_deref(),
-            Some("the lock"),
-            "so the second is not taken as said"
-        );
-
-        stream.open = true;
-        say_output_reason(&mut said, Some("the boundary"), true, &mut stream);
-        assert_eq!(
-            stream.lines(),
-            2,
-            "the second is said when the stream takes it"
-        );
-        say_output_reason(&mut said, Some("the boundary"), true, &mut stream);
-        assert_eq!(stream.lines(), 2, "and not again while it stands");
-    }
-
-    /// A pass that removed nothing by age cannot tell that a reason the age bound left has gone, so
-    /// a reason said by a pass that applied age is not said again after a pass that did not: the
-    /// host's look at its cap sits between two passes of the tick.
-    #[test]
-    fn a_pass_that_applied_no_age_bound_does_not_make_an_age_reason_repeat() {
-        let mut said = None;
-        assert_eq!(said_by(&mut said, Some("a segment"), true).len(), 1);
-        assert!(
-            said_by(&mut said, None, false).is_empty(),
-            "a look finds no reason, as it applied no age bound"
-        );
-        assert!(
-            said_by(&mut said, Some("a segment"), true).is_empty(),
-            "so the pass that applies it again has nothing new to say"
-        );
-        assert!(
-            said_by(&mut said, None, true).is_empty(),
-            "a pass that applied it finds none"
-        );
-        assert_eq!(
-            said_by(&mut said, Some("a segment"), true).len(),
-            1,
-            "and then the reason is new again"
-        );
     }
 
     /// A line to the diagnostics is one write, and a write that fails is let go.

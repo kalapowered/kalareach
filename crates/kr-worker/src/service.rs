@@ -417,8 +417,8 @@ pub struct WorkerService {
     received: Mutex<Vec<(kr_protocol::method::MethodName, ParamsValue)>>,
     /// The reason an output retention pass left output it was asked to remove, as last written to
     /// this worker's standard error, so that a reason that stands is said once and not on every
-    /// pass. Only the host's maintenance takes it, and it holds it while it writes.
-    said_output_reason: Mutex<Option<String>>,
+    /// pass.
+    output_reasons: crate::diagnostics::OutputReasons,
     /// How many times a host that found the host over its output cap while another held the lock
     /// on it has looked at the cap again, for this host's own tests. It is compiled away in every
     /// shipped build.
@@ -835,7 +835,7 @@ impl WorkerService {
             hold_next_delivery: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             received: Mutex::new(Vec::new()),
-            said_output_reason: Mutex::new(None),
+            output_reasons: crate::diagnostics::OutputReasons::default(),
             #[cfg(feature = "testing")]
             host_cap_looks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
@@ -2027,8 +2027,6 @@ impl WorkerService {
         // here even when nobody is reading them, so the feed the daemon's attention store reads
         // and every client that follows it hear of it on this tick rather than at the next read.
         let _ = self.questions.sweep(self.question_clock());
-        // Last, since a standard error that has stopped draining holds this write for as long as it
-        // stands, and nothing else of the pass is to wait for it.
         self.say_output_reason(&output);
         MaintenancePass {
             closed,
@@ -2036,26 +2034,19 @@ impl WorkerService {
         }
     }
 
-    /// Says to this worker's standard error why a pass of output retention left output it was
+    /// Hands this worker's standard error the reason a pass of output retention left output it was
     /// asked to remove, once while the reason stands.
     ///
-    /// This is called with neither the session's lock nor the dispatch barrier held. On Unix the
-    /// standard error is where a person looking into a host that keeps more than its cap finds the
-    /// reason: a launchd job's or a detached process's diagnostics file, a transient unit's
-    /// journal. A Windows worker has a console with no window, so nobody reads it there. A write
-    /// that fails is let go: the volume that made the pass leave output behind may well refuse it
-    /// too, and a diagnostic is not worth the session. A write that does not return holds this
-    /// pass and so this host's maintenance, and nothing that serves a person.
+    /// This is called with neither the session's lock nor the dispatch barrier held, and it waits
+    /// for nothing: the line is handed to the thread that writes this worker's diagnostics, so a
+    /// standard error that has stopped draining holds that thread and no pass, no session call and
+    /// not the end of the process. The module `diagnostics` says where the reason is found, and
+    /// what becomes of a write that fails.
     fn say_output_reason(&self, report: &crate::session::OutputPassReport) {
-        let mut said = self
-            .said_output_reason
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::session::say_output_reason(
-            &mut said,
+        self.output_reasons.say(
             report.reason.as_deref(),
             report.age_applied,
-            &mut std::io::stderr(),
+            crate::diagnostics::standard_error,
         );
     }
 
@@ -2080,15 +2071,20 @@ impl WorkerService {
     }
 
     /// The reason an output retention pass left output behind that this host last wrote to its
-    /// standard error, for this host's own tests. It waits for a write in progress. It is compiled
-    /// away in every shipped build.
+    /// standard error, for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn output_reason_said(&self) -> Option<String> {
-        self.said_output_reason
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.output_reasons.said()
+    }
+
+    /// Whether a reason an output retention pass left output behind waits for its write to this
+    /// host's standard error or is being written, for this host's own tests. It is compiled away
+    /// in every shipped build.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn output_reason_being_written(&self) -> bool {
+        self.output_reasons.being_written()
     }
 
     /// Runs the storage half of one maintenance pass now: the journal first, then the broker.
