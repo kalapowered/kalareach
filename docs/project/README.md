@@ -576,12 +576,12 @@ with no usable Git opens the service all the same. A request that runs Git is re
 `HOST_NOT_CONFIGURED` before it makes a repository, an operation row, a workspace or a directory,
 and the refusal names the step that installs Git. Windows runs no Git at all and says so under the
 same code, whether or not Git is installed. No step on a Windows host changes that, so the sentence
-ends with the host to use instead, one on macOS or Linux. A Linux kernel with no Landlock interface,
+ends with the advice to use a host on macOS or Linux. A Linux kernel with no Landlock interface,
 or one older than version 3 (Linux 6.2), gets the same refusal before Git is looked for, and a
 request that reaches a remote on a kernel older than version 4 (Linux 6.7) gets it when its
 invocation is built. The sentence says which version the kernel has and which the boundary needs. A
 machine whose system-call numbers this host does not hold is refused alike, and its sentence ends
-with a host on an x86-64 or aarch64 machine. What a person can do about it is in that sentence:
+with the advice to use a host on an x86-64 or aarch64 machine. What a person can do about it is in that sentence:
 install Git where it names that step, or use the other host it names. The CLI shows that sentence
 alone for a command that runs Git, because the client's one line for this code, "Change a setting on
 this device or on the host.", fits neither. A client that takes its action from the client library's
