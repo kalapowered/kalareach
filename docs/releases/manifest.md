@@ -136,7 +136,7 @@ citation too, and the record is refused until `records.json` says the new commit
 | Vendor routes | The plugins repository's qualification notes at the commit the bundled catalogue was taken from, which are the research behind the connector tables that `bundled-plugins.lock` pins. The record cites no change log, and these notes are not the specification's qualification notes |
 | Dependency and runtime revisions | `Cargo.toml`, `Cargo.lock`, the toolchain file, each shell's pins, the stack pins, the bundled catalogue's lock and the lock of stored formats |
 | Model assets | Each model profile with its model, conversion and runtime revisions and the digest of each asset |
-| Provider event schemas | The voice providers' profiles and their digests, in the web repository at a pinned commit |
+| Provider event schemas | The voice and reasoning providers' profiles and their digests, in the web repository at a pinned commit |
 | Service limits | The managed service's limits, in the web repository at a pinned commit |
 
 A class is recorded, unavailable or pending. A recorded class lists each record with the
@@ -158,8 +158,8 @@ Those are the only conditions on a result: a result in any other state, `not_tes
 `incompatible` included, counts as evidence, no result is matched to the capability that cites it,
 and a capability entry names its plugin, version and application but not the build. A listed build
 whose plugin cites no result stops the record for the build's platform. The check covers the
-capabilities of listed agent builds only. The shell packages, the model profiles and the voice
-providers are cited as pins, by digest, and not by evidence. A record cited in `records.json` that is missing, or is not the one cited, stops the
+capabilities of listed agent builds only. The shell packages, the model profiles and the voice and
+reasoning providers are cited as pins, by digest, and not by evidence. A record cited in `records.json` that is missing, or is not the one cited, stops the
 record; for another repository that holds only when the repository is at hand. The index names no
 build yet, and the pipeline of the plugins repository does not yet write the results into an index
 entry, so the first build it names would stop the release record of that build's platform until it
@@ -238,13 +238,14 @@ approval decides the publication.
 Every job after the first settles the commit by its identifier and not by the ref, so a branch that
 moves while the trees build, or while an approval waits, cannot change what is built or signed. The
 tag is made by publishing the release at the commit, and a tag made that way starts no workflow.
-A release that has been published is never changed: a correction is a new commit under its own tag.
+A release that has been published is never changed except in its notes: a correction is a new commit
+under its own tag.
 
 `release-windows.yml` builds and checks the two Windows trees, on a `host/v*` tag pushed to the
 repository and on a run started by hand. Its `release` job, which signs them behind its own
-environment, runs only for a release tag or the default branch and only when the repository variable
-`WINDOWS_HOST_RELEASE` is `true`; otherwise it is skipped and asks for no approval. It signs the files
-that carry a signature. Its step that
+environment, runs only for a tag or the default branch (the environment admits only `host/v*` tags and
+`main`) and only when the repository variable `WINDOWS_HOST_RELEASE` is `true`; otherwise it is skipped
+and asks for no approval. It signs the files that carry a signature. Its step that
 writes each manifest again and signs it takes no key and ends the job with an error, so the job publishes
 no release.
 
