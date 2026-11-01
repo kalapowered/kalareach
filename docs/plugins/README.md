@@ -200,7 +200,8 @@ talks to the App Server) adds a `backend` member that informs a host capable of 
 server how to start the server (namely, with the same executable that a shell would resolve for the
 command and the arguments declared here) and run the terminal against a gateway of its own. A host
 on macOS or Linux does so for a plain launch of the terminal, as described below; any other host
-checks the declaration and runs each invocation as typed, and `kr doctor` says why.
+checks the declaration and runs each invocation as typed, and `kr doctor` shows the host's reason as its
+class and its length (`[message withheld, <length> bytes]`), not in words.
 
 ```json
 "command_integration": {
@@ -255,10 +256,10 @@ manifest or a table written before them reads and hashes exactly as it did.
 On macOS and Linux, for a plain launch of the terminal, the host runs the server if the first
 executable the shell found is a native executable (not a script), the signed index names it as a
 qualified build, and its version is one the connector's table is qualified for; otherwise, and on all other
-platforms, the invocation runs as typed. `kr doctor` names a platform that establishes no backend, and
-for the other cases it shows where the daemon's search path resolves the command, with the version a
-signed record gives that executable, and the host's reason as its class and its length
-(`[message withheld, <length> bytes]`), not in words.
+platforms, the invocation runs as typed. `kr doctor` shows where the daemon's search path resolves the
+command, with the version a signed record gives that executable, and the host's reason as its class and
+its length (`[message withheld, <length> bytes]`), not in words; it names a platform or a missing
+launcher only for an integration that no new session could launch through at all.
 
 When the launcher says it is going, the host starts the server in its own process group, in the
 directory the invocation runs in, and with the environment presented by the launcher except for the
