@@ -977,6 +977,50 @@ fn a_stop_asked_late_is_given_its_time_from_the_request() {
     }
 }
 
+/// KR-REQ-22.11: the driver says it has something to do at the job's deadline, when the process is
+/// to be asked to stop the job, even when its next sample comes later, and after the request at the
+/// end of the time the request gives, counted from the request and not from the deadline. It never
+/// says a time that has gone by: a daemon that sleeps until the time it is given would wake at once,
+/// again and again, for as long as the job takes to answer. The process here reads the job and
+/// nothing after it, so nothing but the daemon's own clock decides what comes next.
+#[test]
+fn the_driver_wakes_at_a_jobs_deadline_and_at_the_end_of_the_time_its_stop_is_given() {
+    let mut rig = Rig::new(&Script {
+        generate_until_cancelled: true,
+        wedge_input_after: Some(3),
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    let deadline = 3_000 + DEADLINE_MS;
+
+    // A look half a sample before the deadline takes the sample, which puts the next one past the
+    // deadline: the deadline is still the soonest thing.
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(deadline - SAMPLE_MS / 2))
+        .expect("a turn");
+    assert!(!the_process_ended(&reports), "{reports:?}");
+    assert_eq!(rig.driver.stopping_at_its_deadline(), None);
+    assert_eq!(rig.driver.due_ms(), Some(deadline));
+
+    // The next look is a minute late. The process is asked then, and that look takes a sample too:
+    // the soonest thing is the next sample, after the look and before the end of the grace.
+    let asked = deadline + 60_000;
+    let reports = rig.driver.turn(&roomy(), at(asked)).expect("a turn");
+    assert!(!the_process_ended(&reports), "{reports:?}");
+    assert_eq!(rig.driver.stopping_at_its_deadline(), Some(false));
+    assert_eq!(rig.driver.due_ms(), Some(asked + SAMPLE_MS));
+
+    // At that sample the soonest thing is the end of the grace, counted from the request.
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(asked + SAMPLE_MS))
+        .expect("a turn");
+    assert!(!the_process_ended(&reports), "{reports:?}");
+    assert_eq!(rig.driver.due_ms(), Some(asked + ANSWER_GRACE_MS));
+}
+
 /// KR-REQ-22.11: a cancellation the control thread has said it has read is not a process that
 /// stopped listening: the job's own answer is bounded by its deadline and the stop bound after it,
 /// and the process is ended when that passes and not at the cancellation's bound, whether or not
