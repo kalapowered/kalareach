@@ -898,6 +898,17 @@ method, and that is exactly what it cannot do:
 - **The buffer belongs to the read that is in progress.** Between one line being accepted and the
   next read starting, the editor still holds the line that has gone; the module reports the buffer
   it is about to have, which is empty, and counts no change the person did not make.
+- **Bytes ahead of the cursor reply are read as part of it.** After its prompt the editor asks the
+  terminal where the cursor is (`CSI 6 n`), and the .NET runtime reads the reply from the same
+  input as everything else the terminal sends, one byte at a time. It anchors on the first `;` and
+  joins every digit up to the `R` into the column, so bytes that come ahead of the reply change the
+  number: three answers to a device-attributes query (`CSI ? 62 ; 22 c`) ahead of a reply give a
+  column of 226222621, and the editor then throws `ArgumentOutOfRangeException` when it places the
+  cursor and stops answering. The host holds no answer back for this. The broker answers the cursor
+  question itself, at once, and the response lane writes replies in the order of their queries, so
+  the host puts no answer of its own ahead of a cursor reply produced after that query. It cannot
+  take back bytes that are already in the terminal's input, such as the answer to an earlier query
+  of a program that ended before it read it.
 
 Running the module on Windows, where the endpoint is a named pipe and the console has no line
 discipline to name an end-of-file character, so that the module reports the gesture as disabled at its
