@@ -811,6 +811,40 @@ mod tests {
         }
     }
 
+    /// A directory this account cannot enter is refused as the caller's argument, though the caller
+    /// holds an identity for it: a refused permission is not a directory that went missing.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_this_account_cannot_enter_is_an_argument_though_an_identity_is_held() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([16; 16]));
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let fenced = root.path().join("fenced");
+        std::fs::create_dir(&fenced).expect("the directory above the place");
+        let place = fenced.join("tree");
+        std::fs::create_dir(&place).expect("the place");
+        let held = AuthorisedDirectory::open_root(environment_id, &place)
+            .expect("the place opens")
+            .identity();
+        std::fs::set_permissions(&fenced, std::fs::Permissions::from_mode(0o000))
+            .expect("the directory above the place is closed");
+
+        let opened = OpenedDirectory::open(environment_id, &place, Some(held));
+
+        std::fs::set_permissions(&fenced, std::fs::Permissions::from_mode(0o755))
+            .expect("and opened again, so that it goes with the case");
+        // An account that bypasses the mode (root) enters the place anyway, and there is no
+        // refusal for it to be held to.
+        let Err(refused) = opened else {
+            return;
+        };
+        assert!(
+            matches!(refused, ProjectError::Destination { .. }),
+            "{refused:?}"
+        );
+    }
+
     /// A recorded directory that goes after the invocation has opened it and before its path is
     /// resolved is a source that changed too: each step of the open answers for what it finds, so
     /// the answer does not depend on which of them the directory went before. On Linux a

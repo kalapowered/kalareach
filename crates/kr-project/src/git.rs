@@ -5646,6 +5646,17 @@ mod tests {
         !state.trim().is_empty() && !state.trim().starts_with('Z')
     }
 
+    /// Whether a process with this identifier is gone altogether, which one that has ended and not
+    /// yet been collected is not.
+    #[cfg(unix)]
+    fn collected(pid: &str) -> bool {
+        let listed = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .expect("ps lists the process");
+        String::from_utf8_lossy(&listed.stdout).trim().is_empty()
+    }
+
     /// A stand-in that writes its number to `own` and then waits, placed as the program a case
     /// asks. It ends when a case lets it go with [`let_go`], or when `directory` is gone, as it is
     /// when the case ends and the directory is removed with it; a guard of two minutes ends one
@@ -6230,13 +6241,14 @@ mod tests {
     /// then runs `body`, a shell command, and ends, giving the question `time`. The first poll of
     /// the ask is held back until the stand-in has ended and waits to be collected, so what it said
     /// and the end of its output are in the pipe when that poll comes. The release is given once
-    /// `time` has run out when `after_the_time` is set, and at once otherwise.
+    /// `time` has run out when `after_the_time` is set, and at once otherwise. The directory the
+    /// stand-in ran in comes back with the outcome, with the numbers the stand-in wrote in it.
     #[cfg(unix)]
     fn ask_with_the_first_poll_after_the_stand_in_ended(
         body: &str,
         time: Duration,
         after_the_time: bool,
-    ) -> std::result::Result<String, Asked> {
+    ) -> (std::result::Result<String, Asked>, tempfile::TempDir) {
         let directory = tempfile::tempdir().expect("a directory for this test");
         let (own, release, gate) = (
             directory.path().join("own"),
@@ -6280,20 +6292,21 @@ mod tests {
             ask(&program, &["--version"], deadline)
         });
         STARTS_FIRST.with(|started| *started.borrow_mut() = None);
-        outcome
+        (outcome, directory)
     }
 
-    /// A poll of the program itself that comes after the time the look was given, when the program
-    /// has answered and ended, reads nothing and the look is a fault that passes: what the program
-    /// wrote cannot be told from what reached the pipe after the time, so it is not taken for the
-    /// answer. The stand-in is released only once the time has run out, so the answer is written
-    /// after it, and the first poll is held until the stand-in has ended. The case goes through
-    /// `ask`, which gives each read the probe's time and gives the wait for the end of the output
-    /// the same time.
+    /// A first poll that comes after the time the look was given, when the program has answered
+    /// and ended, is a fault that passes: what the program wrote cannot be told from what reached
+    /// the pipe after the time, so it is not taken for the answer. The stand-in is released only
+    /// once the time has run out, so the answer is written after it, and the first poll is held
+    /// until the stand-in has ended. The case goes through `ask` and holds the outcome. Three
+    /// guards each give it alone, which is why none of them fails this case when it is lost: the
+    /// reading rule of the poll, the exit seen after the time, and the deadline the wait for the
+    /// end of the output is given. The cases beside this one hold each of the three.
     #[cfg(unix)]
     #[test]
     fn a_first_poll_after_the_time_ran_out_reads_nothing_of_an_answer_that_came_after_it() {
-        let outcome = ask_with_the_first_poll_after_the_stand_in_ended(
+        let (outcome, _directory) = ask_with_the_first_poll_after_the_stand_in_ended(
             "echo git version 2.50.1",
             Duration::from_millis(500),
             true,
@@ -6318,38 +6331,59 @@ mod tests {
     }
 
     /// An exit that is seen after the time the look was given is the clock's, even when the output
-    /// was read to its end in time. The stand-in answers and ends with a failure, and the poll
-    /// that finds it ended comes when the time is used up (the case has the time read as used up
-    /// from the loop's first look at it, and the output is read by the real clock, far inside the
-    /// time). A refusal made on the exit code would blame the program, with the step to install
-    /// Git, for an exit that this host saw only after its time.
+    /// was read to its end in time, and whatever the program exited with. The stand-in answers and
+    /// ends, with a failure and then with success, and the poll that finds it ended comes when the
+    /// time is used up (the case has the time read as used up from the loop's first look at it,
+    /// and the output is read by the real clock, far inside the time). A refusal made on the exit
+    /// code would blame the program, with the step to install Git, and a success would be
+    /// accepted, for an exit that this host saw only after its time. The stand-in leaves a process
+    /// in its group, which holds the pipe open, so the case also shows that the group is ended and
+    /// the stand-in collected before the look is refused.
     #[cfg(unix)]
     #[test]
     fn an_exit_seen_after_the_time_ran_out_is_the_clocks_and_not_the_programs() {
-        TIME_IS_UP.with(|up| up.set(true));
-        let outcome = ask_with_the_first_poll_after_the_stand_in_ended(
-            "echo git version 2.50.1; exit 1",
-            Duration::from_secs(60),
-            false,
-        );
-        TIME_IS_UP.with(|up| up.set(false));
+        for exit in [1, 0] {
+            TIME_IS_UP.with(|up| up.set(true));
+            let (outcome, directory) = ask_with_the_first_poll_after_the_stand_in_ended(
+                &format!(
+                    "sleep 120 &\necho $! > \"$(dirname \"$0\")/sleeper\"\n\
+                     echo git version 2.50.1\nexit {exit}"
+                ),
+                Duration::from_secs(60),
+                false,
+            );
+            TIME_IS_UP.with(|up| up.set(false));
 
-        let refusal = match outcome {
-            Err(Asked::Overran(refusal)) => refusal,
-            other => panic!(
-                "an exit seen after the time is not an answer: {:?}",
-                other.map_err(Asked::into_error)
-            ),
-        };
-        assert!(
-            matches!(refusal, ProjectError::GitFailed { .. }),
-            "{refusal:?}"
-        );
-        assert_eq!(
-            refusal.code(),
-            kr_protocol::error::ErrorCode::UpstreamUnavailable
-        );
-        assert!(refusal.code().retry_category().permits_automatic_retry());
+            let refusal = match outcome {
+                Err(Asked::Overran(refusal)) => refusal,
+                other => panic!(
+                    "an exit ({exit}) seen after the time is not an answer: {:?}",
+                    other.map_err(Asked::into_error)
+                ),
+            };
+            assert!(
+                matches!(refusal, ProjectError::GitFailed { .. }),
+                "{refusal:?}"
+            );
+            assert!(
+                refusal.to_string().contains("was not seen to end"),
+                "it is refused for the exit, which is the guard under test: {refusal}"
+            );
+            assert_eq!(
+                refusal.code(),
+                kr_protocol::error::ErrorCode::UpstreamUnavailable
+            );
+            assert!(refusal.code().retry_category().permits_automatic_retry());
+            let sleeper = std::fs::read_to_string(directory.path().join("sleeper"))
+                .expect("the stand-in recorded the process it left in its group")
+                .trim()
+                .to_owned();
+            assert!(!running(&sleeper), "the group the stand-in led was ended");
+            assert!(
+                collected(&number_of(&directory.path().join("own"))),
+                "and the stand-in was collected"
+            );
+        }
     }
 
     /// A first poll that comes after the time the look was given takes in none of the output that
@@ -6756,9 +6790,12 @@ mod tests {
 
     /// A host too short of memory to resolve a path that names Git says nothing of the Git: the
     /// look is refused as a fault that passes, which a client sends the request again after, and
-    /// names no step to install it. Both resolutions the look makes are held, the program's own
-    /// path and the helper directory it reports. A resolution that fails for another reason is
-    /// the program's, as it was, with the step.
+    /// names no step to install it. The four resolutions the look makes are held, each by the
+    /// words that say which it was: the program's own path, the helper directory it reports, the
+    /// copy of Git under that directory, and the helper directory the copy reports. A resolution
+    /// that fails for another reason is the program's, as it was: for the first it is a Git that
+    /// cannot be used, with the step, and for the copy it is a stand-in that has none, which runs
+    /// as itself. The copy is found when nothing fails, so those two rows stand for it.
     #[cfg(unix)]
     #[test]
     fn a_host_too_short_of_memory_to_resolve_a_path_of_git_refuses_the_look_as_a_fault_that_passes()
@@ -6766,10 +6803,27 @@ mod tests {
         let directory = tempfile::tempdir().expect("a directory for this test");
         let helpers = directory.path().join("helpers");
         std::fs::create_dir(&helpers).expect("a helper directory");
-        place_stand_in(directory.path(), &format!("echo '{}'", helpers.display()));
+        let body = format!(
+            "case \"$1\" in\n--exec-path) echo '{}' ;;\n--version) echo 'git version 2.50.1' ;;\nesac",
+            helpers.display()
+        );
+        place_stand_in(directory.path(), &body);
+        place_stand_in(&helpers, &body);
         let search = directory.path().as_os_str().to_owned();
 
-        for passing in [0, 1] {
+        let found = GitProgram::discover_on(Some(&search), PROBE_BOUND)
+            .expect("a Git whose copy answers as it does is found");
+        assert_ne!(
+            found.executable(),
+            found.program(),
+            "and it runs as the copy under its helper directory"
+        );
+        for (passing, says, not) in [
+            (0, "could not be resolved", Some("helpers/git")),
+            (1, "reports a helper directory", Some("helpers/git")),
+            (2, "helpers/git could not be resolved", None),
+            (3, "helpers/git reports a helper directory", None),
+        ] {
             RESOLUTION_FAILS.with(|fails| {
                 fails.set(Some((passing, rustix::io::Errno::NOMEM)));
             });
@@ -6788,6 +6842,10 @@ mod tests {
             assert!(refusal.code().retry_category().permits_automatic_retry());
             let said = refusal.to_string();
             assert!(!said.contains("Install"), "it names no step: {said}");
+            assert!(
+                said.contains(says) && not.is_none_or(|absent| !said.contains(absent)),
+                "after {passing} resolutions it says which one: {said}"
+            );
         }
 
         RESOLUTION_FAILS.with(|fails| fails.set(Some((0, rustix::io::Errno::IO))));
@@ -6798,6 +6856,16 @@ mod tests {
             matches!(refusal, ProjectError::GitUnavailable { .. })
                 && refusal.to_string().contains("Install"),
             "a failure that is not the host's shortage is the program's: {refusal:?}"
+        );
+
+        RESOLUTION_FAILS.with(|fails| fails.set(Some((2, rustix::io::Errno::IO))));
+        let alone = GitProgram::discover_on(Some(&search), PROBE_BOUND)
+            .expect("a copy that cannot be resolved for another reason is no copy");
+        RESOLUTION_FAILS.with(|fails| fails.set(None));
+        assert_eq!(
+            alone.executable(),
+            alone.program(),
+            "and the program on the search path runs as itself"
         );
     }
 
