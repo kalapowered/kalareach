@@ -177,6 +177,17 @@ const LISTING_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// limit.
 const PLATFORM_OUTPUT_LIMIT: usize = 1024 * 1024;
 
+/// Starts a thread that runs `body`, or says why it could not be started. A caller of this module
+/// may be a destructor (a harness removing what its test made), and a thread that cannot be made
+/// must not panic there: the failure is the call's, and is told as one.
+fn spawn_thread(body: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::threads_are_refused() {
+        return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+    }
+    std::thread::Builder::new().spawn(body).map(drop)
+}
+
 /// Reads one pipe on a thread of its own, handing over at most the answer's limit.
 ///
 /// The pieces cross a channel rather than being returned from the thread, because the caller has a
@@ -188,11 +199,15 @@ const PLATFORM_OUTPUT_LIMIT: usize = 1024 * 1024;
 /// that keeps printing would otherwise fill this process's memory for as long as the deadline
 /// lasts. Past the limit the pipe is still read and what it carries is dropped, so this host never
 /// blocks the child it is ending.
+///
+/// # Errors
+///
+/// Returns why the thread could not be started.
 fn read_in_the_background<R: std::io::Read + Send + 'static>(
     stream: Option<R>,
-) -> std::sync::mpsc::Receiver<Vec<u8>> {
+) -> std::io::Result<std::sync::mpsc::Receiver<Vec<u8>>> {
     let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    spawn_thread(move || {
         let Some(mut stream) = stream else { return };
         let mut buffer = [0_u8; 8192];
         let mut handed_over = 0_usize;
@@ -212,8 +227,8 @@ fn read_in_the_background<R: std::io::Read + Send + 'static>(
                 Err(_) => return,
             }
         }
-    });
-    receiver
+    })?;
+    Ok(receiver)
 }
 
 /// Collects what one reader hands over, until the pipe ends or the deadline passes.
@@ -263,7 +278,9 @@ fn end_and_reap(mut child: std::process::Child) -> bool {
             // knows, which is that the ending was not seen.
             Ok(None) | Err(_) => {
                 if std::time::Instant::now() >= grace {
-                    std::thread::spawn(move || {
+                    // Where no thread can be made nobody waits, and the child is collected when
+                    // this process ends: the caller is told all the same that it was not seen.
+                    let _ = spawn_thread(move || {
                         let _ = child.wait();
                     });
                     return false;
@@ -288,7 +305,8 @@ enum Ending {
 /// [`named`] says, and none repeats a value after them.
 #[derive(Debug)]
 pub enum CallFailure {
-    /// The program could not be started.
+    /// The program could not be started, or could not be given a thread to read what it prints,
+    /// in which case it was ended.
     NotRun {
         /// The call.
         call: String,
@@ -393,6 +411,15 @@ pub fn run_bounded(
         })?;
     let reading_out = read_in_the_background(child.stdout.take());
     let reading_err = read_in_the_background(child.stderr.take());
+    let (reading_out, reading_err) = match (reading_out, reading_err) {
+        (Ok(out), Ok(err)) => (out, err),
+        // The program is running, and nothing can read what it prints: it is ended, and the call
+        // is told as one that could not be run.
+        (Err(error), _) | (_, Err(error)) => {
+            end_and_reap(child);
+            return Err(CallFailure::NotRun { call, error });
+        }
+    };
 
     let ending = loop {
         match child.try_wait() {
@@ -552,6 +579,16 @@ fn container_state(output: &CommandOutput) -> EnvironmentPresence {
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        /// Whether the thread that asks refuses to start the threads this module makes.
+        static THREADS_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Whether this test thread has the threads of the module under test refused.
+    pub(super) fn threads_are_refused() -> bool {
+        THREADS_REFUSED.with(std::cell::Cell::get)
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_platform_command_that_never_returns_is_ended_rather_than_waited_for() {
@@ -710,6 +747,40 @@ mod tests {
             panic!("the program was not run: {error}");
         };
         assert_eq!(why.kind(), std::io::ErrorKind::NotFound, "{error}");
+    }
+
+    /// A program that cannot be given a thread to read what it prints is ended, and the call is
+    /// refused as one that could not be run. Where this panicked instead, a destructor that made a
+    /// call on a machine out of threads ended the whole test binary.
+    #[cfg(unix)]
+    #[test]
+    fn a_call_whose_output_cannot_be_read_for_want_of_a_thread_is_ended_and_refused() {
+        // A program of no other test and no other run: nothing else has this in its arguments.
+        let marker = format!("sleep 120.{}", std::process::id());
+        THREADS_REFUSED.with(|refused| refused.set(true));
+        let result = super::run_bounded(
+            "/bin/sh",
+            &["-c".to_owned(), format!("exec {marker}")],
+            std::time::Duration::from_secs(60),
+        );
+        THREADS_REFUSED.with(|refused| refused.set(false));
+        let error = result.expect_err("nothing can read what the program prints");
+        assert!(
+            matches!(error, super::CallFailure::NotRun { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("/bin/sh -c could not be run"),
+            "{error}"
+        );
+        let listing = std::process::Command::new("ps")
+            .args(["-A", "-o", "command="])
+            .output()
+            .expect("lists the processes");
+        assert!(
+            !String::from_utf8_lossy(&listing.stdout).contains(&marker),
+            "the program was left running"
+        );
     }
 
     #[cfg(unix)]
