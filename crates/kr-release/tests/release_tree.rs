@@ -664,6 +664,15 @@ fn a_signed_tree_verifies_and_a_changed_or_short_signed_one_does_not() {
 /// state, and its executables are the `.exe` programs of `bin/`; a file of the package that is not
 /// the checkout's, and a directory under `shells/` that is no part of it, are refused, and the
 /// unedited tree is the control.
+///
+/// KR-REQ-08.41, the part about the private pinned terminfo: the tree carries the compiled database
+/// under both names a library looks for it by, equal to the bytes the pinned entry compiles to, and
+/// a tree without either name, or with a copy that differs, is refused by name. Not shown here:
+/// that the responder agrees with the database, or the SSH baseline.
+///
+/// KR-REQ-08.11, the part about the capability manifest: the tree carries the manifest this
+/// checkout commits, and a tree without it, or with a copy that differs, is refused by name. Not
+/// shown here: the manifest's signature, since the case signs nothing.
 #[test]
 fn a_windows_tree_carries_the_powershell_package_as_files() {
     const WINDOWS: &str = "x86_64-pc-windows-msvc";
