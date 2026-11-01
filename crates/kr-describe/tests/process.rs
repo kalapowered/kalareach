@@ -648,6 +648,48 @@ fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
     assert!(sent.elapsed() >= Duration::from_millis(200 + STOP_BOUND_MS));
 }
 
+/// KR-REQ-22.11: a job the control thread has read the stop of gets the stop bound before the
+/// control thread does anything that can take long, the acknowledgement's write included. The
+/// control thread here reads the stop 1.4 s after the job's request, which leaves 0.8 s of the
+/// grace after the job's deadline (200 ms plus 2 s), and then takes 1.2 s to write the
+/// acknowledgement, which is inside the control thread's own bound of 2 s: a write that came
+/// before the extension would carry the watchdog past the grace first, and the process would end
+/// as overdue. The model does not look at its token until after the grace, so the job is still
+/// there to answer. Both delays are the process's own, so a loaded host moves the test with the
+/// process. The control is the same job told nothing, which ends the process at the grace
+/// (above).
+#[test]
+fn a_job_told_to_stop_has_its_bound_before_the_acknowledgement_is_written() {
+    let placed = Placed::stub();
+    let runtime = placed.directory("slow-acknowledgement");
+    let script = Script {
+        ignore_token_ms: 3_000,
+        late_read_after: Some(3),
+        late_read_ms: 1_400,
+        slow_acknowledgement_ms: 1_200,
+        mark_work: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    process.expect_answer(SOON, "the load");
+    process.send(&generate(2, 1, 200));
+    wait_until_began(&runtime, "job");
+    process.send(&Request::Cancel { id: U64::new(2) });
+    assert_eq!(
+        process.expect_answer(SOON, "the acknowledgement"),
+        Answer::Cancelling { id: U64::new(2) },
+        "the process ended as {:?}",
+        process.exit_within(Duration::from_millis(10))
+    );
+    assert!(matches!(
+        process.expect_terminal(SOON, "the stopped job"),
+        Answer::Ended { id, why: JobEnd::Cancelled, .. } if id.get() == 2
+    ));
+    assert!(process.exit_within(Duration::from_millis(500)).is_none());
+}
+
 /// A process whose model fails inside a job ends itself, so the daemon restarts inference rather
 /// than sending work to a process with no model thread; the control is the same job succeeding.
 #[test]

@@ -474,10 +474,11 @@ pub fn run<M: Model>(
                     });
                 }
             }
-            // The acknowledgement is the control thread's own, written before the work stops: it
-            // says this thread is reading, which is the condition the daemon waits for. It is
-            // sent only for work still in hand, so a cancellation that crosses the work's answer
-            // is not acknowledged after it.
+            // The acknowledgement is the control thread's own: it says this thread is reading,
+            // which is the condition the daemon waits for. It is written after the work is
+            // cancelled and a job has its stop bound, since the write can take long, and before
+            // the work's own answer. It is sent only for work still in hand, so a cancellation
+            // that crosses the work's answer is not acknowledged after it.
             Ok(Some(Request::Cancel { id })) => shared.cancel_and_acknowledge(id),
             // The input ended, or failed, which on a pipe the daemon holds is the same thing: the
             // daemon is not going to send anything more.
@@ -568,16 +569,28 @@ impl Shared {
             .remove(&id);
     }
 
-    /// Acknowledges the cancellation of the work with this identifier and then cancels it, when
-    /// there is any in hand.
+    /// Cancels the work with this identifier, gives a job the stop bound, and acknowledges the
+    /// cancellation, in that order, when there is any such work in hand.
     ///
-    /// Both happen under the lock the model thread takes to forget the work before it answers, so
-    /// the acknowledgement is written before the work's own answer: the work cannot be seen
-    /// cancelled, forgotten and answered in the gap between cancelling it and saying so.
+    /// All three happen under the lock the model thread takes to forget the work before it
+    /// answers. The model thread can see the work cancelled before it is acknowledged, but cannot
+    /// answer it until the lock is free, so the acknowledgement is still written before the work's
+    /// own answer.
+    ///
+    /// The cancellation comes before the job is looked for. A job the model thread has taken in
+    /// hand before the cancellation is found there, and extended; one it takes in hand after reads
+    /// the cancelled token and ends at once. Looking first would leave a job that starts between
+    /// the look and the cancellation cancelled and not extended.
+    ///
+    /// The extension comes before the acknowledgement because the write can take long, when the
+    /// daemon is slow to read or the system has set the thread aside, and the watchdog reads the
+    /// bound without the lock: a write ahead of the extension can carry the watchdog past the old
+    /// bound. A watchdog that has already read the old bound when the extension is made can still
+    /// end the process. Closing that would need the watchdog to take the lock, which a write that
+    /// has stuck holds, and the watchdog could then not end the process for that stall.
     fn cancel_and_acknowledge(&self, id: U64) {
         let tokens = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(token) = tokens.get(&id.get()) {
-            self.answer(&Answer::Cancelling { id });
             token.cancel();
             // A job whose stop has been read is not stuck, and is given the stop bound after its
             // deadline to reach a place where the model can stop, where other work is overdue at
@@ -588,6 +601,7 @@ impl Shared {
                 self.work_due
                     .fetch_max(self.job_stop_due.load(Ordering::Acquire), Ordering::AcqRel);
             }
+            self.answer(&Answer::Cancelling { id });
         }
     }
 

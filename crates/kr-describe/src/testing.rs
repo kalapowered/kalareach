@@ -329,6 +329,17 @@ pub struct Script {
     pub wedge_input_after: Option<u64>,
     /// From this answer on, counting from one, writing blocks for good.
     pub wedge_output_from: Option<u64>,
+    /// After this many whole requests, once, reading the next request is put off for
+    /// [`Self::late_read_ms`]: a control thread the system has not run for that long, which reads
+    /// the request late though it was sent in time.
+    pub late_read_after: Option<u64>,
+    /// How long reading is put off, in milliseconds, once the request count of
+    /// [`Self::late_read_after`] is reached.
+    pub late_read_ms: u64,
+    /// How long writing the answer that acknowledges a cancellation takes, in milliseconds: a
+    /// daemon that is slow to read, or a control thread the system has put aside, in the middle of
+    /// acknowledging.
+    pub slow_acknowledgement_ms: u64,
     /// A process that does not serve through [`crate::serve::run`] at all.
     pub raw: Option<Raw>,
     /// Whether the model looks at its token without pausing between looks, so that it sees a
@@ -504,6 +515,8 @@ impl Script {
         number("hold-bytes", self.hold_bytes);
         number("job-threads", u64::from(self.job_threads));
         number("commit-at-start", self.commit_at_start_bytes);
+        number("late-read-ms", self.late_read_ms);
+        number("slow-acknowledgement-ms", self.slow_acknowledgement_ms);
         if let Some(bytes) = self.peak_rss_bytes {
             parts.push(format!("peak-rss={bytes}"));
         }
@@ -512,6 +525,9 @@ impl Script {
         }
         if let Some(count) = self.wedge_output_from {
             parts.push(format!("wedge-output-from={count}"));
+        }
+        if let Some(count) = self.late_read_after {
+            parts.push(format!("late-read-after={count}"));
         }
         let mut flag = |name: &str, set: bool| {
             if set {
@@ -597,9 +613,12 @@ impl Script {
                         .map_err(|_| format!("{name} takes a count of threads"))?;
                 }
                 "commit-at-start" => script.commit_at_start_bytes = number()?,
+                "late-read-ms" => script.late_read_ms = number()?,
+                "slow-acknowledgement-ms" => script.slow_acknowledgement_ms = number()?,
                 "peak-rss" => script.peak_rss_bytes = Some(number()?),
                 "wedge-input-after" => script.wedge_input_after = Some(number()?),
                 "wedge-output-from" => script.wedge_output_from = Some(number()?),
+                "late-read-after" => script.late_read_after = Some(number()?),
                 "load-until-cancelled" => script.load_until_cancelled = true,
                 "load-until-released" => script.load_until_released = true,
                 "generate-until-released" => script.generate_until_released = true,
@@ -1330,8 +1349,10 @@ pub fn stub_main() -> i32 {
         catalogue,
         daemon,
     };
-    let input = Wedging::reading(std::io::stdin(), script.wedge_input_after);
-    let output = Wedging::writing(std::io::stdout(), script.wedge_output_from);
+    let input = Wedging::reading(std::io::stdin(), script.wedge_input_after)
+        .reading_late(script.late_read_after, script.late_read_ms);
+    let output = Wedging::writing(std::io::stdout(), script.wedge_output_from)
+        .acknowledging_slowly(script.slow_acknowledgement_ms);
     let model = StubModel::new(script).in_runtime_dir(options.runtime_dir.clone());
     crate::serve::run(options, model, input, output).code()
 }
@@ -1483,6 +1504,9 @@ fn flag(arguments: &[String], name: &str) -> Option<String> {
 /// Reading, it counts whole frames by their length prefixes and never returns from the read after
 /// the last one it lets through. Writing, it counts the answers it has flushed and never returns
 /// from the write of the one it stops at.
+///
+/// It can also be late once: reading, after a number of whole frames it puts off the next read,
+/// and writing, it takes a while to write the answer that acknowledges a cancellation.
 struct Wedging<T> {
     inner: T,
     stop_at: Option<u64>,
@@ -1490,6 +1514,10 @@ struct Wedging<T> {
     /// Reading: how much of the current frame is still to come, and the prefix bytes seen so far.
     remaining: usize,
     prefix: Vec<u8>,
+    /// Reading: the frame count after which the next read is put off, and for how long.
+    late: Option<(u64, Duration)>,
+    /// Writing: how long the answer that acknowledges a cancellation takes to write.
+    slow_acknowledgement: Duration,
 }
 
 impl<T> Wedging<T> {
@@ -1500,11 +1528,25 @@ impl<T> Wedging<T> {
             frames: 0,
             remaining: 0,
             prefix: Vec::new(),
+            late: None,
+            slow_acknowledgement: Duration::ZERO,
         }
     }
 
     const fn writing(inner: T, from: Option<u64>) -> Self {
         Self::reading(inner, from)
+    }
+
+    /// Puts off the read that follows `after` whole frames by `milliseconds`, once.
+    fn reading_late(mut self, after: Option<u64>, milliseconds: u64) -> Self {
+        self.late = after.map(|after| (after, Duration::from_millis(milliseconds)));
+        self
+    }
+
+    /// Makes writing the answer that acknowledges a cancellation take `milliseconds`.
+    fn acknowledging_slowly(mut self, milliseconds: u64) -> Self {
+        self.slow_acknowledgement = Duration::from_millis(milliseconds);
+        self
     }
 }
 
@@ -1519,6 +1561,12 @@ impl<R: Read> Read for Wedging<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         if self.stop_at.is_some_and(|after| self.frames >= after) {
             stop_for_good();
+        }
+        if let Some((after, wait)) = self.late
+            && self.frames >= after
+        {
+            self.late = None;
+            std::thread::sleep(wait);
         }
         // Reading one byte at a time keeps the count exact without buffering ahead of the frame
         // that stops the stream.
@@ -1560,6 +1608,14 @@ impl<W: Write> Write for Wedging<W> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         if self.stop_at.is_some_and(|from| self.frames + 1 >= from) {
             stop_for_good();
+        }
+        if !self.slow_acknowledgement.is_zero()
+            && matches!(
+                read_message::<Answer>(&mut &buffer[..]),
+                Ok(Some(Answer::Cancelling { .. }))
+            )
+        {
+            std::thread::sleep(self.slow_acknowledgement);
         }
         self.inner.write(buffer)
     }
