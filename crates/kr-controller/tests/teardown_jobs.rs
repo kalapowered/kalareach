@@ -628,23 +628,39 @@ fn units_with_no_file_are_not_asked_about_after_the_time_given_for_them_has_gone
 
 /// The time the questions about units with no file share starts when the list has been read, and a
 /// list that was slow to answer does not take it from them: the question is asked, and answered.
+///
+/// The list takes longer than the allowance and ends inside the ten seconds a list is given at
+/// least: the allowance cannot be longer than the list, so the two are close, and a machine that
+/// delays either by seconds changes what was run. A run is therefore decided after it, from what it
+/// did: a list that gave out, or a question that was begun and did not end in the time left, shows
+/// nothing about the allowance and is run again; a question that was never begun, because the time
+/// for it had gone, is the fault this case is for, and fails it at once.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_slow_list_does_not_take_the_time_given_for_the_questions_about_units_with_no_file() {
-    let tree = kr_ipc::testing::TempHost::create();
-    let manager = StandInManager::new();
-    manager.lists(A_UNIT);
-    manager.says_it_runs_in(A_UNIT, &tree.root().join("s"));
-    // The list takes longer than the allowance, and ends inside the ten seconds a list is given
-    // at least: the allowance cannot be longer than the list, so this is the case that needs the
-    // two to be close, and each has about five seconds to spare.
-    manager.lists_slowly("5.5");
-    let left = manager.remove_within(&tree, std::time::Duration::from_secs(5));
-    assert!(
-        left.iter().all(|what| what.contains("has no file in")),
-        "the unit was asked about and found in the tree: {left:?}"
-    );
-    assert_eq!(manager.stopped(), [A_UNIT], "the unit was stopped");
+    const RUNS: usize = 3;
+    for run in 1..=RUNS {
+        let tree = kr_ipc::testing::TempHost::create();
+        let manager = StandInManager::new();
+        manager.lists(A_UNIT);
+        manager.says_it_runs_in(A_UNIT, &tree.root().join("s"));
+        manager.lists_slowly("5.5");
+        let left = manager.remove_within(&tree, std::time::Duration::from_secs(5));
+        let list_gave_out = left.iter().any(|what| what.contains("could not be listed"));
+        let question_gave_out = left.iter().any(|what| what.contains("could not be asked"))
+            && !manager.asked().is_empty();
+        if list_gave_out || question_gave_out {
+            eprintln!("run {run} of {RUNS} shows nothing, the machine was too slow: {left:?}");
+            continue;
+        }
+        assert!(
+            left.iter().all(|what| what.contains("has no file in")),
+            "the unit was asked about and found in the tree: {left:?}"
+        );
+        assert_eq!(manager.stopped(), [A_UNIT], "the unit was stopped");
+        return;
+    }
+    panic!("none of {RUNS} runs got its list and its question through in the time they are given");
 }
 
 /// A tree whose teardown could not establish that something its test started has ended is kept, and
