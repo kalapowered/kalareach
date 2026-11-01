@@ -3689,12 +3689,13 @@ enum Asked {
     /// no. A copy of Git that does this is not the program, and the caller goes on without it.
     Declined(ProjectError),
     /// The look is refused. What the program did, answering with more than a version and a
-    /// directory or leaving its output open, is [`ProjectError::GitUnavailable`], since it is not a
-    /// program this host can run work through. What the host did, or the time that ran out, is
-    /// [`ProjectError::GitFailed`], which passes: the look was not made because the time was used
-    /// up, because the host was short of descriptors, processes or memory to start the program,
-    /// because the program did not answer in time, or because the host could not wait on it,
-    /// collect it, or switch or read its output.
+    /// directory or leaving its output open after the second it is given, is
+    /// [`ProjectError::GitUnavailable`], since it is not a program this host can run work through.
+    /// What the host did, or the time that ran out, is [`ProjectError::GitFailed`], which passes:
+    /// the look was not made because the time was used up, because the host was short of
+    /// descriptors, processes or memory to start the program, because the program did not answer in
+    /// time or had not finished answering when the time ran out, or because the host could not wait
+    /// on it, collect it, or switch or read its output.
     Overran(ProjectError),
 }
 
@@ -3851,7 +3852,10 @@ fn too_much(described: &str) -> Asked {
 /// Reads what a probe wrote to its end, once the probe has ended.
 ///
 /// A process that left the probe's group may still hold the pipe, so the wait for the end is
-/// short: [`PROBE_DRAIN`], and never past the probe's own `deadline`.
+/// short: [`PROBE_DRAIN`], and never past the probe's own `deadline`. When the wait runs out, whose
+/// time it was decides what it says. The probe's own time running out is the clock's, and says
+/// nothing of the program, so it is a fault that passes. The second the drain is given running out
+/// first is the program's: it left its output open.
 fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::Result<(), Asked> {
     let drain = drain_until(Instant::now(), deadline);
     loop {
@@ -3862,9 +3866,19 @@ fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::
         if heard.ended() {
             return Ok(());
         }
-        if Instant::now() >= drain {
-            return Err(Asked::Overran(ProjectError::GitUnavailable {
-                detail: format!("{described} left its output open after it ended").into(),
+        let now = Instant::now();
+        if now >= drain {
+            return Err(Asked::Overran(if now >= deadline {
+                ProjectError::GitFailed {
+                    detail: format!(
+                        "{described} had not finished answering when the time it is given ran out"
+                    )
+                    .into(),
+                }
+            } else {
+                ProjectError::GitUnavailable {
+                    detail: format!("{described} left its output open after it ended").into(),
+                }
             }));
         }
         std::thread::sleep(Duration::from_millis(5));
