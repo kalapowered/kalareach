@@ -54,8 +54,8 @@ pub struct RemoteOutput {
         std::sync::Mutex<std::collections::BTreeMap<RequestId, tokio::sync::oneshot::Sender<()>>>,
     /// Where the frames go: the connection's control stream.
     sink: Box<dyn FrameSink>,
-    /// The most bytes of one frame the control stream carries, as the hello negotiated it, when
-    /// it is known.
+    /// The most bytes of one frame the control stream carries, as the hello negotiated it. Every
+    /// connection has one; only an output built for a case that has no peer has none.
     max_payload: Option<usize>,
     /// The authority this connection writes under, read inside the turn.
     ///
@@ -425,16 +425,29 @@ impl RemoteOutput {
         authority: Arc<Authorisation>,
         receiving: &kr_protocol::hello::ReceiveLimits,
     ) -> Self {
-        let mut output = Self::writing_to(sink, authority);
-        output.max_payload = Some(
-            usize::try_from(receiving.max_control_frame_len.get())
-                .unwrap_or(usize::MAX)
-                .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN),
-        );
-        output
+        Self::over(
+            sink,
+            authority,
+            Some(
+                usize::try_from(receiving.max_control_frame_len.get())
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN),
+            ),
+        )
     }
 
+    /// An output with no peer to hold its frames to, for a case that has none. A connection always
+    /// has one, so only [`Self::for_a_peer_receiving`] builds an output outside a case.
+    #[cfg(test)]
     pub(super) fn writing_to(sink: Box<dyn FrameSink>, authority: Arc<Authorisation>) -> Self {
+        Self::over(sink, authority, None)
+    }
+
+    fn over(
+        sink: Box<dyn FrameSink>,
+        authority: Arc<Authorisation>,
+        max_payload: Option<usize>,
+    ) -> Self {
         // Tied to the registration before anything can be sent: a withdrawal that removes the
         // registration sets the latch with it, so the fence below needs no read of the connection
         // table, which a poll may not take.
@@ -449,7 +462,7 @@ impl RemoteOutput {
             queued: std::sync::atomic::AtomicUsize::new(0),
             delivery: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             sink,
-            max_payload: None,
+            max_payload,
             authority,
         }
     }
