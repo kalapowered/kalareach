@@ -278,6 +278,81 @@ async fn a_device_reads_and_prompts_an_agent_on_a_worker_the_daemon_adopted() {
     adopted.stop().await;
 }
 
+/// The reason an agent instance's rich mutations wait is the worker's own text, and it can quote a
+/// lock file under the account's home directory. The owner, on the worker's socket, is told it as
+/// the worker wrote it, and a paired device, through the daemon, is told that the mutations wait and
+/// not what the reason says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_reason_rich_mutations_wait_reaches_the_owner_whole_and_a_device_by_its_kind() {
+    let reason =
+        "could not lock /Users/marguerite/.codex/sessions/0193.lock: held by another process";
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let instance = worker.register_agent(Arc::new(Upstream::default()));
+    worker
+        .service
+        .broker()
+        .suspend_rich_mutations(instance, reason)
+        .expect("the instance is registered");
+    let params = AgentCapabilitiesParams {
+        subject: kr_worker::broker::subject(worker.session_id, instance),
+    };
+
+    // The owner reads an agent on the worker's own socket, as a terminal on this machine does, and
+    // so meets nothing that holds the reason back.
+    let mut owner = worker.client().await;
+    let owners: AgentCapabilitiesResult = owner
+        .request(Method::AgentCapabilities, &params)
+        .await
+        .expect("the call reaches the worker")
+        .expect("the owner reads the capabilities")
+        .to_typed()
+        .expect("decodes");
+    assert!(owners.binding.rich_mutations_suspended);
+    assert_eq!(
+        owners.binding.suspension_reason.0.as_deref(),
+        Some(reason),
+        "the owner is told the reason as the worker wrote it"
+    );
+
+    let (device, record) = viewer(
+        &adopted,
+        &[ActionRight::SessionView, ActionRight::AgentPrompt],
+    )
+    .await;
+    let connection = RawDevice::connect(&adopted.host, &device, &record).await;
+    let devices: AgentCapabilitiesResult = connection
+        .read(Method::AgentCapabilities, &params)
+        .await
+        .expect("the capabilities are read")
+        .to_typed()
+        .expect("decodes");
+    assert!(devices.binding.rich_mutations_suspended);
+    let told = devices
+        .binding
+        .suspension_reason
+        .0
+        .clone()
+        .expect("a device is told that the mutations wait for a reason");
+    assert!(
+        told.starts_with("rich mutations are suspended")
+            && !told.contains("marguerite")
+            && !told.contains('/'),
+        "{told}"
+    );
+    assert_eq!(
+        kr_protocol::agent::AgentBindingState {
+            suspension_reason: owners.binding.suspension_reason.clone(),
+            ..devices.binding
+        },
+        owners.binding,
+        "and the rest of the binding is the owner's"
+    );
+
+    connection.close();
+    adopted.stop().await;
+}
+
 /// The host decides what a connection is opened with: an open reports the rights the host decided
 /// it with, which the host's configured ceiling can leave smaller than the grant a pairing
 /// proposed, and never a right the grant lacks.
