@@ -4793,6 +4793,27 @@ impl Session {
         // removing output because it is seven days old is exactly that. The caps are applied
         // either way: they are about bytes rather than about time.
         let age_permitted = self.time.may_collect_expired();
+        self.collect_output_with(retention, age_permitted)
+    }
+
+    /// Applies the two byte caps of output retention, the session's own and the host's, and
+    /// removes nothing by age.
+    ///
+    /// This is for a pass that is not preceded by a look at the clocks: whether the wall clock can
+    /// be proved is decided by that look, and a pass without it would act on a verdict that the
+    /// platform's time service may have withdrawn since.
+    pub fn collect_output_for_the_caps(&mut self) -> Vec<crate::persistence::retention::Eviction> {
+        self.collect_output_with(
+            crate::persistence::retention::OutputRetention::DEFAULT,
+            false,
+        )
+    }
+
+    fn collect_output_with(
+        &mut self,
+        retention: crate::persistence::retention::OutputRetention,
+        age_permitted: bool,
+    ) -> Vec<crate::persistence::retention::Eviction> {
         let now = kr_ipc::now_ms();
         match self
             .config

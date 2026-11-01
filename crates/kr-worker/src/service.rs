@@ -415,6 +415,11 @@ pub struct WorkerService {
     /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
     received: Mutex<Vec<(kr_protocol::method::MethodName, ParamsValue)>>,
+    /// How many times a host that found the host over its output cap while another held the lock
+    /// on it has looked at the cap again, for this host's own tests. It is compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    host_cap_looks: std::sync::atomic::AtomicU64,
     /// How many question subscriptions the long polls this service is serving hold at this moment,
     /// for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -826,6 +831,8 @@ impl WorkerService {
             hold_next_delivery: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             received: Mutex::new(Vec::new()),
+            #[cfg(feature = "testing")]
+            host_cap_looks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
             subscriptions_held: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
@@ -1935,12 +1942,17 @@ impl WorkerService {
         off_the_executor(|| self.maintain_once())
     }
 
-    /// Applies output retention again, for a host that found the host over its output cap and did
-    /// not get the lock on it. It takes the session's lock for the pass and waits for nothing else.
+    /// Applies the byte caps of output retention again, for a host that found the host over its
+    /// output cap and did not get the lock on it. It takes the session's lock for the pass and
+    /// waits for nothing else. It removes nothing by age: no look at the clocks comes before it,
+    /// and the time service may have lost its qualification since the pass that did.
     fn retry_output_once(&self) -> MaintenancePass {
+        #[cfg(feature = "testing")]
+        self.host_cap_looks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (closed, awaits_the_host_cap_lock, times) = {
             let mut session = self.runtime.session();
-            session.collect_output();
+            session.collect_output_for_the_caps();
             (
                 session.state() == kr_protocol::session::SessionState::Closed,
                 session.output_awaits_the_host_cap_lock(),
@@ -2034,6 +2046,16 @@ impl WorkerService {
             tokio::time::Instant::now() + HOST_MAINTENANCE,
         )
         .await;
+    }
+
+    /// How many times this host has looked again at the host's output cap, having found the host
+    /// over it while another held the lock on it, for this host's own tests. It is compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn host_cap_looks(&self) -> u64 {
+        self.host_cap_looks
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Runs the storage half of one maintenance pass now: the journal first, then the broker.
