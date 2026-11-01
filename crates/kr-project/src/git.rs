@@ -3863,7 +3863,6 @@ fn too_much(described: &str) -> Asked {
 /// wake-up does not change it.
 fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::Result<(), Asked> {
     let drain = drain_until(Instant::now(), deadline);
-    let clocks_own = drain == deadline;
     loop {
         // Read for as long as the probe's own time allows, not only for the drain's second: the
         // second is how long the wait goes on, and a poll that comes after it still reads an end
@@ -3875,8 +3874,9 @@ fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::
         if heard.ended() {
             return Ok(());
         }
-        if Instant::now() >= drain {
-            return Err(Asked::Overran(if clocks_own {
+        let now = Instant::now();
+        if now >= drain {
+            return Err(Asked::Overran(if now >= deadline {
                 ProjectError::GitFailed {
                     detail: format!(
                         "{described} was not read to the end of its output in the time it is given"
