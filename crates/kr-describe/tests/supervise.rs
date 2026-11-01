@@ -1652,7 +1652,9 @@ fn a_late_answer_is_dropped_and_counted() {
 /// the job is dequeued: the load is not held to the job's deadline, the cold start is reported
 /// apart, and the job is then published. The job takes a moment in the process, which a deadline
 /// the load had used up would end, so the load did not use up the deadline the process was sent.
-/// The control is a job whose answer arrives past that deadline, which is refused.
+/// The control is a job whose answer arrives past that deadline, which is refused. The first job
+/// after such a load is also held to the whole of its deadline from its send: the daemon ends a
+/// process that holds it at the deadline and the grace after the send, and not a moment before.
 ///
 /// The process holds its load until the case has seen the handshake and has taken a turn at the
 /// reading past the job's deadline and its grace, so the load's answer is told at that reading,
@@ -1690,9 +1692,9 @@ fn a_load_over_thirty_seconds_is_followed_by_a_published_job() {
         !the_process_ended(&reports),
         "a long load is not a job past its deadline"
     );
-    // The job's timers run from the reading it was sent at: the next is the sample a second after
-    // it, ahead of the job's own deadline and grace. A state of the driver, read before any turn
-    // that could take the answer.
+    // No timer of the job runs from before it was sent: the soonest is the sample a second after
+    // the send. A state of the driver, read before any turn that could take the answer. The job's
+    // own deadline is held by the last part of the case.
     assert_eq!(rig.driver.due_ms(), Some(loaded_at + SAMPLE_MS));
     let reports = rig.until(
         &roomy(),
@@ -1731,6 +1733,47 @@ fn a_load_over_thirty_seconds_is_followed_by_a_published_job() {
         }),
         "{reports:?}"
     );
+
+    // The first job after the same load, held by the process until it is cancelled, is ended at the
+    // job's deadline and grace after its send, with nothing before.
+    let mut rig = Rig::new(&Script {
+        load_until_released: true,
+        generate_until_cancelled: true,
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.until(&roomy(), at(3_000), "the handshake", |_, driver| {
+        driver.background().is_some()
+    });
+    release_held_work(&rig.placed.directory("runtime"));
+    rig.until(&roomy(), at(loaded_at), "the load", |reports, _| {
+        outcomes(reports)
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Loaded { .. }))
+    });
+    assert_eq!(rig.driver.service().in_flight(), 1);
+    let due = loaded_at + DEADLINE_MS + ANSWER_GRACE_MS;
+    let reports = rig.driver.turn(&roomy(), at(due - 1)).expect("a turn");
+    assert!(outcomes(&reports).is_empty(), "{reports:?}");
+    assert!(
+        rig.driver.pid().is_some(),
+        "not a moment before its deadline"
+    );
+    let reports = rig.driver.turn(&roomy(), at(due)).expect("a turn");
+    let ended = outcomes(&reports);
+    assert!(
+        ended.contains(&&Outcome::DeadlineExceeded {
+            session_id: session(1)
+        }),
+        "{reports:?}"
+    );
+    assert!(
+        ended.contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::PastDeadline
+        }),
+        "{reports:?}"
+    );
+    assert_eq!(rig.driver.pid(), None);
 }
 
 /// KR-REQ-22.14: under mixed demand through the process, an ordinary session is described again
