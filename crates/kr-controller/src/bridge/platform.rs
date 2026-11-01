@@ -182,6 +182,12 @@ fn collect_until(
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
     while bytes.len() < PLATFORM_OUTPUT_LIMIT {
+        // What has already arrived is taken whatever the clock says: a stream read after the
+        // deadline has passed, because the other one held the time, is not an empty one.
+        if let Ok(piece) = pieces.try_recv() {
+            bytes.extend_from_slice(&piece);
+            continue;
+        }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             break;
@@ -533,6 +539,28 @@ mod tests {
             "{error}"
         );
         assert!(!error.to_string().contains("exec sleep"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_the_command_printed_on_a_stream_is_kept_when_the_other_one_held_the_time() {
+        // The command exits with a status and leaves a descendant holding both streams. Standard
+        // output is read until the deadline, and standard error, read after it, still has what the
+        // command wrote to it before it ended.
+        let output = super::run_bounded(
+            "/bin/sh",
+            &[
+                "-c".to_owned(),
+                "sleep 5 & echo said-on-standard-error >&2; exit 3".to_owned(),
+            ],
+            std::time::Duration::from_millis(300),
+        )
+        .expect("the command exited, so it has an answer");
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            "said-on-standard-error"
+        );
     }
 
     #[cfg(unix)]
