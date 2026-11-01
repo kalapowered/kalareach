@@ -231,20 +231,22 @@ fn resolve_container_target_through(
     // Neither the target nor what the runtime printed is repeated: the target is what was typed,
     // and the runtime's own output is whatever it chose to say.
     if !output.status.success() {
-        return Err(if says_there_is_no_such_container(&output.stderr) {
-            CliError::Usage(shown!(
-                "{} knows no container by that name ({})",
-                runtime,
-                output.status
-            ))
-        } else {
-            CliError::Other(shown!(
-                "{} container inspect, which resolves the target to a container identifier, ended \
+        return Err(
+            if platform::says_there_is_no_such_container(&String::from_utf8_lossy(&output.stderr)) {
+                CliError::Usage(shown!(
+                    "{} knows no container by that name ({})",
+                    runtime,
+                    output.status
+                ))
+            } else {
+                CliError::Other(shown!(
+                    "{} container inspect, which resolves the target to a container identifier, ended \
                  with {}",
-                runtime,
-                output.status
-            ))
-        });
+                    runtime,
+                    output.status
+                ))
+            },
+        );
     }
     let resolved = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if !kr_protocol::identity::is_container_identifier(&resolved) {
@@ -254,14 +256,6 @@ fn resolve_container_target_through(
         )));
     }
     Ok(resolved)
-}
-
-/// Whether what the runtime printed on its error stream says that it knows no such container, as
-/// `podman` and `docker` both do for a name or an identifier they do not hold. It is read and not
-/// repeated: the runtime's words are whatever it chose to say.
-fn says_there_is_no_such_container(stderr: &[u8]) -> bool {
-    let said = String::from_utf8_lossy(stderr).to_lowercase();
-    said.contains("no such container") || said.contains("no such object")
 }
 
 /// Decides whether the destination may be asked which environment it is.
@@ -568,6 +562,19 @@ mod tests {
             "{refused}"
         );
         assert_eq!(refused.exit_code(), 2, "{refused}");
+
+        // The words in a path that could not be read are another failure.
+        let unreadable = a_runtime_that(
+            "echo 'Error: reading /tmp/no such container/storage.conf: permission denied' >&2; \
+             exit 125",
+        );
+        let refused = resolve_container_target_through(unreadable, limit, "typed")
+            .expect_err("a failed call is refused");
+        assert!(
+            !refused.to_string().contains("knows no container"),
+            "{refused}"
+        );
+        assert_eq!(refused.exit_code(), 1, "{refused}");
 
         let broken = a_runtime_that("echo 'Error: cannot connect to the store' >&2; exit 125");
         let refused = resolve_container_target_through(broken, limit, "typed")

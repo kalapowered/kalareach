@@ -431,6 +431,21 @@ fn run_within(
     })
 }
 
+/// Whether what a container runtime printed says that it knows no such container, in the form the
+/// runtimes say it: a diagnostic one of whose parts, set off by a colon, begins with the words
+/// (`podman`: `Error: no such container "x"`; `docker`: `Error response from daemon: No such
+/// container: x`). The words anywhere else, as in the path of a file that could not be read, are
+/// another failure that names a path. The text is read and not repeated.
+#[must_use]
+pub fn says_there_is_no_such_container(printed: &str) -> bool {
+    printed.lines().any(|line| {
+        line.to_lowercase().split(": ").any(|part| {
+            let part = part.trim_start();
+            part.starts_with("no such container") || part.starts_with("no such object")
+        })
+    })
+}
+
 /// Reads one distribution's state out of the two listings of names `wsl.exe` prints.
 ///
 /// Each listing is one name to a line and nothing else, so the answer does not depend on the
@@ -539,6 +554,28 @@ mod tests {
             "{error}"
         );
         assert!(!error.to_string().contains("exec sleep"), "{error}");
+    }
+
+    /// The runtimes' own form of the diagnostic is the one read; the words in a path are not.
+    #[test]
+    fn a_runtime_that_knows_no_such_container_is_read_by_its_own_form_of_saying_so() {
+        for said in [
+            "Error: no such container \"abc\"",
+            "Error: error inspecting object: no such object: \"abc\"",
+            "Error response from daemon: No such container: abc",
+            "Error: No such object: abc",
+            "Warning: something\nError: no such container abc\n",
+        ] {
+            assert!(super::says_there_is_no_such_container(said), "{said}");
+        }
+        for said in [
+            "Error: reading /tmp/no such container/storage.conf: permission denied",
+            "Error: cannot connect to the store",
+            "Error: open /var/lib/no such object: permission denied",
+            "",
+        ] {
+            assert!(!super::says_there_is_no_such_container(said), "{said}");
+        }
     }
 
     /// What a stream has already delivered is the answer whatever the clock says: a stream read
