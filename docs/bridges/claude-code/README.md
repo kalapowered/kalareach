@@ -59,8 +59,9 @@ and on these five events even a wrong exit code could not block anything.
 
 ## The command line
 
-`kr-hook` accepts exactly the invocations the registration names, the relay a launched agent uses,
-and the launcher the shell runs for an integrated command:
+`kr-hook` accepts the invocations a registration names for each of the three applications it knows
+(`gemini-cli hook` and `qoder-cli hook` belong to the other two guides), the relay a launched agent
+uses, and the launcher the shell runs for an integrated command. Those of Claude Code are:
 
 ```
 kr-hook claude-code channel
