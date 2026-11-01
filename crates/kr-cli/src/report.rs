@@ -66,8 +66,79 @@ pub fn with_failure(mut document: Document, error: &CliError) -> Document {
 /// [`failed`], and each is a [`Shown`]: this program's own words, values with nothing in them to
 /// hide, and what a reducer or a door decided may be said. The one other thing written there is
 /// the preview of a content export, by [`show_preview`].
+///
+/// A stream that refuses the line does not end the process: the failure is kept, and [`ending`]
+/// says what could not be written once the command is done.
 pub fn say(line: &Shown) {
-    eprintln!("{line}");
+    use std::io::Write as _;
+
+    if ERROR_UNWRITTEN.get().is_some() {
+        return;
+    }
+    if let Err(error) = writeln!(error_stream(), "{line}") {
+        let _ = ERROR_UNWRITTEN.set(Shown::io(&error));
+    }
+}
+
+/// The first failure to write standard error, kept until the command ends.
+static ERROR_UNWRITTEN: std::sync::OnceLock<Shown> = std::sync::OnceLock::new();
+
+/// Standard error, for a line.
+#[cfg(not(test))]
+fn error_stream() -> std::io::StderrLock<'static> {
+    std::io::stderr().lock()
+}
+
+/// Standard error as a test sees it: the harness's capture of what `eprint!` writes, which the
+/// stream itself does not reach.
+#[cfg(test)]
+fn error_stream() -> impl std::io::Write {
+    struct Captured;
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            eprint!("{}", String::from_utf8_lossy(bytes));
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    Captured
+}
+
+/// Ends a command whose streams may have refused what it wrote, with the exit status it ends with.
+///
+/// A stream with no room left takes none of what is written to it, and the writes do not panic. The
+/// command says what it could not write on the other stream, where it still can: standard output's
+/// failure on standard error, and standard error's on standard output, as a line, or as a failure
+/// document when the caller asked for `--json`. A command that had already failed ends with its own
+/// failure; one that had not ends with the failure for the stream, because it could not give the
+/// person what it had to say.
+#[must_use]
+pub fn ending(ended: std::process::ExitCode, json: bool) -> std::process::ExitCode {
+    let unwritten = if let Some(why) = output::unwritten_output() {
+        let unwritten =
+            CliError::Terminal(shown!("standard output could not be written: {}", *why));
+        failed(&unwritten);
+        unwritten
+    } else if let Some(why) = ERROR_UNWRITTEN.get() {
+        let unwritten = CliError::Terminal(shown!("standard error could not be written: {}", *why));
+        if json {
+            output::document(&failure(&unwritten));
+        } else {
+            output::say(&shown!("kr: {}", unwritten));
+        }
+        unwritten
+    } else {
+        return ended;
+    };
+    if ended == std::process::ExitCode::SUCCESS {
+        std::process::ExitCode::from(unwritten.exit_code())
+    } else {
+        ended
+    }
 }
 
 /// Prints the preview of a content export on standard error, and flushes it.

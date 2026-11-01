@@ -29,14 +29,23 @@ use kr_protocol::session::{
 use kr_shell_integration::host::startup::HomeLayout;
 
 fn main() -> ExitCode {
-    // Whether the caller asked for machine-readable output has to be known before the arguments
-    // parse, because a usage mistake is one of the things a script has to be able to read. A
-    // literal `--` ends the options, so a `--json` after it is an argument and asks for nothing.
-    // Read as the operating system gave them: an argument that is not UTF-8 is compared, never
-    // decoded, so it cannot end the program with a panic that repeats it.
-    let json = std::env::args_os()
+    report::ending(command(), json_asked_for())
+}
+
+/// Whether the caller asked for machine-readable output, which has to be known before the arguments
+/// parse, because a usage mistake is one of the things a script has to be able to read. A literal
+/// `--` ends the options, so a `--json` after it is an argument and asks for nothing. Read as the
+/// operating system gave them: an argument that is not UTF-8 is compared, never decoded, so it
+/// cannot end the program with a panic that repeats it.
+fn json_asked_for() -> bool {
+    std::env::args_os()
         .take_while(|argument| argument != "--")
-        .any(|argument| argument == "--json");
+        .any(|argument| argument == "--json")
+}
+
+/// Runs the command the caller named and returns how it ended.
+fn command() -> ExitCode {
+    let json = json_asked_for();
     // Before anything a release could matter to: a command of an installed release holds that
     // release for as long as it runs, and does not run at all once the release is being removed.
     if let Err(error) = kr_ipc::install::this_process() {

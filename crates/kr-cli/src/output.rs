@@ -797,14 +797,65 @@ pub fn said(value: &dyn Plain) -> Shown {
     Shown::compose("{}", &[value])
 }
 
+/// The first failure to write standard output, kept until the command ends.
+static OUTPUT_UNWRITTEN: std::sync::OnceLock<Shown> = std::sync::OnceLock::new();
+
+/// Writes one line on standard output, or keeps why it could not.
+///
+/// A stream that refuses the line, a full disk behind a redirection or a pipe nobody reads, does not
+/// end the process: the first failure is kept, nothing more is written to the stream, and the
+/// command goes on to its end, where [`report::ending`](crate::report::ending) says what could not
+/// be written.
+fn write_stdout(text: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+
+    if OUTPUT_UNWRITTEN.get().is_some() {
+        return;
+    }
+    if let Err(error) = writeln!(stdout_stream(), "{text}") {
+        let _ = OUTPUT_UNWRITTEN.set(Shown::io(&error));
+    }
+}
+
+/// Standard output, for a line.
+#[cfg(not(test))]
+fn stdout_stream() -> std::io::StdoutLock<'static> {
+    std::io::stdout().lock()
+}
+
+/// Standard output as a test sees it: the harness's capture of what `print!` writes, which the
+/// stream itself does not reach.
+#[cfg(test)]
+fn stdout_stream() -> impl std::io::Write {
+    struct Captured;
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            print!("{}", String::from_utf8_lossy(bytes));
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    Captured
+}
+
+/// What standard output refused, when it refused anything.
+#[must_use]
+pub(crate) fn unwritten_output() -> Option<&'static Shown> {
+    OUTPUT_UNWRITTEN.get()
+}
+
 /// Writes one line on standard output.
 pub fn say(line: &Shown) {
-    println!("{line}");
+    write_stdout(format_args!("{line}"));
 }
 
 /// Writes one composed line on standard output.
 pub fn line(line: &Line) {
-    println!("{}", line.text);
+    write_stdout(format_args!("{}", line.text));
 }
 
 /// Writes composed lines on standard output, one after another.
@@ -836,10 +887,10 @@ pub fn write_prompt(writer: &mut impl std::io::Write, prompt: &Line) -> std::io:
 
 /// Writes one machine-readable document on standard output.
 pub fn document(document: &Document) {
-    println!(
+    write_stdout(format_args!(
         "{}",
         serde_json::to_string_pretty(&document.values).unwrap_or_else(|_| "{}".to_owned())
-    );
+    ));
 }
 
 /// The document a contact tool returns to the agent that called it, as the tool's structured
