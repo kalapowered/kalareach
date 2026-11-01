@@ -4187,11 +4187,11 @@ fn a_call_that_ended_and_left_something_holding_its_output_fails_and_names_the_c
 
 /// Run by the case below as a process of its own, with a `PATH` that holds a `systemctl` the case
 /// chose: starts a user manager of its own, giving the machine's manager two seconds to say who it
-/// is, and prints what became of it.
+/// is, and prints what became of it. Two seconds is for the `systemctl` that never answers.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "run as a process of its own by a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skipped"]
-fn a_user_manager_is_started_with_the_systemctl_of_the_path_it_was_given() {
+fn a_user_manager_is_started_with_a_systemctl_that_is_given_two_seconds() {
     let tree = teardown::Tree::create();
     let home = tree.root().join("home");
     std::fs::create_dir_all(&home).expect("a home");
@@ -4201,9 +4201,28 @@ fn a_user_manager_is_started_with_the_systemctl_of_the_path_it_was_given() {
     }
 }
 
+/// Run by the case below as a process of its own, like the one above, with the time a start is
+/// ordinarily given for the question: for a `systemctl` that answers.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "run as a process of its own by a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skipped"]
+fn a_user_manager_is_started_with_a_systemctl_that_is_given_the_ordinary_time() {
+    let tree = teardown::Tree::create();
+    let home = tree.root().join("home");
+    std::fs::create_dir_all(&home).expect("a home");
+    match user_manager::UserManager::start(&home, tree.holder()) {
+        Ok(_) => println!("started"),
+        Err(why) => println!("not here: {why}"),
+    }
+}
+
 /// A machine whose user service manager is not there is a machine that cannot run a service-start
 /// case, and says so. A manager that is there and does not answer is not: the start fails the case,
 /// with the call named, where a skip would pass the case without running it.
+///
+/// The `systemctl` that never answers is given two seconds, which is all that case needs. The one
+/// that answers, and takes three seconds to, is given the time a start is ordinarily given, so the
+/// verdict does not rest on how soon a loaded machine runs a shell.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skipped() {
@@ -4214,7 +4233,6 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
         eprintln!("this machine has no systemd, so a manager of the test's own cannot be tried");
         return;
     }
-    let case = "a_user_manager_is_started_with_the_systemctl_of_the_path_it_was_given";
     let place = |directory: &Path, body: &str| {
         let text = directory.join("systemctl.text");
         std::fs::write(&text, format!("#!/bin/sh\n{body}\n")).expect("the stand-in");
@@ -4223,7 +4241,7 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
 
     // The case runs with that `systemctl` first on its `PATH` and no runtime directory of the
     // person's, so that the teardown of its tree does not ask the stand-in about units too.
-    let run_with = |path: &Path| {
+    let run_with = |case: &str, path: &Path| {
         let mut command = std::process::Command::new(std::env::current_exe().expect("this binary"));
         command
             .args(["--ignored", "--exact", case, "--nocapture"])
@@ -4231,9 +4249,12 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
             .env_remove("XDG_RUNTIME_DIR");
         to_its_end(command, Duration::from_secs(120))
     };
+    let short = "a_user_manager_is_started_with_a_systemctl_that_is_given_two_seconds";
+    let ordinary = "a_user_manager_is_started_with_a_systemctl_that_is_given_the_ordinary_time";
+
     let stalling = tempfile::tempdir().expect("a directory");
-    place(stalling.path(), "exec /bin/sleep 60");
-    let ran = run_with(stalling.path());
+    place(stalling.path(), "exec /bin/sleep 600");
+    let ran = run_with(short, stalling.path());
     let said = String::from_utf8_lossy(&ran.stderr);
     assert_eq!(
         ran.status.code(),
@@ -4243,8 +4264,11 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
     assert!(said.contains("did not end within"), "{said}");
 
     let absent = tempfile::tempdir().expect("a directory");
-    place(absent.path(), "echo 'Failed to connect to bus' >&2; exit 1");
-    let ran = run_with(absent.path());
+    place(
+        absent.path(),
+        "/bin/sleep 3; echo 'Failed to connect to bus: No medium found' >&2; exit 1",
+    );
+    let ran = run_with(ordinary, absent.path());
     let printed = String::from_utf8_lossy(&ran.stdout);
     assert!(
         ran.status.success(),
