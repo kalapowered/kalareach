@@ -4175,6 +4175,10 @@ fn a_call_that_ended_and_left_something_holding_its_output_fails_and_names_the_c
         .expect_err("output that is still held is a failure and not an empty answer");
     assert!(why.contains("still holds its output"), "{why}");
     assert!(
+        why.contains("\"/bin/sh\"") && why.contains("\"program\""),
+        "the failure names the call: {why}"
+    );
+    assert!(
         held.pid.exists(),
         "the call ended before the descendant started: {why}"
     );
