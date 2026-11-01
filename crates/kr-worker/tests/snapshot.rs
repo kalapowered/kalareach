@@ -2102,7 +2102,7 @@ async fn reported_as(
     what: &str,
 ) {
     let started = tokio::time::Instant::now();
-    let waited = tokio::time::timeout_at(started + LIVENESS_DEADLINE, async {
+    let waited = tokio::time::timeout_at(started + Duration::from_secs(20), async {
         loop {
             if reported(host, client, attachment_id).await == expected {
                 return;
@@ -2111,7 +2111,15 @@ async fn reported_as(
         }
     })
     .await;
-    assert!(waited.is_ok(), "waited {:?} for {what}", started.elapsed());
+    if waited.is_err() {
+        let state = reported(host, client, attachment_id).await;
+        let seen = retained(&host.runtime);
+        panic!(
+            "waited {:?} for {what}; the session reports {state:?}; it retained {:?}",
+            started.elapsed(),
+            String::from_utf8_lossy(&seen).escape_debug().to_string()
+        );
+    }
 }
 
 /// KR-REQ-08.81: asking for a screen is beginning again, and beginning again meets a boundary.
