@@ -3652,8 +3652,8 @@ impl Drop for PrivateTemporary {
 /// version, reporting the same helper directory. It runs when it is. Where there is no such copy,
 /// or it answers differently, the program this host resolved is what runs, and a stand-in that
 /// then cannot hand off is an honest failure rather than a widened list. A host too short of
-/// memory to resolve either path has not said that there is no copy, or that it answers
-/// differently, so the look is refused as a fault that passes and keeps nothing.
+/// descriptors, processes or memory to resolve either path has not said that there is no copy, or
+/// that it answers differently, so the look is refused as a fault that passes and keeps nothing.
 fn handed_off_to(
     program: &Path,
     exec_path: &Path,

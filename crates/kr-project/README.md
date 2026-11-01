@@ -36,8 +36,9 @@ arrives while one is under way waits for that look and shares its result, so a p
 started once for all of them. A copy of Git under the helper directory that does not answer in time,
 or answers with more, refuses the whole look. One that cannot run, or answers differently, leaves
 the program on the search path as the one that runs. A host that is short of descriptors, processes
-or memory when a copy is started refuses the look rather than taking the copy for one that cannot
-run.
+or memory when a copy is started, or when the path of the copy or of the helper directory it reports
+is resolved, refuses the look rather than taking the copy for one that is not there, cannot run or
+answers differently.
 
 ## Why there is one
 
