@@ -5170,7 +5170,7 @@ Content-history retention, description inference, sync production and backup pro
 prospectively, together. What this host holds itself is removed with them: the retained output goes,
 the spool with it, and the content a settled receipt carries (the intent envelope the caller sent
 and the result the action produced) is taken out of the journal while the receipt's own metadata
-stays. A receipt that has *not* settled keeps its envelope, because recovery reads it and a retry of
+stays, its error message with it (the last list in this section says so). A receipt that has *not* settled keeps its envelope, because recovery reads it and a retry of
 an action this host may already have performed is answered from it. It loses its content in the
 transaction that settles it. That transaction reads the journal's own privacy record, and while the
 record says privacy mode is on, a receipt that settles or is rejected is committed without its
@@ -5202,9 +5202,9 @@ kept locally unless explicitly cleared and are left out of sync while privacy mo
 delivery journal's own records, and each destination's spent rate allowance. A session's worker
 keeps more, which the report does not carry and this guide names: the receipt journal's operation
 metadata, the minimal local authority this host holds, the envelope of an action that has not
-settled, and live pending questions and approvals, which keep working under the grants they already
-have. The attention store serves none of their text, but their ledgers keep it, as the last list in
-this section says. A host that claimed a functioning
+settled, the error message of a receipt, and live pending questions and approvals, which keep working
+under the grants they already have. The attention store serves none of the text of those questions
+and approvals, but their ledgers keep it, as the last list in this section says. A host that claimed a functioning
 durable control system wrote no state at all would be claiming something untrue.
 
 The same boundary applies when exporting session content as part of a support bundle:
@@ -5351,8 +5351,8 @@ credential, and neither is a row recorded with no digest: it matches no destinat
 message that its destination took, called a duplicate or left unknown is listed and is not
 deletable, because this host holds no way to ask the service it went to to forget it. A message
 that its destination read and refused is not listed, although its content reached that service, and
-nor is one still retrying after an answer this host could not read, which has left too, until
-turning privacy mode on settles it as uncertain.
+nor is one still retrying after an answer this host could not read, which has left too, until a
+later answer, its expiry or turning privacy mode on settles it.
 Backup does not silently delete unrelated collections and does not claim a copy
 somebody else holds can be recalled. Local deletion is logical cleanup of this host's own records
 rather than a claim of physical secure erase: the files are unlinked and the rows are cleared, and
@@ -5497,12 +5497,19 @@ what it removes is exactly the thing a person cannot check for themselves.
   invitation's record in the sharing store. The sharing store is not one of the subsystems privacy
   cleanup takes through the steps, so it removes none of this, and the record keeps it after the
   invitation is redeemed, withdrawn or has expired.
-* **A session's questions and approvals keep their text.** The question ledger in the session's
-  store keeps each question's context, text, choices and answer in any state, and the broker's
-  ledger keeps what each approval asked. Privacy cleanup removes none of this. The attention store
-  serves none of it from before the change, but `question.read` is not fenced by privacy mode: while
-  the mode is on and after it, the local owner reads every question, and a device that holds
-  `session.view` reads the questions its grant's history reaches.
+* **A session's questions, approvals and alerts keep their text.** The question ledger in the
+  session's store keeps each question's context, text, choices and answer in any state, the broker's
+  ledger keeps what each approval asked, and the same store keeps the text of each alert an agent
+  raises with `send_notification`, also while the mode is on. Privacy cleanup removes none of this.
+  The attention store serves none of it from before the change, but `question.read` and
+  `agent.approval.inspect` are not fenced by privacy mode: while the mode is on and after it, the
+  local owner reads every question and the record of every interpreted approval, its original bytes
+  included, and a device that holds `session.view` reads the questions and approvals its grant's
+  history reaches, and those its grant names while they are open. Nothing serves an alert's text to
+  a reader.
+* **A receipt keeps its error message.** Cleanup takes out a settled receipt's intent envelope and
+  result and leaves the message of its error, which can quote the upstream or the session. A device
+  is shown that message withheld, and the local owner reads it.
 
 ## Session names and descriptions
 
