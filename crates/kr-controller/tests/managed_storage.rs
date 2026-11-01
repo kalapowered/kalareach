@@ -6583,8 +6583,8 @@ async fn a_delay_named_in_an_answer_that_ends_the_call_at_once_is_owed() {
 
 /// KR-REQ-09.09: a delay the service names in the answer to a request that is out when a fence
 /// lands stays owed, though the call is refused for the fence and is not told it. The enrolment is
-/// held, the fence raised and the enrolment let go, and the service refuses it as rate limiting for
-/// 30 seconds. The control: with the fence let go, the same call is told the delay at its first
+/// held, the fence raised and the enrolment let go, and the service refuses it as unavailable for
+/// 30 seconds. The control: with the fence let go, the same call is told the 30 seconds at its first
 /// request, which does not leave.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delay_named_by_a_request_that_is_out_when_a_fence_lands_stays_owed_though_the_call_is_refused()
@@ -6596,8 +6596,8 @@ async fn a_delay_named_by_a_request_that_is_out_when_a_fence_lands_stays_owed_th
         MANIFEST,
         1,
         Moment::SlowRefuse {
-            status: 429,
-            code: "RATE_LIMITED",
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
             retry_after_seconds: Some(30),
         },
     );
@@ -6621,10 +6621,12 @@ async fn a_delay_named_by_a_request_that_is_out_when_a_fence_lands_stays_owed_th
     );
 
     rig.controller.hold_fence(false);
-    assert!(matches!(
-        rig.enable(&made.params).await,
-        BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
-    ));
+    let told = rig.enable(&made.params).await;
+    assert!(
+        matches!(&told, BackupEnableResult::Unknown { retry_after_seconds }
+            if retry_after_seconds.0.map(|seconds| seconds.get()) == Some(30)),
+        "{told:?}"
+    );
     assert_eq!(
         web.requests_to(SYNC),
         1,
