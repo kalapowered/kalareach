@@ -5120,6 +5120,45 @@ async fn the_last_attempt_follows_the_answers_and_is_left_as_it_was_by_a_call_th
     assert_eq!(rig.backup_status().await.last_attempt.0, None);
 }
 
+/// A call goes on when the client that made it closes its connection: the daemon serves the call in
+/// line and withdraws the connection's registration only after the call has ended. The bundle write
+/// is held, the client's task dropped and the write let go, and the setup is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_goes_on_when_the_client_that_made_it_closes_its_connection() {
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(SYNC, 1, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the bundle write", web.requests_reach(SYNC, 1)).await;
+    call.abort();
+    assert!(
+        call.await
+            .expect_err("the client's task is dropped")
+            .is_cancelled()
+    );
+    // A look through another connection shows the call still running.
+    assert!(matches!(
+        rig.backup_status().await.setup,
+        BackupSetupState::InProgress { .. }
+    ));
+    web.release_held();
+    within("the call to end", async {
+        while matches!(
+            rig.backup_status().await.setup,
+            BackupSetupState::InProgress { .. }
+        ) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(matches!(
+        rig.backup_status().await.setup,
+        BackupSetupState::Committed { .. }
+    ));
+    assert_eq!(rig.enrolments().len(), 1, "the writer was enrolled");
+}
+
 /// A write whose answer was lost is settled by reading the bundle: the same bytes are there, and
 /// the call goes on in one try. A write that never reached the service is an unknown outcome the
 /// repeat finishes, under the same request identity, and nothing is recorded in between.
