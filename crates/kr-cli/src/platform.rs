@@ -1,6 +1,6 @@
 //! The one module in this crate that calls the operating system directly.
 //!
-//! Two things have no safe interface in the standard library, and no higher-level library exposes
+//! Three things have no safe interface in the standard library, and no higher-level library exposes
 //! them in the form this command needs:
 //!
 //! * **Ignoring the background-write signal.** A guard that restores a terminal acts from the
@@ -8,13 +8,16 @@
 //!   enough; the call still fails. The disposition has to be `SIG_IGN`, which needs `signal(2)`.
 //! * **Reading and restoring a console's exact mode.** The Windows guard carries the mode words
 //!   across a process boundary, which the terminal libraries do not expose.
+//! * **Waiting for a terminal and a pipe at once.** `select(2)` is the wait that works on every
+//!   open of a terminal on macOS, `/dev/tty` included, and the wrapper the system-call library
+//!   gives it is unsafe only because it cannot see that the descriptors stay open.
 //!
 //! Every such call is wrapped once, here. Nothing else in this crate relaxes the workspace's rule
 //! against unsafe code, and each wrapper documents what makes its call sound.
 
 #![expect(
     unsafe_code,
-    reason = "signal dispositions and console modes have no safe interface"
+    reason = "signal dispositions, console modes and a wait on descriptors have no safe interface"
 )]
 
 /// Ignores the signal that stops a background process from changing the terminal.
@@ -53,6 +56,51 @@ pub fn end_by_signal(signal: std::os::raw::c_int) -> ! {
     }
     // The signal was blocked or ignored: the conventional status of a process it ended.
     std::process::exit(128 + signal)
+}
+
+/// Which of two descriptors a wait found ready to be read.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ready {
+    /// The first descriptor can be read, is at its end or has hung up.
+    pub first: bool,
+    /// The second can.
+    pub second: bool,
+}
+
+/// Waits until `first` or `second` can be read, which a descriptor at its end or hung up can, and
+/// says which can.
+///
+/// It is `select` and not `poll`. macOS answers a poll of an open of `/dev/tty` at once with an
+/// error and no wait, while `select` waits on it as it does on any terminal and wakes together with
+/// a pipe, which is what ends a thread that waits for a terminal without a read to cancel.
+///
+/// # Errors
+///
+/// Returns the system's failure, an interruption by a signal among them.
+#[cfg(unix)]
+pub fn wait_until_readable(
+    first: std::os::fd::BorrowedFd<'_>,
+    second: std::os::fd::BorrowedFd<'_>,
+) -> std::io::Result<Ready> {
+    use std::os::fd::AsRawFd as _;
+
+    use rustix::event::{FdSetElement, FdSetIter, fd_set_insert, fd_set_num_elements, select};
+
+    let (first_fd, second_fd) = (first.as_raw_fd(), second.as_raw_fd());
+    let bound = first_fd.max(second_fd) + 1;
+    let mut waiting = vec![FdSetElement::default(); fd_set_num_elements(2, bound)];
+    fd_set_insert(&mut waiting, first_fd);
+    fd_set_insert(&mut waiting, second_fd);
+    // SAFETY: both descriptors are open for the whole call, because the borrows that name them last
+    // as long as it does and the set holds no others, and the set has the number of elements
+    // `fd_set_num_elements` gives for descriptors below `bound`, which is what `select` is told.
+    unsafe { select(bound, Some(&mut waiting), None, None, None) }.map_err(std::io::Error::from)?;
+    let ready: Vec<std::os::fd::RawFd> = FdSetIter::new(&waiting).collect();
+    Ok(Ready {
+        first: ready.contains(&first_fd),
+        second: ready.contains(&second_fd),
+    })
 }
 
 /// Ignores the signal that stops a background process from changing the terminal.
