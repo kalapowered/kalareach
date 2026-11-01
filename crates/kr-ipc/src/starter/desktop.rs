@@ -422,11 +422,13 @@ impl Source {
             &Texts {
                 access: &own_access,
                 access_entries: self.access_entries()?,
+                access_bytes: self.access_bytes()?,
                 label: &own_label,
             },
             &Texts {
                 access: &found_access,
                 access_entries: there.access_entries()?,
+                access_bytes: there.access_bytes()?,
                 label: &found_label,
             },
         )
@@ -440,14 +442,14 @@ impl Source {
         })
     }
 
-    /// How many entries this object's access list holds, as the system counts them, which the
-    /// text of the list must account for: a text that reads as fewer entries has hidden some.
-    fn access_entries(&self) -> io::Result<usize> {
-        if self.access.is_null() {
-            return Ok(0);
-        }
+    /// How the system sizes this object's access list: how many entries it holds and how many
+    /// bytes it uses. An object with no list has none of either.
+    fn access_size(&self) -> io::Result<ACL_SIZE_INFORMATION> {
         // SAFETY: all-zero is a valid value of this plain structure of counts.
         let mut size: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+        if self.access.is_null() {
+            return Ok(size);
+        }
         // SAFETY: the list lives in this value's descriptor, and the structure is live and of the
         // size given.
         let read = unsafe {
@@ -461,7 +463,34 @@ impl Source {
         if read == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(usize::try_from(size.AceCount).unwrap_or(usize::MAX))
+        Ok(size)
+    }
+
+    /// How many entries this object's access list holds, as the system counts them, which the
+    /// text of the list must account for: a text that reads as fewer entries has hidden some.
+    fn access_entries(&self) -> io::Result<usize> {
+        Ok(usize::try_from(self.access_size()?.AceCount).unwrap_or(usize::MAX))
+    }
+
+    /// The entries of this object's access list as the system holds them, without the list's
+    /// header, which also holds how much room the list was given. Two lists with the same entries
+    /// admit the same, which the text of a list that holds a condition does not show.
+    fn access_bytes(&self) -> io::Result<&[u8]> {
+        if self.access.is_null() {
+            return Ok(&[]);
+        }
+        let used = usize::try_from(self.access_size()?.AclBytesInUse).unwrap_or(0);
+        let Some(length) = used.checked_sub(size_of::<ACL>()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the access list uses fewer bytes than its header",
+            ));
+        };
+        // SAFETY: the list lives in this value's descriptor and uses `used` bytes from its start,
+        // the first `size_of::<ACL>()` of which are its header.
+        Ok(unsafe {
+            std::slice::from_raw_parts(self.access.cast::<u8>().add(size_of::<ACL>()), length)
+        })
     }
 
     /// The text of one of this object's lists, as security descriptors are written in.
@@ -578,19 +607,30 @@ mod tests {
         )
     }
 
-    /// The security of the desktop this thread runs on, which is what the starter takes for its
-    /// own.
-    fn own() -> Source {
+    /// Two entries that differ, added to the list of the desktop this thread runs on so that the
+    /// list the cases take for the starter's own holds at least two, whatever that desktop has.
+    const ADDED: &str = "(A;;0x1;;;SY)(A;;0x2;;;BA)";
+
+    /// The security of the desktop this thread runs on.
+    fn current() -> Source {
         let name = name_of(current_desktop()).expect("the desktop's name");
         let opened = Desktop::open(&name, READ_CONTROL).expect("the desktop opens to be read");
         security_of(opened.0).expect("the desktop's security")
     }
 
-    /// The text of the starter's own access list.
+    /// The text of the access list the cases take for the starter's own: the list of the desktop
+    /// this thread runs on, with two entries added.
     fn own_access_list() -> String {
-        own()
+        let current = current()
             .text(DACL_SECURITY_INFORMATION)
-            .expect("the starter's own access list")
+            .expect("the current desktop's access list");
+        format!("{current}{ADDED}")
+    }
+
+    /// The security of a desktop made with that list, which the cases take for the starter's own.
+    fn own() -> Source {
+        let reference = desktop_with(&own_access_list());
+        security_of(reference.0).expect("the reference desktop's security")
     }
 
     /// How many entries a list the system wrote holds, counted by its parentheses alone, which is
@@ -682,10 +722,6 @@ mod tests {
     fn a_desktop_with_the_starters_own_access_list_is_used_and_its_entries_are_counted() {
         let text = own_access_list();
         let counted = entries_in(&text);
-        assert!(
-            counted >= 2,
-            "the starter's own access list is too short to show this: {text}"
-        );
         let target = desktop_with(&text);
         assert_eq!(
             own().access_entries().expect("the starter's own count"),
@@ -795,7 +831,7 @@ mod tests {
         .expect("the station opens to be read");
         println!(
             "the label of the starter's own desktop is {:?}, and of its station {:?}",
-            own().text(LABEL_SECURITY_INFORMATION),
+            current().text(LABEL_SECURITY_INFORMATION),
             security_of(station.0)
                 .expect("the station's security")
                 .text(LABEL_SECURITY_INFORMATION)
@@ -853,8 +889,9 @@ mod tests {
         bytes
     }
 
-    /// The condition `@User.X == "<literal>"` in its binary form, whatever the literal holds.
-    fn condition_on(literal: &str) -> Vec<u8> {
+    /// The condition `@User.X == "<literal>"` in its binary form, whatever the literal holds, and
+    /// followed by `padding` bytes of padding, which the text of the entry does not show.
+    fn condition_on(literal: &str, padding: usize) -> Vec<u8> {
         let mut bytes = b"artx".to_vec();
         for (token, text) in [(0xF9_u8, "X"), (0x10, literal)] {
             let units: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -867,6 +904,7 @@ mod tests {
             bytes.extend(units);
         }
         bytes.push(0x80);
+        bytes.extend(std::iter::repeat_n(0, padding));
         bytes
     }
 
@@ -924,6 +962,44 @@ mod tests {
         desktop_made(&attributes(&mut descriptor))
     }
 
+    /// The entries of a list with a condition, padded as asked.
+    fn entries_with_a_condition(padding: usize) -> Vec<Vec<u8>> {
+        vec![
+            entry(0x0A, 0x1, "BG", &condition_on("a", padding)),
+            entry(0x00, 0x1, "SY", &[]),
+        ]
+    }
+
+    /// A list that holds a condition is used beside a list of the same entries, and not beside a
+    /// list whose text is the same and whose entries are other bytes: the text of a condition does
+    /// not tell two lists apart.
+    #[test]
+    fn a_list_with_a_condition_is_used_only_beside_the_same_entries() {
+        let own = desktop_with_entries(&entries_with_a_condition(0));
+        let same = desktop_with_entries(&entries_with_a_condition(0));
+        let padded = desktop_with_entries(&entries_with_a_condition(4));
+        let source = security_of(own.0).expect("the starter's own security");
+        let text_of = |desktop: &Desktop| {
+            security_of(desktop.0)
+                .expect("a desktop's security")
+                .text(DACL_SECURITY_INFORMATION)
+                .expect("a desktop's text")
+        };
+        assert_eq!(
+            text_of(&padded),
+            text_of(&own),
+            "the system writes the padding, so the lists' text differs"
+        );
+        source
+            .require_no_more_on(same.0)
+            .expect("a list with the same entries is used");
+        let error = source
+            .require_no_more_on(padded.0)
+            .expect_err("a list with other bytes and the same text was used");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(error.to_string().contains("not the same bytes"), "{error}");
+    }
+
     /// Entries whose strings hold a double quote, for which the text of a descriptor has no form
     /// and the system writes the quote as it is: read as the text reads, the strings end early and
     /// the entries between them are lost to the reader. The starter does not read such a text.
@@ -932,9 +1008,9 @@ mod tests {
         let denying = 0x0A;
         let allowing = 0x00;
         let target = desktop_with_entries(&[
-            entry(denying, 0x1, "BG", &condition_on("a\"b")),
+            entry(denying, 0x1, "BG", &condition_on("a\"b", 0)),
             entry(allowing, 0x1, NOBODY, &[]),
-            entry(denying, 0x1, "BG", &condition_on("c\"d")),
+            entry(denying, 0x1, "BG", &condition_on("c\"d", 0)),
             entry(allowing, 0x1, "SY", &[]),
         ]);
         let there = security_of(target.0).expect("the target's security");

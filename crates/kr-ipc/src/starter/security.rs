@@ -3,9 +3,10 @@
 //!
 //! The starter makes a headless worker's desktop with the access list and integrity label of its
 //! own. A window station that already exists keeps the access list it was made with. Where the
-//! starter's own station has an integrity label, the starter applies it to the object it uses and
-//! reads it back, whether or not the change was allowed. Before it starts a child on either
-//! object, it asks whether the object admits more than the starter's own does. More is refused.
+//! starter's own object has an integrity label, the starter applies it to the object it uses and
+//! reads the label back, whether or not the change was allowed. Before it starts a child on
+//! either object, it asks whether the object admits more than the starter's own does. More is
+//! refused.
 //! Less is not: a station made from an earlier reading of the interactive one has not the entries
 //! that were added to that one later (a "Run as different user", for one), and the worker, which
 //! runs as the starter does, is admitted to it all the same. What counts as less is narrow: the
@@ -18,7 +19,7 @@
 //! it is. An object "admits more" when its entries show a loss that the starter's own does not
 //! have: no access list, a null one, an allowing entry for a trustee that the starter's own allows
 //! nothing (other than the owner's rights), a denying entry whose trustee has none left while an
-//! allowing entry remains to grant what it took away, a lower integrity level or a weaker policy.
+//! allowing entry remains, a lower integrity level or a weaker policy.
 //! That is a reading of the entries, not an evaluation of which entry decides for a given
 //! process, so an allowing entry behind a denying one is still called wider. An object whose
 //! entries differ in any other way (other rights on an entry, another order, an entry more or
@@ -28,11 +29,11 @@
 //!
 //! The text of an access list is read only when it holds as many entries as the list itself, as
 //! the system counts them. A text that holds a condition, a double quote or a parenthesis inside
-//! an entry, is read only when the starter's own and the object's are the same text. The grammar
-//! has no form for a double quote inside a string, and Windows 11 writes one as it is, so a string
-//! ends early; an attribute name may hold a parenthesis unencoded as well. Nothing else keeps the
-//! reading from losing the entries up to the next quote, and a count alone does not: false entries
-//! can stand in for the hidden ones.
+//! an entry, is read only when the starter's own list and the object's hold the same entries byte
+//! for byte, which is what the text is not: the grammar has no form for a double quote inside a
+//! string, and Windows 11 writes one as it is, so a string ends early, and one text can stand for
+//! two lists. Nothing else keeps the reading from losing the entries up to the next quote, and a
+//! count alone does not: false entries can stand in for the hidden ones.
 //!
 //! The text is what the system writes for a descriptor, `D:` and its entries for an access list or
 //! `S:` and its label entry for the integrity label. Nothing here calls the system, so it is read
@@ -47,6 +48,9 @@ pub(super) struct Texts<'a> {
     /// How many entries the access list itself holds, as the system counts them, which the text
     /// must account for.
     pub(super) access_entries: usize,
+    /// The entries of the access list as the system holds them, without the list's header, or
+    /// nothing when it has no list. Two lists that hold the same entries admit the same.
+    pub(super) access_bytes: &'a [u8],
     /// The integrity label, for a descriptor asked for it alone.
     pub(super) label: &'a str,
 }
@@ -124,13 +128,13 @@ impl Refusal {
 pub(super) fn require_no_more(own: &Texts<'_>, found: &Texts<'_>) -> Result<(), Stop> {
     let unreadable = |what: &'static str| move |why| Stop::Unreadable { what, why };
     if (holds_a_condition(own.access) || holds_a_condition(found.access))
-        && own.access.trim() != found.access.trim()
+        && own.access_bytes != found.access_bytes
     {
         return Err(Stop::Unreadable {
             what: "access list",
-            why: "one of the two access lists holds a condition and they are not the same text, \
-                  and the entries around a condition's string or parentheses cannot be told \
-                  apart from it"
+            why: "one of the two access lists holds a condition and their entries are not the \
+                  same bytes, and the text around a condition's string or parentheses cannot be \
+                  told apart from it"
                 .to_owned(),
         });
     }
@@ -158,10 +162,10 @@ pub(super) fn require_no_more(own: &Texts<'_>, found: &Texts<'_>) -> Result<(), 
 }
 
 /// Whether the text of an access list holds a condition: a double quote, or a parenthesis inside
-/// an entry. The entries of a list that holds neither are told apart by their parentheses alone;
-/// a condition's string can end early at a double quote the grammar has no form for, and an
-/// attribute name can hold a parenthesis unencoded, so the entries around a condition cannot be
-/// told apart from it.
+/// an entry. Every conditional entry holds both a parenthesis of its own inside the entry's, and
+/// the entries of a list that holds neither are told apart by their parentheses alone. A string of
+/// a condition can end early at a double quote the grammar has no form for, so the entries around
+/// a condition cannot be told apart from it.
 fn holds_a_condition(text: &str) -> bool {
     let mut depth = 0_u32;
     for character in text.chars() {
@@ -458,7 +462,7 @@ fn entries_refusal(own: &[Entry], found: &[Entry]) -> Option<Refusal> {
         return Some(Refusal::not_accepted(match counterpart {
             Some(other) => format!(
                 "its entry ({}) is not the starter's own ({}) for the same trustee, so its \
-                 rights or its conditions differ",
+                 rights differ",
                 entry.meaning, other.meaning
             ),
             None => format!(
@@ -652,11 +656,25 @@ mod tests {
         entries
     }
 
+    /// The texts of an object whose list holds the entries the text shows, as the system counts
+    /// them. The bytes of the entries stand for the list: the text that holds them.
     fn texts<'a>(access: &'a str, label: &'a str) -> Texts<'a> {
         Texts {
             access,
             access_entries: counted(access),
+            access_bytes: access.trim().as_bytes(),
             label,
+        }
+    }
+
+    /// The texts of an object whose list the system counts as `access_entries` entries, which the
+    /// text may not account for.
+    fn with_count(access: &str, access_entries: usize) -> Texts<'_> {
+        Texts {
+            access,
+            access_entries,
+            access_bytes: access.trim().as_bytes(),
+            label: "",
         }
     }
 
@@ -916,15 +934,19 @@ mod tests {
     }
 
     /// KR-REQ-03.24: a denying entry that is gone makes the object admit more only where access
-    /// can grow, which needs an allowing entry left to grant what the denying entry took away. With
-    /// none left, neither list grants that access, and the refusal is in words that do not say so.
+    /// can grow, which needs an allowing entry left in the object itself. With none left, the
+    /// object grants nothing, and the refusal is in words that do not say it admits more.
     #[test]
     fn a_denying_entry_that_is_gone_is_called_wider_only_while_an_allowing_entry_is_left() {
         let none_left = why("D:(D;;0x1;;;WD)", "D:");
         assert!(!none_left.admits_more, "{none_left:?}");
         assert!(none_left.why.contains("lacks"), "{none_left:?}");
-        // Entries that grant nothing a denying entry took away are no allowing entry: one for the
-        // owner's rights, which only narrows what the owner has, and one of a kind that is not read.
+        // The starter's own having an allowing entry does not make one left: it is the object's
+        // entries that are asked.
+        let own_allows = why("D:(D;;0x1;;;WD)(A;;0x1;;;SY)", "D:");
+        assert!(!own_allows.admits_more, "{own_allows:?}");
+        // An entry for the owner's rights, which is kept whole and not weighed, and one of a kind
+        // that is not read, are no allowing entry left, and the refusal says no more than that.
         for rest in ["(A;;0x20000;;;OW)", "(ZZ;;0x1;;;WD)"] {
             let said = why(&format!("D:(D;;0x1;;;WD){rest}"), &format!("D:{rest}"));
             assert!(!said.admits_more, "{rest}: {said:?}");
@@ -1202,11 +1224,7 @@ mod tests {
         // Read for itself the text has two entries, and the list it came from has four. It is the
         // same text as the starter's own and as the object's, so nothing but the count refuses it.
         assert_eq!(entries(hiding), 2);
-        let hidden = Texts {
-            access: hiding,
-            access_entries: 4,
-            label: "",
-        };
+        let hidden = with_count(hiding, 4);
         let why = unread(require_no_more(&hidden, &hidden));
         assert!(
             why.contains("holds 2 entries where the list holds 4"),
@@ -1215,11 +1233,7 @@ mod tests {
 
         // A text that holds more entries than the list does is not read either.
         let honest = "D:(A;;0x1;;;SY)(A;;0x1;;;WD)";
-        let more = Texts {
-            access: honest,
-            access_entries: 1,
-            label: "",
-        };
+        let more = with_count(honest, 1);
         let why = unread(require_no_more(&more, &more));
         assert!(
             why.contains("holds 2 entries where the list holds 1"),
@@ -1228,20 +1242,15 @@ mod tests {
 
         // Whichever side is the wrong one: the starter's own text, or the object's.
         let own = texts("D:(A;;0x1;;;SY)", "");
-        let miscounted = |access, access_entries| Texts {
-            access,
-            access_entries,
-            label: "",
-        };
         let why = unread(require_no_more(
-            &miscounted("D:(A;;0x1;;;SY)", 2),
+            &with_count("D:(A;;0x1;;;SY)", 2),
             &texts("D:(A;;0x1;;;SY)", ""),
         ));
         assert!(
             why.contains("holds 1 entries where the list holds 2"),
             "{why}"
         );
-        let why = unread(require_no_more(&own, &miscounted("D:(A;;0x1;;;SY)", 2)));
+        let why = unread(require_no_more(&own, &with_count("D:(A;;0x1;;;SY)", 2)));
         assert!(
             why.contains("holds 1 entries where the list holds 2"),
             "{why}"
@@ -1257,13 +1266,10 @@ mod tests {
                 &Texts {
                     access: "D:NO_ACCESS_CONTROL",
                     access_entries: 0,
+                    access_bytes: &[],
                     label: "",
                 },
-                &Texts {
-                    access: "D:(A;;0x1;;;SY)",
-                    access_entries: 1,
-                    label: "",
-                },
+                &with_count("D:(A;;0x1;;;SY)", 1),
             ),
             Ok(())
         );
@@ -1273,12 +1279,13 @@ mod tests {
     }
 
     /// KR-REQ-03.24: an access list that holds a condition, a string or parentheses inside an
-    /// entry, is read only beside the same text, whichever of the two lists holds it. A count of
-    /// entries is not enough for it: a double quote inside a string, for which the grammar has no
-    /// form, ends the string early, and so would a parenthesis that an attribute name holds
-    /// unencoded, and the false entries they make can stand in for the entries they hide.
+    /// entry, is read only beside a list of the same entries, whichever of the two lists holds it.
+    /// A count of entries is not enough for it: a double quote inside a string, for which the
+    /// grammar has no form, ends the string early, and so would a parenthesis that an attribute
+    /// name holds unencoded, and the false entries they make can stand in for the entries they
+    /// hide.
     #[test]
-    fn an_access_list_with_a_condition_is_read_only_beside_the_same_text() {
+    fn an_access_list_with_a_condition_is_read_only_beside_the_same_entries() {
         let own_text = "D:(A;;0x1;;;SY)";
         let own = texts(own_text, "");
         // Four entries hidden as two, and four entries of which one is the hidden allow for
@@ -1286,20 +1293,12 @@ mod tests {
         let compensating = "D:(XD;;0x1;;;BG;(@User.X==\"a\"))(D;;0x1;;;BG)\
                             (XD;;0x1;;;BG;(@User.X==\"a\"b\"))(A;;GA;;;WD)\
                             (XD;;0x1;;;BG;(@User.X==\"c\"d\"))(A;;0x1;;;SY)";
-        let found = |access, entries| {
-            require_no_more(
-                &own,
-                &Texts {
-                    access,
-                    access_entries: entries,
-                    label: "",
-                },
-            )
-        };
+        let found = |access, entries| require_no_more(&own, &with_count(access, entries));
         let why = unread(found(compensating, entries(compensating)));
         assert!(why.contains("condition"), "{why}");
 
-        // The same without a double quote: an attribute name with parentheses written as they are.
+        // The same without a double quote: a parenthesis inside an entry that a condition's own do
+        // not account for.
         let unencoded = "D:(XD;;0x1;;;BG;(@User.a))(D;;0x1;;;BG)\
                          (XD;;0x1;;;BG;(@User.b(==1))(A;;GA;;;WD)\
                          (XD;;0x1;;;BG;(@User.c)==1))(A;;0x1;;;SY)";
@@ -1320,13 +1319,8 @@ mod tests {
                          (XA;;0x1;;;BG;(@User.X==\"a\"b\"))(D;;0x1;;;WD)\
                          (XA;;0x1;;;BG;(@User.X==\"c\"d\"))(A;;0x1;;;WD)";
         assert_eq!(entries(reference), 4);
-        let hiding_a_deny = Texts {
-            access: reference,
-            access_entries: 4,
-            label: "",
-        };
         let why = unread(require_no_more(
-            &hiding_a_deny,
+            &with_count(reference, 4),
             &texts("D:(A;;0x1;;;WD)", ""),
         ));
         assert!(why.contains("condition"), "{why}");
@@ -1336,27 +1330,66 @@ mod tests {
         ));
         assert!(why.contains("condition"), "{why}");
 
-        // The same text on both sides is itself, and is used, also with whitespace around it.
+        // The same entries on both sides are themselves, and are used, also when the text has
+        // whitespace around it or comes after other flags.
         let with_a_string = "D:(XA;;FX;;;WD;(@User.X==\"a(b\"))(A;;0x1;;;SY)";
-        let strung = Texts {
-            access: with_a_string,
-            access_entries: 2,
-            label: "",
-        };
+        let strung = with_count(with_a_string, 2);
         assert_eq!(require_no_more(&strung, &strung), Ok(()));
         let padded = format!(" {with_a_string}\n");
         let beside = Texts {
-            access: &padded,
-            access_entries: 2,
-            label: "",
+            access_bytes: strung.access_bytes,
+            ..with_count(&padded, 2)
         };
         assert_eq!(require_no_more(&strung, &beside), Ok(()));
         assert_eq!(require_no_more(&beside, &strung), Ok(()));
+        let flagged = format!("D:AI{}", &with_a_string[2..]);
+        let flags_differ = Texts {
+            access_bytes: strung.access_bytes,
+            ..with_count(&flagged, 2)
+        };
+        assert_eq!(require_no_more(&strung, &flags_differ), Ok(()));
         // Lists without a condition are read as before, whatever they are.
         assert_eq!(
             require_no_more(&texts("D:(A;;0x1;;;SY)(A;;0x1;;;WD)", ""), &own),
             Ok(())
         );
+    }
+
+    /// KR-REQ-03.24: the same text does not make two lists the same. A double quote inside a
+    /// condition's string, which the system writes as it is, lets one text stand for lists of other
+    /// entries, whatever their count, so a list that holds a condition is used beside another only
+    /// when their entries are the same bytes. A list without a condition is told by its text.
+    #[test]
+    fn the_same_text_with_a_condition_is_used_only_for_the_same_entries() {
+        // Two lists of three entries can write this text: in one the allow for everyone is an
+        // entry, in the other it is inside the string of a condition.
+        let text = "D:(XD;;CC;;;BG;(@USER.X == \"a\"b\"))(D;;CC;;;WD)\
+                    (XD;;CC;;;BG;(@USER.X == \"c\"d\"))(A;;CC;;;WD)\
+                    (XD;;CC;;;BG;(@USER.X == \"e\"))";
+        assert_eq!(entries(text), 3);
+        let held_as = |access_bytes| Texts {
+            access: text,
+            access_entries: 3,
+            access_bytes,
+            label: "",
+        };
+        let why = unread(require_no_more(
+            &held_as(b"one list"),
+            &held_as(b"another list"),
+        ));
+        assert!(why.contains("not the same bytes"), "{why}");
+        assert_eq!(
+            require_no_more(&held_as(b"one list"), &held_as(b"one list")),
+            Ok(())
+        );
+        // Without a condition the text is the list, and the bytes are not asked.
+        let plain = |access_bytes| Texts {
+            access: "D:(A;;0x1;;;SY)",
+            access_entries: 1,
+            access_bytes,
+            label: "",
+        };
+        assert_eq!(require_no_more(&plain(b"one"), &plain(b"another")), Ok(()));
     }
 
     /// KR-REQ-03.24: what a person reads says whether the object admits more, or is only one the
