@@ -1728,19 +1728,14 @@ mod tests {
     /// paste and are not held: the reply is queued whole, as the host's own, and the gate the next
     /// reply waits on stays open. No reply the broker builds carries such bytes today; one that
     /// echoed what the application sent would, and the application must not be able to open a paste
-    /// in the person's framing through it. The session is a managed one, with the root editor's
-    /// machine told of each reply, because that is the session in which a reply is accounted
-    /// beside the person's keys.
+    /// in the person's framing through it. The session is a managed one whose root editor is
+    /// reading, because that is the session in which a reply is accounted beside the person's keys.
     #[test]
     fn a_reply_that_reads_as_the_start_of_a_paste_opens_none_and_is_not_held() {
         for text in [&b"\x1b[200~inside"[..], b"\x1b[20", b"ok\x1b[200", b"\x1b"] {
             let session_id = SessionId::new(kr_ipc::new_uuid());
             let mut input = InputDomain::new(session_id);
-            input.install_fence(FenceDriver::new(
-                session_id,
-                LeaseView::unheld(InputLeaseEpoch::new(0)),
-                Arc::new(kr_transport::clock::ManualClock::new()),
-            ));
+            input.install_fence(a_driver_with_its_root_editor_reading(session_id));
             let _ = input.set_bracketed_paste(true);
 
             let _ = input.queue_replies(vec![crate::projection::LaneReply {
@@ -1759,6 +1754,52 @@ mod tests {
                 "{text:?} is queued whole and as the host's own"
             );
         }
+    }
+
+    /// A driver whose bridge has registered and whose hooks are live, with the root editor at a
+    /// prompt, so that the machine takes the host's own bytes into account.
+    fn a_driver_with_its_root_editor_reading(session_id: SessionId) -> FenceDriver {
+        use kr_protocol::ids::RequestId;
+        use kr_protocol::root::{
+            CwdRevision, EditorBufferRevision, EditorKeymap, EditorState, PendingReaderInput,
+            PromptGeneration, ReaderContext, ReaderRevision, RootEditorEnterParams,
+        };
+        use kr_shell_integration::contract::events::{BridgeEvent, HooksActivated};
+        use kr_shell_integration::contract::qualification::ShellKind;
+
+        let mut driver = FenceDriver::new(
+            session_id,
+            LeaseView::unheld(InputLeaseEpoch::new(0)),
+            Arc::new(kr_transport::clock::ManualClock::new()),
+        );
+        assert!(driver.registered(ShellKind::Zsh, "zle-5.9"));
+        let _ = driver.bridge_event(
+            RequestId::new(1),
+            &BridgeEvent::HooksActivated(HooksActivated {
+                session_id,
+                prompt_generation: PromptGeneration::new(1),
+                modules: Vec::new(),
+            }),
+        );
+        let _ = driver.bridge_event(
+            RequestId::new(2),
+            &BridgeEvent::EditorEnter(RootEditorEnterParams {
+                session_id,
+                root_process: kr_ipc::identity::current_process_start_identity()
+                    .expect("this process"),
+                prompt_generation: PromptGeneration::new(1),
+                reader_revision: ReaderRevision::new(1),
+                reader_context: ReaderContext::Primary,
+                editor: EditorState {
+                    buffer_empty: true,
+                    buffer_revision: EditorBufferRevision::new(1),
+                    keymap: EditorKeymap::Emacs,
+                    pending: PendingReaderInput::NONE,
+                },
+                cwd_revision: CwdRevision::new(1),
+            }),
+        );
+        driver
     }
 
     fn editor_busy(attachment_id: AttachmentId) -> Step {
