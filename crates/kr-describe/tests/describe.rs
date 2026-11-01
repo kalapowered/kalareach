@@ -338,24 +338,44 @@ fn a_cancelled_job_publishes_nothing_and_keeps_the_title_it_had() {
 }
 
 /// KR-REQ-22.10: a job that passes its deadline publishes nothing, and the deadline is from
-/// dequeue.
+/// dequeue: after five minutes in the queue, a job that takes a millisecond more than the deadline
+/// is refused, and one that takes all of it publishes, with all of it as its execution.
 #[test]
 fn a_job_that_passes_its_deadline_publishes_nothing() {
-    let behaviour = SharedBehaviour::new();
-    behaviour.set(Behaviour::Slow {
-        duration_ms: 31_000,
-    });
-    let mut service = service();
-    queue_one(
-        &mut service,
-        &session(1),
-        "kalareach",
-        Priority::Ordinary,
-        at(0),
+    let deadline_ms = Budgets::DEFAULTS.execution_deadline_ms;
+    let after_five_minutes = |duration_ms: u64| {
+        let behaviour = SharedBehaviour::new();
+        behaviour.set(Behaviour::Slow { duration_ms });
+        let mut service = service();
+        queue_one(
+            &mut service,
+            &session(1),
+            "kalareach",
+            Priority::Ordinary,
+            at(0),
+        );
+        let tick = turn(&mut service, &behaviour, &roomy(), at(300_000)).expect("a tick");
+        (tick, service)
+    };
+    let (tick, service) = after_five_minutes(deadline_ms + 1);
+    assert_eq!(
+        tick,
+        Tick::DeadlineExceeded {
+            session_id: session(1)
+        }
     );
-    // The job waits five minutes in the queue and is still given its whole deadline afterwards.
-    let tick = turn(&mut service, &behaviour, &roomy(), at(300_000)).expect("a tick");
-    assert!(matches!(tick, Tick::DeadlineExceeded { .. }), "{tick:?}");
+    assert!(service.store().generated(&session(1)).unwrap().is_none());
+
+    let (tick, service) = after_five_minutes(deadline_ms);
+    assert_eq!(
+        tick,
+        Tick::Published {
+            session_id: session(1),
+            queue_wait_ms: 298_000,
+            execution_ms: deadline_ms
+        }
+    );
+    assert!(service.store().generated(&session(1)).unwrap().is_some());
 }
 
 /// A model load that passes its own deadline is abandoned and publishes nothing.
