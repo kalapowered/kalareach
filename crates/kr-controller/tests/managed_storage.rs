@@ -6559,6 +6559,11 @@ async fn a_delay_named_by_a_request_that_is_out_when_a_fence_lands_stays_owed_th
         BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
     ));
     assert_eq!(
+        web.requests_to(SYNC),
+        1,
+        "the delay kept the control call from writing its bundle again"
+    );
+    assert_eq!(
         web.requests_to(MANIFEST),
         1,
         "the delay kept the control call from enrolling again"
