@@ -1140,10 +1140,12 @@ fn ceiling_above(tree: &AuthorisedDirectory) -> Option<PathBuf> {
 /// Nothing at the path is a tree that is no longer the object the record names, as a directory that
 /// took its place is, and is told as that: a source that changed, and not an argument the caller
 /// got wrong. Nothing is what the open itself finds: the tree is gone, or the path is a link that
-/// leads nowhere, so a tree that goes between a look and an open is not a case of its own, because
-/// there is no look. Every other failure of the open keeps the answer it always had: a parent that
-/// is now a file, a link that cannot be followed, a directory this account cannot enter. They are
-/// the arguments a caller got wrong, and not a source that changed.
+/// leads nowhere, so a tree that goes between a look and this open is not a case of its own,
+/// because there is no look. The invocation that follows opens the directory again, and answers a
+/// recorded tree that has gone by then the same way ([`crate::boundary::OpenedDirectory::open`]).
+/// Every other failure of the open keeps the answer it always had: a parent that is now a file, a
+/// link that cannot be followed, a directory this account cannot enter. They are the arguments a
+/// caller got wrong, and not a source that changed.
 fn open_recorded_root(
     environment_id: EnvironmentId,
     path: &Path,

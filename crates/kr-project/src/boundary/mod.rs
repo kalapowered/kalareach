@@ -247,13 +247,28 @@ impl OpenedDirectory {
     ///
     /// Returns [`ProjectError::Destination`] when the directory cannot be opened or its path
     /// cannot be resolved, and [`ProjectError::IdentityChanged`] when the caller recorded an
-    /// identity and the object at the path is a different one.
+    /// identity and the object at the path is a different one, or there is nothing at the path to
+    /// open: the object the record names is gone, which is a source that changed and not an
+    /// argument the caller got wrong, however the open learned of it.
     pub fn open(
         environment_id: EnvironmentId,
         path: &Path,
         expected: Option<ObjectIdentity>,
     ) -> Result<Self> {
-        let directory = AuthorisedDirectory::open_root(environment_id, path)?;
+        let directory = match AuthorisedDirectory::open_root(environment_id, path) {
+            Ok(directory) => directory,
+            Err(_) if expected.is_some() && is_gone(path) => {
+                return Err(ProjectError::IdentityChanged {
+                    detail: format!(
+                        "this record names a directory, and {} holds nothing now; the invocation \
+                         is not enclosed around it",
+                        crate::git::redact(&path.display().to_string())
+                    )
+                    .into(),
+                });
+            }
+            Err(refusal) => return Err(refusal.into()),
+        };
         let identity = directory.identity();
         if let Some(expected) = expected
             && expected != identity
@@ -337,6 +352,15 @@ impl OpenedDirectory {
         }
         Ok(())
     }
+}
+
+/// Whether nothing is at `path`: the name is not there, or it is a link that leads nowhere.
+///
+/// Asked of a path that has just failed to open, to tell a directory that went from one that cannot
+/// be entered, whose parent is a file or whose link cannot be followed, which are the caller's to
+/// put right.
+fn is_gone(path: &Path) -> bool {
+    matches!(std::fs::metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Returns the instant the filesystem says a directory was created, where it says.
