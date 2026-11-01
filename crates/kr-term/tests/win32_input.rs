@@ -2,9 +2,9 @@
 //!
 //! | Row | What is checked here |
 //! | --- | --- |
-//! | KR-REQ-08.53 | The worker records its owned backend's input encoding from what that backend asked for |
+//! | KR-REQ-08.53 | The worker records its owned backend's input encoding from what that backend asked for, and encodes the records it is given as the console reported them: a character outside the basic plane as two records, a composed character and a dead key without a key invented for them, AltGr with the state it was reported in, and a repeat and a key coming up with their own counts and order |
 //! | KR-REQ-08.55 | Every mode request and reset stops at this boundary and is never broadcast |
-//! | KR-REQ-08.56 | The encoding of composition, dead keys, AltGr, paste, mouse and ordering. **Not** the record path's own qualification: nothing here drives a console, an IME or a keyboard, so that stays open for a machine which can |
+//! | KR-REQ-08.56 | Paste and mouse stay operations of their own beside the keyboard encoding. **Not** the record path's own qualification: nothing here drives a console, an IME or a keyboard, so that stays open for a machine which can |
 //!
 //! None of this needs Windows. The encoding is a rule about bytes, the boundary is a rule about a
 //! stream, and a record is six numbers; writing them out by hand is what lets the same rule be
@@ -171,12 +171,13 @@ fn a_unix_backend_never_enters_the_mode_however_often_it_is_asked(/* KR-REQ-08.5
     assert_eq!(engine.modes().backend_input_fidelity(), Fidelity::LegacyVt);
 }
 
-/// KR-REQ-08.52, the part about the form of the encoding and its UTF-16 code unit field: a
-/// composed character is written as `CSI Vk;Sc;Uc;Kd;Cs;Rc_` with all six fields and the final
-/// underscore (`\x1b[0;0;12354;1;0;1_`) and reads back as the record it was written from, and a
-/// character outside the basic plane is two records. Not shown here: omitted fields.
+/// KR-REQ-08.53, the part about a surrogate pair and a key that is not invented: a composed
+/// character is written as the one record the console reported, with no virtual key and no scan code
+/// (`\x1b[0;0;12354;1;0;1_`), and reads back as the record it was written from, and a character
+/// outside the basic plane is two records that both travel. Not shown here: omitted fields, or a
+/// console or an IME producing the records.
 #[test]
-fn a_composed_character_arrives_as_the_records_the_console_produced(/* KR-REQ-08.56 */) {
+fn a_composed_character_arrives_as_the_records_the_console_produced(/* KR-REQ-08.53 */) {
     // Windows IME composition ends in one `WM_CHAR` per UTF-16 code unit, which the console
     // reports as a key record with no virtual key and no scan code: the character was composed,
     // not typed. Encoding it means carrying exactly that, rather than inventing the key somebody
@@ -214,8 +215,12 @@ fn a_composed_character_arrives_as_the_records_the_console_produced(/* KR-REQ-08
     );
 }
 
+/// KR-REQ-08.53, the part about a key record that is not decoded and encoded again with a key
+/// invented for it: a dead key is written as the record the console reported, with its virtual key
+/// and scan code and no code unit, and the character it composes is the next record, in that order.
+/// Not shown here: a console or a keyboard producing them.
 #[test]
-fn a_dead_key_is_its_own_record_and_so_is_what_it_composes(/* KR-REQ-08.56 */) {
+fn a_dead_key_is_its_own_record_and_so_is_what_it_composes(/* KR-REQ-08.53 */) {
     // A dead key produces a record with a virtual key and a scan code and no code unit at all;
     // the key after it produces the composed character. Both are carried, in that order, because
     // an application that tracks the keyboard itself needs to see the dead key happen.
@@ -248,12 +253,11 @@ fn a_dead_key_is_its_own_record_and_so_is_what_it_composes(/* KR-REQ-08.56 */) {
     );
 }
 
-/// KR-REQ-08.52, the part about the control-key state field: right Alt with left Ctrl is written
-/// with all six fields and the final underscore (`\x1b[50;3;64;1;9;1_`), its virtual key, scan
-/// code, code unit and control-key state as the console reported them, and reads back as the
-/// record it was written from.
+/// KR-REQ-08.53, the part about AltGr and modifier state: right Alt with left Ctrl is written as
+/// the record the console reported (`\x1b[50;3;64;1;9;1_`), its virtual key, scan code, code unit
+/// and control-key state unchanged, and reads back as the record it was written from, still AltGr.
 #[test]
-fn alt_graph_travels_as_the_state_the_console_reported(/* KR-REQ-08.56 */) {
+fn alt_graph_travels_as_the_state_the_console_reported(/* KR-REQ-08.53 */) {
     // On a keyboard with an AltGr key the console reports right Alt and left Ctrl together. An
     // encoder that decided this was "Ctrl and Alt" and re-encoded it as a control character would
     // turn a perfectly ordinary character into an interrupt.
@@ -274,11 +278,11 @@ fn alt_graph_travels_as_the_state_the_console_reported(/* KR-REQ-08.56 */) {
     assert!(read_back.is_alt_graph());
 }
 
-/// KR-REQ-08.52, the part about the key-down and repeat-count fields: a held key is one record
-/// with its count and a key coming up is a record of its own after it, each written with all six
-/// fields and the final underscore (`\x1b[65;30;97;1;0;4_\x1b[65;30;97;0;0;1_`).
+/// KR-REQ-08.53, the part about repeat counts and key-up events: a held key is one record with its
+/// count and a key coming up is a record of its own after it, written as the console reported them
+/// (`\x1b[65;30;97;1;0;4_\x1b[65;30;97;0;0;1_`).
 #[test]
-fn a_repeat_and_a_key_up_keep_their_own_order_and_their_own_counts(/* KR-REQ-08.56 */) {
+fn a_repeat_and_a_key_up_keep_their_own_order_and_their_own_counts(/* KR-REQ-08.53 */) {
     // A held key is one record with a count. A key coming up is a record of its own, and it comes
     // after the one that put it down. Legacy VT input can express neither.
     let down = KeyRecord {

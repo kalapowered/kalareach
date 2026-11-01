@@ -317,8 +317,9 @@ fn first_cut_that_changes_the_spelling(run: &[KeyRecord], keyboard: &Keyboard) -
     })
 }
 
-/// However a console's records are cut into reads, what is sent is what the whole run would have
-/// been sent as.
+/// KR-REQ-08.53: however a console's records are cut into reads, what is sent is what the whole
+/// run would have been sent as, so a character outside the basic plane is never lost to a read that
+/// ends between its halves.
 #[test]
 fn a_run_cut_anywhere_is_sent_as_the_whole_run_would_be() {
     let run = [
@@ -340,9 +341,9 @@ fn a_run_cut_anywhere_is_sent_as_the_whole_run_would_be() {
     assert_eq!(first_cut_that_changes_the_spelling(&run, &ordinary()), None);
 }
 
-/// The same holds for the records of every case of the fixture, which include the ones a console
-/// wrote for a character outside the basic plane: the halves come on the Alt coming up, with the
-/// Alt going down and the keypad digits of the second half between them.
+/// KR-REQ-08.53: the same holds for the records of every case of the fixture, which include the
+/// ones a console wrote for a character outside the basic plane: the halves come on the Alt coming
+/// up, with the Alt going down and the keypad digits of the second half between them.
 #[test]
 fn the_records_of_each_fixture_case_cut_anywhere_are_sent_as_the_whole_run_would_be() {
     let document = fixture("console-legacy-input.json");
