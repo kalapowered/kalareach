@@ -734,6 +734,37 @@ mod tests {
         );
     }
 
+    /// A recorded directory that goes after the invocation has opened it and before its path is
+    /// resolved is a source that changed too: each step of the open answers for what it finds, so
+    /// the answer does not depend on which of them the directory went before. On Linux a
+    /// directory that is removed while it is held open is still opened by the path the kernel
+    /// gives its descriptor, and that path then resolves to nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_recorded_directory_that_goes_before_its_path_is_resolved_is_a_source_that_changed() {
+        use std::os::fd::AsRawFd as _;
+
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([14; 16]));
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let directory = root.path().join("tree");
+        std::fs::create_dir(&directory).expect("the directory");
+        let held = std::fs::File::open(&directory).expect("the directory is held open");
+        let recorded = AuthorisedDirectory::open_root(environment_id, &directory)
+            .expect("the directory opens")
+            .identity();
+        std::fs::remove_dir(&directory).expect("the directory goes while it is held");
+        let by_descriptor = PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()));
+
+        let gone = OpenedDirectory::open(environment_id, &by_descriptor, Some(recorded))
+            .expect_err("the path of a directory that is gone resolves to nothing");
+
+        assert_eq!(
+            gone.code(),
+            kr_protocol::error::ErrorCode::SourceChanged,
+            "{gone}"
+        );
+    }
+
     /// A platform that runs no Git refuses every request that needs it under a code a client does
     /// not send again, with the platform's reason and no step to install Git, which would change
     /// nothing there.
