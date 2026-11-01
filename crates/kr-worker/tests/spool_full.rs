@@ -168,9 +168,15 @@ async fn burst(full: bool) -> Burst {
 ///
 /// The shell prints far more than the resident window holds. With room, the spool holds the first
 /// lines and a read from the start of the session is whole, with no gap. With the first segment a
-/// link to `/dev/full`, the write is refused with ENOSPC: the range the spool did not take reads as
-/// a gap whose cause is the spool, the newest lines, which the resident window holds, are served,
-/// the output that comes later is served, and the session is live and takes what it is typed.
+/// link to `/dev/full`, the write is refused: the range the spool did not take reads as a gap whose
+/// cause is the spool, the newest lines, which the resident window holds, are served, the output
+/// that comes later is served, and the session is live and takes what it is typed.
+///
+/// What the case shows, and what it does not. The refused write is the first one into a new
+/// segment; the spool removes the link when it settles the failure, so the disk is full for that
+/// one write and not for the writes after it. The case does not read the reason the spool gives,
+/// so a refused open would also pass it; and a write that continues a segment already holding bytes
+/// (the usual one) is not the one refused here.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_spool_that_meets_a_full_disk_says_what_it_could_not_keep_and_the_session_goes_on() {
     let with_room = burst(false).await;
