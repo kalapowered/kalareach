@@ -209,6 +209,19 @@ const JOBS_END_WITHIN: Duration = Duration::from_secs(60);
 /// the longest takes seconds; one that waits for a device that is not there waits for good.
 const SCRIPT_ENDS_WITHIN: Duration = Duration::from_secs(300);
 
+/// Whether `child`, which has been told to end, is collected within `within`. A child that does not
+/// go in that time (one stuck in the kernel) is reported and not waited for.
+fn collected_within(child: &mut std::process::Child, within: Duration) -> bool {
+    let gone = Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < gone => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) | Err(_) => return false,
+        }
+    }
+}
+
 /// Runs `command` to its end within `bound`, ending it when it has not ended, and gives what it
 /// printed. A command that outlasts the bound, or that leaves something running which holds its
 /// output, fails the case with the command named, where a wait for it would hold the suite.
@@ -245,16 +258,7 @@ fn to_its_end(mut command: Command, bound: Duration) -> std::process::Output {
                 let _ = child.kill();
                 // A killed process is collected within a time of its own, and a process that does
                 // not go (one stuck in the kernel) is said to still be there.
-                let gone = Instant::now() + Duration::from_secs(10);
-                let ended = loop {
-                    match child.try_wait() {
-                        Ok(Some(_)) => break true,
-                        Ok(None) if Instant::now() < gone => {
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Ok(None) | Err(_) => break false,
-                    }
-                };
+                let ended = collected_within(&mut child, Duration::from_secs(10));
                 panic!(
                     "{what} did not end within {bound:?}{}",
                     if ended {
@@ -821,10 +825,14 @@ fn the_wait_for_the_jobs_of_a_case_sees_a_process_that_names_the_cases_directory
     let recorded = marker.exists();
     // The job is ended whatever the wait did, and collected, before the case goes on or fails.
     let _ = job.kill();
-    let _ = job.wait();
+    let collected = collected_within(&mut job, Duration::from_secs(10));
     if let Err(payload) = waited {
         std::panic::resume_unwind(payload);
     }
+    assert!(
+        collected,
+        "the job was still there 10 s after it was killed"
+    );
     assert!(
         !returned_while_the_job_ran,
         "the wait returned before it had looked three times, with a process that names the case's \
@@ -857,4 +865,17 @@ fn a_look_at_the_processes_that_never_ends_fails_the_case_and_names_the_look() {
         said.contains("pgrep") && said.contains("did not end within"),
         "{said}"
     );
+}
+
+/// A child that does not go is reported within the time given, and not waited for.
+#[test]
+fn a_child_that_does_not_go_is_reported_within_the_time_given_and_not_waited_for() {
+    let mut child = Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("starts a child");
+    let collected = collected_within(&mut child, Duration::from_millis(500));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(!collected, "a child that is still running is not collected");
 }
