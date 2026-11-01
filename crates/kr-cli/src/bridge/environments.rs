@@ -266,15 +266,17 @@ fn probe_permitted(
     helper: &str,
 ) -> Result<()> {
     let observed = kr_controller::bridge::platform::destination_state(access, target, user, helper)
-        .map_err(probe_failure)?;
+        .map_err(|error| probe_failure(access, error))?;
     probe_decision(observed)
 }
 
 /// What a failure to ask the platform whether the destination is running is told as. An argument
 /// the platform could not be asked with is the person's to correct; a program that could not be
 /// run, did not end in its time or ended in a way that says nothing of the destination is a
-/// failure outside `kr`, whatever the person typed.
-fn probe_failure(error: ControllerError) -> CliError {
+/// failure outside `kr`, whatever the person typed, and the refusal names that program. What the
+/// program printed is not repeated, and the call's own words are not either: they come from
+/// outside, and the program is known here by the access class.
+fn probe_failure(access: EnvironmentAccess, error: ControllerError) -> CliError {
     let code = error.code();
     if matches!(error, ControllerError::InvalidArgument(_)) {
         CliError::Usage(shown!(
@@ -283,9 +285,15 @@ fn probe_failure(error: ControllerError) -> CliError {
             code
         ))
     } else {
+        let program = match access {
+            EnvironmentAccess::Container => CONTAINER_RUNTIME,
+            EnvironmentAccess::WslDistribution => "wsl.exe",
+            _ => "the platform's command",
+        };
         CliError::Other(shown!(
-            "this host could not ask whether the destination is running ({}), so it will not \
-             start it by asking; pass --environment-id <uuid> instead",
+            "{}, which this host asked whether the destination is running, failed ({}), so it \
+             will not start it by asking; pass --environment-id <uuid> instead",
+            program,
             code
         ))
     }
@@ -580,17 +588,18 @@ mod tests {
         }
     }
 
-    /// A runtime of this test's own: a program that runs `body`.
+    /// A runtime of this test's own: a program that runs `body`, and the directory it is in, which
+    /// goes when the test drops it. The program's name is a few bytes kept for the run, since a
+    /// runtime is named by a `&'static str`.
     #[cfg(unix)]
-    fn a_runtime_that(body: &str) -> &'static str {
+    fn a_runtime_that(body: &str) -> (tempfile::TempDir, &'static str) {
         let directory = tempfile::tempdir().expect("a directory");
         let source = directory.path().join("source");
         std::fs::write(&source, format!("#!/bin/sh\n{body}\n")).expect("a stand-in runtime");
         let program = directory.path().join("podman");
         kr_ipc::testing::place_program(&source, &program);
-        // The directory stays as long as the program that is in it is used, which is this test.
-        std::mem::forget(directory);
-        Box::leak(program.display().to_string().into_boxed_str())
+        let name = Box::leak(program.display().to_string().into_boxed_str());
+        (directory, name)
     }
 
     /// A runtime that says it knows no such container is the person's mistake, a usage failure;
@@ -599,7 +608,7 @@ mod tests {
     #[test]
     fn only_the_answer_that_means_it_says_the_runtime_knows_no_such_container() {
         let limit = std::time::Duration::from_secs(30);
-        let unknown = a_runtime_that("echo 'Error: no such container' >&2; exit 125");
+        let (_kept, unknown) = a_runtime_that("echo 'Error: no such container' >&2; exit 125");
         let refused = resolve_container_target_through(unknown, limit, "typed")
             .expect_err("an unknown container is refused");
         assert!(
@@ -609,9 +618,9 @@ mod tests {
         assert_eq!(refused.exit_code(), 2, "{refused}");
 
         // The words in a path that could not be read are another failure.
-        let unreadable = a_runtime_that(
-            "echo 'Error: reading /tmp/no such container/storage.conf: permission denied' >&2; \
-             exit 125",
+        let (_kept, unreadable) = a_runtime_that(
+            "echo 'Error: reading config: no such container/storage.conf: permission denied' \
+             >&2; exit 125",
         );
         let refused = resolve_container_target_through(unreadable, limit, "typed")
             .expect_err("a failed call is refused");
@@ -621,7 +630,8 @@ mod tests {
         );
         assert_eq!(refused.exit_code(), 1, "{refused}");
 
-        let broken = a_runtime_that("echo 'Error: cannot connect to the store' >&2; exit 125");
+        let (_kept, broken) =
+            a_runtime_that("echo 'Error: cannot connect to the store' >&2; exit 125");
         let refused = resolve_container_target_through(broken, limit, "typed")
             .expect_err("a failed call is refused");
         let said = refused.to_string();
@@ -636,7 +646,7 @@ mod tests {
         );
         assert_eq!(refused.exit_code(), 1, "{refused}");
 
-        let killed = a_runtime_that("kill -KILL $$");
+        let (_kept, killed) = a_runtime_that("kill -KILL $$");
         let refused = resolve_container_target_through(killed, limit, "typed")
             .expect_err("a call that was killed is refused");
         assert!(
@@ -673,11 +683,24 @@ mod tests {
         let told = helper_failure(&Refusal::NotAnAcknowledgement);
         assert_eq!(told.exit_code(), 2, "{told}");
 
-        let asked = probe_failure(ControllerError::supervision(
-            "podman said nothing".to_owned(),
-        ));
-        assert_eq!(asked.exit_code(), 1, "{asked}");
-        let asked = probe_failure(ControllerError::InvalidArgument("a target".to_owned()));
+        for (access, program) in [
+            (EnvironmentAccess::Container, CONTAINER_RUNTIME),
+            (EnvironmentAccess::WslDistribution, "wsl.exe"),
+        ] {
+            let asked = probe_failure(
+                access,
+                ControllerError::supervision("a-value ended with exit status 125".to_owned()),
+            );
+            assert_eq!(asked.exit_code(), 1, "{asked}");
+            // The refusal names the program that was asked, and repeats nothing the call said.
+            let said = asked.to_string();
+            assert!(said.contains(program), "{said}");
+            assert!(!said.contains("a-value"), "{said}");
+        }
+        let asked = probe_failure(
+            EnvironmentAccess::Container,
+            ControllerError::InvalidArgument("a target".to_owned()),
+        );
         assert_eq!(asked.exit_code(), 2, "{asked}");
     }
 
@@ -686,7 +709,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_runtime_that_answers_with_something_that_is_not_an_identifier_is_an_outside_failure() {
-        let runtime = a_runtime_that("echo not-an-identifier");
+        let (_kept, runtime) = a_runtime_that("echo not-an-identifier");
         let refused = resolve_container_target_through(
             runtime,
             std::time::Duration::from_secs(30),
