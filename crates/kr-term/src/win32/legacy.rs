@@ -13,7 +13,8 @@
 //! The translation is a function of the records, the session's keyboard and a bound on what it may
 //! produce. It keeps no state between calls, so a call sees whole characters only: a high
 //! surrogate with no low one after it is replaced. A producer that reads a console in pieces keeps
-//! a pair together with [`PairHold`](super::PairHold).
+//! a pair together with [`PairHold`](super::PairHold), which waits for the second half across the
+//! records this translation passes over without a trace.
 
 use kr_keys::{Arrow, Key, KeyEvent, KeyboardEncoding, Modifiers};
 use thiserror::Error;
@@ -88,7 +89,8 @@ impl Output {
     }
 }
 
-/// The UTF-16 code units gathered since the last key that is not text.
+/// The UTF-16 code units gathered since the last write: text waits for the key that ends it, a key
+/// with a sequence of its own, or for the end of the records.
 ///
 /// Every unit comes out as at least one byte, so a unit that would leave the bound behind it is
 /// refused when it is gathered and the buffer never holds more units than the bound has bytes.
@@ -126,6 +128,61 @@ const fn composed_with_alt(record: &KeyRecord) -> bool {
     !record.key_down && record.virtual_key == VK_MENU && record.unicode != 0
 }
 
+/// What the translation does with one record.
+///
+/// This is the one place a record is classified, so that what a producer that reads a console in
+/// pieces waits across and what the translation passes over are the same records by construction.
+enum Step {
+    /// Nothing: a key coming up, or a key going down that is neither text nor a key this encoding
+    /// has a spelling for.
+    Passed,
+    /// The first half of a character outside the basic plane, going down or on an Alt coming up.
+    High,
+    /// The second half of one.
+    Low,
+    /// A character composed with Alt on the numeric keypad.
+    Composed,
+    /// A control code the console produced, and whether Alt was held with it.
+    Control(u8, bool),
+    /// A printable character.
+    Text(u16),
+    /// A key with a sequence of its own.
+    Keys(Vec<u8>),
+}
+
+fn step(key: &KeyRecord, application_cursor_keys: bool) -> Step {
+    let composed = composed_with_alt(key);
+    if !key.key_down && !composed {
+        return Step::Passed;
+    }
+    if key.is_high_surrogate() {
+        return Step::High;
+    }
+    if key.is_low_surrogate() {
+        return Step::Low;
+    }
+    if composed {
+        return Step::Composed;
+    }
+    if let Some((byte, alt)) = console_control(key) {
+        return Step::Control(byte, alt);
+    }
+    if let Some(character) = plain_text(key) {
+        return Step::Text(character);
+    }
+    encoded_key(key, application_cursor_keys).map_or(Step::Passed, Step::Keys)
+}
+
+/// Returns whether the translation passes over a record without a trace: it writes nothing,
+/// gathers nothing and does not end the gathering of text around it.
+///
+/// A key coming up, the Alt going down and the keypad digits of a character composed with it, a
+/// modifier and a key with no spelling are such records. They come between the halves of a
+/// character without breaking it.
+pub(super) fn passes_without_trace(record: &KeyRecord) -> bool {
+    matches!(step(record, false), Step::Passed)
+}
+
 /// Spells a run of key records as legacy VT input, in the order they were read.
 ///
 /// A key coming up produces nothing: legacy input has no way to say so, and the encoder refuses to
@@ -156,82 +213,74 @@ pub fn legacy_within(
     let mut output = Output::new(limit);
     let mut text = Text { units: Vec::new() };
     for key in records {
-        let composed = composed_with_alt(key);
-        if !key.key_down && !composed {
-            continue;
-        }
-        // Half of a character outside the basic plane. Both halves are gathered and the pair is
-        // repeated as one character: high, high, low, low would be two replacements around one
-        // character.
-        if key.is_high_surrogate() {
-            text.push(key.unicode, &output)?;
-            continue;
-        }
-        if key.is_low_surrogate() {
-            let high = text
-                .units
-                .last()
-                .copied()
-                .filter(|unit| (0xD800..=0xDBFF).contains(unit));
-            if let Some(high) = high {
-                text.units.pop();
-                text.write(&mut output)?;
-                let pair = char::decode_utf16([high, key.unicode])
-                    .next()
-                    .and_then(Result::ok)
-                    .unwrap_or(char::REPLACEMENT_CHARACTER);
-                let mut buffer = [0_u8; 4];
-                let spelled = pair.encode_utf8(&mut buffer).as_bytes();
+        match step(key, application_cursor_keys) {
+            Step::Passed => {}
+            // Half of a character outside the basic plane. Both halves are gathered and the pair is
+            // repeated as one character: high, high, low, low would be two replacements around one
+            // character.
+            Step::High => text.push(key.unicode, &output)?,
+            Step::Low => {
+                let high = text
+                    .units
+                    .last()
+                    .copied()
+                    .filter(|unit| (0xD800..=0xDBFF).contains(unit));
+                if let Some(high) = high {
+                    text.units.pop();
+                    text.write(&mut output)?;
+                    let pair = char::decode_utf16([high, key.unicode])
+                        .next()
+                        .and_then(Result::ok)
+                        .unwrap_or(char::REPLACEMENT_CHARACTER);
+                    let mut buffer = [0_u8; 4];
+                    let spelled = pair.encode_utf8(&mut buffer).as_bytes();
+                    for _ in 0..key.repeat.max(1) {
+                        output.push_slice(spelled)?;
+                    }
+                } else {
+                    text.push(key.unicode, &output)?;
+                }
+            }
+            // A character composed with Alt on the numeric keypad. The console reports it on the
+            // Alt coming up, and what the Alt carries is the Alt itself rather than a modifier of
+            // the character, so it is text whatever state the record is in.
+            Step::Composed => {
                 for _ in 0..key.repeat.max(1) {
-                    output.push_slice(spelled)?;
+                    text.push(key.unicode, &output)?;
                 }
-            } else {
-                text.push(key.unicode, &output)?;
             }
-            continue;
-        }
-        // A character composed with Alt on the numeric keypad. The console reports it on the Alt
-        // coming up, and what the Alt carries is the Alt itself rather than a modifier of the
-        // character, so it is text whatever state the record is in.
-        if composed {
-            for _ in 0..key.repeat.max(1) {
-                text.push(key.unicode, &output)?;
-            }
-            continue;
-        }
-        // A control code the console itself produced for a key held with Control. The console has
-        // already done the translation an application expects - Ctrl and Return is a line feed,
-        // Ctrl and A is 0x01 - and replacing it with the key's own sequence would send a
-        // different key.
-        if let Some((byte, alt)) = console_control(key) {
-            text.write(&mut output)?;
-            for _ in 0..key.repeat.max(1) {
-                // Alt in front of the control code rather than instead of it: that is how the
-                // legacy encoding spells a chord with Alt in it, and dropping the prefix would
-                // turn Alt, Ctrl and I into an ordinary tab.
-                if alt {
-                    output.push(0x1B)?;
+            // A control code the console itself produced for a key held with Control. The console
+            // has already done the translation an application expects - Ctrl and Return is a line
+            // feed, Ctrl and A is 0x01 - and replacing it with the key's own sequence would send a
+            // different key.
+            Step::Control(byte, alt) => {
+                text.write(&mut output)?;
+                for _ in 0..key.repeat.max(1) {
+                    // Alt in front of the control code rather than instead of it: that is how the
+                    // legacy encoding spells a chord with Alt in it, and dropping the prefix would
+                    // turn Alt, Ctrl and I into an ordinary tab.
+                    if alt {
+                        output.push(0x1B)?;
+                    }
+                    output.push(byte)?;
                 }
-                output.push(byte)?;
             }
-            continue;
-        }
-        // Plain text: no modifier the encoder would spell differently, and a character that is not
-        // a control code. Anything else is a key rather than text.
-        if let Some(character) = plain_text(key) {
-            for _ in 0..key.repeat.max(1) {
-                text.push(character, &output)?;
+            // Plain text: no modifier the encoder would spell differently, and a character that is
+            // not a control code.
+            Step::Text(character) => {
+                for _ in 0..key.repeat.max(1) {
+                    text.push(character, &output)?;
+                }
             }
-            continue;
-        }
-        // A key interrupts the text around it, so what is pending is written before its sequence
-        // rather than after. A key with no sequence interrupts nothing: the Alt and the keypad
-        // digits of a character composed in two parts come between its halves, and a half written
-        // at the first of them would be replaced.
-        if let Some(bytes) = encoded_key(key, application_cursor_keys) {
-            text.write(&mut output)?;
-            for _ in 0..key.repeat.max(1) {
-                output.push_slice(&bytes)?;
+            // A key interrupts the text around it, so what is pending is written before its
+            // sequence rather than after. A key with no sequence interrupts nothing: the Alt and
+            // the keypad digits of a character composed in two parts come between its halves, and a
+            // half written at the first of them would be replaced.
+            Step::Keys(bytes) => {
+                text.write(&mut output)?;
+                for _ in 0..key.repeat.max(1) {
+                    output.push_slice(&bytes)?;
+                }
             }
         }
     }

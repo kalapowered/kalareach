@@ -64,7 +64,7 @@
         },
         {
           "path": "console-legacy-input.json",
-          "sha256": "74297e141520f9c2186ef4fd4564c72622af90fceacf9d53d064b9ffd1e4ccaa"
+          "sha256": "ac805cb4da72b1c4b948abe8ee5894ffe421e739f241b6c7e414d455f258cf63"
         },
         {
           "path": "client-encodings.json",

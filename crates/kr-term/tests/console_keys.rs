@@ -2,8 +2,8 @@
 //! asked for them, and the legacy VT input a terminal would have sent when it did not.
 //!
 //! `fixtures/terminal/console-legacy-input.json` holds the legacy spelling of each kind of record,
-//! written by hand and not read off the translation, so a translation checked against it is not
-//! compared with itself. The cases that a fixture cannot hold are here: the bound on what one write
+//! written by hand or recorded from a Windows console and never read off the translation, so a
+//! translation checked against it is not compared with itself. The cases that a fixture cannot hold are here: the bound on what one write
 //! may produce, the pair of surrogate halves a console reports in two reads, and the records the
 //! wire carries.
 
@@ -295,6 +295,28 @@ fn the_halves_of_a_character_are_kept_in_one_write() {
     assert_eq!(hold.take(&[low()]), [high(), low()]);
 }
 
+/// Cuts `run` into two reads at every place, passes each read through the hold and spells what
+/// comes out, and returns the place at which that differs from what the whole run is spelled as.
+///
+/// A key that is typed after the run closes it, so that a half of a character the run ends with is
+/// replaced in both and not left waiting in one.
+fn first_cut_that_changes_the_spelling(run: &[KeyRecord], keyboard: &Keyboard) -> Option<usize> {
+    let closing = typed(u16::from(b'!'), 1);
+    let mut closed = run.to_vec();
+    closed.push(closing);
+    let whole = legacy_within(&closed, keyboard, LIMIT).expect("the whole run");
+    (0..=run.len()).find(|&cut| {
+        let mut hold = PairHold::new();
+        let first = hold.take(&run[..cut]);
+        let mut rest = run[cut..].to_vec();
+        rest.push(closing);
+        let second = hold.take(&rest);
+        let mut spelled = legacy_within(&first, keyboard, LIMIT).expect("the first part");
+        spelled.extend(legacy_within(&second, keyboard, LIMIT).expect("the second part"));
+        spelled != whole
+    })
+}
+
 /// However a console's records are cut into reads, what is sent is what the whole run would have
 /// been sent as.
 #[test]
@@ -310,18 +332,31 @@ fn a_run_cut_anywhere_is_sent_as_the_whole_run_would_be() {
         high(),
         typed(u16::from(b'c'), 1),
     ];
-    let whole = legacy_within(&run, &ordinary(), LIMIT).expect("the whole run");
     assert_eq!(
-        whole,
+        legacy_within(&run, &ordinary(), LIMIT).expect("the whole run"),
         "a\u{1F600}\x1b[A\x1b[Ab\u{FFFD}c".as_bytes(),
         "the pair is one character and the lone half is replaced"
     );
-    for cut in 0..=run.len() {
-        let mut hold = PairHold::new();
-        let mut sent = hold.take(&run[..cut]);
-        let mut spelled = legacy_within(&sent, &ordinary(), LIMIT).expect("the first part");
-        sent = hold.take(&run[cut..]);
-        spelled.extend(legacy_within(&sent, &ordinary(), LIMIT).expect("the second part"));
-        assert_eq!(spelled, whole, "cut after {cut} records");
+    assert_eq!(first_cut_that_changes_the_spelling(&run, &ordinary()), None);
+}
+
+/// The same holds for the records of every case of the fixture, which include the ones a console
+/// wrote for a character outside the basic plane: the halves come on the Alt coming up, with the
+/// Alt going down and the keypad digits of the second half between them.
+#[test]
+fn the_records_of_each_fixture_case_cut_anywhere_are_sent_as_the_whole_run_would_be() {
+    let document = fixture("console-legacy-input.json");
+    for case in document["cases"].as_array().expect("cases") {
+        if case.get("refused").is_some() {
+            continue;
+        }
+        let id = case["id"].as_str().expect("an id");
+        let records = records_of(&case["records"]);
+        let keyboard = keyboard_of(&case["keyboard"]);
+        assert_eq!(
+            first_cut_that_changes_the_spelling(&records, &keyboard),
+            None,
+            "{id}: a cut after this many records changes what is sent"
+        );
     }
 }

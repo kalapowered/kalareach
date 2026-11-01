@@ -329,7 +329,9 @@ A Windows console reports keys, not bytes, so there the command reads the consol
 records of a read go to the session as a `console_keys` write: for each key it sends, the virtual
 key, the scan code, the UTF-16 code unit, whether the key went down or came up, the modifier state
 and the repeat count, as the console reported them. A record that is not a key ends the run, and the
-first half of a character outside the basic plane waits for its second half. The command spells
+first half of a character outside the basic plane waits for its second half, across the records
+between the halves that spell nothing (a key coming up, a modifier, and for a character the console
+was given as text the Alt going down and the keypad digits of the second half). The command spells
 nothing and invents no scan code. The worker spells the records for the session's terminal, in the
 win32 input mode format when that terminal asked for it and as legacy terminal input otherwise (see
 the host reference). Under legacy terminal input (`Fidelity::LegacyVt`: every session of a Unix

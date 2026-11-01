@@ -161,20 +161,12 @@ impl RecordReader {
     }
 
     /// Returns the first half of a character outside the basic plane that is waiting for its second
-    /// half, if one is, and forgets it.
+    /// half, if one is, with the records that came after it, and forgets them.
     ///
     /// The reader hands it on at the moment it stops reading records, so that what it was is counted
     /// with the rest and not lost without a trace.
     pub fn held(&mut self) -> Vec<KeyRecord> {
-        // Any key going down after the half makes it a half that nothing completes, which the hold
-        // lets go; the key used for that is not one of the console's and is not handed on.
-        let after = KeyRecord {
-            key_down: true,
-            ..KeyRecord::DEFAULT
-        };
-        let mut records = self.pairs.take(&[after]);
-        records.pop();
-        records
+        self.pairs.release()
     }
 
     /// Returns how many events are waiting, without taking any.
