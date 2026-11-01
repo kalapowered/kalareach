@@ -112,9 +112,6 @@ pub struct RemoteConnection {
     budget: Arc<RelayBudget>,
     /// Notified when this connection's link to its worker ends, whichever way it ends.
     lost: Arc<tokio::sync::Notify>,
-    /// What the device said it can receive, as the hello negotiated it. The links this connection
-    /// opens to a worker say the same, so the worker never answers it with a frame it must discard.
-    receive: kr_protocol::hello::ReceiveLimits,
     windows: Arc<kr_transport::window::ActionWindowIssuer>,
 }
 
@@ -176,7 +173,6 @@ impl RemoteConnection {
                     .min(RELAY_QUEUED_BYTES),
             )),
             lost: Arc::new(tokio::sync::Notify::new()),
-            receive: session.selection.limits,
             windows: Arc::clone(&session.windows),
         }
     }
@@ -259,7 +255,6 @@ impl RemoteConnection {
             notifications,
             budget: Arc::new(RelayBudget::new(RELAY_QUEUED_BYTES)),
             lost: Arc::new(tokio::sync::Notify::new()),
-            receive: kr_protocol::hello::ReceiveLimits::default(),
             windows: Arc::new(
                 kr_transport::window::ActionWindowIssuer::with_default_validity(Arc::clone(
                     &controller.clock,

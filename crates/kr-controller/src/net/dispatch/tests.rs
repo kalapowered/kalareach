@@ -1802,7 +1802,7 @@ async fn try_close_for_a_device_of(
             Some(&connection.expiry_observer()),
             answer,
             delivered,
-            connection.receive,
+            connection.output().receive(),
         )
         .await;
     answered.await.expect("the close settles")

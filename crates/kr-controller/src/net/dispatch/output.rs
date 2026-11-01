@@ -54,7 +54,11 @@ pub struct RemoteOutput {
         std::sync::Mutex<std::collections::BTreeMap<RequestId, tokio::sync::oneshot::Sender<()>>>,
     /// Where the frames go: the connection's control stream.
     sink: Box<dyn FrameSink>,
-    /// The most bytes of one frame the control stream carries, as the hello negotiated it. Every
+    /// What the device said it can receive, as the hello negotiated it. The connection's links to a
+    /// worker are opened with the same limits, so a worker never answers the device with a frame it
+    /// must discard, and the bound below is drawn from them: one reading of the session serves both.
+    receive: kr_protocol::hello::ReceiveLimits,
+    /// The most bytes of one frame the control stream carries, as `receive` bounds it. Every
     /// connection has one; an output built for a case that has no peer carries the largest number.
     max_payload: usize,
     /// The authority this connection writes under, read inside the turn.
@@ -428,20 +432,37 @@ impl RemoteOutput {
         Self::over(
             sink,
             authority,
+            *receiving,
             usize::try_from(receiving.max_control_frame_len.get())
                 .unwrap_or(usize::MAX)
                 .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN),
         )
     }
 
+    /// What the device said it can receive, which the links this connection opens to a worker say
+    /// too.
+    pub(super) fn receive(&self) -> kr_protocol::hello::ReceiveLimits {
+        self.receive
+    }
+
     /// An output whose frames are held to no bound, for a case that has no peer. A connection always
     /// has one, so only [`Self::for_a_peer_receiving`] builds an output outside a case.
     #[cfg(test)]
     pub(super) fn writing_to(sink: Box<dyn FrameSink>, authority: Arc<Authorisation>) -> Self {
-        Self::over(sink, authority, usize::MAX)
+        Self::over(
+            sink,
+            authority,
+            kr_protocol::hello::ReceiveLimits::default(),
+            usize::MAX,
+        )
     }
 
-    fn over(sink: Box<dyn FrameSink>, authority: Arc<Authorisation>, max_payload: usize) -> Self {
+    fn over(
+        sink: Box<dyn FrameSink>,
+        authority: Arc<Authorisation>,
+        receive: kr_protocol::hello::ReceiveLimits,
+        max_payload: usize,
+    ) -> Self {
         // Tied to the registration before anything can be sent: a withdrawal that removes the
         // registration sets the latch with it, so the fence below needs no read of the connection
         // table, which a poll may not take.
@@ -456,6 +477,7 @@ impl RemoteOutput {
             queued: std::sync::atomic::AtomicUsize::new(0),
             delivery: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             sink,
+            receive,
             max_payload,
             authority,
         }
