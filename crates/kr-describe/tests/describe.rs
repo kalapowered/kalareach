@@ -337,7 +337,7 @@ fn a_cancelled_job_publishes_nothing_and_keeps_the_title_it_had() {
     assert!(service.store().generated(&session(1)).unwrap().is_none());
 }
 
-/// KR-REQ-22.11: a job that passes its deadline publishes nothing, and the deadline is from
+/// KR-REQ-22.10: a job that passes its deadline publishes nothing, and the deadline is from
 /// dequeue.
 #[test]
 fn a_job_that_passes_its_deadline_publishes_nothing() {
@@ -358,7 +358,7 @@ fn a_job_that_passes_its_deadline_publishes_nothing() {
     assert!(matches!(tick, Tick::DeadlineExceeded { .. }), "{tick:?}");
 }
 
-/// KR-REQ-22.11: a model load that passes its own deadline is abandoned and publishes nothing.
+/// KR-REQ-22.10: a model load that passes its own deadline is abandoned and publishes nothing.
 #[test]
 fn a_model_load_that_passes_its_deadline_is_abandoned_and_publishes_nothing() {
     let behaviour = SharedBehaviour::new();
@@ -389,7 +389,7 @@ fn a_model_load_that_passes_its_deadline_is_abandoned_and_publishes_nothing() {
     );
 }
 
-/// KR-REQ-22.11: a load longer than a job's deadline happens before the job is dequeued, and the
+/// KR-REQ-22.10: a load longer than a job's deadline happens before the job is dequeued, and the
 /// job is sent with its whole deadline after it; the control is a job that runs past that deadline.
 #[test]
 fn a_load_longer_than_a_jobs_deadline_leaves_the_job_its_whole_deadline() {
