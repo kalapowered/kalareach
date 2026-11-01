@@ -43,10 +43,31 @@ fn json_asked_for() -> bool {
         .any(|argument| argument == "--json")
 }
 
+/// Whether the command line asks for a protocol on standard output: the tool server or the bridge
+/// with `--stdio`, whose readers take whatever arrives there as a frame.
+///
+/// Read from the arguments as the operating system gave them, as [`json_asked_for`] reads
+/// `--json`, because it has to be known before anything can fail: a failure of the release check or
+/// of the parse is still a failure whose line must not reach the frames. A line that names neither
+/// command, or names them with another word, may be claimed too; such a line is a usage mistake,
+/// and the only effect is that a refused standard error says nothing more.
+fn protocol_asked_for() -> bool {
+    let mut stdio = false;
+    let mut serves = false;
+    for argument in std::env::args_os()
+        .skip(1)
+        .take_while(|argument| argument != "--")
+    {
+        stdio |= argument == "--stdio";
+        serves |= argument == "bridge" || argument == "agent-tools";
+    }
+    stdio && serves
+}
+
 /// Runs the command the caller named and returns how it ended.
 fn command() -> ExitCode {
     let json = json_asked_for();
-    if json {
+    if json || protocol_asked_for() {
         output::claim_for_a_document_or_protocol();
     }
     // Before anything a release could matter to: a command of an installed release holds that
@@ -65,9 +86,6 @@ fn command() -> ExitCode {
         Err(error) => return usage(&error, json),
     };
     let json = cli.json;
-    if speaks_a_protocol(&cli.command) {
-        output::claim_for_a_document_or_protocol();
-    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -105,16 +123,6 @@ fn command() -> ExitCode {
             }
             ExitCode::from(error.exit_code())
         }
-    }
-}
-
-/// Whether the command serves a protocol on standard output: the tool server and the bridge, whose
-/// readers take whatever arrives there as a frame.
-fn speaks_a_protocol(command: &Command) -> bool {
-    match command {
-        Command::AgentTools(arguments) => arguments.stdio,
-        Command::Bridge(arguments) => arguments.stdio,
-        _ => false,
     }
 }
 

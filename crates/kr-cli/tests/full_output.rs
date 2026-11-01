@@ -11,6 +11,9 @@
 
 use std::process::{Command, Output, Stdio};
 
+use kr_cli::bridge::pipe;
+use kr_protocol::identity::BridgeFrame;
+
 mod support;
 
 /// The exit status a command ends with when it could not write to the terminal.
@@ -18,6 +21,9 @@ const TERMINAL_FAILURE: i32 = 6;
 
 /// The exit status of a command line that names no command.
 const USAGE_FAILURE: i32 = 2;
+
+/// The exit status of a command the host or the peer refused.
+const REFUSED: i32 = 8;
 
 /// The device that takes no byte.
 fn full() -> Stdio {
@@ -71,6 +77,20 @@ fn run_fed(temp: &kr_ipc::testing::TempHost, line: &[&str], input: &[u8], stderr
         .expect("standard input is piped")
         .write_all(input);
     child.wait_with_output().expect("kr ends")
+}
+
+/// The frames `output` holds, read with the bridge's own codec. A byte that is not part of a whole
+/// frame, a line of text among them, fails here.
+fn frames_of(output: &[u8]) -> Vec<BridgeFrame> {
+    let mut cursor = std::io::Cursor::new(output);
+    let mut frames = Vec::new();
+    while usize::try_from(cursor.position()).is_ok_and(|read| read < output.len()) {
+        frames.push(
+            pipe::read_frame(&mut cursor)
+                .expect("standard output holds whole frames and nothing else"),
+        );
+    }
+    frames
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -172,9 +192,10 @@ fn a_failure_that_a_full_standard_error_refuses_is_said_on_standard_output() {
 }
 
 /// A command whose standard output is a protocol's frames takes no line of text on it, whatever
-/// else fails: a bridge handed an opening frame it cannot read says why on standard error, and with
-/// standard error full there is nowhere to say that, so the invoker reads exactly what it read
-/// with room and the command ends with the status it ended with then.
+/// else fails: a bridge handed an opening frame it cannot read answers with a refusal frame and
+/// says why on standard error, and with standard error full there is nowhere to say that, so the
+/// invoker reads exactly the frame it read with room and the command ends with the status it
+/// ended with then.
 #[test]
 fn a_bridge_whose_standard_error_has_no_room_writes_no_text_among_its_frames() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -184,18 +205,65 @@ fn a_bridge_whose_standard_error_has_no_room_writes_no_text_among_its_frames() {
     let control = run_fed(&temp, &line, &unreadable, Stdio::piped());
     assert!(
         !control.stderr.is_empty(),
-        "with room, the command says on standard error why it ended: {}",
-        text(&control.stdout)
+        "with room, the command says on standard error why it ended"
     );
+    assert!(
+        matches!(
+            frames_of(&control.stdout).as_slice(),
+            [BridgeFrame::Refused(_)]
+        ),
+        "with room, the invoker reads one refusal frame"
+    );
+    assert_eq!(control.status.code(), Some(REFUSED));
 
     let refused = run_fed(&temp, &line, &unreadable, full());
+    assert!(
+        matches!(
+            frames_of(&refused.stdout).as_slice(),
+            [BridgeFrame::Refused(_)]
+        ),
+        "with standard error full, the invoker reads the same one frame and no text"
+    );
     assert_eq!(
         refused.stdout, control.stdout,
-        "the frames the invoker reads are the ones it read with room, with no line of text added"
+        "and the bytes are the ones it read with room"
     );
     assert_eq!(
         refused.status.code(),
         control.status.code(),
         "and the command ends as it ended with room"
     );
+}
+
+/// The same holds for a command line that is a mistake: the tool server and the bridge name the
+/// stream they own before the line is read, so a usage failure whose diagnostic standard error
+/// refuses leaves the stream with nothing on it, and the status is the usage failure's.
+#[test]
+fn a_usage_mistake_on_a_protocol_line_writes_no_text_when_standard_error_has_no_room() {
+    let temp = kr_ipc::testing::TempHost::create();
+    for command in ["bridge", "agent-tools"] {
+        let line = [command, "--stdio", "--no-such-option"];
+        let control = run_fed(&temp, &line, b"", Stdio::piped());
+        assert_eq!(control.status.code(), Some(USAGE_FAILURE), "kr {line:?}");
+        assert!(
+            !control.stderr.is_empty(),
+            "kr {line:?} says on standard error that the line is a mistake"
+        );
+        assert!(
+            control.stdout.is_empty(),
+            "kr {line:?} writes nothing on its protocol stream"
+        );
+
+        let refused = run_fed(&temp, &line, b"", full());
+        assert_eq!(
+            refused.status.code(),
+            Some(USAGE_FAILURE),
+            "kr {line:?} with a full standard error ends with the usage failure"
+        );
+        assert!(
+            refused.stdout.is_empty(),
+            "kr {line:?} with a full standard error writes no text on its protocol stream: {}",
+            text(&refused.stdout)
+        );
+    }
 }
