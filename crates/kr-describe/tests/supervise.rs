@@ -4,7 +4,10 @@
 //!
 //! Every turn takes a reading the test chooses, as the host's thread passes its own, so a thirty
 //! second deadline or a ten second handshake is crossed by the reading rather than waited out. The
-//! process answers in real time, and the tests wait for its answers in real time.
+//! process answers in real time, and the tests wait for its answers in real time. The process keeps
+//! two real-time bounds of its own that no reading moves, `CONTROL_BOUND_MS` for its control thread
+//! on one request and `OVERDUE_GRACE_MS` for work past its deadline, and a stall past either ends
+//! it.
 
 mod stub;
 mod support;

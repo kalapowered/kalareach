@@ -53,10 +53,14 @@ use crate::wire::{
     WIRE_VERSION, WireError, read_message, write_message,
 };
 
-/// The longest the control thread may spend on one request before the process ends itself.
+/// The longest the control thread may spend on one request before the process ends itself. The
+/// bound is real time and no reading the daemon takes moves it: a control thread kept on one
+/// request past it, by a daemon that does not read the process's answers or by a host too busy to
+/// run the thread, ends the process as [`Exit::ControlStalled`].
 pub const CONTROL_BOUND_MS: u64 = 2_000;
 
-/// How far past its deadline a load or a job may run before the process ends itself.
+/// How far past its deadline a load or a job may run before the process ends itself. It is real
+/// time too, and a stall past it ends the process as [`Exit::Overdue`].
 pub const OVERDUE_GRACE_MS: u64 = 2_000;
 
 /// How this process's memory ceiling is enforced: by the daemon's own reading of its resident set.
@@ -886,6 +890,7 @@ fn watchdog(shared: &Shared, daemon: Option<&ProcessStartIdentity>) {
         }
         let now = shared.stamp();
         let since = shared.control_since.load(Ordering::Acquire);
+        // A stall past the bound ends the process, whatever readings the daemon takes meanwhile.
         if since != 0 && now.saturating_sub(since) > CONTROL_BOUND_MS {
             eprintln!(
                 "kr-describe: the control thread has been on one request for more than \
