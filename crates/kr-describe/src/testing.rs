@@ -61,6 +61,39 @@ const RELEASE_MARK: &str = "stub-released";
 /// milliseconds that the job's request carried on the wire.
 pub const SENT_DEADLINE_PREFIX: &str = "stub-sent-deadline-";
 
+/// The start of the name of the file a stub whose script marks work leaves in its runtime
+/// directory for each job it is given, followed by the job's identifier. It holds the two bounds
+/// the process's watchdog holds the job to, as the process recorded them when it took the job in
+/// hand: the grace after the job's deadline, and the stop bound after it for a job whose stop the
+/// control thread reads, both in milliseconds.
+pub const JOB_BOUNDS_PREFIX: &str = "stub-job-bounds-";
+
+/// Where this process leaves the bounds it holds each job to: set by a stub whose script marks
+/// work, and unset in every other process.
+static BOUNDS_DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Records the bounds the process holds a job to, past its deadline, when the process is a stub
+/// whose script marks work.
+pub(crate) fn job_bounds_held(id: u64, grace_ms: u64, stop_bound_ms: u64) {
+    if let Some(directory) = BOUNDS_DIRECTORY.get() {
+        let _ = std::fs::write(
+            directory.join(format!("{JOB_BOUNDS_PREFIX}{id}")),
+            format!("{grace_ms} {stop_bound_ms}"),
+        );
+    }
+}
+
+/// Returns the grace and the stop bound, in milliseconds past its deadline, that the stub process
+/// with `runtime_dir` as its runtime directory holds the job with this identifier to, once the job
+/// is in hand.
+#[must_use]
+pub fn job_bounds(runtime_dir: &Path, id: u64) -> Option<(u64, u64)> {
+    let text =
+        std::fs::read_to_string(runtime_dir.join(format!("{JOB_BOUNDS_PREFIX}{id}"))).ok()?;
+    let (grace_ms, stop_bound_ms) = text.trim().split_once(' ')?;
+    Some((grace_ms.parse().ok()?, stop_bound_ms.parse().ok()?))
+}
+
 /// Returns the deadline, in milliseconds, that each job a recording process ([`Raw::Recording`])
 /// has been sent carried on the wire, with the job's identifier, in order of identifier.
 #[must_use]
@@ -1341,6 +1374,9 @@ pub fn stub_main() -> i32 {
             return 64;
         }
     };
+    if script.mark_work {
+        let _ = BOUNDS_DIRECTORY.set(runtime_dir.clone());
+    }
     let options = Options {
         build: stub_build(),
         runtime_dir,

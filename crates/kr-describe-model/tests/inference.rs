@@ -576,8 +576,9 @@ fn the_real_model_stops_a_job_it_is_told_to_cancel() {
     }
     send(&Request::Cancel { id: U64::new(2) });
     let asked = Instant::now();
-    // The control thread says it has read the cancellation before it cancels, and the model thread
-    // answers the job after it has forgotten it, so the acknowledgement is the first frame.
+    // The control thread acknowledges the cancellation under the lock the model thread takes to
+    // forget the job, and the model thread answers the job after it has forgotten it, so the
+    // acknowledgement is the first frame.
     let mut acknowledged_in = None;
     let answer = loop {
         let answer = answers.recv_timeout(CANCEL_HUNG);

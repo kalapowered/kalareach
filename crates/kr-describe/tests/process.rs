@@ -20,7 +20,7 @@ use kr_describe::serve::{
     Verifying,
 };
 use kr_describe::supervise::STOP_BOUND_MS;
-use kr_describe::testing::Script;
+use kr_describe::testing::{Script, job_bounds};
 use kr_describe::wire::{Answer, JobEnd, LoadEnd, Request, WIRE_VERSION, frame_of};
 use kr_protocol::ids::SessionEpoch;
 use kr_protocol::scalars::U64;
@@ -30,6 +30,12 @@ use stub::{Placed, Process, generate, load, wait_until_began, wait_until_started
 use support::{binding, default_profile};
 
 const SOON: Duration = Duration::from_secs(10);
+
+/// How long past its deadline the guide gives work that its process has not been told to stop, and
+/// a job whose stop its control thread has read, written out so that a case that counts in them
+/// fails when either changes.
+const GUIDE_GRACE_MS: u64 = 2_000;
+const GUIDE_STOP_BOUND_MS: u64 = 30_000;
 
 /// What the job built by [`generate`] was produced under.
 fn produced_under(revision: u64) -> ProducedUnder {
@@ -234,9 +240,10 @@ fn a_cancellation_reaches_a_load_and_a_job_while_they_run() {
 }
 
 /// A cancellation that reaches work in hand is acknowledged before the work's own answer, for a
-/// load and for a job, every time: the control thread writes the acknowledgement before it
-/// cancels, under the lock the model thread takes to forget the work before it answers. The
-/// control is a cancellation that arrives after the answer, which is acknowledged by nothing.
+/// load and for a job, every time: the control thread cancels and acknowledges under the lock the
+/// model thread takes to forget the work before it answers, so a model that sees the cancellation
+/// at once still cannot answer ahead of the acknowledgement. The control is a cancellation that
+/// arrives after the answer, which is acknowledged by nothing.
 #[test]
 fn a_cancelled_load_and_job_are_acknowledged_before_they_answer() {
     let placed = Placed::stub();
@@ -261,7 +268,7 @@ fn a_cancelled_load_and_job_are_acknowledged_before_they_answer() {
     ));
 
     // The model looks at its token without pausing, so it answers the moment it is cancelled and
-    // the acknowledgement has to be written before that for the order to hold.
+    // only the lock the acknowledgement is written under keeps the answer behind it.
     let runtime = placed.directory("deciding");
     let script = Script {
         generate_until_cancelled: true,
@@ -618,8 +625,10 @@ fn a_job_past_its_deadline_that_was_told_to_stop_is_given_time_to_stop() {
 /// as overdue, and not before that bound, which the lower limit of the elapsed time shows (the
 /// process cannot end itself sooner than its own bound, whatever the load), and not never, which
 /// the wait for the end shows. The wait allows twice the bound so that a loaded host does not fail
-/// it, so the case does not hold how much later than the bound the process ends. It runs as long as
-/// the bound it holds.
+/// it, so no elapsed time holds how much later than the bound the process ends. What holds it is
+/// the process's own record of the bounds its watchdog holds the job to, read back as the job comes
+/// into hand and compared with the guide's two seconds and thirty. It runs as long as the bound it
+/// holds.
 #[test]
 fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
     let placed = Placed::stub();
@@ -636,6 +645,11 @@ fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
     let sent = Instant::now();
     process.send(&generate(2, 1, 200));
     wait_until_began(&runtime, "job");
+    assert_eq!(
+        job_bounds(&runtime, 2),
+        Some((GUIDE_GRACE_MS, GUIDE_STOP_BOUND_MS)),
+        "the grace and the stop bound past the deadline, in milliseconds"
+    );
     process.send(&Request::Cancel { id: U64::new(2) });
     assert_eq!(
         process.expect_answer(SOON, "the acknowledgement"),
@@ -655,9 +669,13 @@ fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
 /// acknowledgement, which is inside the control thread's own bound of 2 s: a write that came
 /// before the extension would carry the watchdog past the grace first, and the process would end
 /// as overdue. The model does not look at its token until after the grace, so the job is still
-/// there to answer. Both delays are the process's own, so a loaded host moves the test with the
-/// process. The control is the same job told nothing, which ends the process at the grace
-/// (above).
+/// there to answer. Both delays are the process's own, and the case is process evidence of the
+/// order, not a proof of it: the control thread has 0.8 s from its read of the stop to extend the
+/// bound (2.2 s from the request), and 0.8 s is left of its own bound of 2 s for one request after
+/// the write. A host so loaded that a thread of the process loses 0.8 s fails the case with the
+/// right order, and one that keeps the watchdog from looking for 0.4 s after the grace passes it
+/// with the wrong one. The control is the same job told nothing, which ends the process at the
+/// grace (above).
 #[test]
 fn a_job_told_to_stop_has_its_bound_before_the_acknowledgement_is_written() {
     let placed = Placed::stub();

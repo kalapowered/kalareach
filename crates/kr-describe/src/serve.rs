@@ -579,15 +579,17 @@ impl Shared {
     ///
     /// The cancellation comes before the job is looked for. A job the model thread has taken in
     /// hand before the cancellation is found there, and extended; one it takes in hand after reads
-    /// the cancelled token and ends at once. Looking first would leave a job that starts between
-    /// the look and the cancellation cancelled and not extended.
+    /// the cancelled token and does not start generating. Looking first would leave a job that
+    /// starts between the look and the cancellation running, cancelled and not extended.
     ///
     /// The extension comes before the acknowledgement because the write can take long, when the
     /// daemon is slow to read or the system has set the thread aside, and the watchdog reads the
     /// bound without the lock: a write ahead of the extension can carry the watchdog past the old
     /// bound. A watchdog that has already read the old bound when the extension is made can still
-    /// end the process. Closing that would need the watchdog to take the lock, which a write that
-    /// has stuck holds, and the watchdog could then not end the process for that stall.
+    /// end the process. That window is the few instructions between the watchdog's read and its
+    /// exit, and what it costs is one process failure, a reload and the job queued again. Closing
+    /// it would need the watchdog to take the lock, which a write that has stuck holds, and the
+    /// watchdog could then not end the process for that stall.
     fn cancel_and_acknowledge(&self, id: U64) {
         let tokens = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(token) = tokens.get(&id.get()) {
@@ -771,6 +773,20 @@ fn model_thread<M: Model>(
                 shared.work_due.store(
                     shared.stamp_of(due + Duration::from_millis(OVERDUE_GRACE_MS)),
                     Ordering::Release,
+                );
+                // The bounds as the watchdog holds them, before a stop can extend one, for a test to
+                // read back.
+                #[cfg(feature = "testing")]
+                crate::testing::job_bounds_held(
+                    id,
+                    shared
+                        .work_due
+                        .load(Ordering::Acquire)
+                        .saturating_sub(shared.stamp_of(due)),
+                    shared
+                        .job_stop_due
+                        .load(Ordering::Acquire)
+                        .saturating_sub(shared.stamp_of(due)),
                 );
                 // Last, so that a stop read before the job is in hand finds the one before it
                 // gone and extends nothing.
