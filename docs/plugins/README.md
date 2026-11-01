@@ -255,7 +255,10 @@ manifest or a table written before them reads and hashes exactly as it did.
 On macOS and Linux, for a plain launch of the terminal, the host runs the server if the first
 executable the shell found is a native executable (not a script), the signed index names it as a
 qualified build, and its version is one the connector's table is qualified for; otherwise, and on all other
-platforms, the invocation runs as typed, and `kr doctor` says why.
+platforms, the invocation runs as typed. `kr doctor` names a platform that establishes no backend, and
+for the other cases it shows where the daemon's search path resolves the command, with the version a
+signed record gives that executable, and the host's reason as its class and its length
+(`[message withheld, <length> bytes]`), not in words.
 
 When the launcher says it is going, the host starts the server in its own process group, in the
 directory the invocation runs in, and with the environment presented by the launcher except for the
