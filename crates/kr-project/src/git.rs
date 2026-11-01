@@ -3890,6 +3890,12 @@ fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::
         // Dated by the moment before the read, which is the moment the pipe was last known to be
         // as it is read, and not by the clock after it, which a pause between the two can move.
         let began = Instant::now();
+        // A case that asks for it counts the polls that begin at or after the probe's time, of
+        // which a wait that ends when that time comes makes exactly one.
+        #[cfg(all(test, unix))]
+        if began >= deadline {
+            tests::POLLS_AT_OR_AFTER_THE_DEADLINE.with(|polls| polls.set(polls.get() + 1));
+        }
         // Read for as long as the probe's own time allows, not only for the drain's second: the
         // second is how long the wait goes on, and a poll that comes after it, and before the
         // probe's time, still reads an end that arrived before it. A poll that comes after the
@@ -5369,6 +5375,10 @@ mod tests {
         /// after that many resolutions have succeeded, with that error.
         pub(super) static RESOLUTION_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
             const { std::cell::Cell::new(None) };
+        /// The number of polls of the wait for a probe's output, on this thread, that began at or
+        /// after the probe's time.
+        pub(super) static POLLS_AT_OR_AFTER_THE_DEADLINE: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
         /// Set by a case to run something once on its own thread right after a read of a probe's
         /// output has returned, before anything is decided from what it returned.
         pub(super) static AFTER_THE_READ: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
@@ -6424,7 +6434,9 @@ mod tests {
     /// fault that passes, which a client sends the request again after, and not the refusal of a
     /// program that is not Git, which ends with the step that installs it. The pipe here is held
     /// open and has said something, as a process that outlived the probe leaves it, and the time
-    /// is far shorter than the wait the drain is given, so the time is what ends the wait.
+    /// is far shorter than the wait the drain is given, so the time is what ends the wait: the
+    /// first poll that begins when the time has come is the last, and the wait does not go on
+    /// polling to the end of the second it was given.
     #[cfg(unix)]
     #[test]
     fn a_probes_time_that_runs_out_while_its_output_is_awaited_is_a_fault_that_passes() {
@@ -6449,6 +6461,11 @@ mod tests {
         // cat ends when its input does, and the pipe it held goes with it.
         drop(said);
         holder.wait().expect("cat ends");
+        assert_eq!(
+            POLLS_AT_OR_AFTER_THE_DEADLINE.with(std::cell::Cell::get),
+            1,
+            "the wait ended with the first poll that began when the time had come"
+        );
         let Err(Asked::Overran(refusal)) = outcome else {
             panic!("a pipe still open when the time runs out is not the end of an answer");
         };
