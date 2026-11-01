@@ -1141,7 +1141,8 @@ impl Controller {
     }
 
     /// How long a paired device's request waits for its effect before it is told the outcome is
-    /// unknown: the wait a suite gave this daemon.
+    /// unknown: the wait a suite gave this daemon, or [`net::dispatch::EFFECT_WAIT`] where it gave
+    /// none.
     #[cfg(feature = "testing")]
     #[must_use]
     pub(crate) const fn effect_wait(&self) -> std::time::Duration {
