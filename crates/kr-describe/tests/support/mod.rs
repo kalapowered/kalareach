@@ -5,11 +5,12 @@
 //! drives that area, where a reader can see what it does without leaving the test.
 #![allow(dead_code)]
 
+use kr_crypto::keys::AuthorisationKeyPair;
 use kr_describe::budget::GIB;
 use kr_describe::context::ContextBinding;
 use kr_describe::environment::{EnvironmentKind, ExecutionEnvironment};
-use kr_describe::profile::ModelProfile;
-use kr_describe::profile::catalogue::Catalogue;
+use kr_describe::profile::catalogue::{self, Catalogue};
+use kr_describe::profile::{ModelProfile, ProfileDocument, ProfileTrust, SignedProfile};
 use kr_describe::resource::{HostConditions, PowerSource, ThermalState};
 use kr_describe::time::Reading;
 use kr_protocol::ids::{EnvironmentId, SessionId};
@@ -51,6 +52,32 @@ pub fn built_in() -> Catalogue {
 /// The default profile.
 pub fn default_profile() -> ModelProfile {
     built_in().default_profile().clone()
+}
+
+/// A catalogue of one profile: the default profile's document with some of its text replaced,
+/// signed with a key of the test's own and verified as every profile is before it is used.
+///
+/// Each edit names text the document holds, so an edit that matches nothing is a mistake in the
+/// test and stops it.
+pub fn catalogue_with(edits: &[(&str, &str)]) -> Catalogue {
+    let mut document = catalogue::DEFAULT_PROFILE_DOCUMENT.to_owned();
+    for (find, replace) in edits {
+        assert!(document.contains(find), "the document holds no {find}");
+        document = document.replace(find, replace);
+    }
+    let keys = AuthorisationKeyPair::generate().expect("a keypair");
+    let document = ProfileDocument::new(document.into_bytes());
+    let transcript = document.transcript().expect("a transcript");
+    let signature = kr_crypto::sign::sign(&keys, &transcript).expect("a signature");
+    let signed = SignedProfile {
+        document,
+        key: *keys.public(),
+        signature,
+    };
+    let profile = ProfileTrust::new(vec![*keys.public()])
+        .verify(&signed)
+        .expect("a profile this build would run");
+    Catalogue::new(vec![profile]).expect("a catalogue of one default")
 }
 
 /// Conditions a host with plenty of everything reports.

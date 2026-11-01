@@ -25,7 +25,8 @@ pub const GIB: u64 = 1 << 30;
 pub struct Budgets {
     /// CPU threads the runtime may use.
     pub cpu_threads: u32,
-    /// How many requests may be executing at once.
+    /// How many requests may be executing at once. Nothing reads this figure: a service has one job
+    /// slot, so one request executes at a time in an execution environment whatever it says.
     pub active_requests: u32,
     /// The context window, in tokens.
     pub context_tokens: u32,

@@ -25,11 +25,11 @@ use kr_describe::privacy::{
     CleanupDebt, DescriptionFence, DescriptionPrivacy, InFlight, RunningJob,
 };
 use kr_describe::profile::ProfileRevision;
-use kr_describe::profile::catalogue::MetGates;
+use kr_describe::profile::catalogue::{Catalogue, MetGates};
 use kr_describe::qualification::{Case, Evidence, Matrix, REQUIRED_TARGETS, SMOKE_13_SEPTEMBER};
 use kr_describe::queue::{Enqueued, Priority, Scheduler};
 use kr_describe::resource::{
-    HostConditions, PauseReason, PowerSource, ResourceSettings, ThermalState,
+    HostConditions, PauseReason, PowerSource, ResourceSettings, ResourceState, ThermalState,
 };
 use kr_describe::service::{
     Answered, DescriptionService, DownloadProgress, HostPlacement, IDLE_UNLOAD_MS, Instruction,
@@ -46,12 +46,22 @@ use kr_worker::privacy::{
 };
 
 use support::{
-    MAC, a_pin_not_yet_committed, at, binding, built_in, default_profile, environment_id, native,
-    roomy, session,
+    MAC, a_pin_not_yet_committed, at, binding, built_in, catalogue_with, default_profile,
+    environment_id, native, roomy, session,
 };
 
 /// A service over one environment, with settings a test chooses.
 fn service_with(
+    environment: ExecutionEnvironment,
+    choice: Option<DataAccessChoice>,
+    settings: ResourceSettings,
+) -> DescriptionService {
+    service_over(built_in(), environment, choice, settings)
+}
+
+/// A service over one environment and a catalogue a test chooses.
+fn service_over(
+    catalogue: Catalogue,
     environment: ExecutionEnvironment,
     choice: Option<DataAccessChoice>,
     settings: ResourceSettings,
@@ -63,7 +73,7 @@ fn service_with(
             target: MAC.to_owned(),
             processor: kr_describe::processor::Features::running(),
         },
-        built_in(),
+        catalogue,
         MetGates::default(),
         settings,
         DescriptionStore::in_memory().expect("a store in memory"),
@@ -263,10 +273,18 @@ fn dispatch_after_load(
 
 /// The answer the in-process answerer gives a request.
 fn produced(request: &kr_describe::service::GenerationRequest) -> Answered {
+    produced_peaking(request, 0)
+}
+
+/// The same answer from a process whose resident set peaked at `peak_rss_bytes` during the job.
+fn produced_peaking(
+    request: &kr_describe::service::GenerationRequest,
+    peak_rss_bytes: u64,
+) -> Answered {
     Answered::Produced {
         bytes: answer_of(&request.prompt, &Output::WellFormed),
         phases: Phases::default(),
-        peak_rss_bytes: 0,
+        peak_rss_bytes,
     }
 }
 
@@ -288,10 +306,189 @@ fn a_dispatched_job_carries_the_thread_count_and_bounds_the_profile_records() {
     assert_eq!(request.cpu_threads, 4);
     assert_eq!(request.context_tokens, 4_096);
     assert_eq!(request.max_output_tokens, 128);
-    assert_eq!(request.deadline_ms, Budgets::DEFAULTS.execution_deadline_ms);
+    assert_eq!(request.deadline_ms, 30_000);
+    assert_eq!(request.ceiling_bytes, 4 * GIB);
+}
+
+/// KR-REQ-22.10: a job is held to four threads, a context of 4,096 tokens and at most 128 tokens of
+/// output, whatever a profile asks for. The control is a profile that asks for fewer threads, which
+/// is given what it asked for.
+#[test]
+fn a_profile_that_asks_for_more_is_held_to_four_threads_4096_tokens_and_128_of_output() {
+    let job_of = |edits: &[(&str, &str)]| {
+        let mut service = service_over(
+            catalogue_with(edits),
+            native(1),
+            None,
+            ResourceSettings::default(),
+        );
+        queue_one(
+            &mut service,
+            &session(1),
+            "kalareach",
+            Priority::Ordinary,
+            at(0),
+        );
+        dispatch_one(&mut service, at(3_000)).2
+    };
+    let asking_for_more = job_of(&[
+        ("\"cpu_threads\": 4", "\"cpu_threads\": 16"),
+        ("\"context_tokens\": 4096", "\"context_tokens\": 16384"),
+        ("\"max_output_tokens\": 128", "\"max_output_tokens\": 512"),
+    ]);
+    assert_eq!(asking_for_more.cpu_threads, 4);
+    assert_eq!(asking_for_more.context_tokens, 4_096);
+    assert_eq!(asking_for_more.max_output_tokens, 128);
+
+    let asking_for_less = job_of(&[("\"cpu_threads\": 4", "\"cpu_threads\": 2")]);
+    assert_eq!(asking_for_less.cpu_threads, 2);
+}
+
+/// KR-REQ-22.10: a change to a session's context settles into a job two seconds after the change,
+/// and not a millisecond before.
+#[test]
+fn a_context_change_settles_into_a_job_two_seconds_after_it() {
+    let mut service = service();
+    service.session_opened(session(1), SessionEpoch::V1, binding());
+    service.observe(
+        &session(1),
+        ContextSignal::WorkingDirectory {
+            directory: "kalareach".to_owned(),
+            repository: None,
+        },
+        at(10_000),
+    );
     assert_eq!(
-        request.ceiling_bytes,
-        Budgets::DEFAULTS.process_memory_ceiling_bytes
+        service.settle(&session(1), Priority::Ordinary, at(11_999)),
+        None
+    );
+    assert_eq!(
+        service.settle(&session(1), Priority::Ordinary, at(12_000)),
+        Some(Enqueued::Admitted)
+    );
+}
+
+/// KR-REQ-22.10: a session is described again no sooner than thirty seconds after its last job was
+/// sent, and the host waits until then and no longer.
+#[test]
+fn a_session_is_described_again_thirty_seconds_after_its_last_job_was_sent() {
+    let mut service = service();
+    queue_one(
+        &mut service,
+        &session(1),
+        "kalareach",
+        Priority::Ordinary,
+        at(0),
+    );
+    let (id, _, request) = dispatch_one(&mut service, at(3_000));
+    assert!(matches!(
+        service
+            .finished(id, produced(&request), at(3_500))
+            .expect("the answer"),
+        Outcome::Published { .. }
+    ));
+    service.observe(
+        &session(1),
+        ContextSignal::WorkingDirectory {
+            directory: "crates".to_owned(),
+            repository: None,
+        },
+        at(4_000),
+    );
+    assert!(
+        service
+            .settle(&session(1), Priority::Ordinary, at(6_000))
+            .is_some(),
+        "the change is queued for a second description"
+    );
+    assert_eq!(
+        service.next(&roomy(), at(32_999)).expect("an instruction"),
+        Instruction::Wait {
+            until_ms: Some(33_000)
+        },
+        "thirty seconds after the job was sent, to the millisecond"
+    );
+    let Instruction::Generate { session_id, .. } =
+        service.next(&roomy(), at(33_000)).expect("an instruction")
+    else {
+        panic!("the second description is sent when the cooldown ends");
+    };
+    assert_eq!(session_id, session(1));
+}
+
+/// KR-REQ-22.10: one job is in the process at a time. A second session whose description is due
+/// waits for the first job's answer, and is sent as soon as it has come.
+#[test]
+fn one_job_is_in_the_process_at_a_time() {
+    let mut service = service();
+    for seed in [1, 2] {
+        queue_one(
+            &mut service,
+            &session(seed),
+            "kalareach",
+            Priority::Ordinary,
+            at(0),
+        );
+    }
+    let (id, first, request) = dispatch_one(&mut service, at(3_000));
+    assert_eq!(service.in_flight(), 1);
+    for later in [3_001, 10_000, 20_000] {
+        assert_eq!(
+            service.next(&roomy(), at(later)).expect("an instruction"),
+            Instruction::Wait { until_ms: None },
+            "the second session waits while the first job is in the process, at {later}"
+        );
+    }
+    assert!(matches!(
+        service
+            .finished(id, produced(&request), at(20_500))
+            .expect("the answer"),
+        Outcome::Published { .. }
+    ));
+    let Instruction::Generate { session_id, .. } =
+        service.next(&roomy(), at(20_500)).expect("an instruction")
+    else {
+        panic!("the second session is sent once the first job has answered");
+    };
+    assert_ne!(session_id, first);
+}
+
+/// KR-REQ-22.10: the process-memory ceiling is 4 GiB. It is the figure a job is sent, and a job
+/// whose process peaked at it leaves the model loaded while one that peaked a byte over it pauses
+/// inference for memory pressure.
+#[test]
+fn the_process_memory_ceiling_is_four_gibibytes_to_the_byte() {
+    let peaked_at = |peak_rss_bytes: u64| {
+        let mut service = service();
+        assert_eq!(service.ceiling_bytes(), 4 * GIB);
+        queue_one(
+            &mut service,
+            &session(1),
+            "kalareach",
+            Priority::Ordinary,
+            at(0),
+        );
+        let (id, _, request) = dispatch_one(&mut service, at(3_000));
+        assert_eq!(request.ceiling_bytes, 4 * GIB);
+        assert!(matches!(
+            service
+                .finished(id, produced_peaking(&request, peak_rss_bytes), at(3_500))
+                .expect("the answer"),
+            Outcome::Published { .. }
+        ));
+        service
+    };
+    let at_the_ceiling = peaked_at(4 * GIB);
+    assert!(at_the_ceiling.is_mapped());
+    assert_eq!(at_the_ceiling.resource_state(), ResourceState::Admitted);
+
+    let over_it = peaked_at(4 * GIB + 1);
+    assert_eq!(
+        over_it.resource_state(),
+        ResourceState::ResourcePaused {
+            reason: PauseReason::MemoryPressure,
+            unloaded: true
+        }
     );
 }
 
@@ -337,12 +534,14 @@ fn a_cancelled_job_publishes_nothing_and_keeps_the_title_it_had() {
     assert!(service.store().generated(&session(1)).unwrap().is_none());
 }
 
-/// KR-REQ-22.10: a job that passes its deadline publishes nothing, and the deadline is from
-/// dequeue: after five minutes in the queue, a job that takes a millisecond more than the deadline
-/// is refused, and one that takes all of it publishes, with all of it as its execution.
+/// KR-REQ-22.10: a job that passes its thirty-second deadline publishes nothing, and the deadline
+/// is from dequeue: after five minutes in the queue, a job that takes a millisecond more than the
+/// deadline ends at it and publishes nothing, and one that takes all of it publishes, with all of
+/// it as its execution. The answerer ends the slow job, as a process does; a result that arrives
+/// past the deadline is refused by the service in the case below.
 #[test]
 fn a_job_that_passes_its_deadline_publishes_nothing() {
-    let deadline_ms = Budgets::DEFAULTS.execution_deadline_ms;
+    let deadline_ms = 30_000;
     let after_five_minutes = |duration_ms: u64| {
         let behaviour = SharedBehaviour::new();
         behaviour.set(Behaviour::Slow { duration_ms });
@@ -413,7 +612,7 @@ fn a_model_load_that_passes_its_deadline_is_abandoned_and_publishes_nothing() {
 /// job is sent with its whole deadline after it; the control is a job that runs past that deadline.
 #[test]
 fn a_load_longer_than_a_jobs_deadline_leaves_the_job_its_whole_deadline() {
-    let deadline_ms = Budgets::DEFAULTS.execution_deadline_ms;
+    let deadline_ms = 30_000;
     let mut service = service();
     queue_one(
         &mut service,
@@ -547,7 +746,7 @@ fn a_result_that_arrives_past_its_deadline_publishes_nothing() {
         at(0),
     );
     let (id, _, request) = dispatch_one(&mut service, at(3_000));
-    let deadline = Budgets::DEFAULTS.execution_deadline_ms;
+    let deadline = 30_000;
     assert_eq!(
         service
             .finished(id, produced(&request), at(3_000 + deadline + 1))
