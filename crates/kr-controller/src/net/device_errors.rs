@@ -30,14 +30,14 @@
 //! ([`suspension_for_a_device`]), in a result and in the refusal of a rich mutation.
 //!
 //! What the general rule does not find, and so passes whole, unless the refusal is one this module
-//! knows by its wording: a number that follows a word for an account after more than one separator
-//! or through a longer name for one (`uid: 501`, `owner: 502`, `user id 501`, `user  501`,
-//! `uid(501)`, `uid_501`); a path whose first slash follows a name (`~name/work`,
-//! `Users/name/work`, `.config/kalareach/x`); and an account's bare name with no path, number or
-//! command beside it, or with only a path beside it in the clause that is kept (the error output
-//! of `systemctl` that `supervision.rs` quotes can hold one). A producer that writes one of these
-//! is mended by giving the refusal a wording that is shared with this module, as [`KNOWN_REASONS`]
-//! does for the refusals it lists.
+//! knows by its wording: a number that follows a word for an account across a separator the rule
+//! does not read, or through a longer name for one (`uid: 501`, `owner: 502`, `user id 501`,
+//! `user  501`, `uid(501)`, `uid_501`); a path of which every slash follows a name (`~name/work`,
+//! `Users/name/work`, `.config/kalareach/x`); and an account's bare name in a clause that holds no
+//! path, number or command of its own (the error output of `systemctl` that `supervision.rs`
+//! quotes can hold one), even when a later clause does. A producer that writes one of these is
+//! mended by giving the refusal a wording that is shared with this module, as [`KNOWN_REASONS`]
+//! does for its last seven refusals.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -896,11 +896,13 @@ fn shown_member(map: &CanonicalMap, key: &str, child: &CanonicalValue) -> Option
             {
                 // The subject before the clause is the host's own words only if it names nothing of
                 // the host. A subject that does is held to the rule, as a text with no clause is,
-                // up to the end of the clause: the words after it are not the host's and are not
-                // looked at. A plugin identifier that reads as an account's number (`acme/user-1`)
-                // is held too.
+                // up to the end of the clause, and the words after it are not sent. The guard has
+                // found a name, so when the rule over the text through the clause finds none (the
+                // clause can complete a pointer's refusal that hides the subject's path), what
+                // stands for it is the fixed sentence. A plugin identifier that reads as an
+                // account's number (`acme/user-1`) is held too.
                 Some((at, end)) if first_naming(&text[..at]).is_some() => {
-                    told_in_place(&text[..end], fixed)
+                    Some(told_in_place(&text[..end], fixed).unwrap_or_else(fixed))
                 }
                 Some((_, end)) => (end < text.len()).then(|| text[..end].to_owned()),
                 None => told_in_place(text, fixed),
@@ -3969,11 +3971,18 @@ mod tests {
                 "{said}"
             );
             // The words after the clause, which can hold the end of a pointer's refusal, do not
-            // hide a path in the subject.
-            let said = format!(
-                "x at /Users/marguerite/p{clause}: this carries a field it does not declare"
-            );
-            assert_eq!(left_out_detail_told_to_a_device(&said), nothing, "{said}");
+            // hide a path in the subject, and neither does a clause that completes the beginning
+            // of one.
+            for said in [
+                format!(
+                    "x at /Users/marguerite/p{clause}: this carries a field it does not declare"
+                ),
+                format!(
+                    "x at /Users/marguerite/p names a variant in{clause}: marguerite wrote this"
+                ),
+            ] {
+                assert_eq!(left_out_detail_told_to_a_device(&said), nothing, "{said}");
+            }
         }
     }
 
