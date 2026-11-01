@@ -358,7 +358,7 @@ fn a_job_that_passes_its_deadline_publishes_nothing() {
     assert!(matches!(tick, Tick::DeadlineExceeded { .. }), "{tick:?}");
 }
 
-/// KR-REQ-22.10: a model load that passes its own deadline is abandoned and publishes nothing.
+/// A model load that passes its own deadline is abandoned and publishes nothing.
 #[test]
 fn a_model_load_that_passes_its_deadline_is_abandoned_and_publishes_nothing() {
     let behaviour = SharedBehaviour::new();
