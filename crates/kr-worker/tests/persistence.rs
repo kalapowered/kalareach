@@ -4272,3 +4272,119 @@ async fn a_host_looking_again_at_the_output_cap_removes_no_output_by_age() {
         "and gave up the output for the cap"
     );
 }
+
+/// Fills a session's spool with one segment of 4,096 bytes, last written `days_ago` days ago.
+#[cfg(unix)]
+fn a_segment_written(days_ago: u64) -> impl FnOnce(&std::path::Path) {
+    move |spool| {
+        use std::io::Write as _;
+        use std::time::{Duration, SystemTime};
+
+        std::fs::create_dir_all(spool).expect("the spool directory");
+        let mut segment = std::fs::File::create(spool.join("0.out")).expect("a segment");
+        segment.write_all(&[b'x'; 4096]).expect("its bytes");
+        segment
+            .set_modified(SystemTime::now() - Duration::from_secs(days_ago * 24 * 60 * 60))
+            .expect("a segment of that age");
+    }
+}
+
+/// A host whose pass cannot take the lock on the host's output cap: its session holds a segment,
+/// another session's spool holds the cap, and a directory stands where the lock file goes. The
+/// pass leaves output it was asked to remove, and says why.
+#[cfg(unix)]
+async fn host_whose_pass_leaves_output_behind() -> Host {
+    let host = host_started(
+        |_| {},
+        a_segment_written(0),
+        kr_worker::action::time::TimeSources::system(),
+        "sleep 30",
+    )
+    .await;
+    let spools = host._temp.environment().spool_dir();
+    let other = spools.join("other.log");
+    std::fs::create_dir_all(&other).expect("another session's spool directory");
+    std::fs::File::create(other.join("0.out"))
+        .and_then(|segment| segment.set_len(OutputRetention::DEFAULT.host_cap_bytes))
+        .expect("a segment that holds the cap");
+    std::fs::create_dir(spools.join("host-cap.lock")).expect("a directory where the lock goes");
+    host
+}
+
+/// Section 24 and section 20, KR-REQ-20.20: a worker says why a pass left output behind to its
+/// standard error, once while the reason stands, and a standard error that refuses the write
+/// costs the session nothing. A volume that is full is a cause of output left behind, and it
+/// refuses the diagnostic too; the stop of a session must not wait on it.
+///
+/// The worker is this test's own program, started twice with the standard error the case needs:
+/// one that a person reads, and one whose reading end is closed. In each the host makes two
+/// passes and then the session is stopped through the endpoint.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_refused_write() {
+    use std::io::{Read as _, Write as _};
+    use std::process::{Command, Stdio};
+
+    const NAME: &str =
+        "a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_refused_write";
+    const CHILD: &str = "KR_TEST_WORKER_WITH_ITS_OWN_STANDARD_ERROR";
+
+    if std::env::var_os(CHILD).is_some() {
+        // A failure is told on the standard output, which this case reads, since the standard
+        // error may be the one that refuses.
+        std::panic::set_hook(Box::new(|failure| {
+            println!("the worker panicked: {failure}")
+        }));
+        // Waits until the starter has settled its end of the standard error.
+        std::io::stdin()
+            .read_exact(&mut [0_u8; 1])
+            .expect("the starter's go-ahead");
+        let host = host_whose_pass_leaves_output_behind().await;
+        host.service.maintain_now();
+        host.service.maintain_now();
+        let mut client = cli(&host).await;
+        close(&mut client, &host).await;
+        return;
+    }
+
+    let start = |readable: bool| {
+        let mut worker = Command::new(std::env::current_exe().expect("this test's program"))
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("starts the worker");
+        if !readable {
+            drop(worker.stderr.take());
+        }
+        let mut go_ahead = worker.stdin.take().expect("its standard input");
+        go_ahead.write_all(b"g").expect("the go-ahead");
+        drop(go_ahead);
+        let outcome = worker.wait_with_output().expect("the worker ends");
+        let standard_output = String::from_utf8_lossy(&outcome.stdout).into_owned();
+        assert!(
+            outcome.status.success() && standard_output.contains("1 passed"),
+            "the worker ended {:?}: {standard_output}",
+            outcome.status
+        );
+        String::from_utf8_lossy(&outcome.stderr).into_owned()
+    };
+
+    let said = start(true);
+    let reasons: Vec<&str> = said
+        .lines()
+        .filter(|line| line.contains("output retention left output it was asked to remove"))
+        .collect();
+    assert_eq!(
+        reasons.len(),
+        1,
+        "two passes left the output for one reason, which is said once: {said}"
+    );
+    assert!(
+        reasons[0].contains("host-cap.lock"),
+        "and it names the lock: {reasons:?}"
+    );
+    start(false);
+}

@@ -4835,13 +4835,18 @@ impl Session {
                     .apply_retention(retention, held, now, age_permitted)
             }
         };
-        // A pass that could not remove what it was asked to says why to this worker's own
-        // diagnostics, where a person looking into a host that keeps more than its cap finds it.
-        if let Some(reason) =
-            new_output_reason(&mut self.reported_output_reason, self.history.left_behind())
-        {
-            eprintln!("kr-worker: output retention left output it was asked to remove: {reason}");
-        }
+        // A pass that could not remove what it was asked to says why to this worker's standard
+        // error. On Unix that is where a person looking into a host that keeps more than its cap
+        // finds it: a launchd job's or a detached process's diagnostics file, a transient unit's
+        // journal. A Windows worker has a console with no window, so nobody reads it there. The
+        // write is made under the session's lock, and one that fails is let go: the volume that
+        // made the pass leave output behind may well refuse it too, and a diagnostic is not worth
+        // the session.
+        say_output_reason(
+            &mut self.reported_output_reason,
+            self.history.left_behind(),
+            &mut std::io::stderr().lock(),
+        );
         taken
     }
 
@@ -5624,50 +5629,104 @@ impl Answered {
     }
 }
 
-/// The reason an output retention pass left output behind that is to be said now: `now` when it is
-/// not the reason last said (`said`), and nothing when it is, or when there is none. `said` follows
-/// `now`, so a reason that goes and comes back is said again.
-fn new_output_reason(said: &mut Option<String>, now: Option<&str>) -> Option<String> {
-    if said.as_deref() == now {
-        return None;
+/// Says to `diagnostics` why an output retention pass left output behind, when it is not the
+/// reason last said.
+///
+/// `said` is the reason last written, and follows `reason`: one that goes and comes back is said
+/// again. A write that fails is let go, and its reason is not taken as said, so that the next pass
+/// that can write it says it.
+fn say_output_reason(
+    said: &mut Option<String>,
+    reason: Option<&str>,
+    diagnostics: &mut impl std::io::Write,
+) {
+    if said.as_deref() == reason {
+        return;
     }
-    *said = now.map(str::to_owned);
-    now.map(str::to_owned)
+    match reason {
+        None => *said = None,
+        Some(reason) => {
+            let written = writeln!(
+                diagnostics,
+                "kr-worker: output retention left output it was asked to remove: {reason}"
+            );
+            if written.is_ok() {
+                *said = Some(reason.to_owned());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use kr_protocol::root::{CommandBypassReason, PromptGeneration};
 
-    use super::{Answered, StartTerms, new_output_reason};
+    use super::{Answered, StartTerms, say_output_reason};
+
+    /// What the pass said, one reason to a line.
+    fn said_by(said: &mut Option<String>, reason: Option<&str>) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        say_output_reason(said, reason, &mut diagnostics);
+        String::from_utf8(diagnostics)
+            .expect("text")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A diagnostics stream that refuses every write, as a full volume does.
+    struct Refusing;
+
+    impl std::io::Write for Refusing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("no space left on device"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("no space left on device"))
+        }
+    }
 
     /// A reason an output retention pass left output behind is said when it first stands, once
     /// while it goes on, and again if it goes and comes back or changes.
     #[test]
     fn a_reason_output_was_left_behind_is_said_once_while_it_stands() {
         let mut said = None;
-        assert_eq!(new_output_reason(&mut said, None), None);
-        assert_eq!(
-            new_output_reason(&mut said, Some("the lock")),
-            Some("the lock".to_owned()),
-            "a new reason is said"
-        );
-        assert_eq!(
-            new_output_reason(&mut said, Some("the lock")),
-            None,
+        assert!(said_by(&mut said, None).is_empty());
+        let first = said_by(&mut said, Some("the lock"));
+        assert_eq!(first.len(), 1, "a new reason is said");
+        assert!(first[0].ends_with("the lock"), "{first:?}");
+        assert!(
+            said_by(&mut said, Some("the lock")).is_empty(),
             "and not again while it stands"
         );
-        assert_eq!(new_output_reason(&mut said, None), None, "it goes");
+        assert!(said_by(&mut said, None).is_empty(), "it goes");
         assert_eq!(
-            new_output_reason(&mut said, Some("the lock")),
-            Some("the lock".to_owned()),
+            said_by(&mut said, Some("the lock")).len(),
+            1,
             "and is said again when it comes back"
         );
         assert_eq!(
-            new_output_reason(&mut said, Some("the boundary")),
-            Some("the boundary".to_owned()),
+            said_by(&mut said, Some("the boundary")).len(),
+            1,
             "as is another"
         );
+    }
+
+    /// A stream that refuses the write costs the pass nothing: it returns, and the reason is not
+    /// taken as said, so the next pass that can write it does.
+    #[test]
+    fn a_reason_that_could_not_be_written_is_said_at_the_next_pass_that_can_write_it() {
+        let mut said = None;
+        say_output_reason(&mut said, Some("the lock"), true, &mut Refusing);
+        assert_eq!(said, None, "a reason that was not written is not said");
+        say_output_reason(&mut said, Some("the lock"), true, &mut Refusing);
+        assert_eq!(
+            said_by(&mut said, Some("the lock")).len(),
+            1,
+            "the next pass that can write it says it"
+        );
+        assert!(said_by(&mut said, Some("the lock")).is_empty());
     }
 
     /// An adoption is given the bypass its own line was answered with, and none of an earlier
