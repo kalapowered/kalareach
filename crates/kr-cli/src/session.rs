@@ -4033,6 +4033,42 @@ mod tests {
         assert!(held.is_empty());
     }
 
+    /// A console reached over a remote desktop or a virtual keyboard reports its own scan code for a
+    /// key, so two records with one virtual key and one enhanced flag can still be two keys. The one
+    /// held with Shift is the window's, the one with another scan code and no Shift is the session's,
+    /// and neither one's release moves the other.
+    #[test]
+    fn two_scroll_keys_that_differ_only_in_their_scan_code_are_told_apart() {
+        use kr_term::win32::{
+            KeyRecord,
+            control_keys::{ENHANCED_KEY, SHIFT_PRESSED},
+        };
+
+        let page_up = |scan_code: u16, key_down: bool, control_keys: u32| KeyRecord {
+            virtual_key: super::VK_PRIOR,
+            scan_code,
+            unicode: 0,
+            key_down,
+            control_keys: control_keys | ENHANCED_KEY,
+            repeat: 1,
+        };
+        let held_down = page_up(0x49, true, SHIFT_PRESSED);
+        let held_up = page_up(0x49, false, 0);
+        let other_down = page_up(0, true, 0);
+        let other_up = page_up(0, false, 0);
+        let mut held = Vec::new();
+
+        let (rest, steps) = take_scroll_keys(vec![held_down], &mut held, true);
+        assert_eq!((rest.len(), steps), (0, 1));
+        let (rest, steps) = take_scroll_keys(vec![other_down], &mut held, true);
+        assert_eq!((rest, steps), (vec![other_down], 0));
+        let (rest, steps) = take_scroll_keys(vec![held_up], &mut held, true);
+        assert_eq!((rest.len(), steps), (0, 0));
+        let (rest, steps) = take_scroll_keys(vec![other_up], &mut held, true);
+        assert_eq!((rest, steps), (vec![other_up], 0));
+        assert!(held.is_empty());
+    }
+
     /// A release, a modifier on its own and a lock key are not something the person typed: they
     /// neither take a terminal back to the live screen nor count as input a closing session
     /// refused.
