@@ -2192,6 +2192,11 @@ async fn kept_record_is_refused_at_every_step(
 /// another, the page is shown nothing wrong, turning recovery on again changes nothing, the
 /// archives are listed and the offline copy is read from the record's service, the host is covered
 /// through it, and the service the setting names is sent nothing.
+///
+/// KR-REQ-20.18, the part about the bundle a printed kit names and the offline export: after the
+/// host is covered, the bundle read with only the first kit names the host's writer, and the
+/// offline copy of the bundle is the bundle the service holds, naming that service. Not shown
+/// here: the compare-and-swap of the update, or the export of an archive the bundle names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_is_read_and_covered_at_its_own_service_when_the_setting_names_another() {
     let computer = Computer::new().await;
@@ -2422,6 +2427,10 @@ async fn recovery_goes_on_with_an_unkept_record_at_its_own_service_when_the_sett
 /// answered; settling it asks the fork's service and finds it applied; covering the host then
 /// writes the bundle there before the host is asked. Every ask of the clients is for the record's
 /// origin, and neither the service the record names nor the one the setting names is sent anything.
+///
+/// KR-REQ-20.15, the part about the bundle being committed before the host is asked: while the
+/// write of the cover has no answer the host is not asked, and when it is asked the bundle is at
+/// the record's service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lost_write_is_settled_and_the_host_covered_at_the_records_service_when_the_setting_names_another()
  {
@@ -2510,6 +2519,10 @@ async fn a_lost_write_is_settled_and_the_host_covered_at_the_records_service_whe
 /// before the host is asked, as covering it without one does. Every ask of the clients is for the
 /// record's origin, and neither the service the record names nor the one the setting names is sent
 /// anything.
+///
+/// KR-REQ-20.15, the part about the bundle being committed before the host is asked, for a
+/// replacement: when the host is asked to replace its setup the bundle is already at the record's
+/// service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_cover_goes_through_the_clients_at_the_records_service_when_the_setting_names_another()
  {
@@ -2583,6 +2596,10 @@ async fn a_replacement_cover_goes_through_the_clients_at_the_records_service_whe
 /// read there, with the record's origin asked for and the account presenting. Nothing is written
 /// over the bundle, the service the record names and the one the setting names are sent nothing,
 /// and the adopted bundle is noted as no account's.
+///
+/// KR-REQ-20.18, the part about the kit's locator and service: the kit names the adopted bundle's
+/// locator and the service the record names, whatever the setting names. Not shown here: the kit's
+/// seed and checksum, or an update that adds a writer key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turning_recovery_on_adopts_an_earlier_write_at_the_records_service_when_the_setting_names_another()
  {

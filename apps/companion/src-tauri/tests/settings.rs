@@ -1510,6 +1510,11 @@ async fn settings_sync_talks_to_the_service_client_it_was_given_at_the_origin_it
 /// computer's settings, with the service's copy still there, lets that copy go there and sends the
 /// choice there; a second refused change leaves a copy there that is dropped when the person asks.
 /// The service the setting names now receives none, and the record goes on naming the first.
+///
+/// KR-REQ-20.13, the part about conflicting content kept for the person's choice: a change refused
+/// because another device wrote the setting first stays a conflict, with the service's copy kept,
+/// until the person keeps this computer's settings or has the copy dropped. Not shown here: that no
+/// clock decides the choice, or that a host's grants are never overwritten.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_choice_between_versions_and_a_dropped_copy_go_to_the_service_the_record_names() {
     let computer = Computer::new().await;
