@@ -585,9 +585,23 @@ impl Rig {
         .await;
     }
 
-    /// Waits until the doctor's check of the producer says `words`, and returns what it said. The
-    /// count of the producer's looks says that a look ended and not which: one that was under way
-    /// when the count was read ends with the state it began with.
+    /// Waits until the producer has ended a look that began after now, and so after what the test
+    /// changed before it called this. A look writes what it found and counts itself afterwards, so
+    /// the count says that a look ended and not when it began: a look under way now ends first, with
+    /// what it found before the change. The look that ends after that one began after it ended; the
+    /// producer is signalled for each of the two.
+    #[cfg(unix)]
+    async fn production_looked_afresh(&self) {
+        let looked = *self.controller.production_looks().borrow();
+        for ended in 1..=2 {
+            self.controller.backup().signals().produce.notify_one();
+            self.production_looked(looked + ended).await;
+        }
+    }
+
+    /// Waits until the doctor's check of the producer says `words`, and returns what it said. Called
+    /// after [`Self::production_looked_afresh`], it finds the words of a look that began after the
+    /// change, or of one after that.
     async fn production_says(&self, words: &str) -> (DoctorStatus, String) {
         let mut said = None;
         let found = tokio::time::timeout(Duration::from_secs(180), async {
@@ -4043,8 +4057,7 @@ async fn a_session_packed_while_held_back_is_not_packed_again_when_its_journal_h
     let looked = *rig.controller.production_looks().borrow();
     rig.controller.backup().signals().produce.notify_one();
     rig.production_looked(looked + 1).await;
-    let (_, detail) = rig.production_says("nothing has changed").await;
-    assert!(detail.contains("nothing has changed"), "{detail}");
+    rig.production_says("nothing has changed").await;
     assert_eq!(
         rig.controller.backup().generations().expect("a read").len(),
         1,
@@ -4451,12 +4464,9 @@ async fn no_generation_is_staged_while_a_finished_ones_ciphertext_is_still_on_th
     rig.controller
         .lower_producer_bounds(kr_controller::service::ProducerBounds::PRODUCTION);
     timer.advance_day(Duration::from_secs(25 * 3600));
-    let looked = *rig.controller.production_looks().borrow();
-    rig.controller.backup().signals().produce.notify_one();
-    rig.production_looked(looked + 1).await;
-    let (status, detail) = rig.production_says("still on this host's disk").await;
+    rig.production_looked_afresh().await;
+    let (status, _) = rig.production_says("still on this host's disk").await;
     assert_eq!(status, DoctorStatus::Warning);
-    assert!(detail.contains("still on this host's disk"), "{detail}");
     assert_eq!(walk(&staging), staged, "nothing new was staged");
     assert_eq!(
         rig.controller.backup().generations().expect("a read").len(),
@@ -4662,11 +4672,8 @@ async fn a_session_that_cannot_be_read_makes_no_generation_each_day_and_is_tried
     // Two days on, nothing changed: no second generation, and the doctor still says why.
     for _ in 0..2 {
         timer.advance_day(Duration::from_secs(25 * 3600));
-        let looked = *rig.controller.production_looks().borrow();
-        rig.controller.backup().signals().produce.notify_one();
-        rig.production_looked(looked + 1).await;
+        rig.production_looked_afresh().await;
         let (_, detail) = rig.production_says("nothing has changed").await;
-        assert!(detail.contains("nothing has changed"), "{detail}");
         assert!(detail.contains("could not be read"), "{detail}");
         assert_eq!(
             rig.controller.backup().generations().expect("a read").len(),
@@ -5531,15 +5538,9 @@ async fn a_try_that_found_a_session_readable_is_made_again_when_the_pass_stops_a
             ..kr_controller::service::ProducerBounds::PRODUCTION
         });
     timer.advance_day(Duration::from_secs(25 * 3600));
-    for look in 0..2 {
-        let looked = *rig.controller.production_looks().borrow();
-        rig.controller.backup().signals().produce.notify_one();
-        rig.production_looked(looked + 1).await;
-        let (_, detail) = rig.production_says("too little room").await;
-        assert!(
-            detail.contains("too little room"),
-            "look {look} the same day: {detail}"
-        );
+    for _ in 0..2 {
+        rig.production_looked_afresh().await;
+        rig.production_says("too little room").await;
     }
     assert_eq!(
         rig.controller.backup().generations().expect("a read").len(),
