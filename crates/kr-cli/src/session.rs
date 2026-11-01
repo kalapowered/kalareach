@@ -1545,10 +1545,10 @@ const READER_STILL_RUNNING: &str = "kr: the part of this command that reads the 
      input mode may change, and the keys it had already taken were not counted.";
 
 /// What an attachment says when the thread that reads its terminal is still waiting for a key that
-/// the terminal cannot wake it from, and the command is about to read the terminal itself.
+/// nothing can wake it from, and the command is about to read the terminal itself.
 const READER_WAITING_FOR_A_KEY: &str = "kr: the part of this command that reads the terminal's \
-     keys is still waiting for one, and this terminal cannot wake it, so the next key you press \
-     may be taken by it and lost.";
+     keys is still waiting for one and cannot be woken, so the next key you press may be taken by \
+     it and lost.";
 
 /// What an attachment says when that thread ended only after the command asked the system to cancel
 /// its read of the console, which hands the next key typed to a read that was cancelled.
