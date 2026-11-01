@@ -25,7 +25,7 @@ use kr_client::services::{
     ServiceSigner, managed_response_limits,
 };
 use kr_controller::account::{HostAccount, Service};
-use kr_controller::backup::runtime::{OPERATOR_CEILING, TOKEN_CHECK};
+use kr_controller::backup::runtime::{OPERATOR_CEILING, STORAGE_DEADLINES, TOKEN_CHECK};
 use kr_controller::backup::store::{AttemptStatus, MadeFrom, Production, Remote};
 use kr_controller::quiet::{LONGEST_DELAY, Timer};
 use kr_controller::service::{Clocks, Controller, ControllerSetup, WallClock};
@@ -6048,12 +6048,13 @@ async fn a_deadline_that_passes_while_the_bundle_write_waits_for_its_own_token_s
 /// passes, says nothing was read and owes nothing: a runner that stops for that long cuts the first
 /// look and not the second. So the look is made again, with the fault armed before each one, until
 /// the host owes a delay. A look that meets the fault and is not cut owes it, so this ends at the
-/// first look that does. The guard is shorter than the 60 seconds a request the case holds has to
-/// be answered in: after that the call goes on without the case, and what fails is another step.
+/// first look that does. The guard is shorter than the time a request the case holds has to be
+/// answered in: after that the call goes on without the case, and what fails is another step.
 async fn the_service_names_a_delay_to_a_look_at_its_storage_state(rig: &Rig, delay: Moment) {
     let quiet = rig.controller.backup_runtime().expect("a carrier").quiet();
     let mut said = None;
-    let owed = tokio::time::timeout(Duration::from_secs(50), async {
+    let guard = STORAGE_DEADLINES.read - Duration::from_secs(10);
+    let owed = tokio::time::timeout(guard, async {
         while quiet.left().is_none() {
             rig.served.web().fail(STATUS, 1, delay);
             said = Some(rig.backup_status().await.storage);
@@ -6463,7 +6464,7 @@ async fn the_storage_state_the_owner_is_told(rig: &Rig) -> BackupStorageState {
             match status.sign_in {
                 BackupSignIn::Usable => return status.storage,
                 BackupSignIn::NotRenewed => {}
-                other => panic!("the host is not signed in: {other:?}"),
+                other => panic!("the look found the sign-in {other:?}"),
             }
         }
     })
