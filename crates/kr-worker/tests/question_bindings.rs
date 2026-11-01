@@ -16,7 +16,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-11.62 | every test below but the last |
+//! | KR-REQ-11.62 | every test below but `a_helper_created_under_the_previous_helpers_identifier_within_one_second_is_refused_its_token` |
 
 use std::sync::Arc;
 
@@ -562,6 +562,11 @@ fn a_request_identifier_two_questions_of_one_instance_share_places_neither_in_a_
 /// although the backend runs outside the terminal's boundary and the root shell's tree; without the
 /// broker's word it is refused as outside the session. Where the session's own boundary cannot be
 /// read, nothing establishes it outside, and the broker's word still binds it.
+///
+/// KR-REQ-11.52 and KR-REQ-23.31, the part about a helper's identity being checked against the
+/// broker's record of the agent it belongs to: without the broker's word it is refused as outside
+/// the session, and with it the helper is bound to the instance. Not shown here: the caller token,
+/// or the four tools.
 #[cfg(unix)]
 #[test]
 fn a_helper_under_an_agent_the_broker_launched_is_bound_through_the_broker() {
@@ -650,6 +655,10 @@ fn a_helper_under_an_agent_the_broker_launched_is_bound_through_the_broker() {
 /// The broker's record of an agent that has ended, naming the identifier a live agent holds now,
 /// hides no helper under the live one: the helper is admitted to the session and bound to the
 /// live agent, whichever of the two records the broker walks first.
+///
+/// KR-REQ-11.52 and KR-REQ-23.31, the part about a helper being known by its process and start
+/// value: a record whose start value differs from the live agent's, under the same identifier,
+/// binds the helper to nothing. Not shown here: the caller token, or the four tools.
 #[cfg(unix)]
 #[test]
 fn an_ended_agents_record_hides_no_live_agent_that_holds_its_identifier() {
@@ -815,6 +824,10 @@ fn an_empty_session(root: u32) -> (Arc<kr_worker::windows::job::SessionJob>, Ses
 /// process the agent did not start is outside, and so is the helper without the broker's word. An
 /// ended agent's record naming the live agent's identifier hides nothing, whichever the broker
 /// reads first.
+///
+/// KR-REQ-11.52 and KR-REQ-23.31, the part about a helper being known by its process and start
+/// value: the helper's identifier with another start value is placed nowhere, and a process the
+/// agent did not start is outside. Not shown here: the caller token, or the four tools.
 #[cfg(windows)]
 #[test]
 fn a_helper_an_agent_started_is_bound_through_the_job_the_agent_was_started_in() {

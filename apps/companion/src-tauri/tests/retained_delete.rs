@@ -615,8 +615,8 @@ async fn a_yes_deletes_the_copy_the_host_listed_and_no_other() {
 
 /// The person says no: no token is minted and nothing is sent.
 ///
-/// KR-REQ-24.29, the part about no silent deletion: with the person's no no token is minted and
-/// every copy stays.
+/// KR-REQ-24.29, the part about no silent deletion: when the person says no, no token is minted
+/// and every copy stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_no_mints_nothing_and_deletes_nothing() {
     let rig = Rig::after_two_backups_under_privacy_mode().await;

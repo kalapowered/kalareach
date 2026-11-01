@@ -201,6 +201,15 @@ fn collection_of(origin: &str, locator: &str) -> String {
 /// same bytes served under another locator or from another origin fail authentication and bring in
 /// no writer; a kit of another seed fails too; and a writer enabled by compare and swap at the same
 /// locator is read with the same kit.
+///
+/// KR-REQ-20.15, the part about the bundle being committed before a writer is declared: enabling a
+/// writer returns only once the bundle that holds it has landed at the same locator (revision 2,
+/// write sequence 2), and a store that holds only the kit reads the writer in that bundle. Not
+/// shown here: a write that fails and declares nothing.
+///
+/// KR-REQ-20.18, the part about a bundle update that adds a trusted writer key: it uses the stable
+/// locator and a compare-and-swap, and the kit already printed reads it. Not shown here: the kit's
+/// contents.
 #[tokio::test]
 async fn a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin() {
     let Some(deployment) = Deployment::from_environment() else {

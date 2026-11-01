@@ -747,11 +747,9 @@ fn a_caller_bounded_by_a_grant_clones_makes_a_working_copy_and_removes_it_throug
     assert!(!root.join("review").exists());
 }
 
-/// KR-REQ-14.06, the part about identity being the object that was recorded and not the name it is
-/// reached by: a repository's tree removed from under the source location a caller bounded by a
-/// grant reaches it through, with nothing put in its place, is a source that changed: the record
-/// names an object and the location holds nothing at its name. Not shown here: a rename that keeps
-/// the grant, or a worktree that does not extend it.
+/// A repository's tree removed from under the source location a caller bounded by a grant reaches
+/// it through, with nothing put in its place, is a source that changed: the record names an object
+/// and the location holds nothing at its name.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_tree_removed_from_under_its_source_location_is_a_source_that_changed() {

@@ -457,6 +457,10 @@ fn open_recorded(
     .map(|(opened, _)| opened)
 }
 
+/// KR-REQ-14.06, the part about identity being the stable filesystem identity and not the path: a
+/// rename of the checkout keeps the identity that was recorded, a different repository at the old
+/// path is refused as a source that changed, and a workspace of the project is refused the same
+/// way. Not shown here: a worktree.
 #[test]
 fn a_rename_of_the_checkout_keeps_the_grant_and_a_replacement_at_its_path_does_not() {
     // Section 14 paragraph 5: identity is the stable filesystem identity, so a rename does not
@@ -525,11 +529,6 @@ fn a_rename_of_the_checkout_keeps_the_grant_and_a_replacement_at_its_path_does_n
     assert_eq!(refusal.code(), ErrorCode::SourceChanged);
 }
 
-/// KR-REQ-14.06, the part about identity being the object that was recorded and not its path: a
-/// checkout removed with nothing in its place is a source that changed, as a replacement there is,
-/// and the refusal says it is the object rather than the path; a workspace asked for from the
-/// project's own record is refused the same way. Not shown here: a rename that keeps the grant, or
-/// a worktree that does not extend it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_checkout_removed_with_nothing_in_its_place_is_a_source_that_changed() {
@@ -589,6 +588,9 @@ fn a_checkout_removed_with_nothing_in_its_place_is_a_source_that_changed() {
     assert_eq!(refusal.code(), ErrorCode::SourceChanged, "{refusal}");
 }
 
+/// KR-REQ-14.06, the part about worktrees not extending a grant: an added worktree shares the
+/// repository's Git directory and is another working tree, so a record of the first tree does not
+/// cover it and is refused as a source that changed. Not shown here: a rename.
 #[test]
 fn an_added_worktree_is_its_own_object_and_a_record_of_one_tree_never_covers_another() {
     let fixture = Fixture::create();

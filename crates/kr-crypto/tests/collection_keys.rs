@@ -113,7 +113,8 @@ fn binding(result: kr_crypto::Result<()>) -> bool {
 }
 
 /// KR-REQ-18.05, the part about a collection key reaching a member only through its own wrap: the
-/// wrap opens for its recipient, the collection and the epoch it names, and for no other.
+/// wrap opens for its recipient, the collection and the epoch it names, and for no other. Not shown
+/// here: a settings object, backups or recovery material.
 #[test]
 fn a_collection_key_wrap_opens_only_for_its_recipient_collection_and_epoch() {
     let (issuer, member, stranger) = (Device::new(), Device::new(), Device::new());
@@ -196,7 +197,8 @@ fn a_collection_key_wrap_opens_only_for_its_recipient_collection_and_epoch() {
 }
 
 /// KR-REQ-18.05, the part about a collection key reaching a member only through its own wrap: the
-/// issuer cannot open the wrap it made for a member.
+/// issuer cannot open the wrap it made for a member. Not shown here: a settings object, backups or
+/// recovery material.
 #[test]
 fn a_wrap_opened_from_its_sender_side_is_refused() {
     let (issuer, member) = (Device::new(), Device::new());
@@ -408,6 +410,9 @@ fn removing_two_members_advances_the_epoch_once() {
     assert_eq!(members.key_epoch(), SyncKeyEpoch::new(1));
 }
 
+/// KR-REQ-20.11, the part about a removal taking a rotation: at the same epoch a record may not
+/// replace a member with another, nor give an existing member another stored-envelope key, while
+/// an addition keeps the epoch and the key in use. Not shown here: the rotation itself.
 #[test]
 fn an_addition_keeps_the_epoch_and_every_member() {
     let (home, joining, another) = (Device::new(), Device::new(), Device::new());

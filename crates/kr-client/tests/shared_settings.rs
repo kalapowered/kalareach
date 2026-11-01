@@ -337,10 +337,6 @@ async fn a_refused_write_in_a_claimed_collection_keeps_the_other_devices_setting
 /// The collection moves to a newer epoch while a device still writes under the older one. The
 /// service stores nothing and keeps the refusal as the request's receipt; the client leaves the
 /// work outstanding, asks about it, and is told it never ran, which ends it with nothing kept.
-///
-/// KR-REQ-20.11, the part about a rotated collection: once the collection has moved to a newer
-/// epoch, a write under the retired epoch stores nothing and ends as never run. Not shown here: a
-/// revocation, or the removal of a wrap.
 #[tokio::test]
 async fn a_write_under_a_retired_epoch_stores_nothing_and_the_work_is_settled_as_never_run() {
     let web = Arc::new(ServiceWeb::new());
@@ -512,10 +508,6 @@ async fn a_device_given_only_the_newer_key_is_told_by_name_that_it_cannot_open_a
 /// once the collection has moved on: the object is refused by name before any key is tried, however
 /// many keys the reader holds. A member that holds the plaintext seals it again under the newer
 /// epoch, and that is read.
-///
-/// KR-REQ-20.11, the part about a device taken out of a rotated collection: it holds every key it
-/// held, and what it could seal is not believed once the collection has moved on, until a member
-/// seals it again under the newer epoch. Not shown here: that no future wrap reaches it.
 #[tokio::test]
 async fn an_object_sealed_before_the_floor_is_refused_by_name_until_a_member_seals_it_again() {
     let web = Arc::new(ServiceWeb::new());
