@@ -4117,6 +4117,68 @@ fn a_call_that_ended_and_left_something_holding_its_output_fails_and_names_the_c
     );
 }
 
+/// Run by the case below as a process of its own, with a `PATH` that holds a `systemctl` the case
+/// chose: starts a user manager of its own, giving the machine's manager two seconds to say who it
+/// is, and prints what became of it.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "run as a process of its own by a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skipped"]
+fn a_user_manager_is_started_with_the_systemctl_of_the_path_it_was_given() {
+    let tree = teardown::Tree::create();
+    let home = tree.root().join("home");
+    std::fs::create_dir_all(&home).expect("a home");
+    match user_manager::UserManager::start_within(&home, tree.holder(), Duration::from_secs(2)) {
+        Ok(_) => println!("started"),
+        Err(why) => println!("not here: {why}"),
+    }
+}
+
+/// A machine whose user service manager is not there is a machine that cannot run a service-start
+/// case, and says so. A manager that is there and does not answer is not: the start fails the case,
+/// with the call named, where a skip would pass the case without running it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skipped() {
+    if !["/usr/lib/systemd/systemd", "/lib/systemd/systemd"]
+        .iter()
+        .any(|program| Path::new(program).is_file())
+    {
+        eprintln!("this machine has no systemd, so a manager of the test's own cannot be tried");
+        return;
+    }
+    let case = "a_user_manager_is_started_with_the_systemctl_of_the_path_it_was_given";
+    let place = |directory: &Path, body: &str| {
+        let text = directory.join("systemctl.text");
+        std::fs::write(&text, format!("#!/bin/sh\n{body}\n")).expect("the stand-in");
+        kr_ipc::testing::place_program(&text, &directory.join("systemctl"));
+    };
+
+    let stalling = tempfile::tempdir().expect("a directory");
+    place(stalling.path(), "exec sleep 60");
+    let ran = this_binary_with(&["--ignored", "--exact", case], Some(stalling.path()));
+    let said = String::from_utf8_lossy(&ran.stderr);
+    assert_eq!(
+        ran.status.code(),
+        Some(101),
+        "a manager that does not answer fails the case: {said}"
+    );
+    assert!(said.contains("did not end within"), "{said}");
+
+    let absent = tempfile::tempdir().expect("a directory");
+    place(absent.path(), "echo 'Failed to connect to bus' >&2; exit 1");
+    let ran = this_binary_with(&["--ignored", "--exact", case], Some(absent.path()));
+    let printed = String::from_utf8_lossy(&ran.stdout);
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        printed.contains("not here: no user manager answers"),
+        "a manager that says it is not there reads as a machine that cannot run the case: {printed}"
+    );
+}
+
 /// The bounds the case below gives a run of `kr`, each below the twenty seconds a run of `kr`
 /// that is waiting for a program that does not answer gives up in by itself, so that no bound is
 /// one the run ends before.

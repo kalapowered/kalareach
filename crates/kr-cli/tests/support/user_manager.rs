@@ -231,8 +231,25 @@ pub struct UserManager {
 
 #[cfg(target_os = "linux")]
 impl UserManager {
-    /// Starts a manager whose home is `home`, or says why none can be started here.
+    /// Starts a manager whose home is `home`, or says why this machine has no user service manager
+    /// to start one in. Any other failure fails the case.
     pub fn start(home: &Path, holder: crate::teardown::Holder) -> Result<Self, String> {
+        Self::start_within(home, holder, TEARDOWN_BOUND)
+    }
+
+    /// [`UserManager::start`], giving the question that asks the machine's own manager who it is
+    /// `probe_bound` to be answered in, the wait for the turn to start a process included.
+    ///
+    /// Only a machine with no user service manager is a reason not to test: no systemd to run one
+    /// with, no `systemctl`, or a manager of its own that says it is not there. A call that did not
+    /// end, a manager that did not come up and every other failure of the start fail the case, with
+    /// what happened, where an error returned would read as a machine that cannot run the test and
+    /// pass the case without running it.
+    pub fn start_within(
+        home: &Path,
+        holder: crate::teardown::Holder,
+        probe_bound: Duration,
+    ) -> Result<Self, String> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let program = ["/usr/lib/systemd/systemd", "/lib/systemd/systemd"]
@@ -240,9 +257,17 @@ impl UserManager {
             .map(PathBuf::from)
             .find(|candidate| candidate.is_file())
             .ok_or("this host has no systemd to run a user manager with")?;
+        let present = std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path).any(|directory| directory.join("systemctl").is_file())
+        });
+        if !present {
+            return Err("this host has no systemctl to ask a user manager anything with".into());
+        }
         let mut asked = Command::new("systemctl");
         asked.args(["--user", "show", "--property=Version", "--value"]);
-        let answered = bounded(asked, STREAMS_DEADLINE)?;
+        let answered = bounded(asked, probe_bound).unwrap_or_else(|why| {
+            panic!("the machine's own user service manager was asked who it is: {why}")
+        });
         if !answered.status.success() {
             return Err(format!(
                 "no user manager answers for whoever runs these tests, so there is no scope to run \
@@ -251,20 +276,19 @@ impl UserManager {
             ));
         }
         let units = home.join(".config/systemd/user");
-        std::fs::create_dir_all(&units).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&units).expect("a directory for the manager's units");
         std::fs::write(
             units.join("kr-test-idle.target"),
             "[Unit]\nDescription=Nothing, so that this manager starts only what a test asks for\n\
              DefaultDependencies=no\n",
         )
-        .map_err(|error| error.to_string())?;
+        .expect("the idle target");
         let runtime =
             std::env::temp_dir().join(format!("krm-{}", &kr_ipc::new_uuid().to_string()[..8]));
-        std::fs::create_dir(&runtime).map_err(|error| error.to_string())?;
+        std::fs::create_dir(&runtime).expect("the manager's runtime directory");
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
-            .map_err(|error| error.to_string())?;
-        let log = std::fs::File::create(runtime.join("manager.log"))
-            .map_err(|error| error.to_string())?;
+            .expect("a private runtime directory");
+        let log = std::fs::File::create(runtime.join("manager.log")).expect("the manager's log");
         let scope = format!("kr-test-manager-{}.scope", kr_ipc::new_uuid());
         let process = spawning(|| {
             let mut command = Command::new("systemd-run");
@@ -287,7 +311,7 @@ impl UserManager {
                 .stderr(log)
                 .spawn()
         })
-        .map_err(|error| format!("systemd-run could not be started: {error}"))?;
+        .unwrap_or_else(|error| panic!("systemd-run could not be started: {error}"));
         let mut manager = Self {
             scope,
             process: Some(process),
@@ -299,7 +323,9 @@ impl UserManager {
             let mut asked = manager.systemctl(&["show", "--property=Version", "--value"]);
             asked.env_remove("DBUS_SESSION_BUS_ADDRESS");
             if bounded(asked, STREAMS_DEADLINE).is_ok_and(|answer| answer.status.success()) {
-                manager.keep_its_units_on_it()?;
+                manager
+                    .keep_its_units_on_it()
+                    .unwrap_or_else(|why| panic!("{why}"));
                 return Ok(manager);
             }
             let ended = manager
@@ -307,11 +333,11 @@ impl UserManager {
                 .as_mut()
                 .is_some_and(|process| matches!(process.try_wait(), Ok(Some(_))));
             if ended || begun.elapsed() > COMES_UP {
-                return Err(format!(
+                panic!(
                     "the test's user manager did not come up: {}",
                     std::fs::read_to_string(manager.runtime.join("manager.log"))
                         .unwrap_or_default()
-                ));
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -331,7 +357,7 @@ impl UserManager {
     fn keep_its_units_on_it(&self) -> Result<(), String> {
         let mut set = self.systemctl(&["set-environment"]);
         set.arg(format!("XDG_RUNTIME_DIR={}", self.runtime.display()));
-        let set = bounded(set, STREAMS_DEADLINE)?;
+        let set = bounded(set, TEARDOWN_BOUND)?;
         if set.status.success() {
             Ok(())
         } else {
