@@ -585,6 +585,27 @@ impl Rig {
         .await;
     }
 
+    /// Waits until the doctor's check of the producer says `words`, and returns what it said. The
+    /// count of the producer's looks says that a look ended and not which: one that was under way
+    /// when the count was read ends with the state it began with.
+    async fn production_says(&self, words: &str) -> (DoctorStatus, String) {
+        let mut said = None;
+        let found = tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                let (status, detail) = self.production_check().await;
+                if detail.contains(words) {
+                    return (status, detail);
+                }
+                said = Some(detail);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        found.unwrap_or_else(|_| {
+            panic!("gave up waiting for the producer to say {words:?}; the last said {said:?}")
+        })
+    }
+
     /// Turns privacy mode on and waits until the daemon has ended the work it had in hand, which is
     /// what a fence owes. It is a point of the daemon's own order to decide after: whatever it did
     /// about work that arrived before the fence has been done by then.
@@ -4022,13 +4043,13 @@ async fn a_session_packed_while_held_back_is_not_packed_again_when_its_journal_h
     let looked = *rig.controller.production_looks().borrow();
     rig.controller.backup().signals().produce.notify_one();
     rig.production_looked(looked + 1).await;
+    let (_, detail) = rig.production_says("nothing has changed").await;
+    assert!(detail.contains("nothing has changed"), "{detail}");
     assert_eq!(
         rig.controller.backup().generations().expect("a read").len(),
         1,
         "the closure-only summary packed is the one the journal gives, so nothing is made again"
     );
-    let (_, detail) = rig.production_check().await;
-    assert!(detail.contains("nothing has changed"), "{detail}");
 }
 
 /// KR-REQ-24.18: a session whose journal is of an earlier schema and whose migration fails is packed
@@ -4433,7 +4454,7 @@ async fn no_generation_is_staged_while_a_finished_ones_ciphertext_is_still_on_th
     let looked = *rig.controller.production_looks().borrow();
     rig.controller.backup().signals().produce.notify_one();
     rig.production_looked(looked + 1).await;
-    let (status, detail) = rig.production_check().await;
+    let (status, detail) = rig.production_says("still on this host's disk").await;
     assert_eq!(status, DoctorStatus::Warning);
     assert!(detail.contains("still on this host's disk"), "{detail}");
     assert_eq!(walk(&staging), staged, "nothing new was staged");
@@ -4644,14 +4665,14 @@ async fn a_session_that_cannot_be_read_makes_no_generation_each_day_and_is_tried
         let looked = *rig.controller.production_looks().borrow();
         rig.controller.backup().signals().produce.notify_one();
         rig.production_looked(looked + 1).await;
+        let (_, detail) = rig.production_says("nothing has changed").await;
+        assert!(detail.contains("nothing has changed"), "{detail}");
+        assert!(detail.contains("could not be read"), "{detail}");
         assert_eq!(
             rig.controller.backup().generations().expect("a read").len(),
             1,
             "a spool that stays unreadable makes no generation"
         );
-        let (_, detail) = rig.production_check().await;
-        assert!(detail.contains("nothing has changed"), "{detail}");
-        assert!(detail.contains("could not be read"), "{detail}");
     }
 
     // The spool reads again: the next day's look finds it and makes the generation.
@@ -5514,7 +5535,7 @@ async fn a_try_that_found_a_session_readable_is_made_again_when_the_pass_stops_a
         let looked = *rig.controller.production_looks().borrow();
         rig.controller.backup().signals().produce.notify_one();
         rig.production_looked(looked + 1).await;
-        let (_, detail) = rig.production_check().await;
+        let (_, detail) = rig.production_says("too little room").await;
         assert!(
             detail.contains("too little room"),
             "look {look} the same day: {detail}"
