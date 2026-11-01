@@ -483,7 +483,7 @@ already running: a session keeps the package identity it started with until it e
 of a macOS or Linux release tree runs the contract suites of the Zsh, Bash and Fish packages it
 built before the tree is assembled; the core workflow runs the whole corpus on x86-64 Linux. A
 Windows release tree carries the PowerShell package as plain files that `kr-release` holds to the
-repository's, and no step of its workflow requalifies it. No release workflow reads the core
+repository's, and no step of its workflow requalifies it. No macOS or Linux release tree carries the PowerShell package, and no Windows host release is published, so no published release carries it. No release workflow reads the core
 workflow's result for the commit it builds.
 
 A package whose fourteen days pass with no published release that carries a requalified build is flagged in the register, a row of
