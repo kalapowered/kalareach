@@ -910,11 +910,12 @@ mod tests {
         assert_eq!(process_class(), Some(before), "and the class is left");
     }
 
-    /// The class is read from the thread that asks, and the thread that loads the model exists
-    /// before the process's class is lowered. On the Windows build this was tried on (Windows
-    /// Server 2025, build 26100), a thread that was already running when the process's class was
-    /// lowered reads the lowered value for itself, so the read-back taken on that thread says the
-    /// process's. The class is put back for the thread as well as the process.
+    /// KR-REQ-22.11: the background I/O class of a Windows process reaches the thread that loads
+    /// the model. The class is read from the thread that asks, and the thread that loads the model
+    /// exists before the process's class is lowered. On the Windows build this was tried on
+    /// (Windows Server 2025, build 26100), a thread that was already running when the process's
+    /// class was lowered reads the lowered value for itself, so the read-back taken on that thread
+    /// says the process's. The class is put back for the thread as well as the process.
     #[cfg(windows)]
     #[test]
     fn the_io_class_a_windows_thread_reads_is_its_own_and_follows_the_process() {
@@ -971,10 +972,12 @@ mod tests {
         assert_eq!(thread_after, None, "for the thread as well");
     }
 
-    /// The thread's own value is part of the class apart from the process's: with the process's
-    /// I/O priority lowered and the calling thread's set back to normal, the process reads very low
-    /// and the thread reads normal, and the class is not applied to the thread that loads the
-    /// model, because either one left at the normal priority is a path the weights can be read by.
+    /// KR-REQ-22.11: the background I/O class of a Windows process is read as held only when the
+    /// thread that loads the model reads it too. The thread's own value is part of the
+    /// class apart from the process's: with the process's I/O priority lowered and the calling
+    /// thread's set back to normal, the process reads very low and the thread reads normal, and the
+    /// class is not applied to the thread that loads the model, because either one left at the
+    /// normal priority is a path the weights can be read by.
     #[cfg(windows)]
     #[test]
     fn a_thread_set_back_to_normal_is_not_in_the_class_though_its_process_is() {
