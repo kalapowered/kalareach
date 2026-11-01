@@ -7608,6 +7608,132 @@ async fn a_launch_reserved_before_the_hosts_answer_is_revoked_and_refused() {
     wired.close().await;
 }
 
+/// KR-REQ-08.48: the host's answer to the application bypasses the root editor's hold on the
+/// person's keys and the recognition of the paste among them, and still waits for a paste that is
+/// open.
+///
+/// Bracketed paste is on, so what the person types is framed, and a launch is reserved, so the
+/// root editor holds it: a paste begun and not ended. The application asks while the paste is
+/// open, and the lane keeps the answer back rather than put it inside what the person is typing.
+/// When the paste ends the answer goes to the terminal first, as a write of its own that belongs to
+/// no lease, and the paste the editor held follows it whole. An answer framed as the person's input
+/// would belong to a lease, and one held behind the keys would be written after the paste.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosts_answer_goes_ahead_of_the_keys_the_root_editor_holds_and_apart_from_the_paste() {
+    const ANSWER: &[u8] = b"\x1b[?62;22c";
+    const PASTE: &[u8] = b"\x1b[200~pasted";
+    const PASTE_END: &[u8] = b"\x1b[201~";
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let holder = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+    // The application turns bracketed paste on, which is when the person's input is framed.
+    wired.runtime.session().ingest_output(b"\x1b[?2004h");
+    let target = wired.target();
+    let session_id = wired.session_id;
+    let prompt = fence.prompt_generation;
+    let calling = tokio::spawn(async move {
+        client
+            .mutate(
+                Method::ShellLaunch,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &ShellLaunchParams {
+                    session_id,
+                    command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
+                    expected_prompt_generation: prompt,
+                    expected_buffer_revision: EditorBufferRevision::new(1),
+                },
+            )
+            .await
+    });
+    loop {
+        match wired.next().await {
+            ToBridge::Request { request, .. } if matches!(*request, WorkerRequest::Launch(_)) => {
+                break;
+            }
+            _ => continue,
+        }
+    }
+    let state = |wired: &Wired| wired.runtime.session().fence().expect("a driver").state();
+    assert_eq!(state(&wired), FenceState::LaunchReserved);
+    let written_before = wired.runtime.input().terminal_writes().len();
+
+    // The person begins a paste. The framer sees it open, and the editor holds it.
+    type_keys(&wired, holder, 0, PASTE);
+    assert!(
+        wired.runtime.session().input().lock().paste_open(),
+        "the person's paste is recognised as open"
+    );
+    // The application asks while it is. Its answer is kept back, so it is not queued for the
+    // terminal and cannot land inside the paste.
+    wired.runtime.session().ingest_output(b"\x1b[c");
+    wired.runtime.flush_input();
+    assert_eq!(
+        wired
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .host_reply_bytes(),
+        0,
+        "the answer waits for the paste to end"
+    );
+    assert_eq!(
+        state(&wired),
+        FenceState::LaunchReserved,
+        "the editor still holds the paste"
+    );
+    assert_eq!(
+        wired.runtime.input().terminal_writes().len(),
+        written_before,
+        "neither the held paste nor the answer has reached the terminal"
+    );
+
+    // The paste ends. That opens the gate, and the answer is written while the editor still held
+    // the paste it ends.
+    type_keys(&wired, holder, 1, PASTE_END);
+    let all = [PASTE, PASTE_END].concat();
+    let written = || -> Vec<kr_worker::testing::TerminalWrite> {
+        wired.runtime.input().terminal_writes()[written_before..].to_vec()
+    };
+    tokio::time::timeout(SOON, async {
+        while written()
+            .iter()
+            .filter(|write| write.of_a_lease)
+            .flat_map(|write| write.bytes.clone())
+            .collect::<Vec<u8>>()
+            != all
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the held paste reached the terminal once the answer was written");
+    let writes = written();
+    let ahead = writes.iter().take_while(|write| !write.of_a_lease).count();
+    assert_eq!(
+        writes[..ahead]
+            .iter()
+            .flat_map(|write| write.bytes.clone())
+            .collect::<Vec<u8>>(),
+        ANSWER,
+        "the answer is the first thing the terminal is given, and it belongs to no lease: {writes:?}"
+    );
+    assert!(
+        writes[ahead..].iter().all(|write| write.of_a_lease),
+        "the paste follows the answer whole, with nothing of the host's inside it: {writes:?}"
+    );
+    assert!(
+        !wired.runtime.session().input().lock().paste_open(),
+        "the paste ended"
+    );
+    calling.abort();
+    wired.close().await;
+}
+
 /// KR-PERF-002, KR-REQ-08.49: the client whose keys a launch held is told the editor was busy once
 /// the host's answer to the application releases them, and the keys reach the terminal first.
 ///

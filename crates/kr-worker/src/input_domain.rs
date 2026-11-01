@@ -1723,6 +1723,36 @@ mod tests {
         );
     }
 
+    /// KR-REQ-08.48: a reply bypasses the paste recogniser. Bytes of a reply that the recogniser
+    /// would read as the start of a bracketed paste, or hold back as the first bytes of one, open no
+    /// paste and are not held: the reply is queued whole, as the host's own, and the gate the next
+    /// reply waits on stays open. No reply the broker builds carries such bytes today; one that
+    /// echoed what the application sent would, and the application must not be able to open a paste
+    /// in the person's framing through it.
+    #[test]
+    fn a_reply_that_reads_as_the_start_of_a_paste_opens_none_and_is_not_held() {
+        for text in [&b"\x1b[200~inside"[..], b"\x1b[20", b"ok\x1b[200", b"\x1b"] {
+            let mut input = domain();
+            let _ = input.set_bracketed_paste(true);
+
+            let _ = input.queue_replies(vec![crate::projection::LaneReply {
+                bytes: text.to_vec(),
+                expires_at_ms: None,
+            }]);
+
+            assert!(!input.paste_open(), "{text:?} opened a paste");
+            assert!(
+                input.lane_gate().allows_write(),
+                "{text:?} is held in the recogniser as the start of a frame"
+            );
+            assert_eq!(
+                input.take_pending(),
+                vec![batch(text)],
+                "{text:?} is queued whole and as the host's own"
+            );
+        }
+    }
+
     fn editor_busy(attachment_id: AttachmentId) -> Step {
         Step::EditorBusy(Box::new(kr_protocol::root::EditorBusyEvent {
             session_id: SessionId::new(kr_ipc::new_uuid()),
