@@ -171,8 +171,8 @@ fn a_load_the_process_does_not_hold_is_refused() {
     ));
 }
 
-/// KR-REQ-22.11: a cancellation reaches a load and a job while they run, and each answers that it
-/// was cancelled; the control is the same work left alone, which finishes.
+/// KR-REQ-22.11: a cancellation reaches a load and a job once the model thread has begun them, and
+/// each answers that it was cancelled; the control is the same work left alone, which finishes.
 #[test]
 fn a_cancellation_reaches_a_load_and_a_job_while_they_run() {
     let placed = Placed::stub();
@@ -180,15 +180,13 @@ fn a_cancellation_reaches_a_load_and_a_job_while_they_run() {
     let runtime = placed.directory("loading");
     let script = Script {
         load_until_cancelled: true,
+        mark_work: true,
         ..Script::default()
     };
     let mut process = Process::start(&placed, &script, &runtime);
     process.hello();
     process.send(&load(1, &default_profile(), 300_000));
-    assert!(
-        process.answer(Duration::from_millis(300)).is_none(),
-        "the load is still running"
-    );
+    wait_until_began(&runtime, "load");
     process.send(&Request::Cancel { id: U64::new(1) });
     assert!(matches!(
         process.expect_terminal(SOON, "the cancelled load"),
@@ -198,6 +196,7 @@ fn a_cancellation_reaches_a_load_and_a_job_while_they_run() {
     let runtime = placed.directory("decoding");
     let script = Script {
         generate_until_cancelled: true,
+        mark_work: true,
         ..Script::default()
     };
     let mut process = Process::start(&placed, &script, &runtime);
@@ -205,10 +204,7 @@ fn a_cancellation_reaches_a_load_and_a_job_while_they_run() {
     process.send(&load(1, &default_profile(), 300_000));
     process.expect_answer(SOON, "the load");
     process.send(&generate(2, 1, 30_000));
-    assert!(
-        process.answer(Duration::from_millis(300)).is_none(),
-        "the job is still running"
-    );
+    wait_until_began(&runtime, "job");
     process.send(&Request::Cancel { id: U64::new(2) });
     assert!(matches!(
         process.expect_terminal(SOON, "the cancelled job"),

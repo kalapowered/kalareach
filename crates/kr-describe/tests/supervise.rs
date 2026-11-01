@@ -1431,13 +1431,14 @@ fn a_load_whose_file_is_not_the_profiles_ends_as_assets_and_is_no_failure() {
     }
 }
 
-/// KR-REQ-22.11: a cancellation reaches the process during a load and during a decode, and each
-/// ends as cancelled with the process still running. The control is the same work left alone, which
-/// finishes.
+/// KR-REQ-22.11: a cancellation reaches the process during a load and during a decode, once the
+/// model thread has begun each, and each ends as cancelled with the process still running. The
+/// control is the same work left alone, which finishes.
 #[test]
 fn a_cancellation_reaches_the_process_during_a_load_and_a_decode() {
     let mut rig = Rig::new(&Script {
         load_until_cancelled: true,
+        mark_work: true,
         ..Script::default()
     });
     queue(rig.service(), &session(1), Priority::Ordinary, at(0));
@@ -1451,6 +1452,10 @@ fn a_cancellation_reaches_the_process_during_a_load_and_a_decode() {
     // the cancellation rather than the start of a process.
     rig.until(&roomy(), at(3_050), "the handshake", |_, driver| {
         driver.background().is_some()
+    });
+    let runtime = rig.placed.directory("runtime");
+    rig.until(&roomy(), at(3_050), "the load begins", |_, _| {
+        stub::began(&runtime, "load")
     });
     rig.service().set_enabled(false);
     let reports = rig.until(&roomy(), at(3_100), "the cancelled load", |reports, _| {
@@ -1473,10 +1478,15 @@ fn a_cancellation_reaches_the_process_during_a_load_and_a_decode() {
 
     let mut rig = Rig::new(&Script {
         generate_until_cancelled: true,
+        mark_work: true,
         ..Script::default()
     });
     queue(rig.service(), &session(1), Priority::Ordinary, at(0));
     rig.job_sent(at(3_000));
+    let runtime = rig.placed.directory("runtime");
+    rig.until(&roomy(), at(3_000), "the job begins", |_, _| {
+        stub::began(&runtime, "job")
+    });
     let pid = rig.driver.pid();
     assert!(rig.driver.service().cancel_running(&session(1)));
     let reports = rig.until(&roomy(), at(3_100), "the cancelled job", |reports, _| {
