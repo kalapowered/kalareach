@@ -1690,6 +1690,10 @@ fn a_load_over_thirty_seconds_is_followed_by_a_published_job() {
         !the_process_ended(&reports),
         "a long load is not a job past its deadline"
     );
+    // The job's timers run from the reading it was sent at: the next is the sample a second after
+    // it, ahead of the job's own deadline and grace. A state of the driver, read before any turn
+    // that could take the answer.
+    assert_eq!(rig.driver.due_ms(), Some(loaded_at + SAMPLE_MS));
     let reports = rig.until(
         &roomy(),
         at(loaded_at + 500),

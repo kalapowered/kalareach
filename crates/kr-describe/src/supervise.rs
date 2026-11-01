@@ -889,12 +889,12 @@ impl Driver {
     }
 
     /// Whether the operating system refused the process memory since it was last asked, and
-    /// forgets it. The daemon asks at the next thing it handles of the process: an end that shows
-    /// as the process closing its end or its frames coming short, or the answer to a load or a job
-    /// in hand. It takes a refusal for the cause of that end, or of an answer that says the work
-    /// failed. An answer that does not say so clears the refusal and takes it for the cause of
-    /// nothing, and a later end is not put down to it. Any other end, and the answer to a check of
-    /// a file, do not ask.
+    /// forgets it. The daemon asks at the next thing it handles of the process: an end it reads as
+    /// `ProcessEnd::Exited` or `ProcessEnd::BrokenWire`, or the answer to a load or a job in hand.
+    /// It takes a refusal for the cause of that end, or of an answer that says the work failed. An
+    /// answer that does not say so clears the refusal and takes it for the cause of nothing, and a
+    /// later end is not put down to it. Any other end, and the answer to a check of a file, do not
+    /// ask.
     fn the_system_refused_memory(&self) -> bool {
         // Asked of the test's record as well as the system's, so that both are forgotten.
         #[cfg(feature = "testing")]
