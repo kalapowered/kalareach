@@ -1534,6 +1534,242 @@ async fn kr_req_26_43_an_answer_a_channel_could_not_write_is_counted_though_its_
     );
 }
 
+/// The verdict this host writes on a channel for one approval, as the application reads it.
+fn verdict(request_id: &str, behavior: &str) -> serde_json::Value {
+    serde_json::json!({
+        "method": "notifications/claude/channel/permission",
+        "params": { "behavior": behavior, "request_id": request_id },
+    })
+}
+
+/// Relays one approval on `channel` and waits until the binding has interpreted it.
+async fn interpreted(
+    broker: &Arc<Broker>,
+    channel: &mut Channel,
+    request_id: &str,
+) -> PendingResource {
+    channel.relay(request_id).await;
+    eventually("the approval is interpreted", || {
+        relayed(broker, 2, request_id).is_some_and(|resource| resource.interpretation_verified)
+    })
+    .await;
+    relayed(broker, 2, request_id).expect("recorded")
+}
+
+/// What a caller does with an admission it was given: writes its marker, hands the verdict to the
+/// channel and waits to be told it was written. An answer that was refused is the refusal.
+async fn carried(
+    broker: &Broker,
+    admitted: Result<
+        kr_worker::broker::methods::MutationAdmission,
+        kr_worker::broker::error::BrokerError,
+    >,
+    now: u64,
+) -> Result<(), kr_worker::broker::error::BrokerError> {
+    let admitted = admitted?;
+    broker
+        .record_approval(&admitted, TimestampMs::new(now))?
+        .settled(TimestampMs::new(now))
+        .await
+        .map(|_| ())
+}
+
+/// KR-REQ-12.18 and KR-REQ-27.05, approval races: answers to one approval that a channel relayed
+/// carry one verdict to the application, whichever answer takes it, and every other answer is
+/// refused as an approval that has been answered, before any byte of it goes.
+///
+/// Three approvals meet three kinds of race. A second answer that reaches the resource while the
+/// first holds it, before the first has written its marker; a second that reaches it after the
+/// marker, with the first's verdict not yet written; and eight at once from several tasks, which
+/// two or more can reach at the same moment. The application's end of the channel is read last, and
+/// it holds one verdict for each approval, the winner's, and no other. The channel is the route a
+/// shipped package's approvals take: the dispatch is `ChannelDispatch`, and the admission, the
+/// claim and the marker are the broker's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_answers_racing_for_one_relayed_approval_carry_one_verdict_and_refuse_the_rest()
+ {
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::laid_out();
+    package.bind(&broker, 2);
+    let mut channel = Channel::open(
+        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+
+    // A second answer while the first holds the resource and has written no marker. Whatever is
+    // admitted goes on, as a caller carries it, so what the application reads is the truth of it.
+    let first = interpreted(&broker, &mut channel, "aaaaa").await;
+    let held = broker
+        .admit_approval(&caller(), &respond(2, &first, "allow"), TimestampMs::new(5))
+        .expect("the first answer is admitted");
+    let reserved =
+        broker.admit_approval(&caller(), &respond(2, &first, "deny"), TimestampMs::new(6));
+    broker
+        .record_approval(&held, TimestampMs::new(7))
+        .expect("the first answer's marker is written and its verdict goes")
+        .settled(TimestampMs::new(7))
+        .await
+        .expect("the first verdict is written");
+    let reserved = carried(&broker, reserved, 8).await;
+
+    // A second answer after the marker, while the first's verdict is on its way.
+    let second = interpreted(&broker, &mut channel, "bbbbb").await;
+    let held = broker
+        .admit_approval(&caller(), &respond(2, &second, "deny"), TimestampMs::new(9))
+        .expect("the first answer is admitted");
+    let marked = broker
+        .mark_approval(&held, TimestampMs::new(10))
+        .expect("the first answer's marker is written");
+    let marker_written = broker.admit_approval(
+        &caller(),
+        &respond(2, &second, "allow"),
+        TimestampMs::new(11),
+    );
+    let (dispatch, request) = marked.transmission();
+    let pending = dispatch
+        .submit(&request)
+        .expect("the channel's writer takes the verdict");
+    marked
+        .submitted(pending)
+        .settled(TimestampMs::new(12))
+        .await
+        .expect("the first verdict is written");
+    let marker_written = carried(&broker, marker_written, 13).await;
+
+    // Eight answers at once, half of them one decision and half the other.
+    let third = interpreted(&broker, &mut channel, "ccccc").await;
+    let answering: Vec<_> = (0..8_u8)
+        .map(|index| {
+            let broker = Arc::clone(&broker);
+            let decision = if index % 2 == 0 { "allow" } else { "deny" };
+            let params = respond(2, &third, decision);
+            tokio::spawn(async move {
+                broker
+                    .agent_approval_respond(&caller(), &params, TimestampMs::new(14))
+                    .await
+                    .map(|_| decision)
+            })
+        })
+        .collect();
+    let mut outcomes = Vec::new();
+    for task in answering {
+        outcomes.push(task.await.expect("the answer's task joins"));
+    }
+
+    // What the application read, which is what matters most: one verdict for each approval.
+    channel.close().await;
+    let mut written = Vec::new();
+    while let Some(frame) = channel.next().await {
+        written.push(frame);
+    }
+    assert_eq!(
+        written.len(),
+        3,
+        "the application read one verdict for each approval, and no second one for any: {written:?}"
+    );
+    let winners: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().ok().copied())
+        .collect();
+    assert_eq!(
+        winners.len(),
+        1,
+        "one of eight simultaneous answers is carried: {outcomes:?}"
+    );
+    assert_eq!(
+        written,
+        vec![
+            verdict("aaaaa", "allow"),
+            verdict("bbbbb", "deny"),
+            verdict("ccccc", winners[0]),
+        ],
+        "the application read one verdict for each approval, the winner's, and no other"
+    );
+    for refusal in [&reserved, &marker_written]
+        .into_iter()
+        .map(|late| {
+            late.as_ref()
+                .expect_err("an answer that came second is refused")
+        })
+        .chain(outcomes.iter().filter_map(|outcome| outcome.as_ref().err()))
+    {
+        assert_eq!(
+            refusal.code(),
+            ErrorCode::QuestionResolved,
+            "an answer that lost the race is refused as an answered approval: {refusal}"
+        );
+    }
+    assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
+    for resource in [&first, &second, &third] {
+        assert_eq!(
+            settled_as(&broker, resource.resource_id),
+            Some(PendingState::Resolved)
+        );
+    }
+}
+
+/// KR-REQ-12.18 and KR-REQ-27.05, upstream disconnect after dispatch: the application goes after
+/// the marker is written and before the channel has taken the whole verdict (it holds 64 bytes
+/// unread, so only the first bytes of a verdict are in it). The answer is not applied, the approval
+/// stays uncertain rather than answerable, a further answer is refused as an answered approval, the
+/// failed transmission is counted once against the application's adapter, and nothing is written
+/// to the channel for the further answer.
+#[tokio::test]
+async fn kr_req_12_18_an_application_that_goes_after_the_marker_leaves_the_approval_uncertain() {
+    let broker = memory_broker();
+    let (_package, channel, resource) = channel_nobody_reads(&broker).await;
+    let admitted = broker
+        .admit_approval(
+            &caller(),
+            &respond(2, &resource, "allow"),
+            TimestampMs::new(5),
+        )
+        .expect("the answer is admitted");
+    let marked = broker
+        .mark_approval(&admitted, TimestampMs::new(5))
+        .expect("the answer's marker is written");
+    let (dispatch, request) = marked.transmission();
+    let pending = dispatch
+        .submit(&request)
+        .expect("the channel's writer takes the answer");
+    // The application goes: it has read none of the verdict, and its end of the connection closes.
+    drop(channel);
+    let outcome = marked.submitted(pending).settled(TimestampMs::new(6)).await;
+    assert!(
+        outcome.is_err(),
+        "a verdict the application did not read is not an applied one: {outcome:?}"
+    );
+    assert_eq!(
+        settled_as(&broker, resource.resource_id),
+        Some(PendingState::Uncertain),
+        "the marker is written and nothing says whether the verdict arrived"
+    );
+    let again = broker
+        .agent_approval_respond(
+            &caller(),
+            &respond(2, &resource, "deny"),
+            TimestampMs::new(7),
+        )
+        .await
+        .expect_err("an answer that may have gone is not answered a second time");
+    assert_eq!(again.code(), ErrorCode::QuestionResolved, "{again}");
+    eventually("the failed transmission is counted", || {
+        !adapter_failures(&broker).is_empty()
+    })
+    .await;
+    assert_eq!(
+        adapter_failures(&broker),
+        vec![(
+            kr_protocol::metrics::Adapter::ClaudeCode,
+            kr_protocol::metrics::MetricOutcome::Unavailable,
+            1
+        )],
+        "and it is one failure of the application's adapter"
+    );
+}
+
 /// KR-REQ-12.18: only a binding of exactly the package whose table the channel reads gives what it
 /// relays a meaning. A binding of the same identifier at other bytes interprets nothing, and a
 /// binding of the package itself does.
