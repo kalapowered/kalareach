@@ -194,6 +194,10 @@ jobs:
           # The checks that mount a user-space filesystem stand down with a printed reason where
           # this account cannot place one. Here a mount that cannot be placed fails them.
           KR_REQUIRE_FUSE: "1"
+          # The checks that start a daemon through the user's service manager stand down with a
+          # printed reason where there is none to start one in, and pass. Here a runner without
+          # one fails them.
+          KR_REQUIRE_SERVICE_MANAGER: "1"
         run: cargo test --locked --workspace
 
       # Documentation is built with warnings refused, so a link that resolves to nothing, or to an

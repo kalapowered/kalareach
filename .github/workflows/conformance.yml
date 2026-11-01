@@ -53,6 +53,10 @@ jobs:
       # The plugin runtime's tests run real components, which the step below builds; a component
       # that is not there is a failure here rather than a skip.
       KR_REQUIRE_PLUGIN_FIXTURES: "1"
+      # The checks that start a daemon through the user's service manager stand down with a
+      # printed reason where there is none, and the report would read that as a pass. Here a runner
+      # without one fails them.
+      KR_REQUIRE_SERVICE_MANAGER: "1"
       # The evidence directory: inside the platform's temporary directory, new for the run.
       KR_TEST_ARTIFACTS_DIR: /tmp/kr-conformance-evidence
     steps:
