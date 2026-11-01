@@ -582,7 +582,8 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 /// These cases make desktops on the window station the test runs on, give them security of their
-/// own, and ask what the starter makes of each against the security of the desktop the test runs on.
+/// own, and ask what the starter makes of each against a reference desktop they make, whose list is
+/// that of the desktop the test runs on with two entries added.
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -705,8 +706,8 @@ mod tests {
         Desktop(handle)
     }
 
-    /// What the starter makes of `target` as a desktop to use, given the desktop this thread runs
-    /// on as its own.
+    /// What the starter makes of `target` as a desktop to use, given the reference desktop as its
+    /// own.
     fn judged(target: &Desktop) -> io::Result<()> {
         own().require_no_more_on(target.0)
     }

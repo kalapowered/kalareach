@@ -31,7 +31,7 @@
 //! the system counts them. A text that holds a condition, a double quote or a parenthesis inside
 //! an entry, is read only when the starter's own list and the object's hold the same entries byte
 //! for byte, which is what the text is not: the grammar has no form for a double quote inside a
-//! string, and Windows 11 writes one as it is, so a string ends early, and one text can stand for
+//! string, and Windows Server 2025 writes one as it is, so a string ends early, and one text can stand for
 //! two lists. Nothing else keeps the reading from losing the entries up to the next quote, and a
 //! count alone does not: false entries can stand in for the hidden ones.
 //!
@@ -162,10 +162,10 @@ pub(super) fn require_no_more(own: &Texts<'_>, found: &Texts<'_>) -> Result<(), 
 }
 
 /// Whether the text of an access list holds a condition: a double quote, or a parenthesis inside
-/// an entry. Every conditional entry holds both a parenthesis of its own inside the entry's, and
-/// the entries of a list that holds neither are told apart by their parentheses alone. A string of
-/// a condition can end early at a double quote the grammar has no form for, so the entries around
-/// a condition cannot be told apart from it.
+/// an entry. Every conditional entry holds a parenthesis of its own inside the entry's, and the
+/// entries of a list that holds neither are told apart by their parentheses alone. A string of a
+/// condition can end early at a double quote the grammar has no form for, so the entries around a
+/// condition cannot be told apart from it.
 fn holds_a_condition(text: &str) -> bool {
     let mut depth = 0_u32;
     for character in text.chars() {
@@ -363,9 +363,9 @@ fn label(text: &str) -> Result<Label, String> {
 /// further denying entries admit less. A denying entry whose trustee has none left, while an
 /// allowing entry remains, an allowing entry for a trustee the starter's own allows nothing, and a
 /// null or absent list where there were entries admit more. Every other difference, an entry with
-/// other rights, one more or less often, a denying entry gone with no allowing entry left to grant
-/// what it took away, entries in another order that the system may evaluate differently, is not
-/// shown to admit more and is refused as not accepted.
+/// other rights, one more or less often, a denying entry gone with no allowing entry left, entries
+/// in another order that the system may evaluate differently, is not shown to admit more and is
+/// refused as not accepted.
 fn access_list_refusal(own: &AccessList, found: &AccessList) -> Option<Refusal> {
     match (own, found) {
         (AccessList::Entries(own), AccessList::Entries(found)) => entries_refusal(own, found),
@@ -427,7 +427,7 @@ fn entries_refusal(own: &[Entry], found: &[Entry]) -> Option<Refusal> {
     };
     // The entries show that these admit more: nothing in the starter's own allows the trustee, or
     // nothing in the found list denies the trustee that the starter's own denies while an
-    // allowing entry is left to grant what the denying entry took away.
+    // allowing entry is left.
     if let Some(entry) = found.iter().find(|entry| {
         entry.decision == Decision::Allow && !for_trustee(own, Decision::Allow, &entry.trustee)
     }) {
@@ -935,7 +935,7 @@ mod tests {
 
     /// KR-REQ-03.24: a denying entry that is gone makes the object admit more only where access
     /// can grow, which needs an allowing entry left in the object itself. With none left, the
-    /// object grants nothing, and the refusal is in words that do not say it admits more.
+    /// refusal is in words that do not say it admits more.
     #[test]
     fn a_denying_entry_that_is_gone_is_called_wider_only_while_an_allowing_entry_is_left() {
         let none_left = why("D:(D;;0x1;;;WD)", "D:");
@@ -1216,7 +1216,8 @@ mod tests {
     /// KR-REQ-03.24: a text is read only when it holds as many entries as the list it was written
     /// from, whichever way the two differ, and whichever of the two texts is the wrong one. The count
     /// does not keep a condition from hiding entries, which the next case is for; it is what refuses
-    /// a text that is the same on both sides, and so is not refused for holding a condition.
+    /// a text that is the same on both sides, and so is not refused for holding a condition: the
+    /// entries are the same bytes.
     #[test]
     fn a_text_that_does_not_hold_as_many_entries_as_the_list_is_not_read() {
         let hiding = "D:(XD;;0x1;;;BG;(@User.X==\"a\"b\"))(A;;GA;;;WD)\
@@ -1281,9 +1282,8 @@ mod tests {
     /// KR-REQ-03.24: an access list that holds a condition, a string or parentheses inside an
     /// entry, is read only beside a list of the same entries, whichever of the two lists holds it.
     /// A count of entries is not enough for it: a double quote inside a string, for which the
-    /// grammar has no form, ends the string early, and so would a parenthesis that an attribute
-    /// name holds unencoded, and the false entries they make can stand in for the entries they
-    /// hide.
+    /// grammar has no form, ends the string early, and the false entries it makes can stand in
+    /// for the entries it hides.
     #[test]
     fn an_access_list_with_a_condition_is_read_only_beside_the_same_entries() {
         let own_text = "D:(A;;0x1;;;SY)";
@@ -1381,6 +1381,35 @@ mod tests {
         assert_eq!(
             require_no_more(&held_as(b"one list"), &held_as(b"one list")),
             Ok(())
+        );
+        // Bytes of one length, a prefix of the other's, or the same entries with another label:
+        // none stands for the same list, and the same entries are still held to the label.
+        let why = unread(require_no_more(
+            &held_as(b"one list"),
+            &held_as(b"two list"),
+        ));
+        assert!(why.contains("not the same bytes"), "{why}");
+        let why = unread(require_no_more(&held_as(b"one"), &held_as(b"one list")));
+        assert!(why.contains("not the same bytes"), "{why}");
+        let why = unread(require_no_more(&held_as(b"one list"), &held_as(b"one")));
+        assert!(why.contains("not the same bytes"), "{why}");
+        let with_label = |label| Texts {
+            label,
+            ..held_as(b"one list")
+        };
+        let lower = require_no_more(
+            &with_label("S:(ML;;NW;;;ME)"),
+            &with_label("S:(ML;;NW;;;LW)"),
+        );
+        assert!(
+            matches!(
+                &lower,
+                Err(Stop::Refused {
+                    what: "integrity label",
+                    ..
+                })
+            ),
+            "{lower:?}"
         );
         // Without a condition the text is the list, and the bytes are not asked.
         let plain = |access_bytes| Texts {

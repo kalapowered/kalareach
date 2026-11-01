@@ -276,8 +276,9 @@ mod tests {
 
     /// KR-REQ-03.18: the list of sessions and the reply about one are given back to Terminal
     /// Services, so that a reader that asks often does not grow. The case asks the calls that
-    /// answer; the other paths return through the guard that frees. The measurement is of a whole
-    /// process, so the case runs it in a process of its own.
+    /// answer; a call that fails allocates nothing the reader keeps, and the paths after an answer
+    /// return through the guard that frees. The measurement is of a whole process, so the case
+    /// runs it in a process of its own.
     #[test]
     fn memory_that_terminal_services_allocated_is_given_back() {
         let program = std::env::current_exe().expect("the program of this test");
