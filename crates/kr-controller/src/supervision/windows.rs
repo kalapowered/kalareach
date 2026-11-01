@@ -2703,6 +2703,92 @@ mod tests {
         assert_eq!(unread, vec!["12".to_owned()]);
     }
 
+    /// The Task Scheduler's refusals that a paired device is told by their reason are known to the
+    /// device rule by the words their functions write, and the calls that make them run only on
+    /// Windows, where no case of another platform reaches them. So the source is read: each call
+    /// that writes a refusal takes its words from the function beside the markers, and the words of
+    /// a marker are written once, in its constant. A call that went back to a literal would match
+    /// today and stop matching on the day either side was reworded, and what the scheduler printed
+    /// after it, which can hold an account's name, would reach a device.
+    #[test]
+    fn the_calls_to_the_task_scheduler_write_their_refusals_with_the_words_of_the_markers() {
+        let source = include_str!("windows.rs");
+        let code = source
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the code of this module");
+        let calls = code
+            .split("\nmod platform {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the calls to the Task Scheduler");
+
+        // The words of each marker are in the code once, in the constant that holds them. Comments
+        // that quote them are not code.
+        let without_comments = code
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (name, words) in [
+            ("DID_NOT_REGISTER", DID_NOT_REGISTER),
+            ("DID_NOT_REMOVE", DID_NOT_REMOVE),
+            ("COULD_NOT_LIST", COULD_NOT_LIST),
+            ("DID_NOT_RUN", DID_NOT_RUN),
+            ("A_TASK_NAMED", A_TASK_NAMED),
+            ("NOT_THE_ONE_REGISTERED", NOT_THE_ONE_REGISTERED),
+            ("READS_BACK_DIFFERENTLY", READS_BACK_DIFFERENTLY),
+        ] {
+            assert_eq!(
+                without_comments.matches(words).count(),
+                1,
+                "{name} is written once, and a call writes it by the constant"
+            );
+        }
+
+        // Each failure of a command the scheduler ran is written by one of the functions.
+        let mut refusals = 0;
+        for (at, _) in calls.match_indices("refused(") {
+            let named = calls[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|before| before.is_alphanumeric() || before == '_');
+            if named || calls[..at].ends_with("fn ") {
+                continue;
+            }
+            let words = calls[at + "refused(".len()..]
+                .split_once(',')
+                .expect("the question that was asked")
+                .1
+                .trim_start();
+            assert!(
+                [
+                    "&did_not_register(",
+                    "&did_not_remove(",
+                    "&could_not_list(",
+                    "&could_not_list_tasks(",
+                ]
+                .iter()
+                .any(|shared| words.starts_with(shared)),
+                "a refusal is written with words of its own: {}",
+                words.lines().next().unwrap_or_default()
+            );
+            refusals += 1;
+        }
+        assert_eq!(
+            refusals, 4,
+            "the calls that refuse a command the scheduler ran"
+        );
+
+        // And the failure to run the task, which is not one of them.
+        let run = calls
+            .split("pub fn run(definition")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("the call that runs the task");
+        assert!(run.contains("did_not_run(&definition.name)"), "{run}");
+    }
+
     /// KR-REQ-07.58: a process the kernel does not establish is read by what this account can read
     /// of it. A reading that failed for another reason than the process being another account's
     /// (a clock stepped back past the allowance leaves every creation time out of range) must not
