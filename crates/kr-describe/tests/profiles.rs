@@ -592,6 +592,54 @@ fn the_defaults_are_section_22s_and_the_cost_is_more_than_the_file() {
     }));
 }
 
+/// KR-REQ-22.10: every item of what a resident model costs counts against the ceiling: the
+/// weights, the mapping, the key-value cache, the other caches, the batch and the runtime's own
+/// allocations. The six items below, each of its own size, make up the 4 GiB ceiling exactly; a
+/// byte more in any one of them is over it, and the total, what a job allocates again and what lies
+/// beyond the weights each add up the items they name.
+#[test]
+fn every_item_of_a_models_cost_counts_against_the_ceiling() {
+    const MIB: u64 = 1 << 20;
+    let cost = ResidentCost {
+        weights_bytes: 3 * GIB,
+        mapping_bytes: 256 * MIB,
+        kv_cache_bytes: 384 * MIB,
+        additional_cache_bytes: 128 * MIB,
+        batch_bytes: 192 * MIB,
+        runtime_overhead_bytes: 64 * MIB,
+    };
+    assert_eq!(cost.total(), 4 * GIB);
+    assert!(Budgets::DEFAULTS.admits(&cost));
+    assert_eq!(cost.per_job_peak(), (384 + 128 + 192) * MIB);
+    assert_eq!(cost.beyond_the_weights(), GIB);
+
+    let one_more = |cost: ResidentCost| !Budgets::DEFAULTS.admits(&cost);
+    assert!(one_more(ResidentCost {
+        weights_bytes: cost.weights_bytes + 1,
+        ..cost
+    }));
+    assert!(one_more(ResidentCost {
+        mapping_bytes: cost.mapping_bytes + 1,
+        ..cost
+    }));
+    assert!(one_more(ResidentCost {
+        kv_cache_bytes: cost.kv_cache_bytes + 1,
+        ..cost
+    }));
+    assert!(one_more(ResidentCost {
+        additional_cache_bytes: cost.additional_cache_bytes + 1,
+        ..cost
+    }));
+    assert!(one_more(ResidentCost {
+        batch_bytes: cost.batch_bytes + 1,
+        ..cost
+    }));
+    assert!(one_more(ResidentCost {
+        runtime_overhead_bytes: cost.runtime_overhead_bytes + 1,
+        ..cost
+    }));
+}
+
 /// KR-REQ-22.10: an owner may tighten the ceiling and never loosen it.
 #[test]
 fn an_owner_may_tighten_the_ceiling_and_never_loosen_it() {
