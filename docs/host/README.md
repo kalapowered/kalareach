@@ -4293,9 +4293,10 @@ segments. Both parties read the whole environment's bytes and each acts on its o
 the minute the daemon and a worker both find the host over the cap they can both give up output,
 and the host is then under the cap by what both took. A worker that does not get the lock leaves
 the cap to the one that holds it. It looks again after two to five seconds, drawn at random, and
-goes on looking at that interval until it gets the lock, finds the host under the cap, reaches its
-next pass, or its session closes. It never waits for the lock, so a session's own work waits on no
-other worker. A look applies the two byte caps and removes nothing by age: no look at
+goes on looking at that interval until it gets the lock, finds the host under the cap, finds that
+its session has no output to give up, finds that the lock file cannot be opened or taken at all,
+reaches its next pass, or its session closes. It never waits for the lock, so a session's own work
+waits on no other worker. A look applies the two byte caps and removes nothing by age: no look at
 the clocks comes before it, and the platform's time service may have stopped keeping the clock since
 the pass that did, so the age bound waits for the next pass. The holder gives up only its own
 output, so when that is less than the excess the workers that look again give up the rest, one at a
@@ -4303,10 +4304,17 @@ time; where no worker lost the lock, the rest stays until the pass of a worker t
 give up finds the host over the cap. A worker that cannot open or take the lock file at all gives up
 nothing for the cap and keeps the reason with the others its pass left output behind for. A pass
 writes such a reason to the worker's standard error once while it stands, and again if it changes
-or comes back. On Unix a launchd job's or a detached process's standard error is the job's diagnostics
-file, and a transient unit's is the user's journal. A Windows worker's is a console with no window,
-so nothing keeps the reason there. A write to the standard error that fails, as one does on a full
-volume, costs the pass nothing; the reason is written at the next pass that can. Nothing bounds how
+or comes back, with one exception: a pass that applies no age bound, as a look at the cap does not
+and as a pass on a wall clock the host cannot prove does not, keeps the reason it said last when it
+finds none, since it cannot tell that a reason the age bound left has gone. While the host cannot
+prove its wall clock, a reason of the byte caps that goes and comes back is therefore not said
+again, until a pass that applies the age bound finds none. On Unix a launchd job's or a detached
+process's standard error is the job's diagnostics file, and a transient unit's is the user's
+journal. A Windows worker's is a console with no window, so nothing keeps the reason there. The
+write is made once the pass has let go of the session and the dispatch barrier. A write to the
+standard error that fails, as one does on a full volume, costs the pass nothing; the reason is
+written at the next pass that can. A standard error that has stopped draining, a pipe nobody reads,
+holds the write and with it the host's maintenance, and stops nothing that serves a person. Nothing bounds how
 long the host stays over the cap: the delays are random, and a holder that stops without ending
 keeps the lock while the others go on looking. The host also stays over the cap when the session
 that grew cannot give up the excess, as when its worker has ended, it holds less than the excess
