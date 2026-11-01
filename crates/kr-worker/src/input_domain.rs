@@ -1728,11 +1728,19 @@ mod tests {
     /// paste and are not held: the reply is queued whole, as the host's own, and the gate the next
     /// reply waits on stays open. No reply the broker builds carries such bytes today; one that
     /// echoed what the application sent would, and the application must not be able to open a paste
-    /// in the person's framing through it.
+    /// in the person's framing through it. The session is a managed one, with the root editor's
+    /// machine told of each reply, because that is the session in which a reply is accounted
+    /// beside the person's keys.
     #[test]
     fn a_reply_that_reads_as_the_start_of_a_paste_opens_none_and_is_not_held() {
         for text in [&b"\x1b[200~inside"[..], b"\x1b[20", b"ok\x1b[200", b"\x1b"] {
-            let mut input = domain();
+            let session_id = SessionId::new(kr_ipc::new_uuid());
+            let mut input = InputDomain::new(session_id);
+            input.install_fence(FenceDriver::new(
+                session_id,
+                LeaseView::unheld(InputLeaseEpoch::new(0)),
+                Arc::new(kr_transport::clock::ManualClock::new()),
+            ));
             let _ = input.set_bracketed_paste(true);
 
             let _ = input.queue_replies(vec![crate::projection::LaneReply {
