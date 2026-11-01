@@ -4019,12 +4019,12 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// KR-PERF-003: output a session appends is measured at once even when its retained byte count
+    /// Output a session appends is measured at once even when its retained byte count
     /// has not moved. After an eviction for the host cap the resident window still holds the bytes
     /// the spool gave up, so new output that fills the window again leaves the count where it was
     /// while the files grow.
     #[test]
-    fn kr_perf_003_a_session_measures_again_when_output_arrived_though_its_count_did_not_move() {
+    fn a_session_measures_again_when_output_arrived_though_its_count_did_not_move() {
         let root = spool_directory("host-reading-window");
         let retention = OutputRetention::new(
             std::time::Duration::from_secs(7 * 24 * 60 * 60),
@@ -4576,11 +4576,11 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// KR-PERF-003: a reading taken while a write to the spool is still to be made does not stand.
+    /// A reading taken while a write to the spool is still to be made does not stand.
     /// The session counts the bytes of that write as held and the files do not have them yet, so
     /// the files outgrow the reading once it is made, with the session taking no output.
     #[test]
-    fn kr_perf_003_a_reading_taken_with_a_write_still_to_be_made_does_not_stand() {
+    fn a_reading_taken_with_a_write_still_to_be_made_does_not_stand() {
         let root = spool_directory("host-reading-owed");
         let retention = OutputRetention::new(
             std::time::Duration::from_secs(7 * 24 * 60 * 60),
@@ -4614,11 +4614,11 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// KR-PERF-003: nor does a reading taken after a write to the spool failed and before the
+    /// Nor does a reading taken after a write to the spool failed and before the
     /// failure is settled. The spool then stops, and takes the output its window holds when the
     /// pass resumes it, which grows the files with the session taking no output.
     #[test]
-    fn kr_perf_003_a_reading_taken_before_a_failed_write_is_settled_does_not_stand() {
+    fn a_reading_taken_before_a_failed_write_is_settled_does_not_stand() {
         let root = spool_directory("host-reading-failed");
         let retention = OutputRetention::new(
             std::time::Duration::from_secs(7 * 24 * 60 * 60),
@@ -4653,12 +4653,12 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// KR-PERF-003: nor does a reading taken while the spool is stopped. A write to the spool that
+    /// Nor does a reading taken while the spool is stopped. A write to the spool that
     /// stopped part way leaves the spool stopped with the bytes it could not write in the window,
     /// and the pass that reads the host resumes it, which writes those bytes to the files while the
     /// session takes no output.
     #[test]
-    fn kr_perf_003_a_reading_taken_while_the_spool_is_stopped_does_not_stand() {
+    fn a_reading_taken_while_the_spool_is_stopped_does_not_stand() {
         let root = spool_directory("host-reading-stopped");
         let retention = OutputRetention::new(
             std::time::Duration::from_secs(7 * 24 * 60 * 60),
@@ -4697,11 +4697,11 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// KR-PERF-003: a pass that finds the host over its cap and can give nothing up leaves no
+    /// A pass that finds the host over its cap and can give nothing up leaves no
     /// reading behind. Here the boundary cannot be written, so nothing is removed, and the host
     /// grows before the next pass, which has to give up what it is over by then.
     #[test]
-    fn kr_perf_003_a_pass_that_finds_the_host_over_its_cap_and_gives_nothing_up_looks_again() {
+    fn a_pass_that_finds_the_host_over_its_cap_and_gives_nothing_up_looks_again() {
         let root = spool_directory("host-reading-nothing");
         let retention = OutputRetention::new(
             std::time::Duration::from_secs(7 * 24 * 60 * 60),
