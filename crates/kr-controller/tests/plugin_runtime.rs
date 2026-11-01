@@ -392,6 +392,28 @@ struct World {
     tree: teardown::Tree,
 }
 
+impl Drop for World {
+    /// Stops the daemon before anything it started is ended. A daemon that goes on serving starts
+    /// a runtime in place of a host that was ended, after the hosts to end were listed, and that
+    /// host is then left to a teardown that waits for it to close as a worker does and a host
+    /// never does.
+    fn drop(&mut self) {
+        for serving in self.serving.drain(..) {
+            serving.abort();
+        }
+        let Some(controller) = self.controller.take() else {
+            return;
+        };
+        // The tasks the daemon runs let it go as they are dropped: a liveness condition, waited for
+        // for as long as the loaded machine needs and no longer.
+        let until = std::time::Instant::now() + Duration::from_secs(60);
+        while Arc::strong_count(&controller) > 1 && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(controller);
+    }
+}
+
 impl World {
     /// A world whose daemon runs in this process.
     async fn start(component: &[u8]) -> Self {

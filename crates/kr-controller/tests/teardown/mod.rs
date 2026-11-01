@@ -223,14 +223,28 @@ impl Drop for Tree {
             "the host tree has been kept at {}",
             root.display()
         ));
-        // A job left registered outlives the test, so the test fails; one already failing has
-        // said so, and a second panic would end the whole run instead.
-        if !jobs_left.is_empty() && !std::thread::panicking() {
-            panic!(
-                "this test left {} jobs registered with the service manager: {}",
-                jobs_left.len(),
-                jobs_left.join("; ")
-            );
+        // What is left outlives the test, so the test fails: a job still registered, and anything
+        // this test started that could not be established as ended (a worker still running when its
+        // closure was waited for, a registry that could not be read, a launch that named no
+        // process). One already failing has said so, and a second panic would end the whole run
+        // instead.
+        if !std::thread::panicking() {
+            let mut left = Vec::new();
+            if !jobs_left.is_empty() {
+                left.push(format!(
+                    "{} jobs registered with the service manager: {}",
+                    jobs_left.len(),
+                    jobs_left.join("; ")
+                ));
+            }
+            if !unresolved.is_empty() {
+                left.push(format!(
+                    "{} things it started that could not be established as ended: {}",
+                    unresolved.len(),
+                    unresolved.join("; ")
+                ));
+            }
+            panic!("this test left {}", left.join(", and "));
         }
     }
 }
