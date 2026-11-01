@@ -168,8 +168,8 @@ assembles the tree, and proves it: it signs the manifest with keys of its own, p
 the archive to what a host stages. What it signs is no release, and the archive it keeps says so in
 its name. The `release` job takes the two trees. It waits, because it declares the `release-signing`
 environment and that environment has a required reviewer, so a person approves every Windows
-signature. It runs for a release tag and for the default branch only, and a run on any other
-ref shows it skipped. Approve it and the run signs the files of each tree that carry a signature,
+signature. It runs for a tag and for the default branch only (its environment admits only `host/v*` tags
+and `main`), and a run on any other ref shows it skipped. Approve it and the run signs the files of each tree that carry a signature,
 verifies each of them, puts them back, and then stops, naming the reason: the production update
 channel's release keys are not available to a workflow, so `release.json` cannot be signed again
 after the signatures changed the files. Publishing a Windows release waits for the key ceremony of
@@ -377,8 +377,8 @@ run is suspected, or signing access must be revoked immediately:
        time becomes invalid too, so each Windows release that carries one is released again from a
        new commit, under that commit's tag; `share/signatures.txt` of a release names the thumbprint
        of the certificate that signed each of its files.
-     - The GitHub repository administrator deletes any compromised release draft or published release,
-       purges published artefacts from distribution, and notifies downstream consumers.
+     - The GitHub repository administrator deletes any compromised release draft or published release (the one case in which a
+       published release is deleted), purges published artefacts from distribution, and notifies downstream consumers.
    - Where no record covers the window, or none shows that nothing was signed outside an approved
      run, take the steps of the item above as if unauthorised signatures were produced. Nothing then
      says which certificates carry one or when the first was made, so the owner treats every
