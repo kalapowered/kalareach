@@ -5246,7 +5246,8 @@ the fence stands at. Turning privacy mode on waits for exchanges already admitte
 notification claimed before the change and presented after it, once a credential renewal that waits
 on the gateway has finished, is taken back rather than presented: nothing of it left this host, and
 it is settled as cancelled. Anything the outbox has on the wire when privacy mode is turned on stays
-outstanding until its answer arrives, and is then listed among what left.
+outstanding until its answer arrives, and is then listed among what left, as this section says for
+each kind.
 
 Content-history retention, description inference, sync production and backup production are disabled
 prospectively, together. What this host holds itself is removed with them: the retained output goes,
@@ -5277,12 +5278,16 @@ session reopened under privacy mode, or one whose privacy state this host could 
 both, because an enabling that was interrupted leaves content behind and nothing on disk says
 whether it did.
 
-What stays is named rather than silently retained: the receipt journal's operation metadata, the
-minimal local authority this host holds, the envelope of an action that has not settled, live
-pending questions and approvals, which keep working under the grants they already have without their
-bodies being exported as historical content, and user-pinned labels, which are kept locally unless
-explicitly cleared and excluded from later sync while privacy mode is on. A host that claimed a
-functioning durable control system wrote no state at all would be claiming something untrue.
+What stays is named rather than silently retained, in two places. The report's `kept` list names
+what the daemon's own services keep, each with its reason: the record of each backup generation
+this host produced, the enrolment of each backup writer, the session names people pinned, which are
+kept locally unless explicitly cleared and are left out of sync while privacy mode is on, the
+delivery journal's own records, and each destination's spent rate allowance. A session's worker
+keeps more, which the report does not carry and this guide names: the receipt journal's operation
+metadata, the minimal local authority this host holds, the envelope of an action that has not
+settled, and live pending questions and approvals, which keep working under the grants they already
+have without their bodies being exported as historical content. A host that claimed a functioning
+durable control system wrote no state at all would be claiming something untrue.
 
 The same boundary applies when exporting session content as part of a support bundle:
 
@@ -5425,8 +5430,10 @@ stays listed, and it is offered again only if the destination returns to the val
 under, which a new authorisation never does. A notification of a device since unpaired is not
 offered, because the destination is kept as history with no rule and this host no longer holds the
 credential, and neither is a row recorded with no digest: it matches no destination. An external
-message is listed and is not deletable, because this host holds no way to ask the service it went to
-to forget it. Backup does not silently delete unrelated collections and does not claim a copy
+message that its destination took, called a duplicate or left unknown is listed and is not
+deletable, because this host holds no way to ask the service it went to to forget it. A message
+that its destination read and refused is not listed, although its content reached that service.
+Backup does not silently delete unrelated collections and does not claim a copy
 somebody else holds can be recalled. Local deletion is logical cleanup of this host's own records
 rather than a claim of physical secure erase: the files are unlinked and the rows are cleared, and
 nothing here says the bytes are unrecoverable from the device they were on.
@@ -5504,18 +5511,21 @@ after privacy mode is off, whatever has changed and however recently the deleted
 until then no restore works: the restore takes the newest publication, and the service prunes
 nothing.
 
-Copies held by authorised viewers are listed with the rest of what has left the host, because a device
-that was let see a session may hold what it was shown, on a screen or in its own scrollback, and this
-host cannot recall that: revoking the device ends what it can read from now on and nothing before.
-Each device that has held a session share with the right to view (a grant of the sharing store) is
-listed once, as a *possible* copy, with the moment it first could view under a share, whether the
-share is still in force or was revoked, because the host records what a grant allows and not what a
-device was sent. A device's pairing grant is not in that store, so a paired device that has viewed
-only under its pairing grant is not listed. A grant nobody has redeemed puts nothing
-on a device and is not listed, nor is one that cannot view. The entry is never deletable: there is
-no route through which this host could ask a device's own store to forget, and it offers no action
-for one. A grant store that cannot be read is named among what could not be listed, and the list is
-not shorter without saying so.
+Copies held by authorised viewers are listed with the rest of what has left the host, as far as the
+sharing store shows them, because a device that was let see a session may hold what it was shown, on
+a screen or in its own scrollback, and this host cannot recall that: revoking the device ends what
+it can read from now on and nothing before. Each device named by an activated grant of the sharing
+store that carries the right to view a session is listed once, as a *possible* copy, with the moment
+the first such grant was activated, whether that grant is still in force, ran out or was revoked,
+because the host records what a grant allows and not what a device was sent. A session share is
+activated when its invitation is redeemed; a grant written active on issue, as a voice grant or a
+control transfer is, counts from that moment when it carries that right. A grant nobody has
+activated puts nothing on a device and is not listed, nor is one that cannot view. A device's
+pairing grant is not in that store, so a paired device that holds no such activated grant is not
+listed, whatever it has viewed, and the report does not say so. The entry is never deletable: there
+is no route through which this host could ask a device's own store to forget, and it offers no
+action for one. If the sharing store cannot be read, the report names viewers among what could not
+be listed and holds no viewer entry.
 
 Turning privacy mode off starts retention again from that moment, under a generation of its own.
 It reconstructs nothing, and the new generation is what keeps the private interval's own results
@@ -5562,6 +5572,11 @@ what it removes is exactly the thing a person cannot check for themselves.
   screen needs an interface the projection does not have.
 * **Application notices keep their content.** A notification's title and body are written to the
   host-event store, and privacy cleanup removes neither the rows already there nor later ones.
+* **An invitation keeps what its issuer was shown.** `grant.create` stores the visible lines of a
+  shared live screen, the text of each named question and what each named approval asks, in the
+  invitation's record in the sharing store. The sharing store is not one of the subsystems privacy
+  cleanup takes through the steps, so it removes none of this, and the record keeps it after the
+  invitation is redeemed, withdrawn or has expired.
 
 ## Session names and descriptions
 
