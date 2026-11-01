@@ -46,8 +46,8 @@ natively and then started on the machine that built it. None is only cross-built
 
 The executables are `kr`, `kr-attach-guard`, `kr-worker`, `kr-controller`, `kr-describe-inference`,
 `kr-hook` and `kr-plugin-host`. The names of the programs to include in a release for each target
-are defined in `scripts/release-programs.json`. This is the one list that the two release workflows,
-the Windows archive check, `kr host install` and `kr host update` read. `release-baselines.yml`
+are defined in `scripts/release-programs.json`. This is the one list that the release workflows,
+`kr host install` and `kr host update` read. `release-baselines.yml`
 builds each program it names by a Cargo command of its own, as `release-windows.yml` does, so that
 the dependencies resolve exactly as they do for the release. The `release-windows.yml` workflow
 builds and signs all of these programs for the x86-64 Windows target, and will fail if any of them
