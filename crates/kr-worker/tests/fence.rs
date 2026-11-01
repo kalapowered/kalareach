@@ -8392,7 +8392,7 @@ async fn a_real_root_shell_killed_at_its_prompt_closes_its_session_with_the_sign
         )
         .await;
         let first = shell.keys();
-        let second = shell.terminal_attached();
+        let _second = shell.terminal_attached();
         shell.until_fenced_for(first.attachment_id).await;
         // The control: a shell nobody kills is live, with both terminals on it.
         assert_eq!(
