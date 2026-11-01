@@ -4311,14 +4311,37 @@ async fn host_whose_pass_leaves_output_behind() -> Host {
     host
 }
 
+/// A host whose pass cannot remove a segment a week and a day old, because a directory stands
+/// where the spool's boundary is written: the age bound leaves the output, and says why.
+#[cfg(unix)]
+async fn host_whose_old_output_cannot_be_removed() -> Host {
+    let host = host_started(
+        |_| {},
+        a_segment_written(8),
+        unix_time_service(true),
+        "sleep 30",
+    )
+    .await;
+    std::fs::create_dir(
+        host._temp
+            .environment()
+            .session_spool(host.session_id)
+            .join("boundary"),
+    )
+    .expect("a directory where the boundary goes");
+    host
+}
+
 /// Section 24 and section 20, KR-REQ-20.20: a worker says why a pass left output behind to its
 /// standard error, once while the reason stands, and a standard error that refuses the write
 /// costs the session nothing. A volume that is full is a cause of output left behind, and it
-/// refuses the diagnostic too; the stop of a session must not wait on it.
+/// refuses the diagnostic too; the stop of a session must not wait on it. A look at the host's
+/// cap applies no age bound, so it does not make the reason the age bound left be said again.
 ///
 /// The worker is this test's own program, started twice with the standard error the case needs:
-/// one that a person reads, and one whose reading end is closed. In each the host makes two
-/// passes and then the session is stopped through the endpoint.
+/// one that a person reads, and one whose reading end is closed. In each, one host makes two
+/// passes that cannot take the lock on the host's cap; another makes a pass, a look and a pass
+/// that cannot remove output for its age; and the first is stopped through the endpoint.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_refused_write() {
@@ -4342,6 +4365,10 @@ async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_re
         let host = host_whose_pass_leaves_output_behind().await;
         host.service.maintain_now();
         host.service.maintain_now();
+        let aged = host_whose_old_output_cannot_be_removed().await;
+        aged.service.maintain_now();
+        aged.runtime.session().collect_output_for_the_caps();
+        aged.service.maintain_now();
         let mut client = cli(&host).await;
         close(&mut client, &host).await;
         return;
@@ -4379,12 +4406,16 @@ async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_re
         .collect();
     assert_eq!(
         reasons.len(),
-        1,
-        "two passes left the output for one reason, which is said once: {said}"
+        2,
+        "each host left its output for one reason, which is said once: {said}"
     );
     assert!(
-        reasons[0].contains("host-cap.lock"),
-        "and it names the lock: {reasons:?}"
+        reasons.iter().any(|line| line.contains("host-cap.lock")),
+        "one names the lock: {reasons:?}"
+    );
+    assert!(
+        reasons.iter().any(|line| line.contains("boundary")),
+        "and the other the boundary: {reasons:?}"
     );
     start(false);
 }
