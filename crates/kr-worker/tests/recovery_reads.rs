@@ -11,11 +11,6 @@
 //! present view on every page, beside the local owner, who is shown everything, and the device is
 //! refused retained history outright; and a receipt answers only the actor whose action it is, only
 //! for this worker's own session, and only in a frame its reader can receive.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-23.48 | every `kr_req_23_48_` test here |
-//! | KR-REQ-13.11 | the launch surface a paired device reads is what its grant's live screen shows |
 
 #![cfg(unix)]
 

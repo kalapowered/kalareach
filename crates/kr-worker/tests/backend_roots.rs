@@ -5,12 +5,6 @@
 //! owned-process record is the one a worker keeps: it reads the trees below a server by parentage
 //! and start identity, so the command is recorded while its parent runs and is still the session's
 //! after its parent has gone.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-07.60 | a server's commands are recorded below it, each below its own server, whether or not the server runs; a descendant of one whose server has gone is found too |
-//! | KR-REQ-07.66 | the session's request to stop reaches a server's commands and leaves the server to its owner; the record names the server, so that a later daemon asks it without a hang-up |
-//! | KR-REQ-07.65 | a process the session's stop could not signal is noted, so the receipt says why it is still running |
 
 #![cfg(unix)]
 

@@ -19,15 +19,6 @@
 //! socket: the owner in one of its own windows on the worker's socket, the owner as the daemon
 //! forwards it, and a paired device. `the_local_owner_is_the_local_ingress_holding_no_grant` states
 //! the question all of them ask, over every ingress.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-10.50 | `a_local_caller_under_a_grant_is_drawn_the_live_screen_alone`, `the_local_owner_is_drawn_the_whole_screen_and_a_device_the_live_screen`, `only_the_local_owner_previews_the_screen` |
-//! | KR-REQ-10.49 | `a_local_caller_under_a_grant_is_refused_the_retained_history`, `the_local_owner_reads_the_retained_history_on_either_socket`, `a_local_caller_under_a_grant_reads_the_last_command_only_inside_its_scope`, `the_local_owner_reads_the_last_command_on_either_socket` |
-//! | KR-REQ-10.51 | `a_local_caller_under_a_grant_reads_only_the_questions_its_scope_admits`, `the_local_owner_reads_every_question_on_either_socket`, `a_worker_states_that_it_holds_a_question_read_to_its_scope` |
-//! | KR-REQ-10.41 | `a_local_caller_under_a_grant_detaches_only_what_its_own_connection_made`, `the_local_owner_detaches_another_windows_attachment_and_a_device_does_not`, `a_detach_refused_for_another_connections_attachment_is_recorded_as_rejected`, `a_detach_whose_succession_fails_after_its_marker_stays_unknown` |
-//! | KR-REQ-10.45 | `a_revision_takes_the_lease_from_a_local_caller_under_a_grant`, `a_revision_takes_a_devices_lease_and_leaves_the_local_owners`, `a_revision_takes_the_lease_of_the_grants_and_devices_it_names_and_no_other`, `a_reach_is_trusted_by_a_worker_that_has_fenced_the_revision_it_follows_and_by_no_other`, `a_refused_revision_is_fenced_by_the_worker_for_the_reach_it_was_announced_with`, `an_attachment_the_empty_prompt_gesture_detaches_is_no_longer_counted_as_granted`, `the_empty_prompt_gesture_leaves_nothing_of_a_granted_attachment_behind`, `a_granted_attachment_detached_through_the_service_at_the_prompt_is_let_go_at_once` |
-//! | KR-REQ-23.46 | `a_local_caller_under_a_grant_cancels_its_own_intent_and_no_other`, `the_local_owner_cancels_another_actors_intent_and_a_device_does_not` |
 
 mod common;
 

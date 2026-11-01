@@ -13,10 +13,6 @@
 //! A helper's own binding is its process and start value, and one test checks it where Windows can
 //! give a helper's identifier to the next one within a second: the next helper is a new source, with
 //! a new key, and the first one's caller token does not reach its question for it.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-11.62 | `a_launched_agents_questions_are_application_scoped_and_end_with_its_instance`, `a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_the_binding_it_left`, `a_request_identifier_two_questions_of_one_instance_share_places_neither_in_a_thread` |
 
 use std::sync::Arc;
 

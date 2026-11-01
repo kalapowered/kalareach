@@ -4,12 +4,6 @@
 //! started the way a session starts one. The ownership record is the real one, so what the ladder
 //! ends is what a session would have recorded. Build the stand-in before a package-scoped run
 //! (`cargo build -p kr-codex-stand-in`); a run of the workspace builds it first.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-07.60 | a server is started in a group of its own with the presented environment less the two variables that name the launch, in the directory asked, only when the executable is the one the record names; an ending that needs no more than the end of its input, one that needs a terminate, and one that needs force each end the server and what the session recorded below it, a command that outlived a server that died included; the server's error stream is read and only its last part kept; a process the session reads as having left for a control daemon's own scope is neither asked, nor forced, nor reported, whether it is read so before the ending asks it or while the ending waits to force |
-//! | KR-REQ-07.53 | an ending forces nothing before five seconds from its beginning: a server and a command that ignore everything they are asked are still there just before it and are forced after it, a command that outlives a server that ended is too, and one that ends when it is asked within the five seconds is not forced |
-//! | KR-REQ-07.66 | a process the ladder ends by force is noted as forced, and none that ended when it was asked is |
 
 #![cfg(unix)]
 

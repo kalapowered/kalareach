@@ -9,11 +9,6 @@
 //! and a reader that follows the continuations reads it whole, once and in order; an entry larger
 //! than a frame on its own comes back with its text cut; and a history that fits, and one the
 //! reader's grant narrows, answer as they did.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-08.72 | `a_history_larger_than_the_frame_is_read_in_parts_that_each_fit`, `an_entry_larger_than_the_frame_is_carried_cut`, `a_snapshot_whose_parts_pass_the_total_is_cut_at_it`, `two_readers_on_one_connection_each_spend_a_total_of_their_own` |
-//! | KR-REQ-23.39 | `a_history_that_fits_one_frame_answers_whole_with_no_continuation`, `a_narrowed_part_counts_what_it_withheld_and_spends_nothing_on_it`, `a_snapshot_under_the_total_is_read_in_parts_that_never_name_it` |
 
 use std::sync::Arc;
 

@@ -6,10 +6,6 @@
 //! backend no launch took is retired. The launch that presents itself to a backend is proved with
 //! the real launcher in `kr-hook`'s own suite. The launcher and the application a case stands in for
 //! are copies of a program the machine has: `sleep` on Unix and `cmd.exe` on Windows.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation; each session has a root of its own; a backend is established under the longest runtime directory a Mac has by default, a runtime directory with no room for the socket a backend binds below it establishes nothing, and a backend retired by the end of its line leaves no directory; a declared package establishes with its flags, and its variables in the launch record rather than the answer; a session entry whose flags are not the package's, a run that splits the flags and an executable no match rule recognises establish nothing; a bypassed invocation exports nothing; an integration that declares a backend establishes nothing where it cannot be served, and says which launch it refuses |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -572,6 +568,9 @@ async fn kr_req_12_07_a_bypassed_invocation_creates_nothing() {
 
 /// On a platform that cannot prove a file closed to other accounts, nothing is established and
 /// nothing is created.
+///
+/// KR-REQ-12.07, the part about where a backend cannot be served: an integrated invocation
+/// establishes nothing there.
 #[tokio::test]
 async fn a_platform_that_cannot_publish_a_credential_file_establishes_nothing() {
     let setup = Setup::new();
@@ -654,6 +653,10 @@ async fn kr_req_12_07_one_line_runs_one_integrated_invocation() {
 }
 
 /// A finished command block ends its line, and a backend no launch took for it is retired.
+///
+/// KR-REQ-12.07, the part about a backend retired by the end of its line: its credential, its
+/// launch record and its directory are gone, and an earlier line's ending leaves the backend where
+/// it is.
 #[tokio::test]
 async fn a_finished_line_retires_its_unbound_backend() {
     let setup = Setup::new();
@@ -1179,6 +1182,9 @@ async fn kr_req_12_07_the_flags_are_added_whole_or_not_at_all() {
 
 /// A match rule that names the directory an executable is in holds the resolved executable to
 /// it: the same name anywhere else establishes nothing.
+///
+/// KR-REQ-12.07, the part about an executable no match rule recognises: it establishes nothing, and
+/// nothing is created for it.
 #[tokio::test]
 async fn an_executable_outside_the_directory_its_match_rule_names_establishes_nothing() {
     let shape = fixture::Shape {

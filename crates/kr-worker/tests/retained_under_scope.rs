@@ -5,12 +5,6 @@
 //! proved its generation and forwards a paired device's mutations and reads as the daemon does:
 //! the device's envelope, the rights its grant carried and the history scope of that grant. The
 //! question is asked by an application bound to the session, as an agent asks.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-10.49 | the `kr_req_10_49_` tests here |
-//! | KR-REQ-10.51 | the `kr_req_10_51_` tests here |
-//! | KR-REQ-23.34 | the `kr_req_23_34_` tests here |
 
 #![cfg(unix)]
 

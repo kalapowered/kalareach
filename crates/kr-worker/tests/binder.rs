@@ -5,14 +5,6 @@
 //! admissions, and the broker's ledger is on the internal disk beside a real receipt journal, so a
 //! row is read back through a connection of its own and a store that fails is the store's own
 //! refusal.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-11.13 | a binding is made only from the admissions held, at their frame, for a package they admit, and carries its release, origin, frame, program and version, which stays; a binding stays on its hash across an upgrade and new bindings take the new one; an instance no package recognised is bound once one that recognises it is admitted, and only a matching, admitted package binds; a disabled or removed package's bindings end at the next snapshot; a write that fails leaves no binding; a launch given back takes its binding and its row, the row as soon as the store takes writes again or at the next process's open; a native exit removes the rows; the actions a package declares that cannot be registered are reported by name |
-//! | KR-REQ-27.09 | an executable no signed build names has no version: the package that recognises it is still admitted and bound, its bridge channel is not served for that program, and the channel of a build a record names opens |
-//! | KR-REQ-11.24 | the grants are the installation's effective capabilities through the runtime's map; a confirmed widening reaches a binding on the installed hash with its actions and its fault state kept, and never a retired release's; a withdrawal reaches every release of the package, a skipped revision's too |
-//! | KR-REQ-11.25 | the decoding trust is the admitted connector's, with the answer right only beside the decoding right |
-//! | KR-REQ-25.22 | a revoked release's binding is warned about once and served under the policy that only warns, refused every rich admission under the policy that disables at the next admission until the revocation is lifted, and ended under the policy that disables at once as soon as the request it admitted completes; the release's state is found by its origin, so a revocation reaches a binding on a release from another repository |
 
 use std::path::Path;
 use std::sync::Arc;

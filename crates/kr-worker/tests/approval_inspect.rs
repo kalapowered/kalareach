@@ -9,12 +9,6 @@
 //! itself gave the broker rather than to what the broker says about itself. They also read it, and
 //! the agent's shared state, as the control daemon forwards a paired device's read: narrowed by
 //! section 10's one host-side filter to the history scope of the grant the daemon decided it under.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-11.26 | `kr_req_11_26_a_local_caller_reads_what_the_decoder_read_and_offered`, `kr_req_11_26_the_record_says_where_the_request_stands_once_answered`, `kr_req_11_26_another_instances_resource_and_one_never_decoded_answer_unknown`, `kr_req_11_26_a_device_reads_the_approval_records_its_grants_scope_reaches` |
-//! | KR-REQ-10.51 | `kr_req_10_51_a_named_approval_is_read_while_current_although_it_predates_the_bound`, `kr_req_10_51_a_named_approval_that_has_ended_answers_as_unknown`, `kr_req_10_51_a_name_excepts_its_own_resource_and_no_other_with_the_same_upstream_identifier`, `kr_req_10_51_a_device_answers_an_approval_only_where_its_history_or_its_name_reaches_it` |
-//! | KR-REQ-23.39 | `kr_req_23_39_a_device_reads_the_agent_history_its_grants_scope_reaches` |
 
 use std::sync::Arc;
 

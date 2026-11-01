@@ -12,11 +12,6 @@
 //! asked for its state, whichever task handed it. All are decided at the
 //! lane's own interface, and the cases in kr-controller's `plugin_observation` show the same lane at
 //! work in a running worker.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-11.38 | `kr_req_11_38_what_the_lane_lost_comes_with_the_entry_and_is_older_than_it`, `kr_req_11_38_a_loss_goes_with_the_first_entry_newer_than_it` |
-//! | KR-REQ-24.27 | `kr_req_24_27_a_state_asked_for_before_a_change_of_privacy_mode_is_not_held_after_it`, `kr_req_24_27_the_runtimes_words_are_withheld_for_the_life_of_a_connection_privacy_mode_has_stood_on`, `kr_req_24_27_a_component_handed_private_content_on_the_connection_it_registers_on_stays_marked`, `kr_req_24_27_a_first_hand_over_before_the_component_is_registered_is_marked`, `kr_req_24_27_a_mark_outlasts_an_unbinding_on_the_connection_it_was_made_on` |
 
 use std::sync::Arc;
 

@@ -4,15 +4,6 @@
 //! one, under its hash, and hands the worker what an installation hands it. What the worker reads
 //! is checked against that hash, so a package that is not the installed one, or a file that is not
 //! the bytes its manifest names, is refused rather than read.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-12.07 | an integrated command resolves to the connector its installed package carries, and to nothing else; its command, flags and variables are the verified manifest's, and apply only while `command_integration.launch` is granted |
-//! | KR-REQ-07.64 | a package's launch probe is the verified manifest's, and applies only while `launch.probe` is granted |
-//! | KR-REQ-11.30 | the table an installed Codex-shaped package carries compiles to the table the gateway interprets, which is the golden one; the broker pins it and reads every frame of a session as the installed table classifies it, an unlisted method as a presumed mutation; no table is compiled for an executable no signed record names, one the table is not qualified for, or a channel's table |
-//! | KR-REQ-11.34 | the table a channel is served with is the installed package's own |
-//! | KR-REQ-12.22 | Qoder CLI's launch flags give its launch a hook bridge on this installation's own forwarder, for Qoder CLI and nothing else |
-//! | KR-REQ-12.18, KR-REQ-12.20, KR-REQ-12.22 | the test packages declare the command integrations the released packages declare |
 
 use std::path::{Path, PathBuf};
 
@@ -113,6 +104,9 @@ fn kr_req_12_07_an_installed_connector_is_read_from_its_package() {
 
 /// A file in the package that is not the bytes its manifest names is refused, and nothing is
 /// integrated from it.
+///
+/// KR-REQ-12.07, the part about the verified manifest: only a connector whose files are the bytes
+/// its manifest names is integrated.
 #[test]
 fn a_table_changed_after_installation_is_refused() {
     let store = Store::new("changed");
@@ -139,6 +133,9 @@ fn a_table_changed_after_installation_is_refused() {
 
 /// A package directory whose manifest is not the installed hash is another package, whatever it
 /// says, and is refused.
+///
+/// KR-REQ-12.07, the part about the installed package: only the connector of the installed hash is
+/// integrated.
 #[test]
 fn a_package_that_is_not_the_installed_one_is_refused() {
     let store = Store::new("foreign");
@@ -220,6 +217,8 @@ fn a_bridge_the_installation_was_not_granted_is_refused() {
 }
 
 /// Two packages that integrate one command name are both left out.
+///
+/// KR-REQ-12.07, the part about a command two packages integrate: it resolves to no connector.
 #[test]
 fn a_command_two_packages_integrate_resolves_to_neither() {
     let first = Store::new("first");
@@ -247,6 +246,9 @@ fn kr_req_12_07_a_rule_recognises_a_file_found_for_its_own_command_only() {
 /// A manifest's integration names a command one of the package's match rules recognises: the
 /// package check refuses a path, another application's name and no name at all, and nothing is
 /// integrated from such a package.
+///
+/// KR-REQ-12.07, the part about the command an integration names: a command no match rule of the
+/// package recognises integrates nothing.
 #[test]
 fn a_command_the_package_does_not_recognise_is_refused() {
     let store = Store::new("command");
@@ -522,6 +524,8 @@ fn kr_req_07_64_a_launch_probe_runs_only_while_launch_probe_is_granted() {
 
 /// Connectors that declare no command integration are held, however many there are,
 /// and resolve no command.
+///
+/// KR-REQ-12.07, the part about connectors that declare no integration: they resolve no command.
 #[test]
 fn connectors_that_declare_no_integration_are_held_and_resolve_no_command() {
     let store = Store::new("undeclared");

@@ -4,12 +4,6 @@
 //! surfaces that share it. These tests take a real terminal engine, print content at known
 //! moments, and ask the filter for each surface, because the property at stake is what a viewer
 //! *receives* rather than what a predicate returns.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-10.49 | `one_filter_covers_every_surface_a_grant_reaches`, `a_summary_made_now_from_pre_cutoff_content_is_withheld_or_recomputed`, `derived_data_names_the_interval_and_resources_it_was_built_from` |
-//! | KR-REQ-10.50 | `a_live_only_invitation_is_installed_the_visible_screen_only_when_the_issuer_selected_it`, `the_live_screen_exception_never_reaches_the_buffer_that_is_not_showing`, `what_the_terminal_shows_later_is_visible_to_a_live_only_viewer_and_what_stays_hidden_is_not`, `attachment_bytes_need_their_own_file_grant`, `voice_context_intersects_the_requesting_device_scope`, `kr_req_10_50_a_previewed_screen_restoration_carries_no_title_and_no_link_target`, `kr_req_10_50_a_previewed_screen_projection_carries_no_title_and_no_link_target_now_or_later` |
-//! | KR-REQ-10.51 | `a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff`, `a_named_question_is_excepted_only_while_it_is_open`, `a_named_approval_is_excepted_only_while_it_is_current`, `a_pending_resource_snapshot_does_not_bypass_the_filter_without_that_scope` |
 
 use kr_protocol::gateway::PendingState;
 use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};

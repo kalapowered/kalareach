@@ -7,11 +7,6 @@
 //! a copy of a system program from running, and a link to one would run under the system program's
 //! own name. The watch's own cases run a session whose root shell is a POSIX shell with job
 //! control, which starts the same program as a foreground job when a line is typed into it.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-12.07 | a program the root shell ran that the integration did not launch is adopted as a native terminal instance with no process record, its process placing the questions it asks and admitting no bridge, with the bypass its line was answered with, its bridges refused, and ended when it exits; a program the integration launched is not adopted; a view that installs the session's list and applies the announcements after it holds each instance once; the watch finds a program the root shell starts from a typed line within two seconds of it running, at once or after four silent seconds, and its end within two seconds of its exit, and looks when the integration asks about an invocation or reports a command starting |
-//! | KR-REQ-11.13 | an adopted program is bound in the same step to the admitted package that recognises it, for the program found running, and the binding ends with it; a program two packages recognise equally well is adopted bound to neither, with an announcement that names them, and the one left is bound to it; a package with no connector table adopts and binds what it recognises |
 
 #![cfg(unix)]
 

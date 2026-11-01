@@ -8,11 +8,6 @@
 //!
 //! The cases take turns: each is a tree this process is the root of, and one case's processes are
 //! easier to tell from the next case's when only one tree is growing at a time.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-07.60 | the observation records the root shell, a job, a job that called `setsid`, and a process the worker adopted when its parent exited, and not a process of the worker's own; a process adopted while the observation runs, and one left in the session after the root shell has gone, are found too |
-//! | KR-REQ-07.66 | the worker's own close hangs up on what it recorded and, after the grace period, ends what ignored the hangup, each through the hold the platform gives on the recorded process |
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
