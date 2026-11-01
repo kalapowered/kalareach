@@ -4476,6 +4476,107 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A spool of two segments of 8 bytes: the first was last written eight days ago, the second
+    /// now. Returns a history over it.
+    fn history_over_an_old_and_a_new_segment(spool: &Path) -> OutputHistory {
+        std::fs::create_dir_all(spool).expect("a spool directory");
+        for (start, days_ago) in [(0_u64, 8_u64), (8, 0)] {
+            let segment =
+                std::fs::File::create(spool.join(format!("{start:020}.out"))).expect("a segment");
+            segment.set_len(8).expect("its bytes");
+            segment
+                .set_modified(
+                    std::time::SystemTime::now()
+                        - std::time::Duration::from_secs(days_ago * 24 * 60 * 60),
+                )
+                .expect("a segment of that age");
+        }
+        OutputHistory::with_spool(8, spool, SpoolLayout::new(8, 1 << 20)).expect("a spool")
+    }
+
+    /// KR-REQ-20.20, section 9: a pass that is not to remove output by age removes none where the
+    /// host is under its cap, whether it measures the host or a reading stands. The first segment
+    /// is eight days old, and goes by age once the pass may.
+    #[test]
+    fn a_pass_not_to_remove_output_by_age_removes_none_where_the_host_is_under_its_cap() {
+        let root = spool_directory("age-withheld-under-cap");
+        let retention = OutputRetention::new(
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            1000,
+            1 << 20,
+        );
+        let mut this = history_over_an_old_and_a_new_segment(&root.join("this.log"));
+        let now = kr_ipc::now_ms();
+
+        assert!(
+            this.apply_retention_to_host(&root, retention, now, false)
+                .is_empty(),
+            "a pass that measures the host and finds it under its cap"
+        );
+        assert!(
+            this.apply_retention_to_host(&root, retention, now, false)
+                .is_empty(),
+            "and one that finds the reading standing"
+        );
+        assert_eq!(retained_bytes_under(&root), 16);
+
+        let taken = this.apply_retention_to_host(&root, retention, now, true);
+        assert_eq!(
+            taken
+                .iter()
+                .map(|eviction| (eviction.limit, eviction.bytes))
+                .collect::<Vec<_>>(),
+            vec![(RetentionLimit::Age, 8)],
+            "the pass that may takes the old segment by age, and the new one stays"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// KR-REQ-20.20, section 9: a pass that is not to remove output by age removes none for its age
+    /// where the host is over its cap, with the lock held elsewhere or held by the pass. Output
+    /// that goes for the cap is told by the bound that took it, and not by its age: the first
+    /// segment is eight days old and is the one the cap takes too.
+    #[test]
+    fn a_pass_not_to_remove_output_by_age_removes_output_for_the_cap_alone() {
+        let root = spool_directory("age-withheld-over-cap");
+        let retention = OutputRetention::new(
+            std::time::Duration::from_secs(7 * 24 * 60 * 60),
+            100,
+            1 << 20,
+        );
+        let mut other =
+            OutputHistory::with_spool(8, root.join("other.log"), SpoolLayout::new(8, 1 << 20))
+                .expect("a spool");
+        other.append(&[b'o'; 90]);
+        let mut this = history_over_an_old_and_a_new_segment(&root.join("this.log"));
+        let now = kr_ipc::now_ms();
+        assert_eq!(
+            retained_bytes_under(&root),
+            106,
+            "6 bytes over a cap of 100"
+        );
+
+        let held = the_host_cap_lock_held_elsewhere(&root);
+        assert!(
+            this.apply_retention_to_host(&root, retention, now, false)
+                .is_empty(),
+            "the lock is held elsewhere, and nothing is removed for the cap or for its age"
+        );
+        assert!(this.awaits_the_host_cap_lock());
+        drop(held);
+
+        let taken = this.apply_retention_to_host(&root, retention, now, false);
+        assert_eq!(
+            taken
+                .iter()
+                .map(|eviction| (eviction.limit, eviction.bytes))
+                .collect::<Vec<_>>(),
+            vec![(RetentionLimit::HostCap, 8)],
+            "with the lock the old segment goes for the cap"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// KR-PERF-003: a reading taken while a write to the spool is still to be made does not stand.
     /// The session counts the bytes of that write as held and the files do not have them yet, so
     /// the files outgrow the reading once it is made, with the session taking no output.
