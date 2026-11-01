@@ -1580,23 +1580,35 @@ async fn a_created_sessions_shell_reads_the_private_database_and_the_worker_says
         "the private entry has the truecolour flag"
     );
 
-    // The worker's own log, which is the job's diagnostics file, says the same.
-    let diagnostics = std::fs::read_dir(host.paths().jobs_dir())
-        .expect("the jobs directory")
-        .map(|entry| entry.expect("an entry").path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "diagnostics")
-        })
-        .map(|path| std::fs::read_to_string(path).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let line = diagnostics
-        .lines()
-        .find(|line| line.contains("terminfo: private database"))
-        .unwrap_or_else(|| {
-            panic!("the worker's diagnostics say nothing of terminfo: {diagnostics:?}")
-        });
+    // The worker's own log, which is the job's diagnostics file, says the same. The worker hands
+    // the line to a thread of its own, so the line is waited for as a condition. The thread has
+    // been held since the worker started, and the shell has run by now: it is let go here.
+    std::fs::write(&hold, b"").expect("lets the worker's diagnostics thread write");
+    let started = std::time::Instant::now();
+    let line = loop {
+        let diagnostics = std::fs::read_dir(host.paths().jobs_dir())
+            .expect("the jobs directory")
+            .map(|entry| entry.expect("an entry").path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "diagnostics")
+            })
+            .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(line) = diagnostics
+            .lines()
+            .find(|line| line.contains("terminfo: private database"))
+        {
+            break line.to_owned();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "waited {:?} for the worker to say which terminfo database it selected: {diagnostics:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     assert!(line.contains(&private), "{line}");
     // The log says which of the creator's variables were kept and never what they held.
     assert!(line.contains("(TERMINFO, TERMINFO_DIRS)"), "{line}");
