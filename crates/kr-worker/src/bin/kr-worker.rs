@@ -15,6 +15,11 @@
 //!                          ───worker ready──▶  (controller publishes the descriptor)
 //! ```
 
+// Every line this program says goes through `kr_worker::diagnostics`, whose thread writes it, so
+// that a standard error that has stopped draining holds nothing here. `eprintln!` and `dbg!` write
+// where they are called.
+#![deny(clippy::print_stderr, clippy::dbg_macro)]
+
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -40,6 +45,7 @@ use kr_shell_integration::host::HostError;
 use kr_shell_integration::host::endpoint::HostEndpoint;
 use kr_shell_integration::host::package::{PackageFault, ShellPackage, StartupMode};
 use kr_worker::action::time::TimeSources;
+use kr_worker::diagnostics::tell;
 use kr_worker::environment::{ExecutionContext, build as build_environment};
 use kr_worker::history::DEFAULT_RESIDENT_BYTES;
 use kr_worker::output::DEFAULT_SEND_QUEUE_BYTES;
@@ -92,7 +98,22 @@ struct Arguments {
     state_dir: std::path::PathBuf,
 }
 
+/// How long the program gives its lines to be written to its standard error before it ends.
+///
+/// A line said just before the process ends, as the one that says why it could not start is, is
+/// usually lost to the exit unless the thread that writes it is given the time. A standard error
+/// that drains takes a line in far less than this; one that has stopped draining holds the end of
+/// the process for this long and no longer.
+const DIAGNOSTICS_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn main() -> ExitCode {
+    let ended = serve();
+    kr_worker::diagnostics::drain(DIAGNOSTICS_DRAIN);
+    ended
+}
+
+/// Runs the worker for its session, and returns how the process is to end.
+fn serve() -> ExitCode {
     // A worker's lifetime must not depend on whatever started it. Becoming a session leader is
     // what detaches it: it leaves the launcher's session and its controlling terminal, so nothing
     // aimed at that terminal or that session reaches this process or the shell it will start. It
@@ -103,7 +124,7 @@ fn main() -> ExitCode {
     // Next: a worker of an installed release holds that release for as long as it runs, which is
     // for as long as its session does, and does not start at all once the release is being removed.
     if let Err(error) = kr_ipc::install::this_process() {
-        eprintln!("kr-worker: {error}");
+        tell(format_args!("{error}"));
         return ExitCode::FAILURE;
     }
     let arguments = Arguments::parse();
@@ -111,14 +132,14 @@ fn main() -> ExitCode {
     let runtime = match session_runtime(processors) {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("kr-worker: could not start: {error}");
+            tell(format_args!("could not start: {error}"));
             return ExitCode::FAILURE;
         }
     };
     match runtime.block_on(run(arguments)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("kr-worker: {error}");
+            tell(format_args!("{error}"));
             ExitCode::FAILURE
         }
     }
@@ -167,10 +188,9 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     ) {
         Ok(floor) => Some(Arc::new(floor)),
         Err(unusable) => {
-            eprintln!(
-                "kr-worker: {unusable}; this session serves no copy of authority that carries a UTC \
-                 deadline"
-            );
+            tell(format_args!(
+                "{unusable}; this session serves no copy of authority that carries a UTC deadline"
+            ));
             None
         }
     };
@@ -458,9 +478,9 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         .await
         .is_ok();
     if !ready_reported {
-        eprintln!(
-            "kr-worker: the controller did not receive the ready report; the session continues and is recoverable by challenge"
-        );
+        tell(format_args!(
+            "the controller did not receive the ready report; the session continues and is recoverable by challenge"
+        ));
     }
     // The rendezvous is finished. Every later conversation with a controller happens on this
     // worker's own endpoint, where it presents a generation token like any other client.
@@ -468,9 +488,10 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     drop(reader);
 
     // The worker exists for its session. When the session closes, the last record is written, every
-    // attachment is told, and the process ends; nothing here restarts a shell. A standard error that
-    // has stopped draining does not hold the process: the worker's diagnostics are written by a
-    // thread of their own, which the end of the process leaves behind.
+    // attachment is told, and the process ends; nothing here restarts a shell. The worker's
+    // diagnostics are written by a thread of their own, so a standard error that has stopped
+    // draining holds nothing here; `main` gives that thread a short time to write what it was
+    // handed, and the process ends after that with the thread still in its write.
     let _record = runtime.wait_closed().await;
     finish(&runtime, serving, bridge_server).await;
     Ok(())
@@ -522,9 +543,10 @@ fn ready_report(
 /// The root integration's endpoint goes with its shell. Each attachment is sent how the session
 /// closed, behind the output it was still owed, and one the session admitted that has not
 /// subscribed yet is owed it until it does or leaves. The process ends only once every one has it,
-/// or once [`CLOSURE_NOTICE_TIMEOUT`] has passed for a client that has stopped reading. A client
-/// that has gone holds nothing up. Ending first would take the connections with it, and every
-/// attachment would learn only that its connection had stopped.
+/// or once [`CLOSURE_NOTICE_TIMEOUT`] has passed for a client that has stopped reading, when the
+/// worker says so on its standard error and ends without it. A client that has gone holds nothing
+/// up. Ending first would take the connections with it, and every attachment would learn only that
+/// its connection had stopped.
 ///
 /// The endpoint goes on answering while this waits, so a client that asks how the session ended is
 /// told by the worker that ended it. A connection it accepts cannot attach to a closed session, and
@@ -540,11 +562,11 @@ async fn finish(
         server.abort();
     }
     if !runtime.closure_delivered(CLOSURE_NOTICE_TIMEOUT).await {
-        eprintln!(
-            "kr-worker: an attachment had not been sent the closure after {} seconds, and the \
-             worker ends without it",
+        tell(format_args!(
+            "an attachment had not been sent the closure after {} seconds, and the worker ends \
+             without it",
             CLOSURE_NOTICE_TIMEOUT.as_secs()
-        );
+        ));
     }
     serving.abort();
     let _ = serving.await;
@@ -710,11 +732,11 @@ fn session_config(
     );
     // The worker's own log says which terminfo database the session reads and what it kept of the
     // creator's, next to the other lines it writes about how it started the session.
-    eprintln!(
-        "kr-worker: session {}: {}",
+    tell(format_args!(
+        "session {}: {}",
         specification.session_id,
         launch_environment.sources.terminfo.describe()
-    );
+    ));
     let mut environment_pairs = launch_environment.to_pairs();
     // What the package's own launch sets: the runtime a shell that is not built here needs to
     // find, and the directory its module is found in by name, put first. It goes in before the

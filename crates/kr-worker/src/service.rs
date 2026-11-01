@@ -2039,9 +2039,10 @@ impl WorkerService {
     ///
     /// This is called with neither the session's lock nor the dispatch barrier held, and it waits
     /// for nothing: the line is handed to the thread that writes this worker's diagnostics, so a
-    /// standard error that has stopped draining holds that thread and no pass, no session call and
-    /// not the end of the process. The module `diagnostics` says where the reason is found, and
-    /// what becomes of a write that fails.
+    /// standard error that has stopped draining holds that thread and no pass and no session call.
+    /// The worker's program waits for that thread only for a short fixed time when it ends. The
+    /// module `diagnostics` says where the reason is found, and what becomes of a write that
+    /// fails.
     fn say_output_reason(&self, report: &crate::session::OutputPassReport) {
         self.output_reasons.say(
             report.reason.as_deref(),
