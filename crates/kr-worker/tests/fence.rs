@@ -2976,6 +2976,13 @@ impl RealShell {
     /// Attaches a terminal that takes the keys, as a person's terminal does.
     #[cfg(unix)]
     fn keys(&self) -> RealKeys {
+        let attachment_id = self.terminal_attached();
+        self.takes_the_keys(attachment_id)
+    }
+
+    /// Attaches a terminal that holds nothing, as a second window on the session is.
+    #[cfg(unix)]
+    fn terminal_attached(&self) -> AttachmentId {
         let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
         let mut params = terminal(self.runtime.session().config().session_id);
         if self.kind == ShellKind::Fish {
@@ -2983,11 +2990,18 @@ impl RealShell {
             // can supply the encoding the application reads.
             params.terminal_profile_id = Nullable::some("xterm-kitty".to_owned());
         }
+        self.runtime
+            .session()
+            .attach(&params, params.requested.clone(), attachment_id)
+            .expect("attaches");
+        attachment_id
+    }
+
+    /// Gives an attached terminal the keys, taking them from whoever holds them.
+    #[cfg(unix)]
+    fn takes_the_keys(&self, attachment_id: AttachmentId) -> RealKeys {
         let epoch = {
             let mut session = self.runtime.session();
-            session
-                .attach(&params, params.requested.clone(), attachment_id)
-                .expect("attaches");
             session
                 .acquire_input(attachment_id, ConnectionId::new(kr_ipc::new_uuid()), None)
                 .expect("takes the keys");
@@ -7928,6 +7942,318 @@ async fn a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_agai
         .await
         .unwrap_or_else(|_| panic!("{kind:?}: the reader never proved its queues again"));
         shell.close().await;
+    }
+}
+
+// --------------------------------------------------------------------------------------------
+// Ownership transfer during an end of input, at a real root prompt.
+// --------------------------------------------------------------------------------------------
+
+/// What a terminal sends to end its input at an empty prompt: the byte the tty's `VEOF` is by
+/// default.
+#[cfg(unix)]
+const END_OF_INPUT: &[u8] = &[0x04];
+
+/// How many times a real session's retained output says what a bridge prints when it consumes an
+/// end-of-input gesture it cannot attribute.
+#[cfg(unix)]
+fn hints_printed(shell: &RealShell) -> usize {
+    let seen = retained(&shell.runtime.session());
+    let hint = kr_protocol::root::DETACH_HINT.as_bytes();
+    seen.windows(hint.len())
+        .filter(|window| *window == hint)
+        .count()
+}
+
+#[cfg(unix)]
+impl RealShell {
+    /// The attachments the session holds.
+    fn attached(&self) -> Vec<AttachmentId> {
+        self.runtime
+            .session()
+            .attachments()
+            .iter()
+            .map(|summary| summary.attachment_id)
+            .collect()
+    }
+
+    /// Waits until the reader has proved a fence for `attachment`: the shell is at an empty prompt
+    /// and the worker holds the proof that the keys reaching it are that attachment's.
+    async fn until_fenced_for(&self, attachment: AttachmentId) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                {
+                    let session = self.runtime.session();
+                    let driver = session.fence().expect("a driver");
+                    if driver.state() == FenceState::Fenced
+                        && driver
+                            .fence()
+                            .is_some_and(|fence| fence.originating_attachment == attachment)
+                    {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the reader never proved a fence for {attachment}"));
+    }
+
+    /// Waits until the session no longer holds `attachment`.
+    async fn until_gone(&self, attachment: AttachmentId) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while self.attached().contains(&attachment) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{attachment} was not taken off the session"));
+    }
+
+    /// Types a command whose output the shell's own echo of the line cannot make, and waits for it:
+    /// the shell is at its prompt and takes what it is typed.
+    async fn answers_a_command(&self, keys: &mut RealKeys, word: &str) {
+        keys.type_line(self, &format!("printf 'kr-%s-ran\\n' {word}"));
+        // The terminal writes the line end it is asked for as a carriage return and a line feed.
+        self.produced(format!("kr-{word}-ran\r\n").as_bytes(), 1)
+            .await;
+    }
+}
+
+/// KR-REQ-27.05, ownership transfer during an end of input: an end of input typed at the empty
+/// prompt of a real root shell, in each of the three ways a takeover can meet it. The end of input is the shell's: it reaches it once, from the attachment
+/// that held the lease, and removes that attachment alone; or it does not reach it, and the refusal
+/// is recorded. It is never the next holder's, and it never ends the shell.
+///
+/// * The takeover first: the old holder's end of input carries a lease it no longer holds and is
+///   refused at the worker (`LeaseLost`), so the shell is given nothing, prints no hint, and takes
+///   the next holder's command.
+/// * The end of input reached the terminal and the takeover came before the shell's detach was
+///   handled (the session is held across both, so the order is the case's): the detach names a
+///   fence the takeover invalidated, so it is refused, nobody is taken off, the shell consumes the
+///   gesture and prints the hint once, and the next holder's command runs.
+/// * The detach handled first: the holder is taken off the session once and the attachment that
+///   waited is untouched; its own end of input, typed after it takes the keys and the reader proves
+///   a fence for it, takes it off and nothing else.
+///
+/// Zsh and Bash are the shells whose package patches the editor's own end-of-file decision; Fish
+/// binds its own gesture. A shell that closed on the gesture, or that took the wrong attachment off,
+/// fails the first case that sees it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
+async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_once_from_its_holder_or_not_at_all()
+ {
+    for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+        let package = installed_package_of(kind);
+        let start = || {
+            RealShell::start(
+                &package,
+                kr_protocol::session::LaunchProfile::default(),
+                Vec::new(),
+                None,
+            )
+        };
+
+        // The takeover first.
+        {
+            let shell = start().await;
+            let first = shell.keys();
+            let second = shell.terminal_attached();
+            shell.until_fenced_for(first.attachment_id).await;
+            let (refused, epoch) = {
+                let mut session = shell.runtime.session();
+                session
+                    .acquire_input(second, ConnectionId::new(kr_ipc::new_uuid()), None)
+                    .expect("the second terminal takes the keys");
+                let epoch = session.lease().epoch.get();
+                (
+                    session.write_input(
+                        first.attachment_id,
+                        first.epoch,
+                        first.sequence,
+                        END_OF_INPUT,
+                        None,
+                        std::time::Instant::now(),
+                    ),
+                    epoch,
+                )
+            };
+            assert!(
+                matches!(refused, Err(kr_worker::WorkerError::LeaseLost)),
+                "{kind:?}: an end of input typed under a lease the terminal no longer holds was not \
+                 refused as a lost lease: {refused:?}"
+            );
+            let mut second = RealKeys {
+                attachment_id: second,
+                epoch,
+                sequence: 0,
+            };
+            shell.until_fenced_for(second.attachment_id).await;
+            shell.answers_a_command(&mut second, "first").await;
+            assert_eq!(
+                hints_printed(&shell),
+                0,
+                "{kind:?}: the shell was given an end of input that was refused"
+            );
+            assert_eq!(
+                shell.attached().len(),
+                2,
+                "{kind:?}: a refused end of input took an attachment off"
+            );
+            assert_eq!(
+                shell.runtime.state(),
+                kr_protocol::session::SessionState::Live
+            );
+            assert!(shell.close().await, "{kind:?}: the session did not close");
+        }
+
+        // The end of input reached the terminal; the takeover came before the detach was handled.
+        {
+            let shell = start().await;
+            let first = shell.keys();
+            let second = shell.terminal_attached();
+            shell.until_fenced_for(first.attachment_id).await;
+            let epoch = {
+                // Held across the write and the takeover: the bridge handles the shell's detach
+                // under this hold, so it is handled after the takeover whatever the shell does.
+                let mut session = shell.runtime.session();
+                session
+                    .write_input(
+                        first.attachment_id,
+                        first.epoch,
+                        first.sequence,
+                        END_OF_INPUT,
+                        None,
+                        std::time::Instant::now(),
+                    )
+                    .expect("the holder's end of input is accepted");
+                shell.runtime.flush_input();
+                // The byte is the terminal's before the lease moves, so what the takeover leaves
+                // behind is nothing, and the shell has been given the gesture.
+                let started = std::time::Instant::now();
+                while !shell
+                    .runtime
+                    .input()
+                    .terminal_writes()
+                    .iter()
+                    .any(|write| write.of_a_lease && write.bytes.contains(&END_OF_INPUT[0]))
+                {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(60),
+                        "{kind:?}: the end of input was never written to the terminal"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let acquired = session
+                    .acquire_input(second, ConnectionId::new(kr_ipc::new_uuid()), None)
+                    .expect("the second terminal takes the keys");
+                assert_eq!(
+                    acquired.discarded_bytes,
+                    U64::new(0),
+                    "{kind:?}: the takeover discarded bytes that were already the terminal's"
+                );
+                session.lease().epoch.get()
+            };
+            let mut second = RealKeys {
+                attachment_id: second,
+                epoch,
+                sequence: 0,
+            };
+            // The shell consumes the gesture and says once how to detach by hand.
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while hints_printed(&shell) == 0 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{kind:?}: the shell consumed an end of input with a stale fence and did not \
+                     say how to detach"
+                )
+            });
+            shell.until_fenced_for(second.attachment_id).await;
+            shell.answers_a_command(&mut second, "second").await;
+            assert_eq!(
+                hints_printed(&shell),
+                1,
+                "{kind:?}: the gesture was consumed once"
+            );
+            let held = shell.attached();
+            assert!(
+                held.contains(&first.attachment_id) && held.contains(&second.attachment_id),
+                "{kind:?}: an end of input that lost the takeover took an attachment off: {held:?}"
+            );
+            assert_eq!(
+                shell.runtime.state(),
+                kr_protocol::session::SessionState::Live
+            );
+            assert!(shell.close().await, "{kind:?}: the session did not close");
+        }
+
+        // The detach handled first.
+        {
+            let shell = start().await;
+            let mut first = shell.keys();
+            let waiting = shell.terminal_attached();
+            shell.until_fenced_for(first.attachment_id).await;
+            shell
+                .runtime
+                .session()
+                .write_input(
+                    first.attachment_id,
+                    first.epoch,
+                    first.sequence,
+                    END_OF_INPUT,
+                    None,
+                    std::time::Instant::now(),
+                )
+                .expect("the holder's end of input is accepted");
+            first.sequence += 1;
+            shell.runtime.flush_input();
+            shell.until_gone(first.attachment_id).await;
+            assert_eq!(
+                shell.attached(),
+                vec![waiting],
+                "{kind:?}: the end of input took the holder off, and nothing else"
+            );
+            assert_eq!(
+                hints_printed(&shell),
+                0,
+                "{kind:?}: a detach that was accepted printed the hint"
+            );
+            // The next holder is attributed its own gesture, and the shell is still there to take it.
+            let mut next = shell.takes_the_keys(waiting);
+            shell.until_fenced_for(waiting).await;
+            shell.answers_a_command(&mut next, "third").await;
+            shell
+                .runtime
+                .session()
+                .write_input(
+                    next.attachment_id,
+                    next.epoch,
+                    next.sequence,
+                    END_OF_INPUT,
+                    None,
+                    std::time::Instant::now(),
+                )
+                .expect("the next holder's end of input is accepted");
+            shell.runtime.flush_input();
+            shell.until_gone(waiting).await;
+            assert_eq!(
+                shell.attached(),
+                Vec::<AttachmentId>::new(),
+                "{kind:?}: each gesture took off the attachment that typed it"
+            );
+            assert_eq!(
+                shell.runtime.state(),
+                kr_protocol::session::SessionState::Live,
+                "{kind:?}: the end of input closed the session"
+            );
+            assert!(shell.close().await, "{kind:?}: the session did not close");
+        }
     }
 }
 
