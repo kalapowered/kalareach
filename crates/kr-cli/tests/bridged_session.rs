@@ -3712,12 +3712,22 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
         .unwrap_or_default()
 }
 
+/// What a case sets for the process it runs this test binary as. The cases that exist only to be
+/// run that way (they are ignored, and fail or run a machine's own service manager by design) do
+/// nothing without it, so that a run of the ignored cases of this suite passes.
+const AS_A_PROCESS_OF_A_CASE: &str = "KR_TEST_AS_A_PROCESS_OF_A_CASE";
+
+/// Whether this process was started by a case that exists to run the case it is running.
+fn as_a_process_of_a_case() -> bool {
+    std::env::var_os(AS_A_PROCESS_OF_A_CASE).is_some()
+}
+
 /// Runs this test binary again with `arguments`, as a process of its own, and gives what it did.
 /// For a case that needs what a process writes to its own standard error, or what it does with a
 /// `PATH` of its own, which a thread of this one cannot give it.
 fn this_binary_with(arguments: &[&str], path: Option<&Path>) -> std::process::Output {
     let mut command = std::process::Command::new(std::env::current_exe().expect("this binary"));
-    command.args(arguments);
+    command.args(arguments).env(AS_A_PROCESS_OF_A_CASE, "1");
     if let Some(path) = path {
         command.env("PATH", path);
     }
@@ -3796,6 +3806,9 @@ exit 0
 #[test]
 #[ignore = "run as a process of its own by a_removal_that_is_asked_again_leaves_a_line_on_standard_error"]
 fn a_removal_that_stalls_once_and_is_then_answered() {
+    if !as_a_process_of_a_case() {
+        return;
+    }
     let directory = tempfile::tempdir().expect("a directory");
     let _held = held_in(stand_in_runtime_that_stalls_its_first_removal(
         directory.path(),
@@ -3850,6 +3863,9 @@ fn a_case_that_passes_fails_when_its_container_could_not_be_removed() {
 #[test]
 #[ignore = "run as a process of its own by a_container_that_cannot_be_removed_is_recorded_whatever_the_harness_captures"]
 fn a_case_fails_while_its_container_cannot_be_removed() {
+    if !as_a_process_of_a_case() {
+        return;
+    }
     let directory = tempfile::tempdir().expect("a directory");
     let _held = held_in(stand_in_runtime(directory.path(), &[], &["rm"]));
     panic!("the case's own assertion fails");
@@ -4275,6 +4291,9 @@ fn a_call_that_ended_and_left_something_holding_its_output_fails_and_names_the_c
 #[test]
 #[ignore = "run as a process of its own by a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skipped"]
 fn a_user_manager_is_started_with_a_systemctl_that_is_given_two_seconds() {
+    if !as_a_process_of_a_case() {
+        return;
+    }
     let tree = teardown::Tree::create();
     let home = tree.root().join("home");
     std::fs::create_dir_all(&home).expect("a home");
@@ -4290,6 +4309,9 @@ fn a_user_manager_is_started_with_a_systemctl_that_is_given_two_seconds() {
 #[test]
 #[ignore = "run as a process of its own by a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skipped"]
 fn a_user_manager_is_started_with_a_systemctl_that_is_given_the_ordinary_time() {
+    if !as_a_process_of_a_case() {
+        return;
+    }
     let tree = teardown::Tree::create();
     let home = tree.root().join("home");
     std::fs::create_dir_all(&home).expect("a home");
@@ -4329,7 +4351,9 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
         command
             .args(["--ignored", "--exact", case, "--nocapture"])
             .env("PATH", path)
-            .env_remove("XDG_RUNTIME_DIR");
+            .env(AS_A_PROCESS_OF_A_CASE, "1")
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("LC_ALL");
         to_its_end(command, Duration::from_secs(120))
     };
     let short = "a_user_manager_is_started_with_a_systemctl_that_is_given_two_seconds";
