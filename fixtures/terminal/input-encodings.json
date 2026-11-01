@@ -2,7 +2,7 @@
   "cases": [
     {
       "bytes": "1b5b303b303b31323335343b313b303b315f",
-      "covers": "KR-REQ-08.52 KR-REQ-08.56",
+      "covers": "KR-REQ-08.52",
       "id": "composed-character",
       "records": [
         {
@@ -17,7 +17,7 @@
     },
     {
       "bytes": "1b5b303b303b35353339393b313b303b315f1b5b303b303b35363839333b313b303b315f",
-      "covers": "KR-REQ-08.52 KR-REQ-08.56",
+      "covers": "KR-REQ-08.52",
       "id": "character-outside-the-basic-plane",
       "records": [
         {
@@ -40,7 +40,7 @@
     },
     {
       "bytes": "1b5b3232313b32363b303b313b303b315f1b5b36393b31383b3233343b313b303b315f",
-      "covers": "KR-REQ-08.56",
+      "covers": "KR-REQ-08.52",
       "id": "dead-key-then-the-character-it-composes",
       "records": [
         {
@@ -63,7 +63,7 @@
     },
     {
       "bytes": "1b5b35303b333b36343b313b393b315f",
-      "covers": "KR-REQ-08.52 KR-REQ-08.56",
+      "covers": "KR-REQ-08.52",
       "id": "alt-graph",
       "records": [
         {
@@ -78,7 +78,7 @@
     },
     {
       "bytes": "1b5b36353b33303b39373b313b303b345f1b5b36353b33303b39373b303b303b315f",
-      "covers": "KR-REQ-08.52 KR-REQ-08.56",
+      "covers": "KR-REQ-08.52",
       "id": "repeat-and-key-up",
       "records": [
         {
