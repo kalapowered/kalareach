@@ -720,11 +720,11 @@ pub struct Controller {
     /// The only gateway a paired device may name in the credential it hands this host, and the
     /// origin an owed revocation is asked at when no credential is held for it. Read once at start.
     gateway_origin: String,
-    /// How long a paired device's request waits for its effect before it is told the outcome is
+    /// How a paired device's request waits for its effect before it is told the outcome is
     /// unknown, where a suite gave this host's daemon a wait of its own. Read once at start.
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    effect_wait: std::time::Duration,
+    effect_wait: Option<crate::testing::EffectWait>,
     /// The paired devices, for the device method group.
     ///
     /// A view on this daemon's own registry database, which is the file the network half keeps its
@@ -901,6 +901,10 @@ pub struct Controller {
     /// record only the daemon that holds it may write takes it as proof.
     lock: SingletonLock,
 }
+
+/// The wait for the effect of a paired device's mutation ended before the effect did.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EffectWaitEnded;
 
 impl std::fmt::Debug for Controller {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1140,21 +1144,23 @@ impl Controller {
         &self.delivery
     }
 
-    /// How long a paired device's request waits for its effect before it is told the outcome is
-    /// unknown: the wait a suite gave this daemon, or [`net::dispatch::EFFECT_WAIT`] where it gave
-    /// none.
-    #[cfg(feature = "testing")]
-    #[must_use]
-    pub(crate) const fn effect_wait(&self) -> std::time::Duration {
-        self.effect_wait
-    }
-
-    /// How long a paired device's request waits for its effect before it is told the outcome is
-    /// unknown: [`net::dispatch::EFFECT_WAIT`], in every shipped build.
-    #[cfg(not(feature = "testing"))]
-    #[must_use]
-    pub(crate) const fn effect_wait(&self) -> std::time::Duration {
-        net::dispatch::EFFECT_WAIT
+    /// Waits for the effect of a paired device's mutation, which runs on a task that outlives the
+    /// connection, and returns what it settled as, or says the wait ended first: the caller is then
+    /// told the outcome is unknown and the effect goes on.
+    ///
+    /// The wait is [`net::dispatch::EFFECT_WAIT`], or the one a suite gave this daemon, which only a
+    /// build with the `testing` feature has.
+    pub(crate) async fn within_effect_wait<F: Future>(
+        &self,
+        effect: F,
+    ) -> std::result::Result<F::Output, EffectWaitEnded> {
+        #[cfg(feature = "testing")]
+        if let Some(wait) = &self.effect_wait {
+            return wait.within(effect).await.ok_or(EffectWaitEnded);
+        }
+        tokio::time::timeout(net::dispatch::EFFECT_WAIT, effect)
+            .await
+            .map_err(|_| EffectWaitEnded)
     }
 
     /// Returns the loop that drives delivery, and the credentials it delivers under.

@@ -355,11 +355,11 @@ pub struct Waits {
     /// The signed release matrix as the daemon reads it, when the suite serves one: the key the
     /// daemon verifies it against and the timer the daemon's reads of it wait by.
     pub release_matrix: Option<ReleaseMatrixStage>,
-    /// How long the daemon waits for the effect of a paired device's mutation before it answers
-    /// that the outcome is unknown, when the suite does not take the daemon's own wait. A suite
-    /// whose cases run Git and write to the disk on a machine that may be loaded gives it a long
-    /// one; a suite about the wait gives it a short one.
-    pub effect_wait: Option<std::time::Duration>,
+    /// How the daemon waits for the effect of a paired device's mutation before it answers that
+    /// the outcome is unknown, when the suite does not take the daemon's own wait. A suite whose
+    /// cases run Git and write to the disk on a machine that may be loaded gives it a long one; a
+    /// suite about the wait holds the timer it is counted by.
+    pub effect_wait: Option<kr_controller::testing::EffectWait>,
 }
 
 /// How a suite stands the signed release matrix up for a daemon.
@@ -492,13 +492,20 @@ impl Host {
     /// effect of a paired device's mutation for the long wait a suite gives a loaded machine
     /// ([`kr_controller::testing::HUNG_EFFECT`]).
     pub async fn start_holding_effects(owner: &DeviceKeys) -> Self {
-        Self::start_with_effect_wait(owner, kr_controller::testing::HUNG_EFFECT).await
+        Self::start_with_effect_wait(
+            owner,
+            kr_controller::testing::EffectWait::after(kr_controller::testing::HUNG_EFFECT),
+        )
+        .await
     }
 
     /// Starts a daemon with `owner` as its first owner, as [`Self::start`] does, that answers a
-    /// paired device's mutation as one whose outcome is unknown once `bound` has passed without its
+    /// paired device's mutation as one whose outcome is unknown once `wait` has ended without its
     /// effect ending.
-    pub async fn start_with_effect_wait(owner: &DeviceKeys, bound: Duration) -> Self {
+    pub async fn start_with_effect_wait(
+        owner: &DeviceKeys,
+        wait: kr_controller::testing::EffectWait,
+    ) -> Self {
         let mut host = Self::start_on(
             kr_ipc::testing::TempHost::create(),
             room::TestRoom::new(),
@@ -511,7 +518,7 @@ impl Host {
             Clocks::system(),
             None,
             Waits {
-                effect_wait: Some(bound),
+                effect_wait: Some(wait),
                 ..Waits::default()
             },
         )
@@ -1023,10 +1030,8 @@ impl Host {
                             None => started.await,
                         }
                     };
-                    match waits.effect_wait {
-                        Some(bound) => {
-                            kr_controller::testing::with_effect_wait(bound, started).await
-                        }
+                    match waits.effect_wait.clone() {
+                        Some(wait) => kr_controller::testing::with_effect_wait(wait, started).await,
                         None => started.await,
                     }
                 }),

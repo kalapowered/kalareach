@@ -1250,7 +1250,7 @@ impl Controller {
             delivery_runtime,
             gateway_origin: crate::push::gateway_origin_for_start(),
             #[cfg(feature = "testing")]
-            effect_wait: crate::testing::effect_wait().unwrap_or(super::net::dispatch::EFFECT_WAIT),
+            effect_wait: crate::testing::effect_wait(),
             devices,
             lifetimes,
             owner,

@@ -108,35 +108,76 @@ pub(crate) fn git_read_bound() -> Option<Duration> {
 }
 
 tokio::task_local! {
-    /// How long the daemon being started in this task waits for the effect of a mutation a paired
+    /// How the daemon being started in this task waits for the effect of a mutation a paired
     /// device sends.
-    static EFFECT_WAIT_BOUND: Duration;
+    static EFFECT_WAIT_OF_THE_START: EffectWait;
 }
 
-/// Runs `start` so that the daemon it starts waits `bound` for the effect of a mutation a paired
-/// device sends before it answers that the outcome is unknown, in place of
-/// [`crate::service::net::dispatch::EFFECT_WAIT`].
+/// How a daemon waits for the effect of a mutation a paired device sends before it answers that
+/// the outcome is unknown: for how long, and by which timer.
 ///
-/// The daemon's own bound is its choice of how long a caller is kept waiting. A suite that is about
+/// The daemon's own wait is its choice of how long a caller is kept waiting. A suite that is about
 /// something other than that choice should not end because a loaded machine took longer than the
-/// bound to run a Git child or to write a file: it gives the daemon a long bound, and an effect
-/// that finishes inside it is answered whenever it does. A suite about the bound itself gives a
-/// short one.
-pub async fn with_effect_wait<F: Future>(bound: Duration, start: F) -> F::Output {
-    EFFECT_WAIT_BOUND.scope(bound, start).await
+/// wait to run a Git child or to write a file: it gives the daemon a long wait ([`Self::after`]),
+/// and an effect that finishes inside it is answered whenever it does. A suite about the wait
+/// holds the timer it is counted by ([`Self::held_by`]), so that the wait ends when the suite lets
+/// it and no clock decides which of the effect and the wait comes first.
+#[derive(Clone, Debug)]
+pub struct EffectWait {
+    bound: Duration,
+    timer: Arc<dyn Timer>,
+}
+
+impl EffectWait {
+    /// A wait of `bound` on the machine's clock.
+    #[must_use]
+    pub fn after(bound: Duration) -> Self {
+        Self {
+            bound,
+            timer: Arc::new(crate::quiet::RealTimer),
+        }
+    }
+
+    /// The wait a shipped daemon has, [`crate::service::net::dispatch::EFFECT_WAIT`], counted by
+    /// `timer`: it ends when `timer` lets the wait it was asked for end.
+    #[must_use]
+    pub fn held_by(timer: Arc<dyn Timer>) -> Self {
+        Self {
+            bound: crate::service::net::dispatch::EFFECT_WAIT,
+            timer,
+        }
+    }
+
+    /// Waits for `effect`, and returns what it settled as, or `None` when the wait ended first.
+    /// An effect that has settled counts before a wait that has ended, as it does in the shipped
+    /// daemon's timeout.
+    pub(crate) async fn within<F: Future>(&self, effect: F) -> Option<F::Output> {
+        tokio::select! {
+            biased;
+            settled = effect => Some(settled),
+            () = self.timer.sleep(self.bound) => None,
+        }
+    }
+}
+
+/// Runs `start` so that the daemon it starts waits as `wait` says for the effect of a mutation a
+/// paired device sends, in place of
+/// [`crate::service::net::dispatch::EFFECT_WAIT`] on the machine's clock.
+pub async fn with_effect_wait<F: Future>(wait: EffectWait, start: F) -> F::Output {
+    EFFECT_WAIT_OF_THE_START.scope(wait, start).await
 }
 
 /// A long effect wait, ten minutes.
 ///
-/// The one a suite that is about something other than the daemon's own bound gives its daemons
-/// through [`with_effect_wait`], as an allowance for a loaded machine: an effect that finishes
-/// inside it is answered whenever it does, and one that does not is told the outcome is unknown,
-/// as in the field.
+/// The one a suite that is about something other than the daemon's own wait gives its daemons
+/// through [`with_effect_wait`] and [`EffectWait::after`], as an allowance for a loaded machine: an
+/// effect that finishes inside it is answered whenever it does, and one that does not is told the
+/// outcome is unknown, as in the field.
 pub const HUNG_EFFECT: Duration = Duration::from_secs(600);
 
 /// The wait a suite gave the daemon being started for an effect, when it did.
-pub(crate) fn effect_wait() -> Option<Duration> {
-    EFFECT_WAIT_BOUND.try_with(|bound| *bound).ok()
+pub(crate) fn effect_wait() -> Option<EffectWait> {
+    EFFECT_WAIT_OF_THE_START.try_with(Clone::clone).ok()
 }
 
 /// The environment variable that stands the account service at an origin for a daemon a suite

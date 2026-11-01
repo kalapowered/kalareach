@@ -13,6 +13,7 @@ mod net_support;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::net::dispatch::EFFECT_WAIT;
 use kr_controller::sharing::ShareRequest;
+use kr_controller::testing::{EffectWait, HeldTimer};
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::GrantExpiry;
@@ -31,6 +32,8 @@ use kr_protocol::sharing::{
 use net_support::{
     Device, Host, MovedWall, RawDevice, on_the_host, owned_by, pair_with, proposal, recipient,
 };
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Shares `session_id` with `recipient` as a viewer, as the owner at this machine does.
@@ -163,14 +166,28 @@ async fn kr_req_25_10_a_device_redeems_its_invitation_once_and_a_repeat_of_the_a
 /// A request whose effect outlasts the host's wait for it is told the outcome is unknown, and the
 /// effect goes on: the action presented again is answered as the effect ended.
 ///
-/// The host waits [`EFFECT_WAIT`] in the field, and a suite can give a daemon a shorter wait; the
-/// redemption is held at the store until the answer has come, so the wait is what ends the request
-/// and nothing else.
+/// The host's wait is counted by a timer the case holds, and the redemption is held at the store
+/// until the answer has come. The order of events decides the case: the host starts its wait, the
+/// redemption reaches the store and is held there, the case ends the wait, and the request is
+/// answered that the outcome is unknown while the effect is still held. The wait is what ends the
+/// request and nothing else, and no clock decides which of the effect and the wait comes first, so
+/// nothing in the case depends on how long the host takes to write the action's route or to bring
+/// the redemption to the store.
+///
+/// The limits that remain are the request's own. The raw device asks for two minutes from the
+/// moment the host receives the request, and the host refuses the redemption by name if it reaches
+/// its commit after that, which leaves the grant inactive and the case waiting for an effect that
+/// ended. The raw device also stops waiting for an answer two minutes after it sent the request.
+/// The route's write, the redemption's way to the store, the hold and the case's letting go of it
+/// have to take under two minutes together. [`within`] ends a case that went wrong and decides
+/// nothing for a run that stays inside them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repeat_is_answered_as_it_ended()
  {
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start_with_effect_wait(&owner, Duration::from_millis(250)).await;
+    let wait = HeldTimer::held();
+    let host =
+        Host::start_with_effect_wait(&owner, EffectWait::held_by(Arc::clone(&wait) as _)).await;
     let (device, record) = recipient(&host, &owner).await;
     let issued = shared(
         &host,
@@ -189,44 +206,51 @@ async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repea
     // different action.
     let window = connection.action_window_id();
     let (arrived, go) = host.controller().sharing().grants().pause_before_effect();
-    // The host's wait is 250 ms and the answer comes when it ends. The 40 s does not measure that
-    // wait: it is the detector of a host that did not end the request at the wait it was given,
-    // and of one that never answers. It sits under [`EFFECT_WAIT`] so a host that waits its own 45 s
-    // fails the case, and it is wide of 250 ms because the host writes the action's route before
-    // its timer starts, which a stalled disk can hold for some of the limit.
-    let told = tokio::time::timeout(
-        Duration::from_secs(40),
-        connection.mutate_in(
-            window.clone(),
-            Method::GrantRedeem,
-            action,
-            on_the_host(&host),
-            &redeem,
-        ),
-    )
-    .await
-    .expect("the host gave up on the held effect at the wait it was given")
-    .expect_err("an effect that has not ended is not an answer");
-    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
-    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(60)))
-        .await
-        .expect("the wait for the request ran")
-        .expect("the redemption reached the store and is held there");
-    assert!(
-        !is_active(&host, issued.grant.grant_id),
-        "the effect has not happened: the request was told nothing of it"
+    let wait_ended = AtomicBool::new(false);
+    let (told, ()) = tokio::join!(
+        async {
+            let told = connection
+                .mutate_in(
+                    window.clone(),
+                    Method::GrantRedeem,
+                    action,
+                    on_the_host(&host),
+                    &redeem,
+                )
+                .await;
+            assert!(
+                wait_ended.load(Ordering::SeqCst),
+                "the host answered before its wait was ended: {told:?}"
+            );
+            told
+        },
+        within("the host's wait and the held redemption", async {
+            // The host has started its wait once the timer has been asked for it, and the wait
+            // goes on until the case lets it end.
+            let (_, end_the_wait) = wait.next_wait().await;
+            tokio::task::spawn_blocking(move || arrived.recv())
+                .await
+                .expect("the wait for the redemption ran")
+                .expect("the redemption reached the store and is held there");
+            assert!(
+                !is_active(&host, issued.grant.grant_id),
+                "the effect has not happened: the request was told nothing of it"
+            );
+            wait_ended.store(true, Ordering::SeqCst);
+            end_the_wait.notify_one();
+        }),
     );
+    let told = told.expect_err("an effect that has not ended is not an answer");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
 
     // The effect goes on when it is let go, and the action presented again is answered as it ended.
     go.send(()).expect("the held redemption is let go");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    while !is_active(&host, issued.grant.grant_id) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the effect went on to its end after the host stopped waiting for it"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    within("the effect to go on to its end", async {
+        while !is_active(&host, issued.grant.grant_id) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
     // The grant becomes active in the commit that keeps the action's receipt, so an action
     // presented once the grant is active is answered from that receipt.
     let repeated = connection
@@ -243,6 +267,14 @@ async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repea
     assert_eq!(redeemed.grant.grant_id, issued.grant.grant_id);
     connection.close();
     host.stop().await;
+}
+
+/// A failure guard for a wait on a condition: the case decides on what the host did, and this only
+/// keeps a case that went wrong from hanging.
+async fn within<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(180), work)
+        .await
+        .unwrap_or_else(|_| panic!("gave up waiting for {what}"))
 }
 
 /// KR-REQ-25.10: withdrawing an invitation is revoking the grant it carries, and a withdrawn

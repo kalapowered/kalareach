@@ -894,7 +894,7 @@ impl RemoteConnection {
                         )
                         .await;
                 });
-                match tokio::time::timeout(self.controller.effect_wait(), answered).await {
+                match self.controller.within_effect_wait(answered).await {
                     Ok(Ok(Ok(closed))) => {
                         // A close the worker answered from its journal is a read of that receipt,
                         // and this is the check section 23 wants before either half of a retained
@@ -960,7 +960,7 @@ impl RemoteConnection {
                         .project_mutation(&actor_id, &mutation, method, carried, Some(grant))
                         .await
                 });
-                match tokio::time::timeout(self.controller.effect_wait(), effect).await {
+                match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(outcome)) => ControlFrame::Response(Response {
                         request_id,
                         outcome: match outcome {
@@ -1007,7 +1007,7 @@ impl RemoteConnection {
                         .write_frame(&actor_id, &mutation, method, carried, held, None)
                         .await
                 });
-                match tokio::time::timeout(self.controller.effect_wait(), effect).await {
+                match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(answer)) => super::narrowing::shown_materialisation(answer),
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
@@ -1052,7 +1052,7 @@ impl RemoteConnection {
                         .write_frame(&actor_id, &mutation, method, carried, held, Some(grant))
                         .await
                 });
-                match tokio::time::timeout(self.controller.effect_wait(), effect).await {
+                match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(answer)) => super::narrowing::shown_working_tree_change(answer, method),
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
@@ -1109,7 +1109,7 @@ impl RemoteConnection {
                         .catalogue_write(&actor_id, &mutation, method, confirmations, admission)
                         .await
                 });
-                match tokio::time::timeout(self.controller.effect_wait(), effect).await {
+                match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(outcome)) => ControlFrame::Response(Response {
                         request_id,
                         outcome: match outcome {
@@ -1154,7 +1154,7 @@ impl RemoteConnection {
                         .write_frame(&controller, &caller, &actor_id, &mutation, method, &carried)
                         .await
                 });
-                match tokio::time::timeout(self.controller.effect_wait(), effect).await {
+                match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(answer)) => answer,
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
@@ -1278,10 +1278,7 @@ impl RemoteConnection {
                     drop(hold);
                     kept.and(outcome)
                 });
-                settled(
-                    request_id,
-                    tokio::time::timeout(self.controller.effect_wait(), effect).await,
-                )
+                settled(request_id, self.controller.within_effect_wait(effect).await)
             }
             // A redemption is this daemon's own effect, once per actor's action, for the device
             // that sends it and no other: the invitation names the device that may redeem it. The
@@ -1312,10 +1309,7 @@ impl RemoteConnection {
                         )
                         .await
                 });
-                settled(
-                    request_id,
-                    tokio::time::timeout(self.controller.effect_wait(), effect).await,
-                )
+                settled(request_id, self.controller.within_effect_wait(effect).await)
             }
             // A device delegates a narrower grant from a share it holds, and revokes what lies
             // below a share it holds. They are this daemon's own effects, once per actor's action,
@@ -1396,10 +1390,7 @@ impl RemoteConnection {
                         )
                         .await
                 });
-                settled(
-                    request_id,
-                    tokio::time::timeout(self.controller.effect_wait(), effect).await,
-                )
+                settled(request_id, self.controller.within_effect_wait(effect).await)
             }
             // A machine group step changes this environment's own record and nothing else: the
             // daemon's own effect, once per actor's action, and never forwarded to a worker or to
@@ -1424,10 +1415,7 @@ impl RemoteConnection {
                         .machine_step(&actor_id, &mutation, method, carried)
                         .await
                 });
-                settled(
-                    request_id,
-                    tokio::time::timeout(self.controller.effect_wait(), effect).await,
-                )
+                settled(request_id, self.controller.within_effect_wait(effect).await)
             }
             // A device presenting the lease its organisation signed for it: the daemon's own
             // effect, on this device's standing and nothing else. The action claims its route like
@@ -1464,10 +1452,7 @@ impl RemoteConnection {
                         .membership_present(device_id, &proven_key, &mutation, carried)
                         .await
                 });
-                settled(
-                    request_id,
-                    tokio::time::timeout(self.controller.effect_wait(), effect).await,
-                )
+                settled(request_id, self.controller.within_effect_wait(effect).await)
             }
             Method::DevicePreviewKeyUpdate => {
                 if let Err(refusal) = self.claim_route(mutation, None) {
@@ -1617,7 +1602,7 @@ impl RemoteConnection {
                         .automation_mutation(&actor_id, &mutation, method, carried, caller_grant)
                         .await
                 });
-                match tokio::time::timeout(self.controller.effect_wait(), effect).await {
+                match self.controller.within_effect_wait(effect).await {
                     Ok(Ok(outcome)) => ControlFrame::Response(Response {
                         request_id,
                         outcome: match outcome {
@@ -1701,12 +1686,10 @@ impl RemoteConnection {
 /// The task owns the effect and outlives this connection, so a wait that ran out says the outcome
 /// is unknown rather than that the action failed: the effect is still running, and section 9
 /// forbids reporting an action that may have happened as refused.
-type Effect = std::result::Result<
-    std::result::Result<Result<ParamsValue>, tokio::task::JoinError>,
-    tokio::time::error::Elapsed,
->;
+type Effect<Ended> =
+    std::result::Result<std::result::Result<Result<ParamsValue>, tokio::task::JoinError>, Ended>;
 
-fn settled(request_id: RequestId, outcome: Effect) -> ControlFrame {
+fn settled<Ended>(request_id: RequestId, outcome: Effect<Ended>) -> ControlFrame {
     match outcome {
         Ok(Ok(Ok(value))) => ControlFrame::Response(Response {
             request_id,
