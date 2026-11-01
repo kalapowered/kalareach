@@ -12,7 +12,9 @@
 //! identifier. Its message is kept when it names nothing of this host, unless the refusal is one
 //! this module knows by its wording ([`KNOWN_REASONS`]), which is told by its reason. A command
 //! quoted in backticks is a quotation with an end, so it is replaced by `a command` and the
-//! sentence it was in is kept. Anything else that names the host (a path of any kind, the number
+//! sentence it was in is kept; the words beside the replacement are read run together with it and
+//! apart from it, and where the two readings differ about what comes before the first name, none of
+//! the sentence is kept. Anything else that names the host (a path of any kind, the number
 //! of an account, the name of a program that changes who may use a file) has no end this module
 //! can find, so the device is given the part of the message that comes before the first such name,
 //! if that is a clause of its own, and otherwise a sentence composed here from the code.
@@ -30,18 +32,18 @@
 //! ([`suspension_for_a_device`]), in a result and in the refusal of a rich mutation.
 //!
 //! Examples of what the general rule does not find, and so passes whole, unless the refusal is one
-//! this module knows by its wording: a number that follows a word for an account across a separator the rule
-//! does not read, or through a longer name for one (`uid: 501`, `owner: 502`, `user id 501`,
-//! `user  501`, `uid(501)`, `uid_501`); a path of which every slash follows a name (`~name/work`,
-//! `Users/name/work`, `.config/kalareach/x`); a command of a program the rule does not know,
-//! written without backticks (`rm -rf x`); a place in the words of a pointer's refusal, whatever
-//! stands ahead of `at` (`x at /Users/name/p carries a field it does not declare`), which the rule
-//! sets aside; and an account's bare name in a clause that holds no path, number or command of its
-//! own (the error output of `systemctl` that `supervision.rs` quotes can hold one), even when a
-//! later clause does. The words ahead of a clause of the host's own, in the detail of a plugin the
-//! admissions leave out, are read without the set-aside place, and are held to the rule when they
-//! hold a backtick. A producer that writes one of these is mended by giving the refusal a wording
-//! that is shared with this module, as [`KNOWN_REASONS`] does for its last seven refusals.
+//! this module knows by its wording: a number that follows a word for an account across a separator
+//! the rule does not read, or through a longer name for one (`uid: 501`, `owner: 502`, `user id
+//! 501`, `user  501`, `uid(501)`, `uid_501`); a path of which every slash follows a name
+//! (`~name/work`, `Users/name/work`, `.config/kalareach/x`); a command of a program the rule does
+//! not know, written without backticks (`rm -rf x`); a place in the words of a pointer's refusal,
+//! whatever stands ahead of `at` (`x at /Users/name/p carries a field it does not declare`), which
+//! the rule sets aside; and an account's bare name in a clause that holds no path, number or
+//! command of its own (the error output of `systemctl` that `supervision.rs` quotes can hold one),
+//! even when a later clause does. The words ahead of a clause of the host's own, in the detail of a
+//! plugin the admissions leave out, are read without the set-aside place, and are held to the rule
+//! when they hold a backtick. A producer that writes one of these is mended by giving the refusal a
+//! wording that is shared with this module, as [`KNOWN_REASONS`] does for its last seven refusals.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -523,14 +525,27 @@ fn message_for_a_device(code: ErrorCode, message: &str) -> Option<String> {
 /// What a device is told in place of `text`, or `None` when it is told the text itself. `fixed` is
 /// what stands where nothing of the text can be kept.
 fn told_in_place(text: &str, fixed: impl Fn() -> String) -> Option<String> {
-    let without_commands = without_quoted_commands(text);
+    // A command quoted in backticks is replaced by `a command`. The words beside the quotation are
+    // read twice: as they stand against the replacement, which is what is told, and apart from it,
+    // which lets the rule find what the backticks were hiding. Where the two readings differ about
+    // what comes before the first name, the text cannot be told as it stands, so the rule never
+    // tells more of a text than it tells of the same text with the words run together.
+    let without_commands = without_quoted_commands(text, false);
+    let read_apart = without_quoted_commands(text, true);
     let text = without_commands.as_deref().unwrap_or(text);
+    let apart = read_apart.as_deref().unwrap_or(text);
+    let (first, first_apart) = (first_naming(text), first_naming(apart));
     // A refusal that is known by its wording is told by its reason whether or not the rule finds a
     // name in it: it can name an account that has no form the rule can find.
     let told = match known_reason(text) {
         Some(reason) => reason.to_owned(),
-        None => match first_naming(text) {
+        None if first.map(|at| &text[..at]) != first_apart.map(|at| &apart[..at]) => fixed(),
+        None => match first {
             None => without_commands?,
+            // Whether a clause is kept is decided by the length of the text and not by where the
+            // first name is, so that finding a name earlier cannot make a long text tell a clause
+            // that finding it later would have refused.
+            Some(_) if text.len() + "; ".len() + WHY_NOT_SHOWN.len() > LONGEST_MESSAGE => fixed(),
             Some(at) => match clause_before(text, at) {
                 Some(clause) => format!("{clause}; {WHY_NOT_SHOWN}"),
                 None => fixed(),
@@ -1389,8 +1404,9 @@ fn joins_a_word(character: char) -> bool {
 }
 
 /// `text` with every command quoted in backticks (more than one word between a pair of them)
-/// replaced by `a command`, or `None` when it quotes none.
-fn without_quoted_commands(text: &str) -> Option<String> {
+/// replaced by `a command`, or `None` when it quotes none. With `apart`, a space stands between the
+/// replacement and a neighbour that would run into it.
+fn without_quoted_commands(text: &str, apart: bool) -> Option<String> {
     let mut shown = String::new();
     let mut rest = text;
     let mut replaced = false;
@@ -1402,12 +1418,11 @@ fn without_quoted_commands(text: &str) -> Option<String> {
         let quoted = &rest[opening + 1..closing];
         shown.push_str(&rest[..opening]);
         if quoted.chars().any(char::is_whitespace) {
-            // A word beside the quotation stays a word of its own, so the rule can still read it.
-            if shown.ends_with(joins_a_word) {
+            if apart && shown.ends_with(joins_a_word) {
                 shown.push(' ');
             }
             shown.push_str("a command");
-            if rest[closing + 1..].starts_with(joins_a_word) {
+            if apart && rest[closing + 1..].starts_with(joins_a_word) {
                 shown.push(' ');
             }
             replaced = true;
@@ -4202,6 +4217,48 @@ mod tests {
         assert!(!names_the_host(
             "Params at /field uid 501 carries a field it does not declare"
         ));
+    }
+
+    /// The replacement of a quotation gives the words beside it a boundary, which lets the rule
+    /// read more, and can complete a pointer's refusal or turn a glued word into a web address.
+    /// The rule tells no more of a text than it tells of the text with the words run together, so
+    /// where the two readings differ it tells nothing of the text. A long text is judged by its
+    /// length and not by where the first name is.
+    #[test]
+    fn a_replaced_quotation_never_lets_the_rule_tell_more_than_the_text_without_it_would() {
+        let fixed = sentence_for(ErrorCode::InvalidArgument, WHY_NOT_SHOWN);
+        let nothing = format!("why the admissions leave the installation out; {WHY_NOT_SHOWN}");
+        let long = format!("uid: 501; `a b`(chmod 700 q) {}; user 502", "x".repeat(930));
+        let beyond = format!(
+            "uid: 509; Params at /field uid 501 carries a field it does not declare; user 502; \
+             {}; /Users/alice/private",
+            "x".repeat(900)
+        );
+        for said in [
+            // The space completes the refusal of a pointer, which sets its place aside.
+            "Params at /x user 502`a b`carries a field it does not declare".to_owned(),
+            "Params`a b`at /Users/marguerite/p carries a field it does not declare".to_owned(),
+            "Params at /x chmod 700 q`a b`carries a field it does not declare".to_owned(),
+            "Params at /Users/marguerite/p`a b`carries a field it does not declare; user 502"
+                .to_owned(),
+            // The space turns a glued word into a web address, which names no place.
+            "`a b`http://h uid: 501 failed".to_owned(),
+            "`a b`http://h ~name/work failed".to_owned(),
+            // A name found earlier makes the kept clause short, and a short clause passes the
+            // limit that a long one did not.
+            long.clone(),
+            beyond,
+        ] {
+            assert_eq!(
+                message_for_a_device(ErrorCode::InvalidArgument, &said).as_deref(),
+                Some(fixed.as_str()),
+                "{said}"
+            );
+        }
+        for clause in LEFT_OUT_CLAUSES {
+            let said = format!("{long}{clause}: marguerite wrote this");
+            assert_eq!(left_out_detail_told_to_a_device(&said), nothing, "{said}");
+        }
     }
 
     #[test]
