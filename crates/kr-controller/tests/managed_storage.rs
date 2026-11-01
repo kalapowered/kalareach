@@ -5134,11 +5134,17 @@ async fn the_last_attempt_follows_the_answers_and_is_left_as_it_was_by_a_call_th
             cause: Nullable::some(BackupEnableCause::AlreadySetUp {}),
         })
     );
+    let (bundles, enrolments) = (web.requests_to(SYNC), web.requests_to(MANIFEST));
     assert!(matches!(
         rig.enable(&made.params).await,
         BackupEnableResult::Enabled { .. }
     ));
     assert_eq!(rig.backup_status().await.last_attempt.0, None);
+    assert_eq!(
+        (web.requests_to(SYNC), web.requests_to(MANIFEST)),
+        (bundles, enrolments),
+        "the repeat was answered from the record and wrote and enrolled nothing"
+    );
 }
 
 /// A call goes on when the client that made it closes its connection: the daemon serves the call in
