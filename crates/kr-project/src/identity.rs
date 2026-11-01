@@ -1149,6 +1149,14 @@ fn open_recorded_root(
     path: &Path,
     tree: RecordedIdentity,
 ) -> Result<AuthorisedDirectory> {
+    // A case that asks for it has the tree go here, at the instant of the open, which is the one
+    // place a look made before it would be wrong.
+    #[cfg(all(test, unix))]
+    tests::REMOVED_BEFORE_THE_OPEN.with(|going| {
+        if let Some(going) = going.take() {
+            std::fs::remove_dir(going).expect("the case's tree goes");
+        }
+    });
     match cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority()) {
         Ok(handle) => Ok(AuthorisedDirectory::from_handle(
             environment_id,
@@ -1626,6 +1634,33 @@ mod tests {
                 .contains("the object rather than the path"),
             "and it says why: {dangling}"
         );
+    }
+
+    #[cfg(unix)]
+    thread_local! {
+        /// Set by a case to have the directory at this path removed at the instant the next open
+        /// of a recorded tree is made on its own thread, after anything that looked at the path.
+        pub(super) static REMOVED_BEFORE_THE_OPEN: std::cell::Cell<Option<PathBuf>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// The tree is there until the open and gone when the open is made, as it is for a tree that
+    /// is removed between a look at the path and the open. Whatever a look saw is not the answer:
+    /// the open finds nothing, and so the tree is a source that changed and not an argument the
+    /// caller got wrong.
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_that_goes_at_the_instant_of_the_open_is_a_source_that_changed() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let (environment_id, tree, recorded) = recorded_tree_in(root.path());
+        assert!(tree.is_dir(), "the tree is there until the open");
+
+        REMOVED_BEFORE_THE_OPEN.with(|going| going.set(Some(tree.clone())));
+        let gone = open_recorded_root(environment_id, &tree, recorded)
+            .expect_err("the tree is gone when the open is made");
+
+        assert!(!tree.exists(), "the case removed the tree at the open");
+        assert_eq!(gone.code(), ErrorCode::SourceChanged, "{gone}");
     }
 
     /// Every other failure of the open is the caller's argument and keeps its answer: a parent that
