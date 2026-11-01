@@ -5161,22 +5161,54 @@ fn the_environment_of_a_process(number: u32) -> std::io::Result<Vec<u8>> {
     std::fs::read(format!("/proc/{number}/environ"))
 }
 
+/// A child of this test that is ended when the guard is dropped, whatever the test does before it
+/// hands the child on: a child that nothing ends goes on for as long as it was told to, holding
+/// the output of the whole run.
+#[cfg(target_os = "linux")]
+struct EndedWithTheCase(Option<std::process::Child>);
+
+#[cfg(target_os = "linux")]
+impl EndedWithTheCase {
+    /// The child, which the guard no longer ends.
+    fn into_child(mut self) -> std::process::Child {
+        self.0.take().expect("the guard still holds the child")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for EndedWithTheCase {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        let _ = child.kill();
+        // Collected, so that it is not left a zombie, for as long as a kill takes and no longer.
+        let gone = Instant::now() + Duration::from_secs(10);
+        while matches!(child.try_wait(), Ok(None)) && Instant::now() < gone {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
 /// A process that stands for the pause process of a runtime whose runtime directory is
 /// `runtime`: it lives on, with the variable the runtime gives it, and its number is in the file
 /// the runtime keeps it in.
 #[cfg(target_os = "linux")]
 fn a_pause_process(runtime: &Path, environment: &Path) -> std::process::Child {
-    let child = std::process::Command::new("sleep")
-        .arg("300")
-        .env("XDG_RUNTIME_DIR", environment)
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .expect("starts a process");
+    let child = EndedWithTheCase(Some(
+        std::process::Command::new("sleep")
+            .arg("300")
+            .env("XDG_RUNTIME_DIR", environment)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("starts a process"),
+    ));
+    let number = child.0.as_ref().expect("the child").id();
     // A process that has just started shows no environment for a moment, though its program is
     // running: the cases that read it wait until it shows the variable, and not for a time.
     let wanted = format!("XDG_RUNTIME_DIR={}", environment.display());
     let begun = Instant::now();
-    while !the_environment_of_a_process(child.id()).is_ok_and(|shown| {
+    while !the_environment_of_a_process(number).is_ok_and(|shown| {
         shown
             .split(|byte| *byte == 0)
             .any(|v| v == wanted.as_bytes())
@@ -5188,12 +5220,36 @@ fn a_pause_process(runtime: &Path, environment: &Path) -> std::process::Child {
         std::thread::sleep(Duration::from_millis(5));
     }
     std::fs::create_dir_all(runtime.join("libpod/tmp")).expect("the runtime's directory");
-    std::fs::write(
-        runtime.join("libpod/tmp/pause.pid"),
-        format!("{}\n", child.id()),
-    )
-    .expect("the file that names it");
-    child
+    std::fs::write(runtime.join("libpod/tmp/pause.pid"), format!("{number}\n"))
+        .expect("the file that names it");
+    child.into_child()
+}
+
+/// A child that its case fails before handing it on is ended all the same, and collected: the
+/// guard that ends it is the case's, not the caller's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_a_case_fails_before_handing_it_on_is_ended_with_the_case() {
+    let child = std::process::Command::new("sleep")
+        .arg("300")
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("starts a process");
+    let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("a process number"))
+        .expect("a process number");
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = EndedWithTheCase(Some(child));
+        panic!("the case fails before it hands the child on");
+    }));
+    assert!(failed.is_err());
+    let gone = rustix::process::test_kill_process(pid).is_err();
+    if !gone {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    }
+    assert!(
+        gone,
+        "the child was still there after the case that held it failed"
+    );
 }
 
 /// The pause process a case left, which names the case's runtime directory, is ended by the case's
