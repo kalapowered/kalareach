@@ -3652,15 +3652,28 @@ impl Drop for PrivateTemporary {
 /// all. So the copy under the helper directory is asked whether it is the same program: the same
 /// version, reporting the same helper directory. It runs when it is. Where there is no such copy,
 /// or it answers differently, the program this host resolved is what runs, and a stand-in that
-/// then cannot hand off is an honest failure rather than a widened list.
+/// then cannot hand off is an honest failure rather than a widened list. A host too short of
+/// memory to resolve either path has not said that there is no copy, or that it answers
+/// differently, so the look is refused as a fault that passes and keeps nothing.
 fn handed_off_to(
     program: &Path,
     exec_path: &Path,
     version: &str,
     deadline: Instant,
 ) -> Result<PathBuf> {
-    let Ok(candidate) = exec_path.join(GIT_FILE_NAME).canonicalize() else {
-        return Ok(program.to_owned());
+    let copy = exec_path.join(GIT_FILE_NAME);
+    let candidate = match resolved(&copy) {
+        Ok(candidate) => candidate,
+        Err(error) if short_of_resources(&error) => {
+            return Err(could_not_resolve(
+                format!(
+                    "{} could not be resolved: {error}",
+                    redact(&copy.display().to_string())
+                ),
+                &error,
+            ));
+        }
+        Err(_) => return Ok(program.to_owned()),
     };
     if candidate == program {
         return Ok(program.to_owned());
@@ -3677,9 +3690,20 @@ fn handed_off_to(
     // Compared as the directories the two answers resolve to, because the helper directory is held
     // resolved and either program may report it through a link.
     let same_helpers = match ask(&candidate, &["--exec-path"], deadline) {
-        Ok(reported) => Path::new(reported.trim_end())
-            .canonicalize()
-            .is_ok_and(|resolved| resolved == exec_path),
+        Ok(reported) => match resolved(Path::new(reported.trim_end())) {
+            Ok(helpers) => helpers == exec_path,
+            Err(error) if short_of_resources(&error) => {
+                return Err(could_not_resolve(
+                    format!(
+                        "{} reports a helper directory {} that could not be resolved: {error}",
+                        redact(&candidate.display().to_string()),
+                        redact(reported.trim_end())
+                    ),
+                    &error,
+                ));
+            }
+            Err(_) => false,
+        },
         Err(Asked::Declined(_)) => false,
         Err(overran) => return Err(overran.into_error()),
     };
