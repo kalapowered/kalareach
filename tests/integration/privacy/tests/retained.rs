@@ -10,10 +10,6 @@
 //! gateway's forget with the credential the installation issued; each of those refuses a request
 //! without that authorisation; and the other collection is untouched throughout.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-24.29, service side | `kr_req_24_29_what_is_at_the_services_stays_until_its_own_authorised_action_removes_it` |
-//!
 //! # Local only
 //!
 //! The leg signs accounts in through the deployment's mail sink and answers the gateway's challenge
