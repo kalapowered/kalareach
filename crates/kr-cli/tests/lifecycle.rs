@@ -5161,60 +5161,97 @@ fn the_environment_of_a_process(number: u32) -> std::io::Result<Vec<u8>> {
     std::fs::read(format!("/proc/{number}/environ"))
 }
 
-/// A child of this test that is ended when the guard is dropped, whatever the test does before it
-/// hands the child on: a child that nothing ends goes on for as long as it was told to, holding
-/// the output of the whole run.
+/// A child of this test that is ended when the guard is dropped, whatever the test does with it
+/// and whatever it does before it hands the guard on: a child that nothing ends goes on for as long
+/// as it was told to, holding the output of the whole run.
 #[cfg(target_os = "linux")]
-struct EndedWithTheCase(Option<std::process::Child>);
+struct EndedWithTheCase(std::process::Child);
 
 #[cfg(target_os = "linux")]
 impl EndedWithTheCase {
-    /// The child, which the guard no longer ends.
-    fn into_child(mut self) -> std::process::Child {
-        self.0.take().expect("the guard still holds the child")
+    /// Ends the child now and collects it, for as long as a kill takes and no longer: true when it
+    /// was collected. A child that does not go (one stuck in the kernel) is reported by the false
+    /// and not waited for.
+    fn end(&mut self) -> bool {
+        let _ = self.0.kill();
+        let gone = Instant::now() + Duration::from_secs(10);
+        while matches!(self.0.try_wait(), Ok(None)) && Instant::now() < gone {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        !matches!(self.0.try_wait(), Ok(None))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::ops::Deref for EndedWithTheCase {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &std::process::Child {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::ops::DerefMut for EndedWithTheCase {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.0
     }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for EndedWithTheCase {
     fn drop(&mut self) {
-        let Some(mut child) = self.0.take() else {
-            return;
-        };
-        let _ = child.kill();
-        // Collected, so that it is not left a zombie, for as long as a kill takes and no longer.
-        let gone = Instant::now() + Duration::from_secs(10);
-        while matches!(child.try_wait(), Ok(None)) && Instant::now() < gone {
-            std::thread::sleep(Duration::from_millis(5));
+        if !self.end() {
+            eprintln!(
+                "the child {} was still there 10 seconds after it was killed",
+                self.0.id()
+            );
         }
     }
 }
 
 /// A process that stands for the pause process of a runtime whose runtime directory is
 /// `runtime`: it lives on, with the variable the runtime gives it, and its number is in the file
-/// the runtime keeps it in.
+/// the runtime keeps it in. It is ended with the case that asks for it, from the moment it exists.
 #[cfg(target_os = "linux")]
-fn a_pause_process(runtime: &Path, environment: &Path) -> std::process::Child {
-    let child = EndedWithTheCase(Some(
+fn a_pause_process(runtime: &Path, environment: &Path) -> EndedWithTheCase {
+    a_pause_process_through(
+        runtime,
+        environment,
+        the_environment_of_a_process,
+        Duration::from_secs(30),
+    )
+}
+
+/// [`a_pause_process`], reading what the process shows of its environment by `environment_of`, and
+/// failing the case when it has not shown the variable `shows_within` after it was started.
+#[cfg(target_os = "linux")]
+fn a_pause_process_through(
+    runtime: &Path,
+    environment: &Path,
+    environment_of: impl Fn(u32) -> std::io::Result<Vec<u8>>,
+    shows_within: Duration,
+) -> EndedWithTheCase {
+    let child = EndedWithTheCase(
         std::process::Command::new("sleep")
             .arg("300")
             .env("XDG_RUNTIME_DIR", environment)
             .stdin(std::process::Stdio::null())
             .spawn()
             .expect("starts a process"),
-    ));
-    let number = child.0.as_ref().expect("the child").id();
+    );
+    let number = child.id();
     // A process that has just started shows no environment for a moment, though its program is
     // running: the cases that read it wait until it shows the variable, and not for a time.
     let wanted = format!("XDG_RUNTIME_DIR={}", environment.display());
     let begun = Instant::now();
-    while !the_environment_of_a_process(number).is_ok_and(|shown| {
+    while !environment_of(number).is_ok_and(|shown| {
         shown
             .split(|byte| *byte == 0)
             .any(|v| v == wanted.as_bytes())
     }) {
         assert!(
-            begun.elapsed() < Duration::from_secs(30),
+            begun.elapsed() < shows_within,
             "the stand-in process never showed the environment it was given"
         );
         std::thread::sleep(Duration::from_millis(5));
@@ -5222,11 +5259,12 @@ fn a_pause_process(runtime: &Path, environment: &Path) -> std::process::Child {
     std::fs::create_dir_all(runtime.join("libpod/tmp")).expect("the runtime's directory");
     std::fs::write(runtime.join("libpod/tmp/pause.pid"), format!("{number}\n"))
         .expect("the file that names it");
-    child.into_child()
+    child
 }
 
 /// A child that its case fails before handing it on is ended all the same, and collected: the
-/// guard that ends it is the case's, not the caller's.
+/// guard that ends it is the case's, not the caller's. It is looked for by the identity it had
+/// while it ran, so that a number another process took since is not taken for it.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_child_a_case_fails_before_handing_it_on_is_ended_with_the_case() {
@@ -5235,20 +5273,57 @@ fn a_child_a_case_fails_before_handing_it_on_is_ended_with_the_case() {
         .stdin(std::process::Stdio::null())
         .spawn()
         .expect("starts a process");
-    let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("a process number"))
-        .expect("a process number");
+    let identity = process_start_identity(child.id()).expect("the child's identity");
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        let _guard = EndedWithTheCase(Some(child));
+        let _guard = EndedWithTheCase(child);
         panic!("the case fails before it hands the child on");
     }));
     assert!(failed.is_err());
-    let gone = rustix::process::test_kill_process(pid).is_err();
+    let gone = matches!(process_state(&identity), ProcessState::Ended);
     if !gone {
-        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        let _ = kr_ipc::identity::stop_process(&identity, kr_ipc::identity::Stop::Kill);
     }
     assert!(
         gone,
         "the child was still there after the case that held it failed"
+    );
+}
+
+/// A stand-in pause process whose environment is never shown fails its case, and is ended with it:
+/// the process exists from the moment it is started, and the case fails inside the call that
+/// started it, before anything was handed on.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pause_process_that_never_shows_its_environment_is_ended_with_the_case() {
+    let runtime = tempfile::tempdir().expect("a directory");
+    let identity = std::cell::RefCell::new(None);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        a_pause_process_through(
+            runtime.path(),
+            runtime.path(),
+            |number| {
+                identity
+                    .borrow_mut()
+                    .get_or_insert_with(|| process_start_identity(number).expect("an identity"));
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            },
+            Duration::from_millis(100),
+        )
+    }));
+    assert!(
+        failed.is_err(),
+        "a process that shows nothing fails the case"
+    );
+    let identity = identity
+        .into_inner()
+        .expect("the process was looked at while it ran");
+    let gone = matches!(process_state(&identity), ProcessState::Ended);
+    if !gone {
+        let _ = kr_ipc::identity::stop_process(&identity, kr_ipc::identity::Stop::Kill);
+    }
+    assert!(
+        gone,
+        "the stand-in process was left running by the case that failed"
     );
 }
 
@@ -5277,8 +5352,6 @@ fn a_process_that_does_not_name_the_runtime_directory_is_left_alone() {
     let mut other = a_pause_process(runtime.path(), elsewhere.path());
     end_the_container_runtimes_pause_process(runtime.path()).expect("nothing to end");
     let running = other.try_wait().expect("its state").is_none();
-    let _ = other.kill();
-    let _ = other.wait();
     assert!(running, "a process of another directory was ended");
 }
 
@@ -5288,15 +5361,13 @@ fn a_process_that_does_not_name_the_runtime_directory_is_left_alone() {
 #[test]
 fn a_stop_that_is_refused_leaves_the_pause_process_and_is_reported() {
     let runtime = tempfile::tempdir().expect("a directory");
-    let mut pause = a_pause_process(runtime.path(), runtime.path());
+    let _pause = a_pause_process(runtime.path(), runtime.path());
     let result = end_the_pause_process_through(
         runtime.path(),
         |_| kr_ipc::identity::Stopped::Refused("not allowed".to_owned()),
         the_environment_of_a_process,
         Duration::from_secs(1),
     );
-    let _ = pause.kill();
-    let _ = pause.wait();
     let why = result.expect_err("a refusal is an error");
     assert!(why.contains("was not ended"), "{why}");
 }
@@ -5307,7 +5378,7 @@ fn a_stop_that_is_refused_leaves_the_pause_process_and_is_reported() {
 #[test]
 fn a_live_pause_process_whose_environment_cannot_be_read_is_reported() {
     let runtime = tempfile::tempdir().expect("a directory");
-    let mut pause = a_pause_process(runtime.path(), runtime.path());
+    let _pause = a_pause_process(runtime.path(), runtime.path());
     let result = end_the_pause_process_through(
         runtime.path(),
         |_| panic!("a process that is not known to be the case's is not stopped"),
@@ -5319,10 +5390,24 @@ fn a_live_pause_process_whose_environment_cannot_be_read_is_reported() {
         },
         Duration::from_secs(1),
     );
-    let _ = pause.kill();
-    let _ = pause.wait();
     let why = result.expect_err("an environment that cannot be read is an error");
     assert!(why.contains("could not be read"), "{why}");
+}
+
+/// A live pause process whose environment is gone when it is read has gone since it was looked at,
+/// which is the end the case wants: it is not reported, and nothing is stopped.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pause_process_that_goes_between_the_looking_and_the_reading_is_the_end_wanted() {
+    let runtime = tempfile::tempdir().expect("a directory");
+    let _pause = a_pause_process(runtime.path(), runtime.path());
+    end_the_pause_process_through(
+        runtime.path(),
+        |_| panic!("there is nothing to stop"),
+        |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        Duration::from_secs(1),
+    )
+    .expect("a process that has gone since is the end that was wanted");
 }
 
 /// A number the runtime left in its file for a process that has gone is the end the case wants: it
@@ -5332,8 +5417,10 @@ fn a_live_pause_process_whose_environment_cannot_be_read_is_reported() {
 fn a_pause_process_that_has_already_gone_is_not_reported_and_nothing_is_stopped() {
     let runtime = tempfile::tempdir().expect("a directory");
     let mut pause = a_pause_process(runtime.path(), runtime.path());
-    let _ = pause.kill();
-    let _ = pause.wait();
+    assert!(
+        pause.end(),
+        "the process was still there 10 s after it was killed"
+    );
     end_the_pause_process_through(
         runtime.path(),
         |_| panic!("there is nothing to stop"),
@@ -5348,17 +5435,35 @@ fn a_pause_process_that_has_already_gone_is_not_reported_and_nothing_is_stopped(
 #[test]
 fn a_pause_process_that_is_still_there_after_the_stop_is_reported() {
     let runtime = tempfile::tempdir().expect("a directory");
-    let mut pause = a_pause_process(runtime.path(), runtime.path());
+    let _pause = a_pause_process(runtime.path(), runtime.path());
     let result = end_the_pause_process_through(
         runtime.path(),
         |_| kr_ipc::identity::Stopped::Signalled,
         the_environment_of_a_process,
         Duration::from_millis(300),
     );
-    let _ = pause.kill();
-    let _ = pause.wait();
     let why = result.expect_err("a process that stays is an error");
     assert!(why.contains("after it was told to end"), "{why}");
+}
+
+/// Whether the teardown of an emulator left nothing: no mount under its tree, and the container
+/// runtime's pause process ended or not there. A mount that is gone with a pause process that is
+/// not leaves the case with a process running on the machine.
+#[cfg(target_os = "linux")]
+fn nothing_is_left(mounts_left: &[PathBuf], pause: &Result<(), String>) -> bool {
+    mounts_left.is_empty() && pause.is_ok()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_teardown_that_left_a_mount_or_the_pause_process_has_not_left_nothing() {
+    let mount = PathBuf::from("/a/mount");
+    assert!(nothing_is_left(&[], &Ok(())));
+    assert!(!nothing_is_left(&[mount], &Ok(())));
+    assert!(!nothing_is_left(
+        &[],
+        &Err("the pause process was not ended".to_owned())
+    ));
 }
 
 impl HeadlessEmulator {
@@ -5445,7 +5550,7 @@ impl HeadlessEmulator {
         }
         // What the table shows afterwards decides, not what the program said.
         let left = mounts_under(&self.root).map_err(table)?;
-        if left.is_empty() && pause.is_ok() {
+        if nothing_is_left(&left, &pause) {
             Ok(())
         } else {
             Err(format!(
