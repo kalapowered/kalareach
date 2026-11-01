@@ -205,10 +205,6 @@ fn a_withdrawal_that_loses_its_admission_at_the_store_writes_nothing() {
 /// would retire it. A revocation and a device's revocation each write one row however many grants
 /// they withdraw; a repeat that withdraws nothing, and a proposal nobody redeemed, write none; and
 /// two changes of the same authority write two rows, so neither can absorb the other.
-///
-/// KR-REQ-09.12, the part about the debt of the per-worker fence: every revocation and every device
-/// revocation writes one debt of its own in the transaction that withdraws, and the debt survives
-/// the failure of the barrier that would retire it.
 #[test]
 fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
     let directory = GrantDirectory::in_memory().expect("a grant store");
@@ -309,10 +305,6 @@ fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
 /// the grant itself or the device holding it is revoked. A grant delegated from a voice grant that
 /// does not carry `voice.use` is not a voice grant, and the change that withdraws it writes its one
 /// row.
-///
-/// KR-REQ-09.12, the control of the case that holds a close under a voice grant: the withdrawal of
-/// a voice grant owes no fence, on any revocation path, while no close forwarded under it can still
-/// run at a worker.
 #[test]
 fn a_voice_grants_withdrawal_owes_no_fence() {
     let directory = GrantDirectory::in_memory().expect("a grant store");
@@ -386,10 +378,6 @@ fn a_voice_grants_withdrawal_owes_no_fence() {
 /// worker, whether the grant is revoked, replaced or revoked with its device. Once the hold on the
 /// close is let go, the same withdrawal owes none. A close held under another voice grant is no
 /// reason to fence this one.
-///
-/// KR-REQ-09.12, the part about which withdrawals owe a fence: the withdrawal of a voice grant owes
-/// a fence while a close forwarded under it can still run at a worker, and none once the hold on
-/// the close is let go.
 #[test]
 fn a_voice_grants_withdrawal_owes_a_fence_while_a_close_is_held_under_it() {
     let voice_rights = [ActionRight::VoiceUse, ActionRight::SessionView];
@@ -826,9 +814,9 @@ fn a_spent_delegation_stays_spent_until_the_caller_says_it_may_be_forgotten() {
 /// record shows, once: never over an answer or a refusal the claim already holds, never under an
 /// attempt that still holds the claim, and never for an action nobody claimed.
 ///
-/// KR-REQ-09.08, the part about settling an unfinished action: a claim whose attempt ended before
-/// it recorded anything is settled once from the daemon's own record, never over an answer or a
-/// refusal the claim holds and never under an attempt that still holds it.
+/// KR-REQ-09.08, the part about settling an unfinished action: a claim whose attempt ended without
+/// recording anything takes a settlement once and never again, never over an answer or a refusal
+/// the claim holds and never under an attempt that still holds it.
 #[test]
 fn a_claim_left_unfinished_is_settled_once_and_only_where_nothing_holds_it() {
     use kr_controller::grants::{ActionClaim, ActionRecord};
@@ -2713,6 +2701,11 @@ fn a_grant_at_an_older_revision_still_decides_and_one_at_a_revision_nothing_issu
 }
 
 /// A clock wound back past a deadline does not revive a grant the host has already refused.
+///
+/// KR-REQ-09.18, the part about a wall clock wound back: a grant the host has refused as expired is
+/// not revived by a smaller reading, and the floor never goes down. Not shown here: wall-clock
+/// trust marked unresolved after a rollback beyond five seconds, or the stop of expiry-based
+/// garbage collection.
 #[test]
 fn a_clock_that_goes_backwards_does_not_revive_an_expiry_the_host_already_decided() {
     let held = grant(

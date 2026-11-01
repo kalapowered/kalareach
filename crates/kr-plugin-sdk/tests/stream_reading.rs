@@ -248,9 +248,6 @@ fn observation(table: &mut ConnectorManifest) -> &mut Observation {
         .expect("the table declares an observation")
 }
 
-/// KR-REQ-11.33 and KR-REQ-12.06, the part about a table that is accepted: a table that answers an
-/// approval as a response and reads the stream's places validates, and it reads back as written.
-/// Not shown here: the ways a table can say either wrongly.
 #[test]
 fn a_table_that_answers_as_a_response_and_reads_the_stream_validates() {
     let report = validated(&server_table());

@@ -208,9 +208,9 @@ fn collection_of(origin: &str, locator: &str) -> String {
 ///
 /// KR-REQ-20.19, the part about a restore that authenticates the bundle with the kit: a new
 /// installation holding the kit, the origin and the account's token finds and authenticates the
-/// bundle, and the same bytes served under another locator or from another origin fail
-/// authentication and bring in no writer. Not shown here: a service or collection migration, or an
-/// updated kit after one.
+/// bundle, and the same bytes served under another locator or as another origin's fail
+/// authentication. Not shown here: a substituted bundle that holds a writer key (this one holds
+/// none), a lost service, or a migration and the updated kit after it.
 #[tokio::test]
 async fn a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin() {
     let Some(deployment) = Deployment::from_environment() else {

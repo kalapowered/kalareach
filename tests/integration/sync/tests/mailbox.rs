@@ -11,8 +11,9 @@
 //! by the reader's own ledger whatever the service says; and the bytes a mailbox counts are the
 //! declared bucket rather than the length of the plaintext somebody padded to it.
 //!
-//! Those rows' acceptance owners are elsewhere; what these legs add is the half nothing had
-//! before, which is that the contract holds against a deployment rather than against a mock.
+//! The rows these legs touch have their acceptance owners elsewhere; what these legs add is the
+//! half nothing had before, which is that the contract holds against a deployment rather than
+//! against a mock.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};

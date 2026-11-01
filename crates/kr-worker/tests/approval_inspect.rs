@@ -821,6 +821,11 @@ async fn kr_req_11_26_the_record_says_where_the_request_stands_once_answered() {
 /// answer to the scope, so the worker refuses both with the reason, and the refusal carries
 /// nothing of the record. The control is the agent read that carries no history:
 /// `agent.capabilities` is served through the same frame.
+///
+/// KR-REQ-23.39, the part about the history filter: a read the daemon forwards for a paired device
+/// without the history scope of its grant, an approval inspection or an agent snapshot, is refused
+/// with the reason and carries nothing of the record or the history, while `agent.capabilities`,
+/// which carries no history, is served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paired_devices_read_without_a_scope_is_refused_with_its_reason() {
     let host = host().await;
@@ -888,6 +893,10 @@ async fn a_paired_devices_read_without_a_scope_is_refused_with_its_reason() {
 /// The host's one intersection of a grant with a request holds this method to the right its entry
 /// names: a grant without `session.view` is refused for it, whatever else it carries, and one with
 /// it passes that rule, on the local socket and from a paired device alike.
+///
+/// KR-REQ-23.39, the part about the right an agent read needs: a grant without `session.view` is
+/// refused for an approval inspection, whatever else it carries, on the local socket and from a
+/// paired device alike. Not shown here: the exact instance or the evidence the read returns.
 #[test]
 fn a_grant_without_session_view_is_refused_by_the_methods_rights() {
     use kr_controller::grants::{AccessRequest, GrantRecord, HostPolicy, Refusal, decide};
@@ -1129,6 +1138,10 @@ fn snapshot_params(host: &Host) -> AgentSnapshotParams {
 /// does not reach this worker with the read, so nothing the agent said reaches the caller, and the
 /// refusal says why. The local owner, forwarded under no grant or on the worker's own socket,
 /// reads the whole history as before.
+///
+/// KR-REQ-23.39, the part about the history filter on a local caller: an agent snapshot forwarded
+/// for a caller acting under a grant, whose scope never reached the worker, is refused with the
+/// reason and carries nothing of the history, while the local owner reads the whole history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_snapshot_forwarded_for_a_local_caller_under_a_grant_carries_none_of_the_history() {
     let host = host().await;

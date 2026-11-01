@@ -134,8 +134,8 @@ fn a_table_changed_after_installation_is_refused() {
 /// A package directory whose manifest is not the installed hash is another package, whatever it
 /// says, and is refused.
 ///
-/// KR-REQ-12.07, the part about the installed package: only the connector of the installed hash is
-/// integrated.
+/// KR-REQ-12.07, the part about the installed package: a connector is read only from the package
+/// whose manifest is the installed hash.
 #[test]
 fn a_package_that_is_not_the_installed_one_is_refused() {
     let store = Store::new("foreign");
@@ -150,6 +150,9 @@ fn a_package_that_is_not_the_installed_one_is_refused() {
 }
 
 /// A table that names another package is not this package's table.
+///
+/// KR-REQ-12.07, the part about the verified manifest: a table that names another package is
+/// refused by the package check even when every digest of the rewritten package holds.
 #[test]
 fn a_table_that_names_another_package_is_refused() {
     let store = Store::new("another");

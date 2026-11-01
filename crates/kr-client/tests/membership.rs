@@ -1641,8 +1641,8 @@ async fn a_member_cannot_remove_itself() {
 /// Publication is fenced from the moment a removal is recorded until a record without the device
 /// is installed, at every crash point on the way.
 ///
-/// KR-REQ-20.11, the sync-collection half: once a removal is recorded, nothing is published to the
-/// collection until a record without the device is installed, at every crash point on the way.
+/// KR-REQ-20.11, the sync-collection half: from the moment a removal is recorded until a record
+/// without the device is installed, the device does not publish, at every crash point on the way.
 #[tokio::test]
 async fn publication_stays_fenced_from_a_recorded_removal_until_its_record_is_installed() {
     // One run for each point a crash can fall at: before the first step, and after each step.
@@ -1736,6 +1736,9 @@ async fn a_removal_arriving_during_a_rotation_is_carried_into_the_next_candidate
 
 /// A record from a member the hosts then revoke wins the race and keeps this device; this device
 /// refuses it, rotates the revoked member out, and never installs its key.
+///
+/// KR-REQ-20.11, the part about a record from a member the hosts then revoke: this device refuses
+/// it, rotates the revoked member out, and never installs the revoked member's key.
 #[tokio::test]
 async fn a_revoked_winner_that_keeps_this_device_is_rotated_out_and_its_key_never_installed() {
     let world = World::default();
@@ -2337,6 +2340,9 @@ async fn a_same_epoch_record_wrapping_another_key_is_refused() {
 
 /// A removal is not done while a refused record between the installed record and the head
 /// left the device the current key; it is done once a rotation away from it is installed.
+///
+/// KR-REQ-20.11, the part about when a removal is done: not while a refused record left the device
+/// the current key, and once a rotation away from that record is installed.
 #[tokio::test]
 async fn a_removal_is_not_done_while_a_refused_record_left_the_device_the_current_key() {
     let world = World::default();
@@ -2419,6 +2425,10 @@ async fn a_removal_is_not_done_while_a_refused_record_left_the_device_the_curren
 
 /// A device its hosts revoke while its addition is in flight is refused as an addition,
 /// removed when the record adding it is settled, and rotated out before publication reopens.
+///
+/// KR-REQ-20.11, the part about a device revoked while its addition is in flight: it is refused as
+/// an addition, removed when the record adding it is settled, and rotated out before publication
+/// reopens.
 #[tokio::test]
 async fn a_device_revoked_while_its_addition_is_in_flight_is_rotated_out_before_publication() {
     let world = World::default();
@@ -2617,6 +2627,9 @@ async fn a_record_that_leaves_this_device_out_ends_its_membership_until_the_owne
 
 /// A revocation verified from an authority feed fences publication at once, before any host
 /// answers, and the removal it asks for waits for a fetch before it is done.
+///
+/// KR-REQ-20.11, the part about a revocation verified from an authority feed: publication is fenced
+/// at once, before any host answers, and the removal waits for a fetch before it is done.
 #[tokio::test]
 async fn a_verified_feed_revocation_fences_publication_before_any_host_answers() {
     let world = World::default();
@@ -3176,8 +3189,8 @@ async fn a_collection_put_back_with_the_head_this_device_holds_is_followed_from_
 /// new history.
 ///
 /// KR-REQ-18.05, across a restore that kept this device's head: nothing settles from the new
-/// history until the device has found its own head there, the lost candidate's key is withdrawn and
-/// never sent again, and its change is built again in the new history.
+/// history until the device has found its own head there, the lost candidate is then settled there
+/// and never sent again, and the removal it carried applies in the new history.
 #[tokio::test]
 async fn a_candidate_that_crossed_a_restore_which_kept_the_head_settles_in_the_new_history() {
     let world = World::default();
@@ -3338,10 +3351,6 @@ async fn a_collection_put_back_again_between_two_reads_records_nothing_and_is_re
 /// A collection this device starts takes the history its claim applied in, and a device that
 /// joins the history of the chain it verified. A membership in a history never put back names
 /// none, and its file is written as it always was, without the member.
-///
-/// KR-REQ-18.05, across a restore: a collection this device starts takes the history its claim
-/// applied in, a join takes that of the chain it verified, and a membership in a history never put
-/// back names none.
 #[tokio::test]
 async fn a_start_takes_the_history_its_claim_applied_in_and_a_join_that_of_the_chain_it_read() {
     let never = World::default();
