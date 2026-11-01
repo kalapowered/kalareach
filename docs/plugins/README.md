@@ -143,8 +143,12 @@ shell started itself, and it establishes no distribution for it. A program that 
 (a script, such as the npm `gemini`, a launcher that starts the program as its child, such as the
 npm `codex`, or a wheel, such as the PyPI `kimi-cli`) is found as the runtime, so a rule that names
 the program does not recognise it, and a vendor can add detection of such a program only with a rule
-on the runtime's name. A Windows host adopts nothing, so there a package binds only where its
-command integration launched the program.
+on the runtime's name. The kernel names the file itself, after any link, and a rule compares that
+file's whole name, so a program that an installer keeps under a name that carries its version
+(Claude Code's `~/.local/share/claude/versions/<version>`, Qoder CLI's `qodercli-<version>`) is
+recognised only by a rule that names that file. The Claude Code package names none, and the Qoder
+CLI package names the file of one release alone. A Windows host adopts nothing, so there a package
+binds only where its command integration launched the program.
 
 A rule states its own confidence. An `exact` rule identifies the application by something that
 cannot be coincidence, such as a bundle identifier. An `inferred` rule is a reasonable guess from a
