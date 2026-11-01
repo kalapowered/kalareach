@@ -117,10 +117,10 @@ const RUN_GIT: [Method; 9] = [
 ];
 
 /// Returns a refusal as a person is told it: for a method that runs Git, a host that is not set up
-/// for it (no usable Git, or a kernel the boundary cannot be built on) says in its own sentence
-/// what a person does, which is to install Git where it names the step or to use a host whose
-/// kernel has the interface. The client's one line for that code, which tells a person to change a
-/// setting, fits neither, so it is not added. Every other refusal is as it was.
+/// for it (no usable Git, a platform or a machine that runs none, or a kernel the boundary cannot
+/// be built on) says in its own sentence what a person does, which is to install Git or to use the
+/// other host the sentence names. The client's one line for that code, which tells a person to
+/// change a setting, fits neither, so it is not added. Every other refusal is as it was.
 fn in_the_hosts_words(method: Method, error: CliError) -> CliError {
     match error {
         CliError::Refused(refused)

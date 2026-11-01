@@ -5716,13 +5716,14 @@ change-set methods that read or write a working tree: `changeset.capture`, `diff
 `diff.revert` and `diff.read` of a working copy. The message ends with the step that installs Git:
 `xcode-select --install` on macOS and the system package manager on Linux. Windows runs no Git at
 all, so there it gives the platform's own refusal, under the same code, before it looks for Git,
-whether or not Git is installed, and names no install. A Linux kernel with no Landlock interface, or
-one older than version 3 (Linux 6.2), gives the same refusal, under the same code and before Git is
-looked for. One older than version 4 (Linux 6.7) gives it to a request that reaches a remote, when
-the request's invocation is built. The sentence says which version the kernel has and which the
-boundary needs. A machine whose system-call numbers this host does not hold is refused alike. A
-client does not send such a request again. A look that runs out of its time, or that the host is too
-short of descriptors, processes or memory to make, is not this refusal. It is
+whether or not Git is installed, and names no install: it ends with a host on macOS or Linux to use
+instead. A Linux kernel with no Landlock interface, or one older than version 3 (Linux 6.2), gives
+the same refusal, under the same code and before Git is looked for. One older than version 4 (Linux
+6.7) gives it to a request that reaches a remote, when the request's invocation is built. The
+sentence says which version the kernel has and which the boundary needs. A machine whose system-call
+numbers this host does not hold is refused alike, and its sentence ends with a host on an x86-64 or
+aarch64 machine. A client does not send such a request again. A look that runs out of its time, or
+that the host is too short of descriptors, processes or memory to make, is not this refusal. It is
 `UPSTREAM_UNAVAILABLE`, a fault that passes, and the sentence names no install. A client may send
 the request again under a new action identifier. The project methods and `changeset.capture` keep
 either refusal as the answer to the request's action identifier, so a request repeated after Git is

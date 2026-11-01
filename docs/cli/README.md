@@ -1306,8 +1306,9 @@ pairing again, waiting, or changing a setting. The protocol code is not in it. I
 no action should be taken then only the reason for the refusal as given by the host is shown. Where
 the refuser itself says what a person does about its refusal, as a managed service does, that action
 is said instead of the code's. A host that cannot run Git does so too: the sentence it refuses with
-says to install Git or to use a host whose kernel offers the interface. The commands that run Git
-are `kr project init`, `kr project clone`, `kr project adopt`, `kr workspace create`,
+says to install Git or to use another host, which it names: one on macOS or Linux, one on an x86-64
+or aarch64 machine, or one whose kernel offers the interface. The commands that run Git are
+`kr project init`, `kr project clone`, `kr project adopt`, `kr workspace create`,
 `kr workspace remove`, `kr changeset capture`, `kr diff read`, `kr diff apply` and `kr diff revert`,
 and they show that sentence alone.
 
