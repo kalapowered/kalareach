@@ -136,8 +136,9 @@ directory separator, a backslash included, is a path and bypasses the integratio
 first hit for the name is a shim (a `.cmd`, `.bat` or `.ps1`, as npm installs beside an agent), the
 worker establishes no backend and the command runs as typed, because the shim's process is its
 interpreter and not the agent. The host records `first hit is` and the shim's path as its reason;
-`kr doctor` shows the shim's path as where the daemon's search path resolves the command, and the
-reason as its class and its length (`[message withheld, <length> bytes]`), not in words.
+`kr doctor` shows the reason as its class and its length (`[message withheld, <length> bytes]`), not in
+words, and beside it where the daemon's search path resolves the command, which is the shim only when
+that path reaches it first.
 
 Anything short of that runs what was typed. On a refusal, on no answer within two seconds (counted
 from the launcher's start for the admission, and from `going` for the commit; on Windows six
