@@ -2713,47 +2713,58 @@ mod tests {
     #[test]
     fn the_calls_to_the_task_scheduler_write_their_refusals_with_the_words_of_the_markers() {
         let source = include_str!("windows.rs");
+        // The code of this module, without the lines that are comments, which quote the words.
         let code = source
             .split("\n#[cfg(test)]\nmod tests {")
             .next()
-            .expect("the code of this module");
-        let calls = code
-            .split("\nmod platform {")
-            .nth(1)
-            .and_then(|rest| rest.split("\n}\n").next())
-            .expect("the calls to the Task Scheduler");
-
-        // The words of each marker are in the code once, in the constant that holds them. Comments
-        // that quote them are not code.
-        let without_comments = code
+            .expect("the code of this module")
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
+        let section = |name: &str| {
+            code.split(&format!("\nmod {name} {{"))
+                .nth(1)
+                .and_then(|rest| rest.split("\n}\n").next())
+                .unwrap_or_else(|| panic!("the code of {name}"))
+        };
+
+        // The words of each marker are in the code once, in the constant that holds them.
         for (name, words) in [
             ("DID_NOT_REGISTER", DID_NOT_REGISTER),
             ("DID_NOT_REMOVE", DID_NOT_REMOVE),
             ("COULD_NOT_LIST", COULD_NOT_LIST),
             ("DID_NOT_RUN", DID_NOT_RUN),
             ("A_TASK_NAMED", A_TASK_NAMED),
+            ("IS_REGISTERED", IS_REGISTERED),
             ("NOT_THE_ONE_REGISTERED", NOT_THE_ONE_REGISTERED),
             ("READS_BACK_DIFFERENTLY", READS_BACK_DIFFERENTLY),
         ] {
             assert_eq!(
-                without_comments.matches(words).count(),
+                code.matches(words).count(),
                 1,
                 "{name} is written once, and a call writes it by the constant"
             );
         }
 
-        // Each failure of a command the scheduler ran is written by one of the functions.
+        // Each failure of a command the scheduler ran is written by one of the functions, and the
+        // refusal puts those words first.
+        let calls = section("platform");
         let mut refusals = 0;
         for (at, _) in calls.match_indices("refused(") {
             let named = calls[..at]
                 .chars()
                 .next_back()
                 .is_some_and(|before| before.is_alphanumeric() || before == '_');
-            if named || calls[..at].ends_with("fn ") {
+            if named {
+                continue;
+            }
+            if calls[..at].ends_with("fn ") {
+                let body = calls[at..].split("\n    }\n").next().expect("its body");
+                assert!(
+                    body.contains("{what}"),
+                    "the refusal begins with its words: {body}"
+                );
                 continue;
             }
             let words = calls[at + "refused(".len()..]
@@ -2780,13 +2791,17 @@ mod tests {
             "the calls that refuse a command the scheduler ran"
         );
 
-        // And the failure to run the task, which is not one of them.
+        // The failure to run the task, and the launch that finds the task differing.
         let run = calls
             .split("pub fn run(definition")
             .nth(1)
             .and_then(|rest| rest.split("\n    }\n").next())
             .expect("the call that runs the task");
         assert!(run.contains("did_not_run(&definition.name)"), "{run}");
+        assert!(
+            section("launching").contains("task_differs("),
+            "a launch that finds the task differing says so with the shared words"
+        );
     }
 
     /// KR-REQ-07.58: a process the kernel does not establish is read by what this account can read
