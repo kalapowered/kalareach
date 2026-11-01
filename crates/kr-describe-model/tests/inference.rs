@@ -429,11 +429,11 @@ fn the_largest_contexts_are_sent_to_the_real_process_and_none_is_refused_for_its
     }
 }
 
-/// The real model stops a job it is told to cancel, between chunks of its prompt or tokens of its
-/// output, and the process answers that job `ended` as cancelled. A model that ran the job to its
-/// end would answer `produced`: the daemon's outcome would still be a cancellation, because the
-/// daemon's own token is cancelled, so only the process's answer tells the two apart. Spoken to
-/// over its own pipes, as the daemon's driver speaks to it.
+/// KR-REQ-22.11: the real model stops a job it is told to cancel, between chunks of its prompt or
+/// tokens of its output, and the process answers that job `ended` as cancelled. A model that ran
+/// the job to its end would answer `produced`: the daemon's outcome would still be a cancellation,
+/// because the daemon's own token is cancelled, so only the process's answer tells the two apart.
+/// Spoken to over its own pipes, as the daemon's driver speaks to it.
 #[test]
 fn the_real_model_stops_a_job_it_is_told_to_cancel() {
     let Some(placed) = Placed::real_weights("the_real_model_stops_a_job_it_is_told_to_cancel")
