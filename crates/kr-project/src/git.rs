@@ -5675,7 +5675,7 @@ mod tests {
 
     /// Whether a process with this identifier is gone altogether, which one that has ended and not
     /// yet been collected is not.
-    #[cfg(unix)]
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     fn collected(pid: &str) -> bool {
         let listed = std::process::Command::new("ps")
             .args(["-o", "stat=", "-p", pid])
@@ -6370,9 +6370,10 @@ mod tests {
     /// and without it. Without it the first poll reads the end of the output as well as the
     /// answer, in time, so the exit is the only reason left to refuse the look: a check that
     /// refused a late exit only while the output was still open would pass the rows with the
-    /// process, where the end is not read, and fail these. The rows with the process also show
-    /// that the group is ended and the stand-in collected before the look is refused.
-    #[cfg(unix)]
+    /// process, where the end is not read, and fail the rows without it. The rows with it also show
+    /// that the group is ended and the stand-in collected before the look is refused, which this
+    /// host does on Linux and macOS only, so the case runs there.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn an_exit_seen_after_the_time_ran_out_is_the_clocks_and_not_the_programs() {
         for exit in [1, 0] {
@@ -6426,10 +6427,16 @@ mod tests {
                         .expect("the stand-in recorded the process it left in its group")
                         .trim()
                         .to_owned();
-                    assert!(
-                        !running(&sleeper),
-                        "{row}: the group the stand-in led was ended"
-                    );
+                    // The signal is asynchronous: the process may be found a moment after it was
+                    // sent, so it is waited for.
+                    let guard = Instant::now() + Duration::from_secs(30);
+                    while running(&sleeper) {
+                        assert!(
+                            Instant::now() < guard,
+                            "{row}: the group the stand-in led was not ended"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
                     assert!(
                         collected(&number_of(&directory.path().join("own"))),
                         "{row}: the stand-in was collected"
