@@ -6327,10 +6327,18 @@ mod tests {
     /// and ended, is a fault that passes: what the program wrote cannot be told from what reached
     /// the pipe after the time, so it is not taken for the answer. The stand-in is released only
     /// once the time has run out, so the answer is written after it, and the first poll is held
-    /// until the stand-in has ended. The case goes through `ask` and holds the outcome. Three
-    /// guards each give it alone, which is why none of them fails this case when it is lost: the
-    /// reading rule of the poll, the exit seen after the time, and the deadline the wait for the
-    /// end of the output is given. The cases beside this one hold each of the three.
+    /// until the stand-in has ended. The case goes through `ask` and holds the outcome.
+    ///
+    /// Three guards give that outcome: the poll reads no later than the look's time, so it takes
+    /// in nothing once that has run out; the exit seen after the time is refused; and the wait
+    /// for the end of the output is given the look's time as its own. The exit check gives it
+    /// alone, and the other two give it only together. So the loss of any one guard does not fail
+    /// this case, and the loss of the exit check with either of the others does. Each guard has a
+    /// case of its own that fails when it alone is lost: the late-exit case beside this one, the
+    /// case that holds the wait for the end of the output past the look's time, and, for the
+    /// poll's time, the case that has the stand-in write more than the limit. That case raises a
+    /// pipe's size, which is Linux's, so on other systems no case fails when the poll is given a
+    /// later time to read to.
     #[cfg(unix)]
     #[test]
     fn a_first_poll_after_the_time_ran_out_reads_nothing_of_an_answer_that_came_after_it() {
