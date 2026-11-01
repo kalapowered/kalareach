@@ -660,6 +660,55 @@ fn a_stop_that_meets_a_read_of_the_consoles_text_cancels_it_and_says_so() {
     probe.report();
 }
 
+/// How many times the paste probe writes U+1F600.
+const PASTED_CHARACTERS: usize = 100;
+
+/// How many records the console holds for the paste probe's text: a key going down and one coming up
+/// for each of the five letters, and twelve for each character outside the basic plane, which a
+/// console records as the Alt going down, two keypad digits and the Alt coming up with the half, for
+/// each of its two halves.
+const PASTED_RECORDS: u32 = 5 * 2 + 12 * PASTED_CHARACTERS as u32;
+
+/// KR-REQ-08.53: a character outside the basic plane that a console is given as text reaches the
+/// session whole, however the console's records are cut into reads.
+///
+/// A console records U+1F600 as twelve key records, six for each half, and the halves come on the
+/// Alt coming up. The reader takes 256 records at a time, so a paste of a hundred of them is read in
+/// five pieces that end wherever the count falls, and four letters before the paste put the first
+/// end between the two halves of one character, after the Alt has come up with the first. The probe,
+/// in a console of its own, waits until the console holds the whole paste, so that the pieces are
+/// the reader's and not the timing's, starts the reader as `kr attach` does, spells each piece it
+/// hands on as the worker does for a session that did not ask for records, and shows the result.
+/// The test, outside, writes the text to the console as UTF-8 and expects every character whole and
+/// none replaced.
+#[test]
+fn a_character_outside_the_basic_plane_pasted_into_a_console_reaches_the_session_whole() {
+    if std::env::var_os(SPELL_PROBE).is_some() {
+        paste_probe_in_the_console();
+        return;
+    }
+
+    let mut probe = Probe::start(
+        "a_character_outside_the_basic_plane_pasted_into_a_console_reaches_the_session_whole",
+    );
+    probe.waits_for("kr-probe:ready");
+    let mut pasted = b"aaaa".to_vec();
+    for _ in 0..PASTED_CHARACTERS {
+        pasted.extend_from_slice("\u{1F600}".as_bytes());
+    }
+    pasted.push(b'z');
+    probe.press(&pasted);
+    probe.waits_for("kr-probe:spelled:");
+    let shown = probe.shown();
+    assert!(
+        shown.contains(&format!(
+            "kr-probe:spelled:letters=5:characters={PASTED_CHARACTERS}:replaced=0:"
+        )),
+        "every character reached the session whole and none was replaced: {shown:?}"
+    );
+    probe.report();
+}
+
 /// What the console half of a probe holds: the console taken as `kr attach` takes it, in record
 /// mode, and the reader over it.
 struct Reading {
@@ -886,6 +935,68 @@ fn stop_probe_in_the_console() {
     println!("kr-probe:taken:1");
     takes.until(2);
     println!("kr-probe:taken:2");
+    let _console = reading.stops();
+}
+
+/// The console half of the paste probe, run in a console of its own.
+fn paste_probe_in_the_console() {
+    use kr_cli::attach::TerminalInput;
+    use kr_cli::platform::ControllingTerminal;
+    use kr_cli::windows::records::RecordReader;
+    use kr_term::modes::KeyboardEncoding;
+    use kr_term::win32::{Keyboard, legacy_within};
+
+    // The console is looked at before a reader takes anything from it: it holds the whole paste when
+    // the reader starts, so the reader's reads are the same however the paste arrived.
+    let console = ControllingTerminal::open().expect("this process has a console");
+    let queue = RecordReader::over(console.handle().try_clone().expect("a handle on the input"));
+    println!("kr-probe:ready");
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
+    while queue.waiting().expect("the console counts its input") < PASTED_RECORDS {
+        assert!(
+            Instant::now() < deadline,
+            "the console never held the paste"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(queue);
+    drop(console);
+
+    let mut reading = Reading::start();
+    let keyboard = Keyboard {
+        application_cursor_keys: false,
+        negotiated: KeyboardEncoding::Legacy,
+    };
+    let mut spelled = Vec::new();
+    let mut pieces = Vec::new();
+    'reading: loop {
+        match reading.read() {
+            TerminalInput::Keys(keys) => {
+                pieces.push(keys.len().to_string());
+                spelled.extend(
+                    legacy_within(&keys, &keyboard, kr_protocol::limits::MAX_INPUT_FRAME_LEN)
+                        .expect("the piece is spelled"),
+                );
+                if keys
+                    .iter()
+                    .any(|key| key.key_down && key.unicode == u16::from(b'z'))
+                {
+                    break 'reading;
+                }
+            }
+            TerminalInput::Bytes(bytes) => println!("kr-probe:early:{}", hex(&bytes)),
+        }
+    }
+    let text = String::from_utf8_lossy(&spelled);
+    println!("kr-probe:pieces:{}", pieces.join(","));
+    println!(
+        "kr-probe:spelled:letters={}:characters={}:replaced={}:",
+        text.chars().filter(char::is_ascii_lowercase).count(),
+        text.chars().filter(|&c| c == '\u{1F600}').count(),
+        text.chars()
+            .filter(|&c| c == char::REPLACEMENT_CHARACTER)
+            .count()
+    );
     let _console = reading.stops();
 }
 
