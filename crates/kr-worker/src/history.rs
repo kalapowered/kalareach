@@ -4123,7 +4123,7 @@ mod tests {
     fn kr_perf_003_a_session_that_takes_the_lock_after_another_removed_output_gives_up_nothing() {
         use std::sync::{Condvar, Mutex};
 
-        let root = spool_directory("host-cap-handoff");
+        let root = spool_directory("host-cap-second-reader");
         let retention = OutputRetention::new(
             std::time::Duration::from_secs(7 * 24 * 60 * 60),
             100,
