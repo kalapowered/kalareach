@@ -274,8 +274,15 @@ impl OpenedDirectory {
                 AuthorisedDirectory::from_handle(environment_id, handle, path.to_path_buf())?
             }
             Err(error) if nothing(&error) => return Err(gone()),
-            // Said by the one place that words an open's failure, as for every other root.
-            Err(_) => AuthorisedDirectory::open_root(environment_id, path)?,
+            // The open's own error is the answer and gives the words, as it does for any other
+            // root. Nothing opens the path again, so what is there by then cannot change them.
+            Err(error) => {
+                return Err(kr_transfer::Escape::Unopenable {
+                    component: path.display().to_string(),
+                    detail: error.to_string(),
+                }
+                .into());
+            }
         };
         let identity = directory.identity();
         if let Some(expected) = expected
