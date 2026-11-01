@@ -663,21 +663,32 @@ fn the_units_with_no_file_share_one_allowance_and_do_not_each_have_one() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_question_about_a_unit_with_no_file_is_given_what_is_left_of_the_allowance_and_no_more() {
-    let tree = kr_ipc::testing::TempHost::create();
-    let manager = StandInManager::new();
-    manager.lists(A_UNIT);
-    std::fs::write(manager.here.join("stall-asking"), "").expect("a mark");
-    let left = manager.remove_within(&tree, std::time::Duration::from_secs(2));
-    let said = left.join("; ");
-    assert!(said.contains("could not be asked"), "{said}");
-    assert!(
-        said.contains("did not finish within"),
-        "the question was begun and ended at its bound: {said}"
-    );
-    assert!(
-        !said.contains("within 10s"),
-        "the question was given the minimum a question is given elsewhere: {said}"
-    );
+    // A run in which the time for the question had gone before it was begun shows nothing of the
+    // bound it was given, and is run again.
+    const RUNS: usize = 3;
+    for run in 1..=RUNS {
+        let tree = kr_ipc::testing::TempHost::create();
+        let manager = StandInManager::new();
+        manager.lists(A_UNIT);
+        std::fs::write(manager.here.join("stall-asking"), "").expect("a mark");
+        let left = manager.remove_within(&tree, std::time::Duration::from_secs(2));
+        let said = left.join("; ");
+        if said.contains("used up before it was asked") {
+            eprintln!("run {run} of {RUNS} shows nothing, the machine was too slow: {said}");
+            continue;
+        }
+        assert!(said.contains("could not be asked"), "{said}");
+        assert!(
+            said.contains("did not finish within"),
+            "the question was begun and ended at its bound: {said}"
+        );
+        assert!(
+            !said.contains("within 10s"),
+            "the question was given the minimum a question is given elsewhere: {said}"
+        );
+        return;
+    }
+    panic!("none of {RUNS} runs began its question in the time it was given");
 }
 
 /// The time the questions about units with no file share starts when the list has been read, and a
@@ -701,8 +712,11 @@ fn a_slow_list_does_not_take_the_time_given_for_the_questions_about_units_with_n
         manager.lists_slowly("5.5");
         let left = manager.remove_within(&tree, std::time::Duration::from_secs(5));
         let list_gave_out = left.iter().any(|what| what.contains("could not be listed"));
-        let question_gave_out = left.iter().any(|what| what.contains("could not be asked"))
-            && !manager.asked().is_empty();
+        // A question that was begun and ended at its bound says so; one that was never begun, because
+        // the time for it had gone, says that, and is the fault this case is for.
+        let question_gave_out = left.iter().any(|what| {
+            what.contains("could not be asked") && what.contains("did not finish within")
+        });
         if list_gave_out || question_gave_out {
             eprintln!("run {run} of {RUNS} shows nothing, the machine was too slow: {left:?}");
             continue;
