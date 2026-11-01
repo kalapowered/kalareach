@@ -5,14 +5,6 @@
 //! upstream it records. The phone is this crate's backend on the mock runtime, paired with the
 //! host, and every call below is made the way the page makes it, through the invoke path. A second
 //! paired device holds a share of the same session where a test needs one.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-19.08 | the `kr_req_19_08_` tests here |
-//! | KR-REQ-23.24 | `kr_req_23_24_a_later_prompt_after_an_unknown_one_is_admitted_only_with_the_quote_of_what_was_read` |
-//! | KR-REQ-13.03 | `kr_req_13_03_a_draft_is_the_same_after_a_visit_to_the_terminal` |
-//! | KR-REQ-13.13 | `kr_req_13_13_a_draft_outlives_the_host_being_out_of_contact_and_follows_its_conversation_only_when_retargeted` |
-//! | KR-REQ-01.01 | `kr_req_01_01_a_phone_that_exited_finds_the_session_it_left_and_attaches_again` |
 
 #![cfg(unix)]
 

@@ -4,24 +4,6 @@
 //! device is this crate's own backend on the mock runtime: it pairs with the host through the
 //! commands the page calls, takes the host as the one its commands go to, and reads through the
 //! paired connection, with the rights its grant carries. Nothing here makes a voice call.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-13.08 | `a_paired_host_answers_the_commands_the_page_calls` |
-//! | KR-REQ-13.08 | `a_host_that_comes_back_is_reached_again` |
-//! | KR-REQ-13.08 | `a_host_chosen_before_is_reached_again_when_the_application_starts` |
-//! | KR-REQ-13.08 | `choosing_between_two_paired_hosts_goes_to_the_one_chosen_last` |
-//! | KR-REQ-13.08 | `a_choice_of_host_that_cannot_be_kept_is_not_made` |
-//! | KR-REQ-13.08 | `a_phone_its_host_revoked_can_forget_that_host` |
-//! | KR-REQ-13.08 | `forgetting_the_host_in_use_ends_the_connection_to_it` |
-//! | KR-REQ-13.08 | `a_forget_whose_write_reports_a_failure_once_the_record_is_gone_still_ends_the_connection` |
-//! | KR-REQ-13.08 | `a_choice_made_from_a_listing_that_has_since_forgotten_the_host_is_refused` |
-//! | KR-REQ-13.08 | `forgetting_a_host_that_is_not_in_use_leaves_the_commands_going_to_the_other` |
-//! | KR-REQ-15.21 | `a_voice_screen_opens_once_the_person_has_allowed_what_it_may_do` |
-//! | KR-REQ-13.01 | `the_inboxes_of_the_other_paired_hosts_are_read_beside_the_one_in_use` |
-//! | KR-REQ-13.01 | `a_host_that_refuses_the_visit_is_in_contact_and_listed_as_having_refused` |
-//! | KR-REQ-13.01 | `a_host_chosen_or_forgotten_while_it_is_visited_is_not_reported` |
-//! | KR-REQ-13.01 | `the_owner_watcher_visits_an_owned_host_beside_the_host_in_use` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
@@ -201,6 +183,11 @@ async fn a_paired_host_answers_the_commands_the_page_calls() {
 /// daemon, which serves them to a paired device under the rights its grant carries, and not over a
 /// link to a worker on this computer, which a phone does not have. The host's own answer is what the
 /// page is told: here a session no worker serves.
+///
+/// KR-REQ-13.08, the part about the page's reads: a question read on a paired device is answered by
+/// the host the commands go to, here with the host's own refusal for a session no worker serves,
+/// and not by a link to a worker on this computer. Not shown here: the commands the grant does not
+/// carry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paired_devices_questions_go_through_the_host() {
     let owner = DeviceKeys::generate().expect("keys");
