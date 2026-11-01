@@ -846,45 +846,54 @@ fn serve_in_process(
 
 /// KR-REQ-22.10: a job runs with the thread count and bounds it was sent and with the sampler of
 /// the profile the process loaded, and the job's deadline is thirty seconds from a moment between
-/// the job's being sent and its reaching the model.
+/// the job's being sent and its reaching the model. The deadline is the one the job was sent with:
+/// a second job sent with twelve seconds is given twelve, so the thirty are not a figure the process
+/// keeps for itself.
 #[test]
 fn a_job_runs_with_the_limits_sent_and_the_loaded_profiles_sampler() {
     let recording = Recording::default();
     let profile = default_profile();
     let (ended, sent_at) = serve_in_process(
         recording.clone(),
-        &[load(1, &profile, 300_000), generate(2, 1, 30_000)],
-        || recording.jobs() == 1,
+        &[
+            load(1, &profile, 300_000),
+            generate(2, 1, 30_000),
+            generate(3, 1, 12_000),
+        ],
+        || recording.jobs() == 2,
     );
     assert_eq!(ended, Exit::Ended);
+    let asked = Asked {
+        context_tokens: 4_096,
+        max_output_tokens: 128,
+        cpu_threads: 4,
+        sampler: *profile.sampler(),
+        ceiling_bytes: 4 << 30,
+    };
     let recorded = recording.asked.lock().expect("the record").clone();
     assert_eq!(
         recorded,
-        vec![Asked {
-            context_tokens: 4_096,
-            max_output_tokens: 128,
-            cpu_threads: 4,
-            sampler: *profile.sampler(),
-            ceiling_bytes: 4 << 30,
-        }],
-        "the job ran with what it was sent and with the loaded profile's sampler"
+        vec![asked, asked],
+        "each job ran with what it was sent and with the loaded profile's sampler"
     );
 
-    // The deadline is thirty seconds from a moment between the job's being sent and its reaching
-    // the model, which orders the three moments and waits for none of them.
+    // The deadline is the sent one, from a moment between the job's being sent and its reaching the
+    // model, which orders the three moments and waits for none of them.
     let due = recording.due.lock().expect("the record").clone();
-    let [due] = due[..] else {
-        panic!("one job reached the model: {due:?}");
+    let [thirty, twelve] = due[..] else {
+        panic!("two jobs reached the model: {due:?}");
     };
-    let thirty_seconds = Duration::from_millis(30_000);
-    assert!(
-        sent_at[1] + thirty_seconds <= due.deadline,
-        "the deadline is no sooner than thirty seconds after the job was sent"
-    );
-    assert!(
-        due.deadline <= due.reached_at + thirty_seconds,
-        "the deadline is no later than thirty seconds after the job reached the model"
-    );
+    for (sent, due, seconds) in [(sent_at[1], thirty, 30), (sent_at[2], twelve, 12)] {
+        let deadline = Duration::from_secs(seconds);
+        assert!(
+            sent + deadline <= due.deadline,
+            "the deadline is no sooner than {seconds} seconds after the job was sent"
+        );
+        assert!(
+            due.deadline <= due.reached_at + deadline,
+            "the deadline is no later than {seconds} seconds after the job reached the model"
+        );
+    }
 }
 
 /// KR-REQ-22.11: the thread that runs a job is in the background class while it runs one: a read
