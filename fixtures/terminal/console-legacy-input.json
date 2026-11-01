@@ -166,7 +166,7 @@
     {
       "id": "alt-keypad-composed-character-is-the-character",
       "covers": "KR-REQ-08.53",
-      "why": "A character composed with Alt on the numeric keypad (Alt and 0233) is on the record of the Alt coming up, and is that character. With Num Lock on, the keypad digits are keys the encoder has no spelling for, and they say nothing.",
+      "why": "Recorded from a classic console window on Windows Server 2025 build 26100, with Alt and 0233 sent by SendInput. A character composed with Alt on the numeric keypad (Alt and 0233) is on the record of the Alt coming up, and is that character. With Num Lock on, the keypad digits are keys the encoder has no spelling for, and they say nothing.",
       "keyboard": {
         "application_cursor_keys": false,
         "negotiated": "legacy"

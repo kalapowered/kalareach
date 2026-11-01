@@ -910,7 +910,7 @@ method, and that is exactly what it cannot do:
   of the cursor reply. The reply to an earlier query can: one already in the terminal's input, such
   as the answer to a query of a program that ended before it read it, and one still waiting in the
   lane. The host cannot take back the first, and holding the second behind the cursor reply would
-  put a reply ahead of the query it answers.
+  write replies out of the order of their queries.
 
 Running the module on Windows, where the endpoint is a named pipe and the console has no line
 discipline to name an end-of-file character, so that the module reports the gesture as disabled at its
