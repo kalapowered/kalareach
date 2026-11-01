@@ -2838,7 +2838,7 @@ mod tests {
 
     /// The device rule knows a refusal by the exact words of its marker, so the value of the
     /// function that writes them reaches the refusal as it is. A call that changes it, here by
-    /// lower-casing the words or cutting them, writes words the rule no longer knows.
+    /// lower-casing or upper-casing the words, writes words the rule no longer knows.
     #[test]
     fn a_refusal_whose_shared_words_are_changed_after_the_call_is_not_the_shared_words() {
         let code = code_without_comments();
@@ -2846,7 +2846,7 @@ mod tests {
         assert_eq!(refusals_in(calls), Ok(4), "the calls as they are");
         for (call, changed) in [
             ("&did_not_register(&definition.name)", ".to_lowercase()"),
-            ("&did_not_remove(&definition.name)", ".trim_end()"),
+            ("&did_not_remove(&definition.name)", ".to_uppercase()"),
         ] {
             let mutated = calls.replacen(call, &format!("{call}{changed}"), 1);
             assert_ne!(
