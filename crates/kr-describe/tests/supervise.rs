@@ -1589,6 +1589,9 @@ fn a_check_that_will_not_stop_is_ended_at_the_bound_and_one_nobody_hears_counts_
     });
     rig.driver.cancel_check(at(20)).expect("a cancellation");
     rig.driver.cancel_check(at(1_020)).expect("a cancellation");
+    // A cancellation nobody has acknowledged is held to its own timer, and nothing else wakes the
+    // driver: it says it is to look when the timer ends, which asking again has not moved.
+    assert_eq!(rig.driver.due_ms(), Some(20 + CANCEL_MS));
     let reports = rig
         .driver
         .turn(&roomy(), at(20 + CANCEL_MS - 1))
