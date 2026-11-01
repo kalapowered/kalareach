@@ -4505,6 +4505,36 @@ async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_re
     );
 }
 
+/// Stops the session through the endpoint once a pass has left a reason to write, with the
+/// standard error of this process full and read by no one, says whether the stop was answered, and
+/// ends the process: the pass is still held in its write, and ends with the process.
+#[cfg(unix)]
+async fn stop_the_session_while_the_standard_error_is_stalled(host: &Host) -> ! {
+    // The report of a pass can be read once the pass has let go of the session.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    while host.runtime.session().output_pass_report().reason.is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a pass left output behind"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let mut client = cli(host).await;
+        close(&mut client, host).await
+    })
+    .await;
+    println!(
+        "{}",
+        if stopped.is_ok() {
+            "the stop was answered"
+        } else {
+            "the stop was not answered"
+        }
+    );
+    std::process::exit(0);
+}
+
 /// Section 24 and section 20, KR-REQ-20.20: a standard error that has stopped draining, a pipe
 /// nobody reads, holds the write of a reason and nothing else: the person's stop of the session is
 /// answered. A write made while the session's lock and the dispatch barrier are held would hold
@@ -4525,30 +4555,75 @@ async fn a_standard_error_that_stops_draining_does_not_hold_up_the_stop_of_a_ses
         }));
         fill_standard_error();
         let host = host_that_cannot_take_the_cap_lock().await;
-        // The report of a pass can be read once the pass has let go of the session.
+        stop_the_session_while_the_standard_error_is_stalled(&host).await;
+    }
+
+    let worker = run_in_a_worker_process(NAME, StandardError::NotRead);
+    assert!(
+        worker.ended_well && worker.standard_output.contains("the stop was answered"),
+        "the stop of the session waited for the standard error (ended well: {}): {}",
+        worker.ended_well,
+        worker.standard_output
+    );
+}
+
+/// As the case above, for the reason a look at the host's cap finds: the host's first pass has
+/// nothing to say because another host holds the lock on the cap, and the look that follows finds
+/// the lock unavailable. The look's write waits for the pipe; the stop of the session is answered.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_standard_error_that_stops_draining_does_not_hold_up_the_stop_of_a_session_during_a_look()
+{
+    const NAME: &str =
+        "a_standard_error_that_stops_draining_does_not_hold_up_the_stop_of_a_session_during_a_look";
+
+    if in_the_worker_process() {
+        std::panic::set_hook(Box::new(|failure| {
+            println!("the worker panicked: {failure}")
+        }));
+        fill_standard_error();
+        // Another host is giving up output for the cap before this host's first pass.
+        let held = Arc::new(std::sync::Mutex::new(None));
+        let host = host_started(
+            |_| {},
+            {
+                let held = Arc::clone(&held);
+                move |spool| {
+                    a_spool_that_puts_the_host_over_its_cap(0)(spool);
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(
+                            spool
+                                .parent()
+                                .expect("the spools' directory")
+                                .join("host-cap.lock"),
+                        )
+                        .expect("the lock file");
+                    kr_flush::lock::try_exclusive(&file).expect("nobody holds the lock");
+                    *held.lock().expect("not poisoned") = Some(file);
+                }
+            },
+            unix_time_service(true),
+            "sleep 30",
+        )
+        .await;
+        let spools = host._temp.environment().spool_dir();
+        // The first pass has ended when the host first looks again.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-        while host.runtime.session().output_pass_report().reason.is_none() {
+        while host.service.host_cap_looks() < 1 {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the first pass left output behind"
+                "the host looked at the cap again"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let stopped = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            let mut client = cli(&host).await;
-            close(&mut client, &host).await
-        })
-        .await;
-        println!(
-            "{}",
-            if stopped.is_ok() {
-                "the stop was answered"
-            } else {
-                "the stop was not answered"
-            }
-        );
-        // The pass is still held in its write, and ends with the process.
-        std::process::exit(0);
+        std::fs::rename(spools.join("host-cap.lock"), spools.join("lock-held"))
+            .expect("the held lock file is moved aside");
+        std::fs::create_dir(spools.join("host-cap.lock")).expect("a directory where the lock goes");
+        stop_the_session_while_the_standard_error_is_stalled(&host).await;
     }
 
     let worker = run_in_a_worker_process(NAME, StandardError::NotRead);
