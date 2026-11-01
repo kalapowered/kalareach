@@ -3567,7 +3567,7 @@ impl Container {
     /// any of it up.
     fn remove(&self) -> Result<(), String> {
         let until = Instant::now() + self.runtime.slow;
-        let mut last = String::new();
+        let mut last: String;
         let mut left = self.runtime.slow;
         loop {
             match self.runtime.run(
