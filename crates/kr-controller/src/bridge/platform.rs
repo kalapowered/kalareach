@@ -337,7 +337,7 @@ impl std::fmt::Display for CallFailure {
             Self::NotRun { call, error } => write!(formatter, "{call} could not be run: {error}"),
             Self::Deadline { call, limit, ended } => write!(
                 formatter,
-                "{call} said nothing for {} seconds and {}",
+                "{call} did not end within {} seconds and {}",
                 limit.as_secs(),
                 if *ended {
                     "was ended"
@@ -603,7 +603,9 @@ mod tests {
         .expect_err("the command is ended");
         assert!(error.to_string().contains("was ended"), "{error}");
         assert!(
-            error.to_string().contains("/bin/sleep 600 said nothing"),
+            error
+                .to_string()
+                .contains("/bin/sleep 600 did not end within"),
             "the refusal names the call: {error}"
         );
         assert!(
@@ -633,7 +635,7 @@ mod tests {
             "{error}"
         );
         assert!(
-            error.to_string().contains("/bin/sh -c said nothing"),
+            error.to_string().contains("/bin/sh -c did not end within"),
             "{error}"
         );
         assert!(
@@ -641,6 +643,9 @@ mod tests {
             "{error}"
         );
         assert!(!error.to_string().contains("exec sleep"), "{error}");
+        // A call that is ended at its limit may have printed before it, and is not said to have
+        // printed nothing.
+        assert!(!error.to_string().contains("said nothing"), "{error}");
     }
 
     /// An inspection that is acted on is read as a container that is not there only when the
