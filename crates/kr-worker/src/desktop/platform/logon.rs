@@ -275,8 +275,9 @@ mod tests {
     const PROBE: &str = "a_process_that_asks_often_holds_no_more_memory_for_it";
 
     /// KR-REQ-03.18: the list of sessions and the reply about one are given back to Terminal
-    /// Services on every path, so that a reader that asks often does not grow. The measurement is
-    /// of a whole process, so the case runs it in a process of its own.
+    /// Services, so that a reader that asks often does not grow. The case asks the calls that
+    /// answer; the other paths return through the guard that frees. The measurement is of a whole
+    /// process, so the case runs it in a process of its own.
     #[test]
     fn memory_that_terminal_services_allocated_is_given_back() {
         let program = std::env::current_exe().expect("the program of this test");

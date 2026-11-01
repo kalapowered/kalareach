@@ -45,7 +45,7 @@ pub struct HeldStation {
     /// The station's access list as the system writes it, as it was read back after it was made.
     pub access_list: String,
     /// The station's integrity label as the system writes it, as it was read back after it was
-    /// made, or empty when it has none.
+    /// made, or the text the system writes for none (empty, or a null list).
     pub label: String,
 }
 
@@ -112,8 +112,9 @@ impl HeldStation {
 }
 
 impl HeldStation {
-    /// The station's integrity label as the system writes it now, or empty when it has none: the
-    /// starter may have changed it since the station was made.
+    /// The station's integrity label as the system writes it now, or the text the system writes
+    /// for none (empty, or a null list): the starter may have changed it since the station was
+    /// made.
     ///
     /// # Errors
     ///
@@ -125,8 +126,8 @@ impl HeldStation {
     }
 }
 
-/// The interactive window station's integrity label as the system writes it, or empty when it has
-/// none.
+/// The interactive window station's integrity label as the system writes it, or the text the
+/// system writes for none (empty, or a null list).
 ///
 /// # Errors
 ///
@@ -147,7 +148,8 @@ impl Drop for HeldStation {
 /// held open until this is dropped.
 ///
 /// A desktop lasts as long as any handle of it does, and a desktop that exists already keeps the
-/// security it was made with, so a starter that is asked for a desktop of this name meets this one.
+/// access list it was made with, so a starter that is asked for a desktop of this name meets this
+/// one.
 pub struct HeldDesktop {
     handle: HDESK,
     /// The desktop's access list as the system writes it, as it was read back after it was made.
@@ -435,7 +437,8 @@ fn access_list_text(object: HANDLE) -> Result<String, String> {
     text_of(descriptor.0, DACL_SECURITY_INFORMATION)
 }
 
-/// The text of an object's integrity label, as the system writes it, or empty when it has none.
+/// The text of an object's integrity label, as the system writes it: empty or a null list when it
+/// has none.
 fn label_text(object: HANDLE) -> Result<String, String> {
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: the object is open with the right to read its security, the other parts are

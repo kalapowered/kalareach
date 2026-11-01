@@ -3,12 +3,12 @@
 //!
 //! KR-REQ-03.24: a headless worker is started on a desktop of its own, on the window station of its
 //! logon. A station that exists already keeps the access list it was made with, and the starter
-//! raises its integrity label to its own where it may, so it reads the station back and refuses to
-//! start a worker on one that admits more than the starter's own station does, and starts it on one
-//! that admits less: the interactive station gains entries while a logon lasts (a "Run as different
-//! user" may add one for the account it starts a program as), and a station made before that has not
-//! the new entry. A station that differs in a way the comparison does not weigh, such as one entry
-//! with another mask, is refused too, and the refusal does not say that it admits more.
+//! applies its integrity label to the station where it may, so it reads the station back and refuses
+//! to start a worker on one that admits more than the starter's own station does, and starts it on
+//! one that admits less: the interactive station gains entries while a logon lasts (a "Run as
+//! different user" may add one for the account it starts a program as), and a station made before
+//! that has not the new entry. A station that differs in a way the comparison does not weigh, such
+//! as one entry with another mask, is refused too, and the refusal does not say that it admits more.
 //!
 //! The desktop is checked the same way. A desktop that exists already on the station keeps the
 //! access list it was made with, so a desktop that admits more than the starter's own is refused. A
@@ -227,6 +227,13 @@ async fn a_logon_station_with_a_lower_label_that_the_starter_may_change_is_used(
         assert!(
             refused_for_the_station(&said) && said.contains("integrity label"),
             "the refusal does not say that the integrity label admits more: {said}"
+        );
+        let now = lowered
+            .label_now()
+            .unwrap_or_else(|error| panic!("the station's label now: {error}"));
+        assert!(
+            now.contains("S-1-16-0"),
+            "the starter changed the label of a station it had no label to put on: {now:?}"
         );
     }
 }
