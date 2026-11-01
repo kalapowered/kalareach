@@ -1081,6 +1081,53 @@ mod tests {
         assert_eq!(container_state(&absent), EnvironmentPresence::Stale);
     }
 
+    /// The words a failure of the daemon's platform calls says: the program and the verbs of the
+    /// four calls it makes, and nothing after them. They are what a person reads in a refresh that
+    /// failed, so they are held here, and a value (a name, a user) is not among them.
+    #[test]
+    fn a_failure_of_the_daemons_platform_calls_names_the_four_calls_it_makes() {
+        let enrolment = |access, target: &str| EnvironmentEnrolment {
+            environment_id: kr_protocol::ids::EnvironmentId::new(
+                kr_protocol::scalars::Uuid::from_bytes([2; 16]),
+            ),
+            access,
+            label: "one".to_owned(),
+            target: target.to_owned(),
+            os_user: "a-user".to_owned(),
+            helper_path: "/usr/local/bin/kr".to_owned(),
+            clipboard_destination: kr_protocol::scalars::Nullable::null(),
+            approved_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+        };
+        let call = |command: &launch::BridgeCommand| named(&command.program, &command.arguments);
+        let wsl = enrolment(EnvironmentAccess::WslDistribution, "a-distribution");
+        // A container is named by the identifier its runtime issued.
+        let container = enrolment(EnvironmentAccess::Container, &"3f".repeat(32));
+
+        let Observation::Listings {
+            registered,
+            running,
+        } = launch::observe(&wsl).expect("a listing")
+        else {
+            panic!("a distribution is observed by its listings");
+        };
+        assert_eq!(call(&registered), "wsl.exe --list");
+        assert_eq!(call(&running), "wsl.exe --list");
+        let Observation::Inspection(inspection) =
+            launch::observe(&container).expect("an inspection")
+        else {
+            panic!("a container is observed by an inspection");
+        };
+        assert_eq!(call(&inspection), "podman container inspect");
+        assert_eq!(
+            call(&launch::start(&wsl).expect("a start")),
+            "wsl.exe --distribution"
+        );
+        assert_eq!(
+            call(&launch::start(&container).expect("a start")),
+            "podman start"
+        );
+    }
+
     /// A runtime that warns on standard error while it answers `true` on standard output has a
     /// running container: the answer is what is read, whatever else the runtime says of itself.
     #[cfg(unix)]
