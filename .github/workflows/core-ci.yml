@@ -1512,6 +1512,7 @@ jobs:
       # The PSReadLine package refuses a PowerShell that a published advisory affects, so this job
       # runs it under a release at or above that bound, whichever one the runner image carries.
       # The release is pinned by version and checked against the digest its release notes publish.
+      # The macos-powershell job pins the same release for macOS, and the two change together.
       - name: Install the pinned PowerShell
         env:
           POWERSHELL_VERSION: "7.6.7"
@@ -2914,8 +2915,9 @@ jobs:
           rustc --version
           cargo --version
 
-      # The release is the one the shell-packages job pins, checked against the digest its release
-      # publishes. The directory goes first on the path, ahead of the PowerShell the image carries.
+      # The release is the one the shell-packages job pins, and the two change together. It is
+      # checked against the digest its release publishes, and its directory goes first on the path,
+      # ahead of the PowerShell the image carries.
       - name: Install the pinned PowerShell
         timeout-minutes: 5
         env:
