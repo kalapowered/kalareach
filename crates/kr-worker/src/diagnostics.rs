@@ -8,10 +8,11 @@
 //! A write to a standard error that has stopped draining, a pipe nobody reads or a journal that has
 //! stalled, does not return until a reader drains it, and nothing can cancel it. So nothing that
 //! serves a person or keeps the host's records makes the write itself. A line is handed to a
-//! thread of its own, started when the first line is said, which writes the lines one at a time.
-//! That thread is not a task of the runtime, and the runtime does not wait for it when it is
-//! dropped: the process ends with the thread still in its write. At most eight lines wait for it.
-//! A line offered beyond that is dropped, not waited for.
+//! thread of its own, started when a line is said and no thread is running, which writes the lines
+//! one at a time and ends when none waits. A worker that says nothing holds no thread, and one that
+//! has said its lines holds none either. That thread is not a task of the runtime, and the runtime
+//! does not wait for it when it is dropped: the process ends with the thread still in its write. At
+//! most eight lines wait for it. A line offered beyond that is dropped, not waited for.
 //!
 //! A line said just before the process ends can be lost to the exit, because the thread has not
 //! reached it. A program that says its last lines on the way out, as the worker's does, calls
@@ -21,8 +22,9 @@
 //! The write can fail as well: a volume that is full refuses it as it refused what made the host
 //! say it. A write that fails is let go.
 
+use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 /// How many lines wait for the thread that writes them before a further line is dropped.
@@ -37,98 +39,109 @@ struct Line {
     ended: Option<Ended>,
 }
 
-/// How many lines the thread has taken or been offered and has not finished with.
-#[derive(Default)]
-struct Unfinished {
-    count: Mutex<usize>,
+/// What the thread that writes the lines shares with the callers that hand lines over.
+struct Shared {
+    queue: Mutex<Queue>,
+    /// Signalled when no line is unfinished.
     none: Condvar,
+    /// Where the lines are written. The thread holds it for as long as it runs, and only one runs.
+    destination: Mutex<Box<dyn Write + Send>>,
 }
 
-impl Unfinished {
-    /// Counts a line that is about to be offered.
-    fn add(&self) {
-        *locked(&self.count) += 1;
-    }
-
-    /// Counts a line as finished with, whether it was written, refused or never taken.
-    fn finish(&self) {
-        let mut count = locked(&self.count);
-        *count -= 1;
-        if *count == 0 {
-            self.none.notify_all();
-        }
-    }
-
-    /// Waits for at most `within` until no line is unfinished, and says whether none is.
-    fn wait_for_none(&self, within: Duration) -> bool {
-        let (count, _) = self
-            .none
-            .wait_timeout_while(locked(&self.count), within, |count| *count > 0)
-            .unwrap_or_else(PoisonError::into_inner);
-        *count == 0
-    }
+/// The lines handed over, and whether a thread is there to write them.
+#[derive(Default)]
+struct Queue {
+    /// The lines that wait for the thread, oldest first. A line in its write is not among them.
+    waiting: VecDeque<Line>,
+    /// Whether a thread is running: from the moment it is started until it has found no line
+    /// waiting.
+    running: bool,
+    /// The lines handed over whose write has not ended, those that wait among them.
+    unfinished: usize,
 }
 
-/// The thread that writes lines to one destination, one at a time.
+/// Writes lines to one destination, one at a time, from a thread of its own that runs while a line
+/// waits or is being written.
 pub(crate) struct Writer {
-    /// Where lines are handed to the thread; none when the thread could not be started.
-    lines: Option<mpsc::SyncSender<Line>>,
-    unfinished: Arc<Unfinished>,
+    shared: Arc<Shared>,
 }
 
 impl Writer {
-    /// Starts the thread, which writes to `destination`.
-    pub(crate) fn start(destination: impl Write + Send + 'static) -> Self {
-        let (lines, waiting) = mpsc::sync_channel::<Line>(WAITING);
-        let unfinished = Arc::new(Unfinished::default());
-        let started = std::thread::Builder::new()
-            .name("kr-worker-diagnostics".to_owned())
-            .spawn({
-                let unfinished = Arc::clone(&unfinished);
-                move || write_lines(destination, &waiting, &unfinished)
-            })
-            .is_ok();
+    /// Makes a writer of lines to `destination`. No thread is started until a line is offered.
+    pub(crate) fn new(destination: impl Write + Send + 'static) -> Self {
         Self {
-            lines: started.then_some(lines),
-            unfinished,
+            shared: Arc::new(Shared {
+                queue: Mutex::default(),
+                none: Condvar::new(),
+                destination: Mutex::new(Box::new(destination)),
+            }),
         }
     }
 
-    /// Hands `text` to the thread, and says whether it took it. It never waits: a line is dropped
-    /// when [`WAITING`] lines already wait, or when the thread could not be started. `ended` is
-    /// called by the thread once the write has ended, and not at all for a line that is dropped.
+    /// Hands `text` to the thread, starting it when none is running, and says whether it took it. It
+    /// never waits: a line is dropped when [`WAITING`] lines already wait, or when no thread could
+    /// be started for it, and the next line tries again. `ended` is called by the thread once the
+    /// write has ended, and not at all for a line that is dropped.
     pub(crate) fn offer(&self, text: String, ended: Option<Ended>) -> bool {
-        let Some(lines) = &self.lines else {
+        let mut queue = locked(&self.shared.queue);
+        if queue.waiting.len() >= WAITING {
             return false;
-        };
-        self.unfinished.add();
-        let taken = lines.try_send(Line { text, ended }).is_ok();
-        if !taken {
-            self.unfinished.finish();
         }
-        taken
+        queue.waiting.push_back(Line { text, ended });
+        queue.unfinished += 1;
+        if !queue.running {
+            let shared = Arc::clone(&self.shared);
+            let started = std::thread::Builder::new()
+                .name("kr-worker-diagnostics".to_owned())
+                .spawn(move || write_lines(&shared))
+                .is_ok();
+            if !started {
+                queue.waiting.pop_back();
+                queue.unfinished -= 1;
+                return false;
+            }
+            queue.running = true;
+        }
+        true
     }
 
     /// Waits for at most `within` until every line the thread took has been written or refused, and
     /// says whether they have. A write that waits for a reader holds this for `within` and no
     /// longer.
     pub(crate) fn drain(&self, within: Duration) -> bool {
-        self.unfinished.wait_for_none(within)
+        let (queue, _) = self
+            .shared
+            .none
+            .wait_timeout_while(locked(&self.shared.queue), within, |queue| {
+                queue.unfinished > 0
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        queue.unfinished == 0
     }
 }
 
-/// Writes each line that arrives to `destination`, and tells whether it was written.
-fn write_lines(
-    mut destination: impl Write,
-    waiting: &mpsc::Receiver<Line>,
-    unfinished: &Unfinished,
-) {
-    for line in waiting {
+/// Writes the lines that wait to the destination, and tells whether each was written. It ends when
+/// none waits.
+fn write_lines(shared: &Shared) {
+    let mut destination = locked(&shared.destination);
+    loop {
+        let line = {
+            let mut queue = locked(&shared.queue);
+            let Some(line) = queue.waiting.pop_front() else {
+                queue.running = false;
+                return;
+            };
+            line
+        };
         let written = destination.write_all(line.text.as_bytes()).is_ok();
         if let Some(ended) = line.ended {
             ended(written);
         }
-        unfinished.finish();
+        let mut queue = locked(&shared.queue);
+        queue.unfinished -= 1;
+        if queue.unfinished == 0 {
+            shared.none.notify_all();
+        }
     }
 }
 
@@ -137,7 +150,7 @@ static STANDARD_ERROR: OnceLock<Writer> = OnceLock::new();
 
 /// Returns the writer of this process's standard error, starting it if no line has been said.
 pub(crate) fn standard_error() -> &'static Writer {
-    STANDARD_ERROR.get_or_init(|| Writer::start(destination()))
+    STANDARD_ERROR.get_or_init(|| Writer::new(destination()))
 }
 
 /// Where the writer of this process's standard error writes.
@@ -188,8 +201,7 @@ fn destination() -> impl Write + Send + 'static {
 /// writer is behind. The line is handed over whole, and the thread writes it with `write_all`: a
 /// volume that is nearly full can take part of it. This never waits for the write.
 ///
-/// A line is also let go when the thread could not be started, and then every line is, for as long
-/// as the process lives: the writer is started once.
+/// A line is also let go when no thread could be started for it. The next line tries again.
 pub fn tell(line: std::fmt::Arguments<'_>) {
     let _ = standard_error().offer(format!("kr-worker: {line}\n"), None);
 }
@@ -363,7 +375,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use super::{OutputReasons, Said, WAITING, Writer};
+    use super::{OutputReasons, Said, WAITING, Writer, locked};
 
     /// The most a case waits for something it expects.
     const DEADLINE: Duration = Duration::from_secs(30);
@@ -557,7 +569,7 @@ mod tests {
     #[test]
     fn lines_are_written_in_order_and_each_is_told_how_it_ended() {
         let volume = Volume::new();
-        let writer = Writer::start(volume.clone());
+        let writer = Writer::new(volume.clone());
         let (ended, results) = mpsc::channel();
         for text in ["one\n", "two\n"] {
             let ended = ended.clone();
@@ -600,6 +612,23 @@ mod tests {
         assert_eq!(volume.lines(), ["one", "two", "four"]);
     }
 
+    /// The thread ends when no line waits, so a worker that has said its lines holds none, and a
+    /// line said later is written by another.
+    #[test]
+    fn the_thread_ends_when_no_line_waits_and_a_later_line_starts_another() {
+        let volume = Volume::new();
+        let writer = Writer::new(volume.clone());
+        let thread_ended = || !locked(&writer.shared.queue).running;
+        assert!(thread_ended(), "no thread runs before a line is said");
+        for (number, text) in ["one\n", "two\n"].into_iter().enumerate() {
+            assert!(writer.offer(text.to_owned(), None));
+            assert!(writer.drain(DEADLINE), "the line was written");
+            until(thread_ended);
+            assert_eq!(volume.lines().len(), number + 1);
+        }
+        assert_eq!(volume.lines(), ["one", "two"]);
+    }
+
     /// A write that waits for a reader holds the writer's thread and nothing else: lines are taken
     /// until [`WAITING`] wait, then dropped without the caller waiting, and the waiting lines are
     /// written once the reader comes.
@@ -608,7 +637,7 @@ mod tests {
         let (begun, begun_at) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let taken = std::sync::Arc::default();
-        let writer = Writer::start(Stalled {
+        let writer = Writer::new(Stalled {
             begun,
             release: released,
             taken: std::sync::Arc::clone(&taken),
@@ -646,7 +675,7 @@ mod tests {
     fn a_drain_waits_for_the_lines_taken_and_gives_up_at_its_bound() {
         let (begun, begun_at) = mpsc::channel();
         let (release, released) = mpsc::channel();
-        let writer = std::sync::Arc::new(Writer::start(Stalled {
+        let writer = std::sync::Arc::new(Writer::new(Stalled {
             begun,
             release: released,
             taken: std::sync::Arc::default(),
@@ -680,7 +709,7 @@ mod tests {
         let (begun, begun_at) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let taken = std::sync::Arc::default();
-        let writer = Writer::start(Stalled {
+        let writer = Writer::new(Stalled {
             begun,
             release: released,
             taken: std::sync::Arc::clone(&taken),
@@ -711,7 +740,7 @@ mod tests {
     fn a_reason_whose_line_was_refused_is_offered_at_the_next_pass() {
         let volume = Volume::new();
         volume.fill();
-        let writer = Writer::start(volume.clone());
+        let writer = Writer::new(volume.clone());
         let reasons = OutputReasons::default();
 
         reasons.say(Some("the lock"), true, || &writer);
@@ -748,7 +777,7 @@ mod tests {
         let (begun, begun_at) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let taken = std::sync::Arc::default();
-        let writer = Writer::start(Stalled {
+        let writer = Writer::new(Stalled {
             begun,
             release: released,
             taken: std::sync::Arc::clone(&taken),
@@ -795,7 +824,7 @@ mod tests {
         let (begun, begun_at) = mpsc::channel();
         let (release, released) = mpsc::channel();
         let taken = std::sync::Arc::default();
-        let writer = Writer::start(Stalled {
+        let writer = Writer::new(Stalled {
             begun,
             release: released,
             taken: std::sync::Arc::clone(&taken),
