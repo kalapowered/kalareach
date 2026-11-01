@@ -30,13 +30,14 @@
 //! ([`suspension_for_a_device`]), in a result and in the refusal of a rich mutation.
 //!
 //! What the general rule does not find, and so passes whole, unless the refusal is one this module
-//! knows by its wording: a number that follows a word for an account with a colon and a space
-//! between them (`uid: 501`, `owner: 502`) or that follows a longer name for one (`user id 501`); a
-//! home directory written without a leading slash (`~name/work`, `Users/name/work`); and an
-//! account's bare name in a message that has no path, number or command beside it, such as the
-//! error output of `systemctl` that `supervision.rs` quotes. No producer of these forms is known.
-//! A producer that writes one is mended by giving the refusal a wording that is shared with this
-//! module, as [`KNOWN_REASONS`] does for the refusals it lists.
+//! knows by its wording: a number that follows a word for an account after more than one separator
+//! or through a longer name for one (`uid: 501`, `owner: 502`, `user id 501`, `user  501`,
+//! `uid(501)`, `uid_501`); a path whose first slash follows a name (`~name/work`,
+//! `Users/name/work`, `.config/kalareach/x`); and an account's bare name with no path, number or
+//! command beside it, or with only a path beside it in the clause that is kept (the error output
+//! of `systemctl` that `supervision.rs` quotes can hold one). A producer that writes one of these
+//! is mended by giving the refusal a wording that is shared with this module, as [`KNOWN_REASONS`]
+//! does for the refusals it lists.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -894,9 +895,13 @@ fn shown_member(map: &CanonicalMap, key: &str, child: &CanonicalValue) -> Option
                 .min()
             {
                 // The subject before the clause is the host's own words only if it names nothing of
-                // the host: a text whose subject does is held to the rule as a text with no clause
-                // is.
-                Some((at, _)) if first_naming(&text[..at]).is_some() => told_in_place(text, fixed),
+                // the host. A subject that does is held to the rule, as a text with no clause is,
+                // up to the end of the clause: the words after it are not the host's and are not
+                // looked at. A plugin identifier that reads as an account's number (`acme/user-1`)
+                // is held too.
+                Some((at, end)) if first_naming(&text[..at]).is_some() => {
+                    told_in_place(&text[..end], fixed)
+                }
                 Some((_, end)) => (end < text.len()).then(|| text[..end].to_owned()),
                 None => told_in_place(text, fixed),
             },
@@ -3943,17 +3948,32 @@ mod tests {
 
     #[test]
     fn a_subject_that_names_the_host_is_held_to_the_rule_before_the_cut() {
-        for subject in ["/Users/marguerite/p", "uid 501", "p at /Users/marguerite/p"] {
-            for clause in LEFT_OUT_CLAUSES {
-                // The clause is followed by words that are not the host's, and it ends the text.
+        // What a device is told when nothing of the text can be kept.
+        let nothing = format!("why the admissions leave the installation out; {WHY_NOT_SHOWN}");
+        for clause in LEFT_OUT_CLAUSES {
+            // A subject that names the host, with words after the clause and without any.
+            for subject in ["/Users/marguerite/p", "uid 501", "p at /Users/marguerite/p"] {
                 for said in [
                     format!("{subject}{clause}: marguerite wrote this"),
                     format!("{subject}{clause}"),
                 ] {
-                    let told = left_out_detail_told_to_a_device(&said);
-                    assert!(!tells_the_owner_alone(&told), "{said} was told as {told}");
+                    assert_eq!(left_out_detail_told_to_a_device(&said), nothing, "{said}");
                 }
             }
+            // A command quoted in the subject is replaced, and the words after the clause are
+            // not sent.
+            let said = format!("`chmod 700 p`{clause}: marguerite wrote this");
+            assert_eq!(
+                left_out_detail_told_to_a_device(&said),
+                format!("a command{clause}"),
+                "{said}"
+            );
+            // The words after the clause, which can hold the end of a pointer's refusal, do not
+            // hide a path in the subject.
+            let said = format!(
+                "x at /Users/marguerite/p{clause}: this carries a field it does not declare"
+            );
+            assert_eq!(left_out_detail_told_to_a_device(&said), nothing, "{said}");
         }
     }
 
