@@ -247,27 +247,35 @@ impl OpenedDirectory {
     ///
     /// Returns [`ProjectError::Destination`] when the directory cannot be opened or its path
     /// cannot be resolved, and [`ProjectError::IdentityChanged`] when the caller recorded an
-    /// identity and the object at the path is a different one, or there is nothing at the path to
-    /// open: the object the record names is gone, which is a source that changed and not an
-    /// argument the caller got wrong, however the open learned of it.
+    /// identity and the object at the path is a different one, or the open or the resolution of the
+    /// path finds nothing there: the object the record names is gone, which is a source that
+    /// changed and not an argument the caller got wrong. Each step answers for what it found
+    /// itself, as it does where a recorded tree is first opened, and nothing looks at the path
+    /// again to decide.
     pub fn open(
         environment_id: EnvironmentId,
         path: &Path,
         expected: Option<ObjectIdentity>,
     ) -> Result<Self> {
-        let directory = match AuthorisedDirectory::open_root(environment_id, path) {
-            Ok(directory) => directory,
-            Err(_) if expected.is_some() && is_gone(path) => {
-                return Err(ProjectError::IdentityChanged {
-                    detail: format!(
-                        "this record names a directory, and {} holds nothing now; the invocation \
-                         is not enclosed around it",
-                        crate::git::redact(&path.display().to_string())
-                    )
-                    .into(),
-                });
+        let gone = || ProjectError::IdentityChanged {
+            detail: format!(
+                "this record names a directory, and {} holds nothing now; the invocation is not \
+                 enclosed around it",
+                crate::git::redact(&path.display().to_string())
+            )
+            .into(),
+        };
+        let nothing = |error: &std::io::Error| {
+            expected.is_some() && error.kind() == std::io::ErrorKind::NotFound
+        };
+        let directory = match cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
+        {
+            Ok(handle) => {
+                AuthorisedDirectory::from_handle(environment_id, handle, path.to_path_buf())?
             }
-            Err(refusal) => return Err(refusal.into()),
+            Err(error) if nothing(&error) => return Err(gone()),
+            // Said by the one place that words an open's failure, as for every other root.
+            Err(_) => AuthorisedDirectory::open_root(environment_id, path)?,
         };
         let identity = directory.identity();
         if let Some(expected) = expected
@@ -284,12 +292,17 @@ impl OpenedDirectory {
         }
         // Every mechanism's rules are written against a path with no link left in it, so the path
         // is resolved once, here, beside the handle rather than at each rule.
-        let resolved = std::fs::canonicalize(path).map_err(|error| ProjectError::Destination {
-            detail: format!(
-                "{} could not be resolved to a directory this invocation may use: {error}",
-                crate::git::redact(&path.display().to_string())
-            )
-            .into(),
+        let resolved = std::fs::canonicalize(path).map_err(|error| {
+            if nothing(&error) {
+                return gone();
+            }
+            ProjectError::Destination {
+                detail: format!(
+                    "{} could not be resolved to a directory this invocation may use: {error}",
+                    crate::git::redact(&path.display().to_string())
+                )
+                .into(),
+            }
         })?;
         let created_at_ms = created_at_ms(directory.handle());
         Ok(Self {
@@ -352,15 +365,6 @@ impl OpenedDirectory {
         }
         Ok(())
     }
-}
-
-/// Whether nothing is at `path`: the name is not there, or it is a link that leads nowhere.
-///
-/// Asked of a path that has just failed to open, to tell a directory that went from one that cannot
-/// be entered, whose parent is a file or whose link cannot be followed, which are the caller's to
-/// put right.
-fn is_gone(path: &Path) -> bool {
-    matches!(std::fs::metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Returns the instant the filesystem says a directory was created, where it says.
