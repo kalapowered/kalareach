@@ -2193,9 +2193,7 @@ impl DescriptionService {
             }
             // A pin committed after validation read none. Nothing was recorded, so nothing is a
             // success: the queue's last success stays where it was.
-            refused => {
-                self.refused_publication(refused, session_id, produced_under.generation, now)
-            }
+            refused => self.refused_publication(refused, dispatched, now),
         })
     }
 
@@ -2299,9 +2297,7 @@ impl DescriptionService {
                     execution_ms,
                 }
             }
-            refused => {
-                self.refused_publication(refused, session_id, produced_under.generation, now)
-            }
+            refused => self.refused_publication(refused, dispatched, now),
         })
     }
 
@@ -2309,10 +2305,11 @@ impl DescriptionService {
     fn refused_publication(
         &mut self,
         gate: PublishGate,
-        session_id: SessionId,
-        produced: PrivacyGeneration,
+        dispatched: &Dispatched,
         now: Reading,
     ) -> Outcome {
+        let session_id = dispatched.job.session_id;
+        let produced = dispatched.produced_under.generation;
         let mut rejected = |rejection: Rejection| {
             self.counts.refused = self.counts.refused.saturating_add(1);
             Outcome::Rejected {
@@ -2328,11 +2325,9 @@ impl DescriptionService {
                 self.counts.cancelled = self.counts.cancelled.saturating_add(1);
                 Outcome::Cancelled { session_id }
             }
-            PublishGate::DeadlineExceeded => {
-                self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
-                self.restart.late(now);
-                Outcome::DeadlineExceeded { session_id }
-            }
+            // The gate read the token under the fence's lock, which a cancellation through the
+            // running job's handle does not wait for: one accepted since then is a caller's.
+            PublishGate::DeadlineExceeded => self.deadline_missed(dispatched, now),
             PublishGate::NamePinned => rejected(Rejection::NamePinned),
             PublishGate::Fenced => rejected(Rejection::LateGeneration {
                 expected: self

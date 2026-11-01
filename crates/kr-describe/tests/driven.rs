@@ -2233,7 +2233,7 @@ fn deadlines_missed_in_a_row_make_the_next_job_wait_and_never_show_inference_fai
         let mut now = at(3_000);
         for (index, how) in forms.into_iter().enumerate() {
             now = overrun(&mut service, now, how);
-            let wait_ms = RESTART_FIRST_MS << index;
+            let wait_ms = 1_000_u64 << index;
             assert_eq!(
                 service.next(&roomy(), now).expect("an instruction"),
                 Instruction::Wait {
@@ -2282,7 +2282,7 @@ fn deadlines_missed_in_a_row_make_the_next_job_wait_and_never_show_inference_fai
         assert_eq!(
             service.next(&roomy(), missed).expect("an instruction"),
             Instruction::Wait {
-                until_ms: Some(missed.monotonic_ms() + RESTART_FIRST_MS)
+                until_ms: Some(missed.monotonic_ms() + 1_000)
             },
             "{forms:?}: a miss after a publication waits a second"
         );
@@ -2334,7 +2334,9 @@ fn the_wait_after_deadlines_missed_in_a_row_stops_at_five_minutes() {
         queue(&mut service, &session(seed), "kalareach", at(0));
     }
     let mut now = at(3_000);
-    let mut expected = RESTART_FIRST_MS;
+    // One second, written out with the five minutes, so that a case that counts in them fails when
+    // either changes.
+    let mut expected = 1_000;
     for round in 1..=12 {
         now = overrun(&mut service, now, Overran::Said);
         assert_eq!(
@@ -2346,9 +2348,9 @@ fn the_wait_after_deadlines_missed_in_a_row_stops_at_five_minutes() {
         );
         assert!(!inference_failed(&service), "after miss {round}");
         now = now.after_ms(expected);
-        expected = (expected * 2).min(RESTART_MOST_MS);
+        expected = (expected * 2).min(300_000);
     }
-    assert_eq!(expected, RESTART_MOST_MS, "the wait stops at five minutes");
+    assert_eq!(expected, 300_000, "the wait stops at five minutes");
 }
 
 /// KR-REQ-22.11: a job the daemon asked to stop because its deadline passed ends past its deadline
@@ -2372,11 +2374,13 @@ fn a_job_stopped_at_its_deadline_ends_past_it_unless_something_else_stopped_it()
         why: JobEnd::Cancelled,
         detail: None,
     };
+    // A job in the process, and another session's waiting for it.
     let sent = |service: &mut DescriptionService| {
         queue(service, &session(1), "kalareach", at(0));
         let Instruction::Generate { id, .. } = loaded(service, at(3_000)) else {
             panic!("the job is sent");
         };
+        queue(service, &session(9), "kalareach", at(3_000));
         id
     };
     let after = at(3_000).after_ms(Budgets::DEFAULTS.execution_deadline_ms);
@@ -2395,11 +2399,10 @@ fn a_job_stopped_at_its_deadline_ends_past_it_unless_something_else_stopped_it()
     );
     assert_eq!(service.counts().deadline_exceeded, 1);
     assert_eq!(service.counts().cancelled, 0);
-    queue(&mut service, &session(2), "kalareach", after);
     assert_eq!(
         service.next(&roomy(), after).expect("an instruction"),
         Instruction::Wait {
-            until_ms: Some(after.monotonic_ms() + RESTART_FIRST_MS)
+            until_ms: Some(after.monotonic_ms() + 1_000)
         }
     );
 
@@ -2416,6 +2419,7 @@ fn a_job_stopped_at_its_deadline_ends_past_it_unless_something_else_stopped_it()
             session_id: session(1)
         }
     );
+    assert_no_wait_for_the_next_job(&mut service, after);
 
     // A pause that cancels the job past its deadline keeps it in the queue.
     let mut service = self::service();
@@ -2436,6 +2440,7 @@ fn a_job_stopped_at_its_deadline_ends_past_it_unless_something_else_stopped_it()
             session_id: session(1)
         }
     );
+    assert_no_wait_for_the_next_job(&mut service, after);
 
     // A session that closed after the request ends it cancelled and leaves the next job no wait:
     // whether the service had cancelled the job at its next look before the answer, or the answer
@@ -2510,15 +2515,13 @@ fn a_job_stopped_at_its_deadline_ends_past_it_unless_something_else_stopped_it()
     );
 }
 
-/// Asserts that a job queued now is sent at once: nothing made the next job wait.
-fn assert_no_wait_for_the_next_job(service: &mut DescriptionService, now: Reading) {
+/// Asserts that the job another session has waiting is sent at the moment the answer was taken:
+/// nothing counted a miss and nothing made the next job wait.
+fn assert_no_wait_for_the_next_job(service: &mut DescriptionService, answered: Reading) {
     assert_eq!(service.counts().deadline_exceeded, 0);
-    queue(service, &session(9), "kalareach", now);
     assert!(
         matches!(
-            service
-                .next(&roomy(), now.after_ms(2_000))
-                .expect("an instruction"),
+            service.next(&roomy(), answered).expect("an instruction"),
             Instruction::Generate { .. }
         ),
         "the next job waits"
@@ -2528,10 +2531,11 @@ fn assert_no_wait_for_the_next_job(service: &mut DescriptionService, now: Readin
 /// KR-REQ-22.21: a cancellation that a caller is told stopped a job is never counted as a job that
 /// passed its deadline, whichever way the job comes to be judged past its deadline: the process
 /// answers that it stopped after the daemon's request, the process answers on its own that the
-/// deadline passed, or the daemon ends the process for it. The service closes the running job's
-/// handle at the moment it decides, and a cancellation accepted until then ends the job cancelled
-/// and leaves the next job no wait. One that arrives after finds nothing running, and the job is
-/// counted past its deadline, so a cancellation is honoured or refused, never both.
+/// deadline passed, the process answers with a description after the deadline, or the daemon ends
+/// the process for it. The service closes the running job's handle at the moment it decides, and a
+/// cancellation accepted until then ends the job cancelled and leaves the next job no deadline
+/// wait. One that arrives after finds nothing running, and the job is counted past its deadline,
+/// so a cancellation is honoured or refused, never both.
 #[test]
 fn a_cancellation_accepted_before_the_handle_closes_is_never_a_missed_deadline() {
     let stopped = Answered::Ended {
@@ -2543,16 +2547,17 @@ fn a_cancellation_accepted_before_the_handle_closes_is_never_a_missed_deadline()
         detail: None,
     };
     let after = at(3_000).after_ms(Budgets::DEFAULTS.execution_deadline_ms);
-    // How each job is judged past its deadline: what the service is told, and whether the daemon
-    // asked the process to stop first.
-    for (form, deadline_stop) in [(Some(stopped), true), (Some(overran), false), (None, false)] {
+    // How each job is judged past its deadline.
+    for form in ["stopped", "overran", "late", "ended"] {
         for accepted in [true, false] {
             let mut service = service();
             queue(&mut service, &session(1), "kalareach", at(0));
-            let Instruction::Generate { id, .. } = loaded(&mut service, at(3_000)) else {
+            let Instruction::Generate { id, request, .. } = loaded(&mut service, at(3_000)) else {
                 panic!("the job is sent");
             };
-            if deadline_stop {
+            // Another session's job waits for the process.
+            queue(&mut service, &session(2), "kalareach", at(3_000));
+            if form == "stopped" {
                 service.job_asked_to_stop_at_its_deadline(id);
             }
             let told = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -2567,13 +2572,27 @@ fn a_cancellation_accepted_before_the_handle_closes_is_never_a_missed_deadline()
             } else {
                 at_next_decision(cancel);
             }
-            let outcomes = match form.clone() {
-                Some(answer) => vec![service.finished(id, answer, after).expect("the answer")],
-                None => service
+            let outcomes = match form {
+                "stopped" => vec![
+                    service
+                        .finished(id, stopped.clone(), after)
+                        .expect("the answer"),
+                ],
+                "overran" => vec![
+                    service
+                        .finished(id, overran.clone(), after)
+                        .expect("the answer"),
+                ],
+                "late" => vec![
+                    service
+                        .finished(id, produced(&request.prompt, 0), after.after_ms(1))
+                        .expect("the answer"),
+                ],
+                _ => service
                     .process_ended(ProcessEnd::PastDeadline, after)
                     .expect("the end"),
             };
-            assert_eq!(told.get(), Some(accepted), "{form:?}: told {accepted}");
+            assert_eq!(told.get(), Some(accepted), "{form}: told {accepted}");
             let expected = if accepted {
                 Outcome::Cancelled {
                     session_id: session(1),
@@ -2583,16 +2602,20 @@ fn a_cancellation_accepted_before_the_handle_closes_is_never_a_missed_deadline()
                     session_id: session(1),
                 }
             };
-            assert_eq!(outcomes[0], expected, "{form:?}: accepted {accepted}");
-            assert_eq!(service.counts().cancelled, u64::from(accepted));
-            if form.is_some() {
+            assert_eq!(outcomes[0], expected, "{form}: accepted {accepted}");
+            assert_eq!(service.counts().cancelled, u64::from(accepted), "{form}");
+            assert_eq!(
+                service.counts().deadline_exceeded,
+                u64::from(!accepted),
+                "{form}: accepted {accepted}"
+            );
+            if form != "ended" {
                 // The wait after a miss belongs to the job that was told it stopped nothing.
-                queue(&mut service, &session(2), "kalareach", after);
                 let next = service.next(&roomy(), after).expect("an instruction");
                 assert_eq!(
                     matches!(next, Instruction::Generate { .. }),
                     accepted,
-                    "{form:?}: accepted {accepted}: {next:?}"
+                    "{form}: accepted {accepted}: {next:?}"
                 );
             }
         }
