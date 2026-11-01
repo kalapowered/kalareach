@@ -6237,14 +6237,15 @@ async fn a_deadline_that_passes_while_the_call_waits_on_the_service_refuses_it_a
     assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
 }
 
-/// KR-REQ-09.09: a call that ends as unknown with no delay to tell is given that answer as it ended,
-/// though a fence landed while the read that settles its bundle write was out. Only an answer that
-/// tells a delay is held to the admission again, so a fence that meets no delay does not turn the
-/// answer into a refusal; the command repeats the unknown at a door that meets the fence. The read
-/// finds no bundle, because the write the service held open acted on nothing. The control: with the
-/// fence let go, the same call records the setup.
+/// KR-REQ-09.09: a call that ends with an answer that tells no delay is given that answer as it
+/// ended, though a fence landed while the read that settles its bundle write was out. Only an answer
+/// that tells a delay is held to the admission again, so a fence that meets no delay does not turn an
+/// unknown or a decline into a refusal; the command repeats the unknown at a door that meets the
+/// fence. In the first phase the read finds no bundle, because the write the service held open acted
+/// on nothing; in the second it finds other bytes at the locator. The control: with the fence let go,
+/// the same call records the setup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fence_owed_while_the_read_that_settles_the_bundle_write_is_out_leaves_an_unknown_that_tells_no_delay_as_it_is()
+async fn a_fence_owed_while_the_read_that_settles_the_bundle_write_is_out_leaves_an_answer_that_tells_no_delay_as_it_is()
  {
     let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
     let web = Arc::clone(rig.served.web());
@@ -6276,6 +6277,30 @@ async fn a_fence_owed_while_the_read_that_settles_the_bundle_write_is_out_leaves
         rig.enable(&made.params).await,
         BackupEnableResult::Enabled { .. }
     ));
+
+    // A decline is given as it ended too: the locator holds other bytes, so the write is refused and
+    // the read that settles it finds them.
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.put_bundle(
+        &made.params.bundle_locator.to_string(),
+        ACCOUNT,
+        vec![1, 2, 3],
+    );
+    web.fail(SYNC, 2, Moment::Slow);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the read that settles it", web.requests_reach(SYNC, 2)).await;
+    rig.controller.hold_fence(true);
+    web.release_held();
+    assert_eq!(
+        call.await
+            .expect("the call ends")
+            .expect("a decline is answered while a fence is owed"),
+        BackupEnableResult::Declined {
+            cause: BackupEnableCause::BundleConflict {}
+        }
+    );
 }
 
 /// KR-REQ-09.09: a delay the service named while the call waits on it holds back the request that
