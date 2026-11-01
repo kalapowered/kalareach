@@ -7,7 +7,10 @@
 //! process answers in real time, and the tests wait for its answers in real time. The process keeps
 //! real-time bounds of its own that no reading moves: the deadline it is sent for each piece of
 //! work, `CONTROL_BOUND_MS` for its control thread on one request and `OVERDUE_GRACE_MS` for work
-//! past its deadline, and a stall past the last two ends it.
+//! past its deadline, and a stall past the last two ends it; and before it says `ready` it waits up
+//! to half of `HANDSHAKE_MS` for its model thread to report the class it applied, which a process
+//! that cannot report it in that time answers as none. A case that must not depend on those bounds
+//! uses a recording process (`Raw::Recording`), which keeps none of them.
 
 mod stub;
 mod support;
@@ -49,8 +52,9 @@ use support::{MAC, a_pin_not_yet_committed, at, binding, built_in, native, roomy
 /// How long a test waits for the process in real time before it gives up.
 const REAL: Duration = Duration::from_secs(20);
 
-/// The execution deadline, from dequeue.
-const DEADLINE_MS: u64 = Budgets::DEFAULTS.execution_deadline_ms;
+/// The execution deadline, from dequeue: section 22's thirty seconds, written out so that a case
+/// that counts in it fails when the default changes.
+const DEADLINE_MS: u64 = 30_000;
 
 /// One description process, driven over its real pipes, with the store in a directory of the
 /// test's own on the internal disk.
@@ -178,6 +182,24 @@ impl Rig {
         self.until(&roomy(), now, "the job is sent", |_, driver| {
             driver.service().in_flight() == 1
         })
+    }
+
+    /// Waits until a recording process (`Raw::Recording`) has been sent `count` jobs, and returns
+    /// each job's identifier with the deadline in milliseconds the process read from the wire.
+    fn deadlines_sent(&self, count: usize) -> Vec<(u64, u64)> {
+        let runtime = self.placed.directory("runtime");
+        let give_up = Instant::now() + REAL;
+        loop {
+            let sent = kr_describe::testing::job_deadlines_sent(&runtime);
+            if sent.len() >= count {
+                return sent;
+            }
+            assert!(
+                Instant::now() < give_up,
+                "the process was not sent {count} jobs within {REAL:?}: {sent:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Waits in real time until an answer has arrived, without handling it.
@@ -1409,7 +1431,7 @@ fn a_load_whose_file_is_not_the_profiles_ends_as_assets_and_is_no_failure() {
 }
 
 /// KR-REQ-22.11: a cancellation reaches the process during a load and during a decode, and each
-/// ends at once with the process still running. The control is the same work left alone, which
+/// ends as cancelled with the process still running. The control is the same work left alone, which
 /// finishes.
 #[test]
 fn a_cancellation_reaches_the_process_during_a_load_and_a_decode() {
@@ -1650,16 +1672,19 @@ fn a_late_answer_is_dropped_and_counted() {
 }
 
 /// KR-REQ-22.10: a load that takes more than a job's thirty seconds, and the grace after them,
-/// happens before the job is dequeued: the load is not held to the job's deadline, the cold start is
-/// reported apart, and the job is then published. The job takes a moment in the process, which a
+/// happens before the job is dequeued: the load is not held to the job's deadline, the cold start
+/// is reported apart, and the job is then published. The job takes a moment in the process, which a
 /// deadline the load had used up would end, so the load did not use up the deadline the process was
 /// sent. The control is a job whose answer arrives past that deadline, which is refused. The first
-/// job after such a load is also held to the whole of its deadline from its send: the daemon ends a
-/// process that holds it at the deadline and the grace after the send, and not a moment before.
+/// job after such a load is sent to the process with the whole of its thirty seconds, as the
+/// process reads it from the wire, and the daemon ends a process that holds it at the deadline and
+/// the grace after the send, and not a moment before.
 ///
 /// The process holds its load until the case has seen the handshake and has taken a turn at the
 /// reading past the job's deadline and its grace, so the load's answer is told at that reading,
-/// whatever time the daemon's thread takes between them.
+/// whatever time the daemon's thread takes between them. The last part uses a process that keeps
+/// no deadline or watchdog of its own, so no reading of the clock and no delay of the host's
+/// threads moves the daemon's timer.
 #[test]
 fn a_load_over_thirty_seconds_is_followed_by_a_published_job() {
     let mut rig = Rig::new(&Script {
@@ -1693,9 +1718,9 @@ fn a_load_over_thirty_seconds_is_followed_by_a_published_job() {
         !the_process_ended(&reports),
         "a long load is not a job past its deadline"
     );
-    // No timer of the job runs from before it was sent: the soonest is the sample a second after
-    // the send. A state of the driver, read before any turn that could take the answer. The job's
-    // own deadline is held by the last part of the case.
+    // The soonest timer the driver holds is the sample a second after the send, which a timer that
+    // ran from before the send would precede. A state of the driver, read before any turn that
+    // could take the answer. The job's own deadline is held by the last part of the case.
     assert_eq!(rig.driver.due_ms(), Some(loaded_at + SAMPLE_MS));
     let reports = rig.until(
         &roomy(),
@@ -1735,9 +1760,11 @@ fn a_load_over_thirty_seconds_is_followed_by_a_published_job() {
         "{reports:?}"
     );
 
-    // The first job after the same load, held by the process until it is cancelled, is ended at the
-    // job's deadline and grace after its send, with nothing before.
+    // The first job after the same load goes to a process that records what it is sent and holds
+    // the job with no answer. The process is sent the job's whole thirty seconds, and the daemon
+    // ends it at that deadline and the grace after the send, with nothing before.
     let mut rig = Rig::new(&Script {
+        raw: Some(Raw::Recording),
         load_until_released: true,
         generate_until_cancelled: true,
         ..Script::default()
@@ -1753,6 +1780,14 @@ fn a_load_over_thirty_seconds_is_followed_by_a_published_job() {
             .any(|outcome| matches!(outcome, Outcome::Loaded { .. }))
     });
     assert_eq!(rig.driver.service().in_flight(), 1);
+    let sent = rig.deadlines_sent(1);
+    assert_eq!(
+        sent.iter()
+            .map(|(_, deadline_ms)| *deadline_ms)
+            .collect::<Vec<_>>(),
+        [30_000],
+        "the process is sent the whole of the job's deadline, whatever the load took: {sent:?}"
+    );
     let due = loaded_at + DEADLINE_MS + ANSWER_GRACE_MS;
     let reports = rig.driver.turn(&roomy(), at(due - 1)).expect("a turn");
     assert!(outcomes(&reports).is_empty(), "{reports:?}");

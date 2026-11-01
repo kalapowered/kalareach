@@ -56,6 +56,34 @@ pub const LOADED_PREFIX: &str = "stub-loaded-";
 /// ends the wait of a load or a job the script holds.
 const RELEASE_MARK: &str = "stub-released";
 
+/// The start of the name of the file a recording process ([`Raw::Recording`]) leaves in its runtime
+/// directory for each job it is sent, followed by the job's identifier. It holds the deadline in
+/// milliseconds that the job's request carried on the wire.
+pub const SENT_DEADLINE_PREFIX: &str = "stub-sent-deadline-";
+
+/// Returns the deadline, in milliseconds, that each job a recording process ([`Raw::Recording`])
+/// has been sent carried on the wire, with the job's identifier, in order of identifier.
+#[must_use]
+pub fn job_deadlines_sent(runtime_dir: &Path) -> Vec<(u64, u64)> {
+    let mut sent: Vec<(u64, u64)> = std::fs::read_dir(runtime_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let id = name.strip_prefix(SENT_DEADLINE_PREFIX)?.parse().ok()?;
+            let deadline_ms = std::fs::read_to_string(entry.path())
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            Some((id, deadline_ms))
+        })
+        .collect();
+    sent.sort_unstable();
+    sent
+}
+
 /// Lets the loads and the jobs run that stub processes with `runtime_dir` as their runtime
 /// directory hold ([`Script::load_until_released`] and [`Script::generate_until_released`]): the
 /// ones waiting now end, and the ones that begin afterwards are not held.
@@ -360,7 +388,8 @@ pub enum Output {
     Claims,
 }
 
-/// A process that breaks the wire on purpose.
+/// A process that does not serve through [`crate::serve::run`]: one that breaks the wire on
+/// purpose, and one that records what it is sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Raw {
     /// Reads everything and answers nothing.
@@ -374,6 +403,14 @@ pub enum Raw {
     /// Answers each job first with a success for work nobody is waiting for, then with its own
     /// answer, that it failed.
     StaleSuccessThenFailure,
+    /// Answers `hello`, loads and jobs as a process that works would, and leaves the deadline each
+    /// job carried on the wire in a file of its runtime directory ([`SENT_DEADLINE_PREFIX`]). The
+    /// script's `load_until_released` holds each load until [`release_held_work`], or for a minute
+    /// at most so that a test that never releases leaves no process waiting for good, and its
+    /// `generate_until_cancelled` leaves each job without an answer. The process keeps no deadline
+    /// and no watchdog of its own, so a job it holds stays held until the daemon ends it, whatever
+    /// the host's threads are doing.
+    Recording,
 }
 
 impl Script {
@@ -450,6 +487,7 @@ impl Script {
             Some(Raw::StaleSuccessThenFailure) => {
                 parts.push("raw=stale-success-then-failure".to_owned());
             }
+            Some(Raw::Recording) => parts.push("raw=recording".to_owned()),
         }
         parts.join(",")
     }
@@ -527,6 +565,7 @@ impl Script {
                         "partial-frame-then-hang" => Raw::PartialFrameThenHang,
                         "answer-twice" => Raw::AnswerTwice,
                         "stale-success-then-failure" => Raw::StaleSuccessThenFailure,
+                        "recording" => Raw::Recording,
                         other => return Err(format!("raw={other} is not a raw mode")),
                     });
                 }
@@ -1185,7 +1224,7 @@ pub fn stub_main() -> i32 {
         }
     }
     if let Some(raw) = script.raw {
-        return run_raw(raw, &script);
+        return run_raw(raw, &script, &runtime_dir);
     }
     let catalogue = match stub_catalogue() {
         Ok(catalogue) => catalogue,
@@ -1441,8 +1480,8 @@ impl<W: Write> Write for Wedging<W> {
     }
 }
 
-/// Runs a stub that breaks the wire on purpose, and returns its exit status.
-fn run_raw(raw: Raw, script: &Script) -> i32 {
+/// Runs a stub that does not serve through [`crate::serve::run`], and returns its exit status.
+fn run_raw(raw: Raw, script: &Script, runtime_dir: &Path) -> i32 {
     let mut input = std::io::stdin();
     let mut output = std::io::stdout();
     if raw == Raw::Silent {
@@ -1469,12 +1508,22 @@ fn run_raw(raw: Raw, script: &Script) -> i32 {
                 }),
                 ceiling: crate::serve::CEILING_MECHANISM.to_owned(),
             }],
-            Request::Load { id, .. } => vec![Answer::Loaded {
+            Request::Load { id, .. } => {
+                if raw == Raw::Recording && script.load_until_released {
+                    hold_until_released(runtime_dir);
+                }
+                vec![Answer::Loaded {
+                    id,
+                    load_ms: U64::new(0),
+                    rss_bytes: U64::new(0),
+                }]
+            }
+            Request::Generate {
                 id,
-                load_ms: U64::new(0),
-                rss_bytes: U64::new(0),
-            }],
-            Request::Generate { id, prompt, .. } => {
+                prompt,
+                deadline_ms,
+                ..
+            } => {
                 let produced = |id: U64| Answer::Produced {
                     id,
                     bytes: Bytes::from(answer_of(&prompt, &script.output)),
@@ -1482,6 +1531,17 @@ fn run_raw(raw: Raw, script: &Script) -> i32 {
                     peak_rss_bytes: U64::new(0),
                 };
                 match raw {
+                    Raw::Recording => {
+                        let _ = std::fs::write(
+                            runtime_dir.join(format!("{SENT_DEADLINE_PREFIX}{}", id.get())),
+                            deadline_ms.get().to_string(),
+                        );
+                        if script.generate_until_cancelled {
+                            Vec::new()
+                        } else {
+                            vec![produced(id)]
+                        }
+                    }
                     Raw::PartialFrameThenExit | Raw::PartialFrameThenHang => {
                         let frame = frame_of(&produced(id)).unwrap_or_default();
                         let _ = output.write_all(&frame[..frame.len() / 2]);
@@ -1521,6 +1581,16 @@ fn run_raw(raw: Raw, script: &Script) -> i32 {
                 return 0;
             }
         }
+    }
+}
+
+/// Waits until [`release_held_work`] has been called for `runtime_dir`, or for a minute, so that a
+/// test that never releases leaves no process waiting for good.
+fn hold_until_released(runtime_dir: &Path) {
+    let mark = runtime_dir.join(RELEASE_MARK);
+    let until = Instant::now() + Duration::from_secs(60);
+    while !mark.exists() && Instant::now() < until {
+        std::thread::sleep(LOOK);
     }
 }
 
