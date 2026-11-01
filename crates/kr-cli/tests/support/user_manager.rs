@@ -96,7 +96,7 @@ pub fn read_aside(
 const ASKED_TO_END_FOR: Duration = Duration::from_secs(5);
 
 /// Ends one of this test's own children that it has not collected, and collects it within
-/// [`STREAMS_DEADLINE`]. Returns what of that failed, as text to add to a reason, or nothing.
+/// [`TEARDOWN_BOUND`]. Returns what of that failed, as text to add to a reason, or nothing.
 ///
 /// The child is asked to end first and given [`ASKED_TO_END_FOR`] to do so. A program that is
 /// killed outright cannot clean up after itself: an image build that is, leaves the program its
@@ -122,9 +122,10 @@ pub fn end_and_collect_asking_for(child: &mut std::process::Child, asked_for: Du
 }
 
 /// Kills one of this test's own children that it has not collected, if it is still running, and
-/// collects it within [`STREAMS_DEADLINE`], where a wait for it would hold the case for as long as
-/// a child that does not go (one stuck in the kernel) stays. Returns what of that failed, as text
-/// to add to a reason, or nothing.
+/// collects it within [`TEARDOWN_BOUND`], where a wait for it would hold the case for as long as a
+/// child that does not go (one stuck in the kernel) stays. A process that is waiting on a disk that
+/// a stall has held for a minute is let go late, and a passing case fails for a child it is only
+/// slow to collect. Returns what of that failed, as text to add to a reason, or nothing.
 pub fn kill_and_collect(child: &mut std::process::Child) -> String {
     let mut failed = String::new();
     if matches!(child.try_wait(), Ok(None))
@@ -136,12 +137,12 @@ pub fn kill_and_collect(child: &mut std::process::Child) -> String {
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return failed,
-            Ok(None) if begun.elapsed() < STREAMS_DEADLINE => {
+            Ok(None) if begun.elapsed() < TEARDOWN_BOUND => {
                 std::thread::sleep(Duration::from_millis(20));
             }
             Ok(None) => {
                 failed.push_str(&format!(
-                    "; it was still running {STREAMS_DEADLINE:?} after it was ended"
+                    "; it was still running {TEARDOWN_BOUND:?} after it was ended"
                 ));
                 return failed;
             }
@@ -180,7 +181,7 @@ pub fn says_there_is_no_user_manager(stderr: &str) -> bool {
 /// For teardown, which must not panic: every failure is returned as what it was, and none waits
 /// without an end. The bound counts from the call, so the wait for the turn to start a process
 /// and the run itself are inside it. Beyond it, a call that did not end is given
-/// [`ASKED_TO_END_FOR`] to end when asked and [`STREAMS_DEADLINE`] to be collected, and what it
+/// [`ASKED_TO_END_FOR`] to end when asked and [`TEARDOWN_BOUND`] to be collected, and what it
 /// printed is given [`STREAMS_DEADLINE`] to reach its end. A call that ended while something it
 /// started still holds its output is a failure, and names the call.
 pub fn bounded(command: Command, bound: Duration) -> Result<Output, String> {
