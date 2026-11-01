@@ -3865,7 +3865,10 @@ fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::
     let drain = drain_until(Instant::now(), deadline);
     let clocks_own = drain == deadline;
     loop {
-        heard.take_in(drain);
+        // Read for as long as the probe's own time allows, not only for the drain's second: the
+        // second is how long the wait goes on, and a poll that comes after it still reads an end
+        // that arrived before it.
+        heard.take_in(deadline);
         if heard.overflowed() {
             return Err(too_much(described));
         }
