@@ -4278,8 +4278,8 @@ finds the host over the cap is not kept, and the worker that finds it gives up o
 on a file in the spools' directory, `host-cap.lock`, that every worker of the host takes without
 waiting. It reads the host again once it holds the lock, since the worker that held it before may
 have given up what the first reading found over, and it gives up what is then over. A worker that
-does not get the lock gives up nothing for the host's cap on that pass and measures again on its
-next, and a worker whose spool holds no output takes none. So workers whose passes fall together,
+does not get the lock gives up nothing for the host's cap on that pass and looks again soon, and a
+worker whose spool holds no output takes none. So workers whose passes fall together,
 as passes on the wall clock's half minutes do whatever the moments their sessions began at, give up
 the excess once and not once each. A worker of an earlier release takes no lock, so the exclusion is
 among the workers of this one. The control daemon applies the cap
@@ -4292,17 +4292,27 @@ that records where a spool's output got to is not counted, and neither is anythi
 segments. Both parties read the whole environment's bytes and each acts on its own sessions, so in
 the minute the daemon and a worker both find the host over the cap they can both give up output,
 and the host is then under the cap by what both took. A worker that does not get the lock leaves
-the cap to the one that holds it, and looks again after two to five seconds, drawn at random, until
-it gets the lock or the cap is met, and no later than its next pass. It never waits for
-the lock, so a session's own work waits on no other worker. The holder gives up only its own
+the cap to the one that holds it. It looks again after two to five seconds, drawn at random, and
+goes on looking at that interval until it gets the lock, finds the host under the cap, reaches its
+next pass, or its session closes. It never waits for the lock, so a session's own work waits on no
+other worker. A look applies the two byte caps and removes nothing by age: no look at
+the clocks comes before it, and the platform's time service may have stopped keeping the clock since
+the pass that did, so the age bound waits for the next pass. The holder gives up only its own
 output, so when that is less than the excess the workers that look again give up the rest, one at a
-time. A worker that cannot open or take the lock file at all gives up nothing for the cap and keeps
-the reason with the others its pass left output behind for. The host is over the cap for no longer
-than a few rounds of looking again after the pass of the session that grew, unless that session
-cannot give up the excess, as when its worker has ended, it holds less than the excess while the
-other workers have taken no output, or it cannot write its boundary: the other workers keep a
-reading that found the host under the cap while they take no output, and find it over the cap when
-that reading, five to six minutes old, is taken again.
+time; where no worker lost the lock, the rest stays until the pass of a worker that has output to
+give up finds the host over the cap. A worker that cannot open or take the lock file at all gives up
+nothing for the cap and keeps the reason with the others its pass left output behind for. A pass
+writes such a reason to the worker's standard error once while it stands, and again if it changes
+or comes back. On Unix a launchd job's or a detached process's standard error is the job's diagnostics
+file, and a transient unit's is the user's journal. A Windows worker's is a console with no window,
+so nothing keeps the reason there. A write to the standard error that fails, as one does on a full
+volume, costs the pass nothing; the reason is written at the next pass that can. Nothing bounds how
+long the host stays over the cap: the delays are random, and a holder that stops without ending
+keeps the lock while the others go on looking. The host also stays over the cap when the session
+that grew cannot give up the excess, as when its worker has ended, it holds less than the excess
+while the other workers have taken no output, or it cannot write its boundary: the other workers
+keep a reading that found the host under the cap while they take no output, and find it over the
+cap when that reading, five to six minutes old, is taken again.
 
 Eviction is not quiet. A retention pass records the cursor range it took and the bound that took
 it, and a reader asking for a cursor inside that range is told both: `history.page` returns the

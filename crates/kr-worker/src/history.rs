@@ -1020,9 +1020,11 @@ impl OutputHistory {
     /// have given up what the first reading found over. A session that does not get the lock gives
     /// up nothing for the host's cap on this pass and says so in
     /// [`Self::awaits_the_host_cap_lock`], and its caller looks again after a short delay, until it
-    /// gets the lock or the cap is met; the holder gives up only its own output, so when that is
-    /// less than the excess the rest goes to the sessions that look again. A lock that cannot be
-    /// opened or taken at all is not another session holding it: the pass says why in
+    /// gets the lock or the cap is met. The holder gives up only its own output. When that is less
+    /// than the excess, the rest goes to the sessions that did not get the lock and look again;
+    /// where none lost it, the rest stays until the pass of a session that has output to give up
+    /// finds the host over its cap. A lock that cannot be opened or taken at all is not another
+    /// session holding it: the pass says why in
     /// [`Self::left_behind`]. A worker of an earlier release takes no lock, so the exclusion is
     /// among the workers of this one. The control daemon applies the same cap to the sessions that
     /// have closed, from a reading of its own.
