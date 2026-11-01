@@ -2102,24 +2102,37 @@ async fn reported_as(
     what: &str,
 ) {
     let started = tokio::time::Instant::now();
-    let waited = tokio::time::timeout_at(started + Duration::from_secs(20), async {
-        loop {
-            if reported(host, client, attachment_id).await == expected {
-                return;
+    let mut answers = 0_u64;
+    let mut last = None;
+    let mut stuck = false;
+    while started.elapsed() < Duration::from_secs(20) {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            reported(host, client, attachment_id),
+        )
+        .await
+        {
+            Ok(state) => {
+                answers += 1;
+                if state == expected {
+                    return;
+                }
+                last = Some(state);
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            Err(_) => {
+                stuck = true;
+                break;
+            }
         }
-    })
-    .await;
-    if waited.is_err() {
-        let state = reported(host, client, attachment_id).await;
-        let seen = retained(&host.runtime);
-        panic!(
-            "waited {:?} for {what}; the session reports {state:?}; it retained {:?}",
-            started.elapsed(),
-            String::from_utf8_lossy(&seen).escape_debug().to_string()
-        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    let seen = retained(&host.runtime);
+    panic!(
+        "waited {:?} for {what}; {answers} answers, the last {last:?}, a request unanswered for 5 s: \
+         {stuck}; it retained {:?}",
+        started.elapsed(),
+        String::from_utf8_lossy(&seen).escape_debug().to_string()
+    );
 }
 
 /// KR-REQ-08.81: asking for a screen is beginning again, and beginning again meets a boundary.
@@ -5761,8 +5774,12 @@ async fn probe_soft_reset_wrap_pending() {
              retained_before_reset={:?} retained_after_abc={:?}",
             started.elapsed(),
             marker.cursor.get(),
-            String::from_utf8_lossy(&seen[..before.min(seen.len())]).escape_debug().to_string(),
-            String::from_utf8_lossy(&seen[before.min(seen.len())..]).escape_debug().to_string(),
+            String::from_utf8_lossy(&seen[..before.min(seen.len())])
+                .escape_debug()
+                .to_string(),
+            String::from_utf8_lossy(&seen[before.min(seen.len())..])
+                .escape_debug()
+                .to_string(),
         );
     }
     eprintln!("probe summary: {mismatches} of {rounds} rounds did not report the projection");
