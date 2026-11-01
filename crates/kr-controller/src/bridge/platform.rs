@@ -47,28 +47,12 @@ pub fn destination_state(
         clipboard_destination: kr_protocol::scalars::Nullable::null(),
         approved_at_ms: kr_protocol::scalars::TimestampMs::new(0),
     };
-    PlatformObserver.observe(&enrolment)
+    observe_enrolment(&enrolment, true)
 }
 
 impl Observer for PlatformObserver {
     fn observe(&self, enrolment: &EnvironmentEnrolment) -> Result<EnvironmentPresence> {
-        let observation = launch::observe(enrolment)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        match observation {
-            Observation::Listings {
-                registered,
-                running,
-            } => {
-                let registered =
-                    run_within(&registered.program, &registered.arguments, LISTING_LIMIT)?;
-                let running = run_within(&running.program, &running.arguments, LISTING_LIMIT)?;
-                Ok(wsl_state(&registered, &running, &enrolment.target))
-            }
-            Observation::Inspection(command) => {
-                let output = run(&command.program, &command.arguments)?;
-                Ok(container_state(&output))
-            }
-        }
+        observe_enrolment(enrolment, false)
     }
 
     fn start(&self, enrolment: &EnvironmentEnrolment) -> Result<()> {
@@ -84,6 +68,52 @@ impl Observer for PlatformObserver {
             output.text.trim()
         )))
     }
+}
+
+/// Observes one enrolment. A container whose inspection ended non-zero is observed as stale, which
+/// is what a daemon records of an identity it could observe nothing about; a caller that is about
+/// to act on the answer (`strict`) is told instead when the runtime failed for any reason but not
+/// knowing the container, since a runtime that is failing has shown nothing of the container.
+fn observe_enrolment(
+    enrolment: &EnvironmentEnrolment,
+    strict: bool,
+) -> Result<EnvironmentPresence> {
+    let observation = launch::observe(enrolment)
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+    match observation {
+        Observation::Listings {
+            registered,
+            running,
+        } => {
+            let registered = run_within(&registered.program, &registered.arguments, LISTING_LIMIT)?;
+            let running = run_within(&running.program, &running.arguments, LISTING_LIMIT)?;
+            Ok(wsl_state(&registered, &running, &enrolment.target))
+        }
+        Observation::Inspection(command) => {
+            let output = run(&command.program, &command.arguments)?;
+            if strict {
+                presence_after_inspection(&named(&command.program, &command.arguments), &output)
+            } else {
+                Ok(container_state(&output))
+            }
+        }
+    }
+}
+
+/// What an inspection that is acted on shows: a container the runtime says it does not know is
+/// stale, and an inspection that ended non-zero in any other way is the failure of the call, which
+/// is named and not read as a container that is not running.
+fn presence_after_inspection(call: &str, output: &CommandOutput) -> Result<EnvironmentPresence> {
+    if output.code != Some(0) && !says_there_is_no_such_container(&output.text) {
+        let ended = output.code.map_or_else(
+            || "without an exit status".to_owned(),
+            |code| format!("with exit status {code}"),
+        );
+        return Err(ControllerError::supervision(format!(
+            "{call} ended {ended}"
+        )));
+    }
+    Ok(container_state(output))
 }
 
 /// What one platform command produced.
@@ -554,6 +584,41 @@ mod tests {
             "{error}"
         );
         assert!(!error.to_string().contains("exec sleep"), "{error}");
+    }
+
+    /// An inspection that is acted on is read as a container that is not there only when the
+    /// runtime says so; any other non-zero ending is the call's failure, named, with no value.
+    #[test]
+    fn an_inspection_that_failed_for_another_reason_is_the_calls_failure() {
+        let ended = |code: Option<i32>, text: &str| super::CommandOutput {
+            code,
+            text: text.to_owned(),
+        };
+        let call = "podman container inspect";
+        assert_eq!(
+            super::presence_after_inspection(call, &ended(Some(0), "true\n")).expect("answered"),
+            super::EnvironmentPresence::Running
+        );
+        assert_eq!(
+            super::presence_after_inspection(call, &ended(Some(0), "false\n")).expect("answered"),
+            super::EnvironmentPresence::EnvironmentStopped
+        );
+        assert_eq!(
+            super::presence_after_inspection(call, &ended(Some(125), "Error: no such container x"))
+                .expect("a container the runtime does not know"),
+            super::EnvironmentPresence::Stale
+        );
+        for failed in [
+            ended(Some(125), "Error: cannot connect to the store of a-value"),
+            ended(Some(1), ""),
+            ended(None, ""),
+        ] {
+            let error = super::presence_after_inspection(call, &failed)
+                .expect_err("a failing runtime has shown nothing of the container");
+            let said = error.to_string();
+            assert!(said.contains(call) && said.contains("ended"), "{said}");
+            assert!(!said.contains("a-value"), "{said}");
+        }
     }
 
     /// The runtimes' own form of the diagnostic is the one read; the words in a path are not.

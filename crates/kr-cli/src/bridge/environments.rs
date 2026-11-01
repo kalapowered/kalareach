@@ -17,6 +17,8 @@ use kr_protocol::ids::{ActionId, EnvironmentId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs};
 
+use kr_controller::ControllerError;
+use kr_controller::bridge::invoke::Refusal;
 use kr_controller::bridge::launch::CONTAINER_RUNTIME;
 use kr_controller::bridge::platform::{self, CallFailure, PLATFORM_LIMIT};
 
@@ -75,7 +77,8 @@ pub async fn list(arguments: &BridgeListArguments) -> Result<EnvironmentInventor
 ///
 /// # Errors
 ///
-/// Returns the daemon's refusal, a usage failure, or a transport failure.
+/// Returns the daemon's refusal, a usage failure, the failure of a program outside `kr` that
+/// enrolment asked something of, or a transport failure.
 pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolResult> {
     let paths = kr_ipc::paths::HostPaths::discover()?;
     let known = resolve::select(&paths, None)?;
@@ -105,14 +108,7 @@ pub async fn enrol(arguments: &BridgeEnrolArguments) -> Result<EnvironmentEnrolR
             }
             let (answered, answered_user) =
                 query_helper_identity(access_class, &target, &arguments.user, &arguments.helper)
-                    .await
-                    .map_err(|error| {
-                        CliError::Usage(shown!(
-                            "the destination did not say which environment it is ({}); pass \
-                             --environment-id <uuid> instead",
-                            error
-                        ))
-                    })?;
+                    .await?;
             // A refresh checks the user the helper runs as against the record, so a record that
             // names another would fail at its first one. It is refused here, where the person can
             // say which user they meant.
@@ -250,7 +246,7 @@ fn resolve_container_target_through(
     }
     let resolved = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if !kr_protocol::identity::is_container_identifier(&resolved) {
-        return Err(CliError::Usage(shown!(
+        return Err(CliError::Other(shown!(
             "{} answered with something that is not the whole identifier a container carries",
             runtime
         )));
@@ -270,14 +266,29 @@ fn probe_permitted(
     helper: &str,
 ) -> Result<()> {
     let observed = kr_controller::bridge::platform::destination_state(access, target, user, helper)
-        .map_err(|error| {
-            CliError::Usage(shown!(
-                "this host could not ask whether the destination is running ({}), so it will not \
-                 start it by asking; pass --environment-id <uuid> instead",
-                error.code()
-            ))
-        })?;
+        .map_err(probe_failure)?;
     probe_decision(observed)
+}
+
+/// What a failure to ask the platform whether the destination is running is told as. An argument
+/// the platform could not be asked with is the person's to correct; a program that could not be
+/// run, did not end in its time or ended in a way that says nothing of the destination is a
+/// failure outside `kr`, whatever the person typed.
+fn probe_failure(error: ControllerError) -> CliError {
+    let code = error.code();
+    if matches!(error, ControllerError::InvalidArgument(_)) {
+        CliError::Usage(shown!(
+            "this host could not ask whether the destination is running ({}), so it will not \
+             start it by asking; pass --environment-id <uuid> instead",
+            code
+        ))
+    } else {
+        CliError::Other(shown!(
+            "this host could not ask whether the destination is running ({}), so it will not \
+             start it by asking; pass --environment-id <uuid> instead",
+            code
+        ))
+    }
 }
 
 /// The rule a probe follows once the platform has answered.
@@ -305,11 +316,16 @@ async fn query_helper_identity(
     target: &str,
     user: &str,
     helper: &str,
-) -> std::result::Result<(EnvironmentId, String), Shown> {
+) -> Result<(EnvironmentId, String)> {
     // What the launch and the destination said is not repeated: it carries the target, the user
     // and whatever the destination wrote.
     let command = kr_controller::bridge::launch::identity_command(access, target, user, helper)
-        .map_err(|_| Shown::said("the helper's command could not be built"))?;
+        .map_err(|_| {
+            CliError::Usage(Shown::said(
+                "the destination did not say which environment it is (the helper's command could \
+                 not be built); pass --environment-id <uuid> instead",
+            ))
+        })?;
     let hello = kr_protocol::identity::BridgeHello {
         protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
         build_id: crate::build_id(),
@@ -323,8 +339,37 @@ async fn query_helper_identity(
     };
     let acknowledgement = kr_controller::bridge::invoke::discover(&command, &hello)
         .await
-        .map_err(|_| Shown::said("the helper did not answer with its environment"))?;
+        .map_err(|refusal| helper_failure(&refusal))?;
     Ok((acknowledgement.environment_id, acknowledgement.os_user))
+}
+
+/// What a helper that did not give its environment is told as. A helper that could not be
+/// started, whose stream failed, that said nothing for long enough or that could not be ended
+/// after it answered is a program outside `kr` that failed; one that answered wrongly is the
+/// person's to correct. Nothing the launch or the destination said is repeated.
+fn helper_failure(refusal: &Refusal) -> CliError {
+    match refusal {
+        Refusal::NotStarted { .. } => CliError::Other(Shown::said(
+            "the destination did not say which environment it is (the helper could not be \
+             started); pass --environment-id <uuid> instead",
+        )),
+        Refusal::Stream { .. } => CliError::Other(Shown::said(
+            "the destination did not say which environment it is (the stream to the helper \
+             failed); pass --environment-id <uuid> instead",
+        )),
+        Refusal::Silent { .. } => CliError::Other(Shown::said(
+            "the destination did not say which environment it is (the helper said nothing for \
+             long enough that it was given up on); pass --environment-id <uuid> instead",
+        )),
+        Refusal::Unkillable { .. } => CliError::Other(Shown::said(
+            "the destination did not say which environment it is (the helper answered and could \
+             not be ended); pass --environment-id <uuid> instead",
+        )),
+        _ => CliError::Usage(Shown::said(
+            "the destination did not say which environment it is (the helper did not answer with \
+             its environment); pass --environment-id <uuid> instead",
+        )),
+    }
 }
 
 /// The environment the invocation is made from, for the opening frame.
@@ -599,6 +644,60 @@ mod tests {
             "{refused}"
         );
         assert_eq!(refused.exit_code(), 1, "{refused}");
+    }
+
+    /// Every failure of a program outside `kr` that enrolment asked something of exits as one
+    /// does, whichever call it was; a refusal the person can correct is a usage failure.
+    #[test]
+    fn a_failure_of_an_outside_program_is_told_as_one_and_a_wrong_answer_as_usage() {
+        let silent = std::time::Duration::from_secs(20);
+        for outside in [
+            Refusal::NotStarted {
+                program: "podman".to_owned(),
+                detail: "a-value".to_owned(),
+            },
+            Refusal::Stream {
+                detail: "a-value".to_owned(),
+            },
+            Refusal::Silent { waited: silent },
+            Refusal::Unkillable {
+                program: "podman".to_owned(),
+                pid: None,
+                detail: "a-value".to_owned(),
+            },
+        ] {
+            let told = helper_failure(&outside);
+            assert_eq!(told.exit_code(), 1, "{outside}: {told}");
+            assert!(!told.to_string().contains("a-value"), "{told}");
+        }
+        let told = helper_failure(&Refusal::NotAnAcknowledgement);
+        assert_eq!(told.exit_code(), 2, "{told}");
+
+        let asked = probe_failure(ControllerError::supervision(
+            "podman said nothing".to_owned(),
+        ));
+        assert_eq!(asked.exit_code(), 1, "{asked}");
+        let asked = probe_failure(ControllerError::InvalidArgument("a target".to_owned()));
+        assert_eq!(asked.exit_code(), 2, "{asked}");
+    }
+
+    /// A runtime that answers with success and something that is not an identifier has failed, and
+    /// is told as an outside program's failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_runtime_that_answers_with_something_that_is_not_an_identifier_is_an_outside_failure() {
+        let runtime = a_runtime_that("echo not-an-identifier");
+        let refused = resolve_container_target_through(
+            runtime,
+            std::time::Duration::from_secs(30),
+            "a-name-the-person-typed",
+        )
+        .expect_err("an answer that is not an identifier is refused");
+        assert_eq!(refused.exit_code(), 1, "{refused}");
+        assert!(
+            !refused.to_string().contains("a-name-the-person-typed"),
+            "{refused}"
+        );
     }
 
     /// A runtime that is not installed is refused as that, and not as a call that ran long.
