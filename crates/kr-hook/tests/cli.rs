@@ -1,9 +1,4 @@
 //! The forwarder's command line, run as the application runs it.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-11.42 | every test below: the invocations the Claude Code, Gemini CLI and Qoder CLI bridges register parse, and nothing else does |
-//! | KR-REQ-11.43 | `outside_a_launch_a_hook_answers_neutrally_and_reaches_for_nothing` |
 
 mod common;
 

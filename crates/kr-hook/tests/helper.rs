@@ -6,11 +6,6 @@
 //! starts already holding the worker's release. These cases run the real forwarder of one release
 //! of a store and a launch whose registration names another release of it, which holds a recording
 //! program in place of its forwarder.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-26.06 | the cases below |
-//! | KR-REQ-26.08 | the cases below |
 
 #![cfg(unix)]
 

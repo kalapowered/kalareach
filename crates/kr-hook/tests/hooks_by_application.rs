@@ -4,13 +4,6 @@
 //! application's bridge installed; the stand-in runs `kr-hook <application> hook` for each event,
 //! with the payload that application writes, and the worker admits each hook as that application's
 //! and applies the one observation it reports.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-12.20 | `kr_req_12_20_each_registered_gemini_cli_hook_observes_and_answers_neutrally` |
-//! | KR-REQ-12.22 | `kr_req_12_22_each_registered_qoder_cli_hook_observes_and_answers_neutrally` |
-//! | KR-REQ-12.27 | both of those: exactly `{}`, exit 0, nothing on standard error, inside the registered timeout |
-//! | KR-REQ-05.09 | `kr_req_05_09_a_hook_is_admitted_only_as_the_application_it_was_installed_for` |
 
 mod common;
 

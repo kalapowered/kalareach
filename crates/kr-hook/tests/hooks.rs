@@ -4,13 +4,6 @@
 //! Every case launches a stand-in application through the worker's gateway, with the bridge
 //! installed; the application runs `kr-hook claude-code hook` for each event, as Claude Code does,
 //! and the worker admits each hook and applies the one observation it reports.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-11.42 | `kr_req_12_18_each_registered_hook_observes_and_answers_neutrally` |
-//! | KR-REQ-12.18 | `kr_req_12_18_each_registered_hook_observes_and_answers_neutrally` |
-//! | KR-REQ-11.62 | `kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions_asked_under_the_old_thread` |
-//! | KR-ACC-018 | `kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions_asked_under_the_old_thread` |
 
 mod common;
 

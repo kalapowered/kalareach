@@ -6,12 +6,6 @@
 //! relay a launched agent runs, with the registration's path in its environment and nothing else,
 //! and a real listener stands at the endpoint the registration names: a socket on Unix and a named
 //! pipe on Windows, bound the way the worker binds it.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-11.43 | every case: the forwarder presents the launch's exchange only where a whole registration says |
-//! | KR-REQ-12.14 | every case: the endpoint is the one the whole registration names |
-//! | KR-REQ-05.09 | the credential is the file the registration names beside it, whatever else the environment says |
 
 mod common;
 

@@ -8,15 +8,6 @@
 //! variable and its argument vector. It is bash itself rather than a copy, because macOS stops a
 //! copy of a system program from running, and rather than `/bin/sh`, which on macOS starts another
 //! shell in its place.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-12.07 | the backend and its registration exist before the program runs; a refused, timed-out, uncommitted or orphaned invocation runs as typed |
-//! | KR-REQ-12.02 | a launch's profile records the executable, the arguments the program ran and the mode; a launch that goes no further than its admission gives back what it took and its retry is admitted; a second launcher for a backend a launch holds runs as typed and leaves the first |
-//! | KR-REQ-05.09 | a launch is admitted by the kernel's account of its process, its parent and its start, and the backend's credential; the program's bridges only when it executes what was hashed |
-//! | KR-REQ-11.34 | the launched program's hooks are admitted against the registration the launch published |
-//! | KR-REQ-11.13 | a launched instance is bound, at its admission, to the connector its command resolved; a launch rolled back takes its binding with it, and an instance's end takes its own |
-//! | KR-REQ-12.20 | the variable Gemini CLI's integration declares is set by the launcher once the launch is committed; a launch that runs as typed keeps the person's own value of it, or its absence |
 
 #![cfg(unix)]
 

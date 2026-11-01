@@ -26,15 +26,6 @@
 //! copied byte for byte from the bundled catalogue's packages, and pinned by their SHA-256 digests,
 //! which are the packages' hashes. A copy pins what the release declares, which is all this suite
 //! reads from it.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-11.42 | every test below: the registration and the forwarder agree |
-//! | KR-REQ-12.18 | `the_hooks_file_registers_the_five_observing_events_within_the_deadline` |
-//! | KR-REQ-12.20 | `the_gemini_cli_extension_registers_its_three_events_as_plain_words` |
-//! | KR-REQ-12.22 | `the_qoder_cli_flags_pass_its_hooks_in_exec_form_and_nothing_else` |
-//! | KR-REQ-12.27 | the Gemini CLI and Qoder CLI registration tests: every timeout the forwarder's deadline fits inside |
-//! | KR-REQ-12.18, KR-REQ-12.20, KR-REQ-12.22 | `the_released_declarations_are_what_a_launch_adds`: each release's command integration |
 
 use kr_hook::cli::{ClaudeCode, Cli, Command, Hooks};
 
