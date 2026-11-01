@@ -238,10 +238,10 @@ Metal backend in whether or not it is wanted: its manifest enables that feature 
 rather than behind an option, so what makes this build CPU-only is the two settings rather than the
 absence of the backend from the binary.
 
-The description process runs its model in the background class each platform offers. It sets the
-class and reads it back from the system, and what it reports when it starts is what the system
-holds, not what it asked for. A class the system does not hold is reported as not applied, with the
-reason.
+The description process runs in the background class each platform offers: its model thread on
+Linux, and the whole process on macOS and Windows. It sets the class and reads it back from the
+system, and what it reports when it starts is what the system holds, not what it asked for. A class
+the system does not hold is reported as not applied, with the reason.
 
 - **Linux:** the model thread takes `SCHED_BATCH`, niceness 19 and the idle I/O class. Threads it
   starts inherit all three. The model's files are read once, at load, and a resident model does no
@@ -256,9 +256,34 @@ reason.
   scheduler of most NVMe disks no I/O class has an effect: the class is kept and acts on nothing,
   so only the processor class lowers the model's share there. What the process reports is what the
   system holds, not that a disk obeys it.
-- **macOS:** the model thread takes the lowest ordinary thread priority, and the process takes the
-  throttled disk policy, which delays its disk requests only while other processes' requests
-  contend with them. No measurement here shows what that costs a load of the weights.
+- **macOS:** the whole process takes the darwin background policy (`setpriority` with
+  `PRIO_DARWIN_PROCESS` and `PRIO_DARWIN_BG`) and the throttled disk policy, which delays its disk
+  requests only while other processes' requests contend with them. The process reports the
+  mechanism as `lowest_thread_priority`, the name this platform has always reported; on macOS it
+  stands for the process's policy, which holds every thread at the lowest priority the scheduler
+  gives, and not for the priority of one thread. The policy is read back from the kernel with
+  `getpriority`. It is the process and not the model thread, because neither the lowest thread
+  priority nor a quality-of-service class passes from a thread to the threads it starts, and the
+  model runtime starts its compute threads from the thread that loads it. With the class on the
+  model thread alone, `ps -M` showed that thread at priority 15 and the three decoding threads at
+  the ordinary 31, each using 48 to 68 percent of a core. Under the process's policy every thread
+  reads 4, those that exist and those started later, and the control thread and the watchdog are
+  in the class too.
+
+  The policy has a price, and the deadline does not move for it. It keeps the process to the
+  efficiency cores of Apple silicon, at the lowest priority. Measured with the real MiniCPM5-2B
+  weights on a Mac with an M4 Pro (12 cores, macOS 26.6.2) that other work kept busy (load average
+  6 to 10, including builds that run in the same class), a job of about 195 prompt tokens, four
+  threads and 128 output tokens took 1.95 to 2.0 seconds in the ordinary class, and the load took
+  1.5 to 2.3 seconds. In the background class the same jobs ran into the 30-second deadline: 11 of
+  12 ended there, answered by the process itself at 30.1 to 30.8 seconds, and the twelfth took 29.2
+  seconds (9.8 of them reading the prompt and 17.4 decoding). The load took about 7 seconds. No
+  process was ended for it. The deadline stays the 30 seconds that section 22 fixes. A job that
+  misses it gives the delayed or stale description that section 22 prescribes when demand exceeds
+  capacity, as on Linux and Windows, so the cost falls on the description and not on the terminal.
+  A utility quality-of-service clamp gave 2.0 to 3.3 seconds, but only the process that starts the
+  description process can set it, through an interface the system does not publish, so it is not
+  used. No measurement here was taken on a Mac with its efficiency cores idle.
 - **Windows:** the whole process takes the idle priority class and the very low I/O priority. It is
   the process and not the thread, because a thread that another thread starts begins at the normal
   priority, and the compute threads of the model runtime are started by the thread that loads it.
