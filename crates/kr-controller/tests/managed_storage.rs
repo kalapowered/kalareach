@@ -6506,6 +6506,16 @@ async fn a_fence_owed_while_the_read_that_settles_the_bundle_write_is_out_leaves
     );
 }
 
+/// The seconds a call that ended as unknown was told to wait, when it was told some.
+fn the_seconds_a_call_is_told(answer: &BackupEnableResult) -> Option<u64> {
+    match answer {
+        BackupEnableResult::Unknown {
+            retry_after_seconds,
+        } => retry_after_seconds.0.map(|seconds| seconds.get()),
+        other => panic!("the call did not end as unknown: {other:?}"),
+    }
+}
+
 /// What the host owes the service now.
 fn the_delay_the_host_owes(rig: &Rig) -> Option<Duration> {
     rig.controller
@@ -6685,10 +6695,10 @@ async fn a_delay_named_while_the_call_waits_on_the_service_holds_back_the_reques
     within("the bundle write", web.requests_reach(SYNC, 1)).await;
     the_service_names_a_delay_to_a_look_at_its_storage_state(&rig, delay).await;
     web.release_held();
-    assert!(matches!(
-        call.await.expect("the call ends"),
-        BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
-    ));
+    assert_eq!(
+        the_seconds_a_call_is_told(&call.await.expect("the call ends")),
+        Some(45)
+    );
     assert_eq!(web.requests_to(MANIFEST), 0, "the writer was not enrolled");
 
     // During the enrolment: the read of the storage state. The read asks for the account's token as
@@ -6713,10 +6723,7 @@ async fn a_delay_named_while_the_call_waits_on_the_service_holds_back_the_reques
     };
     assert_eq!(rig.controller.host_account().token_requests_waiting(), 0);
     drop(gate);
-    assert!(matches!(
-        ended,
-        BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
-    ));
+    assert_eq!(the_seconds_a_call_is_told(&ended), Some(45));
 
     // During the read of the storage state: the retention change.
     let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
@@ -6731,10 +6738,10 @@ async fn a_delay_named_while_the_call_waits_on_the_service_holds_back_the_reques
     .await;
     the_service_names_a_delay_to_a_look_at_its_storage_state(&rig, delay).await;
     web.release_held();
-    assert!(matches!(
-        call.await.expect("the call ends"),
-        BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
-    ));
+    assert_eq!(
+        the_seconds_a_call_is_told(&call.await.expect("the call ends")),
+        Some(45)
+    );
     assert_eq!(web.requests_to(RETENTION), 0, "retention was not changed");
 }
 
