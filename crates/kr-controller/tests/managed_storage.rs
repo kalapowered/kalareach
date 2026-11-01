@@ -5134,14 +5134,16 @@ async fn the_last_attempt_follows_the_answers_and_is_left_as_it_was_by_a_call_th
             cause: Nullable::some(BackupEnableCause::AlreadySetUp {}),
         })
     );
-    let (bundles, enrolments) = (web.requests_to(SYNC), web.requests_to(MANIFEST));
+    // The enrolments are counted, and not the requests to the manifest route: the setup recorded
+    // above wakes the carrier, which publishes the closed session's generation to that route.
+    let (bundles, enrolments) = (web.requests_to(SYNC), rig.enrolments().len());
     assert!(matches!(
         rig.enable(&made.params).await,
         BackupEnableResult::Enabled { .. }
     ));
     assert_eq!(rig.backup_status().await.last_attempt.0, None);
     assert_eq!(
-        (web.requests_to(SYNC), web.requests_to(MANIFEST)),
+        (web.requests_to(SYNC), rig.enrolments().len()),
         (bundles, enrolments),
         "the repeat was answered from the record and wrote and enrolled nothing"
     );
