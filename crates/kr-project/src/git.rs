@@ -3886,6 +3886,14 @@ fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::
                 }
             }));
         }
+        // A case that asks for it has its thread stall here, where a poll would sleep, so that
+        // the next poll comes at a moment the case has chosen.
+        #[cfg(all(test, unix))]
+        tests::BEFORE_THE_NEXT_POLL.with(|stall| {
+            if let Some(stall) = stall.take() {
+                stall();
+            }
+        });
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -5279,6 +5287,10 @@ mod tests {
         /// Set by a case to make the read of a probe's output fail on its own thread, as it does
         /// for a pipe the system can no longer read.
         pub(super) static READ_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Set by a case to run something once on its own thread between two polls of the wait for
+        /// a probe's output, in place of the sleep's start.
+        pub(super) static BEFORE_THE_NEXT_POLL: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::Cell::new(None) };
     }
 
     /// A pipe whose writers are faster than its reader: whenever it is asked, it has something to
@@ -6025,6 +6037,51 @@ mod tests {
         assert_eq!(
             refusal.code(),
             kr_protocol::error::ErrorCode::UpstreamUnavailable
+        );
+    }
+
+    /// The wait for a probe's output ends at the drain's second, and a poll that comes after it
+    /// still reads what arrived before it. The pipe's last writer ends between two polls, so the
+    /// end is in the pipe when the second runs out, and the next poll comes only after it has.
+    /// The time the probe was given is far off, so the end is the program's own, read in time, and
+    /// the look does not refuse a program for a stall of this host's.
+    #[cfg(unix)]
+    #[test]
+    fn an_end_that_arrived_before_the_drains_second_is_read_by_a_poll_that_comes_after_it() {
+        use std::io::Write as _;
+
+        let mut holder = std::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat holds a pipe open for as long as its input is");
+        let mut said = holder.stdin.take().expect("cat's input");
+        said.write_all(b"/a/helper/directory\n")
+            .expect("something is said");
+        let mut heard = Heard::of(holder.stdout.take()).expect("the pipe is read without blocking");
+        let start = Instant::now();
+        BEFORE_THE_NEXT_POLL.with(|stall| {
+            stall.set(Some(Box::new(move || {
+                drop(said);
+                holder
+                    .wait()
+                    .expect("cat ends, and the pipe it held with it");
+                while Instant::now() < start + PROBE_DRAIN + Duration::from_millis(50) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })));
+        });
+
+        let outcome = drain(
+            &mut heard,
+            "git --exec-path",
+            start + Duration::from_secs(60),
+        );
+
+        assert!(
+            outcome.is_ok(),
+            "an end that came in time is the end: {:?}",
+            outcome.err().map(Asked::into_error)
         );
     }
 
