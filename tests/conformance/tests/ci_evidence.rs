@@ -840,8 +840,12 @@ fn the_linux_runs_of_the_workspace_tests_require_a_user_service_manager() {
     );
     let report = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
         .expect("the conformance workflow");
+    // In the job's own environment, ahead of its steps, so that every step that runs tests has it.
+    let linux = job(&report, "linux");
+    let environment = linux.split("\n    steps:").next().unwrap_or_default();
     assert!(
-        job(&report, "linux").contains(variable),
-        "the Linux job of the conformance workflow does not require a user service manager"
+        environment.contains(variable),
+        "the Linux job of the conformance workflow does not require a user service manager in its \
+         own environment"
     );
 }
