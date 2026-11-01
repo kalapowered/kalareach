@@ -357,8 +357,9 @@ fn a_unit_the_manager_goes_on_having_is_left_however_often_it_is_asked() {
 /// manager of the machine's own: a runtime directory holding the manager's private socket and its
 /// transient unit files, and a tool that answers the teardown's questions from what a case wrote
 /// beside it. The tool lists the units in `listed`, answers a unit's working directory from
-/// `directory-of-<unit>` (nothing where the file is not there, and a failure where `fail-asking`
-/// is), records each unit it is told to stop in `stopped`, and says a unit it has stopped is gone.
+/// `directory-of-<unit>` (nothing where the file is not there, a failure where `fail-asking` is,
+/// and a failure for each of the first `failures-left` times), records each unit it is asked about
+/// in `asked` and each it is told to stop in `stopped`, and says a unit it has stopped is gone.
 #[cfg(target_os = "linux")]
 struct StandInManager {
     _directory: tempfile::TempDir,
@@ -384,11 +385,18 @@ here="$(dirname "$0")"
 unit=""
 for argument in "$@"; do unit="$argument"; done
 case "$*" in
-  *list-units*) cat "$here/listed" 2>/dev/null ;;
+  *list-units*)
+    [ -s "$here/list-seconds" ] && sleep "$(cat "$here/list-seconds")"
+    cat "$here/listed" 2>/dev/null ;;
   *--property=LoadState*)
     if grep -qx "$unit" "$here/stopped" 2>/dev/null; then echo not-found; else echo loaded; fi ;;
   *--property=WorkingDirectory*)
+    echo "$unit" >> "$here/asked"
     [ -e "$here/fail-asking" ] && exit 1
+    if [ -s "$here/failures-left" ]; then
+      left="$(cat "$here/failures-left")"
+      if [ "$left" -gt 0 ]; then echo $((left - 1)) > "$here/failures-left"; exit 1; fi
+    fi
     cat "$here/directory-of-$unit" 2>/dev/null || echo ;;
   *stop*) echo "$unit" >> "$here/stopped" ;;
 esac
@@ -438,6 +446,27 @@ exit 0
         .expect("the manager's answer");
     }
 
+    /// Makes the manager take `seconds` to list its units.
+    fn lists_slowly(&self, seconds: u32) {
+        std::fs::write(self.here.join("list-seconds"), format!("{seconds}\n"))
+            .expect("the seconds");
+    }
+
+    /// Makes the manager fail the next `times` questions about where a unit runs, and then answer.
+    fn fails_asking(&self, times: u32) {
+        std::fs::write(self.here.join("failures-left"), format!("{times}\n"))
+            .expect("the failures left");
+    }
+
+    /// The questions about where a unit runs that the manager was asked, by unit.
+    fn asked(&self) -> Vec<String> {
+        std::fs::read_to_string(self.here.join("asked"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// The units the teardown told the manager to stop.
     fn stopped(&self) -> Vec<String> {
         std::fs::read_to_string(self.here.join("stopped"))
@@ -448,12 +477,15 @@ exit 0
     }
 
     fn remove_through(&self, tree: &kr_ipc::testing::TempHost) -> Vec<String> {
-        teardown::remove_units_in(
-            &self.runtime,
-            tree,
-            &self.tool,
-            std::time::Duration::from_secs(5),
-        )
+        self.remove_within(tree, std::time::Duration::from_secs(5))
+    }
+
+    fn remove_within(
+        &self,
+        tree: &kr_ipc::testing::TempHost,
+        give_up_after: std::time::Duration,
+    ) -> Vec<String> {
+        teardown::remove_units_in(&self.runtime, tree, &self.tool, give_up_after)
     }
 }
 
@@ -546,4 +578,63 @@ fn a_unit_with_no_file_that_the_manager_cannot_place_is_not_established() {
         left.iter().any(|what| what.contains("could not be asked")),
         "{left:?}"
     );
+}
+
+/// A question about a unit with no file that fails is asked again, and the answer that comes is the
+/// one the teardown acts on: the unit is the tree's, and it is stopped.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_question_about_a_unit_with_no_file_that_fails_is_asked_again() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let manager = StandInManager::new();
+    manager.lists(A_UNIT);
+    manager.says_it_runs_in(A_UNIT, &tree.root().join("s"));
+    manager.fails_asking(2);
+    let left = manager.remove_through(&tree);
+    assert!(
+        left.iter().all(|what| what.contains("has no file in")),
+        "only the missing file is reported: {left:?}"
+    );
+    assert_eq!(manager.asked().len(), 3, "asked after each of two failures");
+    assert_eq!(manager.stopped(), [A_UNIT], "the unit was stopped");
+}
+
+/// The questions about units with no file share the time the teardown is given for them. When it
+/// has gone they are not asked, and each such unit is counted as not established; the minimum a
+/// question is given elsewhere is not given to each unit after the time has gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn units_with_no_file_are_not_asked_about_after_the_time_given_for_them_has_gone() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let manager = StandInManager::new();
+    let other = "kr-plugin-host-6f0c2b1e-3a4d-4c5b-8e7f-0a1b2c3d4e5f.service";
+    manager.lists(A_UNIT);
+    manager.lists(other);
+    let left = manager.remove_within(&tree, std::time::Duration::ZERO);
+    assert_eq!(
+        left.iter()
+            .filter(|what| what.contains("could not be asked"))
+            .count(),
+        2,
+        "each unit is counted as not established: {left:?}"
+    );
+    assert!(manager.asked().is_empty(), "{:?}", manager.asked());
+}
+
+/// The time the questions about units with no file share starts when the list has been read, and a
+/// list that was slow to answer does not take it from them: the question is asked, and answered.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_slow_list_does_not_take_the_time_given_for_the_questions_about_units_with_no_file() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let manager = StandInManager::new();
+    manager.lists(A_UNIT);
+    manager.says_it_runs_in(A_UNIT, &tree.root().join("s"));
+    manager.lists_slowly(6);
+    let left = manager.remove_within(&tree, std::time::Duration::from_secs(5));
+    assert!(
+        left.iter().all(|what| what.contains("has no file in")),
+        "the unit was asked about and found in the tree: {left:?}"
+    );
+    assert_eq!(manager.stopped(), [A_UNIT], "the unit was stopped");
 }

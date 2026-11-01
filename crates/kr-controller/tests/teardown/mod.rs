@@ -876,6 +876,33 @@ fn asked_again_until_answered(
     }
 }
 
+/// What `ask` answers, where `ask` is given what is left until `deadline` to finish in, with no
+/// minimum, asked again after a short pause for as long as it fails and time is left. When no time
+/// is left it is not asked, and the answer is the last failure, or that the time was used up.
+///
+/// For a question that is asked of many units one after another, which share one allowance: a
+/// minimum for each would let every unit asked after the allowance has gone cost the minimum again.
+#[cfg(target_os = "linux")]
+fn asked_until(
+    deadline: Instant,
+    mut ask: impl FnMut(Duration) -> Result<String, String>,
+) -> Result<String, String> {
+    let mut last = "the time given for these questions was used up before it was asked".to_owned();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(last);
+        }
+        match ask(left) {
+            Ok(answer) => return Ok(answer),
+            Err(error) => last = error,
+        }
+        std::thread::sleep(
+            Duration::from_millis(250).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
 /// Does what [`remove_jobs`] does, for the user manager's units: lists them and stops those that
 /// run inside the tree through `systemctl`, and returns each unit still loaded afterwards, each
 /// question the manager did not answer and each unit file that could not be read.
@@ -919,7 +946,6 @@ pub fn remove_units_in(
     if !runtime.join("systemd/private").exists() {
         return left;
     }
-    let began = Instant::now();
     let manager = || {
         let mut command = Command::new(systemctl);
         command.arg("--user");
@@ -947,6 +973,9 @@ pub fn remove_units_in(
             return left;
         }
     };
+    // The time the questions about units with no file share, counted from the end of the list: a
+    // list that was slow to answer does not take it from them.
+    let asking_until = Instant::now() + give_up_after;
     // The tree as it was named and as the kernel resolves it, since a daemon may hand a unit
     // either spelling.
     let roots: Vec<std::path::PathBuf> = [
@@ -991,25 +1020,18 @@ pub fn remove_units_in(
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // Asked as every other question that decides a unit's fate is: late answers are
-                // waited for and a failed one is asked again, so that a slow manager does not make
-                // the teardown blame a unit that was collected after the list was read.
-                // What is left of the time the whole teardown is given, so that a manager that
-                // answers none of these costs the teardown no more than it is given.
-                match asked_again_until_answered(
-                    give_up_after.saturating_sub(began.elapsed()),
-                    |bound| {
-                        run_bounded_output_within(
-                            manager().args([
-                                "show",
-                                "--property=WorkingDirectory",
-                                "--value",
-                                unit,
-                            ]),
-                            bound,
-                        )
-                    },
-                ) {
+                // Late answers are waited for and a failed one is asked again, so that a slow manager
+                // does not make the teardown blame a unit that was collected after the list was
+                // read. All of these questions share the time left of one allowance, and none is
+                // asked, or given more than what is left, after it has gone: a manager that answers
+                // none of them costs the teardown no more than the allowance and the call that was
+                // under way, and each unit not asked about is counted as not established.
+                match asked_until(asking_until, |bound| {
+                    run_bounded_output_within(
+                        manager().args(["show", "--property=WorkingDirectory", "--value", unit]),
+                        bound,
+                    )
+                }) {
                     Ok(directory) if !inside_the_tree(directory.trim()) => continue,
                     Ok(_) => left.push(format!(
                         "the systemd unit {unit} runs in this tree and has no file in {}, where \
