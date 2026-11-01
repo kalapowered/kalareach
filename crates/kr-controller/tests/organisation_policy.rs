@@ -5,10 +5,6 @@
 //! organisation the way a person enrols it, with a policy the organisation's own keys signed. The
 //! catalogue is the daemon's own: the example package is installed in it, and `plugin.list` says
 //! whether the admissions in force let a new binding use it.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-18.06 | the cases named `kr_req_18_06_` |
 
 #![cfg(unix)]
 

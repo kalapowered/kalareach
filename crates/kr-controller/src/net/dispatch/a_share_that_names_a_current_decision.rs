@@ -11,10 +11,6 @@
 //! holding the issued grant is told. A device's connection is decided under the grant its record
 //! holds, so the second part redeems the invitation and installs the grant it carries in the
 //! device's record itself.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-10.51 | every `kr_req_10_51_` test here |
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

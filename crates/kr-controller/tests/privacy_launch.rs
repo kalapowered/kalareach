@@ -3,11 +3,6 @@
 //! A real daemon, on its local socket, and this process playing the worker the daemon asks for: the
 //! specification a worker is handed is read as it arrives, before any shell could run. What each
 //! test reads is what the daemon decided, from the record it keeps and the specification it sent.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-24.27 | a worker launched while privacy mode is on is given the generation and that it is on, before its shell runs, and the state it is given is the one in force after its claim is accepted |
-//! | KR-REQ-24.28 | a session whose launch has handed out its specification when privacy mode is turned on owes its cleanup, across a daemon restart too, and turning privacy mode off waits for it; one launched while privacy mode is on owes it from before its worker runs |
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -397,6 +392,10 @@ async fn kr_req_24_28_a_launch_under_way_across_a_restart_owes_its_cleanup() {
 /// KR-REQ-24.27: a worker launched while privacy mode is on owes its cleanup from before it runs:
 /// the obligation is on the disk when its specification is read, and turning privacy mode off is
 /// refused, naming it, whatever the daemon's tick has or has not seen.
+///
+/// KR-REQ-24.28, the part about a launch made while privacy mode is on: its cleanup is owed from
+/// before the worker runs, on the disk when the specification is read, and turning privacy mode off
+/// is refused, naming the session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_24_27_a_worker_launched_while_privacy_mode_is_on_owes_cleanup_before_it_runs() {
     let daemon = daemon().await;

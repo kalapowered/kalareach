@@ -6,10 +6,6 @@
 //! admit the session, else the one share that does. These tests play the session's worker and read
 //! what reaches it, which is the grant the host says it decided under: its identity in the actor
 //! envelope, its rights, and the history scope its answers are held to.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-25.10 | every `kr_req_25_10_` test here |
 
 use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::{Grant, GrantExpiry, SessionSelector};

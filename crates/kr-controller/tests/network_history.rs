@@ -11,11 +11,6 @@
 //! file, and two bursts of output, with the clock moving on between them, are two intervals of the
 //! worker's record. A case reads that record back from its file before it asks, so a premise that
 //! did not hold fails by saying so rather than by passing on a page that proved nothing.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-13.15 | the cases here |
-//! | KR-REQ-10.49 | the cases here |
 
 #![cfg(unix)]
 
@@ -417,6 +412,9 @@ async fn a_paired_device_pages_the_output_its_grant_reaches_and_none_before_it()
 
 /// KR-REQ-13.15: a device that holds a share of the session is served the output written after the
 /// share was issued, and none before it.
+///
+/// KR-REQ-10.49, the part about a share's history scope: the output the device reads through the
+/// share begins at the moment the share was issued and carries nothing written before it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_holding_a_share_is_served_the_output_written_after_the_share_was_issued() {
     let rig = Rig::start().await;

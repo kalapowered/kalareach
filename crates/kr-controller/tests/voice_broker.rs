@@ -5,39 +5,6 @@
 //! the device is a paired one over a real connection. The broker and the account service are
 //! stand-ins on the loopback interface that speak the services' wire, so what these prove is what
 //! the daemon sends and what it does with the answers. No test here makes a live provider call.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-15.01 | `a_host_whose_document_names_a_broker_brokers_a_call_through_it` |
-//! | KR-REQ-15.19 | `a_host_whose_document_names_a_broker_brokers_a_call_through_it` |
-//! | KR-REQ-17.23 | `an_operator_signs_the_host_in_and_a_call_presents_the_account_it_signed_in` |
-//! | KR-REQ-17.23 | `a_sign_in_that_does_not_complete_leaves_the_host_signed_out_and_says_why` |
-//! | KR-REQ-17.23 | `a_sign_in_request_sent_again_is_answered_from_the_first` |
-//! | KR-REQ-17.23 | `a_sign_in_never_changes_the_account_a_call_closes_under` |
-//! | KR-REQ-17.23 | `signing_the_host_out_ends_the_grant_and_a_call_presents_no_account_after_it` |
-//! | KR-REQ-17.23 | `a_sign_out_never_changes_the_account_a_call_closes_under` |
-//! | KR-REQ-17.23 | `a_sign_out_request_sent_again_is_answered_from_the_first` |
-//! | KR-REQ-17.23 | `a_sign_out_ends_the_sign_in_that_is_waiting` |
-//! | KR-REQ-17.23 | `an_account_never_changes_under_a_call_whose_start_is_waiting_on_the_broker` |
-//! | KR-REQ-17.23 | `an_account_never_changes_under_a_call_whose_close_is_not_finished` |
-//! | KR-REQ-17.23 | `a_call_that_opens_while_a_sign_in_is_exchanged_leaves_the_account_as_it_was` |
-//! | KR-REQ-17.23 | `a_start_that_meets_an_account_being_changed_waits_and_is_refused_when_the_change_leaves_none` |
-//! | KR-REQ-17.23 | `a_start_that_meets_an_account_being_changed_waits_and_is_made_under_the_account_it_leaves` |
-//! | KR-REQ-17.23 | `a_turned_away_grant_the_queue_cannot_hold_is_still_sent_to_the_service` |
-//! | KR-REQ-17.23 | `a_sign_in_the_host_cannot_keep_is_sent_to_the_service_to_be_ended` |
-//! | KR-REQ-17.23 | `a_sign_in_the_service_refuses_after_issuing_tokens_has_them_ended` |
-//! | KR-REQ-17.23 | `a_host_moved_off_the_managed_broker_can_still_end_the_sign_in_it_keeps` |
-//! | KR-REQ-17.23 | `an_account_the_store_could_not_settle_is_not_presented_until_it_is_settled` |
-//! | KR-REQ-17.23 | `each_refresh_presents_the_token_the_last_one_issued` |
-//! | KR-REQ-17.23 | `an_account_signed_in_at_one_service_is_reached_only_through_that_service` |
-//! | KR-REQ-17.23 | `a_revocation_the_service_did_not_acknowledge_is_sent_again_when_the_daemon_starts` |
-//! | KR-REQ-17.23 | `a_host_whose_broker_is_not_the_account_service_signs_in_nowhere` |
-//! | KR-REQ-17.23 | `a_call_the_service_ended_no_longer_holds_sign_out_refused_when_its_phone_went_silent` |
-//! | KR-REQ-17.23 | `a_call_past_its_deadline_no_longer_holds_sign_out_refused_when_its_phone_went_silent` |
-//! | KR-REQ-17.23 | `a_call_whose_deadline_passes_while_the_service_is_asked_keeps_the_account_as_it_is` |
-//! | KR-REQ-17.23 | `a_call_whose_deadline_passes_while_a_sign_in_is_exchanged_keeps_the_account_as_it_is` |
-//! | KR-REQ-15.17 | `a_stop_after_the_service_ended_the_sign_in_still_revokes_the_calls_grant` |
-//! | KR-REQ-26.14 | `a_host_reaches_the_broker_through_the_proxy_its_document_selects` |
 
 mod net_support;
 

@@ -4,24 +4,6 @@
 //! filter and its own dispatch. What the suite supplies is the paired device's records and a
 //! provider that makes no network call, because no test here makes a live provider call.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-09.07 | `a_second_delegation_under_one_action_identifier_is_refused_and_never_dispatched`, `one_action_identifier_is_one_action_across_the_voice_and_session_routes` |
-//! | KR-REQ-09.08 | `a_voice_start_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_voice_start_runs_is_told_it_has_not_finished`, `a_voice_start_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_voice_start_whose_record_was_never_written_is_not_performed_again_after_a_restart` |
-//! | KR-REQ-09.09, 09.12, 26.16 | `a_voice_change_is_not_written_while_a_fence_is_owed`, `a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed` |
-//! | KR-REQ-15.01 | `a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate` |
-//! | KR-REQ-15.02 | `stopping_voice_leaves_the_session_running` |
-//! | KR-REQ-09.16 | `a_delegation_resubmitted_after_a_lost_reply_gets_its_receipt` |
-//! | KR-REQ-15.11 | `a_delegation_runs_under_the_grant_the_host_already_holds`, `speech_the_daemon_does_not_read_as_a_request_is_refused_and_spends_nothing`, `a_delegation_spent_in_an_ended_call_is_not_a_new_action_later_or_after_a_restart` |
-//! | KR-REQ-15.13 | `an_unlocked_screen_action_is_refused_without_a_signed_confirmation`, `a_challenge_holds_no_claim_so_the_signed_delegation_is_admitted_under_its_identifier` |
-//! | KR-REQ-15.13, 09.12 | `a_stop_with_a_close_on_its_way_is_answered_on_the_link_that_sent_it` |
-//! | KR-REQ-15.14 | `stopping_voice_revokes_the_grant_in_the_hosts_own_store`, `a_stop_for_a_voice_session_the_host_does_not_hold_is_refused_as_unknown_and_nothing_else_is` |
-//! | KR-REQ-15.17 | `an_effect_this_host_does_not_dispatch_is_reported_as_admitted` |
-//! | KR-REQ-15.19 | `a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate` |
-//! | KR-REQ-15.20 | `context_is_filtered_by_the_requesting_devices_own_history_bound` |
-//! | KR-REQ-15.21 | `the_default_voice_grant_is_written_into_the_hosts_own_store`, `speech_reaches_no_prompt_submission_under_a_grant_that_permits_one` |
-//! | KR-REQ-23.51 | `a_voice_method_is_unreachable_from_local_ipc`, `voice_needs_a_paired_device_and_a_voice_grant`, `a_second_delegation_under_one_action_identifier_is_refused_and_never_dispatched`, `a_delegation_resubmitted_after_a_lost_reply_gets_its_receipt`, `a_delegation_spent_in_an_ended_call_is_not_a_new_action_later_or_after_a_restart` |
-//!
 //! Section 23 gives the five voice methods `PairedDevice` ingress and nothing else, so a local
 //! client cannot reach them: `a_voice_method_is_unreachable_from_local_ipc` is that, proved through
 //! the daemon's own endpoint. The suite therefore drives the service the way a paired device's

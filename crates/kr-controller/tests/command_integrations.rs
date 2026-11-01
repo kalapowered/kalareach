@@ -5,10 +5,6 @@
 //! grant confirmed, and the environment's configuration naming it or not. This process plays the
 //! worker the daemon asks for, so the launch specification a worker is handed is read as it
 //! arrives. The package is published for Linux and macOS, so the suite runs on Unix hosts.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-12.07 | a session is launched with an entry for each integration installed, confirmed and admitted, on where the configuration turns it on and off where it does not; a create request naming one is refused before anything is reserved |
 
 #![cfg(unix)]
 

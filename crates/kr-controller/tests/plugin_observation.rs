@@ -9,18 +9,6 @@
 //! the observation lane, the link and its pump, the plugin service protocol, and the engine that
 //! runs the component. A case reads what a component was offered from the component itself, through
 //! its checkpoint, since nothing in the worker presents a component's document.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-06.07 | an upstream frame the worker offers reaches the binding's component with its bytes, its provenance and the request identifier it carried, once and in order |
-//! | KR-REQ-11.01 | the same run, through a vendor component that needed no core release; the binding's other bindings, a binding without the stream, another package's binding and a rich-disabled binding are offered nothing, a frame the table does not list and one it lists as a credential are offered to nobody |
-//! | KR-REQ-11.38 | a lane that is full loses observations it holds, counts them, takes a fresh snapshot of the component, and never loses the request the upstream is waiting on; an observation that never returns is stopped by its bound and named; an observation that asks for more memory or produces more output than a call may is refused and the binding's record names the bound; three faults in a minute disable the binding while the native terminal goes on; a snapshot that never returns is stopped by its bound and named |
-//! | KR-REQ-11.39 | the terminal drains and its questions are answered while the worker's observation pump is held, and while the plugin runtime has stopped reading what is handed to it; the worker lets go of that runtime and takes the component up again when it reads |
-//! | KR-REQ-11.40 | an observation the component never returns from is stopped by fuel when its deadline cannot fire, and named so |
-//! | KR-REQ-11.41 | a component that was compiled when it was registered is observed without a fault, the compile outside the observation's deadline; a compile that is queued and not done leaves the terminal draining and its questions answered |
-//! | KR-REQ-24.06 | a plugin runtime killed with a receipt, a question and an approval live leaves all three as they were and answerable, and its component is registered again in the replacement and restored to the state the worker held |
-//! | KR-REQ-11.01 | a component reads the execution its binding is bound to as the broker holds it: the revision, the selected conversation and the running turn when it is registered, and each change of them in its next call, also on a runtime that replaces a lost one |
-//! | KR-REQ-24.27 | the plugin runtime is told whether privacy mode stands, each time it changes and before the first component is registered on a runtime that replaces another, and no document of the worker's connection reaches the worker once the runtime has said it holds privacy mode; turning privacy mode on drops the state held for a component and none is taken or held while it is on, observation for live use goes on, a component offered anything made in it has no state taken until it starts again, and then state is taken again; the runtime's words in a fault, and in the reason a component is disabled for, are never kept once privacy mode has stood on the connection that carries them, however many notices wait and however late the link reads them |
 
 #![cfg(unix)]
 

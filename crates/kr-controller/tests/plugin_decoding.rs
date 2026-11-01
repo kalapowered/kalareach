@@ -7,18 +7,6 @@
 //! everything the worker forwards to it and answers the requests it is asked. Everything between
 //! them is the product: the broker, the decode queue and the task that asks components, the link,
 //! the plugin service protocol, and the engine that runs the component.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-11.21 | a request the upstream waits on is read by the binding's component into an approval whose summary is the component's and whose decisions carry the connector table's labels; the ledger names the decoding package and keeps the request's bytes; the component sent nothing |
-//! | KR-REQ-06.07 | the component was given the request's own bytes under the provenance the broker recorded them with, and the identifier the upstream gave |
-//! | KR-ACC-016 | a decoder that names another request, offers a decision the table does not map or one twice, offers none, writes a summary over the bound, declines, or traps makes no approval and no ledger entry, the terminal answers the request, and the binding's report names the kind and none of the component's words; a request that waits for its decode is not given to a component whose binding loses the trust to decode it meanwhile |
-//! | KR-REQ-11.26 | a request answered natively while its decode is held is not interpreted afterwards; a request made in privacy mode marks the component's view as made in it whenever it is decoded; one binding's flood is refused past its share of the queue and counted |
-//! | KR-REQ-11.21 and KR-REQ-11.33 | the answer to an approval a component read is the bytes that component encoded, written to the upstream once; an approval the connector's table read is answered with the table's bytes, and no component is asked to encode it |
-//! | KR-REQ-11.38 | three approvals a component read wait for a person while the component takes another call, and are then answered in another order, once each |
-//! | KR-REQ-24.27 | the component that writes the answer to an approval made in privacy mode is marked as handed something made in it, on a replacement runtime and after privacy mode ended |
-//! | KR-REQ-11.33 | a native answer that comes while the component encodes wins, and the component's answer is not sent; the thread changing, the grant or the decoder's trust being withdrawn while it encodes each refuse the answer before the marker, and nothing is sent |
-//! | KR-REQ-11.21 and KR-ACC-016 | bytes that name another request, the right one as another JSON type, a method, an error in place of a result or beside one, a member twice or a line break are refused by the core and nothing is sent; a component that traps, declines or never returns makes no answer, the terminal answers, and the third fault disables the binding |
 
 #![cfg(unix)]
 

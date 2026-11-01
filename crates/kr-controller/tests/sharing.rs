@@ -4,14 +4,6 @@
 //! is a word; `terminal.input` is a right. An invitation issued under a role writes the rights
 //! down, and every later decision reads the rights. So each test here either checks that the
 //! compilation is faithful, or takes a word away and checks that the decision is unchanged.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-09.18 | `a_refusal_the_clock_decided_is_never_answered_on_a_floor_that_was_not_written`, `a_start_that_cannot_write_its_floor_decides_no_expiry_until_it_can`, `a_delegation_whose_parent_expired_before_it_was_written_is_refused`, `a_redemption_whose_invitation_expired_before_it_was_written_is_refused`, `a_transfer_whose_source_expired_before_it_was_written_is_refused` |
-//! | KR-REQ-18.03 | `an_invitation_is_scoped_to_the_session_it_shares`, `a_delegation_narrows_what_the_issuer_holds`, `transfer_of_control_hands_over_only_what_the_transferring_grant_carries`, `transfer_of_control_issues_one_authority_and_revokes_the_other`, `a_transfer_whose_source_expired_before_it_was_written_is_refused` |
-//! | KR-REQ-23.49 | `sharing_checks_parent_rights_expiry_and_owner_confirmation`, `revoking_a_shared_grant_completes_through_the_dispatch_barrier`, `a_delegation_whose_parent_expired_before_it_was_written_is_refused` |
-//! | KR-REQ-25.07 | `each_role_compiles_to_explicit_actions_and_the_host_decides_from_those`, `only_controller_and_owner_answer_questions_without_an_explicit_option` |
-//! | KR-REQ-25.10 | `an_invitation_is_single_use_and_expires`, `the_issuer_sees_what_is_being_shared_and_no_historical_attachment_keys`, `an_invitation_names_nothing_the_issuer_was_not_shown`, `a_redemption_whose_invitation_expired_before_it_was_written_is_refused` |
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -1152,6 +1144,10 @@ fn an_invitation_is_single_use_and_expires() {
 }
 
 /// Transferring control issues the recipient's authority and revokes the transferring device's.
+///
+/// KR-REQ-18.03, the transfer-of-control part: a transfer issues the recipient's authority and
+/// revokes the transferring device's, which is not kept as a delegation would keep it, and a
+/// confirmation given for a different transfer authorises nothing and writes nothing.
 #[test]
 fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");

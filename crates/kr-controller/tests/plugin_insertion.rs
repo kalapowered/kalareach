@@ -6,11 +6,6 @@
 //! transport. The drafts and the uploads are made through the daemon's own transfer service, and
 //! the worker reads and claims them over the daemon's rendezvous endpoint, as it does in the
 //! product. Nothing else is played.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-23.30 | an action that offers an attachment names a draft the daemon holds, is validated against it, and transmits nothing when the draft moved, the package does not declare an offer of it, the action was cancelled, lost its ground or its connection while its component prepared it, or the plan was not the invocation's own; it is prepared over the connection the worker's own link holds to the plugin runtime, and again after that runtime was lost; a repeat of it is answered with its receipt and claims nothing again |
-//! | KR-REQ-24.09 | what the agent answered is recorded on the binding: accepted with the upstream's evidence, failed when it refused, unknown when it did not answer, and a claim the worker could not make is settled by a report |
 
 #![cfg(unix)]
 

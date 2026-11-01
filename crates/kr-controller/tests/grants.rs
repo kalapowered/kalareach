@@ -5,24 +5,6 @@
 //! issued stops being true, and the host has to notice on the next request rather than on the next
 //! reconnection. So every test here changes one fact and then asks the host, rather than asking it
 //! once and trusting the answer.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_answered_from_the_rows_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `an_unfinished_key_registration_is_not_answered_with_another_actions_registration`, `an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answered`, `an_unfinished_revocation_of_a_grant_still_standing_is_unknown`, `an_unfinished_device_revocation_is_answered_only_once_the_device_record_is_revoked`, `a_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `a_device_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `an_unfinished_device_revocation_is_not_answered_while_the_device_holds_live_grants`, `a_device_revocation_on_a_floor_ahead_of_the_clock_names_only_what_it_withdrew`, `a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled`, `an_unfinished_destination_credential_is_unknown`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `a_claimed_revocation_writes_what_it_withdrew_beside_its_claim`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
-//! | KR-REQ-09.12 | `a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled` |
-//! | KR-REQ-09.18 | `a_decision_that_reads_the_clock_waits_for_the_floor_whatever_the_grants_expiry`, `a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not_write`, `a_paired_device_refused_while_the_floor_is_owed_is_told_storage_is_unavailable` |
-//! | KR-REQ-10.40 | `a_grant_carries_every_field_section_ten_names`, `the_host_intersects_the_grant_with_policy_on_every_request`, `a_delegation_narrows_and_never_extends`, `revoking_a_parent_revokes_every_descendant` |
-//! | KR-REQ-10.41 | `a_method_is_decided_from_the_registry_table_and_never_from_a_capability` |
-//! | KR-REQ-10.43 | `an_owner_grant_stays_valid_until_it_is_revoked`, `an_invitation_is_view_only_for_an_hour_and_bounded_at_thirty_days` |
-//! | KR-REQ-10.44 | `the_offline_validity_policy_is_optional_and_bounded_when_it_is_chosen`, `an_expired_grant_is_refused_rather_than_downgraded_to_view_only` |
-//! | KR-REQ-10.45 | `a_local_revocation_advances_the_revision_fences_the_leases_and_reports_per_worker`, `a_revocation_reaches_the_grants_that_can_still_hold_input` |
-//! | KR-REQ-10.49 | `a_grant_with_no_history_cursor_is_read_from_the_moment_its_invitation_was_redeemed` |
-//! | KR-REQ-17.54 | `an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport`, `personal_access_survives_an_organisation_outage_unless_the_host_is_exclusively_managed` |
-//! | KR-REQ-19.02 | `a_delegation_cannot_grant_a_right_the_delegating_actor_lacks` |
-//! | KR-REQ-23.27 | `a_local_revocation_advances_the_revision_fences_the_leases_and_reports_per_worker`, `a_device_revocation_takes_every_grant_that_device_held` |
-//! | KR-REQ-23.32 | `a_question_is_read_with_view_and_answered_only_with_the_respond_right` |
-//! | KR-REQ-23.53 | `a_composite_method_needs_every_right_its_entry_lists` |
-//! | KR-REQ-24.15 | `a_grant_at_an_older_revision_still_decides_and_one_at_a_revision_nothing_issued_is_refused` |
 
 use std::sync::Arc;
 
@@ -223,6 +205,10 @@ fn a_withdrawal_that_loses_its_admission_at_the_store_writes_nothing() {
 /// would retire it. A revocation and a device's revocation each write one row however many grants
 /// they withdraw; a repeat that withdraws nothing, and a proposal nobody redeemed, write none; and
 /// two changes of the same authority write two rows, so neither can absorb the other.
+///
+/// KR-REQ-09.12, the part about the debt of the per-worker fence: every revocation and every device
+/// revocation writes one debt of its own in the transaction that withdraws, and the debt survives
+/// the failure of the barrier that would retire it.
 #[test]
 fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
     let directory = GrantDirectory::in_memory().expect("a grant store");
@@ -323,6 +309,10 @@ fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
 /// the grant itself or the device holding it is revoked. A grant delegated from a voice grant that
 /// does not carry `voice.use` is not a voice grant, and the change that withdraws it writes its one
 /// row.
+///
+/// KR-REQ-09.12, the control of the case that holds a close under a voice grant: the withdrawal of
+/// a voice grant owes no fence, on any revocation path, while no close forwarded under it can still
+/// run at a worker.
 #[test]
 fn a_voice_grants_withdrawal_owes_no_fence() {
     let directory = GrantDirectory::in_memory().expect("a grant store");
@@ -396,6 +386,10 @@ fn a_voice_grants_withdrawal_owes_no_fence() {
 /// worker, whether the grant is revoked, replaced or revoked with its device. Once the hold on the
 /// close is let go, the same withdrawal owes none. A close held under another voice grant is no
 /// reason to fence this one.
+///
+/// KR-REQ-09.12, the part about which withdrawals owe a fence: the withdrawal of a voice grant owes
+/// a fence while a close forwarded under it can still run at a worker, and none once the hold on
+/// the close is let go.
 #[test]
 fn a_voice_grants_withdrawal_owes_a_fence_while_a_close_is_held_under_it() {
     let voice_rights = [ActionRight::VoiceUse, ActionRight::SessionView];
@@ -595,6 +589,10 @@ fn a_fence_debt_an_earlier_build_wrote_is_still_owed() {
 /// A claim excludes every other attempt, however long its own attempt runs, and an attempt that
 /// ends without recording what it did leaves the action unfinished: no later attempt is given the
 /// claim, however long after.
+///
+/// KR-REQ-09.08, the part about an attempt that ends without recording what it did: the action
+/// stays unfinished and no later attempt is given the claim, however long after, and no other
+/// attempt is admitted while the claim stands.
 #[test]
 fn a_claim_excludes_every_other_attempt_and_is_never_taken_over() {
     use kr_controller::grants::{ActionClaim, ActionRecord};
@@ -827,6 +825,10 @@ fn a_spent_delegation_stays_spent_until_the_caller_says_it_may_be_forgotten() {
 /// A claim whose attempt ended before it recorded anything is settled from what the daemon's own
 /// record shows, once: never over an answer or a refusal the claim already holds, never under an
 /// attempt that still holds the claim, and never for an action nobody claimed.
+///
+/// KR-REQ-09.08, the part about settling an unfinished action: a claim whose attempt ended before
+/// it recorded anything is settled once from the daemon's own record, never over an answer or a
+/// refusal the claim holds and never under an attempt that still holds it.
 #[test]
 fn a_claim_left_unfinished_is_settled_once_and_only_where_nothing_holds_it() {
     use kr_controller::grants::{ActionClaim, ActionRecord};
@@ -917,6 +919,10 @@ fn a_claim_left_unfinished_is_settled_once_and_only_where_nothing_holds_it() {
 
 /// A revocation an action performs writes what it withdrew beside the action's claim, in the
 /// transaction that withdraws: all of it, or nothing when the withdrawal is refused, and once.
+///
+/// KR-REQ-09.08, the part about what a claimed revocation records: it writes what it withdrew
+/// beside the action's claim, in the transaction that withdraws, all of it or nothing when the
+/// withdrawal is refused, and once.
 #[test]
 fn a_claimed_revocation_writes_what_it_withdrew_beside_its_claim() {
     use kr_controller::grants::ActionClaim;
@@ -1016,6 +1022,10 @@ fn a_claimed_revocation_writes_what_it_withdrew_beside_its_claim() {
 /// over an old claim, is brought to this build's shape once: the column goes, every row stays, and
 /// a claim that had no result is unfinished rather than one a later attempt can take. What such a
 /// claim's revocation withdrew was never kept, so it reads as not known, not as nothing.
+///
+/// KR-REQ-09.08, the part about a receipts table an earlier build wrote: a claim that had no result
+/// becomes unfinished rather than one a later attempt can take, and what its revocation withdrew
+/// reads as not known, not as nothing.
 #[test]
 fn an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished() {
     use kr_controller::grants::{ActionClaim, ActionRecord};
