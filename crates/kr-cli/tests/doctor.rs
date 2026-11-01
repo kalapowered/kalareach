@@ -671,8 +671,9 @@ fn functions(source: &str) -> Vec<(String, String)> {
 /// error stream, and it gets there through one reporter function. In the reporter, `write_line`
 /// and `write_prompt` are called only by `write_preview`, which `show_preview` alone calls with the
 /// error stream; the error stream is named by nothing else but the reporter's own `ready`,
-/// `is_terminal` and the handle `say` writes its lines through; and no other source file calls `write_line`, `write_prompt` or `write_preview`
-/// but the output module that defines them, the pairing command's terminal, and the crate's tests.
+/// `is_terminal` and the handle `say` writes its lines through; and no other source file calls
+/// `write_line`, `write_prompt` or `write_preview` but the output module that defines them, the
+/// pairing command's terminal, and the crate's tests.
 #[test]
 fn only_the_reporters_preview_writes_content_to_the_error_stream() {
     fn sources(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {

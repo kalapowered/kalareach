@@ -112,24 +112,27 @@ fn error_stream() -> impl std::io::Write {
 ///
 /// A stream with no room left takes none of what is written to it, and the writes do not panic. The
 /// command says what it could not write on the other stream, where it still can: standard output's
-/// failure on standard error, and standard error's on standard output, as a line, or as a failure
-/// document when the caller asked for `--json`. A command that had already failed ends with its own
-/// failure; one that had not ends with the failure for the stream, because it could not give the
-/// person what it had to say.
+/// failure on standard error, and standard error's as a line on standard output. A command that had
+/// already failed ends with its own failure; one that had not ends with the failure for the stream,
+/// because it could not give the person what it had to say.
+///
+/// Standard output that belongs to a `--json` document or to a protocol's frames
+/// ([`output::claim_for_a_document_or_protocol`]) takes no line of text: a reader of it would be
+/// handed something that is neither. A refused standard error then says nothing more and changes no
+/// status; the document or the frames are the command's whole result.
 #[must_use]
-pub fn ending(ended: std::process::ExitCode, json: bool) -> std::process::ExitCode {
+pub fn ending(ended: std::process::ExitCode) -> std::process::ExitCode {
     let unwritten = if let Some(why) = output::unwritten_output() {
         let unwritten =
             CliError::Terminal(shown!("standard output could not be written: {}", *why));
         failed(&unwritten);
         unwritten
     } else if let Some(why) = ERROR_UNWRITTEN.get() {
-        let unwritten = CliError::Terminal(shown!("standard error could not be written: {}", *why));
-        if json {
-            output::document(&failure(&unwritten));
-        } else {
-            output::say(&shown!("kr: {}", unwritten));
+        if output::is_claimed() {
+            return ended;
         }
+        let unwritten = CliError::Terminal(shown!("standard error could not be written: {}", *why));
+        output::say(&shown!("kr: {}", unwritten));
         unwritten
     } else {
         return ended;

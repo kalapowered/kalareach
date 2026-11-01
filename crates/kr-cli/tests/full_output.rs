@@ -46,6 +46,33 @@ fn run(temp: &kr_ipc::testing::TempHost, line: &[&str], stdout: Stdio, stderr: S
         .expect("kr runs")
 }
 
+/// Runs the built `kr` with `line`, hands it `input` on standard input and closes it, and collects
+/// standard output, with standard error on `stderr`.
+fn run_fed(temp: &kr_ipc::testing::TempHost, line: &[&str], input: &[u8], stderr: Stdio) -> Output {
+    use std::io::Write as _;
+
+    let mut child = Command::new(support::kr())
+        .args(line)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", temp.root())
+        .env("KR_RUNTIME_DIR", temp.paths().runtime_root())
+        .env("KR_STATE_DIR", temp.paths().state_root())
+        .current_dir("/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(stderr)
+        .spawn()
+        .expect("kr starts");
+    // The command may end before it has read everything it was given.
+    let _ = child
+        .stdin
+        .take()
+        .expect("standard input is piped")
+        .write_all(input);
+    child.wait_with_output().expect("kr ends")
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -141,5 +168,34 @@ fn a_failure_that_a_full_standard_error_refuses_is_said_on_standard_output() {
         text(&refused.stdout).contains("standard error"),
         "and says what it could not write: {}",
         text(&refused.stdout)
+    );
+}
+
+/// A command whose standard output is a protocol's frames takes no line of text on it, whatever
+/// else fails: a bridge handed an opening frame it cannot read says why on standard error, and with
+/// standard error full there is nowhere to say that, so the invoker reads exactly what it read
+/// with room and the command ends with the status it ended with then.
+#[test]
+fn a_bridge_whose_standard_error_has_no_room_writes_no_text_among_its_frames() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let line = ["bridge", "--stdio"];
+    // The length of a frame, and four bytes that are not a bridge frame.
+    let unreadable = [0_u8, 0, 0, 4, 0xff, 0xff, 0xff, 0xff];
+    let control = run_fed(&temp, &line, &unreadable, Stdio::piped());
+    assert!(
+        !control.stderr.is_empty(),
+        "with room, the command says on standard error why it ended: {}",
+        text(&control.stdout)
+    );
+
+    let refused = run_fed(&temp, &line, &unreadable, full());
+    assert_eq!(
+        refused.stdout, control.stdout,
+        "the frames the invoker reads are the ones it read with room, with no line of text added"
+    );
+    assert_eq!(
+        refused.status.code(),
+        control.status.code(),
+        "and the command ends as it ended with room"
     );
 }

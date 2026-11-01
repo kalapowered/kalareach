@@ -848,6 +848,23 @@ pub(crate) fn unwritten_output() -> Option<&'static Shown> {
     OUTPUT_UNWRITTEN.get()
 }
 
+/// Whether the command's standard output belongs to a document or a protocol.
+static OUTPUT_IS_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Says that this command's standard output is one `--json` document's, or a protocol's frames.
+///
+/// A line of text written there afterwards would break what its reader parses, so the command's end
+/// ([`report::ending`](crate::report::ending)) writes none to it.
+pub fn claim_for_a_document_or_protocol() {
+    OUTPUT_IS_CLAIMED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether [`claim_for_a_document_or_protocol`] has been called.
+#[must_use]
+pub(crate) fn is_claimed() -> bool {
+    OUTPUT_IS_CLAIMED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Writes one line on standard output.
 pub fn say(line: &Shown) {
     write_stdout(format_args!("{line}"));

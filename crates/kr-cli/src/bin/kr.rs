@@ -29,7 +29,7 @@ use kr_protocol::session::{
 use kr_shell_integration::host::startup::HomeLayout;
 
 fn main() -> ExitCode {
-    report::ending(command(), json_asked_for())
+    report::ending(command())
 }
 
 /// Whether the caller asked for machine-readable output, which has to be known before the arguments
@@ -46,6 +46,9 @@ fn json_asked_for() -> bool {
 /// Runs the command the caller named and returns how it ended.
 fn command() -> ExitCode {
     let json = json_asked_for();
+    if json {
+        output::claim_for_a_document_or_protocol();
+    }
     // Before anything a release could matter to: a command of an installed release holds that
     // release for as long as it runs, and does not run at all once the release is being removed.
     if let Err(error) = kr_ipc::install::this_process() {
@@ -62,6 +65,9 @@ fn command() -> ExitCode {
         Err(error) => return usage(&error, json),
     };
     let json = cli.json;
+    if speaks_a_protocol(&cli.command) {
+        output::claim_for_a_document_or_protocol();
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -99,6 +105,16 @@ fn command() -> ExitCode {
             }
             ExitCode::from(error.exit_code())
         }
+    }
+}
+
+/// Whether the command serves a protocol on standard output: the tool server and the bridge, whose
+/// readers take whatever arrives there as a frame.
+fn speaks_a_protocol(command: &Command) -> bool {
+    match command {
+        Command::AgentTools(arguments) => arguments.stdio,
+        Command::Bridge(arguments) => arguments.stdio,
+        _ => false,
     }
 }
 
