@@ -446,8 +446,8 @@ exit 0
         .expect("the manager's answer");
     }
 
-    /// Makes the manager take `seconds` to list its units.
-    fn lists_slowly(&self, seconds: u32) {
+    /// Makes the manager take `seconds` to list its units (the tool's `sleep` takes a fraction).
+    fn lists_slowly(&self, seconds: &str) {
         std::fs::write(self.here.join("list-seconds"), format!("{seconds}\n"))
             .expect("the seconds");
     }
@@ -476,8 +476,11 @@ exit 0
             .collect()
     }
 
+    /// Removes what is in the tree with the allowance a teardown ordinarily has, which a case that
+    /// does not need the allowance to run out does not come near: its verdict does not rest on how
+    /// soon the tool runs.
     fn remove_through(&self, tree: &kr_ipc::testing::TempHost) -> Vec<String> {
-        self.remove_within(tree, std::time::Duration::from_secs(5))
+        self.remove_within(tree, std::time::Duration::from_secs(60))
     }
 
     fn remove_within(
@@ -573,7 +576,9 @@ fn a_unit_with_no_file_that_the_manager_cannot_place_is_not_established() {
     let manager = StandInManager::new();
     manager.lists(A_UNIT);
     std::fs::write(manager.here.join("fail-asking"), "").expect("a mark");
-    let left = manager.remove_through(&tree);
+    // The manager never answers, so the question is asked again until the allowance has run out;
+    // the allowance is short for that, and the verdict is the same however much of it is used.
+    let left = manager.remove_within(&tree, std::time::Duration::from_secs(2));
     assert!(
         left.iter().any(|what| what.contains("could not be asked")),
         "{left:?}"
@@ -630,7 +635,10 @@ fn a_slow_list_does_not_take_the_time_given_for_the_questions_about_units_with_n
     let manager = StandInManager::new();
     manager.lists(A_UNIT);
     manager.says_it_runs_in(A_UNIT, &tree.root().join("s"));
-    manager.lists_slowly(6);
+    // The list takes longer than the allowance, and ends inside the ten seconds a list is given
+    // at least: the allowance cannot be longer than the list, so this is the case that needs the
+    // two to be close, and each has about five seconds to spare.
+    manager.lists_slowly("5.5");
     let left = manager.remove_within(&tree, std::time::Duration::from_secs(5));
     assert!(
         left.iter().all(|what| what.contains("has no file in")),
