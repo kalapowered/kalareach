@@ -25,6 +25,10 @@ use kr_describe::profile::{
     Admission, DownloadLedger, DownloadPolicy, Gate, ModelProfile, ProfileDocument, ProfileTrust,
     QualificationGate, SignedProfile, catalogue,
 };
+use kr_describe::resource::{
+    HostConditions, PauseReason, PowerSource, ResourcePolicy, ResourceSettings, ResourceState,
+    ThermalState,
+};
 use kr_protocol::scalars::TimestampMs;
 
 use support::{MAC, built_in, default_profile, environment_id, native};
@@ -592,11 +596,14 @@ fn the_defaults_are_section_22s_and_the_cost_is_more_than_the_file() {
     }));
 }
 
-/// KR-REQ-22.10: every item of what a resident model costs counts against the ceiling: the
-/// weights, the mapping, the key-value cache, the other caches, the batch and the runtime's own
-/// allocations. The six items below, each of its own size, make up the 4 GiB ceiling exactly; a
-/// byte more in any one of them is over it, and the total, what a job allocates again and what lies
-/// beyond the weights each add up the items they name.
+/// KR-REQ-22.10: every item of what a resident model costs counts against the ceiling, as the
+/// resource policy admits or pauses inference: the weights, the mapping, the key-value cache, the
+/// other caches, the batch and the runtime's own allocations. The six items below, each of its own
+/// size, make up the 4 GiB ceiling exactly and the policy admits them on a host with room for the
+/// model and the reserve; a byte more in any one of them is over the ceiling and the policy pauses
+/// inference for the memory reserve, so no item is left out of the sum that the policy compares. The
+/// total, what a job allocates again and what lies beyond the weights each add up the items they
+/// name.
 #[test]
 fn every_item_of_a_models_cost_counts_against_the_ceiling() {
     const MIB: u64 = 1 << 20;
@@ -609,35 +616,81 @@ fn every_item_of_a_models_cost_counts_against_the_ceiling() {
         runtime_overhead_bytes: 64 * MIB,
     };
     assert_eq!(cost.total(), 4 * GIB);
-    assert!(Budgets::DEFAULTS.admits(&cost));
     assert_eq!(cost.per_job_peak(), (384 + 128 + 192) * MIB);
     assert_eq!(cost.beyond_the_weights(), GIB);
 
-    let one_more = |cost: ResidentCost| !Budgets::DEFAULTS.admits(&cost);
-    assert!(one_more(ResidentCost {
-        weights_bytes: cost.weights_bytes + 1,
-        ..cost
-    }));
-    assert!(one_more(ResidentCost {
-        mapping_bytes: cost.mapping_bytes + 1,
-        ..cost
-    }));
-    assert!(one_more(ResidentCost {
-        kv_cache_bytes: cost.kv_cache_bytes + 1,
-        ..cost
-    }));
-    assert!(one_more(ResidentCost {
-        additional_cache_bytes: cost.additional_cache_bytes + 1,
-        ..cost
-    }));
-    assert!(one_more(ResidentCost {
-        batch_bytes: cost.batch_bytes + 1,
-        ..cost
-    }));
-    assert!(one_more(ResidentCost {
-        runtime_overhead_bytes: cost.runtime_overhead_bytes + 1,
-        ..cost
-    }));
+    // A host with room for the whole model and the reserve beside it, so the ceiling is the only
+    // thing the policy can pause for.
+    let room = HostConditions::measured(
+        64 * GIB,
+        48 * GIB,
+        PowerSource::Mains,
+        ThermalState::Nominal,
+    );
+    let decided = |cost: ResidentCost| {
+        ResourcePolicy::new(ResourceSettings::default(), Budgets::DEFAULTS)
+            .evaluate(&room, &cost, false)
+            .to
+    };
+    assert_eq!(
+        decided(cost),
+        ResourceState::Admitted,
+        "the items that make up the ceiling are admitted"
+    );
+    let over_by_a_byte = ResourceState::ResourcePaused {
+        reason: PauseReason::MemoryReserve,
+        unloaded: false,
+    };
+    for (item, over) in [
+        (
+            "weights",
+            ResidentCost {
+                weights_bytes: cost.weights_bytes + 1,
+                ..cost
+            },
+        ),
+        (
+            "mapping",
+            ResidentCost {
+                mapping_bytes: cost.mapping_bytes + 1,
+                ..cost
+            },
+        ),
+        (
+            "key-value cache",
+            ResidentCost {
+                kv_cache_bytes: cost.kv_cache_bytes + 1,
+                ..cost
+            },
+        ),
+        (
+            "additional caches",
+            ResidentCost {
+                additional_cache_bytes: cost.additional_cache_bytes + 1,
+                ..cost
+            },
+        ),
+        (
+            "batch",
+            ResidentCost {
+                batch_bytes: cost.batch_bytes + 1,
+                ..cost
+            },
+        ),
+        (
+            "runtime overhead",
+            ResidentCost {
+                runtime_overhead_bytes: cost.runtime_overhead_bytes + 1,
+                ..cost
+            },
+        ),
+    ] {
+        assert_eq!(
+            decided(over),
+            over_by_a_byte,
+            "a byte more in the {item} is over the ceiling"
+        );
+    }
 }
 
 /// KR-REQ-22.10: an owner may tighten the ceiling and never loosen it.
