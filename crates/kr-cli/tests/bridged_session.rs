@@ -4513,6 +4513,22 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
         "a manager that says it is not there reads as a machine that cannot run the case: {printed}"
     );
 
+    // The question is asked in the C locale, so that the words that say there is no manager are the
+    // ones that are read: a machine in another language says them in its own.
+    let other_language = tempfile::tempdir().expect("a directory");
+    place(
+        other_language.path(),
+        "if [ \"$LC_ALL\" = C ]; then echo 'Failed to connect to bus: No medium found' >&2; \
+         else echo 'Verbindung zum Bus fehlgeschlagen: Kein Medium gefunden' >&2; fi; exit 1",
+    );
+    let ran = run_with(ordinary, other_language.path());
+    let printed = String::from_utf8_lossy(&ran.stdout);
+    assert!(
+        printed.contains("not here: no user manager answers"),
+        "the question was asked in the C locale: {printed} {}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+
     // A manager that is there and fails its answer for another reason, or is ended by a signal,
     // has not shown that this machine has none: the start fails the case.
     for (what, body, said) in [
@@ -4527,6 +4543,12 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
             "without saying that none is there",
         ),
         ("a systemctl that was killed", "kill -KILL $$", "signal"),
+        // The words it printed before it was killed are no answer either.
+        (
+            "a systemctl that said none is there and was killed",
+            "echo 'Failed to connect to bus: No medium found' >&2; kill -KILL $$",
+            "signal",
+        ),
     ] {
         let failing = tempfile::tempdir().expect("a directory");
         place(failing.path(), body);
@@ -4550,7 +4572,9 @@ fn only_the_words_that_mean_no_user_manager_is_there_are_read_as_that() {
         "Failed to connect to bus: No medium found",
         "Failed to connect to user scope bus via local transport: No such file or directory",
         "Failed to connect to bus: Connection refused",
-        "System has not been booted with systemd as init system (PID 1). Can't operate.\nFailed to connect to bus: Host is down",
+        // Each of the other ways of saying it, on its own.
+        "System has not been booted with systemd as init system (PID 1). Can't operate.",
+        "Failed to connect to bus: Host is down",
         "$DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined (consider using --machine=<user>@.host --user to connect to bus of other user)",
     ] {
         assert!(
@@ -4563,6 +4587,9 @@ fn only_the_words_that_mean_no_user_manager_is_there_are_read_as_that() {
         "Failed to get properties: Connection timed out",
         "Failed to get properties: Access denied",
         "Failed to get properties: No such file or directory",
+        // A bus that timed out, beside a line of its own output with the words of an absent one.
+        "Failed to connect to bus: Connection timed out\nFailed to open a file: No such file or directory",
+        "Failed to open a file: No such file or directory\nFailed to connect to bus: Connection timed out",
         "",
     ] {
         assert!(

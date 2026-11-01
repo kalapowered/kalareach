@@ -157,19 +157,22 @@ pub fn kill_and_collect(child: &mut std::process::Child) -> String {
 /// ask: no bus to reach it by (no session, no runtime directory, nothing at the socket, a refused
 /// connection, no medium), or no systemd as the init system at all. A bus that timed out, a
 /// property that could not be read and every other failure say nothing of the kind: a manager is
-/// there, and a case that needs it has to run.
+/// there, and a case that needs it has to run. The cause is read on the line that says the
+/// connection failed, since another line of the same output may say something else of its own.
 pub fn says_there_is_no_user_manager(stderr: &str) -> bool {
     stderr.contains("System has not been booted with systemd")
         || stderr.contains("$DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined")
-        || (stderr.contains("Failed to connect to")
-            && [
-                "No such file or directory",
-                "No medium found",
-                "Connection refused",
-                "Host is down",
-            ]
-            .iter()
-            .any(|words| stderr.contains(words)))
+        || stderr.lines().any(|line| {
+            line.contains("Failed to connect to")
+                && [
+                    "No such file or directory",
+                    "No medium found",
+                    "Connection refused",
+                    "Host is down",
+                ]
+                .iter()
+                .any(|words| line.contains(words))
+        })
 }
 
 /// Runs a command to its end within `bound`, ending and collecting it when it has not ended.
@@ -305,7 +308,11 @@ impl UserManager {
             return Err("this host has no systemctl to ask a user manager anything with".into());
         }
         let mut asked = Command::new("systemctl");
-        asked.args(["--user", "show", "--property=Version", "--value"]);
+        // Its words are read, and the words of a machine in another language are not the ones the
+        // list holds.
+        asked
+            .args(["--user", "show", "--property=Version", "--value"])
+            .env("LC_ALL", "C");
         let answered = bounded(asked, probe_bound).unwrap_or_else(|why| {
             panic!("the machine's own user service manager was asked who it is: {why}")
         });
