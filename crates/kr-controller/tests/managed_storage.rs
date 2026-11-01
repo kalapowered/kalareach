@@ -6021,11 +6021,12 @@ async fn a_deadline_that_passes_while_the_bundle_write_waits_for_its_own_token_s
 /// passes, says nothing was read and owes nothing: a runner that stops for that long cuts the first
 /// look and not the second. So the look is made again, with the fault armed before each one, until
 /// the host owes a delay. A look that meets the fault and is not cut owes it, so this ends at the
-/// first look that does.
+/// first look that does. The guard is shorter than the 60 seconds a request the case holds has to
+/// be answered in: after that the call goes on without the case, and what fails is another step.
 async fn the_service_names_a_delay_to_a_look_at_its_storage_state(rig: &Rig, delay: Moment) {
     let quiet = rig.controller.backup_runtime().expect("a carrier").quiet();
     let mut said = None;
-    let owed = tokio::time::timeout(Duration::from_secs(180), async {
+    let owed = tokio::time::timeout(Duration::from_secs(50), async {
         while quiet.left().is_none() {
             rig.served.web().fail(STATUS, 1, delay);
             said = Some(rig.backup_status().await.storage);
@@ -6425,14 +6426,17 @@ fn the_delay_the_host_owes(rig: &Rig) -> Option<Duration> {
 }
 
 /// What the owner is told of the storage state by a look that finds the host signed in. A look
-/// that finds it otherwise was cut by the bound it keeps on the wait for the sign-in, which a runner
-/// that stops can pass, and says nothing of the service, so it is made again.
+/// that finds the sign-in not renewed was cut by the bound it keeps on the wait for it, which a
+/// runner that stops can pass, and says nothing of the service, so it is made again. Any other
+/// state of the sign-in is a failure of the case.
 async fn the_storage_state_the_owner_is_told(rig: &Rig) -> BackupStorageState {
     within("a look that finds the host signed in", async {
         loop {
             let status = rig.backup_status().await;
-            if status.sign_in == BackupSignIn::Usable {
-                return status.storage;
+            match status.sign_in {
+                BackupSignIn::Usable => return status.storage,
+                BackupSignIn::NotRenewed => {}
+                other => panic!("the host is not signed in: {other:?}"),
             }
         }
     })
