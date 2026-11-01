@@ -274,7 +274,7 @@ enum Ending {
 }
 
 /// Why a call run within a limit gave no answer. Each names the call by its program and verbs, as
-/// [`named`] says, and none repeats a value after them.
+/// `named` says, and none repeats a value after them.
 #[derive(Debug)]
 pub enum CallFailure {
     /// The program could not be started.
