@@ -20,7 +20,7 @@ use kr_describe::serve::{
     Verifying,
 };
 use kr_describe::supervise::STOP_BOUND_MS;
-use kr_describe::testing::{Script, job_bounds};
+use kr_describe::testing::{Script, acknowledging_state, job_bounds};
 use kr_describe::wire::{Answer, JobEnd, LoadEnd, Request, WIRE_VERSION, frame_of};
 use kr_protocol::ids::SessionEpoch;
 use kr_protocol::scalars::U64;
@@ -625,10 +625,12 @@ fn a_job_past_its_deadline_that_was_told_to_stop_is_given_time_to_stop() {
 /// as overdue, and not before that bound, which the lower limit of the elapsed time shows (the
 /// process cannot end itself sooner than its own bound, whatever the load), and not never, which
 /// the wait for the end shows. The wait allows twice the bound so that a loaded host does not fail
-/// it, so no elapsed time holds how much later than the bound the process ends. What holds it is
-/// the process's own record of the bounds its watchdog holds the job to, read back as the job comes
-/// into hand and compared with the guide's two seconds and thirty. It runs as long as the bound it
-/// holds.
+/// it, so no elapsed time holds how much later than the bound the process ends. What holds the
+/// figure is the process's own record of the bounds it sets for the job as it comes into hand,
+/// compared with the guide's two seconds and thirty (the case below holds that the extension to
+/// the stop bound is made); that the watchdog compares the clock with those bounds and no others
+/// is held by the lower limit and by the end, and not to the second. It runs as long as the bound
+/// it holds.
 #[test]
 fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
     let placed = Placed::stub();
@@ -662,29 +664,22 @@ fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
     assert!(sent.elapsed() >= Duration::from_millis(200 + STOP_BOUND_MS));
 }
 
-/// KR-REQ-22.11: a job the control thread has read the stop of gets the stop bound before the
-/// control thread does anything that can take long, the acknowledgement's write included. The
-/// control thread here reads the stop 1.4 s after the job's request, which leaves 0.8 s of the
-/// grace after the job's deadline (200 ms plus 2 s), and then takes 1.2 s to write the
-/// acknowledgement, which is inside the control thread's own bound of 2 s: a write that came
-/// before the extension would carry the watchdog past the grace first, and the process would end
-/// as overdue. The model does not look at its token until after the grace, so the job is still
-/// there to answer. Both delays are the process's own, and the case is process evidence of the
-/// order, not a proof of it: the control thread has 0.8 s from its read of the stop to extend the
-/// bound (2.2 s from the request), and 0.8 s is left of its own bound of 2 s for one request after
-/// the write. A host so loaded that a thread of the process loses 0.8 s fails the case with the
-/// right order, and one that keeps the watchdog from looking for 0.4 s after the grace passes it
-/// with the wrong one. The control is the same job told nothing, which ends the process at the
-/// grace (above).
+/// KR-REQ-22.11: a job the control thread has read the stop of is cancelled, and has the stop
+/// bound, before the control thread begins to write the acknowledgement. The write can take long,
+/// on a daemon that is slow to read or a thread the system has set aside, and the watchdog reads
+/// the job's bound without a lock, so a write ahead of the extension would carry the watchdog past
+/// the grace before the job had its extension and the process would end as overdue. The process
+/// records what its control thread had done as it began to write, and the case reads that back
+/// once the acknowledgement has arrived: the job's token cancelled, and the bound the watchdog
+/// holds the job to the stop bound that was set as the job began, and not the grace. No delay
+/// decides it, and the job's deadline is far off. Written first, the acknowledgement shows a token
+/// not yet cancelled and the grace; extending by more than the stop bound shows a bound past it.
 #[test]
-fn a_job_told_to_stop_has_its_bound_before_the_acknowledgement_is_written() {
+fn a_job_told_to_stop_is_cancelled_and_has_its_bound_before_the_acknowledgement_is_written() {
     let placed = Placed::stub();
-    let runtime = placed.directory("slow-acknowledgement");
+    let runtime = placed.directory("acknowledging");
     let script = Script {
-        ignore_token_ms: 3_000,
-        late_read_after: Some(3),
-        late_read_ms: 1_400,
-        slow_acknowledgement_ms: 1_200,
+        generate_until_cancelled: true,
         mark_work: true,
         ..Script::default()
     };
@@ -692,20 +687,24 @@ fn a_job_told_to_stop_has_its_bound_before_the_acknowledgement_is_written() {
     process.hello();
     process.send(&load(1, &default_profile(), 300_000));
     process.expect_answer(SOON, "the load");
-    process.send(&generate(2, 1, 200));
+    process.send(&generate(2, 1, 60_000));
     wait_until_began(&runtime, "job");
     process.send(&Request::Cancel { id: U64::new(2) });
     assert_eq!(
         process.expect_answer(SOON, "the acknowledgement"),
-        Answer::Cancelling { id: U64::new(2) },
-        "the process ended as {:?}",
-        process.exit_within(Duration::from_millis(10))
+        Answer::Cancelling { id: U64::new(2) }
+    );
+    let before_the_write = acknowledging_state(&runtime, 2).expect("the control thread's record");
+    assert!(before_the_write.cancelled, "{before_the_write:?}");
+    assert_ne!(before_the_write.job_stop_due, 0, "{before_the_write:?}");
+    assert_eq!(
+        before_the_write.work_due, before_the_write.job_stop_due,
+        "the watchdog holds the job to the stop bound: {before_the_write:?}"
     );
     assert!(matches!(
         process.expect_terminal(SOON, "the stopped job"),
         Answer::Ended { id, why: JobEnd::Cancelled, .. } if id.get() == 2
     ));
-    assert!(process.exit_within(Duration::from_millis(500)).is_none());
 }
 
 /// A process whose model fails inside a job ends itself, so the daemon restarts inference rather

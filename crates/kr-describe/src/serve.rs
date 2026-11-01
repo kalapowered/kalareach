@@ -476,9 +476,9 @@ pub fn run<M: Model>(
             }
             // The acknowledgement is the control thread's own: it says this thread is reading,
             // which is the condition the daemon waits for. It is written after the work is
-            // cancelled and a job has its stop bound, since the write can take long, and before
-            // the work's own answer. It is sent only for work still in hand, so a cancellation
-            // that crosses the work's answer is not acknowledged after it.
+            // cancelled and a job in hand has its stop bound, since the write can take long, and
+            // before the work's own answer. It is sent only for work still in hand, so a
+            // cancellation that crosses the work's answer is not acknowledged after it.
             Ok(Some(Request::Cancel { id })) => shared.cancel_and_acknowledge(id),
             // The input ended, or failed, which on a pipe the daemon holds is the same thing: the
             // daemon is not going to send anything more.
@@ -569,8 +569,8 @@ impl Shared {
             .remove(&id);
     }
 
-    /// Cancels the work with this identifier, gives a job the stop bound, and acknowledges the
-    /// cancellation, in that order, when there is any such work in hand.
+    /// Cancels the work with this identifier, gives a job in hand the stop bound, and acknowledges
+    /// the cancellation, in that order, when there is any such work to cancel.
     ///
     /// All three happen under the lock the model thread takes to forget the work before it
     /// answers. The model thread can see the work cancelled before it is acknowledged, but cannot
@@ -585,11 +585,14 @@ impl Shared {
     /// The extension comes before the acknowledgement because the write can take long, when the
     /// daemon is slow to read or the system has set the thread aside, and the watchdog reads the
     /// bound without the lock: a write ahead of the extension can carry the watchdog past the old
-    /// bound. A watchdog that has already read the old bound when the extension is made can still
-    /// end the process. That window is the few instructions between the watchdog's read and its
-    /// exit, and what it costs is one process failure, a reload and the job queued again. Closing
-    /// it would need the watchdog to take the lock, which a write that has stuck holds, and the
-    /// watchdog could then not end the process for that stall.
+    /// bound. Two windows stay open, and each costs one process failure, a reload and a job queued
+    /// again. A watchdog that has already read the old bound when the extension is made can still
+    /// end the process: the window is the time between its read and its exit, which includes the
+    /// message it writes first. A job cancelled before the model thread takes it in hand is not
+    /// extended, since the model thread sets its bound as it starts, and a write that outlasts that
+    /// bound still ends the process. A lock in the watchdog would wait behind a write that has
+    /// stuck, and one it only tries would leave the first window the time between the control
+    /// thread's read and its taking the lock, at the price of a race no case can hold.
     fn cancel_and_acknowledge(&self, id: U64) {
         let tokens = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(token) = tokens.get(&id.get()) {
@@ -603,6 +606,14 @@ impl Shared {
                 self.work_due
                     .fetch_max(self.job_stop_due.load(Ordering::Acquire), Ordering::AcqRel);
             }
+            // What has been done by the time the write begins, for a test to read back.
+            #[cfg(feature = "testing")]
+            crate::testing::acknowledging(
+                id.get(),
+                token.is_cancelled(),
+                self.work_due.load(Ordering::Acquire),
+                self.job_stop_due.load(Ordering::Acquire),
+            );
             self.answer(&Answer::Cancelling { id });
         }
     }
@@ -774,8 +785,8 @@ fn model_thread<M: Model>(
                     shared.stamp_of(due + Duration::from_millis(OVERDUE_GRACE_MS)),
                     Ordering::Release,
                 );
-                // The bounds as the watchdog holds them, before a stop can extend one, for a test to
-                // read back.
+                // The bounds as the watchdog holds them, before a stop can extend one, for a test
+                // to read back.
                 #[cfg(feature = "testing")]
                 crate::testing::job_bounds_held(
                     id,

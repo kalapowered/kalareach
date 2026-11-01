@@ -68,14 +68,20 @@ pub const SENT_DEADLINE_PREFIX: &str = "stub-sent-deadline-";
 /// control thread reads, both in milliseconds.
 pub const JOB_BOUNDS_PREFIX: &str = "stub-job-bounds-";
 
-/// Where this process leaves the bounds it holds each job to: set by a stub whose script marks
-/// work, and unset in every other process.
-static BOUNDS_DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/// The start of the name of the file a stub whose script marks work leaves in its runtime
+/// directory as its control thread begins to write the acknowledgement of a cancellation of the
+/// work with an identifier, followed by that identifier. It holds what the control thread had done
+/// by then, in the form [`Acknowledging`] reads.
+pub const ACKNOWLEDGING_PREFIX: &str = "stub-acknowledging-";
+
+/// Where this process leaves what it records for a test: set by a stub whose script marks work,
+/// and unset in every other process.
+static RECORDS_DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Records the bounds the process holds a job to, past its deadline, when the process is a stub
 /// whose script marks work.
 pub(crate) fn job_bounds_held(id: u64, grace_ms: u64, stop_bound_ms: u64) {
-    if let Some(directory) = BOUNDS_DIRECTORY.get() {
+    if let Some(directory) = RECORDS_DIRECTORY.get() {
         let _ = std::fs::write(
             directory.join(format!("{JOB_BOUNDS_PREFIX}{id}")),
             format!("{grace_ms} {stop_bound_ms}"),
@@ -92,6 +98,47 @@ pub fn job_bounds(runtime_dir: &Path, id: u64) -> Option<(u64, u64)> {
         std::fs::read_to_string(runtime_dir.join(format!("{JOB_BOUNDS_PREFIX}{id}"))).ok()?;
     let (grace_ms, stop_bound_ms) = text.trim().split_once(' ')?;
     Some((grace_ms.parse().ok()?, stop_bound_ms.parse().ok()?))
+}
+
+/// What the control thread of a stub process had done when it began to write the acknowledgement
+/// of a cancellation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Acknowledging {
+    /// Whether the work's token was cancelled.
+    pub cancelled: bool,
+    /// When the watchdog holds the work overdue, in the process's stamps (milliseconds since its
+    /// origin, plus one).
+    pub work_due: u64,
+    /// When the watchdog holds the job overdue once its stop is read, in the same stamps, or
+    /// nought for work that is not a job.
+    pub job_stop_due: u64,
+}
+
+/// Records what the control thread had done as it begins to write the acknowledgement of the
+/// cancellation of the work with this identifier, when the process is a stub whose script marks
+/// work.
+pub(crate) fn acknowledging(id: u64, cancelled: bool, work_due: u64, job_stop_due: u64) {
+    if let Some(directory) = RECORDS_DIRECTORY.get() {
+        let _ = std::fs::write(
+            directory.join(format!("{ACKNOWLEDGING_PREFIX}{id}")),
+            format!("{} {work_due} {job_stop_due}", u8::from(cancelled)),
+        );
+    }
+}
+
+/// Returns what the control thread of the stub process with `runtime_dir` as its runtime
+/// directory had done when it began to write the acknowledgement of the cancellation of the work
+/// with this identifier, once it has.
+#[must_use]
+pub fn acknowledging_state(runtime_dir: &Path, id: u64) -> Option<Acknowledging> {
+    let text =
+        std::fs::read_to_string(runtime_dir.join(format!("{ACKNOWLEDGING_PREFIX}{id}"))).ok()?;
+    let mut parts = text.split_whitespace();
+    Some(Acknowledging {
+        cancelled: parts.next()? == "1",
+        work_due: parts.next()?.parse().ok()?,
+        job_stop_due: parts.next()?.parse().ok()?,
+    })
 }
 
 /// Returns the deadline, in milliseconds, that each job a recording process ([`Raw::Recording`])
@@ -360,17 +407,6 @@ pub struct Script {
     pub wedge_input_after: Option<u64>,
     /// From this answer on, counting from one, writing blocks for good.
     pub wedge_output_from: Option<u64>,
-    /// After this many whole requests, once, reading the next request is put off for
-    /// [`Self::late_read_ms`]: a control thread the system has not run for that long, which reads
-    /// the request late though it was sent in time.
-    pub late_read_after: Option<u64>,
-    /// How long reading is put off, in milliseconds, once the request count of
-    /// [`Self::late_read_after`] is reached.
-    pub late_read_ms: u64,
-    /// How long writing the answer that acknowledges a cancellation takes, in milliseconds: a
-    /// daemon that is slow to read, or a control thread the system has put aside, in the middle of
-    /// acknowledging.
-    pub slow_acknowledgement_ms: u64,
     /// A process that does not serve through [`crate::serve::run`] at all.
     pub raw: Option<Raw>,
     /// Whether the model looks at its token without pausing between looks, so that it sees a
@@ -546,8 +582,6 @@ impl Script {
         number("hold-bytes", self.hold_bytes);
         number("job-threads", u64::from(self.job_threads));
         number("commit-at-start", self.commit_at_start_bytes);
-        number("late-read-ms", self.late_read_ms);
-        number("slow-acknowledgement-ms", self.slow_acknowledgement_ms);
         if let Some(bytes) = self.peak_rss_bytes {
             parts.push(format!("peak-rss={bytes}"));
         }
@@ -556,9 +590,6 @@ impl Script {
         }
         if let Some(count) = self.wedge_output_from {
             parts.push(format!("wedge-output-from={count}"));
-        }
-        if let Some(count) = self.late_read_after {
-            parts.push(format!("late-read-after={count}"));
         }
         let mut flag = |name: &str, set: bool| {
             if set {
@@ -644,12 +675,9 @@ impl Script {
                         .map_err(|_| format!("{name} takes a count of threads"))?;
                 }
                 "commit-at-start" => script.commit_at_start_bytes = number()?,
-                "late-read-ms" => script.late_read_ms = number()?,
-                "slow-acknowledgement-ms" => script.slow_acknowledgement_ms = number()?,
                 "peak-rss" => script.peak_rss_bytes = Some(number()?),
                 "wedge-input-after" => script.wedge_input_after = Some(number()?),
                 "wedge-output-from" => script.wedge_output_from = Some(number()?),
-                "late-read-after" => script.late_read_after = Some(number()?),
                 "load-until-cancelled" => script.load_until_cancelled = true,
                 "load-until-released" => script.load_until_released = true,
                 "generate-until-released" => script.generate_until_released = true,
@@ -1375,7 +1403,7 @@ pub fn stub_main() -> i32 {
         }
     };
     if script.mark_work {
-        let _ = BOUNDS_DIRECTORY.set(runtime_dir.clone());
+        let _ = RECORDS_DIRECTORY.set(runtime_dir.clone());
     }
     let options = Options {
         build: stub_build(),
@@ -1383,10 +1411,8 @@ pub fn stub_main() -> i32 {
         catalogue,
         daemon,
     };
-    let input = Wedging::reading(std::io::stdin(), script.wedge_input_after)
-        .reading_late(script.late_read_after, script.late_read_ms);
-    let output = Wedging::writing(std::io::stdout(), script.wedge_output_from)
-        .acknowledging_slowly(script.slow_acknowledgement_ms);
+    let input = Wedging::reading(std::io::stdin(), script.wedge_input_after);
+    let output = Wedging::writing(std::io::stdout(), script.wedge_output_from);
     let model = StubModel::new(script).in_runtime_dir(options.runtime_dir.clone());
     crate::serve::run(options, model, input, output).code()
 }
@@ -1538,9 +1564,6 @@ fn flag(arguments: &[String], name: &str) -> Option<String> {
 /// Reading, it counts whole frames by their length prefixes and never returns from the read after
 /// the last one it lets through. Writing, it counts the answers it has flushed and never returns
 /// from the write of the one it stops at.
-///
-/// It can also be late once: reading, after a number of whole frames it puts off the next read,
-/// and writing, it takes a while to write the answer that acknowledges a cancellation.
 struct Wedging<T> {
     inner: T,
     stop_at: Option<u64>,
@@ -1548,10 +1571,6 @@ struct Wedging<T> {
     /// Reading: how much of the current frame is still to come, and the prefix bytes seen so far.
     remaining: usize,
     prefix: Vec<u8>,
-    /// Reading: the frame count after which the next read is put off, and for how long.
-    late: Option<(u64, Duration)>,
-    /// Writing: how long the answer that acknowledges a cancellation takes to write.
-    slow_acknowledgement: Duration,
 }
 
 impl<T> Wedging<T> {
@@ -1562,25 +1581,11 @@ impl<T> Wedging<T> {
             frames: 0,
             remaining: 0,
             prefix: Vec::new(),
-            late: None,
-            slow_acknowledgement: Duration::ZERO,
         }
     }
 
     const fn writing(inner: T, from: Option<u64>) -> Self {
         Self::reading(inner, from)
-    }
-
-    /// Puts off the read that follows `after` whole frames by `milliseconds`, once.
-    fn reading_late(mut self, after: Option<u64>, milliseconds: u64) -> Self {
-        self.late = after.map(|after| (after, Duration::from_millis(milliseconds)));
-        self
-    }
-
-    /// Makes writing the answer that acknowledges a cancellation take `milliseconds`.
-    fn acknowledging_slowly(mut self, milliseconds: u64) -> Self {
-        self.slow_acknowledgement = Duration::from_millis(milliseconds);
-        self
     }
 }
 
@@ -1595,12 +1600,6 @@ impl<R: Read> Read for Wedging<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         if self.stop_at.is_some_and(|after| self.frames >= after) {
             stop_for_good();
-        }
-        if let Some((after, wait)) = self.late
-            && self.frames >= after
-        {
-            self.late = None;
-            std::thread::sleep(wait);
         }
         // Reading one byte at a time keeps the count exact without buffering ahead of the frame
         // that stops the stream.
@@ -1642,14 +1641,6 @@ impl<W: Write> Write for Wedging<W> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         if self.stop_at.is_some_and(|from| self.frames + 1 >= from) {
             stop_for_good();
-        }
-        if !self.slow_acknowledgement.is_zero()
-            && matches!(
-                read_message::<Answer>(&mut &buffer[..]),
-                Ok(Some(Answer::Cancelling { .. }))
-            )
-        {
-            std::thread::sleep(self.slow_acknowledgement);
         }
         self.inner.write(buffer)
     }
