@@ -38,9 +38,9 @@
 //! sets aside; and an account's bare name in a clause that holds no path, number or command of its
 //! own (the error output of `systemctl` that `supervision.rs` quotes can hold one), even when a
 //! later clause does. The words ahead of a clause of the host's own, in the detail of a plugin the
-//! admissions leave out, are read without the set-aside place. A producer that writes one of these
-//! is mended by giving the refusal a wording that is shared with this module, as
-//! [`KNOWN_REASONS`] does for its last seven refusals.
+//! admissions leave out, are read without the set-aside place, and are held to the rule when they
+//! hold a backtick. A producer that writes one of these is mended by giving the refusal a wording
+//! that is shared with this module, as [`KNOWN_REASONS`] does for its last seven refusals.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -911,17 +911,20 @@ fn shown_member(map: &CanonicalMap, key: &str, child: &CanonicalValue) -> Option
                 .min()
             {
                 // The subject before the clause is the host's own words only if it names nothing of
-                // the host and quotes no command. A subject that does is held to the rule, as a
+                // the host and holds no backtick. A subject that does is held to the rule, as a
                 // text with no clause is, up to the end of the clause, and the words after it are
                 // not sent. The guard reads the subject by its words alone, with no place of a
                 // pointer's refusal set aside (a subject is a package and its hash, and has none),
-                // so when the rule over the text through the clause finds nothing (a path the
-                // pointer rule hides, or a clause that completes a pointer's refusal), what stands
-                // for it is the fixed sentence. A plugin identifier that reads as an account's
-                // number (`acme/user-1`) is held too.
-                Some((at, end)) if is_held_to_the_rule(&text[..at]) => {
-                    Some(told_in_place(&text[..end], fixed).unwrap_or_else(fixed))
-                }
+                // and so does the check of what the rule kept: when the rule over the text through
+                // the clause finds nothing (a path the pointer rule hides, or a clause that
+                // completes a pointer's refusal), or what it kept still names something, what
+                // stands for it is the fixed sentence. A plugin identifier that reads as an
+                // account's number (`acme/user-1`) is held too.
+                Some((at, end)) if is_held_to_the_rule(&text[..at]) => Some(
+                    told_in_place(&text[..end], fixed)
+                        .filter(|told| naming_outside(told, None).is_none())
+                        .unwrap_or_else(fixed),
+                ),
                 Some((_, end)) => (end < text.len()).then(|| text[..end].to_owned()),
                 None => told_in_place(text, fixed),
             },
@@ -1189,9 +1192,11 @@ fn survivor(map: &CanonicalMap) -> Option<CanonicalValue> {
 }
 
 /// Whether the words of a subject, ahead of a clause that is the host's own, are held to the rule:
-/// they name something of this host anywhere in them, or they quote a command.
+/// they name something of this host anywhere in them, or they hold a backtick, which begins a
+/// quotation of a command that can end beyond the clause. A subject is a package and its hash, and
+/// has neither.
 fn is_held_to_the_rule(subject: &str) -> bool {
-    naming_outside(subject, None).is_some() || without_quoted_commands(subject).is_some()
+    naming_outside(subject, None).is_some() || subject.contains('`')
 }
 
 /// Where in `text` the first thing that names this host begins, as a byte offset, when anything
@@ -4080,7 +4085,8 @@ mod tests {
     }
 
     /// A subject is read for what it names, with no place set aside: the place a pointer's refusal
-    /// puts after `at` is a path in a subject, which has no field to point at.
+    /// puts after `at` is a path in a subject, which has no field to point at, and what the rule
+    /// keeps of a subject is read the same way.
     #[test]
     fn a_path_in_the_form_of_a_pointers_place_is_a_path_in_a_subject() {
         let nothing = format!("why the admissions leave the installation out; {WHY_NOT_SHOWN}");
@@ -4089,9 +4095,27 @@ mod tests {
                 for said in [
                     format!("x at /Users/marguerite/p{end}{clause}: marguerite wrote this"),
                     format!("x at /Users/marguerite/p{end}{clause}"),
+                    // A quoted command is replaced, and the pointer's place beside it is still a
+                    // path.
+                    format!("`a b` x at /Users/marguerite/p{end}{clause}: marguerite wrote this"),
                 ] {
                     assert_eq!(left_out_detail_told_to_a_device(&said), nothing, "{said}");
                 }
+            }
+        }
+    }
+
+    /// A subject that holds a backtick may quote a command that ends beyond the clause, where
+    /// nothing marks it as one: what is told is the fixed sentence, whatever the quotation holds.
+    #[test]
+    fn a_quotation_that_runs_past_the_clause_is_not_a_subject_that_names_nothing() {
+        let nothing = format!("why the admissions leave the installation out; {WHY_NOT_SHOWN}");
+        for clause in LEFT_OUT_CLAUSES {
+            for said in [
+                format!("`rm -rf x{clause}`: marguerite wrote this"),
+                format!("`rm -rf x{clause}"),
+            ] {
+                assert_eq!(left_out_detail_told_to_a_device(&said), nothing, "{said}");
             }
         }
     }
