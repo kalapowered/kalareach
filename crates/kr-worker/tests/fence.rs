@@ -8373,15 +8373,15 @@ async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_on
 
 /// KR-REQ-27.05, the root shell killed on its own: the real shell of a qualified package, at its
 /// empty prompt with two terminals attached, is killed outright by a signal. The session closes with
-/// the kill signal that ended the shell, the record names it, no shell takes its place, and the
-/// terminals are not left holding a session that is still live. The shell is the package's own, as
-/// a managed session runs it, with its editor reader and its bridge; the root program the daemon
-/// fault suite kills is a script that stands in for one.
+/// the kill signal that ended the shell, the record names it, and the shell is gone. The shell is
+/// the package's own, as a managed session runs it, with its editor reader and its bridge; the root
+/// program the daemon fault suite kills is a script that stands in for one, and that suite is where
+/// the worker and the daemon are shown to go on after it. This case runs in the worker's own
+/// runtime, with no daemon.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
-async fn a_real_root_shell_killed_at_its_prompt_closes_its_session_with_the_signal_and_nothing_replaces_it()
- {
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them"]
+async fn a_real_root_shell_killed_at_its_prompt_closes_its_session_with_the_signal() {
     for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
         let package = installed_package_of(kind);
         let shell = RealShell::start(
@@ -8450,11 +8450,6 @@ async fn a_real_root_shell_killed_at_its_prompt_closes_its_session_with_the_sign
             kr_ipc::identity::process_state(&root),
             kr_ipc::identity::ProcessState::Ended,
             "{kind:?}: the shell is gone"
-        );
-        assert_eq!(
-            shell.runtime.session().root_identity().as_ref(),
-            Some(&root),
-            "{kind:?}: no other shell was started in its place"
         );
         shell.bridge_task.abort();
     }
