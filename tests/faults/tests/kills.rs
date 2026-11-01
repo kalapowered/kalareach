@@ -806,25 +806,16 @@ impl Host {
                 pixel_height: 0,
             })
             .expect("opens a terminal");
-        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
-        command.arg("-c");
-        // The trailing read keeps the shell from replacing itself with `kr`.
-        command.arg(format!("'{}' attach {session_id}; read -r _", kr.display()));
-        command.env_clear();
-        command.env("PATH", "/usr/bin:/bin");
-        command.env("TERM", "xterm-256color");
-        command.env("HOME", self.tree.paths().state_root());
-        command.env("KR_RUNTIME_DIR", self.tree.paths().runtime_root());
-        command.env("KR_STATE_DIR", self.tree.paths().state_root());
-        command.cwd(work);
-        let shell = pty.slave.spawn_command(command).expect("starts the shell");
         let typing = Arc::new(Mutex::new(pty.master.take_writer().expect("a writer")));
         let shown = Arc::new(Mutex::new(Vec::new()));
         let mut reader = pty.master.try_clone_reader().expect("a reader");
         let (answers, output) = (Arc::clone(&typing), Arc::clone(&shown));
+        let (listening, ready) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
             let mut answered = 0;
+            // Said before the first read, and the command is not started until it is heard.
+            let _ = listening.send(());
             while let Ok(read) = reader.read(&mut buffer) {
                 if read == 0 {
                     break;
@@ -849,6 +840,26 @@ impl Host {
                 }
             }
         });
+        // The command asks the terminal what it is as soon as it starts, and gives up on an answer
+        // after one second. The thread that answers is therefore running before the command
+        // exists: started after it, a delay of a second between the two would make `kr attach`
+        // refuse a terminal that was never at fault, and the case would fail before it reached the
+        // kill.
+        ready
+            .recv_timeout(LIVENESS)
+            .expect("the thread that answers the command's terminal queries started");
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        // The trailing read keeps the shell from replacing itself with `kr`.
+        command.arg(format!("'{}' attach {session_id}; read -r _", kr.display()));
+        command.env_clear();
+        command.env("PATH", "/usr/bin:/bin");
+        command.env("TERM", "xterm-256color");
+        command.env("HOME", self.tree.paths().state_root());
+        command.env("KR_RUNTIME_DIR", self.tree.paths().runtime_root());
+        command.env("KR_STATE_DIR", self.tree.paths().state_root());
+        command.cwd(work);
+        let shell = pty.slave.spawn_command(command).expect("starts the shell");
         let shell_pid = shell.process_id().expect("the shell has a process number");
         let mut attach = AttachProcess {
             shell,
