@@ -644,7 +644,7 @@ impl GitProgram {
 
     /// As [`Self::at`], giving Git `bound` in all to answer everything it is asked.
     fn at_within(path: &Path, bound: Duration) -> Result<Self> {
-        let deadline = Instant::now() + bound;
+        let deadline = now() + bound;
         let program = resolved(path).map_err(|error| {
             could_not_resolve(
                 format!(
@@ -3771,7 +3771,7 @@ fn ask(
     let passing = |detail: String| ProjectError::GitFailed {
         detail: detail.into(),
     };
-    if Instant::now() >= deadline {
+    if now() >= deadline {
         return Err(Asked::Overran(passing(format!(
             "{described} was not asked: Git had used the time it is given to answer"
         ))));
@@ -3913,11 +3913,14 @@ fn too_much(described: &str) -> Asked {
 /// once it has, and what it took in after the time is not told from what came before. No request
 /// reaches that, since a platform that reads that way runs no Git.
 fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::Result<(), Asked> {
-    let drain = drain_until(Instant::now(), deadline);
+    let drain = drain_until(now(), deadline);
     loop {
         // Dated by the moment before the read, which is the moment the pipe was last known to be
         // as it is read, and not by the clock after it, which a pause between the two can move.
-        let began = Instant::now();
+        let began = now();
+        // A case whose clock stands still has a wait that would never end fail, and not hang.
+        #[cfg(all(test, unix))]
+        tests::polled_on_a_standing_clock();
         // A case that asks for it counts the polls that begin at or after the probe's time, of
         // which a wait that ends when that time comes makes exactly one.
         #[cfg(all(test, unix))]
@@ -3936,7 +3939,7 @@ fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::
             return Ok(());
         }
         if began >= drain {
-            return Err(Asked::Overran(if Instant::now() >= deadline {
+            return Err(Asked::Overran(if now() >= deadline {
                 ProjectError::GitFailed {
                     detail: format!(
                         "{described} was not read to the end of its output in the time it is given"
@@ -4127,7 +4130,7 @@ enum Gathered {
 fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) -> Gathered {
     let mut buffer = [0_u8; 4096];
     while !seen.truncated {
-        if Instant::now() >= deadline {
+        if now() >= deadline {
             break;
         }
         let read = pipe.read(&mut buffer);
@@ -4151,7 +4154,7 @@ fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) 
             // Bytes and the end count only if they were read in time. The time was checked before
             // this read, and a read that returns after the deadline may have waited for what it
             // found, so it is not known to have been there in time.
-            Ok(_) if Instant::now() >= deadline => return Gathered::Open,
+            Ok(_) if now() >= deadline => return Gathered::Open,
             Ok(0) => return Gathered::Closed,
             Ok(read) => {
                 let room = PROBE_OUTPUT_LIMIT.saturating_sub(seen.bytes.len());
@@ -4215,13 +4218,24 @@ enum Ended {
     Failed(std::io::Error),
 }
 
+/// The time now, as the look for Git and its probes reckon it. A case replaces the clock of its
+/// own thread with one that stands still until the case moves it, so that no verdict of a case
+/// depends on how fast the machine runs.
+fn now() -> Instant {
+    #[cfg(all(test, unix))]
+    if let Some(clock) = tests::CLOCK.with(|clock| clock.borrow().clone()) {
+        return clock.now();
+    }
+    Instant::now()
+}
+
 /// Whether the time a probe was given is used up.
 fn time_is_up(deadline: Instant) -> bool {
     #[cfg(all(test, unix))]
     if tests::TIME_IS_UP.with(std::cell::Cell::get) {
         return true;
     }
-    Instant::now() >= deadline
+    now() >= deadline
 }
 
 /// Whether the child has ended, without collecting it where the platform can say so.
@@ -5412,6 +5426,95 @@ mod tests {
         /// output has returned, before anything is decided from what it returned.
         pub(super) static AFTER_THE_READ: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::Cell::new(None) };
+        /// Set by a case to replace the machine's clock on its own thread with one it moves by
+        /// hand.
+        pub(super) static CLOCK: std::cell::RefCell<Option<Clock>> =
+            const { std::cell::RefCell::new(None) };
+        /// The number of polls of the wait for a probe's output made on this thread since its
+        /// clock was put in place.
+        static POLLS_ON_A_STANDING_CLOCK: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    /// Counts a poll of the wait for a probe's output on a thread whose clock stands still, and
+    /// fails the case when the wait has polled so often that it will never end: the clock moves
+    /// only as the case moves it, so a wait that does not end where the case expects it to would
+    /// otherwise poll for ever. Counts polls and not seconds, so a machine that is stopped for as
+    /// long as it likes cannot trip it.
+    #[cfg(unix)]
+    pub(super) fn polled_on_a_standing_clock() {
+        if CLOCK.with(|set| set.borrow().is_some()) {
+            let polls = POLLS_ON_A_STANDING_CLOCK.with(|polls| {
+                polls.set(polls.get() + 1);
+                polls.get()
+            });
+            assert!(
+                polls <= 2_000,
+                "the wait for the output has polled {polls} times on a clock that stands still"
+            );
+        }
+    }
+
+    /// A clock that stands still until a case moves it, and never goes back. It is shared, so that
+    /// a thread the case starts can move the time that the case's own thread reads.
+    #[cfg(unix)]
+    #[derive(Clone)]
+    pub(super) struct Clock(Arc<Mutex<Instant>>);
+
+    #[cfg(unix)]
+    impl Clock {
+        pub(super) fn now(&self) -> Instant {
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// Moves the time on to `moment`, if that is later than it is.
+        fn advance_to(&self, moment: Instant) {
+            let mut now = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *now = (*now).max(moment);
+        }
+    }
+
+    /// The clock a case's thread reads in place of the machine's, from [`Self::start`] until it
+    /// is dropped. It starts at the machine's time and then moves only as the case moves it, so
+    /// that what a case decides by the time does not depend on how fast the machine runs.
+    #[cfg(unix)]
+    struct StandingClock(Clock);
+
+    #[cfg(unix)]
+    impl StandingClock {
+        fn start() -> Self {
+            let clock = Clock(Arc::new(Mutex::new(Instant::now())));
+            CLOCK.with(|set| *set.borrow_mut() = Some(clock.clone()));
+            POLLS_ON_A_STANDING_CLOCK.with(|polls| polls.set(0));
+            Self(clock)
+        }
+
+        /// The clock itself, to move from another thread or from a stall.
+        fn handle(&self) -> Clock {
+            self.0.clone()
+        }
+    }
+
+    #[cfg(unix)]
+    impl std::ops::Deref for StandingClock {
+        type Target = Clock;
+
+        fn deref(&self) -> &Clock {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for StandingClock {
+        fn drop(&mut self) {
+            CLOCK.with(|set| *set.borrow_mut() = None);
+        }
     }
 
     /// What a case has its thread do between two polls of the wait for a probe's output.
@@ -5442,9 +5545,9 @@ mod tests {
         reads: usize,
         lasts: usize,
         each: usize,
-        /// When set, the first read waits until this moment has passed, so that a deadline that
+        /// When set, the first read moves this clock on to this moment, so that a deadline that
         /// was ahead when the pass began is behind it by the time the read returns.
-        until: Option<Instant>,
+        until: Option<(Clock, Instant)>,
     }
 
     #[cfg(unix)]
@@ -5452,11 +5555,9 @@ mod tests {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             self.reads += 1;
             if self.reads == 1
-                && let Some(until) = self.until
+                && let Some((clock, until)) = &self.until
             {
-                while Instant::now() < until {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                clock.advance_to(*until);
             }
             if self.reads > self.lasts {
                 return Err(std::io::ErrorKind::WouldBlock.into());
@@ -5503,12 +5604,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_writer_faster_than_the_reader_is_read_only_until_the_deadline() {
-        let deadline = Instant::now() + Duration::from_millis(50);
+        let clock = StandingClock::start();
+        let deadline = clock.now() + Duration::from_millis(50);
         let mut pipe = NeverEmpty {
             reads: 0,
             lasts: 1_000_000,
             each: 1,
-            until: Some(deadline),
+            until: Some((clock.handle(), deadline)),
         };
         let mut seen = Bounded::default();
 
@@ -5520,19 +5622,19 @@ mod tests {
         );
     }
 
-    /// A pipe whose writers have gone, whose end is given only once `until` has passed, so that a
-    /// deadline that was ahead when the pass began is behind it by the time the read returns.
+    /// A pipe whose writers have gone, whose end is given only once the clock has been moved on to
+    /// `until`, so that a deadline that was ahead when the pass began is behind it by the time the
+    /// read returns.
     #[cfg(unix)]
     struct EndsAfter {
+        clock: Clock,
         until: Instant,
     }
 
     #[cfg(unix)]
     impl std::io::Read for EndsAfter {
         fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
-            while Instant::now() < self.until {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            self.clock.advance_to(self.until);
             Ok(0)
         }
     }
@@ -5543,8 +5645,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_end_read_after_the_deadline_is_not_taken_as_the_end() {
-        let deadline = Instant::now() + Duration::from_millis(50);
-        let mut pipe = EndsAfter { until: deadline };
+        let clock = StandingClock::start();
+        let deadline = clock.now() + Duration::from_millis(50);
+        let mut pipe = EndsAfter {
+            clock: clock.handle(),
+            until: deadline,
+        };
         let mut seen = Bounded::default();
 
         let left = gather(&mut pipe, &mut seen, deadline);
@@ -5552,12 +5658,13 @@ mod tests {
         assert!(matches!(left, Gathered::Open), "{left:?}");
     }
 
-    /// A pipe whose reads each give 4096 bytes, the `late`th of them only once `until` has passed,
-    /// as a read does that the system holds up.
+    /// A pipe whose reads each give 4096 bytes, the `late`th of them only once the clock has been
+    /// moved on to `until`, as a read does that the system holds up.
     #[cfg(unix)]
     struct LateBytes {
         reads: usize,
         late: usize,
+        clock: Clock,
         until: Instant,
     }
 
@@ -5566,7 +5673,7 @@ mod tests {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             self.reads += 1;
             if self.reads == self.late {
-                wait_until(self.until);
+                self.clock.advance_to(self.until);
             }
             let given = buffer.len().min(4096);
             buffer[..given].fill(b'x');
@@ -5582,11 +5689,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bytes_that_a_read_returns_after_the_deadline_are_not_taken_for_too_much_output() {
-        let deadline = Instant::now() + Duration::from_millis(200);
+        let clock = StandingClock::start();
+        let deadline = clock.now() + Duration::from_millis(200);
         // The sixteen reads before it fill the limit exactly, 64 KiB.
         let mut pipe = LateBytes {
             reads: 0,
             late: 17,
+            clock: clock.handle(),
             until: deadline,
         };
         let mut seen = Bounded::default();
@@ -6216,27 +6325,27 @@ mod tests {
     /// was given is a fault that passes, and names no step to install Git: the program held a pipe
     /// open and the look came back to it too late to say that it was the program that did. This is
     /// the refusal a person is shown, so the case goes through the installation that every request
-    /// asks for Git. The wait is held between its first poll and the next, at the one place a
-    /// poll comes late, and the time the look was given is short so that the hold is not long.
+    /// asks for Git. The clock stands still while the stand-in runs, so nothing here depends on how
+    /// fast it does, and is moved on to the look's time between the wait's first poll and the next,
+    /// at the one place a poll comes late.
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn a_look_whose_wait_for_a_programs_output_is_held_past_its_time_names_no_step_to_install_git()
     {
+        let clock = StandingClock::start();
         let directory = tempfile::tempdir().expect("a directory for this test");
         stand_in_whose_output_a_process_outside_its_group_holds(directory.path());
         let bound = Duration::from_secs(3);
+        let started = clock.now();
         let installation =
             Installation::looked_for_on(Some(directory.path().as_os_str().to_owned()), bound);
         let held = std::rc::Rc::new(std::cell::Cell::new(None::<Limits>));
-        // The poll is held until the look's own time has run out, which the case counts from its
-        // start and not from the limits the wait reports, since a wait that was given another
-        // time would otherwise hold the case with it.
-        let past_the_time = Instant::now() + bound + Duration::from_millis(300);
         BEFORE_THE_NEXT_POLL.with(|stall| {
             let held = std::rc::Rc::clone(&held);
+            let clock = clock.handle();
             stall.set(Some(Box::new(move |limits| {
                 held.set(Some(limits));
-                wait_until(past_the_time);
+                clock.advance_to(limits.deadline);
             })));
         });
 
@@ -6249,9 +6358,10 @@ mod tests {
         let limits = held
             .get()
             .expect("the wait for the output was reached, and held");
-        assert!(
-            limits.deadline < past_the_time,
-            "the hold went past the look's time"
+        assert_eq!(
+            limits.deadline,
+            started + bound,
+            "the look was given the time it was asked for, and the hold went to it"
         );
         assert!(
             matches!(refusal, ProjectError::GitFailed { .. }),
@@ -6270,9 +6380,11 @@ mod tests {
     /// then runs `body`, a shell command, and ends, giving the question `time`. The first poll of
     /// the ask is held back until the stand-in has ended and waits to be collected, so what it said
     /// is in the pipe when that poll comes, and so is the end of its output unless `body` leaves a
-    /// process that holds the pipe open. The release is given once `time` has run out when
-    /// `after_the_time` is set, and at once otherwise. The directory that holds the stand-in comes
-    /// back with the outcome, with the numbers the stand-in wrote in it.
+    /// process that holds the pipe open. The clock the ask reads stands still, and is moved on to
+    /// the end of `time` before the release when `after_the_time` is set, so that nothing here
+    /// depends on how fast the machine runs; otherwise the release is given at once. The directory
+    /// that holds the stand-in comes back with the outcome, with the numbers the stand-in wrote
+    /// in it.
     #[cfg(unix)]
     fn ask_with_the_first_poll_after_the_stand_in_ended(
         body: &str,
@@ -6303,15 +6415,19 @@ mod tests {
         .expect("the stand-in's text");
         kr_ipc::testing::place_program(&text, &program);
 
+        let clock = StandingClock::start();
         STARTS_FIRST.with(|started| *started.borrow_mut() = Some(gate.clone()));
-        let deadline = Instant::now() + time;
+        let deadline = clock.now() + time;
+        let moves = clock.handle();
         let outcome = std::thread::scope(|scope| {
             scope.spawn(|| {
+                // The clock is moved only once the stand-in has started, so the ask is past its
+                // first look at the time, whenever this thread runs.
+                let pid = number_of(&own);
                 if after_the_time {
-                    wait_until(deadline);
+                    moves.advance_to(deadline);
                 }
                 std::fs::write(&release, "").expect("the stand-in is released");
-                let pid = number_of(&own);
                 let guard = Instant::now() + Duration::from_secs(30);
                 while running(&pid) {
                     assert!(Instant::now() < guard, "the stand-in never ended");
@@ -6499,11 +6615,16 @@ mod tests {
         .expect("the stand-in's text");
         kr_ipc::testing::place_program(&text, &program);
 
+        let clock = StandingClock::start();
         STARTS_FIRST.with(|started| *started.borrow_mut() = Some(gate.clone()));
-        let deadline = Instant::now() + Duration::from_millis(500);
+        let deadline = clock.now() + Duration::from_millis(500);
+        let moves = clock.handle();
         let outcome = std::thread::scope(|scope| {
             scope.spawn(|| {
-                wait_until(deadline);
+                // Only once the stand-in has started, so the ask is past its first look at the
+                // time, whenever this thread runs.
+                number_of(&own);
+                moves.advance_to(deadline);
                 std::fs::write(&release, "").expect("the stand-in is released");
             });
             ask(&program, &["--version"], deadline)
@@ -6622,13 +6743,24 @@ mod tests {
         );
     }
 
-    /// Drains the output of a `cat` that has said something and is still running, with the
-    /// probe's time ending `time` after the start. The first poll finds the pipe open. Between it
-    /// and the next one `cat` ends, so the end is in the pipe before the drain's second runs out,
-    /// and the thread then stalls until `after_the_second` after that second: the next poll comes
-    /// only then. What it returns besides the outcome is the limits the wait held, so that a case
-    /// states the order of the three moments it stands for and fails when the machine was too slow
-    /// to keep it.
+    /// A pipe with no process behind it: the end a probe's output is read from, and the end a case
+    /// writes to and closes.
+    #[cfg(unix)]
+    fn a_pipe_without_a_process() -> (std::process::ChildStdout, std::io::PipeWriter) {
+        let (reader, writer) = std::io::pipe().expect("a pipe");
+        (
+            std::process::ChildStdout::from(std::os::fd::OwnedFd::from(reader)),
+            writer,
+        )
+    }
+
+    /// Drains the output of a pipe that has said something and has not ended, with the probe's time
+    /// ending `time` after the start. The clock stands still, so nothing here depends on how fast
+    /// the machine runs. The first poll finds the pipe open. Between it and the next one the writer
+    /// ends, so the end is in the pipe before the drain's second runs out, and the clock is then
+    /// moved on to `after_the_second` after that second: the next poll comes only then. What it
+    /// returns besides the outcome is the limits the wait held, so that a case states the order of
+    /// the three moments it stands for.
     #[cfg(unix)]
     fn drain_with_a_stall_after_the_end_arrives(
         time: Duration,
@@ -6636,33 +6768,23 @@ mod tests {
     ) -> (std::result::Result<(), Asked>, Limits) {
         use std::io::Write as _;
 
-        let mut holder = std::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("cat holds a pipe open for as long as its input is");
-        let mut said = holder.stdin.take().expect("cat's input");
+        let clock = StandingClock::start();
+        let (pipe, mut said) = a_pipe_without_a_process();
         said.write_all(b"/a/helper/directory\n")
             .expect("something is said");
-        let mut heard = Heard::of(holder.stdout.take()).expect("the pipe is read without blocking");
+        let mut heard = Heard::of(Some(pipe)).expect("the pipe is read without blocking");
         let held = std::rc::Rc::new(std::cell::Cell::new(None));
         BEFORE_THE_NEXT_POLL.with(|stall| {
             let held = std::rc::Rc::clone(&held);
+            let clock = clock.handle();
             stall.set(Some(Box::new(move |limits| {
                 held.set(Some(limits));
                 drop(said);
-                holder
-                    .wait()
-                    .expect("cat ends, and the pipe it held with it");
-                assert!(
-                    Instant::now() < limits.second,
-                    "the end is in the pipe before the drain's second runs out"
-                );
-                wait_until(limits.second + after_the_second);
+                clock.advance_to(limits.second + after_the_second);
             })));
         });
 
-        let outcome = drain(&mut heard, "git --exec-path", Instant::now() + time);
+        let outcome = drain(&mut heard, "git --exec-path", clock.now() + time);
         let limits = held.get().expect("the wait reached its first stall");
         (outcome, limits)
     }
@@ -6774,27 +6896,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_read_that_returns_after_the_probes_time_does_not_blame_the_program() {
-        let mut holder = std::process::Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("cat holds a pipe open for as long as its input is");
-        let said = holder.stdin.take().expect("cat's input");
-        let mut heard = Heard::of(holder.stdout.take()).expect("the pipe is read without blocking");
+        let clock = StandingClock::start();
+        let (pipe, said) = a_pipe_without_a_process();
+        let mut heard = Heard::of(Some(pipe)).expect("the pipe is read without blocking");
         let held = std::rc::Rc::new(std::cell::Cell::new(None));
         BEFORE_THE_NEXT_POLL.with(|stall| {
             let held = std::rc::Rc::clone(&held);
+            let clock = clock.handle();
             stall.set(Some(Box::new(move |limits: Limits| {
                 drop(said);
-                holder
-                    .wait()
-                    .expect("cat ends, and the pipe it held with it");
-                wait_until(limits.second);
+                clock.advance_to(limits.second);
                 // The next poll begins now, inside the probe's time, and its read returns after it.
                 AFTER_THE_READ.with(|pause| {
                     pause.set(Some(Box::new(move || {
-                        held.set(Some((Instant::now(), limits)));
-                        wait_until(limits.deadline);
+                        held.set(Some((clock.now(), limits)));
+                        clock.advance_to(limits.deadline);
                     })));
                 });
             })));
@@ -6803,7 +6919,7 @@ mod tests {
         let outcome = drain(
             &mut heard,
             "git --exec-path",
-            Instant::now() + PROBE_DRAIN + Duration::from_millis(500),
+            clock.now() + PROBE_DRAIN + Duration::from_millis(500),
         );
 
         let (read_at, limits) = held.get().expect("the second poll's read was reached");
@@ -6825,28 +6941,28 @@ mod tests {
     }
 
     /// An output that passes the limit while the wait for its end is under way is refused as more
-    /// than a version and a directory, the program's answer and not the clock's. The writer here
-    /// writes 200,000 bytes and has not ended when the wait begins, so the limit is passed by the
-    /// wait's own reads.
+    /// than a version and a directory, the program's answer and not the clock's. The wait has
+    /// taken in a full limit before it begins, and the pipe, still open, holds one byte more, so
+    /// the limit is passed by the wait's own first read. No process writes it, so nothing here
+    /// depends on how fast one starts.
     #[cfg(unix)]
     #[test]
     fn an_output_that_passes_the_limit_while_its_end_is_awaited_is_more_than_was_asked() {
-        let mut writer = std::process::Command::new("head")
-            .args(["-c", "200000", "/dev/zero"])
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("head writes 200,000 bytes");
-        let mut heard = Heard::of(writer.stdout.take()).expect("the pipe is read without blocking");
+        use std::io::Write as _;
+
+        let clock = StandingClock::start();
+        let (pipe, mut writer) = a_pipe_without_a_process();
+        writer.write_all(b"x").expect("one byte more is said");
+        let mut heard = Heard::of(Some(pipe)).expect("the pipe is read without blocking");
+        heard.seen.bytes = vec![b'x'; PROBE_OUTPUT_LIMIT];
 
         let outcome = drain(
             &mut heard,
             "git --version",
-            Instant::now() + Duration::from_secs(60),
+            clock.now() + Duration::from_secs(60),
         );
 
-        // The writer is blocked on a pipe nobody reads any more; closing it ends the writer.
-        drop(heard);
-        writer.wait().expect("head ends");
+        drop(writer);
         let Err(Asked::Overran(refusal)) = outcome else {
             panic!("an output past the limit is refused");
         };
