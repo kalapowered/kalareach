@@ -392,7 +392,7 @@ A binding records the hash it was made against and stays on it. An upgrade moves
 and leaves every live binding where it is, because a running process was qualified against the bytes
 it bound to and not against the bytes that arrived afterwards. The binding also records the release
 and the repository it came through, and the program it was made for with the version the signed index's qualified
-build for that program named then; a later index for the same program changes no live binding's
+build for that program named then, where the index names one; a later index for the same program changes no live binding's
 version.
 
 What a binding may do follows its installation. A grant the owner withdraws reaches every live
