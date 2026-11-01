@@ -2207,43 +2207,80 @@ fn overrun(service: &mut DescriptionService, from: Reading, how: Overran) -> Rea
     }
 }
 
-/// Three jobs in a row that overran their deadline leave inference failed while the restart delay
-/// runs, whichever way each one was found out, and the model that answered them is still in the
-/// process, so the state does not say it was unloaded. The control is two.
+/// KR-REQ-22.11: jobs that pass their deadline in a row, whichever way each one was found out, are
+/// demand beyond what the host can serve and not a process that failed: the next job waits, twice
+/// as long after each (one second, two, four, eight), the model that answered them stays in the
+/// process, and the host is never shown as `inference_failed` for them. A description that is then
+/// published ends the waiting. The control is processes ended for passing their deadline, which are
+/// failures: three in a row leave inference failed.
 #[test]
-fn three_deadlines_in_a_row_leave_inference_failed_whichever_way_each_was_found() {
-    let paused = |service: &DescriptionService| match service.resource_state() {
-        ResourceState::ResourcePaused {
-            reason: PauseReason::InferenceFailed,
-            unloaded,
-        } => Some(unloaded),
-        _ => None,
-    };
+fn deadlines_missed_in_a_row_make_the_next_job_wait_and_never_show_inference_failed() {
+    use kr_describe::service::RESTART_FIRST_MS;
+
     for forms in [
-        [Overran::Said, Overran::AnsweredLate, Overran::Said],
         [
+            Overran::Said,
             Overran::AnsweredLate,
-            Overran::AnsweredLate,
+            Overran::Said,
             Overran::AnsweredLate,
         ],
-        [Overran::Said, Overran::Said, Overran::Said],
-        [Overran::Ended, Overran::AnsweredLate, Overran::Said],
+        [Overran::Said; 4],
+        [Overran::AnsweredLate; 4],
     ] {
         let mut service = service();
+        for seed in 1..=6 {
+            queue(&mut service, &session(seed), "kalareach", at(0));
+        }
         let mut now = at(3_000);
         for (index, how) in forms.into_iter().enumerate() {
-            queue(&mut service, &session(1 + index as u8), "kalareach", now);
             now = overrun(&mut service, now, how);
-            service.next(&roomy(), now).expect("an instruction");
-            match (index, paused(&service)) {
-                (0 | 1, shown) => assert_eq!(shown, None, "{forms:?}: after {}", index + 1),
-                (_, shown) => assert_eq!(
-                    shown,
-                    Some(false),
-                    "{forms:?}: after three, the model is still in the process"
-                ),
-            }
+            let wait_ms = RESTART_FIRST_MS << index;
+            assert_eq!(
+                service.next(&roomy(), now).expect("an instruction"),
+                Instruction::Wait {
+                    until_ms: Some(now.monotonic_ms() + wait_ms)
+                },
+                "{forms:?}: after miss {} the next job waits {wait_ms} ms",
+                index + 1
+            );
+            assert!(
+                !inference_failed(&service),
+                "{forms:?}: after {}",
+                index + 1
+            );
+            assert!(service.is_mapped(), "{forms:?}: the model stays");
+            now = now.after_ms(wait_ms);
         }
+        // A description published ends the waiting.
+        let (sent, id, request) = next_job(&mut service, now);
+        assert!(matches!(
+            service
+                .finished(id, produced(&request.prompt, 0), sent.after_ms(500))
+                .expect("the answer"),
+            Outcome::Published { .. }
+        ));
+        assert!(
+            matches!(
+                service
+                    .next(&roomy(), sent.after_ms(500))
+                    .expect("an instruction"),
+                Instruction::Generate { .. }
+            ),
+            "{forms:?}: the next job is sent at once"
+        );
+    }
+
+    let mut service = service();
+    let mut now = at(3_000);
+    for round in 0..3 {
+        queue(&mut service, &session(1 + round), "kalareach", now);
+        now = overrun(&mut service, now, Overran::Ended);
+        service.next(&roomy(), now).expect("an instruction");
+        assert_eq!(
+            inference_failed(&service),
+            round == 2,
+            "processes ended for their deadlines: inference is failed after the third, not before"
+        );
     }
 }
 

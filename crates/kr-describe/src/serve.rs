@@ -47,7 +47,7 @@ use crate::priority::{Applied, Cancellation, enter_background};
 use crate::profile::catalogue::Catalogue;
 use crate::profile::{Asset, ModelProfile, SamplerSettings};
 use crate::prompt::Prompt;
-use crate::supervise::HANDSHAKE_MS;
+use crate::supervise::{HANDSHAKE_MS, STOP_BOUND_MS};
 use crate::wire::{
     Answer, AssetFile, Background, JobEnd, JobLimits, LoadEnd, Phases, Request, VerifyResult,
     WIRE_VERSION, WireError, read_message, write_message,
@@ -295,6 +295,8 @@ pub fn run<M: Model>(
         origin: Instant::now(),
         control_since: AtomicU64::new(0),
         work_due: AtomicU64::new(0),
+        job_in_hand: AtomicU64::new(0),
+        job_stop_due: AtomicU64::new(0),
         tokens: Mutex::new(BTreeMap::new()),
         output: Mutex::new(Box::new(output)),
         returned: AtomicBool::new(false),
@@ -505,6 +507,11 @@ struct Shared {
     /// When the model thread's current work is overdue, in milliseconds since the origin plus
     /// one, or nought while it is idle.
     work_due: AtomicU64,
+    /// The identifier of the job the model thread has in hand, or nought while it has none.
+    job_in_hand: AtomicU64,
+    /// When that job is overdue if the control thread has read a request to stop it: the stop bound
+    /// after its deadline, in the same stamps as `work_due`.
+    job_stop_due: AtomicU64,
     /// The token of each piece of work received and not yet answered.
     tokens: Mutex<BTreeMap<u64, Cancellation>>,
     output: Mutex<Box<dyn Write + Send>>,
@@ -571,6 +578,15 @@ impl Shared {
         if let Some(token) = tokens.get(&id.get()) {
             self.answer(&Answer::Cancelling { id });
             token.cancel();
+            // A job whose stop has been read is not stuck, and is given the stop bound after its
+            // deadline to reach a place where the model can stop, where other work is overdue at
+            // the grace. The lock held here is the one the model thread takes to forget the job
+            // before it answers, so the job is still in hand and the model thread sets the bound
+            // back to nought after this.
+            if id.get() != 0 && self.job_in_hand.load(Ordering::Acquire) == id.get() {
+                self.work_due
+                    .fetch_max(self.job_stop_due.load(Ordering::Acquire), Ordering::AcqRel);
+            }
         }
     }
 
@@ -733,6 +749,11 @@ fn model_thread<M: Model>(
                 ceiling_bytes,
                 token,
             } => {
+                shared.job_in_hand.store(id, Ordering::Release);
+                shared.job_stop_due.store(
+                    shared.stamp_of(due + Duration::from_millis(STOP_BOUND_MS)),
+                    Ordering::Release,
+                );
                 shared.work_due.store(
                     shared.stamp_of(due + Duration::from_millis(OVERDUE_GRACE_MS)),
                     Ordering::Release,
@@ -781,6 +802,7 @@ fn model_thread<M: Model>(
                     },
                 });
                 shared.work_due.store(0, Ordering::Release);
+                shared.job_in_hand.store(0, Ordering::Release);
             }
             Work::Verify {
                 id,

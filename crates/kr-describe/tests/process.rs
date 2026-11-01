@@ -577,6 +577,41 @@ fn a_process_whose_job_does_not_stop_ends_itself() {
     assert!(process.exit_within(Duration::from_millis(500)).is_none());
 }
 
+/// KR-REQ-22.11: a job that is past its deadline and has been told to stop, with the stop read by
+/// the control thread, is given until the stop bound to stop, and the process does not end itself
+/// for it at the usual grace after the deadline. The model here does not look at its token for
+/// longer than that grace, as a model in the background class on a busy host can take; the process
+/// answers the job as stopped. The control is the same job that was told nothing, which ends the
+/// process at the grace (above).
+#[test]
+fn a_job_past_its_deadline_that_was_told_to_stop_is_given_time_to_stop() {
+    let placed = Placed::stub();
+    let runtime = placed.directory("told-to-stop");
+    let slow_ms = 200 + OVERDUE_GRACE_MS + 1_500;
+    let script = Script {
+        ignore_token_ms: slow_ms,
+        mark_work: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    process.expect_answer(SOON, "the load");
+    process.send(&generate(2, 1, 200));
+    wait_until_began(&runtime, "job");
+    process.send(&Request::Cancel { id: U64::new(2) });
+    assert_eq!(
+        process.expect_answer(SOON, "the acknowledgement"),
+        Answer::Cancelling { id: U64::new(2) }
+    );
+    // The model looks at its token after the grace, and the process is still there to answer.
+    assert!(matches!(
+        process.expect_terminal(Duration::from_millis(slow_ms) * 5, "the stopped job"),
+        Answer::Ended { id, why: JobEnd::Cancelled, .. } if id.get() == 2
+    ));
+    assert!(process.exit_within(Duration::from_millis(500)).is_none());
+}
+
 /// A process whose model fails inside a job ends itself, so the daemon restarts inference rather
 /// than sending work to a process with no model thread; the control is the same job succeeding.
 #[test]

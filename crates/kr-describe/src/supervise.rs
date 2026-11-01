@@ -16,7 +16,7 @@
 //! | --- | --- |
 //! | The handshake | [`HANDSHAKE_MS`] for `ready` |
 //! | A load | its own deadline, plus [`ANSWER_GRACE_MS`] |
-//! | A job | its execution deadline, plus [`ANSWER_GRACE_MS`] |
+//! | A job | its execution deadline, plus [`ANSWER_GRACE_MS`]; a process whose control thread has said it read the request to stop that the daemon makes at the deadline is given [`STOP_BOUND_MS`] after the deadline instead |
 //! | A cancellation | [`CANCEL_MS`] for the process to say it has read it; a load's or a check's own answer is then held to the same bound |
 //! | A check of a file | its deadline, plus [`ANSWER_GRACE_MS`] |
 //! | The ceiling | the process's resident set, read every [`SAMPLE_MS`] while it loads or runs a job, so a process over it is ended by the first reading after it passed, and on Windows the system's own limit on its committed memory ([`Launch::system_memory_limit`]) |
@@ -67,6 +67,19 @@ pub const HANDSHAKE_MS: u64 = 10_000;
 
 /// How far past its own deadline a load or a job may go before the process is ended.
 pub const ANSWER_GRACE_MS: u64 = 2_000;
+
+/// How long a job whose control thread has said it has read a stop is given to answer, from the
+/// job's deadline.
+///
+/// A job past its deadline is asked to stop at the deadline. The grace after it ends a process that
+/// has not said it read the request: its control thread is not listening. A process that has said
+/// so is listening and has not yet reached a place where the model can stop, which a busy host in
+/// the background class takes a while to do: the longest stop seen there was 15 seconds, at a
+/// check between chunks of 128 prompt tokens. Ending it costs a new load of the model, 8 to 15
+/// seconds, and a failure of inference. So it is given twice the longest stop seen, which is also
+/// a session's cooldown, 30 seconds: a session is not described again sooner than that, so a
+/// stop within it delays no other description of that session.
+pub const STOP_BOUND_MS: u64 = 30_000;
 
 /// How long a process has to say it has read a cancellation, and how long a load or a check of a
 /// file has to answer one.
@@ -219,6 +232,18 @@ struct Due {
     at_ms: u64,
 }
 
+/// The stop of the job in the process, which the daemon asks for when the job's deadline passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct JobStop {
+    id: u64,
+    /// When the job's deadline passes, on the continuous clock.
+    deadline_at_ms: u64,
+    /// Whether the process has been asked to stop the job for its deadline.
+    asked: bool,
+    /// Whether the control thread has said it has read the request.
+    acknowledged: bool,
+}
+
 /// The process the driver has.
 #[derive(Debug)]
 struct Running {
@@ -229,6 +254,8 @@ struct Running {
     hello_at_ms: u64,
     identity: Option<ProcessStartIdentity>,
     work: Option<Due>,
+    /// The job in hand, when the work is a job.
+    job_stop: Option<JobStop>,
     cancel: Option<Cancel>,
     /// The check of a file in the process, when one is.
     check: Option<Due>,
@@ -240,6 +267,29 @@ struct Running {
     /// and it was applied.
     #[cfg(windows)]
     system_limit: Option<kr_ipc::memory_limit::MemoryLimit>,
+}
+
+impl Running {
+    /// Whether the control thread has said it has read a request to stop the job in hand: the
+    /// daemon's own at the deadline, or a caller's.
+    fn job_stop_read(&self, id: u64) -> bool {
+        self.job_stop
+            .is_some_and(|stop| stop.id == id && stop.asked && stop.acknowledged)
+            || self
+                .cancel
+                .is_some_and(|cancel| cancel.id == id && cancel.acknowledged)
+    }
+
+    /// When the work in hand has run too long: its deadline and the grace after it, or for a job
+    /// whose stop the control thread has read, the stop bound after the deadline when that is later.
+    fn work_ends_at_ms(&self, due: Due) -> u64 {
+        match self.job_stop {
+            Some(stop) if stop.id == due.id && self.job_stop_read(due.id) => due
+                .at_ms
+                .max(stop.deadline_at_ms.saturating_add(STOP_BOUND_MS)),
+            _ => due.at_ms,
+        }
+    }
 }
 
 /// Ends and collects a process when it is dropped, unless it was kept: what leaves no process
@@ -411,6 +461,17 @@ impl Driver {
             .map(|cancel| (cancel.id, cancel.acknowledged))
     }
 
+    /// Returns whether the job in the process has been asked to stop for passing its deadline, and
+    /// if so whether the control thread has said it has read the request.
+    #[must_use]
+    pub fn stopping_at_its_deadline(&self) -> Option<bool> {
+        self.process
+            .as_ref()
+            .and_then(|running| running.job_stop)
+            .filter(|stop| stop.asked)
+            .map(|stop| stop.acknowledged)
+    }
+
     /// Returns how many processes this driver has started.
     #[must_use]
     pub const fn started(&self) -> u64 {
@@ -427,7 +488,12 @@ impl Driver {
                 soonest = soonest.min(running.hello_at_ms.saturating_add(HANDSHAKE_MS));
             }
             if let Some(due) = running.work {
-                soonest = soonest.min(due.at_ms).min(running.next_sample_ms);
+                soonest = soonest
+                    .min(running.work_ends_at_ms(due))
+                    .min(running.next_sample_ms);
+                if let Some(stop) = running.job_stop.filter(|stop| !stop.asked) {
+                    soonest = soonest.min(stop.deadline_at_ms);
+                }
             }
             if let Some(cancel) = running.cancel.filter(|cancel| cancel.timed()) {
                 soonest = soonest.min(cancel.at_ms);
@@ -626,7 +692,7 @@ impl Driver {
                         deadline_ms: U64::new(deadline_ms),
                     };
                     if self.send(&request, now, &mut reports)? {
-                        self.start_work(id, now, deadline_ms);
+                        self.start_work(id, now, deadline_ms, false);
                     }
                 }
                 Instruction::Generate { id, request, .. } => {
@@ -645,7 +711,7 @@ impl Driver {
                         ceiling_bytes: U64::new(request.ceiling_bytes),
                     };
                     if self.send(&request, now, &mut reports)? {
-                        self.start_work(id, now, deadline_ms);
+                        self.start_work(id, now, deadline_ms, true);
                     }
                 }
                 Instruction::Cancel { id, work } => {
@@ -824,6 +890,7 @@ impl Driver {
             hello_at_ms: now.monotonic_ms(),
             identity: None,
             work: None,
+            job_stop: None,
             cancel: None,
             check: None,
             worked: false,
@@ -944,7 +1011,7 @@ impl Driver {
     }
 
     /// Starts the timers on a load or a job that was just sent.
-    fn start_work(&mut self, id: u64, now: Reading, deadline_ms: u64) {
+    fn start_work(&mut self, id: u64, now: Reading, deadline_ms: u64, job: bool) {
         if let Some(running) = self.process.as_mut() {
             running.work = Some(Due {
                 id,
@@ -952,6 +1019,12 @@ impl Driver {
                     .monotonic_ms()
                     .saturating_add(deadline_ms)
                     .saturating_add(ANSWER_GRACE_MS),
+            });
+            running.job_stop = job.then(|| JobStop {
+                id,
+                deadline_at_ms: now.monotonic_ms().saturating_add(deadline_ms),
+                asked: false,
+                acknowledged: false,
             });
             running.next_sample_ms = now.monotonic_ms().saturating_add(SAMPLE_MS);
             running.worked = true;
@@ -1008,10 +1081,18 @@ impl Driver {
                 if Some(tag) == current
                     && let Some(running) = self.process.as_mut()
                     && running.ready
-                    && let Some(cancel) = running.cancel.as_mut()
-                    && cancel.id == id.get()
                 {
-                    cancel.acknowledged = true;
+                    if let Some(cancel) = running.cancel.as_mut()
+                        && cancel.id == id.get()
+                    {
+                        cancel.acknowledged = true;
+                    }
+                    if let Some(stop) = running.job_stop.as_mut()
+                        && stop.id == id.get()
+                        && stop.asked
+                    {
+                        stop.acknowledged = true;
+                    }
                 }
             }
             Event::Answer {
@@ -1045,6 +1126,7 @@ impl Driver {
                 let Some(id) = answer.id() else {
                     return Ok(());
                 };
+                let mut stopped_for_its_deadline = false;
                 if Some(tag) == current {
                     let Some(running) = self.process.as_mut() else {
                         return Ok(());
@@ -1055,8 +1137,17 @@ impl Driver {
                         return self.kill(ProcessEnd::BrokenWire, now, reports);
                     }
                     let in_hand = running.work.is_some_and(|due| due.id == id);
+                    // A job that stopped when the daemon asked it to at its deadline, and that no
+                    // caller asked to stop, is one that passed its deadline, whatever the process
+                    // calls the stop.
+                    stopped_for_its_deadline = in_hand
+                        && running
+                            .job_stop
+                            .is_some_and(|stop| stop.id == id && stop.asked)
+                        && !running.cancel.is_some_and(|cancel| cancel.id == id);
                     if in_hand {
                         running.work = None;
+                        running.job_stop = None;
                         running.next_sample_ms = u64::MAX;
                     }
                     if running.cancel.is_some_and(|cancel| cancel.id == id) {
@@ -1086,7 +1177,16 @@ impl Driver {
                 }
                 // An answer from a process that has been ended is still given to the service,
                 // which drops it: its work ended with the process.
-                let outcome = self.service.finished(id, answered(answer), now)?;
+                let mut answer = answered(answer);
+                if stopped_for_its_deadline
+                    && let Answered::Ended {
+                        why: why @ crate::wire::JobEnd::Cancelled,
+                        ..
+                    } = &mut answer
+                {
+                    *why = crate::wire::JobEnd::DeadlineExceeded;
+                }
+                let outcome = self.service.finished(id, answer, now)?;
                 reports.push(Report::Outcome(outcome));
             }
         }
@@ -1099,6 +1199,28 @@ impl Driver {
             return Ok(());
         };
         let at = now.monotonic_ms();
+        // A job that has passed its deadline is asked to stop. A process whose control thread
+        // says it has read the request is listening, and is given the stop bound to answer; one
+        // that does not is ended at the grace, as it was.
+        let stop = running
+            .job_stop
+            .filter(|stop| {
+                !stop.asked
+                    && at >= stop.deadline_at_ms
+                    && running.work.is_some_and(|due| due.id == stop.id)
+            })
+            .map(|stop| stop.id);
+        if let Some(id) = stop {
+            if let Some(stop) = running.job_stop.as_mut() {
+                stop.asked = true;
+            }
+            if !self.send(&Request::Cancel { id: U64::new(id) }, now, reports)? {
+                return Ok(());
+            }
+        }
+        let Some(running) = self.process.as_mut() else {
+            return Ok(());
+        };
         let why = if !running.ready && at >= running.hello_at_ms.saturating_add(HANDSHAKE_MS) {
             Some(ProcessEnd::SilentAtStart)
         } else if let Some(cancel) = running
@@ -1110,7 +1232,10 @@ impl Driver {
             } else {
                 ProcessEnd::CancelUnanswered
             })
-        } else if running.work.is_some_and(|due| at >= due.at_ms) {
+        } else if running
+            .work
+            .is_some_and(|due| at >= running.work_ends_at_ms(due))
+        {
             Some(ProcessEnd::PastDeadline)
         } else if running.check.is_some_and(|due| at >= due.at_ms) {
             Some(ProcessEnd::CheckOverdue)

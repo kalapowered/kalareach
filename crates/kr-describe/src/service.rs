@@ -81,10 +81,12 @@ pub const IDLE_UNLOAD_MS: u64 = 15 * 60 * 1000;
 /// always has its whole execution deadline after it.
 pub const LOAD_DEADLINE_MS: u64 = 5 * 60 * 1000;
 
-/// How long the next load waits after the first failure. It doubles with each failure after that.
+/// How long the next load waits after the first failure, and the next job after the first job that
+/// passed its deadline. Each doubles with each one after that.
 pub const RESTART_FIRST_MS: u64 = 1_000;
 
-/// The longest the next load waits after repeated failures.
+/// The longest the next load waits after repeated failures, and the next job after repeated jobs
+/// that passed their deadlines.
 pub const RESTART_MOST_MS: u64 = 5 * 60 * 1000;
 
 /// How many failures in a row, none of them followed by a publication, make inference failed.
@@ -538,12 +540,17 @@ struct Dispatched {
 }
 
 /// Restarts after failures: when the next load may happen, and whether the service is paused
-/// until then.
+/// until then; and the wait after jobs that passed their deadline, which are demand beyond what the
+/// host can serve and no failure of inference.
 #[derive(Clone, Copy, Debug, Default)]
 struct Restart {
     failures: u32,
     not_before_ms: u64,
     pause: Option<PauseReason>,
+    /// Jobs in a row that passed their deadline, none of them followed by a publication.
+    late: u32,
+    /// When the next job may be sent after the last one that passed its deadline.
+    busy_until_ms: u64,
 }
 
 impl Restart {
@@ -573,6 +580,18 @@ impl Restart {
     /// Whether a delay was set, by a failure or by a pace.
     const fn waiting(&self) -> bool {
         self.not_before_ms != 0
+    }
+
+    /// Records a job that passed its deadline: the next job waits, twice as long after each one in
+    /// a row. It counts toward no failure and pauses nothing: a host that cannot answer in time
+    /// is busy, and the description it gives is the delayed or stale one section 22 prescribes.
+    fn late(&mut self, now: Reading) {
+        self.late = self.late.saturating_add(1);
+        let doublings = self.late.saturating_sub(1).min(20);
+        let wait_ms = RESTART_FIRST_MS
+            .saturating_mul(1_u64 << doublings)
+            .min(RESTART_MOST_MS);
+        self.busy_until_ms = now.monotonic_ms().saturating_add(wait_ms);
     }
 
     fn succeeded(&mut self) {
@@ -1528,6 +1547,11 @@ impl DescriptionService {
         if !resident {
             return Ok(self.load_when_due(profile, now));
         }
+        if now.monotonic_ms() < self.restart.busy_until_ms {
+            return Ok(Instruction::Wait {
+                until_ms: (self.scheduler.queued() > 0).then_some(self.restart.busy_until_ms),
+            });
+        }
         Ok(self.dispatch(&profile, now))
     }
 
@@ -2283,7 +2307,7 @@ impl DescriptionService {
             }
             PublishGate::DeadlineExceeded => {
                 self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
-                self.restart.failed(now, None);
+                self.restart.late(now);
                 Outcome::DeadlineExceeded { session_id }
             }
             PublishGate::NamePinned => rejected(Rejection::NamePinned),
@@ -2319,7 +2343,7 @@ impl DescriptionService {
             }
             JobEnd::DeadlineExceeded => {
                 self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
-                self.restart.failed(now, None);
+                self.restart.late(now);
                 Outcome::DeadlineExceeded { session_id }
             }
             JobEnd::MemoryCeiling => {
