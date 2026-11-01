@@ -262,17 +262,20 @@ mod tests {
     }
 
     /// A destination whose writes wait for a reader, as a pipe that nobody reads does: each write
-    /// tells that it has begun, and ends when the case lets it.
+    /// tells that it has begun, and ends when the case lets it, either taking the bytes or refusing
+    /// them, as the case says.
     struct Stalled {
         begun: mpsc::Sender<()>,
-        release: mpsc::Receiver<()>,
+        release: mpsc::Receiver<bool>,
         taken: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     }
 
     impl std::io::Write for Stalled {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             let _ = self.begun.send(());
-            let _ = self.release.recv();
+            if !self.release.recv().unwrap_or(true) {
+                return Err(std::io::Error::other("no space left on device"));
+            }
             self.taken
                 .lock()
                 .expect("not poisoned")
@@ -474,7 +477,7 @@ mod tests {
 
         drop(writer);
         for _ in 0..=WAITING {
-            release.send(()).expect("lets a write end");
+            release.send(true).expect("lets a write end");
         }
         until(|| taken.lock().expect("not poisoned").ends_with(b"line 7\n"));
         let written = String::from_utf8(taken.lock().expect("not poisoned").clone()).expect("text");
@@ -503,7 +506,7 @@ mod tests {
             panic!("a second line is not offered")
         });
 
-        release.send(()).expect("lets the write end");
+        release.send(true).expect("lets the write end");
         until(|| reasons.said().is_some());
         assert!(!reasons.being_written());
         assert!(
@@ -542,6 +545,98 @@ mod tests {
         reasons.say(Some("the lock"), true, || {
             panic!("a said reason is not offered")
         });
+    }
+
+    /// A line that fails after its reason went and came back does not take back the offer the
+    /// returned reason made: the old line's end is not the new line's.
+    ///
+    /// The reason goes and comes back while the first line is in its write, so a second line for
+    /// the same text waits behind it. The first write then fails. The second line is still on its
+    /// way, and a pass that finds the reason again offers nothing, while the second line is
+    /// written and says the reason once.
+    #[test]
+    fn a_line_that_fails_after_its_reason_came_back_does_not_take_back_the_new_offer() {
+        let (begun, begun_at) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let taken = std::sync::Arc::default();
+        let writer = Writer::start(Stalled {
+            begun,
+            release: released,
+            taken: std::sync::Arc::clone(&taken),
+        });
+        let reasons = OutputReasons::default();
+
+        reasons.say(Some("the lock"), true, || &writer);
+        begun_at.recv_timeout(DEADLINE).expect("the write began");
+        reasons.say(None, true, || panic!("nothing to say"));
+        assert!(!reasons.being_written(), "the reason went");
+        reasons.say(Some("the lock"), true, || &writer);
+        assert!(reasons.being_written(), "and came back");
+
+        // The thread writes one line at a time, so the second write beginning means the end of the
+        // first has been told.
+        release.send(false).expect("refuses the first write");
+        begun_at
+            .recv_timeout(DEADLINE)
+            .expect("the second write began");
+        assert!(
+            reasons.being_written(),
+            "the refusal of the old line took back the new offer"
+        );
+        reasons.say(Some("the lock"), true, || {
+            panic!("the reason is offered a third time")
+        });
+
+        release.send(true).expect("lets the second write end");
+        until(|| reasons.said().is_some());
+        assert_eq!(
+            String::from_utf8(taken.lock().expect("not poisoned").clone())
+                .expect("text")
+                .matches("the lock\n")
+                .count(),
+            1,
+            "the reason was written once"
+        );
+    }
+
+    /// A line the writer drops leaves its reason to be offered at the next pass, and is not taken
+    /// as on its way.
+    #[test]
+    fn a_reason_whose_line_the_writer_drops_is_offered_at_the_next_pass() {
+        let (begun, begun_at) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let taken = std::sync::Arc::default();
+        let writer = Writer::start(Stalled {
+            begun,
+            release: released,
+            taken: std::sync::Arc::clone(&taken),
+        });
+        let reasons = OutputReasons::default();
+
+        assert!(writer.offer("first\n".to_owned(), None));
+        begun_at.recv_timeout(DEADLINE).expect("the write began");
+        for number in 0..WAITING {
+            assert!(writer.offer(format!("line {number}\n"), None));
+        }
+
+        reasons.say(Some("the lock"), true, || &writer);
+        assert!(
+            !reasons.being_written(),
+            "a line the writer dropped is not on its way"
+        );
+        assert_eq!(reasons.said(), None);
+
+        for _ in 0..=WAITING {
+            release.send(true).expect("lets a write end");
+        }
+        until(|| taken.lock().expect("not poisoned").ends_with(b"line 7\n"));
+        reasons.say(Some("the lock"), true, || &writer);
+        assert!(
+            reasons.being_written(),
+            "the next pass offers the reason again"
+        );
+        release.send(true).expect("lets the write end");
+        until(|| reasons.said().is_some());
     }
 
     /// Fills this process's standard error, a pipe, to the last byte, so that the next write to it

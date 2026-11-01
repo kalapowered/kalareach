@@ -163,6 +163,118 @@ impl WorkerSupervisor for RecordingSupervisor {
     }
 }
 
+/// A pipe that is the standard error of every worker a daemon starts, and that nothing reads.
+///
+/// A standard error that has stopped draining is a pipe nobody reads, a journal that has stalled or
+/// a mount that has hung: a write to it waits for a reader and nothing can cancel the wait. The
+/// workers are children of this test, so it can see one end.
+#[cfg(unix)]
+#[derive(Debug)]
+struct HeldStandardError {
+    /// The end the workers write to, kept so that the case can fill the pipe.
+    writer: std::io::PipeWriter,
+    /// The end nothing reads, kept so that a write waits for a reader and is not refused.
+    _reader: std::io::PipeReader,
+    /// The workers this pipe was given to.
+    workers: std::sync::Mutex<Vec<std::process::Child>>,
+}
+
+#[cfg(unix)]
+impl HeldStandardError {
+    fn new() -> Arc<Self> {
+        let (reader, writer) = std::io::pipe().expect("a pipe");
+        Arc::new(Self {
+            writer,
+            _reader: reader,
+            workers: std::sync::Mutex::default(),
+        })
+    }
+
+    /// Fills the pipe to the last byte, so that the next write to it waits for a reader.
+    ///
+    /// The pipe's flags are shared with the workers that hold its other end, so this is done while
+    /// a worker has nothing to say.
+    fn fill(&self) {
+        fill_pipe(&self.writer);
+    }
+
+    /// Whether every worker started with this pipe has ended.
+    fn every_worker_has_ended(&self) -> bool {
+        self.workers
+            .lock()
+            .expect("the list is not poisoned")
+            .iter_mut()
+            .all(|worker| worker.try_wait().expect("polls the worker").is_some())
+    }
+}
+
+/// Fills a pipe to the last byte, so that the next write to it waits for a reader. The pipe's flags
+/// are restored before this returns.
+#[cfg(unix)]
+fn fill_pipe(writer: &std::io::PipeWriter) {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+    let flags = fcntl_getfl(writer).expect("the flags of the pipe");
+    fcntl_setfl(writer, flags | OFlags::NONBLOCK).expect("a write that does not wait");
+    for chunk in [1024_usize, 1] {
+        let bytes = vec![b'.'; chunk];
+        loop {
+            match rustix::io::write(writer, &bytes) {
+                Ok(_) => {}
+                Err(rustix::io::Errno::AGAIN) => break,
+                Err(error) => panic!("filling the pipe: {error}"),
+            }
+        }
+    }
+    fcntl_setfl(writer, flags).expect("a write that waits again");
+}
+
+/// Starts each worker as a process of this test with the standard error of [`HeldStandardError`],
+/// as the detached supervisor does with a diagnostics file.
+#[cfg(unix)]
+#[derive(Debug)]
+struct WorkersOnAHeldStandardError(Arc<HeldStandardError>);
+
+#[cfg(unix)]
+impl WorkerSupervisor for WorkersOnAHeldStandardError {
+    fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+        let service = launch.service();
+        let started = self
+            .0
+            .writer
+            .try_clone()
+            .and_then(|standard_error| {
+                std::process::Command::new(&service.program)
+                    .args(&service.arguments)
+                    .current_dir(&service.working_directory)
+                    .envs(launch.desktop_environment.iter().map(|(n, v)| (n, v)))
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(standard_error)
+                    .spawn()
+            })
+            .map(|worker| {
+                let pid = worker.id();
+                self.0
+                    .workers
+                    .lock()
+                    .expect("the list is not poisoned")
+                    .push(worker);
+                pid
+            });
+        match started {
+            Ok(pid) => kr_controller::supervision::settle(pid),
+            Err(error) => LaunchOutcome::NotStarted {
+                detail: error.to_string(),
+            },
+        }
+    }
+
+    fn describe(&self) -> &'static str {
+        "this host's supervisor, with a standard error nothing reads"
+    }
+}
+
 struct Host {
     /// The host tree, which ends every worker its daemon started before it goes.
     temp: teardown::Tree,
@@ -183,6 +295,10 @@ struct Host {
     /// this platform, rather than as detached processes of its own. Windows has one start only.
     #[cfg(not(windows))]
     platform_service: bool,
+    /// The standard error of the workers this daemon starts, when a test gives them a pipe nobody
+    /// reads.
+    #[cfg(unix)]
+    standard_error: Option<Arc<HeldStandardError>>,
 }
 
 impl Host {
@@ -221,6 +337,8 @@ impl Host {
             launched: None,
             #[cfg(not(windows))]
             platform_service: false,
+            #[cfg(unix)]
+            standard_error: None,
         }
     }
 
@@ -232,6 +350,10 @@ impl Host {
     /// signed in, the same type over the task a host with no session registers. Elsewhere, a
     /// detached process of the daemon's own, or the platform's service manager when a test asks.
     fn platform_supervisor(&self) -> Box<dyn WorkerSupervisor> {
+        #[cfg(unix)]
+        if let Some(held) = &self.standard_error {
+            return Box::new(WorkersOnAHeldStandardError(Arc::clone(held)));
+        }
         #[cfg(windows)]
         {
             self.task.product_supervisor(&self.paths())
@@ -257,6 +379,21 @@ impl Host {
     #[cfg(windows)]
     fn through_the_platform(self) -> Self {
         self
+    }
+
+    /// Starts the daemon's workers with a standard error that a case can fill and nothing reads.
+    #[cfg(unix)]
+    fn with_a_standard_error_nobody_reads(mut self) -> Self {
+        self.standard_error = Some(HeldStandardError::new());
+        self
+    }
+
+    /// The pipe the workers write their standard error to.
+    #[cfg(unix)]
+    fn held_standard_error(&self) -> &HeldStandardError {
+        self.standard_error
+            .as_ref()
+            .expect("this host gives its workers a standard error nothing reads")
     }
 
     /// Installs a qualified Zsh package for the daemon, and none for the worker.
@@ -782,7 +919,20 @@ struct LocalTerminal {
 }
 
 impl LocalTerminal {
+    /// Attaches a terminal and subscribes it to the session's output.
     async fn attach(
+        host: &Host,
+        session_id: SessionId,
+        dimensions: kr_protocol::session::Dimensions,
+        keys: bool,
+    ) -> Self {
+        let mut terminal = Self::attached(host, session_id, dimensions, keys).await;
+        terminal.subscribe().await;
+        terminal
+    }
+
+    /// Attaches a terminal, and takes the input lease when `keys` is set, without subscribing it.
+    async fn attached(
         host: &Host,
         session_id: SessionId,
         dimensions: kr_protocol::session::Dimensions,
@@ -857,23 +1007,6 @@ impl LocalTerminal {
         } else {
             None
         };
-        // The subscription is the last call, because a client drops what arrives while it waits
-        // for an answer of its own and the screen it is drawn is queued the moment it subscribes.
-        let mut streams = CanonicalSet::new();
-        streams.insert(kr_protocol::recovery::EventStream::Output);
-        client
-            .request(
-                Method::EventsSubscribe,
-                &kr_protocol::recovery::EventsSubscribeParams {
-                    session_id,
-                    attachment_id,
-                    streams,
-                    from_cursor: Nullable::null(),
-                },
-            )
-            .await
-            .expect("the call reaches the worker")
-            .expect("the worker subscribes the terminal");
         Self {
             client,
             session_id,
@@ -882,6 +1015,28 @@ impl LocalTerminal {
             sequence: 0,
             seen: String::new(),
         }
+    }
+
+    /// Subscribes this terminal to the session's output.
+    ///
+    /// It is the last call a terminal makes, because a client drops what arrives while it waits
+    /// for an answer of its own and the screen it is drawn is queued the moment it subscribes.
+    async fn subscribe(&mut self) {
+        let mut streams = kr_protocol::scalars::CanonicalSet::new();
+        streams.insert(kr_protocol::recovery::EventStream::Output);
+        self.client
+            .request(
+                Method::EventsSubscribe,
+                &kr_protocol::recovery::EventsSubscribeParams {
+                    session_id: self.session_id,
+                    attachment_id: self.attachment_id,
+                    streams,
+                    from_cursor: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker subscribes the terminal");
     }
 
     /// Types one line into the session, under this terminal's lease.
@@ -1394,6 +1549,114 @@ async fn a_worker_the_detached_start_launches_leads_a_session_of_its_own() {
         "and it is not the daemon's"
     );
     close(&mut client, &host, created.session.session_id).await;
+}
+
+/// KR-REQ-20.20: a standard error that has stopped draining, a pipe nobody reads, does not hold the
+/// end of a worker whose session has closed. The worker program says on that standard error that an
+/// attachment had not been sent the closure, and ends.
+///
+/// A terminal that attached and never subscribed is owed the closure, which the worker waits for
+/// until its bound before it says so. The worker program's standard error is full by then, so a
+/// line it writes where it stands would wait for a reader that never comes.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_whose_standard_error_has_stopped_draining_ends_after_its_session_closes() {
+    let host = Host::create().with_a_standard_error_nobody_reads();
+    let _daemon = host.start().await;
+    let mut client = host.client().await;
+    let created = create(&mut client, &host).await;
+    let session_id = created.session.session_id;
+    let _silent = LocalTerminal::attached(
+        &host,
+        session_id,
+        kr_protocol::session::Dimensions::new(80, 24),
+        false,
+    )
+    .await;
+
+    host.held_standard_error().fill();
+    close(&mut client, &host, session_id).await;
+    until("the worker to end with its standard error full", || {
+        host.held_standard_error()
+            .every_worker_has_ended()
+            .then_some(())
+    })
+    .await;
+}
+
+/// KR-REQ-20.20: a worker that cannot reach its controller says why on its standard error and ends
+/// with a failure, whether that standard error is read or has stopped draining. What it says is
+/// there to read when the standard error drains, however soon the program ends after saying it.
+///
+/// The worker program is started with a rendezvous no controller listens on. It says that it has
+/// no clock floor to prove authority by, then that it could not connect.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_its_standard_error_does()
+ {
+    use std::io::Read as _;
+
+    for drained in [true, false] {
+        let host = Host::create();
+        let (mut reader, writer) = std::io::pipe().expect("a pipe");
+        if !drained {
+            fill_pipe(&writer);
+        }
+        let paths = host.paths();
+        let rendezvous = host.temp.root().join("no-controller");
+        let mut worker = std::process::Command::new(&host.worker)
+            .args([
+                "--reservation",
+                &kr_ipc::new_uuid().to_string(),
+                "--session",
+                &kr_ipc::new_uuid().to_string(),
+                "--environment",
+                &host.environment_id.to_string(),
+                "--display",
+                "1",
+                "--rendezvous",
+            ])
+            .arg(&rendezvous)
+            .arg("--runtime-dir")
+            .arg(paths.runtime_root())
+            .arg("--state-dir")
+            .arg(paths.state_root())
+            .current_dir(host.temp.root())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(writer)
+            .spawn()
+            .expect("starts the worker");
+
+        let started = tokio::time::Instant::now();
+        let status = loop {
+            if let Some(status) = worker.try_wait().expect("polls the worker") {
+                break Some(status);
+            }
+            if started.elapsed() > LIVENESS_DEADLINE {
+                worker.kill().expect("ends the worker by its pid");
+                worker.wait().expect("the worker ends");
+                break None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let what = if drained { "read" } else { "full" };
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(1),
+            "the worker with its standard error {what} ended with a failure"
+        );
+        if drained {
+            let mut said = String::new();
+            reader
+                .read_to_string(&mut said)
+                .expect("reads its standard error");
+            assert!(
+                said.contains("no copy of authority") && said.contains("connect"),
+                "the worker said why it could not start: {said}"
+            );
+        }
+    }
 }
 
 /// KR-REQ-05.08: an idle session that has been asked to run nothing is its worker and its root
