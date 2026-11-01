@@ -835,9 +835,10 @@ one fails the build's own tests on the day it is added. A form the walk cannot a
 refused rather than passed over: a value of any shape, a map, whose keys are text nothing classes,
 and a keyword that holds a schema the walk does not follow. Nothing may be classed that no export
 reaches, which keeps the list a record of what leaves rather than a place entries accumulate.
-Two values leave without their content. The boot identity is opaque bytes that identify one boot
+Three values leave without their content. The boot identity is opaque bytes that identify one boot
 of one machine, so an export says which kernel facility this platform reads it from and carries
-none of the value. The number of the account a desktop belongs to names that account on a
+none of the value. The derived identity of a desktop leaves as a fixed marker that says there is a
+desktop and not which one. The number of the account a desktop belongs to names that account on a
 platform that numbers its users, so an export of the desktop context carries none of it and says
 nothing of its kind: a reader sees an empty field, the same as on a platform that has no number.
 
@@ -3287,21 +3288,20 @@ the `metadata_url` and `targets_url` of a catalogue are sent as they are. The sp
 question's verified executable, the command blocks of a session with their working directory, and
 the command a materialisation ran. A session's directory and shell and an attachment's staged path
 are how the product describes a session and a manual attachment, and a device that may see a
-session sees its terminal. The command in the launch offer is a command the person asked the host
-to run, and the companion shows it so that the person can read it before and after the launch. A
-catalogue's two locations are a directory on this host when the catalogue is a local one; they are
-sent because an owner device rebuilds the digest of a trust plan from them and because the
-companion shows where the metadata is. Each reaches a device that holds the right of the method
-that reads it, and a catalogue's locations only a device that holds `host.manage`; the command block
-reaches only a device whose grant keeps history from the moment the command started or earlier. The
-`disabled_reason` of a capability record in `plugin.capabilities` is a sentence of the host's. For
-a signed qualification that the host accepted and whose state is not usable, it is followed by the
-statement of that qualification, which is the publisher's published text and not this host's, and
-is sent as it is. A qualification the host refused is reported as not tested, with the host's own
-sentence of the refusal and no statement. The
-`suspension_reason` of an agent instance's binding, which says why rich mutations wait, and the
-refusal of a rich mutation that repeats it, are sent as the host wrote them when the reason is one
-of the host's own sentences. Otherwise the device is told what kind of wait it was: the method of a
+session sees its terminal. The command in the launch offer is the one an admitted package declares
+for starting its agent, and the companion shows it so that the person can read it before choosing
+the launch. A catalogue's two locations are a directory on this host when the catalogue is a local
+one; they are sent because an owner device rebuilds the digest of a trust plan from them and
+because the companion shows where the metadata is. Each reaches a device that holds the right of
+the method that reads it, and a catalogue's locations only a device that holds `host.manage`; the
+command block reaches only a device whose grant keeps history from the moment the command started
+or earlier. The `disabled_reason` of a capability record in `plugin.capabilities` is a sentence of
+the host's. For a signed qualification that the host accepted and whose state is not usable, it is
+followed by the statement of that qualification, which is the publisher's published text and not
+this host's, and is sent as it is. A qualification the host refused is reported as not tested, with
+the host's own sentence of the refusal and no statement. The `suspension_reason` of an agent
+instance's binding, which says why rich mutations wait, and the refusal of a rich mutation that
+repeats it, are sent as the host wrote them when the reason is one of the host's own sentences. Otherwise the device is told what kind of wait it was: the method of a
 request that the connector's table does not classify, and what stopped the worker taking a
 conversation, are not sent. What a closure records of a resource it left is held to the same rule
 and is replaced by the kind of resource. What the agent of a session says in refusing a prompt, a
