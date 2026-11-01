@@ -5698,3 +5698,65 @@ async fn a_refused_report_changes_neither_the_window_nor_its_revision() {
         "the window and its revision are where the last accepted report left them"
     );
 }
+
+/// Diagnostic: the "d" step of the soft-reset case, repeated, with what the session retained and
+/// what it reports after each round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_soft_reset_wrap_pending() {
+    let narrow = Dimensions::new(4, 5);
+    let rounds: usize = std::env::var("PROBE_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(40);
+    let mut mismatches = 0;
+    for round in 0..rounds {
+        let host = host_with(
+            "stty -echo -echonl || exit 1; printf 'abc'; read -r _; \
+             printf 'd\\033[!p'; read -r _",
+            narrow,
+            None,
+            1024 * 1024,
+        )
+        .await;
+        produced(&host.runtime, b"abc").await;
+        let before = retained(&host.runtime).len();
+        let mut typist = typist(&host).await;
+        let mut attached = attach(&host, narrow, Some("xterm-256color")).await;
+        typist.release(&host).await;
+        let events = collect_until_resync(&mut attached.client, "the soft reset").await;
+        let marker = resync_of(&events);
+        resubscribe(&host, &mut attached, marker.cursor.get()).await;
+        let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        let started = tokio::time::Instant::now();
+        let mut state = reported(&host, &mut reader, attached.attachment_id).await;
+        while state
+            != (
+                Some(TerminalPresentationMode::Viewport),
+                Some(PresentationReason::RestorationIncomplete),
+            )
+            && started.elapsed() < Duration::from_secs(5)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            state = reported(&host, &mut reader, attached.attachment_id).await;
+        }
+        let seen = retained(&host.runtime);
+        let matched = state
+            == (
+                Some(TerminalPresentationMode::Viewport),
+                Some(PresentationReason::RestorationIncomplete),
+            );
+        mismatches += usize::from(!matched);
+        eprintln!(
+            "probe round {round}: matched={matched} state={state:?} waited={:?} marker_cursor={} \
+             retained_before_reset={:?} retained_after_abc={:?}",
+            started.elapsed(),
+            marker.cursor.get(),
+            String::from_utf8_lossy(&seen[..before.min(seen.len())]).escape_debug().to_string(),
+            String::from_utf8_lossy(&seen[before.min(seen.len())..]).escape_debug().to_string(),
+        );
+    }
+    eprintln!("probe summary: {mismatches} of {rounds} rounds did not report the projection");
+    assert_eq!(mismatches, 0, "{mismatches} of {rounds} rounds");
+}
