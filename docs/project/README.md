@@ -581,19 +581,20 @@ or one older than version 3 (Linux 6.2), gets the same refusal before Git is loo
 request that reaches a remote on a kernel older than version 4 (Linux 6.7) gets it when its
 invocation is built. The sentence says which version the kernel has and which the boundary needs. A
 machine whose system-call numbers this host does not hold is refused alike, and its sentence ends
-with the advice to use a host on an x86-64 or aarch64 machine. What a person can do about it is in that sentence:
-install Git where it names that step, or use the other host it names. The CLI shows that sentence
-alone for a command that runs Git, because the client's one line for this code, "Change a setting on
-this device or on the host.", fits neither. A client that takes its action from the client library's
-table, the companion among them, adds that line after the sentence. The table has no other action
-for `HOST_NOT_CONFIGURED`, and none of its members says to install Git or to use another host. No
-setting changes a platform that runs no Git, a machine this host holds no system-call numbers for,
-or a kernel whose interface is too old. A kernel that has the interface and does not offer it to
-this process (Landlock not enabled at boot, or a system-call filter around the daemon) is named as
-such in the sentence, and the person who runs the host can change that. A look for Git that runs out
-of its time, or that the host is too short of descriptors, processes or memory to make, is a fault
-that passes. It is answered with `UPSTREAM_UNAVAILABLE`, which a client may send again under a new
-action identifier, and it names no step. A read of what the journal records still answers.
+with the advice to use a host on an x86-64 or aarch64 machine. What a person can do about it is in
+that sentence: install Git where it names that step, or use the other host it names. The CLI shows
+that sentence alone for a command that runs Git, because the client's one line for this code,
+"Change a setting on this device or on the host.", fits neither. A client that takes its action from
+the client library's table, the companion among them, adds that line after the sentence. The table
+has no other action for `HOST_NOT_CONFIGURED`, and none of its members says to install Git or to use
+another host. No setting changes a platform that runs no Git, a machine this host holds no
+system-call numbers for, or a kernel whose interface is too old. A kernel that has the interface and
+does not offer it to this process (Landlock not enabled at boot, or a system-call filter around the
+daemon) is named as such in the sentence, and the person who runs the host can change that. A look
+for Git that runs out of its time, or that the host is too short of descriptors, processes or memory
+to make, is a fault that passes. It is answered with `UPSTREAM_UNAVAILABLE`, which a client may send
+again under a new action identifier, and it names no step. A read of what the journal records still
+answers.
 
 **What environment it runs in.** The child's environment is built from nothing and then filled in.
 Every variable Git reads that can name a program (`GIT_EXTERNAL_DIFF`, `GIT_SSH`, `GIT_SSH_COMMAND`,

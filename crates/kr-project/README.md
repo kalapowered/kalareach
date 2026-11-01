@@ -20,19 +20,21 @@ clean-up that follows takes a few seconds more at most. A program still under wa
 is ended with the processes in its group, and one that has ended has the rest of its group ended
 with it. A program whose answer passes 64 KiB is ended at that point and refused, whatever it would
 have exited with, and no more than that is kept. A process that has left the group and keeps the
-pipe is out of reach: the answer is refused after a second and this host closes its end of the pipe,
-so this host holds nothing of the process. It may go on, and a write it makes to the closed pipe
-fails. A child that cannot be waited on is refused, and nothing is signalled by its number, which
-may be another process's by now. A program that does not answer in time, a child that cannot be
-waited on or collected, output that cannot be read, and a host too short of descriptors, processes
-or memory to ask are faults that pass, and the look is refused as `UPSTREAM_UNAVAILABLE`; the other
-refusals are `HOST_NOT_CONFIGURED`. A look
-is made by one request at a time, and a request that arrives while one is under way waits for that
-look and shares its result, so a program that hangs is started once for all of them. A copy of Git
-under the helper directory that does not answer in time, or answers with more, refuses the whole
-look. One that cannot run, or answers differently, leaves the program on the search path as the one
-that runs. A host that is short of descriptors, processes or memory when a copy is started refuses
-the look rather than taking the copy for one that cannot run.
+pipe is out of reach: the answer is refused after a second, or when the time the program was given
+ends if that comes first, and this host closes its end of the pipe, so this host holds nothing of
+the process. It may go on, and a write it makes to the closed pipe fails. A child that cannot be
+waited on is refused, and nothing is signalled by its number, which may be another process's by now.
+A program that does not answer in time, a child that cannot be waited on or collected, output that
+cannot be read, and a host too short of descriptors, processes or memory to ask are faults that
+pass, as is the time running out while the output of a program that has ended is waited for, and the
+look is refused as `UPSTREAM_UNAVAILABLE`; the other refusals are `HOST_NOT_CONFIGURED`, among them
+a program that has ended and left its output open for a second. A look is made by one request at a
+time, and a request that arrives while one is under way waits for that look and shares its result,
+so a program that hangs is started once for all of them. A copy of Git under the helper directory
+that does not answer in time, or answers with more, refuses the whole look. One that cannot run, or
+answers differently, leaves the program on the search path as the one that runs. A host that is
+short of descriptors, processes or memory when a copy is started refuses the look rather than taking
+the copy for one that cannot run.
 
 ## Why there is one
 
