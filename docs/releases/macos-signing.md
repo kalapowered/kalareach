@@ -1,9 +1,10 @@
 # Signing and publishing the macOS and Linux host
 
-A host release for macOS and Linux is made in four steps. Two of them hold a key, and each key is held
-in one place: the Developer ID and the notary key stay on the machine that signs, and the update
-channel's two release keys are secrets of one deployment environment that one job reads. The notary
-key's file is read by `scripts/store-ios.sh` too, for the iOS export ([the store bundles](mobile-stores.md)). This page
+A host release for macOS and Linux is made in four steps. Two of them use a key: the machine that signs
+reads the Developer ID and the notary key from files, and one job reads the update channel's two
+release keys as secrets of one deployment environment. [The key table](keys.md) names every place
+that holds each key. The notary key's file is read by `scripts/store-ios.sh` too, for the iOS export
+([the store bundles](mobile-stores.md)). This page
 says what each step does, what it checks before it goes on, what to do when it stops, and how a key
 is replaced.
 
