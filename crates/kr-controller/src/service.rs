@@ -720,6 +720,9 @@ pub struct Controller {
     /// The only gateway a paired device may name in the credential it hands this host, and the
     /// origin an owed revocation is asked at when no credential is held for it. Read once at start.
     gateway_origin: String,
+    /// How long a paired device's request waits for its effect before it is told the outcome is
+    /// unknown. Read once at start.
+    effect_wait: std::time::Duration,
     /// The paired devices, for the device method group.
     ///
     /// A view on this daemon's own registry database, which is the file the network half keeps its
@@ -1133,6 +1136,13 @@ impl Controller {
     #[must_use]
     pub fn delivery(&self) -> &Arc<crate::push::DeliveryModule> {
         &self.delivery
+    }
+
+    /// How long a paired device's request waits for its effect before it is told the outcome is
+    /// unknown.
+    #[must_use]
+    pub(crate) const fn effect_wait(&self) -> std::time::Duration {
+        self.effect_wait
     }
 
     /// Returns the loop that drives delivery, and the credentials it delivers under.

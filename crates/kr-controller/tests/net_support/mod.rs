@@ -355,6 +355,11 @@ pub struct Waits {
     /// The signed release matrix as the daemon reads it, when the suite serves one: the key the
     /// daemon verifies it against and the timer the daemon's reads of it wait by.
     pub release_matrix: Option<ReleaseMatrixStage>,
+    /// How long the daemon waits for the effect of a paired device's mutation before it answers
+    /// that the outcome is unknown, when the suite does not take the daemon's own wait. A suite
+    /// whose cases run Git and write to the disk on a machine that may be loaded gives it a long
+    /// one; a suite about the wait gives it a short one.
+    pub effect_wait: Option<std::time::Duration>,
 }
 
 /// How a suite stands the signed release matrix up for a daemon.
@@ -481,6 +486,40 @@ impl Host {
     /// Starts a daemon on a fresh environment, on the network, with no owner yet.
     pub async fn start_unowned() -> Self {
         Self::start_unowned_on_clocks(Clocks::system()).await
+    }
+
+    /// Starts a daemon with `owner` as its first owner, as [`Self::start`] does, that waits for the
+    /// effect of a paired device's mutation for the long wait a suite gives a loaded machine
+    /// ([`kr_controller::testing::HUNG_EFFECT`]).
+    pub async fn start_holding_effects(owner: &DeviceKeys) -> Self {
+        Self::start_with_effect_wait(owner, kr_controller::testing::HUNG_EFFECT).await
+    }
+
+    /// Starts a daemon with `owner` as its first owner, as [`Self::start`] does, that answers a
+    /// paired device's mutation as one whose outcome is unknown once `bound` has passed without its
+    /// effect ending.
+    pub async fn start_with_effect_wait(owner: &DeviceKeys, bound: Duration) -> Self {
+        let mut host = Self::start_on(
+            kr_ipc::testing::TempHost::create(),
+            room::TestRoom::new(),
+            NetworkSettings {
+                endpoint: loopback(),
+                ..NetworkSettings::default()
+            },
+            AccountAt::Managed,
+            Arc::new(MemoryStore::new()),
+            Clocks::system(),
+            None,
+            Waits {
+                effect_wait: Some(bound),
+                ..Waits::default()
+            },
+        )
+        .await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
     }
 
     /// Starts a daemon with `owner` as its first owner, on the clocks a suite moves by hand, by
@@ -764,6 +803,7 @@ impl Host {
                 timer: Some(timer),
                 reader_shares_the_timer: false,
                 release_matrix: matrix,
+                effect_wait: None,
             },
         )
         .await;
@@ -971,13 +1011,21 @@ impl Host {
                             }
                         }
                     };
-                    match waits.release_matrix.as_ref() {
-                        Some(stage) => {
-                            kr_controller::testing::with_release_matrix_pins(
-                                stage.pins.clone(),
-                                started,
-                            )
-                            .await
+                    let started = async {
+                        match waits.release_matrix.as_ref() {
+                            Some(stage) => {
+                                kr_controller::testing::with_release_matrix_pins(
+                                    stage.pins.clone(),
+                                    started,
+                                )
+                                .await
+                            }
+                            None => started.await,
+                        }
+                    };
+                    match waits.effect_wait {
+                        Some(bound) => {
+                            kr_controller::testing::with_effect_wait(bound, started).await
                         }
                         None => started.await,
                     }
@@ -1293,6 +1341,7 @@ impl Stopped {
                 timer: Some(timer),
                 reader_shares_the_timer,
                 release_matrix: waits.release_matrix,
+                effect_wait: waits.effect_wait,
             },
         )
         .await;

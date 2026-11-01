@@ -72,6 +72,7 @@ pub use acting::GRANT_WATCH;
 pub use decision::Answered;
 pub use output::{AUTHORITY_POLL, ExpiryObserver, RELAY_DECISIONS, RemoteOutput, WITHDRAWN};
 pub use routes::EFFECT_WAIT;
+pub(crate) use routes::effect_wait_for_start;
 
 use output::Authorisation;
 

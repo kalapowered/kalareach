@@ -152,6 +152,83 @@ async fn kr_req_25_10_a_device_redeems_its_invitation_once_and_a_repeat_of_the_a
     host.stop().await;
 }
 
+/// A request whose effect outlasts the host's wait for it is told the outcome is unknown, and the
+/// effect goes on: the action presented again is answered as the effect ended.
+///
+/// The host waits [`EFFECT_WAIT`] in the field, and a suite can give a daemon a shorter wait; the
+/// redemption is held at the store until the answer has come, so the wait is what ends the request
+/// and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repeat_is_answered_as_it_ended()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start_with_effect_wait(&owner, Duration::from_millis(250)).await;
+    let (device, record) = recipient(&host, &owner).await;
+    let issued = shared(
+        &host,
+        net_support::an_open_session(&host).0,
+        record.device_id,
+    )
+    .await;
+    let redeem = GrantRedeemParams {
+        invitation_id: issued.preview.invitation_id,
+    };
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let connection = RawDevice::connect(&host, &device, &record).await;
+
+    let (arrived, go) = host.controller().sharing().grants().pause_before_effect();
+    // The 20 s is a limit on how long a hung request is waited for, not a measure: the host's wait
+    // is 250 ms, and the case fails if no answer has come in 20 s.
+    let told = tokio::time::timeout(
+        Duration::from_secs(20),
+        connection.mutate(Method::GrantRedeem, action, on_the_host(&host), &redeem),
+    )
+    .await
+    .expect("the host gave up on the held effect at the wait it was given")
+    .expect_err("an effect that has not ended is not an answer");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(60)))
+        .await
+        .expect("the wait for the request ran")
+        .expect("the redemption reached the store and is held there");
+    assert!(
+        !is_active(&host, issued.grant.grant_id),
+        "the effect has not happened: the request was told nothing of it"
+    );
+
+    // The effect goes on when it is let go, and the action presented again is answered as it ended.
+    go.send(()).expect("the held redemption is let go");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while !is_active(&host, issued.grant.grant_id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the effect went on to its end after the host stopped waiting for it"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The grant is active a moment before the action's receipt is kept, and an action presented in
+    // between is still one whose effect is running, which is told the outcome is unknown again.
+    let repeated = loop {
+        match connection
+            .mutate(Method::GrantRedeem, action, on_the_host(&host), &redeem)
+            .await
+        {
+            Ok(answer) => break answer,
+            Err(error) if error.code == ErrorCode::OutcomeUnknown => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the action presented again is answered as the effect ended: {error:?}"
+                );
+            }
+            Err(error) => panic!("the action presented again was refused: {error:?}"),
+        }
+    };
+    let redeemed: GrantRedeemResult = repeated.to_typed().expect("decodes");
+    assert_eq!(redeemed.grant.grant_id, issued.grant.grant_id);
+    connection.close();
+    host.stop().await;
+}
+
 /// KR-REQ-25.10: withdrawing an invitation is revoking the grant it carries, and a withdrawn
 /// invitation activates nothing: the device is told it was withdrawn, and the grant stays as it
 /// was withdrawn.
