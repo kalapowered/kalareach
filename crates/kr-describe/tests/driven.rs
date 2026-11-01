@@ -2226,7 +2226,8 @@ fn deadlines_missed_in_a_row_make_the_next_job_wait_and_never_show_inference_fai
         [Overran::AnsweredLate; 4],
     ] {
         let mut service = service();
-        for seed in 1..=6 {
+        // Four jobs that miss, one that publishes, one that misses after it, and one left waiting.
+        for seed in 1..=7 {
             queue(&mut service, &session(seed), "kalareach", at(0));
         }
         let mut now = at(3_000);
@@ -2257,14 +2258,33 @@ fn deadlines_missed_in_a_row_make_the_next_job_wait_and_never_show_inference_fai
                 .expect("the answer"),
             Outcome::Published { .. }
         ));
-        assert!(
-            matches!(
-                service
-                    .next(&roomy(), sent.after_ms(500))
-                    .expect("an instruction"),
-                Instruction::Generate { .. }
-            ),
-            "{forms:?}: the next job is sent at once"
+        let Instruction::Generate { id, .. } = service
+            .next(&roomy(), sent.after_ms(500))
+            .expect("an instruction")
+        else {
+            panic!("{forms:?}: the next job is sent at once");
+        };
+        // The waiting is over for good: a miss after the publication waits as the first one did.
+        let missed = sent.after_ms(500 + Budgets::DEFAULTS.execution_deadline_ms);
+        assert!(matches!(
+            service
+                .finished(
+                    id,
+                    Answered::Ended {
+                        why: JobEnd::DeadlineExceeded,
+                        detail: None
+                    },
+                    missed
+                )
+                .expect("the answer"),
+            Outcome::DeadlineExceeded { .. }
+        ));
+        assert_eq!(
+            service.next(&roomy(), missed).expect("an instruction"),
+            Instruction::Wait {
+                until_ms: Some(missed.monotonic_ms() + RESTART_FIRST_MS)
+            },
+            "{forms:?}: a miss after a publication waits a second"
         );
     }
 
@@ -2304,12 +2324,42 @@ fn deadlines_missed_in_a_row_make_the_next_job_wait_and_never_show_inference_fai
     }
 }
 
+/// KR-REQ-22.11: the wait after jobs that pass their deadline in a row doubles to five minutes and
+/// stays there, as the delay after failures does, while the misses go on.
+#[test]
+fn the_wait_after_deadlines_missed_in_a_row_stops_at_five_minutes() {
+    let mut service = service();
+    // Twelve jobs that miss, and one left waiting for the wait to be shown.
+    for seed in 1..=13 {
+        queue(&mut service, &session(seed), "kalareach", at(0));
+    }
+    let mut now = at(3_000);
+    let mut expected = RESTART_FIRST_MS;
+    for round in 1..=12 {
+        now = overrun(&mut service, now, Overran::Said);
+        assert_eq!(
+            service.next(&roomy(), now).expect("an instruction"),
+            Instruction::Wait {
+                until_ms: Some(now.monotonic_ms() + expected)
+            },
+            "after miss {round} the next job waits {expected} ms"
+        );
+        assert!(!inference_failed(&service), "after miss {round}");
+        now = now.after_ms(expected);
+        expected = (expected * 2).min(RESTART_MOST_MS);
+    }
+    assert_eq!(expected, RESTART_MOST_MS, "the wait stops at five minutes");
+}
+
 /// KR-REQ-22.11: a job the daemon asked to stop because its deadline passed ends past its deadline
 /// when the process answers that it stopped, and the next job waits. It does not when something
-/// else stopped it, or asked to: a caller who cancelled it after the daemon's request, before the
-/// driver handled the answer, has it end cancelled; a pause that cancels it past its deadline puts
-/// it back in the queue; a closed session ends it cancelled. The control is a job the daemon never
-/// asked to stop, which the process stopped and answered cancelled.
+/// else stopped it, or would at the service's next look: a caller who cancelled it after the
+/// daemon's request, before the driver handled the answer, has it end cancelled; a pause that
+/// cancels it past its deadline puts it back in the queue; a session that closed, or a change that
+/// made its description stale, ends it cancelled, whether the service had cancelled the job
+/// already or the closure or the change came before the answer was read. None of those leaves the
+/// next job waiting. The control is a job the daemon never asked to stop, which the process
+/// stopped and answered cancelled.
 #[test]
 fn a_job_stopped_at_its_deadline_ends_past_it_unless_something_else_stopped_it() {
     let hot = HostConditions::measured(

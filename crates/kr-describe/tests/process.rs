@@ -19,6 +19,7 @@ use kr_describe::serve::{
     CONTROL_BOUND_MS, Exit, Generating, Job, LoadWork, Loading, Model, OVERDUE_GRACE_MS, Options,
     Verifying,
 };
+use kr_describe::supervise::STOP_BOUND_MS;
 use kr_describe::testing::Script;
 use kr_describe::wire::{Answer, JobEnd, LoadEnd, Request, WIRE_VERSION, frame_of};
 use kr_protocol::ids::SessionEpoch;
@@ -610,6 +611,39 @@ fn a_job_past_its_deadline_that_was_told_to_stop_is_given_time_to_stop() {
         Answer::Ended { id, why: JobEnd::Cancelled, .. } if id.get() == 2
     ));
     assert!(process.exit_within(Duration::from_millis(500)).is_none());
+}
+
+/// KR-REQ-22.11: the process gives a job whose stop its control thread has read the stop bound after
+/// the job's deadline, and no longer: a model that acknowledges the cancellation and never returns
+/// ends the process as overdue at that bound. Not a moment before, which the lower bound of the
+/// elapsed time shows (the process cannot end itself sooner than its own bound, whatever the load),
+/// and not never, which the wait for the end shows. It runs as long as the bound it holds.
+#[test]
+fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
+    let placed = Placed::stub();
+    let runtime = placed.directory("never-returns");
+    let script = Script {
+        ignore_token_ms: 10 * STOP_BOUND_MS,
+        mark_work: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    process.expect_answer(SOON, "the load");
+    let sent = Instant::now();
+    process.send(&generate(2, 1, 200));
+    wait_until_began(&runtime, "job");
+    process.send(&Request::Cancel { id: U64::new(2) });
+    assert_eq!(
+        process.expect_answer(SOON, "the acknowledgement"),
+        Answer::Cancelling { id: U64::new(2) }
+    );
+    let status = process
+        .exit_within(Duration::from_millis(STOP_BOUND_MS) * 2)
+        .expect("the process ends itself at the stop bound");
+    assert_eq!(status.code(), Some(Exit::Overdue.code()));
+    assert!(sent.elapsed() >= Duration::from_millis(200 + STOP_BOUND_MS));
 }
 
 /// A process whose model fails inside a job ends itself, so the daemon restarts inference rather
