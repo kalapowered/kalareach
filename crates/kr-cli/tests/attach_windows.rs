@@ -669,8 +669,8 @@ const PASTED_CHARACTERS: usize = 100;
 /// each of its two halves.
 const PASTED_RECORDS: u32 = 5 * 2 + 12 * PASTED_CHARACTERS as u32;
 
-/// KR-REQ-08.53: a character outside the basic plane that a console is given as text reaches the
-/// session whole, however the console's records are cut into reads.
+/// KR-REQ-08.53: a character outside the basic plane that a console is given as text is spelled
+/// whole from the pieces the reader hands on, however the console's records are cut into reads.
 ///
 /// A console records U+1F600 as twelve key records, six for each half, and the halves come on the
 /// Alt coming up. The reader takes 256 records at a time, so a paste of a hundred of them is read in
@@ -682,14 +682,15 @@ const PASTED_RECORDS: u32 = 5 * 2 + 12 * PASTED_CHARACTERS as u32;
 /// The test, outside, writes the text to the console as UTF-8 and expects every character whole and
 /// none replaced.
 #[test]
-fn a_character_outside_the_basic_plane_pasted_into_a_console_reaches_the_session_whole() {
+fn a_character_outside_the_basic_plane_pasted_into_a_console_is_spelled_whole_from_the_readers_pieces()
+ {
     if std::env::var_os(SPELL_PROBE).is_some() {
         paste_probe_in_the_console();
         return;
     }
 
     let mut probe = Probe::start(
-        "a_character_outside_the_basic_plane_pasted_into_a_console_reaches_the_session_whole",
+        "a_character_outside_the_basic_plane_pasted_into_a_console_is_spelled_whole_from_the_readers_pieces",
     );
     probe.waits_for("kr-probe:ready");
     let mut pasted = b"aaaa".to_vec();
@@ -704,7 +705,7 @@ fn a_character_outside_the_basic_plane_pasted_into_a_console_reaches_the_session
         shown.contains(&format!(
             "kr-probe:spelled:letters=5:characters={PASTED_CHARACTERS}:replaced=0:"
         )),
-        "every character reached the session whole and none was replaced: {shown:?}"
+        "every character was spelled whole from the reader's pieces and none was replaced: {shown:?}"
     );
     probe.report();
 }

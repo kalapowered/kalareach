@@ -904,11 +904,13 @@ method, and that is exactly what it cannot do:
   joins every digit up to the `R` into the column, so bytes that come ahead of the reply change the
   number: three answers to a device-attributes query (`CSI ? 62 ; 22 c`) ahead of a reply give a
   column of 226222621, and the editor then throws `ArgumentOutOfRangeException` when it places the
-  cursor and stops answering. The host holds no answer back for this. The broker answers the cursor
-  question itself, at once, and the response lane writes replies in the order of their queries, so
-  the host puts no answer of its own ahead of a cursor reply produced after that query. It cannot
-  take back bytes that are already in the terminal's input, such as the answer to an earlier query
-  of a program that ended before it read it.
+  cursor and stops answering. The host holds no answer back for this. The broker is the only
+  responder and answers the cursor question itself, and the response lane writes replies in the
+  order of their queries, so the reply to a query asked after the cursor question never goes ahead
+  of the cursor reply. The reply to an earlier query can: one already in the terminal's input, such
+  as the answer to a query of a program that ended before it read it, and one still waiting in the
+  lane. The host cannot take back the first, and holding the second behind the cursor reply would
+  put a reply ahead of the query it answers.
 
 Running the module on Windows, where the endpoint is a named pipe and the console has no line
 discipline to name an end-of-file character, so that the module reports the gesture as disabled at its
