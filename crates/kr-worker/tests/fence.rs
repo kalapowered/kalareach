@@ -8371,6 +8371,95 @@ async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_on
     }
 }
 
+/// KR-REQ-27.05, the root shell killed on its own: the real shell of a qualified package, at its
+/// empty prompt with two terminals attached, is killed outright by a signal. The session closes with
+/// the kill signal that ended the shell, the record names it, no shell takes its place, and the
+/// terminals are not left holding a session that is still live. The shell is the package's own, as
+/// a managed session runs it, with its editor reader and its bridge; the root program the daemon
+/// fault suite kills is a script that stands in for one.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
+async fn a_real_root_shell_killed_at_its_prompt_closes_its_session_with_the_signal_and_nothing_replaces_it()
+ {
+    for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+        let package = installed_package_of(kind);
+        let shell = RealShell::start(
+            &package,
+            kr_protocol::session::LaunchProfile::default(),
+            Vec::new(),
+            None,
+        )
+        .await;
+        let first = shell.keys();
+        let second = shell.terminal_attached();
+        shell.until_fenced_for(first.attachment_id).await;
+        // The control: a shell nobody kills is live, with both terminals on it.
+        assert_eq!(
+            shell.runtime.state(),
+            kr_protocol::session::SessionState::Live,
+            "{kind:?}: the session is live before the kill"
+        );
+        assert_eq!(
+            shell.attached().len(),
+            2,
+            "{kind:?}: both terminals are attached before the kill"
+        );
+        let root = shell
+            .runtime
+            .session()
+            .root_identity()
+            .expect("the launched shell has a process identity");
+        assert_eq!(
+            kr_ipc::identity::process_state(&root),
+            kr_ipc::identity::ProcessState::Running,
+            "{kind:?}: the shell is running before the kill"
+        );
+
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(i32::try_from(root.pid.get()).expect("an identifier"))
+                .expect("a process identifier"),
+            rustix::process::Signal::KILL,
+        )
+        .expect("kills the shell");
+
+        let closure = tokio::time::timeout(Duration::from_secs(60), shell.runtime.wait_closed())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{kind:?}: the session did not close when its shell was killed")
+            });
+        assert_eq!(
+            closure.reason,
+            ClosureReason::RootSignal,
+            "{kind:?}: the closure names a signal as what ended the shell: {closure:?}"
+        );
+        assert!(
+            closure
+                .root_signal
+                .0
+                .as_ref()
+                .is_some_and(|signal| signal.to_ascii_lowercase().contains("kill")),
+            "{kind:?}: and the record names the kill signal: {closure:?}"
+        );
+        assert_eq!(
+            shell.runtime.state(),
+            kr_protocol::session::SessionState::Closed,
+            "{kind:?}: the session is closed"
+        );
+        assert_eq!(
+            kr_ipc::identity::process_state(&root),
+            kr_ipc::identity::ProcessState::Ended,
+            "{kind:?}: the shell is gone"
+        );
+        assert_eq!(
+            shell.runtime.session().root_identity().as_ref(),
+            Some(&root),
+            "{kind:?}: no other shell was started in its place"
+        );
+        shell.bridge_task.abort();
+    }
+}
+
 // --------------------------------------------------------------------------------------------
 // KR-REQ-13.11: `shell.launch.surface` says whether a launch could be made at the root editor now,
 // and the press agrees with it.
