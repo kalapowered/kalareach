@@ -4199,9 +4199,23 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The lock on the host's cap as another worker holds it, until this is dropped.
+    ///
+    /// Dropping it releases the lock itself and not only this handle, as the host's own guard does.
+    /// A program that another case of this test binary starts meanwhile holds a copy of the open
+    /// file description until it replaces itself, and with it the lock, so a lock let go by closing
+    /// the handle can still be held for a moment.
+    struct HeldElsewhere(std::fs::File);
+
+    impl Drop for HeldElsewhere {
+        fn drop(&mut self) {
+            let _ = kr_flush::lock::release(&self.0);
+        }
+    }
+
     /// The lock on the host's cap, held as a worker of another build holds it: by the name every
     /// build agrees on, since workers of different builds run side by side.
-    fn the_host_cap_lock_held_elsewhere(spools: &Path) -> std::fs::File {
+    fn the_host_cap_lock_held_elsewhere(spools: &Path) -> HeldElsewhere {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -4210,7 +4224,7 @@ mod tests {
             .open(spools.join("host-cap.lock"))
             .expect("the lock file");
         kr_flush::lock::try_exclusive(&file).expect("nobody holds the lock");
-        file
+        HeldElsewhere(file)
     }
 
     /// KR-REQ-20.20: a session that does not get the host-wide lock gives up nothing
