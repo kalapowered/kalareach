@@ -455,8 +455,8 @@ It reads the runtime's buffer where it lies, because asking the console whether 
 would take the lock the editor's reading thread holds while it waits. On a Windows console the
 runtime reads console records, which the module does not see, so there the editor's own queue is the
 only count. In the Emacs edit mode, which is the default outside Windows, the editor types an answer
-that reaches an idle prompt into the line, as it types any key it has no binding for, so the line
-then holds the answer.
+that reaches an idle prompt into the line as far as it can, as it types any key it has no binding for,
+so the line can then hold part of the answer.
 
 A launch is never written into the pseudo-terminal. There is no wake marker and no launch string,
 because the process reading the terminal may not be the shell. A rejection installs nothing.
@@ -842,7 +842,9 @@ returns both entries, except for Escape, whose command table entry is `Ignore`, 
 the entry that is spelled as the key itself, which is the insert table's.
 
 What it pins is a range rather than a release: PowerShell 7.4 or later with PSReadLine 2.3.4 up to
-3.0. The module declares the versions it found in its handshake and the worker refuses an editor
+3.0, with one limit on Linux and macOS: the module reads the .NET runtime's decoder, a field that .NET 9 and
+later have and the .NET 8 of PowerShell 7.4 has not, so a 7.4 host there is refused as
+`runtime_reader_unreadable`. The module declares the versions it found in its handshake and the worker refuses an editor
 ABI it was not qualified for. The module also refuses a PowerShell release below the first fixed release of the advisory
 against PowerShell itself that its own list holds, naming the advisory and that release
 (`powershell_release_affected`; `docs/shell-integration/upstream.md` names the advisory in its
@@ -883,13 +885,13 @@ method, and that is exactly what it cannot do:
   not at all. The report names nothing ended, discards nothing and leaves the line alone; the
   worker then withholds the fence until the reader's own queues drain, which is the fail-safe
   answer.
-- **The queues are the editor's own.** The reader's key queue is read directly, under the version
+- **The key queue is the editor's own.** The reader's key queue is read directly, under the version
   range this package was qualified against. Asking the console whether a key is available instead
   would take the lock the editor's own read is holding, and the reader would wait for itself.
 - **The proof here is the editor's own key queue and the runtime's reader.** The editor decodes
   the terminal's bytes inside its own key read, where nothing of the module's runs. What the module
   reports is the editor's own key queue, the operations it is inside, and, outside Windows, what
-  the .NET runtime has read from the terminal and not handed over: the bytes of its buffer, the
+  the .NET runtime has read from the terminal and not handed over: the characters of its buffer, the
   keys it has made, the bytes its decoder holds for a character not yet whole, and whether the
   terminal's queue holds anything. A sequence the editor has begun to decode and not finished is in
   none of these, so the queue proof here is as good as the editor's queue and the runtime's reader
