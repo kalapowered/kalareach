@@ -189,7 +189,6 @@ async fn a_spool_that_meets_a_full_disk_says_what_it_could_not_keep_and_the_sess
         .first
         .gap
         .0
-        .clone()
         .expect("the output the spool could not take is a gap");
     assert_eq!(gap.from_cursor.get(), 0, "{gap:?}");
     assert_eq!(
