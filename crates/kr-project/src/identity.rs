@@ -1149,15 +1149,7 @@ fn open_recorded_root(
     path: &Path,
     tree: RecordedIdentity,
 ) -> Result<AuthorisedDirectory> {
-    // A case that asks for it has the tree go here, at the instant of the open, which is the one
-    // place a look made before it would be wrong.
-    #[cfg(all(test, unix))]
-    tests::REMOVED_BEFORE_THE_OPEN.with(|going| {
-        if let Some(going) = going.take() {
-            std::fs::remove_dir(going).expect("the case's tree goes");
-        }
-    });
-    match cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority()) {
+    match open_directory(path) {
         Ok(handle) => Ok(AuthorisedDirectory::from_handle(
             environment_id,
             handle,
@@ -1172,6 +1164,21 @@ fn open_recorded_root(
         // Said by the one place that words an open's failure, as for every other root.
         Err(_) => Ok(AuthorisedDirectory::open_root(environment_id, path)?),
     }
+}
+
+/// Opens the directory at `path` with this process's own authority, which is how the place a
+/// record names for its tree is opened.
+fn open_directory(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    // A case that asks for it has the tree go here, at the instant of the open. Whatever looked at
+    // the path before the caller got here is behind it, and nothing else stands between it and the
+    // open.
+    #[cfg(all(test, unix))]
+    tests::REMOVED_BEFORE_THE_OPEN.with(|going| {
+        if let Some(going) = going.take() {
+            std::fs::remove_dir(going).expect("the case's tree goes");
+        }
+    });
+    cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
 }
 
 /// Returns the refusal for a directory that is not the working tree a record names.
@@ -1639,7 +1646,7 @@ mod tests {
     #[cfg(unix)]
     thread_local! {
         /// Set by a case to have the directory at this path removed at the instant the next open
-        /// of a recorded tree is made on its own thread, after anything that looked at the path.
+        /// of a recorded tree's place is made on its own thread, in the function that opens it.
         pub(super) static REMOVED_BEFORE_THE_OPEN: std::cell::Cell<Option<PathBuf>> =
             const { std::cell::Cell::new(None) };
     }
@@ -1647,7 +1654,9 @@ mod tests {
     /// The tree is there until the open and gone when the open is made, as it is for a tree that
     /// is removed between a look at the path and the open. Whatever a look saw is not the answer:
     /// the open finds nothing, and so the tree is a source that changed and not an argument the
-    /// caller got wrong.
+    /// caller got wrong. A look made by `open_recorded_root` comes before the removal, and a
+    /// version of it that opens the place any other way never reaches the removal, so the tree is
+    /// still there and the open succeeds.
     #[cfg(unix)]
     #[test]
     fn a_tree_that_goes_at_the_instant_of_the_open_is_a_source_that_changed() {
