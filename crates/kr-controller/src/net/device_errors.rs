@@ -28,6 +28,15 @@
 //! actor holds the number of an account, is told as `local` ([`withheld_local_actor`]). The reason
 //! an agent instance's rich mutations wait is told by what it says of the wait
 //! ([`suspension_for_a_device`]), in a result and in the refusal of a rich mutation.
+//!
+//! What the general rule does not find, and so passes whole, unless the refusal is one this module
+//! knows by its wording: a number that follows a word for an account with a colon and a space
+//! between them (`uid: 501`, `owner: 502`) or that follows a longer name for one (`user id 501`); a
+//! home directory written without a leading slash (`~name/work`, `Users/name/work`); and an
+//! account's bare name in a message that has no path, number or command beside it, such as the
+//! error output of `systemctl` that `supervision.rs` quotes. No producer of these forms is known.
+//! A producer that writes one is mended by giving the refusal a wording that is shared with this
+//! module, as [`KNOWN_REASONS`] does for the refusals it lists.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -292,11 +301,12 @@ struct HostPath {
 /// The members that hold a place on this host and no failure: where a repository or a working copy
 /// is, the staging paths an operation kept or removed, the repository a clone was made from, the
 /// socket of a session's worker. A session's own working directory and shell, and the executable a
-/// question's source runs, are not among them: the specification shows them to the person on
-/// purpose, as part of how a session or a question is described, and a device that may see the
-/// session sees its terminal. A path under a home directory names the account, and a device cannot
-/// use one, so a device is given each as the withheld record of a path (the form the directory of a
-/// materialisation has), with the list of paths as long as it was.
+/// question's source runs, are not among them: the product shows them to the person on purpose, as
+/// part of how a session or a question is described (the specification names a question's verified
+/// executable), and a device that may see the session sees its terminal. A path under a home
+/// directory names the account, and a device cannot use one, so a device is given each as the
+/// withheld record of a path (the form the directory of a materialisation has), with the list of
+/// paths as long as it was.
 const HOST_PATHS: [HostPath; 5] = [
     HostPath {
         key: "display_path",
@@ -675,7 +685,8 @@ fn told_in_place_of_the_upstreams(method: Method, error: &ProtocolError) -> Opti
 
 /// The sentence a device is told when `message` is the refusal of a component that has had its rich
 /// capabilities disabled, which begins as [`DISABLED_COMPONENT_REASONS`] says and gives why after
-/// it. A refusal that gives no why is the host's other sentence and is not this one.
+/// it. A message that is only the beginning has no why in it, so it holds nothing of the component's
+/// or the runtime's to withhold and is not told as this refusal.
 fn disabled_component(message: &str) -> Option<&'static str> {
     DISABLED_COMPONENT_REASONS
         .iter()
@@ -882,6 +893,10 @@ fn shown_member(map: &CanonicalMap, key: &str, child: &CanonicalValue) -> Option
                 .filter_map(|clause| text.find(clause).map(|at| (at, at + clause.len())))
                 .min()
             {
+                // The subject before the clause is the host's own words only if it names nothing of
+                // the host: a text whose subject does is held to the rule as a text with no clause
+                // is.
+                Some((at, _)) if first_naming(&text[..at]).is_some() => told_in_place(text, fixed),
                 Some((_, end)) => (end < text.len()).then(|| text[..end].to_owned()),
                 None => told_in_place(text, fixed),
             },
@@ -3306,6 +3321,27 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_that_is_only_the_beginning_of_a_disabled_component_has_no_words_to_withhold() {
+        for (beginning, kind) in DISABLED_COMPONENT_REASONS {
+            // With the fault or the revocation after it, the device is told which it was.
+            let told = told_on(
+                Method::AgentApprovalRespond,
+                ErrorCode::UnsupportedCapability,
+                &format!("{beginning}marguerite's decoder faulted"),
+            );
+            assert_eq!(told.message, kind);
+            // With nothing after it, there are none of the component's words to withhold, so it
+            // is not told as one that has them.
+            let bare = told_on(
+                Method::AgentApprovalRespond,
+                ErrorCode::UnsupportedCapability,
+                beginning,
+            );
+            assert_eq!(bare.message, beginning);
+        }
+    }
+
+    #[test]
     fn the_plugin_runtime_rule_holds_for_a_plugins_action_and_for_no_other_method() {
         let said = "the session journal is busy";
         let replaced = told_on(
@@ -3537,6 +3573,106 @@ mod tests {
         }
     }
 
+    /// The actor is held by its key, so it is held in every record that names one: where a change
+    /// set came from, what caused a resource's transition, and the same transition announced.
+    #[test]
+    fn the_actor_of_the_owners_local_caller_is_held_in_every_record_that_names_one() {
+        use kr_protocol::changeset::Provenance;
+        use kr_protocol::projection::{
+            AGENT_RESOURCE_EVENT, AgentResourceCause, AgentResourceContentClass, AgentResourceEvent,
+        };
+        use kr_protocol::scalars::Uuid;
+        let actor = |text: &str| kr_protocol::ids::ActorId::new(text).expect("an actor");
+        let provenance = |actor_id: &str| Provenance {
+            actor_id: actor(actor_id),
+            method: "changeset.capture".to_owned(),
+            session_id: Nullable::null(),
+            workflow_run_id: Nullable::null(),
+            derived_from: Nullable::null(),
+            derivation: "captured".to_owned(),
+            note: String::new(),
+        };
+        let event = |actor_id: Option<&str>| AgentResourceEvent {
+            session_id: SessionId::new(Uuid::from_bytes([1; 16])),
+            application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                Uuid::from_bytes([2; 16]),
+            ),
+            resource_id: kr_protocol::ids::PendingResourceId::new(Uuid::from_bytes([3; 16])),
+            state: kr_protocol::gateway::PendingState::Pending,
+            content: AgentResourceContentClass::Metadata,
+            durability: Durability::Durable,
+            cause: AgentResourceCause::Recorded,
+            actor_id: Nullable::from(actor_id.map(actor)),
+            causal_root: "req-1".to_owned(),
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+            stream_generation: U64::new(1),
+            sequence: U64::new(1),
+            event_id: Uuid::from_bytes([4; 16]),
+            parent_sequence: Nullable::null(),
+        };
+        let owner = kr_protocol::sharing::local_actor(501);
+        let owner = owner.as_str();
+        assert!(owner.contains("501"), "{owner}");
+
+        assert_eq!(
+            read_by_a_device(&provenance(owner)),
+            provenance("local"),
+            "a change set's provenance"
+        );
+        assert_eq!(
+            read_by_a_device(&event(Some(owner))),
+            event(Some("local")),
+            "an agent resource's transition"
+        );
+        // A transition with no actor has none to hold.
+        assert_eq!(read_by_a_device(&event(None)), event(None));
+
+        let announced = |event: &AgentResourceEvent| {
+            ControlFrame::Notification(Notification {
+                stream_id: StreamId::new("s").expect("a stream"),
+                sequence: kr_protocol::ids::EventSequence::new(1),
+                event_type: EventType::new(AGENT_RESOURCE_EVENT).expect("an event type"),
+                payload: ParamsValue::from_typed(event).expect("encodes"),
+            })
+        };
+        let Cow::Owned(ControlFrame::Notification(told)) =
+            frame_for_a_device(&announced(&event(Some(owner))))
+        else {
+            panic!("an announcement that names the owner's account was passed as it was");
+        };
+        assert_eq!(
+            told.payload
+                .to_typed::<AgentResourceEvent>()
+                .expect("decodes"),
+            event(Some("local")),
+            "the transition announced to a device"
+        );
+    }
+
+    /// Only a member that is an actor is held, and only an actor that begins as the owner's does.
+    #[test]
+    fn a_text_that_looks_like_the_owners_actor_is_held_only_as_an_actor_that_begins_so() {
+        let owner = kr_protocol::sharing::local_actor(501);
+        let text = |text: &str| CanonicalValue::Text(text.to_owned());
+        let record = |key: &str, value: &str| rebuilt(vec![(key.to_owned(), text(value))]);
+        // The same text under any other key is a text like another.
+        for key in ["note", "label", "actor", "detail"] {
+            assert!(
+                shown_value(&record(key, owner.as_str())).is_none(),
+                "{key} is not an actor"
+            );
+        }
+        // An actor that holds the prefix without beginning with it names no account.
+        for actor in ["device:local:501", "remote-local:501"] {
+            assert!(
+                shown_value(&record("actor_id", actor)).is_none(),
+                "{actor} does not begin as the owner's actor does"
+            );
+        }
+        // And one that does is held, as the control for the cases above.
+        assert!(shown_value(&record("actor_id", owner.as_str())).is_some());
+    }
+
     #[test]
     fn the_program_a_questions_source_runs_reaches_a_device_as_it_is() {
         use kr_protocol::ids::{ApplicationInstanceId, ConnectionId};
@@ -3699,6 +3835,34 @@ mod tests {
     }
 
     #[test]
+    fn a_desktop_name_is_held_with_a_generation_that_is_none_and_by_its_own_key_alone() {
+        // A name beside a generation of none is a name: the binding says which generation it was
+        // taken at only when it knows.
+        let mut owner = bound_session();
+        owner.desktop.login_generation = Nullable::null();
+        let listed = kr_protocol::session::SessionListResult {
+            sessions: vec![owner],
+        };
+        assert_eq!(
+            read_by_a_device(&listed).sessions[0]
+                .desktop
+                .desktop_session_id
+                .0,
+            Some(kr_protocol::hostinfo::export::withheld_identity())
+        );
+        // The generation is what tells a binding from other records, and only the member that
+        // is the name is held: another text beside a generation is a text like another.
+        let record = rebuilt(vec![
+            ("login_generation".to_owned(), CanonicalValue::Null),
+            (
+                "note".to_owned(),
+                CanonicalValue::Text(A_DESKTOP_NAME.to_owned()),
+            ),
+        ]);
+        assert!(shown_value(&record).is_none());
+    }
+
+    #[test]
     fn the_admission_cut_is_made_at_the_earliest_clause_in_the_text() {
         use kr_protocol::catalogue::{PluginAdmission, PluginLeftOutReason};
         let subject = "kalareach/claude-code at 9f2c41";
@@ -3707,7 +3871,7 @@ mod tests {
             detail: detail.to_owned(),
         };
         for (reason, said, kept) in [
-            // A store's own words after the colon quote a clause that comes later in the table.
+            // A store's own words after the colon quote a clause that comes earlier in the table.
             (
                 PluginLeftOutReason::Incomplete,
                 format!(
@@ -3717,7 +3881,7 @@ mod tests {
                 ),
                 format!("{subject} is not whole in this host's store"),
             ),
-            // A state directory named with the words of a later clause.
+            // A state directory named with the words of a clause that comes earlier in the table.
             (
                 PluginLeftOutReason::Incomplete,
                 format!(
@@ -3726,7 +3890,7 @@ mod tests {
                 ),
                 format!("{subject} is not whole in this host's store"),
             ),
-            // A repository's statement that quotes a clause that comes earlier in the table.
+            // A repository's statement that quotes a clause that comes later in the table.
             (
                 PluginLeftOutReason::Revoked,
                 format!(
@@ -3746,6 +3910,50 @@ mod tests {
         ] {
             let told = read_by_a_device(&left_out(reason, &said));
             assert_eq!(told, left_out(reason, &kept), "{said}");
+        }
+    }
+
+    /// The detail of a plugin the admissions leave out, as the daemon reads it for a device.
+    fn left_out_detail_told_to_a_device(said: &str) -> String {
+        use kr_protocol::catalogue::{PluginAdmission, PluginLeftOutReason};
+        let left_out = PluginAdmission::LeftOut {
+            reason: PluginLeftOutReason::Incomplete,
+            detail: said.to_owned(),
+        };
+        let PluginAdmission::LeftOut { detail, .. } = read_by_a_device(&left_out) else {
+            panic!("a plugin left out");
+        };
+        detail
+    }
+
+    #[test]
+    fn a_clause_the_text_says_twice_is_cut_at_the_first_time_it_is_said() {
+        let subject = "kalareach/claude-code at 9f2c41";
+        for clause in LEFT_OUT_CLAUSES {
+            let said = format!(
+                "{subject}{clause}: /Users/marguerite/state{clause}: marguerite wrote this"
+            );
+            assert_eq!(
+                left_out_detail_told_to_a_device(&said),
+                format!("{subject}{clause}"),
+                "{said}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_subject_that_names_the_host_is_held_to_the_rule_before_the_cut() {
+        for subject in ["/Users/marguerite/p", "uid 501", "p at /Users/marguerite/p"] {
+            for clause in LEFT_OUT_CLAUSES {
+                // The clause is followed by words that are not the host's, and it ends the text.
+                for said in [
+                    format!("{subject}{clause}: marguerite wrote this"),
+                    format!("{subject}{clause}"),
+                ] {
+                    let told = left_out_detail_told_to_a_device(&said);
+                    assert!(!tells_the_owner_alone(&told), "{said} was told as {told}");
+                }
+            }
         }
     }
 
@@ -3791,7 +3999,9 @@ mod tests {
         }
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let door = source.join("net");
-        // `net/owner.rs` is the owner's confirmation ceremony, and its text is the owner's.
+        // `net/owner.rs` writes the answers of the owner's confirmation ceremony. The owner's socket
+        // serves them whole and a paired owner device is served them too, whose answers pass this
+        // module at the write boundary, so the file itself never names it.
         let owners = door.join("owner.rs");
         let mut found = Vec::new();
         sources(&source, &mut found);
