@@ -275,11 +275,14 @@ pub struct AttachOptions {
     /// it was typed.
     pub typed_before: Vec<u8>,
     /// Whether the command reads this terminal itself when the attachment ends in a failure: it
-    /// waits for a key so that a window opened for the command alone shows the error.
+    /// waits for a key, at a terminal, so that a window opened for the command alone shows the
+    /// error.
     ///
-    /// A reader thread that cannot be woken, on a terminal that cannot be waited for, is then in a
-    /// read of the terminal and takes that key, and the attachment says so. Where the command reads
-    /// nothing, the thread ends with the process and there is nothing to say.
+    /// A reader thread that cannot be woken, on a terminal that cannot be waited for (an open of
+    /// `/dev/tty` on macOS, which is what a command started with its input redirected from
+    /// `/dev/tty` reads), is then in a read of the terminal and may take that key, and the
+    /// attachment says so. Where the command reads nothing, the thread ends with the process and
+    /// there is nothing to say.
     pub then_reads: bool,
 }
 
@@ -1545,7 +1548,7 @@ const READER_STILL_RUNNING: &str = "kr: the part of this command that reads the 
 /// the terminal cannot wake it from, and the command is about to read the terminal itself.
 const READER_WAITING_FOR_A_KEY: &str = "kr: the part of this command that reads the terminal's \
      keys is still waiting for one, and this terminal cannot wake it, so the next key you press \
-     is taken by it and lost.";
+     may be taken by it and lost.";
 
 /// What an attachment says when that thread ended only after the command asked the system to cancel
 /// its read of the console, which hands the next key typed to a read that was cancelled.
@@ -4284,7 +4287,7 @@ mod tests {
             said.len() == 1
                 && said[0]
                     .as_str()
-                    .contains("next key you press is taken by it")
+                    .contains("next key you press may be taken by it")
                 && !said[0].as_str().contains("input mode"),
             "{said:?}"
         );

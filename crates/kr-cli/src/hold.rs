@@ -14,6 +14,12 @@ use crate::terminal::{ControllingTerminal, ScreenModes};
 const HOLD_LINE: &str =
     "kr: this window stays open so the error above can be read; press any key to close it\r\n";
 
+/// Whether [`for_a_key`] waits: standard input and standard output are both terminals.
+#[must_use]
+pub fn waits() -> bool {
+    std::io::stdin().is_terminal() && crate::output::is_terminal()
+}
+
 /// Waits for one key at the terminal, if this command is run at one.
 ///
 /// Nothing waits when standard input or standard output is not a terminal, because a script that
@@ -27,7 +33,7 @@ const HOLD_LINE: &str =
 /// A terminal that cannot be put into the mode is left alone and the wait is skipped: the failure
 /// has been printed, and the command exits with its status.
 pub async fn for_a_key() {
-    if !(std::io::stdin().is_terminal() && crate::output::is_terminal()) {
+    if !waits() {
         return;
     }
     // Registered before the terminal is touched, so a signal that comes while the modes are

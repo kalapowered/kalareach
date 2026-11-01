@@ -785,7 +785,8 @@ pub(crate) trait ConsoleInput {
     fn keys(&mut self) -> Result<Vec<Vec<kr_term::win32::KeyRecord>>>;
 
     /// Hands over the first half of a character that was waiting for its second half, if there is
-    /// one, so that it is counted with the records the switch drops.
+    /// one, with the records that came after it, so that they are counted with the records the
+    /// switch drops.
     fn held(&mut self) -> Vec<kr_term::win32::KeyRecord>;
 
     /// Reads the text the console has spelled as UTF-8, without waiting for more: nothing when what
@@ -1073,8 +1074,8 @@ fn read_console(
                     );
                     continue;
                 }
-                // The half of a character the reader held is the last record it will read, and
-                // it is handed on to be dropped with the others and counted.
+                // The half of a character the reader held, with the records after it, is the last
+                // it will read, and it is handed on to be dropped with the others and counted.
                 let held = console.held();
                 if !held.is_empty() && !outlet.send(TerminalInput::Keys(held)) {
                     break;
@@ -1220,19 +1221,19 @@ pub fn spawn_input_reader(
         Ok(ends) => ends,
         Err(_) => {
             // No pipe to wait on: the thread reads as it always did and cannot be woken.
-            let in_read = Arc::new(AtomicBool::new(false));
-            let thread = spawn_blocking_reader(terminal, sender, Arc::clone(&in_read));
-            return Ok((receiver, InputStop::unstoppable(thread, in_read)));
+            let read = ReadState::default();
+            let thread = spawn_blocking_reader(terminal, sender, read.clone());
+            return Ok((receiver, InputStop::unstoppable(thread, read)));
         }
     };
     // Set by the thread when the terminal cannot be waited for, so that it reads without waiting
     // and cannot be woken either.
     let unwakeable = Arc::new(AtomicBool::new(false));
     let unwakeable_here = Arc::clone(&unwakeable);
-    // Set while the thread is inside its blocking read of the terminal, which is where the stop
-    // finds a thread that cannot be woken.
-    let in_read = Arc::new(AtomicBool::new(false));
-    let in_read_here = Arc::clone(&in_read);
+    // Where the thread is with respect to its blocking read of the terminal, which is where the
+    // stop finds a thread that cannot be woken.
+    let read = ReadState::default();
+    let read_here = read.clone();
     let thread = std::thread::spawn(move || {
         let mut terminal = terminal;
         let mut buffer = vec![0_u8; 8 * 1024];
@@ -1264,10 +1265,13 @@ pub fn spawn_input_reader(
             } else if waiting[0].revents().is_empty() {
                 continue;
             }
-            in_read_here.store(true, Ordering::SeqCst);
-            let read = terminal.read(&mut buffer);
-            in_read_here.store(false, Ordering::SeqCst);
-            match read {
+            // A stop that came since the look at the pipe keeps the thread out of the read.
+            if !read_here.enter() {
+                break;
+            }
+            let taken = terminal.read(&mut buffer);
+            read_here.leave();
+            match taken {
                 Ok(0) => break,
                 Ok(read) => {
                     if sender
@@ -1287,7 +1291,7 @@ pub fn spawn_input_reader(
         InputStop {
             wake: Some(wake),
             unwakeable,
-            in_read,
+            read,
             thread,
         },
     ))
@@ -1397,18 +1401,18 @@ impl ConsoleInput for WindowsConsole {
 fn spawn_blocking_reader(
     terminal: std::fs::File,
     sender: tokio::sync::mpsc::UnboundedSender<TerminalInput>,
-    in_read: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    read: ReadState,
 ) -> std::thread::JoinHandle<()> {
-    use std::sync::atomic::Ordering;
-
     std::thread::spawn(move || {
         let mut terminal = terminal;
         let mut buffer = vec![0_u8; 8 * 1024];
         loop {
-            in_read.store(true, Ordering::SeqCst);
-            let read = terminal.read(&mut buffer);
-            in_read.store(false, Ordering::SeqCst);
-            match read {
+            if !read.enter() {
+                break;
+            }
+            let taken = terminal.read(&mut buffer);
+            read.leave();
+            match taken {
                 Ok(0) => break,
                 Ok(read) => {
                     if sender
@@ -1425,6 +1429,51 @@ fn spawn_blocking_reader(
     })
 }
 
+/// Where a Unix reader thread is with respect to its blocking read of the terminal, as one value
+/// the thread and the stop decide on together: a stop that finds the thread between reads keeps it
+/// from ever entering one, and a stop that finds it in one knows it is, whatever the thread does
+/// next.
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct ReadState(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+#[cfg(unix)]
+impl ReadState {
+    const BETWEEN: u8 = 0;
+    const IN_READ: u8 = 1;
+    const STOPPED: u8 = 2;
+
+    /// The thread's, before it reads. False when the stop has been made, and the thread ends.
+    fn enter(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        self.0
+            .compare_exchange(Self::BETWEEN, Self::IN_READ, SeqCst, SeqCst)
+            .is_ok()
+    }
+
+    /// The thread's, once its read has returned. A stop made meanwhile stays made.
+    fn leave(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let _ = self
+            .0
+            .compare_exchange(Self::IN_READ, Self::BETWEEN, SeqCst, SeqCst);
+    }
+
+    /// The stop's: makes the stop and says whether the thread was inside its read when it did.
+    fn stop(&self) -> bool {
+        self.0
+            .swap(Self::STOPPED, std::sync::atomic::Ordering::SeqCst)
+            == Self::IN_READ
+    }
+
+    #[cfg(test)]
+    fn in_read(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) == Self::IN_READ
+    }
+}
+
 /// What ends the thread [`spawn_input_reader`] started.
 ///
 /// A command that goes on after an attachment has ended (a window held open on a failure) reads
@@ -1437,63 +1486,43 @@ pub struct InputStop {
     wake: Option<std::os::fd::OwnedFd>,
     /// Whether the thread found a terminal it cannot wait for and so cannot be woken.
     unwakeable: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Whether the thread is inside its blocking read of the terminal.
-    in_read: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Where the thread is with respect to its blocking read.
+    read: ReadState,
     /// The reading thread.
     thread: std::thread::JoinHandle<()>,
 }
 
-/// How long the stop gives a thread that cannot be woken to be either inside its blocking read or
-/// ended. It needs no key to do either; this only bounds a stalled thread.
-#[cfg(unix)]
-const SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
-
 #[cfg(unix)]
 impl InputStop {
     /// A stop for a thread that cannot be woken.
-    fn unstoppable(
-        thread: std::thread::JoinHandle<()>,
-        in_read: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self {
+    fn unstoppable(thread: std::thread::JoinHandle<()>, read: ReadState) -> Self {
         Self {
             wake: None,
             unwakeable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            in_read,
+            read,
             thread,
         }
     }
 
-    /// Ends the thread, which has ended when this returns unless it cannot be woken. A thread that
-    /// cannot be woken is inside a blocking read of the terminal, where it ends with the next key
-    /// or with the process, and is not joined.
+    /// Ends the thread, which has ended when this returns unless it is inside a blocking read of a
+    /// terminal that cannot be waited for. That read ends with the next key or with the process,
+    /// and the thread is not joined.
     ///
     /// `then_reads` says whether the command goes on to read the terminal itself once the thread
-    /// has been stopped. Only then does the answer say that a thread blocked in a read of a
-    /// terminal that cannot be waited for (macOS answers a poll of `/dev/tty` at once with an
-    /// error) is still running: at a normal end the thread ends with the process, and a line about
-    /// it would be a false warning at every attach. A thread that could not be given a pipe to be
-    /// woken by is said to be still running whatever the command does next.
+    /// has been stopped. Only then does the answer say that the thread is still running and
+    /// waiting for a key: at a normal end the thread ends with the process, and a line about it
+    /// would be a false warning. A thread that is not inside its read when the stop is made never
+    /// enters it.
     pub fn stop(self, then_reads: bool) -> Stopped {
-        use std::sync::atomic::Ordering;
-
-        let no_pipe = self.wake.is_none();
+        let in_a_read = self.read.stop();
         drop(self.wake);
-        if !self.unwakeable.load(Ordering::SeqCst) {
+        if !(in_a_read && self.unwakeable.load(std::sync::atomic::Ordering::SeqCst)) {
             let _ = self.thread.join();
             return Stopped::default();
         }
-        // The thread is on its way into its read, or has seen the pipe closed and is ending.
-        let settled = std::time::Instant::now() + SETTLE;
-        while !self.thread.is_finished()
-            && !self.in_read.load(Ordering::SeqCst)
-            && std::time::Instant::now() < settled
-        {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        let waits = !self.thread.is_finished() && self.in_read.load(Ordering::SeqCst);
         Stopped {
-            still_running: waits && (then_reads || no_pipe),
-            waits_for_a_key: waits && (then_reads || no_pipe),
+            still_running: then_reads,
+            waits_for_a_key: then_reads,
             ..Stopped::default()
         }
     }
@@ -2620,37 +2649,40 @@ mod reader {
 }
 
 /// The stop of a Unix reader that cannot be woken: a terminal that cannot be waited for (macOS
-/// answers a poll of `/dev/tty` at once with an error) leaves the thread in a blocking read, where
-/// it ends with the next key or with the process.
+/// answers a poll of an open of `/dev/tty` at once with an error) leaves the thread in a blocking
+/// read, where it ends with the next key or with the process.
 #[cfg(all(test, unix))]
 mod unix_stop {
     use std::io::{Read as _, Write as _};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
 
-    use super::InputStop;
+    use super::{InputStop, ReadState};
 
     /// A thread blocked in a read of a pipe, as the reader is in a read of the terminal.
     struct Blocked {
         thread: std::thread::JoinHandle<()>,
-        in_read: Arc<AtomicBool>,
+        read: ReadState,
         /// A byte written here ends the read.
         release: std::fs::File,
     }
 
     fn blocked_in_a_read() -> Blocked {
         let (read_end, release) = rustix::pipe::pipe().expect("a pipe");
-        let in_read = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&in_read);
+        let read = ReadState::default();
+        let state = read.clone();
         let thread = std::thread::spawn(move || {
             let mut pipe = std::fs::File::from(read_end);
-            flag.store(true, Ordering::SeqCst);
+            assert!(state.enter(), "the stop has not been made");
             let _ = pipe.read(&mut [0_u8; 1]);
-            flag.store(false, Ordering::SeqCst);
+            state.leave();
         });
+        while !read.in_read() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         Blocked {
             thread,
-            in_read,
+            read,
             release: std::fs::File::from(release),
         }
     }
@@ -2660,27 +2692,21 @@ mod unix_stop {
     fn over(blocked: Blocked, no_pipe: bool) -> (InputStop, std::fs::File) {
         let Blocked {
             thread,
-            in_read,
+            read,
             release,
         } = blocked;
         let stop = if no_pipe {
-            InputStop::unstoppable(thread, in_read)
+            InputStop::unstoppable(thread, read)
         } else {
             let (_ignored, wake) = rustix::pipe::pipe().expect("a pipe");
             InputStop {
                 wake: Some(wake),
                 unwakeable: Arc::new(AtomicBool::new(true)),
-                in_read,
+                read,
                 thread,
             }
         };
         (stop, release)
-    }
-
-    fn waits_in_its_read(blocked: &Blocked) {
-        while !blocked.in_read.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
     }
 
     /// A thread blocked in a read of a terminal that cannot be waited for is still running, and
@@ -2688,9 +2714,7 @@ mod unix_stop {
     /// one the command needs.
     #[test]
     fn a_thread_blocked_in_a_read_is_still_running_where_the_command_reads_next() {
-        let blocked = blocked_in_a_read();
-        waits_in_its_read(&blocked);
-        let (stop, mut release) = over(blocked, false);
+        let (stop, mut release) = over(blocked_in_a_read(), false);
         let stopped = stop.stop(true);
         assert!(
             stopped.still_running && stopped.waits_for_a_key,
@@ -2699,14 +2723,11 @@ mod unix_stop {
         release.write_all(b"x").expect("ends the read");
     }
 
-    /// The same thread, where the command cannot tell whether it reads the terminal next, is not
-    /// said to be running: at a normal end it ends with the process, and a macOS terminal leaves it
-    /// in its read at every attach.
+    /// The same thread, where the command reads nothing next, is not said to be running: at a
+    /// normal end it ends with the process, and a line about it would be a false warning.
     #[test]
-    fn a_thread_blocked_in_a_read_is_not_running_where_the_command_cannot_tell() {
-        let blocked = blocked_in_a_read();
-        waits_in_its_read(&blocked);
-        let (stop, mut release) = over(blocked, false);
+    fn a_thread_blocked_in_a_read_is_not_running_where_the_command_reads_nothing() {
+        let (stop, mut release) = over(blocked_in_a_read(), false);
         let stopped = stop.stop(false);
         assert!(
             !stopped.still_running && !stopped.waits_for_a_key,
@@ -2715,45 +2736,21 @@ mod unix_stop {
         release.write_all(b"x").expect("ends the read");
     }
 
-    /// A thread that could not be given a pipe to be woken by is still running whatever the command
-    /// does next: nothing can ever end its read but a key.
+    /// A thread that could not be given a pipe to be woken by is the same: it is in its read, and
+    /// the command that reads next is told so.
     #[test]
-    fn a_thread_with_no_pipe_to_wake_it_is_still_running_whatever_the_command_does() {
-        let blocked = blocked_in_a_read();
-        waits_in_its_read(&blocked);
-        let (stop, mut release) = over(blocked, true);
-        let stopped = stop.stop(false);
+    fn a_thread_with_no_pipe_to_wake_it_is_said_to_wait_where_the_command_reads_next() {
+        let (stop, mut release) = over(blocked_in_a_read(), true);
+        let stopped = stop.stop(true);
         assert!(
             stopped.still_running && stopped.waits_for_a_key,
             "{stopped:?}"
         );
         release.write_all(b"x").expect("ends the read");
-    }
-
-    /// The reader marks the time it spends inside its read of the terminal, and only that.
-    #[test]
-    fn a_reader_is_marked_while_it_is_inside_its_read_and_not_when_it_has_ended() {
-        let (terminal, hold) = rustix::pipe::pipe().expect("a pipe");
-        let (sender, _input) = tokio::sync::mpsc::unbounded_channel();
-        let in_read = Arc::new(AtomicBool::new(false));
-        let thread = super::spawn_blocking_reader(
-            std::fs::File::from(terminal),
-            sender,
-            Arc::clone(&in_read),
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !in_read.load(Ordering::SeqCst) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the thread never marked itself as inside its read"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(!thread.is_finished(), "the thread waits for a key");
-        // The end of the terminal's input ends the read and the thread.
-        drop(hold);
-        thread.join().expect("the thread ends");
-        assert!(!in_read.load(Ordering::SeqCst));
+        let (stop, mut release) = over(blocked_in_a_read(), true);
+        let stopped = stop.stop(false);
+        assert!(!stopped.still_running, "{stopped:?}");
+        release.write_all(b"x").expect("ends the read");
     }
 
     /// A thread that found a terminal it cannot wait for and then saw the stop is not in a read: it
@@ -2768,7 +2765,7 @@ mod unix_stop {
         let stop = InputStop {
             wake: Some(wake),
             unwakeable: Arc::new(AtomicBool::new(true)),
-            in_read: Arc::new(AtomicBool::new(false)),
+            read: ReadState::default(),
             thread: ended,
         };
         let stopped = stop.stop(true);
@@ -2778,10 +2775,49 @@ mod unix_stop {
         );
     }
 
+    /// A thread that is inside a read of a terminal that can be waited for is in a read that ends
+    /// at once, since the terminal had input: it is joined, and nothing is said of it.
+    #[test]
+    fn a_thread_in_a_read_of_a_terminal_that_can_be_waited_for_is_not_still_running() {
+        let ended = std::thread::spawn(|| {});
+        while !ended.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let read = ReadState::default();
+        assert!(read.enter());
+        let (_ignored, wake) = rustix::pipe::pipe().expect("a pipe");
+        let stop = InputStop {
+            wake: Some(wake),
+            unwakeable: Arc::new(AtomicBool::new(false)),
+            read,
+            thread: ended,
+        };
+        let stopped = stop.stop(true);
+        assert!(
+            !stopped.still_running && !stopped.waits_for_a_key,
+            "{stopped:?}"
+        );
+    }
+
+    /// A thread that is between reads when the stop is made never enters one, however long it takes
+    /// to get there: a stop that found it outside its read and a thread that then blocked in one
+    /// would be a reader the command was never told of.
+    #[test]
+    fn a_thread_between_reads_when_the_stop_is_made_never_enters_a_read() {
+        let read = ReadState::default();
+        assert!(!read.stop(), "the thread was not in a read");
+        assert!(!read.enter(), "the stop has been made");
+        let read = ReadState::default();
+        assert!(read.enter());
+        assert!(read.stop(), "the thread was in its read");
+        read.leave();
+        assert!(!read.enter(), "a stop made in a read stays made");
+    }
+
     /// A reader of a terminal that can be waited for is woken by the stop and has ended when it
     /// returns, wherever the command goes next.
     #[test]
-    fn a_thread_that_can_be_woken_has_ended_when_the_stop_returns() {
+    fn a_thread_that_can_be_woken_is_not_still_running_when_the_stop_returns() {
         let (terminal, keep) = rustix::pipe::pipe().expect("a pipe");
         let switch = super::InputSwitch::new(|| Ok(()));
         let (_input, stop) =
@@ -2792,5 +2828,115 @@ mod unix_stop {
             "{stopped:?}"
         );
         drop(keep);
+    }
+
+    /// A reader that has no pipe is marked while it is inside its read, and its stop says so: it
+    /// is the thread the production code starts, and not one the case made.
+    #[test]
+    fn a_reader_with_no_pipe_is_found_in_its_read_by_the_stop() {
+        let (terminal, keep) = rustix::pipe::pipe().expect("a pipe");
+        let (sender, _input) = tokio::sync::mpsc::unbounded_channel();
+        let read = ReadState::default();
+        let thread =
+            super::spawn_blocking_reader(std::fs::File::from(terminal), sender, read.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !read.in_read() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the thread never went into its read"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let stopped = InputStop::unstoppable(thread, read).stop(true);
+        assert!(
+            stopped.still_running && stopped.waits_for_a_key,
+            "{stopped:?}"
+        );
+        drop(keep);
+    }
+
+    /// The variable that makes this test binary, started in a terminal of its own, run the terminal
+    /// half of the case below: `1` for a command that reads the terminal next, `0` for one that
+    /// does not.
+    const STOP_PROBE: &str = "KR_ATTACH_STOP_PROBE";
+
+    /// The reader over an open of `/dev/tty`, which is what a command started with its input
+    /// redirected from `/dev/tty` reads: macOS answers a poll of it at once with an error, so the
+    /// thread cannot be woken and the stop finds it in its read, and anywhere else the thread waits
+    /// for the terminal and the pipe and the stop wakes it.
+    #[test]
+    fn a_reader_over_dev_tty_is_still_running_only_on_a_terminal_that_cannot_be_waited_for() {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+        if let Some(then_reads) = std::env::var_os(STOP_PROBE) {
+            stop_probe_in_a_terminal(then_reads == "1");
+            return;
+        }
+        let name = "attach::unix_stop::\
+                    a_reader_over_dev_tty_is_still_running_only_on_a_terminal_that_cannot_be_waited_for";
+        for then_reads in [true, false] {
+            let pty = native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 100,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect("opens a terminal");
+            let mut command = CommandBuilder::new(std::env::current_exe().expect("this binary"));
+            command.args(["--exact", name, "--nocapture", "--test-threads=1"]);
+            command.env(STOP_PROBE, if then_reads { "1" } else { "0" });
+            let mut child = pty.slave.spawn_command(command).expect("starts the probe");
+            drop(pty.slave);
+            let mut shown = String::new();
+            let mut reader = pty.master.try_clone_reader().expect("a reader");
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let mut buffer = [0_u8; 4096];
+                    while let Ok(read) = reader.read(&mut buffer) {
+                        if read == 0 {
+                            break;
+                        }
+                        shown.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                    }
+                });
+                let _ = child.wait();
+                drop(pty.master);
+            });
+            let waiting = then_reads && cfg!(target_os = "macos");
+            assert!(
+                shown.contains(&format!(
+                    "kr-probe:stopped:still_running={waiting}:waits_for_a_key={waiting}"
+                )),
+                "a command that reads next={then_reads}: {shown:?}"
+            );
+        }
+    }
+
+    /// The terminal half of the case above: starts the reader over `/dev/tty` and stops it.
+    fn stop_probe_in_a_terminal(then_reads: bool) {
+        let terminal = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .expect("this process has a terminal");
+        let switch = super::InputSwitch::new(|| Ok(()));
+        let (_input, stop) = super::spawn_input_reader(terminal, &switch).expect("a reader");
+        if cfg!(target_os = "macos") {
+            // The thread is in its blocking read once it has met the error and the pipe is open.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !stop.read.in_read() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the thread never went into its read"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        let stopped = stop.stop(then_reads);
+        println!(
+            "kr-probe:stopped:still_running={}:waits_for_a_key={}",
+            stopped.still_running, stopped.waits_for_a_key
+        );
     }
 }

@@ -290,7 +290,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 presentation,
                 kr_cli::session::UndeliveredTyping::new(typed_while_asking.len()),
                 typed_while_asking,
-                arguments.hold_on_failure && !cli.json,
+                arguments.hold_on_failure && !cli.json && kr_cli::hold::waits(),
             )
             .await;
             Ok(creation_report(
@@ -1879,7 +1879,7 @@ async fn new_in_enrolled(
                     no_probe: false,
                     follow_live: false,
                     typed_before: typed_while_asking,
-                    then_reads: arguments.hold_on_failure && !json,
+                    then_reads: arguments.hold_on_failure && !json && kr_cli::hold::waits(),
                 },
                 owed,
             )
