@@ -6309,63 +6309,99 @@ async fn a_fence_owed_while_the_read_that_settles_the_bundle_write_is_out_leaves
     );
 }
 
+/// What the host owes the service now.
+fn the_delay_the_host_owes(rig: &Rig) -> Option<Duration> {
+    rig.controller
+        .backup_runtime()
+        .expect("a carrier")
+        .quiet()
+        .left()
+}
+
+/// What the owner is told of the storage state by a look that finds the host signed in. A look
+/// that finds it otherwise was cut by the bound it keeps on the wait for the sign-in, which a runner
+/// that stops can pass, and says nothing of the service, so it is made again.
+async fn the_storage_state_the_owner_is_told(rig: &Rig) -> BackupStorageState {
+    within("a look that finds the host signed in", async {
+        loop {
+            let status = rig.backup_status().await;
+            if status.sign_in == BackupSignIn::Usable {
+                return status.storage;
+            }
+        }
+    })
+    .await
+}
+
 /// KR-REQ-09.09: a delay the service names in an answer that ends the call before the place that
-/// usually owes it is owed all the same, and holds back what asks the service next. The owner's next
-/// look at the service is what shows it: it sends nothing and says the service asked to be left alone.
-/// Two such answers. The first is the refusal of the enrolment, which carries no token and so leaves
-/// under the account the call began under after another account has signed in; the call ends as
-/// another account's. The second is the refusal of the read that settles a bundle write, which
-/// carries the code of a token the service does not take; the call ends as a decline for it.
+/// usually owes it is owed all the same, for as long as the service named, and holds back what asks
+/// the service next. The owner's next look at the service is what shows it: it sends nothing and
+/// says the service asked to be left alone. Two such answers. The first is the refusal of the
+/// enrolment, which carries no token and so leaves under the account the call began under after
+/// another account has signed in; the call ends as another account's. The second is the refusal of
+/// the read that settles a bundle write, which carries the code of a token the service does not
+/// take; the call ends as a decline for it. The control for each: the same answer naming no delay
+/// leaves the host owing none, so the delay owed is the service's and not one the host adds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delay_named_in_an_answer_that_ends_the_call_at_once_is_owed() {
-    let delay = |status: u16, code: &'static str| Moment::Refuse {
-        status,
-        code,
-        retry_after_seconds: Some(30),
-    };
     let delayed = BackupStorageState::Unread {
         why: BackupStorageUnread::Delayed,
     };
+    for named in [Some(30_u64), None] {
+        let refusal = |status: u16, code: &'static str| Moment::Refuse {
+            status,
+            code,
+            retry_after_seconds: named,
+        };
+        let owed = named.map(Duration::from_secs);
 
-    // The enrolment, after another account signed in while the bundle write was out.
-    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
-    let web = Arc::clone(rig.served.web());
-    let made = rig.prepared_setup(archive_id(), false);
-    web.fail(SYNC, 1, Moment::Slow);
-    web.fail(MANIFEST, 1, delay(429, "RATE_LIMITED"));
-    let call = rig.enable_in_the_background(&made.params);
-    within("the bundle write", web.requests_reach(SYNC, 1)).await;
-    rig.sign_in_as("account-2").await;
-    web.release_held();
-    assert_eq!(
-        call.await.expect("the call ends"),
-        BackupEnableResult::Declined {
-            cause: BackupEnableCause::AnotherAccount {}
+        // The enrolment, after another account signed in while the bundle write was out. Its code
+        // is not the rate limit's, so a delay owed for that one only does not pass.
+        let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+        let web = Arc::clone(rig.served.web());
+        let made = rig.prepared_setup(archive_id(), false);
+        web.fail(SYNC, 1, Moment::Slow);
+        web.fail(MANIFEST, 1, refusal(503, "SERVICE_UNAVAILABLE"));
+        let call = rig.enable_in_the_background(&made.params);
+        within("the bundle write", web.requests_reach(SYNC, 1)).await;
+        rig.sign_in_as("account-2").await;
+        web.release_held();
+        assert_eq!(
+            call.await.expect("the call ends"),
+            BackupEnableResult::Declined {
+                cause: BackupEnableCause::AnotherAccount {}
+            }
+        );
+        assert_eq!(
+            web.requests_to(MANIFEST),
+            1,
+            "the enrolment carries no token, so it left"
+        );
+        assert_eq!(the_delay_the_host_owes(&rig), owed);
+        if named.is_some() {
+            assert_eq!(the_storage_state_the_owner_is_told(&rig).await, delayed);
         }
-    );
-    assert_eq!(
-        web.requests_to(MANIFEST),
-        1,
-        "the enrolment carries no token, so it left"
-    );
-    assert_eq!(rig.backup_status().await.storage, delayed);
 
-    // The read that settles a bundle write the service held open and let go unanswered.
-    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
-    let web = Arc::clone(rig.served.web());
-    let made = rig.prepared_setup(archive_id(), false);
-    web.fail(SYNC, 1, Moment::Hold);
-    web.fail(SYNC, 2, delay(404, "COLLECTION_ABSENT"));
-    let call = rig.enable_in_the_background(&made.params);
-    within("the bundle write", web.requests_reach(SYNC, 1)).await;
-    web.release_held();
-    assert_eq!(
-        call.await.expect("the call ends"),
-        BackupEnableResult::Declined {
-            cause: BackupEnableCause::TokenNotAccepted {}
+        // The read that settles a bundle write the service held open and let go unanswered.
+        let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+        let web = Arc::clone(rig.served.web());
+        let made = rig.prepared_setup(archive_id(), false);
+        web.fail(SYNC, 1, Moment::Hold);
+        web.fail(SYNC, 2, refusal(404, "COLLECTION_ABSENT"));
+        let call = rig.enable_in_the_background(&made.params);
+        within("the bundle write", web.requests_reach(SYNC, 1)).await;
+        web.release_held();
+        assert_eq!(
+            call.await.expect("the call ends"),
+            BackupEnableResult::Declined {
+                cause: BackupEnableCause::TokenNotAccepted {}
+            }
+        );
+        assert_eq!(the_delay_the_host_owes(&rig), owed);
+        if named.is_some() {
+            assert_eq!(the_storage_state_the_owner_is_told(&rig).await, delayed);
         }
-    );
-    assert_eq!(rig.backup_status().await.storage, delayed);
+    }
 }
 
 /// KR-REQ-09.09: a delay the service named while the call waits on it holds back the request that
