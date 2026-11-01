@@ -1735,26 +1735,10 @@ impl DescriptionService {
             if dispatched.stopping.is_some() {
                 return None;
             }
-            let session_id = dispatched.job.session_id;
-            let cancelled = dispatched.cancellation.is_cancelled();
-            let ran_at = dispatched.produced_under.context_revision;
-            let stop = if cancelled
-                // A fence raised while this job was being dispatched finds no token to cancel, as
-                // it is raised before the job's is registered: the job is stopped here instead, at
-                // the next look, whatever the fence's own cancellation reached.
-                || self.fence.is_fenced(&session_id)
-            {
-                Stop::Cancelled
-            } else if dispatched.outlived || !self.live_sessions.contains(&session_id) {
-                Stop::Closed
-            } else if !dispatched.job.work.is_summary()
-                && self.revision(&session_id) != Some(ran_at)
-            {
-                Stop::Superseded
-            } else if paused {
-                Stop::Paused
-            } else {
-                return None;
+            let stop = match self.reason_to_stop(dispatched) {
+                Some(stop) => stop,
+                None if paused => Stop::Paused,
+                None => return None,
             };
             let dispatched = self.job.as_mut()?;
             dispatched.cancellation.cancel();
@@ -1786,6 +1770,29 @@ impl DescriptionService {
             id: *id,
             work: Work::Load,
         })
+    }
+
+    /// Returns why the service would stop this job at its next look for a reason of its own that
+    /// is not a pause: its token was cancelled, privacy mode fenced its session, its session
+    /// closed or opened again, or a change moved its session's revision on, so that it describes
+    /// what the session was.
+    ///
+    /// A fence raised while the job was being dispatched finds no token to cancel, as it is raised
+    /// before the job's is registered: the job is stopped at the next look instead, whatever the
+    /// fence's own cancellation reached.
+    fn reason_to_stop(&self, dispatched: &Dispatched) -> Option<Stop> {
+        let session_id = dispatched.job.session_id;
+        if dispatched.cancellation.is_cancelled() || self.fence.is_fenced(&session_id) {
+            Some(Stop::Cancelled)
+        } else if dispatched.outlived || !self.live_sessions.contains(&session_id) {
+            Some(Stop::Closed)
+        } else if !dispatched.job.work.is_summary()
+            && self.revision(&session_id) != Some(dispatched.produced_under.context_revision)
+        {
+            Some(Stop::Superseded)
+        } else {
+            None
+        }
     }
 
     /// Returns whether the policy pauses inference under these conditions.
@@ -2355,21 +2362,15 @@ impl DescriptionService {
                     return self.requeue_unless_cancelled(dispatched);
                 }
                 // The daemon's request at the deadline is the only thing that stopped it: a caller
-                // who cancelled it (which cancels the job's token at once, before any turn), or a
-                // stop of the service's own, has it end cancelled.
-                if dispatched.deadline_stop && stopped(&dispatched).is_none() {
-                    self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
-                    self.restart.late(now);
-                    return Outcome::DeadlineExceeded { session_id };
+                // who cancelled it, or a stop of the service's own, whether it was applied or is
+                // still to be at the next look, has it end cancelled.
+                if dispatched.deadline_stop && !self.stopped_otherwise(&dispatched) {
+                    return self.deadline_missed(&dispatched, now);
                 }
                 self.counts.cancelled = self.counts.cancelled.saturating_add(1);
                 Outcome::Cancelled { session_id }
             }
-            JobEnd::DeadlineExceeded => {
-                self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
-                self.restart.late(now);
-                Outcome::DeadlineExceeded { session_id }
-            }
+            JobEnd::DeadlineExceeded => self.deadline_missed(&dispatched, now),
             JobEnd::MemoryCeiling => {
                 // The job is not queued again: it is the job that passed the ceiling.
                 self.unload_owed = Some(UnloadReason::Paused(PauseReason::MemoryPressure));
@@ -2426,6 +2427,11 @@ impl DescriptionService {
         self.measure(&dispatched, now);
         match why {
             ProcessEnd::PastDeadline => {
+                // The process's end is counted as a failure of inference and sets its own wait,
+                // so the job adds none. A caller who cancelled the job first has it end cancelled.
+                if let Some(cancelled) = self.cancelled_first(&dispatched) {
+                    return cancelled;
+                }
                 self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
                 Outcome::DeadlineExceeded { session_id }
             }
@@ -2451,9 +2457,8 @@ impl DescriptionService {
     /// service's own reasons: a job queued again would get a new token that nothing had cancelled.
     fn retry_or_end(&mut self, dispatched: Dispatched, detail: String) -> Outcome {
         let session_id = dispatched.job.session_id;
-        if self.cancelled_by_caller(&dispatched) {
-            self.counts.cancelled = self.counts.cancelled.saturating_add(1);
-            return Outcome::Cancelled { session_id };
+        if let Some(cancelled) = self.cancelled_first(&dispatched) {
+            return cancelled;
         }
         match stopped(&dispatched) {
             Some(stop) if stop.requeues() => self.requeue(dispatched, false),
@@ -2472,18 +2477,50 @@ impl DescriptionService {
     /// Queues a job that was stopped for a pause again, with its place, unless a caller cancelled
     /// it, which ends it.
     fn requeue_unless_cancelled(&mut self, dispatched: Dispatched) -> Outcome {
-        if self.cancelled_by_caller(&dispatched) {
-            self.counts.cancelled = self.counts.cancelled.saturating_add(1);
-            return Outcome::Cancelled {
-                session_id: dispatched.job.session_id,
-            };
+        if let Some(cancelled) = self.cancelled_first(&dispatched) {
+            return cancelled;
         }
         self.requeue(dispatched, false)
+    }
+
+    /// Counts a job that passed its deadline, and makes the next job wait, unless a caller
+    /// cancelled it first, which ends it cancelled and leaves the next job no wait.
+    fn deadline_missed(&mut self, dispatched: &Dispatched, now: Reading) -> Outcome {
+        if let Some(cancelled) = self.cancelled_first(dispatched) {
+            return cancelled;
+        }
+        self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
+        self.restart.late(now);
+        Outcome::DeadlineExceeded {
+            session_id: dispatched.job.session_id,
+        }
+    }
+
+    /// Closes the running job's handle, and counts the job cancelled when a caller cancelled it
+    /// before. Every decision that would count a job as past its deadline, or as anything else a
+    /// caller's cancellation outranks, asks this first, so that a cancellation a caller was told
+    /// stopped a job is never counted as a deadline miss.
+    fn cancelled_first(&mut self, dispatched: &Dispatched) -> Option<Outcome> {
+        self.cancelled_by_caller(dispatched).then(|| {
+            self.counts.cancelled = self.counts.cancelled.saturating_add(1);
+            Outcome::Cancelled {
+                session_id: dispatched.job.session_id,
+            }
+        })
+    }
+
+    /// Returns whether something other than the job's deadline stops it: a stop the service has
+    /// decided, a cancellation a caller or privacy mode made, or a reason of the service's own that
+    /// it has not yet acted on because the answer was read first.
+    fn stopped_otherwise(&self, dispatched: &Dispatched) -> bool {
+        dispatched.stopping.is_some() || self.reason_to_stop(dispatched).is_some()
     }
 
     /// Closes the running job's handle, which is the moment its fate is decided, and says whether a
     /// caller cancelled it first. A cancellation after this finds nothing running.
     fn cancelled_by_caller(&self, dispatched: &Dispatched) -> bool {
+        #[cfg(feature = "testing")]
+        crate::testing::closing();
         let by_caller = self.running.close(&dispatched.job.session_id);
         #[cfg(feature = "testing")]
         crate::testing::decided();
@@ -2565,6 +2602,8 @@ impl InFlightRecords {
 
 impl Drop for InFlightRecords {
     fn drop(&mut self) {
+        #[cfg(feature = "testing")]
+        crate::testing::closing();
         self.running.finished();
         self.in_flight.reconciled(&self.session_id);
     }

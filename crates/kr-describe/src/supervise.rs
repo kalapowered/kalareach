@@ -16,7 +16,7 @@
 //! | --- | --- |
 //! | The handshake | [`HANDSHAKE_MS`] for `ready` |
 //! | A load | its own deadline, plus [`ANSWER_GRACE_MS`] |
-//! | A job | its execution deadline, plus [`ANSWER_GRACE_MS`]; a process whose control thread has said it read the request to stop that the daemon makes at the deadline is given [`STOP_BOUND_MS`] after the deadline instead |
+//! | A job | its execution deadline, when the daemon asks the process to stop it; then [`ANSWER_GRACE_MS`] after the request, or for a process whose control thread has said it read the request [`STOP_BOUND_MS`] after it |
 //! | A cancellation | [`CANCEL_MS`] for the process to say it has read it; a load's or a check's own answer is then held to the same bound |
 //! | A check of a file | its deadline, plus [`ANSWER_GRACE_MS`] |
 //! | The ceiling | the process's resident set, read every [`SAMPLE_MS`] while it loads or runs a job, so a process over it is ended by the first reading after it passed, and on Windows the system's own limit on its committed memory ([`Launch::system_memory_limit`]) |
@@ -65,19 +65,25 @@ use crate::wire::{
 /// How long a process has to answer `hello`.
 pub const HANDSHAKE_MS: u64 = 10_000;
 
-/// How far past its own deadline a load or a job may go before the process is ended.
+/// How far past its own deadline a load may go before the process is ended, and how long after the
+/// request to stop a job a process that has not said it read the request is given.
 pub const ANSWER_GRACE_MS: u64 = 2_000;
 
 /// How long a job whose control thread has said it has read a stop is given to answer, from the
-/// job's deadline.
+/// request to stop it.
 ///
-/// A job past its deadline is asked to stop at the deadline. The grace after it ends a process that
-/// has not said it read the request: its control thread is not listening. A process that has said
-/// so is listening and has not yet reached a place where the model can stop, which a busy host in
-/// the background class takes a while to do: the longest stop seen there was 15 seconds. Ending it
-/// costs a new load of the model, 8 to 15 seconds, and a failure of inference. So it is given twice
-/// the longest stop seen, which is also a session's cooldown, 30 seconds. The process holds one job
-/// at a time, so a stop that takes the whole bound delays the next job of every session by as much.
+/// A job past its deadline is asked to stop at the deadline, or at the daemon's first look after
+/// it. The grace after the request ends a process that has not said it read it: its control thread
+/// is not listening. A process that has said so is listening and has not yet reached a place where
+/// the model can stop, which a busy host in the background class takes a while to do: the longest
+/// stop seen there was 15 seconds. Ending it costs a new load of the model, 8 to 15 seconds, and a
+/// failure of inference. So it is given twice the longest stop seen, which is also a session's
+/// cooldown, 30 seconds. The process holds one job at a time, so a stop that takes the whole bound
+/// delays the next job of every session by as much.
+///
+/// The time counts from the request and not from the deadline. The daemon reads a clock that counts
+/// the time a Mac sleeps, and the process reads one that does not, so the daemon's first look after
+/// a sleep can be long after the deadline while the process has not had its own time to answer.
 pub const STOP_BOUND_MS: u64 = 30_000;
 
 /// How long a process has to say it has read a cancellation, and how long a load or a check of a
@@ -86,11 +92,11 @@ pub const STOP_BOUND_MS: u64 = 30_000;
 /// A job's cancellation is held to the first alone: the control thread says at once that it has
 /// read it, and the job's own answer is then bounded by the job's deadline and, for a stop that
 /// was read, [`STOP_BOUND_MS`] after it, and by the process's own watchdog, so a busy host that
-/// takes a moment to stop a job is not mistaken for a process that is not listening. A load and a check of a file lose nothing when the process is ended, so each is
-/// held to this bound for its own answer too. A process that said it had read the cancellation and
-/// then did not stop the load or the check is ended without a failure of inference
-/// ([`ProcessEnd::StopOverdue`]); one that did not say so is not listening, which is one
-/// ([`ProcessEnd::CancelUnanswered`]).
+/// takes a moment to stop a job is not mistaken for a process that is not listening. A load and a
+/// check of a file lose nothing when the process is ended, so each is held to this bound for its
+/// own answer too. A process that said it had read the cancellation and then did not stop the load
+/// or the check is ended without a failure of inference ([`ProcessEnd::StopOverdue`]); one that did
+/// not say so is not listening, which is one ([`ProcessEnd::CancelUnanswered`]).
 pub const CANCEL_MS: u64 = 2_000;
 
 /// How often the process's resident set is read while it loads or runs a job.
@@ -237,8 +243,9 @@ struct JobStop {
     id: u64,
     /// When the job's deadline passes, on the continuous clock.
     deadline_at_ms: u64,
-    /// Whether the process has been asked to stop the job for its deadline.
-    asked: bool,
+    /// When the process was asked to stop the job for its deadline, on the continuous clock, once it
+    /// has been: the deadline, or the daemon's first look after it.
+    asked_at_ms: Option<u64>,
     /// Whether the control thread has said it has read the request.
     acknowledged: bool,
 }
@@ -273,18 +280,31 @@ impl Running {
     /// stop the job in hand.
     fn job_stop_read(&self, id: u64) -> bool {
         self.job_stop
-            .is_some_and(|stop| stop.id == id && stop.asked && stop.acknowledged)
+            .is_some_and(|stop| stop.id == id && stop.asked_at_ms.is_some() && stop.acknowledged)
+            || self
+                .cancel
+                .is_some_and(|cancel| cancel.id == id && cancel.acknowledged)
     }
 
-    /// When the work in hand has run too long: its deadline and the grace after it, or for a job
-    /// whose stop the control thread has read, the stop bound after the deadline when that is later.
+    /// When the work in hand has run too long. A load's is its deadline and the grace after it. A
+    /// job's is the grace after the request to stop it, or for a job whose stop the control thread
+    /// has read, the stop bound after the request. The request is made at the job's deadline, or at
+    /// the daemon's first look after it, and the time the process is given counts from the request
+    /// and not from the deadline, so that a look that comes late does not end a process before it
+    /// has had time to answer. A caller's cancellation that the control thread has read gives the
+    /// job the stop bound from its deadline, before the daemon has asked, as the process's watchdog
+    /// does.
     fn work_ends_at_ms(&self, due: Due) -> u64 {
-        match self.job_stop {
-            Some(stop) if stop.id == due.id && self.job_stop_read(due.id) => due
-                .at_ms
-                .max(stop.deadline_at_ms.saturating_add(STOP_BOUND_MS)),
-            _ => due.at_ms,
-        }
+        let Some(stop) = self.job_stop.filter(|stop| stop.id == due.id) else {
+            return due.at_ms;
+        };
+        let from = stop.asked_at_ms.unwrap_or(stop.deadline_at_ms);
+        let given = if self.job_stop_read(due.id) {
+            STOP_BOUND_MS
+        } else {
+            ANSWER_GRACE_MS
+        };
+        due.at_ms.max(from.saturating_add(given))
     }
 }
 
@@ -464,7 +484,7 @@ impl Driver {
         self.process
             .as_ref()
             .and_then(|running| running.job_stop)
-            .filter(|stop| stop.asked)
+            .filter(|stop| stop.asked_at_ms.is_some())
             .map(|stop| stop.acknowledged)
     }
 
@@ -487,7 +507,7 @@ impl Driver {
                 soonest = soonest
                     .min(running.work_ends_at_ms(due))
                     .min(running.next_sample_ms);
-                if let Some(stop) = running.job_stop.filter(|stop| !stop.asked) {
+                if let Some(stop) = running.job_stop.filter(|stop| stop.asked_at_ms.is_none()) {
                     soonest = soonest.min(stop.deadline_at_ms);
                 }
             }
@@ -1019,7 +1039,7 @@ impl Driver {
             running.job_stop = job.then(|| JobStop {
                 id,
                 deadline_at_ms: now.monotonic_ms().saturating_add(deadline_ms),
-                asked: false,
+                asked_at_ms: None,
                 acknowledged: false,
             });
             running.next_sample_ms = now.monotonic_ms().saturating_add(SAMPLE_MS);
@@ -1085,7 +1105,7 @@ impl Driver {
                     }
                     if let Some(stop) = running.job_stop.as_mut()
                         && stop.id == id.get()
-                        && stop.asked
+                        && stop.asked_at_ms.is_some()
                     {
                         stop.acknowledged = true;
                     }
@@ -1178,20 +1198,19 @@ impl Driver {
         };
         let at = now.monotonic_ms();
         // A job that has passed its deadline is asked to stop. A process whose control thread
-        // says it has read the request is listening, and is given the stop bound to answer; one
-        // that does not is ended at the grace, as it was.
+        // says it has read the request is listening, and is given the stop bound from the request
+        // to answer; one that does not is ended at the grace after it.
         let stop = running
             .job_stop
             .filter(|stop| {
-                !stop.asked
+                stop.asked_at_ms.is_none()
                     && at >= stop.deadline_at_ms
                     && running.work.is_some_and(|due| due.id == stop.id)
             })
             .map(|stop| stop.id);
-        let asked_now = stop.is_some();
         if let Some(id) = stop {
             if let Some(stop) = running.job_stop.as_mut() {
-                stop.asked = true;
+                stop.asked_at_ms = Some(at);
             }
             self.service.job_asked_to_stop_at_its_deadline(id);
             if !self.send(&Request::Cancel { id: U64::new(id) }, now, reports)? {
@@ -1212,13 +1231,10 @@ impl Driver {
             } else {
                 ProcessEnd::CancelUnanswered
             })
-        } else if !asked_now
-            && running
-                .work
-                .is_some_and(|due| at >= running.work_ends_at_ms(due))
+        } else if running
+            .work
+            .is_some_and(|due| at >= running.work_ends_at_ms(due))
         {
-            // Not in the turn that asked, which the process has had no time to answer: the grace
-            // counts from the request.
             Some(ProcessEnd::PastDeadline)
         } else if running.check.is_some_and(|due| at >= due.at_ms) {
             Some(ProcessEnd::CheckOverdue)

@@ -22,7 +22,7 @@ use kr_describe::service::{
     ProcessEnd, RESTART_FIRST_MS, RESTART_MOST_MS, UnloadReason, Work,
 };
 use kr_describe::store::DescriptionStore;
-use kr_describe::testing::{Output, answer_of, at_next_decision};
+use kr_describe::testing::{Output, answer_of, at_next_close, at_next_decision};
 use kr_describe::time::Reading;
 use kr_describe::wire::{JobEnd, LoadEnd, Phases};
 use kr_protocol::ids::{SessionEpoch, SessionId};
@@ -2387,6 +2387,68 @@ fn a_job_stopped_at_its_deadline_ends_past_it_unless_something_else_stopped_it()
         }
     );
 
+    // A session that closed after the request ends it cancelled and leaves the next job no wait:
+    // whether the service had cancelled the job at its next look before the answer, or the answer
+    // was read first.
+    for looked_first in [true, false] {
+        let mut service = self::service();
+        let id = sent(&mut service);
+        service.job_asked_to_stop_at_its_deadline(id);
+        service.session_closed(&session(1), after);
+        if looked_first {
+            assert_eq!(
+                service.next(&roomy(), after).expect("an instruction"),
+                Instruction::Cancel {
+                    id,
+                    work: Work::Job
+                }
+            );
+        }
+        assert_eq!(
+            service
+                .finished(id, stopped.clone(), after)
+                .expect("the answer"),
+            Outcome::Cancelled {
+                session_id: session(1)
+            },
+            "the service looked first: {looked_first}"
+        );
+        assert_no_wait_for_the_next_job(&mut service, after);
+    }
+
+    // So does a change that made the job's description stale.
+    for looked_first in [true, false] {
+        let mut service = self::service();
+        let id = sent(&mut service);
+        service.job_asked_to_stop_at_its_deadline(id);
+        change(&mut service, &session(1), "crates", after);
+        assert!(
+            service
+                .settle(&session(1), Priority::Ordinary, after.after_ms(2_000))
+                .is_some()
+        );
+        let after = after.after_ms(2_000);
+        if looked_first {
+            assert_eq!(
+                service.next(&roomy(), after).expect("an instruction"),
+                Instruction::Cancel {
+                    id,
+                    work: Work::Job
+                }
+            );
+        }
+        assert_eq!(
+            service
+                .finished(id, stopped.clone(), after)
+                .expect("the answer"),
+            Outcome::Cancelled {
+                session_id: session(1)
+            },
+            "the service looked first: {looked_first}"
+        );
+        assert_no_wait_for_the_next_job(&mut service, after);
+    }
+
     // The control: the daemon never asked, and the process stopped the job.
     let mut service = self::service();
     let id = sent(&mut service);
@@ -2396,6 +2458,95 @@ fn a_job_stopped_at_its_deadline_ends_past_it_unless_something_else_stopped_it()
             session_id: session(1)
         }
     );
+}
+
+/// Asserts that a job queued now is sent at once: nothing made the next job wait.
+fn assert_no_wait_for_the_next_job(service: &mut DescriptionService, now: Reading) {
+    assert_eq!(service.counts().deadline_exceeded, 0);
+    queue(service, &session(9), "kalareach", now);
+    assert!(
+        matches!(
+            service
+                .next(&roomy(), now.after_ms(2_000))
+                .expect("an instruction"),
+            Instruction::Generate { .. }
+        ),
+        "the next job waits"
+    );
+}
+
+/// KR-REQ-22.21: a cancellation that a caller is told stopped a job is never counted as a job that
+/// passed its deadline, whichever way the job comes to be judged past its deadline: the process
+/// answers that it stopped after the daemon's request, the process answers on its own that the
+/// deadline passed, or the daemon ends the process for it. The service closes the running job's
+/// handle at the moment it decides, and a cancellation accepted until then ends the job cancelled
+/// and leaves the next job no wait. One that arrives after finds nothing running, and the job is
+/// counted past its deadline, so a cancellation is honoured or refused, never both.
+#[test]
+fn a_cancellation_accepted_before_the_handle_closes_is_never_a_missed_deadline() {
+    let stopped = Answered::Ended {
+        why: JobEnd::Cancelled,
+        detail: None,
+    };
+    let overran = Answered::Ended {
+        why: JobEnd::DeadlineExceeded,
+        detail: None,
+    };
+    let after = at(3_000).after_ms(Budgets::DEFAULTS.execution_deadline_ms);
+    // How each job is judged past its deadline: what the service is told, and whether the daemon
+    // asked the process to stop first.
+    for (form, deadline_stop) in [(Some(stopped), true), (Some(overran), false), (None, false)] {
+        for accepted in [true, false] {
+            let mut service = service();
+            queue(&mut service, &session(1), "kalareach", at(0));
+            let Instruction::Generate { id, .. } = loaded(&mut service, at(3_000)) else {
+                panic!("the job is sent");
+            };
+            if deadline_stop {
+                service.job_asked_to_stop_at_its_deadline(id);
+            }
+            let told = std::rc::Rc::new(std::cell::Cell::new(None));
+            let running = service.running_job().clone();
+            let cancel = {
+                let told = std::rc::Rc::clone(&told);
+                move || told.set(Some(running.cancel(&session(1))))
+            };
+            // Before the handle closes the cancellation is accepted; after, it finds nothing.
+            if accepted {
+                at_next_close(cancel);
+            } else {
+                at_next_decision(cancel);
+            }
+            let outcomes = match form.clone() {
+                Some(answer) => vec![service.finished(id, answer, after).expect("the answer")],
+                None => service
+                    .process_ended(ProcessEnd::PastDeadline, after)
+                    .expect("the end"),
+            };
+            assert_eq!(told.get(), Some(accepted), "{form:?}: told {accepted}");
+            let expected = if accepted {
+                Outcome::Cancelled {
+                    session_id: session(1),
+                }
+            } else {
+                Outcome::DeadlineExceeded {
+                    session_id: session(1),
+                }
+            };
+            assert_eq!(outcomes[0], expected, "{form:?}: accepted {accepted}");
+            assert_eq!(service.counts().cancelled, u64::from(accepted));
+            if form.is_some() {
+                // The wait after a miss belongs to the job that was told it stopped nothing.
+                queue(&mut service, &session(2), "kalareach", after);
+                let next = service.next(&roomy(), after).expect("an instruction");
+                assert_eq!(
+                    matches!(next, Instruction::Generate { .. }),
+                    accepted,
+                    "{form:?}: accepted {accepted}: {next:?}"
+                );
+            }
+        }
+    }
 }
 
 /// A session whose changes wait for its job to end reports no time to settle at, so a host that

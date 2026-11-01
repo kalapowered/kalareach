@@ -133,6 +133,11 @@ thread_local! {
     static AT_DECISION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 
+    /// What runs the next time the service on this thread is about to close the running job's
+    /// handle.
+    static AT_CLOSE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+
     /// Whether the system has refused the process of a driver on this thread memory since the
     /// driver last asked.
     static MEMORY_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -219,6 +224,20 @@ pub fn at_next_decision(hook: impl FnOnce() + 'static) {
 /// Runs the hook [`at_next_decision`] set, once.
 pub(crate) fn decided() {
     if let Some(hook) = AT_DECISION.with(|held| held.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// Runs `hook` the next time the service on this thread is about to close the running job's
+/// handle, which is the moment a job's fate is decided: a cancellation from another thread that
+/// arrives here is still accepted, and one that arrives after finds nothing running.
+pub fn at_next_close(hook: impl FnOnce() + 'static) {
+    AT_CLOSE.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Runs the hook [`at_next_close`] set, once.
+pub(crate) fn closing() {
+    if let Some(hook) = AT_CLOSE.with(|held| held.borrow_mut().take()) {
         hook();
     }
 }

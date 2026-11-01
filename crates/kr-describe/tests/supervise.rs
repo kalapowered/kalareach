@@ -56,6 +56,11 @@ const REAL: Duration = Duration::from_secs(20);
 /// that counts in it fails when the default changes.
 const DEADLINE_MS: u64 = 30_000;
 
+/// How long a process that has read the request to stop a job is given to answer, from the request:
+/// the guide's thirty seconds, written out so that a case that counts in it fails when the bound
+/// changes.
+const STOP_BOUND: u64 = 30_000;
+
 /// One description process, driven over its real pipes, with the store in a directory of the
 /// test's own on the internal disk.
 struct Rig {
@@ -604,12 +609,17 @@ fn a_frame_cut_short_ends_the_process() {
     queue(rig.service(), &session(1), Priority::Ordinary, at(0));
     rig.job_sent(at(3_000));
     std::thread::sleep(Duration::from_millis(300));
-    let due = 3_000 + DEADLINE_MS + ANSWER_GRACE_MS;
+    // The job is asked to stop at its deadline, which this process never reads, and the grace runs
+    // from that request.
+    let deadline = 3_000 + DEADLINE_MS;
+    let due = deadline + ANSWER_GRACE_MS;
+    let reports = rig.driver.turn(&roomy(), at(deadline)).expect("a turn");
+    assert!(outcomes(&reports).is_empty(), "{reports:?}");
     let reports = rig.driver.turn(&roomy(), at(due - 1)).expect("a turn");
     assert!(outcomes(&reports).is_empty(), "{reports:?}");
     assert!(
         rig.driver.pid().is_some(),
-        "not a moment before its deadline"
+        "not a moment before its deadline and the grace"
     );
     let reports = rig.driver.turn(&roomy(), at(due)).expect("a turn");
     let ended = outcomes(&reports);
@@ -782,6 +792,7 @@ fn a_job_past_its_deadline_in_a_process_that_reads_the_stop_is_given_time_to_sto
     // readings are the ones the test passes.
     let mut rig = Rig::new(&Script {
         ignore_token_ms: 1_500,
+        generate_until_cancelled: true,
         mark_work: true,
         ..Script::default()
     });
@@ -789,6 +800,14 @@ fn a_job_past_its_deadline_in_a_process_that_reads_the_stop_is_given_time_to_sto
     rig.job_sent(at(3_000));
     stub::wait_until_began(&rig.placed.directory("runtime"), "job");
     let pid = rig.driver.pid();
+
+    // Not a moment before the deadline: until then nothing is asked of the job.
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(3_000 + DEADLINE_MS - 1))
+        .expect("a turn");
+    assert!(outcomes(&reports).is_empty(), "{reports:?}");
+    assert_eq!(rig.driver.stopping_at_its_deadline(), None);
 
     // At the deadline the daemon asks the job to stop, and the control thread says it has read it.
     rig.until(
@@ -834,7 +853,8 @@ fn a_process_that_has_read_the_stop_and_does_not_answer_is_ended_at_the_stop_bou
         "the acknowledgement",
         |_, driver| driver.stopping_at_its_deadline() == Some(true),
     );
-    for after_the_deadline in [ANSWER_GRACE_MS, STOP_BOUND_MS - 1] {
+    assert_eq!(STOP_BOUND_MS, STOP_BOUND, "the guide's thirty seconds");
+    for after_the_deadline in [ANSWER_GRACE_MS, STOP_BOUND - 1] {
         let reports = rig
             .driver
             .turn(&roomy(), at(3_000 + DEADLINE_MS + after_the_deadline))
@@ -847,7 +867,7 @@ fn a_process_that_has_read_the_stop_and_does_not_answer_is_ended_at_the_stop_bou
     }
     let reports = rig
         .driver
-        .turn(&roomy(), at(3_000 + DEADLINE_MS + STOP_BOUND_MS))
+        .turn(&roomy(), at(3_000 + DEADLINE_MS + STOP_BOUND))
         .expect("a turn");
     let ended = outcomes(&reports);
     assert!(
@@ -865,17 +885,108 @@ fn a_process_that_has_read_the_stop_and_does_not_answer_is_ended_at_the_stop_bou
     assert_eq!(rig.driver.pid(), None);
 }
 
-/// A cancellation the control thread has said it has read is not a process that stopped listening:
-/// the job's own answer is bounded by its deadline and the stop bound after it, and the process is
-/// ended when that passes and not at the cancellation's bound. The control is a cancellation
-/// nothing acknowledges, which is ended at the bound (the wedged control thread, above).
+/// A stop asked late is given its time from the request, not from the deadline: a daemon whose first
+/// look at a job comes long after its deadline (the host slept, and the clock the daemon reads
+/// counts the sleep) has not ended the process before it could answer. The next look, a millisecond
+/// later, leaves a process that has not read the request for the grace after it, and one that has
+/// for the stop bound after it. The control is a stop asked at the deadline, which is ended at the
+/// grace after it (the hung process, above).
 #[test]
-fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_bound() {
-    // A model that does not look at its token for longer than this test needs. The process's own
-    // watchdog ends it when the job's deadline has passed, which is the bound this test crosses
-    // by the reading it passes, not by waiting.
+fn a_stop_asked_late_is_given_its_time_from_the_request() {
+    // A process whose control thread reads nothing after the job: the request to stop is never read.
+    let mut rig = Rig::new(&Script {
+        generate_until_cancelled: true,
+        wedge_input_after: Some(3),
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    let pid = rig.driver.pid();
+    let asked = 3_000 + DEADLINE_MS + 60_000;
+    let reports = rig.driver.turn(&roomy(), at(asked)).expect("a turn");
+    assert!(!the_process_ended(&reports), "{reports:?}");
+    assert_eq!(rig.driver.stopping_at_its_deadline(), Some(false));
+    for after_the_request in [1, ANSWER_GRACE_MS - 1] {
+        let reports = rig
+            .driver
+            .turn(&roomy(), at(asked + after_the_request))
+            .expect("a turn");
+        assert!(
+            !the_process_ended(&reports),
+            "{after_the_request} ms after the request: {reports:?}"
+        );
+        assert_eq!(rig.driver.pid(), pid);
+    }
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(asked + ANSWER_GRACE_MS))
+        .expect("a turn");
+    assert!(
+        outcomes(&reports).contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::PastDeadline
+        }),
+        "{reports:?}"
+    );
+
+    // A process that reads the request is given the stop bound from it.
     let mut rig = Rig::new(&Script {
         ignore_token_ms: 120_000,
+        mark_work: true,
+        ..Script::default()
+    });
+    queue(rig.service(), &session(1), Priority::Ordinary, at(0));
+    rig.job_sent(at(3_000));
+    stub::wait_until_began(&rig.placed.directory("runtime"), "job");
+    let pid = rig.driver.pid();
+    let reports = rig.until(
+        &roomy(),
+        at(asked),
+        "the acknowledgement or the end",
+        |reports, driver| {
+            the_process_ended(reports) || driver.stopping_at_its_deadline() == Some(true)
+        },
+    );
+    assert!(!the_process_ended(&reports), "{reports:?}");
+    for after_the_request in [1, ANSWER_GRACE_MS, STOP_BOUND - 1] {
+        let reports = rig
+            .driver
+            .turn(&roomy(), at(asked + after_the_request))
+            .expect("a turn");
+        assert!(
+            !the_process_ended(&reports),
+            "{after_the_request} ms after the request: {reports:?}"
+        );
+        assert_eq!(rig.driver.pid(), pid);
+    }
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(asked + STOP_BOUND))
+        .expect("a turn");
+    assert!(
+        outcomes(&reports).contains(&&Outcome::ProcessEnded {
+            why: ProcessEnd::PastDeadline
+        }),
+        "{reports:?}"
+    );
+}
+
+/// A cancellation the control thread has said it has read is not a process that stopped listening:
+/// the job's own answer is bounded by its deadline and the stop bound after it, and the process is
+/// ended when that passes and not at the cancellation's bound, whether or not it reads the daemon's
+/// own request to stop at the deadline, as the process's watchdog gives it the same time either
+/// way. The job a caller cancelled ends cancelled, and the daemon ending its process makes it no
+/// deadline miss. The control is a cancellation nothing acknowledges, which is ended at the bound
+/// (the wedged control thread, above).
+#[test]
+fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_bound() {
+    // A model that does not look at its token for longer than this test needs, and a control thread
+    // that reads the caller's cancellation, which is the fourth request, and nothing after it: the
+    // request at the deadline is never read. The process's own watchdog ends the process when the
+    // job's deadline has passed, which is the bound this test crosses by the reading it passes, not
+    // by waiting.
+    let mut rig = Rig::new(&Script {
+        ignore_token_ms: 120_000,
+        wedge_input_after: Some(4),
         mark_work: true,
         ..Script::default()
     });
@@ -894,19 +1005,25 @@ fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_
         .expect("a turn");
     assert!(!the_process_ended(&reports), "{reports:?}");
     assert_eq!(rig.driver.pid(), pid);
-    // The first turn past the deadline asks the job to stop, and does not end the process for the
-    // grace: the process has had no time to answer, and the grace counts from the request.
+    // At the deadline the job is asked to stop, and nothing reads the request. The caller's
+    // cancellation was read, so the process is not left to the grace after the request.
+    let reports = rig
+        .driver
+        .turn(&roomy(), at(3_000 + DEADLINE_MS))
+        .expect("a turn");
+    assert!(!the_process_ended(&reports), "{reports:?}");
+    assert_eq!(rig.driver.stopping_at_its_deadline(), Some(false));
     let reports = rig
         .driver
         .turn(&roomy(), at(3_000 + DEADLINE_MS + ANSWER_GRACE_MS))
         .expect("a turn");
     assert!(!the_process_ended(&reports), "{reports:?}");
     assert_eq!(rig.driver.pid(), pid);
-    // The job's own deadline and the stop bound after it end it. The process was ended for running
-    // past its deadline, so the job ends past its deadline, not cancelled.
+    // The job's own deadline and the stop bound after it end the process, as running past its
+    // deadline. The job was cancelled by a caller first, so it ends cancelled.
     let reports = rig
         .driver
-        .turn(&roomy(), at(3_000 + DEADLINE_MS + STOP_BOUND_MS))
+        .turn(&roomy(), at(3_000 + DEADLINE_MS + STOP_BOUND))
         .expect("a turn");
     let ended = outcomes(&reports);
     assert!(
@@ -916,7 +1033,7 @@ fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_
         "{reports:?}"
     );
     assert!(
-        ended.contains(&&Outcome::DeadlineExceeded {
+        ended.contains(&&Outcome::Cancelled {
             session_id: session(1)
         }),
         "{reports:?}"
@@ -1805,8 +1922,8 @@ fn a_late_answer_is_dropped_and_counted() {
 /// deadline the load had used up would end, so the load did not use up the deadline the process was
 /// sent. The control is a job whose answer arrives past that deadline, which is refused. The first
 /// job after such a load is sent to the process with the whole of its thirty seconds, as the
-/// process reads it from the wire, and the daemon ends a process that holds it at the deadline and
-/// the grace after the send, and not a moment before.
+/// process reads it from the wire, and the daemon asks a process that holds it to stop at the
+/// deadline, and not a moment before, and ends it the grace after the request.
 ///
 /// The process holds its load until the case has seen the handshake and has taken a turn at the
 /// reading past the job's deadline and its grace, so the load's answer is told at that reading,
@@ -1916,12 +2033,26 @@ fn a_load_over_thirty_seconds_is_followed_by_a_published_job() {
         [30_000],
         "the process is sent the whole of the job's deadline, whatever the load took: {sent:?}"
     );
-    let due = loaded_at + DEADLINE_MS + ANSWER_GRACE_MS;
+    // The process answers nothing, not even that it has read the request to stop. The job is asked
+    // to stop at its deadline and not a moment before, and the process is ended at the grace after
+    // the request.
+    let deadline = loaded_at + DEADLINE_MS;
+    let due = deadline + ANSWER_GRACE_MS;
+    let reports = rig.driver.turn(&roomy(), at(deadline - 1)).expect("a turn");
+    assert!(outcomes(&reports).is_empty(), "{reports:?}");
+    assert_eq!(
+        rig.driver.stopping_at_its_deadline(),
+        None,
+        "not a moment before its deadline"
+    );
+    let reports = rig.driver.turn(&roomy(), at(deadline)).expect("a turn");
+    assert!(outcomes(&reports).is_empty(), "{reports:?}");
+    assert_eq!(rig.driver.stopping_at_its_deadline(), Some(false));
     let reports = rig.driver.turn(&roomy(), at(due - 1)).expect("a turn");
     assert!(outcomes(&reports).is_empty(), "{reports:?}");
     assert!(
         rig.driver.pid().is_some(),
-        "not a moment before its deadline"
+        "not a moment before the grace after the request"
     );
     let reports = rig.driver.turn(&roomy(), at(due)).expect("a turn");
     let ended = outcomes(&reports);
