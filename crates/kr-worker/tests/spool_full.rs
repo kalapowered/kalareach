@@ -172,11 +172,13 @@ async fn burst(full: bool) -> Burst {
 /// cause is the spool, the newest lines, which the resident window holds, are served, the output
 /// that comes later is served, and the session is live and takes what it is typed.
 ///
-/// What the case shows, and what it does not. The refused write is the first one into a new
-/// segment; the spool removes the link when it settles the failure, so the disk is full for that
-/// one write and not for the writes after it. The case does not read the reason the spool gives,
-/// so a refused open would also pass it; and a write that continues a segment already holding bytes
-/// (the usual one) is not the one refused here.
+/// What the case shows, and what it does not. The refused write is the first one into the segment
+/// the link stands for: the spool adopts a segment that is in its directory as it lies, and makes
+/// one over it when that one is too old to continue (an hour), so which of the two takes the write
+/// depends on the device's age and the case passes either way. The spool removes the link when it
+/// settles the failure, so the disk is full for that one write and not for the writes after it. The
+/// case does not read the reason the spool gives, so a refused open would also pass it; and a write
+/// that continues a segment already holding bytes (the usual one) is not the one refused here.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_spool_that_meets_a_full_disk_says_what_it_could_not_keep_and_the_session_goes_on() {
     let with_room = burst(false).await;

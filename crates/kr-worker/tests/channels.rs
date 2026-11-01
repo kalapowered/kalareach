@@ -1741,7 +1741,10 @@ async fn kr_req_12_18_an_application_that_goes_after_the_marker_leaves_the_appro
         .submit(&request)
         .expect("the channel's writer takes the answer");
     // The application reads the start of the verdict, which the channel has begun to write, and
-    // goes. What it read is a part of one frame, and the rest was never read.
+    // goes. What it read is a part of one frame, and the rest was never read. The case runs on one
+    // thread, so the channel's writer is not polled between this read, which frees room in the
+    // connection, and the disconnect: on a runtime with more threads the writer could write the
+    // rest of the verdict in between, and the case would not be about a verdict cut in two.
     let prefix = channel.read_prefix(16).await;
     assert!(
         prefix.starts_with(b"{") && !prefix.contains(&b'\n'),
