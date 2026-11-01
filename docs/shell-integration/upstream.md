@@ -129,7 +129,8 @@ The requalification has parts, and each runs where it can. Fish's own suite and 
 either. The core workflow's `shell-packages` job runs, on x86-64 Linux, the patch check for all
 three packages, the upstream suites of Zsh and Bash (`--require-upstream-tests`), the contract
 suites of the packages, the startup customisations, the second Zsh build and the PowerShell
-package against a pinned PowerShell. Before a macOS or Linux release tree is assembled, each of
+package against a pinned PowerShell. The core workflow's `macos` job runs the PowerShell package's
+cases once more on the macOS runner, against the PowerShell its image carries. Before a macOS or Linux release tree is assembled, each of
 its four targets builds the Zsh, Bash and Fish packages natively and runs the contract suites of
 the three, the Fish source checks, the native-module proof of Zsh and the case that compares each
 package with its pin, against the packages it just built; a failing suite stops the tree before
