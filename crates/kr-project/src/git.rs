@@ -3694,8 +3694,8 @@ enum Asked {
     /// What the host did, or the time that ran out, is [`ProjectError::GitFailed`], which passes:
     /// the look was not made because the time was used up, because the host was short of
     /// descriptors, processes or memory to start the program, because the program did not answer in
-    /// time or had not finished answering when the time ran out, or because the host could not wait
-    /// on it, collect it, or switch or read its output.
+    /// time or its output was not read to the end when the time ran out, or because the host could
+    /// not wait on it, collect it, or switch or read its output.
     Overran(ProjectError),
 }
 
@@ -3879,7 +3879,7 @@ fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::
             return Err(Asked::Overran(if clocks_own {
                 ProjectError::GitFailed {
                     detail: format!(
-                        "{described} had not finished answering when the time it is given ran out"
+                        "{described} was not read to the end of its output in the time it is given"
                     )
                     .into(),
                 }
@@ -5363,7 +5363,7 @@ mod tests {
         );
     }
 
-    /// The deadline is checked after every read and not only before the first: it comes during the
+    /// The deadline is checked before every read and not only before the first: it comes during the
     /// pass here, because the first read does not return until it has. A pass that checked once
     /// would go on to the end of a writer that is never behind.
     #[cfg(unix)]
@@ -6044,16 +6044,17 @@ mod tests {
         assert!(refusal.code().retry_category().permits_automatic_retry());
     }
 
-    /// What a late poll does. The loop that watches a probe wakes after the time it was given has
-    /// run out, takes in what the pipe holds and finds the program ended, and then waits for the
-    /// end of its output. Everything the program wrote is already in the pipe with its end, so
-    /// nothing here depends on a clock or on how fast a process runs, and none of it was read
-    /// before the time ran out: it is not the program's answer, and is not read as one. The refusal
-    /// is a fault that passes, which a client sends the request again after, and not the one of a
-    /// program that gave an empty answer.
+    /// A poll that begins after the time a probe was given has run out reads nothing, not even an
+    /// answer that is already in the pipe with its end, and the look is a fault that passes, which
+    /// a client sends the request again after. What reached the pipe after the time cannot be told
+    /// from what reached it before, so a poll that wakes late does not read the one and call it
+    /// the other, and a program that gave an empty answer is not told from one whose answer was
+    /// not read. Everything the program wrote is in the pipe before the time is taken, so nothing
+    /// here depends on a clock or on how fast a process runs.
     #[cfg(unix)]
     #[test]
-    fn a_late_poll_does_not_read_what_a_probe_wrote_after_its_time_ran_out() {
+    fn a_poll_that_begins_after_the_time_ran_out_reads_nothing_and_the_look_is_a_fault_that_passes()
+    {
         let mut writer = std::process::Command::new("sh")
             .args(["-c", "echo git version 2.50.1"])
             .stdout(Stdio::piped())
