@@ -386,6 +386,72 @@ fn a_package_managers_older_release_leaves_the_current_one_running() {
     );
 }
 
+/// KR-REQ-27.05, full disks: a notice that standard error refused before the command was handed to
+/// the store's `kr` is not lost with the process it was written by. The older release says that it
+/// is no newer than the current one, as the case above shows, and with standard error full there is
+/// nowhere to say it: the store's `kr` that replaces the process would end 0 without a word of the
+/// failure, so the command is not run, says on standard output what it could not write, and ends
+/// with the failure for the terminal.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_notice_standard_error_refused_is_not_lost_when_the_store_s_kr_replaces_the_process() {
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    let newer = home.prefix("Cellar", &two);
+    assert!(home.first_command(&kr(&newer)).0.status.success());
+    let older = home.prefix("Cellar", &one);
+
+    // The control: with room, the notice is said and the command runs as the current release,
+    // printing the roots it was asked for.
+    let control = home.run(&kr(&older), &["host", "paths"]);
+    assert!(control.status.success(), "{}", said(&control));
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("no newer"),
+        "{}",
+        said(&control)
+    );
+    assert!(
+        !control.stdout.is_empty(),
+        "the command ran: {}",
+        said(&control)
+    );
+
+    let mut command = home.command(&kr(&older), &["host", "paths"]);
+    command.stderr(Stdio::from(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("opens the device that has no room"),
+    ));
+    let refused = finish_within(
+        command
+            .spawn()
+            .unwrap_or_else(|error| panic!("{} did not start: {error}", older.display())),
+        Duration::from_secs(300),
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(6),
+        "the loss of the notice is the command's failure: {}",
+        said(&refused)
+    );
+    let shown = String::from_utf8_lossy(&refused.stdout);
+    assert!(
+        shown.contains("standard error could not be written"),
+        "and it is said where it still can be: {shown}"
+    );
+    assert!(
+        !shown.contains(
+            String::from_utf8_lossy(&control.stdout)
+                .lines()
+                .next()
+                .unwrap_or("-")
+        ),
+        "and the store's kr did not run the command: {shown}"
+    );
+}
+
 /// KR-REQ-26.03: a release a rollback left in the store is not switched back to by running the
 /// package manager's `kr` for it.
 #[test]

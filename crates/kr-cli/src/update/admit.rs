@@ -99,6 +99,10 @@ pub fn run_as_current() -> Result<()> {
 /// Starts the store's `kr` on this command's arguments, in place of this process. It returns only
 /// the failure to do so.
 fn start_stores_kr(store: &Store) -> CliError {
+    // A line this process could not write is not carried into the program that replaces it.
+    if let Some(unwritten) = crate::report::unwritten_before_replacement() {
+        return unwritten;
+    }
     let error = std::process::Command::new(store.stable(Program::Kr))
         .args(std::env::args_os().skip(1))
         .exec();
