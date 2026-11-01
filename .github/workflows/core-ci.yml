@@ -2541,7 +2541,7 @@ jobs:
       # cancelled, so each reports its own result, and any one of them failing fails the job.
       - name: Clippy
         if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 30
+        timeout-minutes: 20
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: What the disk holds after the lint
@@ -2554,7 +2554,7 @@ jobs:
       # only macOS compiles is read by this build and no other. The crates are that step's.
       - name: Documentation without warnings
         if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 9
+        timeout-minutes: 8
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: |
@@ -2644,7 +2644,7 @@ jobs:
       # /private/tmp.
       - name: The cases that need another filesystem
         if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 15
+        timeout-minutes: 6
         run: |
           set -euo pipefail
           cases=(
@@ -2756,7 +2756,7 @@ jobs:
       # runner's three processors with them. A case that did not pass here by name fails the step.
       - name: The timed cases, one at a time
         if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 10
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           cases=(
@@ -2775,6 +2775,25 @@ jobs:
             fi
           done
           exit "$status"
+
+      # The PowerShell package's cases, on a second platform. Its reader counts the input the
+      # runtime has taken through .NET internals that differ by platform, and until this step only
+      # the shell-packages job ran its cases. The runner image carries PowerShell, so none is
+      # installed; the package refuses a release that a published advisory affects, so the version
+      # is printed first and the qualification, which is published before the cases because a run
+      # that has not published it leaves them out, names the refusal if the image carries such a
+      # release. The cases take about 400 seconds on a Linux build machine, and the limit leaves
+      # this runner several times that.
+      - name: Drive the PowerShell package through the contract
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          pwsh -NoProfile -Command '
+            Import-Module ./shells/psreadline/module/KalaReach.ShellBridge.psd1
+            Publish-KalaReachQualification | Format-List'
+          cargo test --locked -p kr-shell-integration --test pwsh -- --test-threads=1 --include-ignored
 
       # Real processes, real sockets and real terminals, the suites the script names and nothing
       # else, each of which must demonstrate something, and no process of the run left behind. This
