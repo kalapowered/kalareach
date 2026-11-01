@@ -127,8 +127,8 @@ that Play installs.
 3. `xcodebuild -exportArchive` signs the build for the App Store, with `-allowProvisioningUpdates`
    and the API key. Xcode uses the cloud-managed Apple Distribution certificate and the App Store
    profiles of both identifiers, creating them when they do not exist. The export must leave the
-   login keychain's signing identities and the keychain search list as they were, and the script
-   fails when either changes.
+   valid code-signing identities that the user's keychain search list offers, and the search list, as
+   they were, and the script fails when either changes.
 
 `--unsigned-archive` stops after step 2, which needs no Apple account. The build rewrites files
 under `gen/apple`, so the script refuses to start when that directory has an uncommitted change or
