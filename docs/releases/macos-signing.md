@@ -1,8 +1,9 @@
 # Signing and publishing the macOS and Linux host
 
-A host release for macOS and Linux is made in four steps. Two of them hold a key, and each key is used
+A host release for macOS and Linux is made in four steps. Two of them hold a key, and each key is held
 in one place: the Developer ID and the notary key stay on the machine that signs, and the update
-channel's two release keys are secrets of one deployment environment that one job reads. This page
+channel's two release keys are secrets of one deployment environment that one job reads. The notary
+key's file is read by `scripts/store-ios.sh` too, for the iOS export ([the store bundles](mobile-stores.md)). This page
 says what each step does, what it checks before it goes on, what to do when it stops, and how a key
 is replaced.
 
@@ -249,8 +250,9 @@ The Developer ID certificate lasts until 2027-11-27. A replacement is a new cert
 team, made from a new key, and the script needs nothing else changed: the team identifier is the
 same. A lost key is a new certificate and no revocation, since permissions name the team. A leaked key
 is a new build signed with a new certificate, taken by hosts through the update channel first, and
-then a revocation, because Apple stops installed copies from launching once a certificate is revoked.
-The notary key is replaced in App Store Connect.
+then a revocation, because Apple stops new installs and stops installed copies from launching once a
+certificate is revoked. The notary key is replaced in App Store Connect, and the new key serves
+`scripts/store-ios.sh` and the upload of an iOS build too ([the store bundles](mobile-stores.md)).
 
 The update channel's root is `release/tester-channel/root.json`. It names two release keys, both of
 which have to sign (two of two), and it expires in 2099. A key is replaced only with a successor root
