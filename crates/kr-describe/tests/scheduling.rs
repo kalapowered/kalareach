@@ -678,12 +678,14 @@ fn whole_product_figures_are_reported_beside_the_model_ones() {
 /// KR-REQ-22.11: this host names the background class it applied only where a read on the thread
 /// that took it finds the class: the processor class is named exactly when the thread holds the
 /// lowered one, and the I/O class exactly when the thread reports the one this build lowers to. A
-/// thread can read its own class on Linux and macOS; Windows reads the process's class from
-/// outside, in `tests/supervise.rs`.
+/// thread can read its own class on Linux and macOS, where the read is the kernel's priority of
+/// the thread; Windows reads the process's class from outside, in `tests/supervise.rs`.
 #[test]
 fn this_host_names_the_background_mechanism_it_actually_applied() {
     // The class is the thread's on Linux and the process's on macOS and Windows, so the test notes
-    // what it found and puts it back, on a thread of its own.
+    // what it found and puts it back, on a thread of its own. On macOS and Windows that holds
+    // every thread of this binary while the class is applied, which is for as long as it takes to
+    // read it.
     let (applied, held) = std::thread::spawn(|| {
         let saved = kr_ipc::background::save();
         let applied = enter_background();

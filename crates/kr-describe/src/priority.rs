@@ -19,15 +19,27 @@
 //! | Platform | CPU | IO |
 //! | --- | --- | --- |
 //! | Linux | `SCHED_BATCH` with niceness 19, on the calling thread and the threads it starts, which is the scheduler class for non-interactive work | the idle class, on the calling thread and the threads it starts |
-//! | macOS | the lowest ordinary thread priority of the calling thread | the throttled disk policy of the process |
+//! | macOS | the darwin background policy of the whole process, which holds every thread of it at the lowest priority the scheduler gives | the throttled disk policy of the process |
 //! | Windows | the idle priority class of the whole process | very low, for the whole process, read back from the calling thread as well |
 //! | the other Unix systems | the lowest ordinary thread priority, where the thread-priority library gives one, and a reported refusal where it does not | none |
 //!
-//! Windows lowers the class of the whole process, because a thread started by another thread there
-//! begins at the normal priority, and the compute threads of the model runtime are started by the
-//! thread that loads it. That puts the process's control thread and its watchdog in the idle class
-//! too, and four things follow when other work keeps every core busy for longer than a few
-//! seconds (Windows lifts a thread that has waited that long, so the wait is bounded):
+//! Windows and macOS lower the class of the whole process, because a thread started by another
+//! thread begins at the ordinary priority there, and the compute threads of the model runtime are
+//! started by the thread that loads it. On macOS neither the lowest thread priority nor a
+//! quality-of-service class passes from a thread to the threads it starts, so a class set on the
+//! model thread alone leaves the decoding threads at the ordinary priority, and only the policy of
+//! the process holds them. It puts the process's control thread and its watchdog in the class too.
+//!
+//! On macOS the class costs a job most of its speed on a busy machine: it keeps the process to
+//! the efficiency cores of Apple silicon and at the lowest priority, and a job that takes about two
+//! seconds in the ordinary class took more than thirty, past its deadline, while other work kept
+//! the machine busy. That is the background class doing what it is for, and a job that misses its
+//! deadline gives the delayed or stale description that section 22 prescribes when demand exceeds
+//! capacity, so the cost falls on the description and not on the terminal.
+//!
+//! On Windows, putting the control thread and the watchdog in the idle class has four
+//! consequences when other work keeps every core busy for longer than a few seconds (Windows
+//! lifts a thread that has waited that long, so the wait is bounded):
 //!
 //! - the daemon can wait past its bound for the process to acknowledge a cancellation, and ends a
 //!   process that does not acknowledge in time;
@@ -71,7 +83,9 @@
 pub enum Mechanism {
     /// The Linux scheduler's batch class.
     LinuxSchedBatch,
-    /// The lowest ordinary thread priority this platform has.
+    /// The lowest priority this platform gives ordinary work: the lowest thread priority where the
+    /// platform has one for threads, and on macOS the darwin background policy of the whole process,
+    /// which holds every thread of it at the lowest priority the scheduler gives.
     LowestThreadPriority,
     /// The idle priority class of a Windows process.
     WindowsIdlePriorityClass,
@@ -126,12 +140,13 @@ impl Applied {
     }
 }
 
-/// Puts the calling thread, and on the platforms that hold the class for a process the calling
-/// process, into the background class this platform offers.
+/// Puts the calling thread, and on the platforms that hold the class for a process (macOS and
+/// Windows) the calling process, into the background class this platform offers.
 ///
 /// It is called by the inference thread and by nothing else, before the model starts a thread of its
-/// own. A failure is reported rather than propagated: a host whose scheduler refuses the change
-/// still runs descriptions, at ordinary priority, and says so.
+/// own. On Linux the threads it starts inherit the class; on macOS and Windows every thread of the
+/// process is in it. A failure is reported rather than propagated: a host whose scheduler refuses
+/// the change still runs descriptions, at ordinary priority, and says so.
 #[must_use]
 pub fn enter_background() -> Applied {
     Applied::of(apply_cpu(), kr_ipc::background::lower_io_class())
@@ -162,7 +177,15 @@ fn apply_cpu() -> std::result::Result<Mechanism, &'static str> {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn apply_cpu() -> std::result::Result<Mechanism, &'static str> {
+    // The class is the process's, because a thread that another thread starts begins at the
+    // ordinary priority on macOS, and the model runtime starts its compute threads from the thread
+    // that loads the model. The system reports the process in the class, or this is a refusal.
+    kr_ipc::background::lower_priority_class().map(|()| Mechanism::LowestThreadPriority)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn apply_cpu() -> std::result::Result<Mechanism, &'static str> {
     use thread_priority::unix::thread_schedule_policy_param;
     use thread_priority::{ThreadPriority, set_current_thread_priority, thread_native_id};

@@ -634,7 +634,9 @@ fn model_thread<M: Model>(
     catalogue: &Catalogue,
 ) {
     // The class is applied on this thread, which is the one that loads and runs the model, before
-    // the model starts any thread of its own.
+    // the model starts any thread of its own. On Linux the threads it starts inherit the thread's
+    // class; on macOS and Windows the class is the process's, which holds every thread of it,
+    // this process's control thread and watchdog included.
     let _ = applied_tell.send(enter_background());
     let mut lock: Option<ProcessLock> = None;
     let mut loaded: Option<ModelProfile> = None;

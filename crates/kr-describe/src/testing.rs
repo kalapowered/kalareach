@@ -269,6 +269,11 @@ pub struct Script {
     pub generate_until_cancelled: bool,
     /// How long a job sleeps without looking at its token, in milliseconds.
     pub ignore_token_ms: u64,
+    /// How many threads a job starts of its own, with the default attributes, as a model runtime
+    /// that has a pool of compute threads does: they live until the job ends, and the job leaves a
+    /// mark named `threads` when they are all running, for a test that reads their class to wait
+    /// for.
+    pub job_threads: u32,
     /// The peak resident set a job reports, in bytes, in place of the process's own.
     pub peak_rss_bytes: Option<u64>,
     /// How many bytes a job holds, each page written, for as long as it runs: what lets a test put
@@ -364,6 +369,51 @@ impl Drop for Resident {
     }
 }
 
+/// Threads a job starts of its own, with the default attributes, that run until it ends.
+///
+/// A model runtime starts its compute threads this way, from the thread that runs the job, and the
+/// class the job's thread holds does not reach them by being passed on: the class of the process
+/// does. The threads wait and do no work.
+struct JobThreads {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl JobThreads {
+    /// Starts `count` threads, which are all running when this returns.
+    fn start(count: u32) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let running = std::sync::Arc::new(std::sync::Barrier::new(count as usize + 1));
+        let threads = (0..count)
+            .map(|index| {
+                let told = std::sync::Arc::clone(&stop);
+                let running = std::sync::Arc::clone(&running);
+                std::thread::Builder::new()
+                    .name(format!("stub-job-{index}"))
+                    .spawn(move || {
+                        running.wait();
+                        while !told.load(std::sync::atomic::Ordering::Acquire) {
+                            std::thread::park();
+                        }
+                    })
+                    .expect("a thread of the job starts")
+            })
+            .collect();
+        running.wait();
+        Self { stop, threads }
+    }
+}
+
+impl Drop for JobThreads {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        for thread in self.threads.drain(..) {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
+    }
+}
+
 /// What a job's answer looks like.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Output {
@@ -430,6 +480,7 @@ impl Script {
         number("generate-ms", self.generate_ms);
         number("ignore-token-ms", self.ignore_token_ms);
         number("hold-bytes", self.hold_bytes);
+        number("job-threads", u64::from(self.job_threads));
         number("commit-at-start", self.commit_at_start_bytes);
         if let Some(bytes) = self.peak_rss_bytes {
             parts.push(format!("peak-rss={bytes}"));
@@ -519,6 +570,10 @@ impl Script {
                 "generate-ms" => script.generate_ms = number()?,
                 "ignore-token-ms" => script.ignore_token_ms = number()?,
                 "hold-bytes" => script.hold_bytes = number()?,
+                "job-threads" => {
+                    script.job_threads = u32::try_from(number()?)
+                        .map_err(|_| format!("{name} takes a count of threads"))?;
+                }
                 "commit-at-start" => script.commit_at_start_bytes = number()?,
                 "peak-rss" => script.peak_rss_bytes = Some(number()?),
                 "wedge-input-after" => script.wedge_input_after = Some(number()?),
@@ -716,6 +771,11 @@ impl Model for StubModel {
     fn generate(&mut self, job: &Job<'_>, token: &Cancellation, deadline: Instant) -> Generating {
         self.began("job");
         let started = Instant::now();
+        let _threads = (self.script.job_threads > 0).then(|| {
+            let threads = JobThreads::start(self.script.job_threads);
+            self.began("threads");
+            threads
+        });
         if self.script.crash_in_generate {
             eprintln!("kr-describe-stub: ending inside a job, as its script says");
             std::process::exit(CRASH_EXIT);
@@ -1208,6 +1268,15 @@ pub fn stub_main() -> i32 {
             return 64;
         }
     };
+    // A process begins in the class of the process that started it, so one started by a process
+    // in the background class (a test run under `taskpolicy -b`) would begin in it and a case that
+    // reads the class the process takes would read the one it inherited. The stub begins outside
+    // the class, as a daemon that is not itself in the background starts the real process.
+    #[cfg(target_os = "macos")]
+    if let Err(error) = kr_ipc::background::leave_priority_class() {
+        eprintln!("kr-describe-stub: {error}");
+        return 71;
+    }
     let _committed = match commit_at_start(&script, &runtime_dir) {
         Ok(held) => held,
         Err(code) => return code,

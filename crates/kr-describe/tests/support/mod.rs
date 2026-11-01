@@ -111,15 +111,22 @@ pub fn a_pin_not_yet_committed(
     other
 }
 
-/// What a read on the calling thread reports of its background class: its scheduling policy and
-/// priority, its niceness on Linux, and the I/O class that is the thread's on Linux and the
-/// process's on macOS. `kr_ipc` reads the class of the calling thread, and the server does not hand
-/// out the model thread's identifier, so a case reads it on the thread that runs the work.
+/// What a read on the calling thread reports of its background class. On Linux: its scheduling
+/// policy and priority, its niceness and its I/O class, all the thread's own. On macOS: the
+/// priority the kernel reports for the thread, as `ps -M` shows it and not the thread library's
+/// record of it, and the I/O class, which is the process's there, as the processor class is. On the
+/// other Unix systems: its scheduling policy and priority.
+/// The server does not hand out the model thread's identifier, so a case reads the class on the
+/// thread that runs the work.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Held {
+    #[cfg(not(target_os = "macos"))]
     pub policy: thread_priority::unix::ThreadSchedulePolicy,
+    #[cfg(not(target_os = "macos"))]
     pub priority: i32,
+    #[cfg(target_os = "macos")]
+    pub kernel_priority: Option<i32>,
     #[cfg(target_os = "linux")]
     pub nice: i32,
     pub io: Option<kr_ipc::background::IoClass>,
@@ -128,12 +135,17 @@ pub struct Held {
 /// Reads the background class of the calling thread.
 #[cfg(unix)]
 pub fn held_by_this_thread() -> Held {
+    #[cfg(not(target_os = "macos"))]
     let (policy, params) =
         thread_priority::unix::thread_schedule_policy_param(thread_priority::thread_native_id())
             .expect("the system reports the thread's scheduling class");
     Held {
+        #[cfg(not(target_os = "macos"))]
         policy,
+        #[cfg(not(target_os = "macos"))]
         priority: params.sched_priority,
+        #[cfg(target_os = "macos")]
+        kernel_priority: kr_ipc::background::thread_priority(),
         #[cfg(target_os = "linux")]
         nice: nice_of_this_thread(),
         io: kr_ipc::background::io_class(),
@@ -157,7 +169,8 @@ fn nice_of_this_thread() -> i32 {
 #[cfg(unix)]
 impl Held {
     /// Whether the thread holds the processor class this build lowers a model thread to: the batch
-    /// policy at niceness 19 on Linux, and the lowest priority its policy has on macOS.
+    /// policy at niceness 19 on Linux, the background priority the kernel reports on macOS, and the
+    /// lowest priority its policy has on the other Unix systems.
     pub fn cpu_is_lowered(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -165,7 +178,12 @@ impl Held {
             self.policy == ThreadSchedulePolicy::Normal(NormalThreadSchedulePolicy::Batch)
                 && self.nice == 19
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            self.kernel_priority
+                .is_some_and(|priority| priority <= kr_ipc::background::BACKGROUND_THREAD_PRIORITY)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             thread_priority::ThreadPriority::Min
                 .to_posix(self.policy)

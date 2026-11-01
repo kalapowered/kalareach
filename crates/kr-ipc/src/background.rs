@@ -11,7 +11,7 @@
 //! | Platform | CPU | I/O |
 //! | --- | --- | --- |
 //! | Windows | the idle priority class of the process | very low I/O priority of the process, read back from the calling thread as well |
-//! | macOS | the caller's own (this module sets none) | the throttled disk policy of the process |
+//! | macOS | the darwin background policy of the process | the throttled disk policy of the process |
 //! | Linux | the caller's own (this module sets none) | the idle class of the calling thread, which threads it starts afterwards inherit |
 //! | the remaining platforms | none | none |
 //!
@@ -34,6 +34,18 @@
 //! back in on every token, and the process's resident set would read as 32 MB to anything that
 //! measures it. The idle priority class and the very low I/O priority are set on their own and
 //! leave the working set alone.
+//!
+//! The macOS class is the process's and not the thread's, because a thread that another thread
+//! starts begins at the ordinary priority there: a thread that took the lowest priority, or a
+//! quality-of-service class, passes neither to the threads it starts, and a model runtime starts
+//! its compute threads from the thread that loads it. The darwin background policy
+//! (`setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`) holds every thread of the process, those
+//! that exist and those started later, at the lowest priority the scheduler gives, throttles its
+//! disk requests, and on Apple silicon keeps it to the efficiency cores. That last effect is a
+//! large share of what the policy costs a job: a job that takes about two seconds in the ordinary
+//! class took more than thirty on a busy machine. The kernel's own account of the policy is read
+//! back (`getpriority(PRIO_DARWIN_PROCESS, 0)`), and the process's control thread and watchdog are in
+//! the class too.
 //!
 //! The system applies an I/O class only through the I/O scheduler that serves the disk. Under the
 //! `none` scheduler of most NVMe disks no I/O class has an effect: the class is kept and acts on
@@ -78,7 +90,8 @@ pub fn io_class() -> Option<IoClass> {
     platform::io_class()
 }
 
-/// Puts the calling process into the idle priority class, and reads the class back.
+/// Puts the calling process into the background class of its platform, and reads the class back
+/// from the system: the idle priority class on Windows and the darwin background policy on macOS.
 ///
 /// The class is the process's, so every thread of the process runs in it, those the process starts
 /// later included.
@@ -86,7 +99,7 @@ pub fn io_class() -> Option<IoClass> {
 /// # Errors
 ///
 /// Returns why the class was not applied.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn lower_priority_class() -> std::result::Result<(), Refusal> {
     platform::lower_priority_class()
 }
@@ -136,6 +149,51 @@ pub fn thread_io_class() -> Option<IoClass> {
 pub fn set_thread_io_class_normal() -> std::result::Result<(), Refusal> {
     platform::set_thread_io_priority(platform::IO_NORMAL)
         .map_err(|()| "this host refused the normal I/O priority for the thread")
+}
+
+/// The scheduling priority the kernel gives every thread of a process in the darwin background
+/// class, as `ps -M` shows it (`4T`): a thread at the ordinary priority shows 31.
+#[cfg(all(target_os = "macos", any(test, feature = "testing")))]
+pub const BACKGROUND_THREAD_PRIORITY: i32 = 4;
+
+/// Whether the kernel holds the calling process in the darwin background class.
+#[cfg(all(target_os = "macos", any(test, feature = "testing")))]
+#[must_use]
+pub fn process_in_background() -> bool {
+    platform::in_background()
+}
+
+/// Takes the calling process out of the darwin background class, as a process that began in it
+/// (one started under `taskpolicy -b`, or by a process in it) is not.
+///
+/// # Errors
+///
+/// Returns why the system refused.
+#[cfg(all(target_os = "macos", any(test, feature = "testing")))]
+pub fn leave_priority_class() -> std::result::Result<(), Refusal> {
+    platform::leave_priority_class()
+}
+
+/// Reads the base scheduling priority the kernel holds for the calling thread, which is what `ps -M`
+/// shows for a thread that no waiting thread is lending its priority to, and not what the thread
+/// library records: setting a thread's priority through the thread library can succeed and leave
+/// the kernel's priority where it was. A thread that holds a lock another thread waits on can show a
+/// higher current priority for a moment, so the base priority is read.
+#[cfg(all(target_os = "macos", any(test, feature = "testing")))]
+#[must_use]
+pub fn thread_priority() -> Option<i32> {
+    platform::thread_priority()
+}
+
+/// Reads the base scheduling priority the kernel holds for each thread of the process `pid`, as
+/// [`thread_priority`] does for the calling thread, in no particular order. A thread that ends while
+/// they are read is left out.
+///
+/// Nothing when the process is not there or the system will not tell.
+#[cfg(all(target_os = "macos", any(test, feature = "testing")))]
+#[must_use]
+pub fn thread_priorities_of(pid: u32) -> Option<Vec<i32>> {
+    platform::thread_priorities_of(pid)
 }
 
 /// The classes a test found its process or thread in, so that it can leave them as it found them.
@@ -230,7 +288,7 @@ mod platform {
 mod platform {
     #![expect(
         unsafe_code,
-        reason = "the I/O policy of a process has no safe interface"
+        reason = "the class and the disk policy of a process, and the priority of a thread, have no safe interface"
     )]
 
     use super::{IoClass, Refusal};
@@ -241,6 +299,12 @@ mod platform {
     const SCOPE_PROCESS: libc::c_int = 0;
     /// `IOPOL_THROTTLE`: disk I/O is throttled when it contends with other I/O.
     const THROTTLE: libc::c_int = 3;
+    /// `PROC_PIDLISTTHREADS`: the thread handles of a process.
+    #[cfg(any(test, feature = "testing"))]
+    const LIST_THREADS: libc::c_int = 6;
+    /// `PROC_PIDTHREADID64INFO`: what the kernel reports of the thread with a given identifier.
+    #[cfg(any(test, feature = "testing"))]
+    const THREAD_ID_INFO: libc::c_int = 15;
 
     unsafe extern "C" {
         /// `setiopolicy_np(2)`.
@@ -251,6 +315,28 @@ mod platform {
         ) -> libc::c_int;
         /// `getiopolicy_np(2)`: the policy, or -1.
         fn getiopolicy_np(iotype: libc::c_int, scope: libc::c_int) -> libc::c_int;
+    }
+
+    pub(super) fn lower_priority_class() -> std::result::Result<(), Refusal> {
+        // SAFETY: the call takes three integers and puts the calling process into the darwin
+        // background class; it reads no memory of this process.
+        let set = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG) };
+        if set != 0 {
+            return Err("this host refused the background class for the process");
+        }
+        if in_background() {
+            Ok(())
+        } else {
+            Err("this host did not report the background class it was given")
+        }
+    }
+
+    /// Whether the kernel holds the calling process in the darwin background class.
+    pub(super) fn in_background() -> bool {
+        // SAFETY: the call takes two integers and reads the background state of the calling
+        // process, which it answers with 1 when the process is in the class; it reads no memory of
+        // this process.
+        unsafe { libc::getpriority(libc::PRIO_DARWIN_PROCESS, 0) == 1 }
     }
 
     pub(super) fn lower_io_class() -> std::result::Result<IoClass, Refusal> {
@@ -274,26 +360,118 @@ mod platform {
         unsafe { getiopolicy_np(TYPE_DISK, SCOPE_PROCESS) }
     }
 
-    /// The disk policy of the calling process when it was noted.
+    /// The classes of the calling process when they were noted.
     #[cfg(any(test, feature = "testing"))]
     #[derive(Debug)]
-    pub(super) struct Saved(libc::c_int);
+    pub(super) struct Saved {
+        /// The disk policy.
+        policy: libc::c_int,
+        /// Whether the process was in the darwin background class.
+        background: bool,
+    }
 
     #[cfg(any(test, feature = "testing"))]
     pub(super) fn save() -> Saved {
-        Saved(policy())
+        Saved {
+            policy: policy(),
+            background: in_background(),
+        }
     }
 
     #[cfg(any(test, feature = "testing"))]
     pub(super) fn restore(saved: Saved) -> std::result::Result<(), Refusal> {
+        // SAFETY: the call takes three integers and sets the background state of the calling
+        // process; it reads no memory of this process.
+        let class = unsafe {
+            libc::setpriority(
+                libc::PRIO_DARWIN_PROCESS,
+                0,
+                if saved.background {
+                    libc::PRIO_DARWIN_BG
+                } else {
+                    0
+                },
+            )
+        };
         // SAFETY: the call takes three integers and changes the disk I/O policy of the calling
         // process; it reads no memory of this process.
-        let set = unsafe { setiopolicy_np(TYPE_DISK, SCOPE_PROCESS, saved.0) };
-        if set == 0 {
+        let disk = unsafe { setiopolicy_np(TYPE_DISK, SCOPE_PROCESS, saved.policy) };
+        if class == 0 && disk == 0 {
             Ok(())
         } else {
-            Err("this host refused to put the disk policy back")
+            Err("this host refused to put the process's classes back")
         }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn leave_priority_class() -> std::result::Result<(), Refusal> {
+        // SAFETY: the call takes three integers and takes the calling process out of the darwin
+        // background class; it reads no memory of this process.
+        let set = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, 0) };
+        if set == 0 && !in_background() {
+            Ok(())
+        } else {
+            Err("this host did not take the process out of the background class")
+        }
+    }
+
+    /// What the kernel reports of one thread, or nothing.
+    #[cfg(any(test, feature = "testing"))]
+    fn report(
+        pid: libc::c_int,
+        flavor: libc::c_int,
+        argument: u64,
+    ) -> Option<libc::proc_threadinfo> {
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_threadinfo>()).ok()?;
+        // SAFETY: an all-zero thread report is a valid value of the type, which is plain integers
+        // and characters.
+        let mut report: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+        // SAFETY: the buffer is a thread report and `size` is its size, so the call writes inside it.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                flavor,
+                argument,
+                std::ptr::addr_of_mut!(report).cast(),
+                size,
+            )
+        };
+        (written == size).then_some(report)
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn thread_priority() -> Option<i32> {
+        let mut identifier: u64 = 0;
+        // SAFETY: the call writes the identifier of the thread it is given, which is the calling
+        // thread, into the one integer it is given.
+        let named = unsafe { libc::pthread_threadid_np(libc::pthread_self(), &raw mut identifier) };
+        if named != 0 {
+            return None;
+        }
+        let own = libc::c_int::try_from(std::process::id()).ok()?;
+        report(own, THREAD_ID_INFO, identifier).map(|report| report.pth_priority)
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn thread_priorities_of(pid: u32) -> Option<Vec<i32>> {
+        let pid = libc::c_int::try_from(pid).ok()?;
+        let mut handles = [0_u64; 1024];
+        let room = libc::c_int::try_from(std::mem::size_of_val(&handles)).ok()?;
+        // SAFETY: the buffer is an array of integers and `room` is its size, so the call writes
+        // inside it.
+        let listed =
+            unsafe { libc::proc_pidinfo(pid, LIST_THREADS, 0, handles.as_mut_ptr().cast(), room) };
+        let count = usize::try_from(listed).ok()? / std::mem::size_of::<u64>();
+        if count == 0 {
+            return None;
+        }
+        Some(
+            handles[..count]
+                .iter()
+                .filter_map(|handle| report(pid, libc::PROC_PIDTHREADINFO, *handle))
+                .map(|report| report.pth_priority)
+                .collect(),
+        )
     }
 }
 
@@ -585,11 +763,19 @@ mod tests {
         assert_eq!(inherited, Some(IoClass::Idle));
     }
 
+    /// The tests that change this process's class take turns, since the class is the process's and
+    /// each starts from the class the process was found in.
+    #[cfg(any(windows, target_os = "macos"))]
+    static CLASS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The process's own disk policy is set and read back, and put back as it was found, so the
     /// tests that run beside this one in the same process are not throttled by it.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_disk_policy_of_this_process_is_set_read_back_and_put_back() {
+        let _turn = CLASS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             io_class(),
             None,
@@ -606,10 +792,87 @@ mod tests {
         assert_eq!(io_class(), None, "and the read-back follows it back");
     }
 
-    /// The tests that change this process's class take turns, since the class is the process's and
-    /// each starts from the class the process was found in.
-    #[cfg(windows)]
-    static CLASS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// KR-REQ-22.11: the process enters the darwin background class, and the kernel holds every
+    /// thread of it there: a thread that was running before the class was set, and a thread started
+    /// after it, both read the background priority from the kernel, where they read the ordinary
+    /// priority before. The kernel's priority is what `ps -M` shows, and not the thread library's
+    /// record of a thread, which a thread-level call can leave unchanged. The process is put back as
+    /// it was found, so the tests that run beside this one are not left in the class; a process that
+    /// began in the class (one started under `taskpolicy -b`) is taken out of it first, so the case
+    /// sees the class this module sets and not the one it inherited.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_background_class_of_this_process_reaches_every_thread_of_it_and_is_left() {
+        use super::{
+            BACKGROUND_THREAD_PRIORITY, leave_priority_class, lower_priority_class,
+            process_in_background, thread_priorities_of, thread_priority,
+        };
+        use std::sync::mpsc::channel;
+
+        let _turn = CLASS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saved = save();
+        let began_in_the_class = process_in_background();
+        assert_eq!(leave_priority_class(), Ok(()));
+        let own = std::process::id();
+        let all_in_the_class = |expected: bool| {
+            let priorities =
+                thread_priorities_of(own).expect("the kernel lists this process's threads");
+            assert!(!priorities.is_empty());
+            priorities
+                .iter()
+                .all(|priority| (*priority <= BACKGROUND_THREAD_PRIORITY) == expected)
+        };
+
+        // A thread that is running before the class is set, and waits for the test to go on.
+        let (running, hears_running) = channel();
+        let (go, goes) = channel::<()>();
+        let bystander = std::thread::spawn(move || {
+            running.send(thread_priority()).expect("the test listens");
+            goes.recv().expect("the test goes on");
+            thread_priority()
+        });
+        let before = hears_running.recv().expect("the thread is running");
+        assert!(
+            before.is_some_and(|priority| priority > BACKGROUND_THREAD_PRIORITY),
+            "the thread begins at the ordinary priority: {before:?}"
+        );
+        assert!(
+            all_in_the_class(false),
+            "no thread of the process is in the class before it is set"
+        );
+
+        let lowered = lower_priority_class();
+        let held = process_in_background();
+        let started_after = std::thread::spawn(thread_priority)
+            .join()
+            .expect("the thread ends");
+        let every_thread = all_in_the_class(true);
+        go.send(()).expect("the other thread waits");
+        let running_before = bystander.join().expect("the thread ends");
+        let left = saved.restore();
+
+        assert_eq!(lowered, Ok(()));
+        assert!(held, "the kernel reports the process in the class");
+        assert_eq!(
+            running_before,
+            Some(BACKGROUND_THREAD_PRIORITY),
+            "a thread that was running when the class was set"
+        );
+        assert_eq!(
+            started_after,
+            Some(BACKGROUND_THREAD_PRIORITY),
+            "a thread started after the class was set"
+        );
+        assert!(every_thread, "every thread of the process is in the class");
+        assert_eq!(left, Ok(()));
+        assert_eq!(
+            process_in_background(),
+            began_in_the_class,
+            "and the class is left as it was found"
+        );
+    }
 
     /// The process enters the background class, and the system reports the idle priority class and
     /// the very low I/O priority, both to the process itself and to a handle opened on it by its

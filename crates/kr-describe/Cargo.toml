@@ -10,8 +10,9 @@ publish.workspace = true
 
 [features]
 # What the tests of this crate and of kr-describe-model drive: a model that answers from the prompt,
-# and the stub executable that serves it over real pipes.
-testing = []
+# and the stub executable that serves it over real pipes, which starts outside the background class
+# whatever class its starter ran in.
+testing = ["kr-ipc/testing"]
 
 [[bin]]
 name = "kr-describe-stub"

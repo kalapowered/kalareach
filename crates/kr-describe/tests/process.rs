@@ -759,14 +759,22 @@ impl Model for Recording {
 }
 
 /// What the system reports of the background class this process holds, where this process is what
-/// holds one: the process's priority class and I/O class on Windows, its disk policy on macOS, and
-/// on Linux the I/O class of the calling thread, which a server run on another thread leaves alone.
+/// holds one: the process's priority class and I/O class on Windows, its background class and disk
+/// policy on macOS, and on Linux the I/O class of the calling thread, which a server run on another
+/// thread leaves alone.
 fn classes() -> impl PartialEq + std::fmt::Debug {
     #[cfg(windows)]
     {
         kr_ipc::background::process_class()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        (
+            kr_ipc::background::process_in_background(),
+            kr_ipc::background::io_class(),
+        )
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         kr_ipc::background::io_class()
     }
@@ -778,12 +786,13 @@ static SERVING: Mutex<()> = Mutex::new(());
 /// Serves `model` inside this process: sends it `requests` in order, ends its input once `done`
 /// holds, and returns how the server ended, with the moment before each request was sent.
 ///
-/// The server's model thread takes the background class, and on macOS and Windows the I/O class it
-/// takes is the whole process's, which every later case of this binary would run in. So the case
-/// notes the class it found and puts it back, and the cases that serve here take turns, since one
-/// that puts the class back while another reads it would fail the second for the first's sake. The
-/// server keeps its real watchdog (`CONTROL_BOUND_MS`), so a host that stalls one of its threads
-/// past it ends the whole test binary, and not a named case.
+/// The server's model thread takes the background class, and on macOS and Windows the class it
+/// takes is the whole process's, which every later case of this binary would run in, and which
+/// holds every thread of this binary, those of the cases that run beside this one included. So the
+/// case notes the class it found and puts it back, and the cases that serve here take turns, since
+/// one that puts the class back while another reads it would fail the second for the first's sake.
+/// The server keeps its real watchdog (`CONTROL_BOUND_MS`), so a host that stalls one of its
+/// threads past it ends the whole test binary, and not a named case.
 fn serve_in_process(
     model: impl Model,
     requests: &[Request],
@@ -896,12 +905,15 @@ fn a_job_runs_with_the_limits_sent_and_the_loaded_profiles_sampler() {
     }
 }
 
-/// KR-REQ-22.11: the thread that runs a job is in the background class while it runs one: a read
-/// on that thread finds the processor class this build lowers a model thread to (Linux: the batch
-/// policy at niceness 19; macOS: the lowest thread priority) and the I/O class it lowers to (Linux:
-/// idle; macOS: the throttled disk policy). `kr_ipc` reads the class of the calling thread, and the
-/// server does not hand out the model thread's identifier, so the case reads it on that thread.
-/// Windows reads the process's class from outside, in `tests/supervise.rs`.
+/// KR-REQ-22.11: the thread that runs a load and a job is in the background class while it runs
+/// them: a read on that thread finds the processor class this build lowers a model thread to
+/// (Linux: the batch policy at niceness 19; macOS: the background priority the kernel reports for
+/// the thread, as `ps -M` shows it) and the I/O class it lowers to (Linux: idle; macOS: the
+/// throttled disk policy of the process). The server does not hand out the model thread's
+/// identifier, so the case reads it on that thread. It shows the model thread and no thread that
+/// thread starts: on macOS the threads a model starts are read from outside in the next case, and
+/// on Linux they inherit the thread's class, which no case reads. Windows reads the process's class
+/// from outside, in `tests/supervise.rs`.
 #[cfg(unix)]
 #[test]
 fn the_thread_that_runs_a_job_is_in_the_background_class_the_system_reports() {
@@ -933,4 +945,54 @@ fn the_thread_that_runs_a_job_is_in_the_background_class_the_system_reports() {
             "the thread holds no lowered I/O class at its {when}: {held:?}"
         );
     }
+}
+
+/// KR-REQ-22.11: on macOS every thread of the description process is in the background class the
+/// kernel reports while a job runs, the threads the model starts during the job as well as the
+/// thread that runs it. The model here starts three threads of its own with the default
+/// attributes, as a runtime with a pool of compute threads does, and holds the job. The case reads
+/// the kernel's priority of every thread of the process from outside, as `ps -M` does, and not a
+/// record the thread library keeps: a thread that took the lowest priority through the thread
+/// library reads 15 there, and the threads it starts read 31. The stub begins outside the class
+/// whatever class its starter ran in, so a process the class was never applied to reads 31 on every
+/// thread and fails the case.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_threads_a_model_starts_during_a_job_are_in_the_class_the_kernel_reports() {
+    use kr_ipc::background::{BACKGROUND_THREAD_PRIORITY, thread_priorities_of};
+
+    let placed = Placed::stub();
+    let runtime = placed.directory("job-threads");
+    let script = Script {
+        job_threads: 3,
+        generate_until_cancelled: true,
+        mark_work: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    process.expect_answer(SOON, "the load");
+    process.send(&generate(2, 1, 30_000));
+    wait_until_began(&runtime, "threads");
+
+    let priorities = thread_priorities_of(process.pid()).expect("the kernel lists the threads");
+    // The control thread, the model thread and the watchdog, and the three the job started.
+    assert!(
+        priorities.len() >= 6,
+        "the job's threads are among those the kernel lists: {priorities:?}"
+    );
+    assert!(
+        priorities
+            .iter()
+            .all(|priority| *priority <= BACKGROUND_THREAD_PRIORITY),
+        "a thread of the process is outside the background class: {priorities:?}"
+    );
+
+    // The job ends when it is cancelled, which is what the process was held for.
+    process.send(&Request::Cancel { id: U64::new(2) });
+    assert!(matches!(
+        process.expect_terminal(SOON, "the cancelled job"),
+        Answer::Ended { id, why: JobEnd::Cancelled, .. } if id.get() == 2
+    ));
 }
