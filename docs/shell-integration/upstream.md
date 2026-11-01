@@ -144,7 +144,7 @@ builds, so the whole corpus is not a gate of a release tree.
 
 ## A package that cannot meet its target
 
-The flag is a row of this register: no host, CLI or companion code reads it, and none of them tells a person that a package is past its target. A package whose fourteen days pass without a requalified build is flagged in the triage record
+The flag is a row of this register: no host, CLI or companion code reads it, and none of them tells a person that a package is past its target. A package whose fourteen days pass with no published release that carries a requalified build is flagged in the triage record
 below, and the flag names the choices rather than leaving a stale package as a silent default. The
 choices are:
 
@@ -162,7 +162,7 @@ The first is what a session does when the person selects nothing; the other two 
 `assessment` says what the change is and whether the pinned release already carries it.
 `Date` is the day the assessment was made. The first assessments (2026-09-20) were made when this register was started, so they count their target from that day and say nothing about when the upstream advisory was published or fixed. `status` is one of `released` (a requalified package is published, and the assessment names the
 identity it was published under), `scheduled` (inside its target date), `flagged` (past its target
-date, with the choices above) or `not-affected`.
+date, with the choices above) or `not-affected`. `not-affected` speaks of the pin: a pin that has moved, and that no published release carries inside its target, is `flagged` until one does.
 
 <!-- kr:triage -->
 | Date | Upstream change | Packages | Assessment | Target release | Status |
