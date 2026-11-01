@@ -1,13 +1,6 @@
 //! A settings collection's membership, as a device lives it: real keys, signed key records, the
 //! device's own key store on the file seam, and a scripted service and hosts.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-18.05, settings-sync part (the library path) | `a_production_device_receives_its_key_through_its_own_wrap_and_keeps_it_in_its_store`, `nothing_is_sealed_to_a_device_its_host_has_not_committed` |
-//! | KR-REQ-18.05, settings-sync part across a restore | `a_collection_put_back_without_the_head_this_device_holds_leaves_it_out_until_a_join`, with its control `an_older_revision_in_the_same_history_leaves_the_head_standing`, and the other tests under "A collection put back" |
-//! | KR-REQ-20.11, sync-collection half | `removing_a_device_gives_the_rest_a_key_it_cannot_open`, `every_new_epoch_has_a_freshly_drawn_key`, `publication_stays_fenced_from_a_recorded_removal_until_its_record_is_installed` |
-//! | KR-REQ-20.17, settings part (export and import) | `a_collection_key_is_neither_backed_up_nor_restored`, `a_restore_returns_settings_without_a_key_a_membership_or_a_sync_checkpoint`, `a_restored_device_joins_only_after_a_fresh_authorisation` |
-//!
 //! Every directory a test uses is a temporary one on the internal disk, and every secret store is
 //! the owner-only directory the file seam opens there: nothing here touches a keychain.
 
@@ -854,6 +847,10 @@ async fn a_production_device_receives_its_key_through_its_own_wrap_and_keeps_it_
 
 /// Nothing is sealed to a device its host has not committed: the keys an addition wraps to come
 /// from the hosts' reports alone, and a device they do not report committed cannot be planned.
+///
+/// KR-REQ-18.05, the settings-sync part through the library: the keys an addition wraps to come
+/// from the hosts' reports alone, so a device they do not report committed is sealed nothing and
+/// cannot be planned.
 #[tokio::test]
 async fn nothing_is_sealed_to_a_device_its_host_has_not_committed() {
     let world = World::default();
@@ -1065,6 +1062,9 @@ async fn a_newer_record_without_a_chain_from_the_held_one_needs_a_confirmed_rejo
 /* -------------------------------------------------------------------------- */
 
 /// Every new epoch's key is drawn fresh: no two epochs share one.
+///
+/// KR-REQ-20.11, the sync-collection half: the key of every new epoch of a collection is drawn
+/// fresh, and no two epochs share one.
 #[tokio::test]
 async fn every_new_epoch_has_a_freshly_drawn_key() {
     let world = World::default();
@@ -1640,6 +1640,9 @@ async fn a_member_cannot_remove_itself() {
 
 /// Publication is fenced from the moment a removal is recorded until a record without the device
 /// is installed, at every crash point on the way.
+///
+/// KR-REQ-20.11, the sync-collection half: once a removal is recorded, nothing is published to the
+/// collection until a record without the device is installed, at every crash point on the way.
 #[tokio::test]
 async fn publication_stays_fenced_from_a_recorded_removal_until_its_record_is_installed() {
     // One run for each point a crash can fall at: before the first step, and after each step.
@@ -3076,6 +3079,10 @@ async fn a_collection_put_back_without_the_head_this_device_holds_leaves_it_out_
 /// The negative control: in one history an older revision is no news, and the head this device
 /// holds stands. A service that answers from behind the head without a restore changes nothing
 /// the device holds.
+///
+/// KR-REQ-18.05, across a restore, as the control of the case that puts the collection back without
+/// this device's head: in one history an older revision is no news, so a service that answers from
+/// behind the head without a restore changes nothing the device holds.
 #[tokio::test]
 async fn an_older_revision_in_the_same_history_leaves_the_head_standing() {
     let world = World::default();
@@ -3134,6 +3141,10 @@ async fn an_older_revision_in_the_same_history_leaves_the_head_standing() {
 /// the same revision, is followed from there: the records up to the head are the ones the device
 /// holds, since each names the digest of the one before it, and the records after it are taken
 /// as a refresh takes them.
+///
+/// KR-REQ-18.05, across a restore: a collection put back under a recovery that holds the head this
+/// device holds is followed from there, and the records after the head are taken as a refresh takes
+/// them.
 #[tokio::test]
 async fn a_collection_put_back_with_the_head_this_device_holds_is_followed_from_there() {
     let world = World::default();
@@ -3163,6 +3174,10 @@ async fn a_collection_put_back_with_the_head_this_device_holds_is_followed_from_
 /// candidate settles there. The restore lost the candidate, so its fence cannot say it never ran:
 /// its key is withdrawn, it is never sent again, and the change it carried is built again in the
 /// new history.
+///
+/// KR-REQ-18.05, across a restore that kept this device's head: nothing settles from the new
+/// history until the device has found its own head there, the lost candidate's key is withdrawn and
+/// never sent again, and its change is built again in the new history.
 #[tokio::test]
 async fn a_candidate_that_crossed_a_restore_which_kept_the_head_settles_in_the_new_history() {
     let world = World::default();
@@ -3207,6 +3222,10 @@ async fn a_candidate_that_crossed_a_restore_which_kept_the_head_settles_in_the_n
 /// the collection stands, and its fence cannot say it never ran, but no record is read after its
 /// base in the new history. The device is out at once, before anything settles, and the candidate
 /// it dispatched stays until status and fence settle it, sent once.
+///
+/// KR-REQ-18.05, across a restore that lost this device's head: the device is out at once, before
+/// anything settles, and the candidate it dispatched stays until its status and fence settle it,
+/// sent once.
 #[tokio::test]
 async fn a_candidate_that_crossed_a_restore_which_lost_the_head_leaves_the_device_out_first() {
     let world = World::default();
@@ -3244,6 +3263,9 @@ async fn a_candidate_that_crossed_a_restore_which_lost_the_head_leaves_the_devic
 /// archive brought back says the candidate applied, below a head this device holds and the
 /// restored collection does not. Such a receipt says nothing of the records after it, a removal
 /// among them, so the device is out.
+///
+/// KR-REQ-18.05, across a restore that lost the record after an applied candidate: the receipt the
+/// archive brought back says nothing of the records after it, so the device is out.
 #[tokio::test]
 async fn an_applied_receipt_below_a_head_the_restore_lost_leaves_the_device_out() {
     let world = World::default();
@@ -3281,6 +3303,9 @@ async fn an_applied_receipt_below_a_head_the_restore_lost_leaves_the_device_out(
 
 /// Two reads answered from two histories record nothing: the collection was put back again while
 /// the device read it. Asked again, the refresh reads one history whole.
+///
+/// KR-REQ-18.05, across a restore: two reads answered from two histories record nothing, and the
+/// refresh asked again reads one history whole.
 #[tokio::test]
 async fn a_collection_put_back_again_between_two_reads_records_nothing_and_is_read_again() {
     let world = World::default();
@@ -3313,6 +3338,10 @@ async fn a_collection_put_back_again_between_two_reads_records_nothing_and_is_re
 /// A collection this device starts takes the history its claim applied in, and a device that
 /// joins the history of the chain it verified. A membership in a history never put back names
 /// none, and its file is written as it always was, without the member.
+///
+/// KR-REQ-18.05, across a restore: a collection this device starts takes the history its claim
+/// applied in, a join takes that of the chain it verified, and a membership in a history never put
+/// back names none.
 #[tokio::test]
 async fn a_start_takes_the_history_its_claim_applied_in_and_a_join_that_of_the_chain_it_read() {
     let never = World::default();
@@ -4215,6 +4244,11 @@ async fn a_settings_export_waits_for_privacy_mode_to_end_and_names_its_generatio
 /// A restored device joins its settings collection only as any new device does: once the owner
 /// has paired it with a host again, a member has authorised it and the owner has confirmed the
 /// join on it. The records that listed the device it replaces give it nothing.
+///
+/// KR-REQ-20.17, the settings part of a restore: a restored device joins its settings collection
+/// only as any new device does, once the owner has paired it with a host again, a member has
+/// authorised it and the owner has confirmed the join, and the records that listed the device it
+/// replaces give it nothing.
 #[tokio::test]
 async fn a_restored_device_joins_only_after_a_fresh_authorisation() {
     let world = World::default();
