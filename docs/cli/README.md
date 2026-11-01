@@ -2356,9 +2356,11 @@ what. A session whose worker has ended does not hold it back, because nothing re
 its obligation stays recorded, and `kr privacy status` keeps reporting it, until the daemon has
 removed what the session kept. Nothing privacy mode removed comes back when it is turned off.
 
-Use `kr privacy status` to also show what data will be retained on this host while in privacy mode
-(and why), and what has left this host (backup archives and notifications, each with whether this
-host holds any way to ask for its removal, and for a copy it can, the command that asks). This
+Use `kr privacy status` to also show what the daemon's own services keep on this host while in
+privacy mode (and why; a session's worker keeps more, which the host guide names), and what has left
+this host (backup archives, notifications, external messages and possible copies on viewers'
+devices, each with whether this host holds any way to ask for its removal, and for a copy it can,
+the command that asks). This
 command does not change anything. Other devices paired with this host that are granted `host.manage`
 can read the same report, but no device can enable or disable privacy mode. Other devices that are
 not granted `host.manage` will see only whether the host is in privacy mode, what generation it is
