@@ -240,9 +240,11 @@ moves while the trees build, or while an approval waits, cannot change what is b
 tag is made by publishing the release at the commit, and a tag made that way starts no workflow.
 A release that has been published is never changed: a correction is a new commit under its own tag.
 
-`release-windows.yml` builds and checks the two Windows trees. Its `release` job, which signs them
-behind its own environment, runs only when the repository variable `WINDOWS_HOST_RELEASE` is `true`,
-and asks for no approval when it does not. It signs the files that carry a signature. Its step that
+`release-windows.yml` builds and checks the two Windows trees, on a `host/v*` tag pushed to the
+repository and on a run started by hand. Its `release` job, which signs them behind its own
+environment, runs only for a release tag or the default branch and only when the repository variable
+`WINDOWS_HOST_RELEASE` is `true`; otherwise it is skipped and asks for no approval. It signs the files
+that carry a signature. Its step that
 writes each manifest again and signs it takes no key and ends the job with an error, so the job publishes
 no release.
 
