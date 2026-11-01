@@ -7,8 +7,11 @@
 //! byte of input it reads, as it reads it, in a file of its own, so what reached the application is
 //! read from the application's own record, and writes a numbered line every twentieth of a second
 //! once the test releases it. A terminal is a local client on the worker's own endpoint, as a
-//! person's is; a client that is to be killed is this test binary run again, as a process of its
-//! own, in a mode where it does that and nothing else.
+//! person's is. A client that is to be killed is one of two kinds. The first is this test binary
+//! run again, as a process of its own, in a mode where it attaches through the harness's own
+//! terminal code and nothing else: it is no `kr attach`, and shows only what the worker does when a
+//! lease holder's connection dies. The second is the built `kr attach` itself, run by a shell on a
+//! pseudo-terminal as a person runs it, which answers the terminal queries the command asks.
 //!
 //! A kill happens only at a named point that the peers prove. A paste is open once the program's
 //! record holds the paste's start and the first half of what was pasted. Output is flowing once the
@@ -27,9 +30,10 @@
 
 #![cfg(unix)]
 
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kr_controller::registry::Registry;
@@ -161,27 +165,32 @@ async fn until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// The worker this workspace builds, beside this test.
+/// A program this workspace builds, beside this test.
 ///
-/// A test run of this crate alone does not build the worker, so one an earlier build left in the
+/// A test run of this crate alone does not build the programs, so one an earlier build left in the
 /// target directory could be started, and every check below would be about another build. The
-/// version the worker reports is checked against this build's, which catches a worker of another
-/// release or protocol and not a stale build of this one, so build the worker before a run of this
-/// crate alone.
-fn built_worker() -> PathBuf {
+/// version a program reports is checked against this build's where the test starts it, which
+/// catches a program of another release or protocol and not a stale build of this one, so build
+/// the programs before a run of this crate alone.
+fn built_program(name: &str, package: &str) -> PathBuf {
     let mut directory = std::env::current_exe().expect("this test's own path");
     directory.pop();
     if directory.file_name().is_some_and(|name| name == "deps") {
         directory.pop();
     }
-    let built = directory.join("kr-worker");
+    let built = directory.join(name);
     assert!(
         built.is_file(),
-        "the kill stage starts a real worker and there is none at {}; build it with `cargo build \
-         -p kr-worker` or run scripts/end-to-end.sh, which does",
+        "the kill stage starts a real {name} and there is none at {}; build it with `cargo build \
+         -p {package}` or run scripts/end-to-end.sh, which does",
         built.display()
     );
     built
+}
+
+/// The worker this workspace builds, beside this test.
+fn built_worker() -> PathBuf {
+    built_program("kr-worker", "kr-worker")
 }
 
 /// The host: its tree, which ends everything its daemon started however the test ends, and the
@@ -699,6 +708,142 @@ impl Host {
         .await;
         half
     }
+
+    /// The session's state as its worker answers it to a connection that attaches to nothing, so
+    /// that asking leaves every terminal's stream as it was.
+    async fn snapshot_of(&self, session_id: SessionId) -> EventsSnapshotResult {
+        let descriptor = kr_ipc::descriptor::read_all(&self.environment())
+            .expect("reads the runtime directory")
+            .into_iter()
+            .filter_map(|entry| entry.descriptor.ok())
+            .find(|descriptor| descriptor.session_id == session_id)
+            .expect("the session's descriptor is published");
+        let endpoint =
+            kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
+        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("reaches the worker");
+        client
+            .verify_worker(&descriptor)
+            .await
+            .expect("the worker answers the descriptor's challenge");
+        client
+            .request(
+                Method::EventsSnapshot,
+                &EventsSnapshotParams {
+                    session_id,
+                    agent_resources_from: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the snapshot reaches the worker")
+            .expect("the worker answers the snapshot")
+            .to_typed()
+            .expect("decodes the snapshot")
+    }
+
+    /// Starts the built `kr attach` for a session, on a pseudo-terminal of its own, and waits until
+    /// it is attached and holds the input lease, as a connection of its own that attaches to
+    /// nothing reads the session's state. The programs run are the built `kr` and its guard, copied
+    /// to the internal disk with everything else a launched process touches.
+    async fn attach_process(
+        &self,
+        session_id: SessionId,
+        work: &Path,
+        dimensions: Dimensions,
+    ) -> AttachProcess {
+        let programs = self.tree.root().join("kr-programs");
+        std::fs::create_dir_all(&programs).expect("a directory for the programs");
+        for name in ["kr", "kr-attach-guard"] {
+            kr_ipc::testing::place_and_start_once(
+                &built_program(name, "kr-cli"),
+                &programs.join(name),
+                &["--version"],
+            );
+        }
+        let kr = programs.join("kr");
+        let pty = portable_pty::native_pty_system()
+            // The session's own size: a terminal of another size is drawn a window of the screen,
+            // and every terminal of the session is then sent screens in place of the application's
+            // output as it wrote it.
+            .openpty(portable_pty::PtySize {
+                rows: u16::try_from(dimensions.rows.get()).expect("a row count"),
+                cols: u16::try_from(dimensions.columns.get()).expect("a column count"),
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("opens a terminal");
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        // The trailing read keeps the shell from replacing itself with `kr`.
+        command.arg(format!("'{}' attach {session_id}; read -r _", kr.display()));
+        command.env_clear();
+        command.env("PATH", "/usr/bin:/bin");
+        command.env("TERM", "xterm-256color");
+        command.env("HOME", self.tree.paths().state_root());
+        command.env("KR_RUNTIME_DIR", self.tree.paths().runtime_root());
+        command.env("KR_STATE_DIR", self.tree.paths().state_root());
+        command.cwd(work);
+        let shell = pty.slave.spawn_command(command).expect("starts the shell");
+        let typing = Arc::new(Mutex::new(pty.master.take_writer().expect("a writer")));
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = pty.master.try_clone_reader().expect("a reader");
+        let (answers, output) = (Arc::clone(&typing), Arc::clone(&shown));
+        std::thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            let mut answered = 0;
+            while let Ok(read) = reader.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                let mut shown = output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                shown.extend_from_slice(&buffer[..read]);
+                // Each time the command asks what the terminal is, it is told.
+                while answered < occurrences(&shown, TERMINAL_QUESTION) {
+                    let mut typing = answers
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if typing
+                        .write_all(TERMINAL_ANSWER)
+                        .and_then(|()| typing.flush())
+                        .is_err()
+                    {
+                        return;
+                    }
+                    answered += 1;
+                }
+            }
+        });
+        let shell_pid = shell.process_id().expect("the shell has a process number");
+        let mut attach = AttachProcess {
+            shell,
+            attach: None,
+            typing,
+            shown,
+            _terminal: pty.master,
+        };
+        let pid = until("the shell to start the attach command", || {
+            child_running(shell_pid, &kr)
+        })
+        .await;
+        attach.attach = Some(process_start_identity(pid).expect("the attach process's identity"));
+        let started = tokio::time::Instant::now();
+        loop {
+            let snapshot = self.snapshot_of(session_id).await;
+            if snapshot.attachments.len() == 2 && snapshot.lease.holder.0.is_some() {
+                return attach;
+            }
+            assert!(
+                started.elapsed() < LIVENESS,
+                "`kr attach` was not attached and holding the keys within {LIVENESS:?}: {snapshot:?}; \
+                 the terminal was sent: {}",
+                attach.shown()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 /// The client half this test started, killed however the test ends.
@@ -724,6 +869,93 @@ impl Drop for Half {
             let _ = child.wait();
         }
     }
+}
+
+/// What a terminal that has negotiated the Kitty keyboard protocol at level 5 and
+/// `modifyOtherKeys` at level 2 answers the questions `kr attach` asks before it changes anything,
+/// ending with the device attributes that close the exchange.
+const TERMINAL_ANSWER: &[u8] = b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c";
+
+/// The question that ends with those device attributes.
+const TERMINAL_QUESTION: &[u8] = b"\x1b[c";
+
+/// A real `kr attach`, started by a shell on a pseudo-terminal as a person's terminal window starts
+/// one. The shell stays the session leader and `kr attach` is its child, as it is in a window:
+/// ending a session leader takes the terminal from every process that holds it, and `kr attach`
+/// is never one.
+struct AttachProcess {
+    shell: Box<dyn portable_pty::Child + Send + Sync>,
+    /// The `kr` process itself, not the shell that started it, once the shell has started it.
+    attach: Option<ProcessStartIdentity>,
+    typing: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+    shown: Arc<Mutex<Vec<u8>>>,
+    _terminal: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+impl AttachProcess {
+    /// Types `bytes` on the terminal, as a person's keys reach `kr attach`.
+    fn type_bytes(&self, bytes: &[u8]) {
+        let mut typing = self
+            .typing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        typing.write_all(bytes).expect("types on the terminal");
+        typing.flush().expect("flushes the terminal");
+    }
+
+    /// Everything the terminal has been sent, as text.
+    fn shown(&self) -> String {
+        let shown = self
+            .shown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&shown).escape_debug().to_string()
+    }
+
+    /// The `kr attach` process, which the shell has started by the time anything asks.
+    fn process(&self) -> &ProcessStartIdentity {
+        self.attach.as_ref().expect("the shell started `kr attach`")
+    }
+
+    /// Kills the `kr attach` process outright: a signal no handler can catch.
+    fn kill(&self) {
+        let pid = rustix::process::Pid::from_raw(
+            i32::try_from(self.process().pid.get()).expect("a number"),
+        )
+        .expect("a process number");
+        rustix::process::kill_process(pid, rustix::process::Signal::KILL)
+            .expect("kills the attach process");
+    }
+}
+
+impl Drop for AttachProcess {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("the attach terminal was sent: {}", self.shown());
+        }
+        let _ = self.shell.kill();
+        let _ = self.shell.wait();
+    }
+}
+
+/// The child of `shell` that runs the program at `program`, if it has started one.
+fn child_running(shell: u32, program: &Path) -> Option<u32> {
+    let listing = std::process::Command::new("pgrep")
+        .args(["-P", &shell.to_string()])
+        .output()
+        .expect("lists the shell's children");
+    String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .find(|pid| {
+            let named = std::process::Command::new("ps")
+                .args(["-o", "command=", "-p", &pid.to_string()])
+                .output()
+                .expect("names the process");
+            String::from_utf8_lossy(&named.stdout)
+                .trim_start()
+                .starts_with(&program.display().to_string())
+        })
 }
 
 /// The process a session's root program wrote the number of, as the kernel describes it now.
@@ -969,7 +1201,10 @@ impl Terminal {
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => panic!("the connection ended before {text:?} was shown: {error}"),
-                Err(_) => panic!("{text:?} was not shown within {LIVENESS:?}"),
+                Err(_) => panic!(
+                    "{text:?} was not shown within {LIVENESS:?}; this terminal was shown {:?}",
+                    String::from_utf8_lossy(&self.shown)
+                ),
             }
         }
     }
@@ -1302,11 +1537,55 @@ async fn a_session_closed_on_request_is_not_ended_as_a_killed_worker_ends_one() 
     host.nothing_restarts(session_id).await;
 }
 
+/// What follows a lease holder's death with a paste open at the application, whichever kind of
+/// client it was: the application is sent the paste's end, once; the dead client's attachment and
+/// the lease go; the next terminal to take the keys is told a paste was closed, and what it types
+/// reaches the application after the paste's end; and the worker, the root program and the session
+/// go on. Ends the session and collects its worker.
+async fn the_next_holder_types_after_the_closed_paste(
+    host: &Host,
+    work: &Path,
+    session_id: SessionId,
+    next: &mut Terminal,
+    worker: &ProcessStartIdentity,
+    root: &ProcessStartIdentity,
+) {
+    recorded(work, PASTE_END).await;
+    let alone = until_alone(next).await;
+    assert!(
+        alone.lease.holder.0.is_none(),
+        "nobody holds the keys: {alone:?}"
+    );
+    let acquired = next.acquire().await;
+    assert!(
+        acquired.closed_open_paste,
+        "the next holder is told a paste was closed: {acquired:?}"
+    );
+    next.write(b"kr-after").await;
+    recorded(work, b"kr-after").await;
+    let record = record(work);
+    assert_eq!(
+        record,
+        [PASTE_OPEN, PASTE_END, b"kr-after"].concat(),
+        "the paste was closed once, and the next holder's input came after it: {:?}",
+        String::from_utf8_lossy(&record)
+    );
+    assert!(running(worker), "the worker goes on");
+    assert!(running(root), "the root program goes on");
+    assert_eq!(
+        host.read(session_id).await.session.state,
+        SessionState::Live
+    );
+    host.close(session_id).await;
+    let _ = collect_worker(worker).await;
+}
+
 /// KR-REQ-27.05, a client killed on its own: the client holding the input lease is killed while
 /// its paste is open at the application. The worker ends its attachment and its lease and closes
 /// the paste, once; the next terminal to take the keys is told a paste was closed, and what it
 /// types reaches the application after the paste's end. The worker, the root program and the
-/// session go on.
+/// session go on. The client is this test binary run again, through the harness's terminal code,
+/// and not `kr attach`; the case after this one kills the built command.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_killed_with_a_paste_open_has_it_closed_once_and_the_next_holder_types_after_it() {
     let host = Host::start().await;
@@ -1325,34 +1604,45 @@ async fn a_client_killed_with_a_paste_open_has_it_closed_once_and_the_next_holde
         Some(libc::SIGKILL),
         "{status:?}"
     );
-    recorded(&work, PASTE_END).await;
-    let alone = until_alone(&mut next).await;
-    assert!(
-        alone.lease.holder.0.is_none(),
-        "nobody holds the keys: {alone:?}"
-    );
-    let acquired = next.acquire().await;
-    assert!(
-        acquired.closed_open_paste,
-        "the next holder is told a paste was closed: {acquired:?}"
-    );
-    next.write(b"kr-after").await;
-    recorded(&work, b"kr-after").await;
-    let record = record(&work);
+    the_next_holder_types_after_the_closed_paste(
+        &host, &work, session_id, &mut next, &worker, &root,
+    )
+    .await;
+}
+
+/// KR-REQ-27.05, the attach process killed on its own: the built `kr attach`, run on a terminal as a
+/// person runs it, holds the input lease with a paste open at the application, and is killed
+/// outright with a signal it cannot catch. The worker ends its attachment and its lease and closes
+/// the paste, once; the next terminal to take the keys is told a paste was closed, and what it
+/// types reaches the application after the paste's end. The worker, the root program and the
+/// session go on. Before the kill the command is shown to be the one holding the keys, with the
+/// paste still open at the application.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_attach_process_killed_with_a_paste_open_has_it_closed_once_and_the_session_goes_on()
+{
+    let host = Host::start().await;
+    let work = host.work("attach-killed");
+    let (session_id, dimensions) = host.create(&work).await;
+    let mut next = Terminal::attach(&host.environment(), session_id, dimensions).await;
+    let attach = host.attach_process(session_id, &work, dimensions).await;
+    attach.type_bytes(PASTE_OPEN);
+    recorded(&work, PASTE_OPEN).await;
     assert_eq!(
-        record,
-        [PASTE_OPEN, PASTE_END, b"kr-after"].concat(),
-        "the paste was closed once, and the next holder's input came after it: {:?}",
-        String::from_utf8_lossy(&record)
+        occurrences(&record(&work), PASTE_END),
+        0,
+        "the paste is still open at the application before the kill"
     );
-    assert!(running(&worker), "the worker goes on");
-    assert!(running(&root), "the root program goes on");
-    assert_eq!(
-        host.read(session_id).await.session.state,
-        SessionState::Live
-    );
-    host.close(session_id).await;
-    let _ = collect_worker(&worker).await;
+    host.release_output(&work);
+    next.until_shown("kr-flow-3\r\n").await;
+    let (worker, root) = (host.worker_of(session_id).await, process(&work, "root.pid"));
+    assert!(running(attach.process()), "`kr attach` is running");
+
+    attach.kill();
+    ended(attach.process(), "the attach process").await;
+    the_next_holder_types_after_the_closed_paste(
+        &host, &work, session_id, &mut next, &worker, &root,
+    )
+    .await;
 }
 
 /// The control: a client killed with no paste open leaves nothing to close. The application is
