@@ -183,12 +183,11 @@ impl Backend {
             let ending = run.handle.spawn(async move {
                 let retirement = server.retire(&owned, begun).await;
                 if !retirement.survivors.is_empty() {
-                    eprintln!(
-                        "kr-worker: {} process(es) a server the session started could not be \
-                         ended: {:?}",
+                    crate::diagnostics::tell(format_args!(
+                        "{} process(es) a server the session started could not be ended: {:?}",
                         retirement.survivors.len(),
                         retirement.ended
-                    );
+                    ));
                 }
                 // The conversations the instance held are free for another session only now.
                 broker.server_retired(instance, &identity, retirement.survivors.is_empty());

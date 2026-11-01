@@ -136,9 +136,9 @@ impl ProfileStore {
         host.take(word).map(Some).map_err(|refusal| match refusal {
             ClaimRefusal::Held => BrokerError::ConversationHeldElsewhere,
             ClaimRefusal::Unavailable(detail) => {
-                eprintln!(
-                    "kr-worker: the claim on a saved conversation could not be made: {detail}"
-                );
+                crate::diagnostics::tell(format_args!(
+                    "the claim on a saved conversation could not be made: {detail}"
+                ));
                 BrokerError::ResourceUnavailable {
                     detail: format!(
                         "the claim on the saved conversation could not be made: {detail}"

@@ -1842,13 +1842,13 @@ impl SessionRuntime {
                     .fence()
                     .and_then(|driver| driver.qualification_refusal().cloned())
                 {
-                    eprintln!(
-                        "kr-worker: session {}: the root integration was refused ({}): {}; {}",
+                    crate::diagnostics::tell(format_args!(
+                        "session {}: the root integration was refused ({}): {}; {}",
                         session.id(),
                         refusal.refused.reason.as_str(),
                         refusal.refused.error.message,
                         refusal.diagnostic
-                    );
+                    ));
                     return Err(qualification_answer(&refusal.refused, powershell));
                 }
                 if session.state() != SessionState::Live {

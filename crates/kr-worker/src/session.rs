@@ -1192,9 +1192,10 @@ impl Session {
                 // The shell is told only that no launch could be integrated, and the invocation
                 // runs as typed. Why goes to this worker's own diagnostics, where a person looking
                 // into a command that ran without its integration finds it. The session is held
-                // while it is written, and the volume that made the launch fail may refuse the
-                // write as well: a write that fails costs the invocation nothing.
-                tell_diagnostics(format_args!(
+                // while this is called, which hands the line on and waits for nothing: the volume
+                // that made the launch fail may refuse the write, and a standard error that has
+                // stopped draining holds only the thread that writes it.
+                crate::diagnostics::tell(format_args!(
                     "{command} is not integrated for this launch: {why}"
                 ));
                 None
@@ -5648,75 +5649,11 @@ pub struct OutputPassReport {
     pub age_applied: bool,
 }
 
-/// Says one line to this worker's standard error, for a person looking into a host that did less
-/// than it was asked to, and lets go of a write that fails. A volume that is full refuses the line
-/// as it refused what made the host say it, and a line to a diagnostic is not worth the session
-/// that is held while it is written.
-fn tell_diagnostics(line: std::fmt::Arguments<'_>) {
-    tell(&mut std::io::stderr(), line);
-}
-
-/// Writes `line` to `diagnostics` as one write, and ignores the result.
-fn tell(diagnostics: &mut impl std::io::Write, line: std::fmt::Arguments<'_>) {
-    let _ = diagnostics.write_all(format!("kr-worker: {line}\n").as_bytes());
-}
-
 #[cfg(test)]
 mod tests {
     use kr_protocol::root::{CommandBypassReason, PromptGeneration};
 
-    use super::{Answered, StartTerms, tell};
-
-    /// A diagnostics stream that takes writes while it is open to them, as a volume does until it
-    /// is full.
-    struct Draining {
-        open: bool,
-        taken: Vec<u8>,
-    }
-
-    impl Default for Draining {
-        fn default() -> Self {
-            Self {
-                open: true,
-                taken: Vec::new(),
-            }
-        }
-    }
-
-    impl Draining {
-        fn lines(&self) -> usize {
-            self.taken.iter().filter(|&&byte| byte == b'\n').count()
-        }
-    }
-
-    impl std::io::Write for Draining {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if !self.open {
-                return Err(std::io::Error::other("no space left on device"));
-            }
-            self.taken.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// A line to the diagnostics is one write, and a write that fails is let go.
-    #[test]
-    fn a_line_to_the_diagnostics_is_let_go_when_it_cannot_be_written() {
-        let mut stream = Draining::default();
-        tell(&mut stream, format_args!("{} is not integrated", "claude"));
-        assert_eq!(stream.taken, b"kr-worker: claude is not integrated\n");
-
-        let mut full = Draining {
-            open: false,
-            taken: Vec::new(),
-        };
-        tell(&mut full, format_args!("{} is not integrated", "claude"));
-        assert!(full.taken.is_empty(), "the full stream took nothing");
-    }
+    use super::{Answered, StartTerms};
 
     /// An adoption is given the bypass its own line was answered with, and none of an earlier
     /// line's: a later line that asked nothing, such as a pipeline, inherits nothing.

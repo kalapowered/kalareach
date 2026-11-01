@@ -42,6 +42,12 @@
 //! | [`service`] | The private endpoint: the handshake, the challenge and the method dispatch |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
+// A line to the standard error is written by the thread of `diagnostics`, which no pass, no session
+// call and no runtime waits for. `eprintln!` writes where it is called, and waits for a standard
+// error that has stopped draining, or panics at one that refuses the write. (The worker's own
+// program, a different crate, writes before it has a runtime and after its session has ended.)
+#![deny(clippy::print_stderr)]
+
 pub mod action;
 pub mod application;
 pub mod attachments;

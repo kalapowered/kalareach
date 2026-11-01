@@ -76,6 +76,13 @@ pub(crate) fn standard_error() -> &'static Writer {
     WRITER.get_or_init(|| Writer::start(std::io::stderr()))
 }
 
+/// Says one line to this worker's standard error, and lets it go if it cannot be written or the
+/// writer is behind. The line is handed over whole, and the thread writes it with `write_all`: a
+/// volume that is nearly full can take part of it.
+pub(crate) fn tell(line: std::fmt::Arguments<'_>) {
+    let _ = standard_error().offer(format!("kr-worker: {line}\n"), None);
+}
+
 /// Takes `state`, whose holders never leave it half changed.
 fn locked(state: &Mutex<Said>) -> MutexGuard<'_, Said> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
@@ -535,6 +542,94 @@ mod tests {
         reasons.say(Some("the lock"), true, || {
             panic!("a said reason is not offered")
         });
+    }
+
+    /// Fills this process's standard error, a pipe, to the last byte, so that the next write to it
+    /// waits for a reader.
+    #[cfg(unix)]
+    fn fill_standard_error() {
+        use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+        let standard_error = std::io::stderr();
+        let flags = fcntl_getfl(&standard_error).expect("the flags of the standard error");
+        fcntl_setfl(&standard_error, flags | OFlags::NONBLOCK).expect("a write that does not wait");
+        for chunk in [1024_usize, 1] {
+            let bytes = vec![b'.'; chunk];
+            loop {
+                match rustix::io::write(&standard_error, &bytes) {
+                    Ok(_) => {}
+                    Err(rustix::io::Errno::AGAIN) => break,
+                    Err(error) => panic!("filling the standard error: {error}"),
+                }
+            }
+        }
+        fcntl_setfl(&standard_error, flags).expect("a write that waits again");
+    }
+
+    /// A line told to a standard error that refuses the write, or that has stopped draining, waits
+    /// for nothing: the caller goes on, and the process ends with the writer still in its write.
+    ///
+    /// The case runs itself again as a process of its own, once with a standard error whose
+    /// reading end is closed and once with a pipe that is full and that nobody reads. Told lines
+    /// are more than [`WAITING`], so the ones beyond are dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_line_told_to_a_standard_error_that_refuses_or_has_stopped_draining_waits_for_nothing() {
+        use std::io::Read as _;
+        use std::process::{Command, Stdio};
+
+        const NAME: &str = "diagnostics::tests::a_line_told_to_a_standard_error_that_refuses_or_has_stopped_draining_waits_for_nothing";
+        const CHILD: &str = "KR_TEST_TELL_PROCESS";
+
+        if let Some(mode) = std::env::var_os(CHILD) {
+            if mode == "full" {
+                fill_standard_error();
+            }
+            for number in 0..WAITING * 3 {
+                super::tell(format_args!("a line to a standard error, number {number}"));
+            }
+            println!("told");
+            return;
+        }
+
+        for mode in ["gone", "full"] {
+            let mut worker = Command::new(std::env::current_exe().expect("this test's program"))
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, mode)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("starts the process");
+            // Held without being read, or closed at once.
+            let pipe = worker.stderr.take();
+            if mode == "gone" {
+                drop(pipe);
+            }
+            let started = std::time::Instant::now();
+            let status = loop {
+                if let Some(status) = worker.try_wait().expect("polls the process") {
+                    break Some(status);
+                }
+                if started.elapsed() > DEADLINE {
+                    worker.kill().expect("ends the process by its pid");
+                    worker.wait().expect("the process ends");
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let mut output = String::new();
+            worker
+                .stdout
+                .take()
+                .expect("its standard output")
+                .read_to_string(&mut output)
+                .expect("reads its standard output");
+            assert!(
+                status.is_some_and(|status| status.success()) && output.contains("told"),
+                "the process with its standard error {mode} told its lines and ended: {output}"
+            );
+        }
     }
 
     /// A pass with nothing to say does not ask for the writer, so no thread is started for it.
