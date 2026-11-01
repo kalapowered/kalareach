@@ -644,15 +644,13 @@ impl GitProgram {
     /// As [`Self::at`], giving Git `bound` in all to answer everything it is asked.
     fn at_within(path: &Path, bound: Duration) -> Result<Self> {
         let deadline = Instant::now() + bound;
-        let program = path
-            .canonicalize()
-            .map_err(|error| ProjectError::GitUnavailable {
-                detail: format!(
-                    "{} could not be resolved: {error}",
-                    redact(&path.display().to_string())
-                )
-                .into(),
-            })?;
+        let program = resolved(path).map_err(|error| ProjectError::GitUnavailable {
+            detail: format!(
+                "{} could not be resolved: {error}",
+                redact(&path.display().to_string())
+            )
+            .into(),
+        })?;
         if !program.is_absolute() {
             return Err(ProjectError::GitUnavailable {
                 detail: format!(
@@ -683,16 +681,14 @@ impl GitProgram {
         // directory through a link has Git report its helper directory through that link, and a
         // boundary that names the directory by path is judged by the path an execution resolves
         // to: named through the link, it would name no helper Git starts from it.
-        let exec_path = reported
-            .canonicalize()
-            .map_err(|error| ProjectError::GitUnavailable {
-                detail: format!(
-                    "{} reports a helper directory {} that could not be resolved: {error}",
-                    redact(&program.display().to_string()),
-                    redact(&reported.display().to_string())
-                )
-                .into(),
-            })?;
+        let exec_path = resolved(&reported).map_err(|error| ProjectError::GitUnavailable {
+            detail: format!(
+                "{} reports a helper directory {} that could not be resolved: {error}",
+                redact(&program.display().to_string()),
+                redact(&reported.display().to_string())
+            )
+            .into(),
+        })?;
         let version = ask(&program, &["--version"], deadline)
             .map_err(Asked::into_error)?
             .trim_end()
@@ -899,7 +895,7 @@ impl Installation {
         // Said after the stored program is read and before anything is searched for: a profile
         // built around a program it was handed has one to give wherever it is, and a profile that
         // has to look runs no Git on a platform that runs none, installed or not.
-        if let Some(why) = crate::boundary::NO_GIT {
+        if let Some(why) = crate::boundary::no_git() {
             return Err(crate::boundary::no_git_refusal(why));
         }
         let mut current = self
@@ -3901,11 +3897,15 @@ fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::
             }));
         }
         // A case that asks for it has its thread stall here, where a poll would sleep, so that
-        // the next poll comes at a moment the case has chosen.
+        // the next poll comes at a moment the case has chosen, which it chooses by the limits
+        // this wait holds and not by a guess at them.
         #[cfg(all(test, unix))]
         tests::BEFORE_THE_NEXT_POLL.with(|stall| {
             if let Some(stall) = stall.take() {
-                stall();
+                stall(tests::Limits {
+                    second: drain,
+                    deadline,
+                });
             }
         });
         std::thread::sleep(Duration::from_millis(5));
@@ -4076,6 +4076,14 @@ fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) 
             break;
         }
         let read = pipe.read(&mut buffer);
+        // A case that asks for it has its thread pause here, once, as one does that the system
+        // holds after a read has returned and before anything is decided from what it returned.
+        #[cfg(test)]
+        tests::AFTER_THE_READ.with(|pause| {
+            if let Some(pause) = pause.take() {
+                pause();
+            }
+        });
         // A case that asks for it has the read fail, as one does for a pipe the system can no
         // longer read, and the arm that handles the failure is the real one.
         #[cfg(test)]
@@ -4257,6 +4265,20 @@ fn end_probe(mut child: std::process::Child) {
     std::thread::spawn(move || {
         let _ = child.wait();
     });
+}
+
+/// Resolves a path that names Git, or the directory Git reports, to the file it leads to.
+fn resolved(path: &Path) -> std::io::Result<PathBuf> {
+    // A case that asks for it has the resolution fail, after the number of resolutions it names
+    // have succeeded, with the error it names, as one does for a host that is short of memory.
+    #[cfg(all(test, unix))]
+    if let Some((passing, error)) = tests::RESOLUTION_FAILS.with(std::cell::Cell::get) {
+        if passing == 0 {
+            return Err(std::io::Error::from(error));
+        }
+        tests::RESOLUTION_FAILS.with(|fails| fails.set(Some((passing - 1, error))));
+    }
+    path.canonicalize()
 }
 
 /// Reads the major and minor version out of `git --version`.
@@ -5307,9 +5329,38 @@ mod tests {
         /// for a pipe the system can no longer read.
         pub(super) static READ_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Set by a case to run something once on its own thread between two polls of the wait for
-        /// a probe's output, in place of the sleep's start.
-        pub(super) static BEFORE_THE_NEXT_POLL: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        /// a probe's output, in place of the sleep's start. It is given the limits of that wait.
+        pub(super) static BEFORE_THE_NEXT_POLL: std::cell::Cell<Option<Stall>> =
             const { std::cell::Cell::new(None) };
+        /// Set by a case to make the resolution of a path that names Git fail on its own thread,
+        /// after that many resolutions have succeeded, with that error.
+        pub(super) static RESOLUTION_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
+            const { std::cell::Cell::new(None) };
+        /// Set by a case to run something once on its own thread right after a read of a probe's
+        /// output has returned, before anything is decided from what it returned.
+        pub(super) static AFTER_THE_READ: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// What a case has its thread do between two polls of the wait for a probe's output.
+    #[cfg(unix)]
+    pub(super) type Stall = Box<dyn FnOnce(Limits)>;
+
+    /// The two limits of a wait for a probe's output after the probe has ended: the second it is
+    /// given, and the time the probe was given.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    pub(super) struct Limits {
+        pub(super) second: Instant,
+        pub(super) deadline: Instant,
+    }
+
+    /// Waits until the clock has reached `moment`.
+    #[cfg(unix)]
+    fn wait_until(moment: Instant) {
+        while Instant::now() < moment {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// A pipe whose writers are faster than its reader: whenever it is asked, it has something to
@@ -5427,6 +5478,71 @@ mod tests {
         let left = gather(&mut pipe, &mut seen, deadline);
 
         assert!(matches!(left, Gathered::Open), "{left:?}");
+    }
+
+    /// A pipe whose reads each give 4096 bytes, the `late`th of them only once `until` has passed,
+    /// as a read does that the system holds up.
+    #[cfg(unix)]
+    struct LateBytes {
+        reads: usize,
+        late: usize,
+        until: Instant,
+    }
+
+    #[cfg(unix)]
+    impl std::io::Read for LateBytes {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.reads == self.late {
+                wait_until(self.until);
+            }
+            let given = buffer.len().min(4096);
+            buffer[..given].fill(b'x');
+            Ok(given)
+        }
+    }
+
+    /// Bytes that a read returns after the deadline are not taken, and so they are not too much
+    /// output: the read began inside the time, and whether the bytes were in the pipe by its end is
+    /// not known, as it is not for an end. The read that passes the limit is the late one here, so
+    /// output counted from it would be refused as the program's answer, with the step to install
+    /// Git, for a time that ran out.
+    #[cfg(unix)]
+    #[test]
+    fn bytes_that_a_read_returns_after_the_deadline_are_not_taken_for_too_much_output() {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        // The sixteen reads before it fill the limit exactly, 64 KiB.
+        let mut pipe = LateBytes {
+            reads: 0,
+            late: 17,
+            until: deadline,
+        };
+        let mut seen = Bounded::default();
+
+        let left = gather(&mut pipe, &mut seen, deadline);
+
+        assert_eq!(
+            pipe.reads, 17,
+            "the read that passes the limit began in time"
+        );
+        assert!(matches!(left, Gathered::Open), "{left:?}");
+        assert!(!seen.truncated, "bytes that came late are not too much");
+    }
+
+    /// A pass that begins when the deadline has come reads nothing: the pipe is not touched, so
+    /// what it holds is neither taken nor lost, and the pass does not decide whether it was there
+    /// in time.
+    #[cfg(unix)]
+    #[test]
+    fn a_pass_that_begins_when_the_deadline_has_come_reads_nothing() {
+        let mut pipe = std::io::Cursor::new(b"git version 2.50.1\n".to_vec());
+        let mut seen = Bounded::default();
+
+        let left = gather(&mut pipe, &mut seen, Instant::now());
+
+        assert!(matches!(left, Gathered::Open), "{left:?}");
+        assert_eq!(pipe.position(), 0, "the pipe was not read");
+        assert!(seen.bytes.is_empty(), "and nothing was taken from it");
     }
 
     /// An answer of exactly 64 KiB, the limit the documents state, is kept whole and is an answer;
@@ -5940,6 +6056,39 @@ mod tests {
         assert_eq!(state(&pid), "", "the child was collected");
     }
 
+    /// Places a `git` in `directory` that starts a process in a session of its own, which holds the
+    /// pipe the stand-in was started with until a case lets it go with [`let_go`] or `directory` is
+    /// gone, and ends. The stand-in ends once the holder has left the group, so that ending the
+    /// group cannot reach it.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    fn stand_in_whose_output_a_process_outside_its_group_holds(directory: &Path) -> PathBuf {
+        let (own, release) = (directory.join("own"), directory.join("release"));
+        let (holder, program) = (directory.join("holder.pl"), directory.join("git"));
+        std::fs::write(
+            &holder,
+            "use POSIX ();\nPOSIX::setsid();\nopen(my $out, '>', $ARGV[0]) or die;\n\
+             print $out $$;\nclose($out);\nmy $i = 0;\n\
+             while (-d $ARGV[2] && !-e $ARGV[1] && $i++ < 2400) {\n\
+             select(undef, undef, undef, 0.05); }\n",
+        )
+        .expect("the holder's text");
+        let text = directory.join("git.text");
+        std::fs::write(
+            &text,
+            format!(
+                "#!/bin/sh\n/usr/bin/perl '{holder}' '{own}' '{release}' '{directory}' &\ni=0\n\
+                 while [ ! -s '{own}' ] && [ $i -lt 2400 ]; do sleep 0.02; i=$((i+1)); done\n",
+                holder = holder.display(),
+                own = own.display(),
+                release = release.display(),
+                directory = directory.display(),
+            ),
+        )
+        .expect("the stand-in's text");
+        kr_ipc::testing::place_program(&text, &program);
+        program
+    }
+
     /// A probe whose child has ended, and whose output a process in a session of its own still
     /// holds, is refused when the short wait for the end of its output has run out and not when the
     /// deadline has: ending the child's group did not reach a process that left it. The deadline
@@ -5949,38 +6098,7 @@ mod tests {
     #[test]
     fn a_probe_whose_output_a_process_outside_its_group_holds_is_refused_after_the_drain() {
         let directory = tempfile::tempdir().expect("a directory for this test");
-        let (own, release) = (
-            directory.path().join("own"),
-            directory.path().join("release"),
-        );
-        let (holder, program) = (
-            directory.path().join("holder.pl"),
-            directory.path().join("git"),
-        );
-        std::fs::write(
-            &holder,
-            "use POSIX ();\nPOSIX::setsid();\nopen(my $out, '>', $ARGV[0]) or die;\n\
-             print $out $$;\nclose($out);\nmy $i = 0;\n\
-             while (-d $ARGV[2] && !-e $ARGV[1] && $i++ < 2400) {\n\
-             select(undef, undef, undef, 0.05); }\n",
-        )
-        .expect("the holder's text");
-        // The stand-in ends once the holder has left the group, so that ending the group cannot
-        // reach it, and the holder goes on holding the pipe the stand-in was started with.
-        let text = directory.path().join("git.text");
-        std::fs::write(
-            &text,
-            format!(
-                "#!/bin/sh\n/usr/bin/perl '{holder}' '{own}' '{release}' '{directory}' &\ni=0\n\
-                 while [ ! -s '{own}' ] && [ $i -lt 2400 ]; do sleep 0.02; i=$((i+1)); done\n",
-                holder = holder.display(),
-                own = own.display(),
-                release = release.display(),
-                directory = directory.path().display(),
-            ),
-        )
-        .expect("the stand-in's text");
-        kr_ipc::testing::place_program(&text, &program);
+        let program = stand_in_whose_output_a_process_outside_its_group_holds(directory.path());
 
         let (done, ended) = std::sync::mpsc::channel();
         let outcome = std::thread::scope(|scope| {
@@ -6008,6 +6126,263 @@ mod tests {
             refusal.to_string().contains("left its output open")
                 && matches!(refusal, ProjectError::GitUnavailable { .. }),
             "what the program does is the program's, and stays so: {refusal:?}"
+        );
+    }
+
+    /// A look whose wait for the output of a program that has ended is held past the time the look
+    /// was given is a fault that passes, and names no step to install Git: the program held a pipe
+    /// open and the look came back to it too late to say that it was the program that did. This is
+    /// the refusal a person is shown, so the case goes through the installation that every request
+    /// asks for Git. The wait is held between its first poll and the next, at the one place a
+    /// poll comes late, and the time the look was given is short so that the hold is not long.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn a_look_whose_wait_for_a_programs_output_is_held_past_its_time_names_no_step_to_install_git()
+    {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        stand_in_whose_output_a_process_outside_its_group_holds(directory.path());
+        let bound = Duration::from_secs(3);
+        let installation =
+            Installation::looked_for_on(Some(directory.path().as_os_str().to_owned()), bound);
+        let held = std::rc::Rc::new(std::cell::Cell::new(None::<Limits>));
+        // The poll is held until the look's own time has run out, which the case counts from its
+        // start and not from the limits the wait reports, since a wait that was given another
+        // time would otherwise hold the case with it.
+        let past_the_time = Instant::now() + bound + Duration::from_millis(300);
+        BEFORE_THE_NEXT_POLL.with(|stall| {
+            let held = std::rc::Rc::clone(&held);
+            stall.set(Some(Box::new(move |limits| {
+                held.set(Some(limits));
+                wait_until(past_the_time);
+            })));
+        });
+
+        let refusal = installation
+            .program()
+            .map(|_| ())
+            .expect_err("a program whose output is held is no Git");
+        let_go(directory.path());
+
+        let limits = held
+            .get()
+            .expect("the wait for the output was reached, and held");
+        assert!(
+            limits.deadline < past_the_time,
+            "the hold went past the look's time"
+        );
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::UpstreamUnavailable
+        );
+        assert!(refusal.code().retry_category().permits_automatic_retry());
+        let said = refusal.to_string();
+        assert!(!said.contains("Install"), "it names no step: {said}");
+    }
+
+    /// Asks `--version` of a stand-in that writes its number to a file, waits for the release, and
+    /// then runs `body`, a shell command, and ends, giving the question `time`. The first poll of
+    /// the ask is held back until the stand-in has ended and waits to be collected, so what it said
+    /// and the end of its output are in the pipe when that poll comes. The release is given once
+    /// `time` has run out when `after_the_time` is set, and at once otherwise.
+    #[cfg(unix)]
+    fn ask_with_the_first_poll_after_the_stand_in_ended(
+        body: &str,
+        time: Duration,
+        after_the_time: bool,
+    ) -> std::result::Result<String, Asked> {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let (own, release, gate) = (
+            directory.path().join("own"),
+            directory.path().join("release"),
+            directory.path().join("gate"),
+        );
+        let (text, program) = (
+            directory.path().join("git.text"),
+            directory.path().join("git"),
+        );
+        std::fs::write(
+            &text,
+            format!(
+                "#!/bin/sh\necho $$ > '{own}'\ni=0\n\
+                 while [ ! -e '{release}' ] && [ -d '{directory}' ] && [ $i -lt 2400 ]; \
+                 do sleep 0.02; i=$((i+1)); done\n{body}\n",
+                own = own.display(),
+                release = release.display(),
+                directory = directory.path().display(),
+            ),
+        )
+        .expect("the stand-in's text");
+        kr_ipc::testing::place_program(&text, &program);
+
+        STARTS_FIRST.with(|started| *started.borrow_mut() = Some(gate.clone()));
+        let deadline = Instant::now() + time;
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                if after_the_time {
+                    wait_until(deadline);
+                }
+                std::fs::write(&release, "").expect("the stand-in is released");
+                let pid = number_of(&own);
+                let guard = Instant::now() + Duration::from_secs(30);
+                while running(&pid) {
+                    assert!(Instant::now() < guard, "the stand-in never ended");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::fs::write(&gate, "ended").expect("the first poll is let go");
+            });
+            ask(&program, &["--version"], deadline)
+        });
+        STARTS_FIRST.with(|started| *started.borrow_mut() = None);
+        outcome
+    }
+
+    /// A poll of the program itself that comes after the time the look was given, when the program
+    /// has answered and ended, reads nothing and the look is a fault that passes: what the program
+    /// wrote cannot be told from what reached the pipe after the time, so it is not taken for the
+    /// answer. The stand-in is released only once the time has run out, so the answer is written
+    /// after it, and the first poll is held until the stand-in has ended. The case goes through
+    /// `ask`, which gives each read the probe's time and gives the wait for the end of the output
+    /// the same time.
+    #[cfg(unix)]
+    #[test]
+    fn a_first_poll_after_the_time_ran_out_reads_nothing_of_an_answer_that_came_after_it() {
+        let outcome = ask_with_the_first_poll_after_the_stand_in_ended(
+            "echo git version 2.50.1",
+            Duration::from_millis(500),
+            true,
+        );
+
+        let refusal = match outcome {
+            Err(Asked::Overran(refusal)) => refusal,
+            other => panic!(
+                "an answer that came after the time is not an answer: {:?}",
+                other.map_err(Asked::into_error)
+            ),
+        };
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::UpstreamUnavailable
+        );
+        assert!(refusal.code().retry_category().permits_automatic_retry());
+    }
+
+    /// An exit that is seen after the time the look was given is the clock's, even when the output
+    /// was read to its end in time. The stand-in answers and ends with a failure, and the poll
+    /// that finds it ended comes when the time is used up (the case has the time read as used up
+    /// from the loop's first look at it, and the output is read by the real clock, far inside the
+    /// time). A refusal made on the exit code would blame the program, with the step to install
+    /// Git, for an exit that this host saw only after its time.
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_seen_after_the_time_ran_out_is_the_clocks_and_not_the_programs() {
+        TIME_IS_UP.with(|up| up.set(true));
+        let outcome = ask_with_the_first_poll_after_the_stand_in_ended(
+            "echo git version 2.50.1; exit 1",
+            Duration::from_secs(60),
+            false,
+        );
+        TIME_IS_UP.with(|up| up.set(false));
+
+        let refusal = match outcome {
+            Err(Asked::Overran(refusal)) => refusal,
+            other => panic!(
+                "an exit seen after the time is not an answer: {:?}",
+                other.map_err(Asked::into_error)
+            ),
+        };
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::UpstreamUnavailable
+        );
+        assert!(refusal.code().retry_category().permits_automatic_retry());
+    }
+
+    /// A first poll that comes after the time the look was given takes in none of the output that
+    /// is already in the pipe, however much it is: the program is still running, and has written
+    /// more than the limit, which a poll made in time would refuse as more than was asked, with
+    /// the step to install Git. This poll was made late, so the output is not weighed, and the
+    /// look is a fault that passes for the time that ran out. The stand-in raises its pipe to a
+    /// size that holds what it writes, so it is never blocked, and tells the case when it has
+    /// written all of it; the first poll is held until then. Raising a pipe's size is Linux's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_first_poll_after_the_time_ran_out_takes_in_no_output_even_past_the_limit() {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let (own, release, gate) = (
+            directory.path().join("own"),
+            directory.path().join("release"),
+            directory.path().join("gate"),
+        );
+        let (text, program) = (
+            directory.path().join("git.text"),
+            directory.path().join("git"),
+        );
+        std::fs::write(
+            &text,
+            format!(
+                "#!/usr/bin/perl\nopen(my $o, '>', '{own}') or die;\nprint $o $$;\nclose($o);\n\
+                 my $i = 0;\n\
+                 while (!-e '{release}' && -d '{directory}' && $i++ < 2400) \
+                 {{ select(undef, undef, undef, 0.02); }}\n\
+                 fcntl(STDOUT, 1031, 1048576) or die; # F_SETPIPE_SZ\n\
+                 syswrite(STDOUT, 'x' x 200000) == 200000 or die;\n\
+                 open(my $g, '>', '{gate}') or die;\nprint $g 'written';\nclose($g);\n\
+                 $i = 0;\n\
+                 while (-d '{directory}' && !-e '{release}.again' && $i++ < 2400) \
+                 {{ select(undef, undef, undef, 0.05); }}\n",
+                own = own.display(),
+                release = release.display(),
+                gate = gate.display(),
+                directory = directory.path().display(),
+            ),
+        )
+        .expect("the stand-in's text");
+        kr_ipc::testing::place_program(&text, &program);
+
+        STARTS_FIRST.with(|started| *started.borrow_mut() = Some(gate.clone()));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                wait_until(deadline);
+                std::fs::write(&release, "").expect("the stand-in is released");
+            });
+            ask(&program, &["--version"], deadline)
+        });
+        STARTS_FIRST.with(|started| *started.borrow_mut() = None);
+        let pid = number_of(&own);
+        std::fs::write(directory.path().join("release.again"), "").expect("the stand-in ends");
+
+        assert!(gate.exists(), "the stand-in wrote all of its output first");
+        assert!(
+            !running(&pid),
+            "the stand-in was ended with the look, and not left running"
+        );
+        let refusal = match outcome {
+            Err(Asked::Overran(refusal)) => refusal,
+            other => panic!(
+                "output taken in after the time is not weighed: {:?}",
+                other.map_err(Asked::into_error)
+            ),
+        };
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::UpstreamUnavailable
         );
     }
 
@@ -6094,13 +6469,16 @@ mod tests {
 
     /// Drains the output of a `cat` that has said something and is still running, with the
     /// probe's time ending `time` after the start. The first poll finds the pipe open. Between it
-    /// and the next one `cat` ends, so the end is in the pipe, and the thread then stalls until
-    /// `stalled` after the start: the next poll comes only then.
+    /// and the next one `cat` ends, so the end is in the pipe before the drain's second runs out,
+    /// and the thread then stalls until `after_the_second` after that second: the next poll comes
+    /// only then. What it returns besides the outcome is the limits the wait held, so that a case
+    /// states the order of the three moments it stands for and fails when the machine was too slow
+    /// to keep it.
     #[cfg(unix)]
     fn drain_with_a_stall_after_the_end_arrives(
         time: Duration,
-        stalled: Duration,
-    ) -> std::result::Result<(), Asked> {
+        after_the_second: Duration,
+    ) -> (std::result::Result<(), Asked>, Limits) {
         use std::io::Write as _;
 
         let mut holder = std::process::Command::new("cat")
@@ -6112,20 +6490,26 @@ mod tests {
         said.write_all(b"/a/helper/directory\n")
             .expect("something is said");
         let mut heard = Heard::of(holder.stdout.take()).expect("the pipe is read without blocking");
-        let start = Instant::now();
+        let held = std::rc::Rc::new(std::cell::Cell::new(None));
         BEFORE_THE_NEXT_POLL.with(|stall| {
-            stall.set(Some(Box::new(move || {
+            let held = std::rc::Rc::clone(&held);
+            stall.set(Some(Box::new(move |limits| {
+                held.set(Some(limits));
                 drop(said);
                 holder
                     .wait()
                     .expect("cat ends, and the pipe it held with it");
-                while Instant::now() < start + stalled {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                assert!(
+                    Instant::now() < limits.second,
+                    "the end is in the pipe before the drain's second runs out"
+                );
+                wait_until(limits.second + after_the_second);
             })));
         });
 
-        drain(&mut heard, "git --exec-path", start + time)
+        let outcome = drain(&mut heard, "git --exec-path", Instant::now() + time);
+        let limits = held.get().expect("the wait reached its first stall");
+        (outcome, limits)
     }
 
     /// The wait for a probe's output ends at the drain's second, and a poll that comes after it
@@ -6138,11 +6522,15 @@ mod tests {
     #[test]
     fn a_poll_after_the_drains_second_and_inside_the_probes_time_reads_an_end_that_came_before_it()
     {
-        let outcome = drain_with_a_stall_after_the_end_arrives(
-            Duration::from_secs(60),
-            PROBE_DRAIN + Duration::from_millis(50),
-        );
+        let after_the_second = Duration::from_millis(50);
 
+        let (outcome, limits) =
+            drain_with_a_stall_after_the_end_arrives(Duration::from_secs(60), after_the_second);
+
+        assert!(
+            limits.second + after_the_second < limits.deadline,
+            "the poll comes inside the probe's time"
+        );
         assert!(
             outcome.is_ok(),
             "an end that came in time is the end: {:?}",
@@ -6157,11 +6545,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_poll_after_both_the_drains_second_and_the_probes_time_does_not_blame_the_program() {
-        let outcome = drain_with_a_stall_after_the_end_arrives(
+        let after_the_second = Duration::from_millis(700);
+
+        let (outcome, limits) = drain_with_a_stall_after_the_end_arrives(
             PROBE_DRAIN + Duration::from_millis(500),
-            PROBE_DRAIN + Duration::from_millis(700),
+            after_the_second,
         );
 
+        assert!(
+            limits.second < limits.deadline && limits.deadline < limits.second + after_the_second,
+            "the probe's time ends after the second and before the poll"
+        );
         let Err(Asked::Overran(refusal)) = outcome else {
             panic!("an end that was not read is not an answer");
         };
@@ -6174,6 +6568,213 @@ mod tests {
             kr_protocol::error::ErrorCode::UpstreamUnavailable
         );
         assert!(refusal.code().retry_category().permits_automatic_retry());
+    }
+
+    /// A pause between a read that finds the pipe open and the check of the clock is not the
+    /// program's. The read comes before the second runs out and the thread then pauses past it, and
+    /// the pipe's last writer ends during the pause, so the end is in the pipe when the clock is
+    /// read. A wait that decided by that read would say the program left its output open for the
+    /// whole second; this one reads again, after the second, before it says so, and finds the end.
+    #[cfg(unix)]
+    #[test]
+    fn a_pause_between_a_read_and_the_clock_does_not_blame_a_program_that_ended_its_output_in_time()
+    {
+        let mut holder = std::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat holds a pipe open for as long as its input is");
+        let said = holder.stdin.take().expect("cat's input");
+        let mut heard = Heard::of(holder.stdout.take()).expect("the pipe is read without blocking");
+        AFTER_THE_READ.with(|pause| {
+            pause.set(Some(Box::new(move || {
+                drop(said);
+                holder
+                    .wait()
+                    .expect("cat ends, and the pipe it held with it");
+                // The wait began before this pause did, so its second is over by the time this one
+                // is.
+                wait_until(Instant::now() + PROBE_DRAIN + Duration::from_millis(100));
+            })));
+        });
+
+        let outcome = drain(
+            &mut heard,
+            "git --exec-path",
+            Instant::now() + Duration::from_secs(60),
+        );
+
+        assert!(
+            outcome.is_ok(),
+            "an end that came in time is the end: {:?}",
+            outcome.err().map(Asked::into_error)
+        );
+    }
+
+    /// A read that begins after the drain's second and inside the probe's time, and returns only
+    /// after that time, is the clock's too. The pipe's last writer has ended, so the end is what
+    /// the read returns, and it returns late: the end is not taken, the pipe looks open, and the
+    /// look is a fault that passes. A refusal dated by the moment the read began would blame the
+    /// program, which held nothing open.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_that_returns_after_the_probes_time_does_not_blame_the_program() {
+        let mut holder = std::process::Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("cat holds a pipe open for as long as its input is");
+        let said = holder.stdin.take().expect("cat's input");
+        let mut heard = Heard::of(holder.stdout.take()).expect("the pipe is read without blocking");
+        let held = std::rc::Rc::new(std::cell::Cell::new(None));
+        BEFORE_THE_NEXT_POLL.with(|stall| {
+            let held = std::rc::Rc::clone(&held);
+            stall.set(Some(Box::new(move |limits: Limits| {
+                drop(said);
+                holder
+                    .wait()
+                    .expect("cat ends, and the pipe it held with it");
+                wait_until(limits.second);
+                // The next poll begins now, inside the probe's time, and its read returns after it.
+                AFTER_THE_READ.with(|pause| {
+                    pause.set(Some(Box::new(move || {
+                        held.set(Some((Instant::now(), limits)));
+                        wait_until(limits.deadline);
+                    })));
+                });
+            })));
+        });
+
+        let outcome = drain(
+            &mut heard,
+            "git --exec-path",
+            Instant::now() + PROBE_DRAIN + Duration::from_millis(500),
+        );
+
+        let (read_at, limits) = held.get().expect("the second poll's read was reached");
+        assert!(
+            limits.second <= read_at && read_at < limits.deadline,
+            "the read is made after the second and inside the probe's time"
+        );
+        let Err(Asked::Overran(refusal)) = outcome else {
+            panic!("an end that was read late is not an answer");
+        };
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::UpstreamUnavailable
+        );
+    }
+
+    /// An output that passes the limit while the wait for its end is under way is refused as more
+    /// than a version and a directory, the program's answer and not the clock's. The writer here
+    /// writes 200,000 bytes and has not ended when the wait begins, so the limit is passed by the
+    /// wait's own reads.
+    #[cfg(unix)]
+    #[test]
+    fn an_output_that_passes_the_limit_while_its_end_is_awaited_is_more_than_was_asked() {
+        let mut writer = std::process::Command::new("head")
+            .args(["-c", "200000", "/dev/zero"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("head writes 200,000 bytes");
+        let mut heard = Heard::of(writer.stdout.take()).expect("the pipe is read without blocking");
+
+        let outcome = drain(
+            &mut heard,
+            "git --version",
+            Instant::now() + Duration::from_secs(60),
+        );
+
+        // The writer is blocked on a pipe nobody reads any more; closing it ends the writer.
+        drop(heard);
+        writer.wait().expect("head ends");
+        let Err(Asked::Overran(refusal)) = outcome else {
+            panic!("an output past the limit is refused");
+        };
+        assert!(
+            matches!(refusal, ProjectError::GitUnavailable { .. })
+                && refusal
+                    .to_string()
+                    .contains("more than a version and a directory"),
+            "what the program wrote is the program's: {refusal:?}"
+        );
+    }
+
+    /// A host too short of memory to resolve a path that names Git says nothing of the Git: the
+    /// look is refused as a fault that passes, which a client sends the request again after, and
+    /// names no step to install it. Both resolutions the look makes are held, the program's own
+    /// path and the helper directory it reports. A resolution that fails for another reason is
+    /// the program's, as it was, with the step.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_too_short_of_memory_to_resolve_a_path_of_git_refuses_the_look_as_a_fault_that_passes()
+    {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let helpers = directory.path().join("helpers");
+        std::fs::create_dir(&helpers).expect("a helper directory");
+        place_stand_in(directory.path(), &format!("echo '{}'", helpers.display()));
+        let search = directory.path().as_os_str().to_owned();
+
+        for passing in [0, 1] {
+            RESOLUTION_FAILS.with(|fails| {
+                fails.set(Some((passing, rustix::io::Errno::NOMEM)));
+            });
+            let refusal = GitProgram::discover_on(Some(&search), PROBE_BOUND)
+                .expect_err("a path that cannot be resolved is not a Git");
+            RESOLUTION_FAILS.with(|fails| fails.set(None));
+
+            assert!(
+                matches!(refusal, ProjectError::GitFailed { .. }),
+                "after {passing} resolutions: {refusal:?}"
+            );
+            assert_eq!(
+                refusal.code(),
+                kr_protocol::error::ErrorCode::UpstreamUnavailable
+            );
+            assert!(refusal.code().retry_category().permits_automatic_retry());
+            let said = refusal.to_string();
+            assert!(!said.contains("Install"), "it names no step: {said}");
+        }
+
+        RESOLUTION_FAILS.with(|fails| fails.set(Some((0, rustix::io::Errno::IO))));
+        let refusal = GitProgram::discover_on(Some(&search), PROBE_BOUND)
+            .expect_err("a path that cannot be resolved is not a Git");
+        RESOLUTION_FAILS.with(|fails| fails.set(None));
+        assert!(
+            matches!(refusal, ProjectError::GitUnavailable { .. })
+                && refusal.to_string().contains("Install"),
+            "a failure that is not the host's shortage is the program's: {refusal:?}"
+        );
+    }
+
+    /// A platform that runs no Git refuses before Git is looked for, installed or not, under the
+    /// refusal a client does not send again and with the platform's reason, and not with the step
+    /// that installs Git, which would change nothing there. Where the search path leads nowhere the
+    /// look would say that no Git was found instead, so the case shows that the platform's reason
+    /// is asked first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_platform_that_runs_no_git_is_asked_before_git_is_looked_for() {
+        let installation = Installation::looked_for_on(None, PROBE_BOUND);
+
+        let refusal = crate::boundary::with_no_git("a reason of the platform", || {
+            installation.program().map(|_| ())
+        })
+        .expect_err("a platform that runs no Git has none to give");
+
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::HostNotConfigured
+        );
+        let said = refusal.to_string();
+        assert!(
+            said.contains("a reason of the platform") && !said.contains("Install"),
+            "{said}"
+        );
     }
 
     #[test]

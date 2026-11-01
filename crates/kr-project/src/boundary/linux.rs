@@ -145,6 +145,44 @@ pub const NO_GIT: Option<&str> = if cfg!(any(target_arch = "x86_64", target_arch
     Some(NO_SYSTEM_CALL_NUMBERS)
 };
 
+#[cfg(any(test, feature = "git-fixtures"))]
+thread_local! {
+    /// The reason this thread's platform runs no Git instead of [`NO_GIT`], when a case forces
+    /// one.
+    static NO_GIT_FORCED: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `run` with this platform running no Git, for the reason `why`, as a machine of an
+/// instruction set this host holds no system-call numbers for does. [`NO_GIT`] is empty on every
+/// machine this host ships for, so a case that shows what the refusal does could not otherwise
+/// reach it.
+///
+/// Nothing about the machine changes: it is the answer to the question whether the platform runs
+/// Git that is replaced, on this thread only.
+#[cfg(any(test, feature = "git-fixtures"))]
+pub fn with_no_git<R>(why: &'static str, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<&'static str>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NO_GIT_FORCED.with(|forced| forced.set(self.0));
+        }
+    }
+
+    let _restore = Restore(NO_GIT_FORCED.with(|forced| forced.replace(Some(why))));
+    run()
+}
+
+/// Why this platform runs no Git, when it runs none: [`NO_GIT`], or what a case forces on this
+/// thread.
+pub fn no_git() -> Option<&'static str> {
+    #[cfg(any(test, feature = "git-fixtures"))]
+    if let Some(forced) = NO_GIT_FORCED.with(std::cell::Cell::get) {
+        return Some(forced);
+    }
+    NO_GIT
+}
+
 /// The interface version the filesystem confinement is built against.
 ///
 /// Truncation arrived here. Below it a process could shorten a file this boundary never made

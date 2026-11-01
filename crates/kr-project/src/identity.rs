@@ -1698,6 +1698,44 @@ mod tests {
         let looping = open_recorded_root(environment_id, &first, recorded)
             .expect_err("a link that leads to itself cannot be followed");
         assert_eq!(looping.code(), ErrorCode::InvalidArgument, "{looping}");
+        // The words are the first open's own: the place, and the reason the system gave for it.
+        // Nothing opens the place a second time to say them.
+        let reason = std::fs::File::open(&first)
+            .expect_err("the system cannot follow it either")
+            .to_string();
+        let said = looping.to_string();
+        assert!(
+            said.contains(&reason) && said.contains(&first.display().to_string()),
+            "{said}"
+        );
+    }
+
+    /// A place this account cannot enter is not a tree that went missing: the open is refused for
+    /// permission, which is the caller's to put right and not a source that changed.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_trees_place_this_account_cannot_enter_is_a_bad_argument() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let (environment_id, _, recorded) = recorded_tree_in(root.path());
+        let fenced = root.path().join("fenced");
+        std::fs::create_dir(&fenced).expect("the directory above the place");
+        let place = fenced.join("tree");
+        std::fs::create_dir(&place).expect("the place");
+        std::fs::set_permissions(&fenced, std::fs::Permissions::from_mode(0o000))
+            .expect("the directory above the place is closed");
+
+        let opened = open_recorded_root(environment_id, &place, recorded);
+
+        std::fs::set_permissions(&fenced, std::fs::Permissions::from_mode(0o755))
+            .expect("and opened again, so that it goes with the case");
+        // An account that bypasses the mode (root) enters the place anyway, and there is no
+        // refusal for it to be held to.
+        let Err(refused) = opened else {
+            return;
+        };
+        assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{refused}");
     }
 
     /// A directory at the place opens, whatever it is: that it is not the recorded tree is decided

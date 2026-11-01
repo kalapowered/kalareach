@@ -124,7 +124,7 @@ use self::unsupported as platform;
 use self::windows as platform;
 
 #[cfg(all(target_os = "linux", feature = "git-fixtures"))]
-pub use self::linux::with_kernel_interface;
+pub use self::linux::{with_kernel_interface, with_no_git};
 #[cfg(all(target_os = "macos", any(test, feature = "git-fixtures")))]
 pub use self::macos::profile_text;
 #[cfg(unix)]
@@ -140,6 +140,20 @@ pub const MECHANISM: &str = platform::MECHANISM;
 /// Said before Git is looked for, so that a host that cannot run Git at all answers the same way
 /// whether or not one is installed.
 pub const NO_GIT: Option<&str> = platform::NO_GIT;
+
+/// Why this platform runs no Git, when it runs none, as a request is told: [`NO_GIT`], except that
+/// on Linux a case can force a reason, since the platform's own is empty on every machine this
+/// host ships for and a refusal that nothing can reach is a refusal nothing holds.
+pub(crate) fn no_git() -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::no_git()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        NO_GIT
+    }
+}
 
 /// The refusal a platform that runs no Git gives every request that needs it, with the reason that
 /// platform gives for running none.
@@ -743,6 +757,41 @@ mod tests {
             matches!(beneath_a_file, ProjectError::Destination { .. }),
             "{beneath_a_file:?}"
         );
+    }
+
+    /// A directory that cannot be opened is refused in the open's own words: the place, and the
+    /// reason the system gave for it. Nothing opens the place a second time to say them, so a
+    /// place that is something else by then does not change them; a link that leads round to
+    /// itself is worded as the open found it, as for a recorded tree.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_opened_is_refused_in_the_words_of_the_open_itself() {
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([15; 16]));
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let (first, second) = (root.path().join("first"), root.path().join("second"));
+        std::os::unix::fs::symlink(&second, &first).expect("a link");
+        std::os::unix::fs::symlink(&first, &second).expect("and a link back");
+        let reason = std::fs::File::open(&first)
+            .expect_err("the system cannot follow it either")
+            .to_string();
+        let recorded = AuthorisedDirectory::open_root(environment_id, root.path())
+            .expect("the directory opens")
+            .identity();
+
+        for expected in [None, Some(recorded)] {
+            let refused = OpenedDirectory::open(environment_id, &first, expected)
+                .expect_err("a link that leads to itself cannot be followed");
+
+            assert!(
+                matches!(refused, ProjectError::Destination { .. }),
+                "{refused:?}"
+            );
+            let said = refused.to_string();
+            assert!(
+                said.contains(&reason) && said.contains(&first.display().to_string()),
+                "{said}"
+            );
+        }
     }
 
     /// A recorded directory that goes after the invocation has opened it and before its path is

@@ -312,6 +312,28 @@ mod linux {
         );
     }
 
+    /// A platform that runs no Git does not qualify, and the doctor is told that cause and not
+    /// that the host cannot name its Git's libraries. The machine is not changed: the answer to
+    /// whether the platform runs Git is, on this thread only.
+    #[test]
+    fn a_platform_that_runs_no_git_does_not_qualify_and_is_not_taken_for_a_missing_library() {
+        use kr_project::service::Refusal;
+
+        let fixture = Fixture::create();
+
+        let refused = kr_project::boundary::with_no_git("a reason of the platform", || {
+            fixture.service().qualify()
+        });
+
+        assert!(!refused.qualifies());
+        assert_eq!(refused.refusal(), Some(Refusal::Invocation));
+        assert!(
+            refused.detail().contains("a reason of the platform"),
+            "the daemon's own log is told the platform's reason: {}",
+            refused.detail()
+        );
+    }
+
     #[test]
     fn a_bounded_caller_can_status_clone_check_out_and_add_a_worktree() {
         let fixture = Fixture::create();

@@ -5123,7 +5123,7 @@ impl ProjectService {
         // host that cannot name its Git's libraries, which `support_set` would say of it by asking
         // for the Git first.
         let unenclosable = crate::boundary::kernel_refusal()
-            .or_else(|| crate::boundary::NO_GIT.map(crate::boundary::no_git_refusal));
+            .or_else(|| crate::boundary::no_git().map(crate::boundary::no_git_refusal));
         if let Some(refusal) = unenclosable {
             return Qualification::refused(Refusal::Invocation, &refusal.to_string())
                 .with_narrowing(narrowing);
