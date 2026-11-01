@@ -263,7 +263,7 @@ Only then is it made read-only, flushed and renamed into `versions/`. What an ar
 file's mode or owner is not read: a file is a program when the manifest says it is.
 
 There is a list of programs (`scripts/release-programs.json`) that the release builds and the
-Windows archive check read as well. A host holds a release that is being taken in to the list its
+Windows release workflow read as well. A host holds a release that is being taken in to the list its
 own build carries, and holds nothing already in the store to it. A release installed from a previous
 build with fewer programs in its manifest can still be started, is still shown by `kr host
 versions`, and can be updated to a release with all the programs that the host now needs. A program
@@ -349,7 +349,7 @@ The new `kr` does not read a worker of another level in the shape it has. It acc
 - `kr status`, `kr share`, `kr close` when it reaches the worker itself, and all `kr question` commands don't replace themselves. Instead they do not read a worker at another level, and report which session they did not read, which release it is running and the command to run with that release's `kr`. `kr question list` prints this after printing all the questions it has found. When called with `--json` it includes this information under the `unread` key.
 - `kr-hook` starts the `kr-hook` of the worker's release if its registration names a release that is different from its own, that release is in the store and its level is not the hook's own (every worker a release retains accepts a forwarder from its own release). The hook has half a second to complete, counted from its start across the hand-over. If less than a tenth of a second is left it goes on directly instead. If it takes over after the half second has passed it answers neutrally.
 
-If a worker is at another level and `kr` runs outside a store, or the worker's release is not in the store or an update is removing it, `kr attach` and `kr detach` are refused with exit code 8 and `UNSUPPORTED_SCHEMA`, and each call of the contact tools is refused with that code. The refusal names the worker's release and, where the store holds that release's `kr`, the command that reads it. A `kr-hook` in the same case talks to the worker directly.
+If a worker is at another level and `kr` runs outside a store, or the worker's release is not in the store or an update is removing it, `kr attach` and `kr detach` are refused with exit code 8 and `UNSUPPORTED_SCHEMA`, and each call of the contact tools is refused with that code. The refusal names the worker's release and, where the store holds that release's `kr`, the command that reads it. A `kr-hook` in the same case talks to the worker directly. None of these hand-overs reaches a worker of another public major than the `kr`'s, which refuses the `kr`'s hello ([the support window](../releases/support-window.md#sessions-that-outlive-an-update)).
 
 ## Environments whose daemon did not run
 
