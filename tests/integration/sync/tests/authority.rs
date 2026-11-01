@@ -13,10 +13,6 @@
 //! check — the service holds no device records and could not — so a leg that applies anything
 //! validates it first, the way a host does.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-10.46 | `kr_req_10_46_a_published_request_is_retained_until_every_host_has_finished_with_it`, `kr_req_10_46_a_request_from_a_key_this_host_holds_no_owner_record_for_is_never_applied`, `kr_req_10_46_an_acknowledgement_outside_the_revision_that_applied_it_is_refused`, `kr_req_10_46_a_revision_that_does_not_follow_the_accepted_one_is_rejected`, `kr_req_10_46_a_synchronisation_is_owed_from_the_connection_until_one_happens`, `kr_req_10_46_an_unreachable_feed_is_stale_and_still_shows_the_last_acknowledgement`, and `kr_req_10_46_an_announcement_is_only_an_announcement` |
-//!
 //! The dispatch barrier itself is section 9's, and a host reports it through the completion in its
 //! acknowledgement; what this file proves about it is that a barrier which has not held leaves the
 //! record outstanding.

@@ -15,13 +15,6 @@
 //! collection on the service. That proves the conflict and resolution rules, and it says nothing
 //! about two installations sharing a collection.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-20.13 | `kr_req_20_13_a_lost_comparison_keeps_both_copies_until_the_person_chooses`, `kr_req_20_13_a_stale_expected_revision_is_refused_and_kept_as_a_copy`, `kr_req_20_13_a_draft_is_published_as_a_draft_and_never_as_an_execution_request`, `kr_req_20_13_a_sealed_object_the_service_refuses_is_refused_here_first`, `kr_req_20_13_an_answer_lost_in_flight_is_settled_from_the_receipt_and_applied_once`, `kr_req_20_13_a_fenced_identity_never_ran_and_nothing_runs_under_it_afterwards`, `kr_req_20_13_a_fetch_of_an_object_never_published_answers_its_absence_under_no_history` |
-//! | KR-REQ-20.13, KR-REQ-24.28 and KR-REQ-18.05, client side across a restore | The same legs read the recovery identity on every answer they take, an exchange, a refusal, a comparison, a status query with and without a receipt, a fence and a fetch that finds nothing, and hold a deployment that has never been put back to naming none |
-//! | KR-REQ-18.05 | `kr_req_18_05_a_setting_is_stored_sealed_in_a_declared_bucket` |
-//! | KR-REQ-24.28 | `kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keeps_its_pinned_labels` |
-//!
 //! # What the lost-answer leg takes as proof
 //!
 //! Only a write the service accepted whose answer was lost on the way back. A `503` with

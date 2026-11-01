@@ -11,15 +11,6 @@
 //! by the reader's own ledger whatever the service says; and the bytes a mailbox counts are the
 //! declared bucket rather than the length of the plaintext somebody padded to it.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-20.04 | `kr_req_20_04_an_envelope_is_delivered_read_opened_and_acknowledged`, `kr_req_20_04_a_routing_record_that_disagrees_with_the_box_is_refused` |
-//! | KR-REQ-20.05 | `kr_req_20_05_an_unpaired_sender_is_refused_before_anything_is_decrypted`, `kr_req_20_05_a_replayed_envelope_identifier_is_refused_by_the_reader` |
-//! | KR-REQ-20.13 | `kr_req_20_13_a_mailbox_counts_the_declared_bucket_rather_than_the_plaintext` |
-//! | KR-REQ-09.24 | `kr_req_09_24_an_item_acknowledged_twice_is_answered_the_same_way`, `kr_req_09_24_a_repeated_state_notification_replaces_the_one_it_supersedes`, `kr_req_09_24_a_mailbox_is_served_only_to_the_key_that_claimed_it` |
-//! | KR-REQ-23.50 | `kr_req_23_50_a_credential_for_another_gateway_is_refused_by_the_service` |
-//! | KR-REQ-23.57 | `kr_req_23_57_a_delivery_the_mailbox_finished_late_goes_once_more_and_is_stored_once`, `kr_req_23_57_a_delivery_the_mailbox_finished_late_twice_comes_back_as_that_answer` |
-//!
 //! Those rows' acceptance owners are elsewhere; what these legs add is the half nothing had
 //! before, which is that the contract holds against a deployment rather than against a mock.
 
