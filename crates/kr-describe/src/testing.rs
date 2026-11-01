@@ -1553,11 +1553,8 @@ pub enum Behaviour {
         /// What it says.
         detail: String,
     },
-    /// Take this long to load.
-    SlowLoad {
-        /// How long the load takes.
-        duration_ms: u64,
-    },
+    /// Take longer to load than the load's deadline, which ends the load at it.
+    LoadPastItsDeadline,
     /// Fail during load, as a missing or corrupt weights file would.
     FailsLoad {
         /// What it says.
@@ -1780,19 +1777,12 @@ pub fn tick(
             }
             Instruction::Load { id, .. } => {
                 let (answer, took_ms) = match behaviour.get() {
-                    Behaviour::SlowLoad { duration_ms } if duration_ms > LOAD_DEADLINE_MS => (
+                    Behaviour::LoadPastItsDeadline => (
                         Answered::LoadEnded {
                             why: LoadEnd::DeadlineExceeded,
                             detail: None,
                         },
                         LOAD_DEADLINE_MS,
-                    ),
-                    Behaviour::SlowLoad { duration_ms } => (
-                        Answered::Loaded {
-                            load_ms: duration_ms,
-                            rss_bytes: 0,
-                        },
-                        duration_ms,
                     ),
                     Behaviour::FailsLoad { detail } => (
                         Answered::LoadEnded {

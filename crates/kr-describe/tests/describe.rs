@@ -33,7 +33,7 @@ use kr_describe::resource::{
 };
 use kr_describe::service::{
     Answered, DescriptionService, DownloadProgress, HostPlacement, IDLE_UNLOAD_MS, Instruction,
-    LOAD_DEADLINE_MS, Outcome, UnloadReason, Work,
+    Outcome, UnloadReason, Work,
 };
 use kr_describe::store::{DescriptionStore, Published};
 use kr_describe::testing::{Behaviour, Output, SharedBehaviour, Tick, answer_of, tick as turn};
@@ -581,9 +581,7 @@ fn a_job_that_passes_its_deadline_publishes_nothing() {
 #[test]
 fn a_model_load_that_passes_its_deadline_is_abandoned_and_publishes_nothing() {
     let behaviour = SharedBehaviour::new();
-    behaviour.set(Behaviour::SlowLoad {
-        duration_ms: LOAD_DEADLINE_MS + 1_000,
-    });
+    behaviour.set(Behaviour::LoadPastItsDeadline);
     let mut service = service();
     queue_one(
         &mut service,
