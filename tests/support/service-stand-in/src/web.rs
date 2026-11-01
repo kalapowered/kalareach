@@ -109,6 +109,18 @@ pub enum Moment {
         /// The seconds the refusal asks the caller to wait, when it asks.
         retry_after_seconds: Option<u64>,
     },
+    /// The service refuses the request as [`Moment::Refuse`] does, and is slow to say so: the
+    /// refusal is given when [`ServiceWeb::release_held`] is called. A test changes something on the
+    /// asking host while the request is out, which is how it decides what the host does with a
+    /// refusal that arrives after the change.
+    SlowRefuse {
+        /// The HTTP status.
+        status: u16,
+        /// The service's error code.
+        code: &'static str,
+        /// The seconds the refusal asks the caller to wait, when it asks.
+        retry_after_seconds: Option<u64>,
+    },
     /// The service refuses the request as stated, without acting on it, and its words repeat the
     /// request it was sent, as a service's error text can.
     Echo {
@@ -1146,9 +1158,19 @@ impl ServiceWeb {
                 return Handled::Answer(refusal_after(
                     status,
                     code,
-                    "The service refuses that request for now.",
+                    REFUSED_FOR_NOW,
                     retry_after_seconds,
                 ));
+            }
+            Some(Moment::SlowRefuse {
+                status,
+                code,
+                retry_after_seconds,
+            }) => {
+                return Handled::Slow(
+                    released,
+                    refusal_after(status, code, REFUSED_FOR_NOW, retry_after_seconds),
+                );
             }
             Some(Moment::Echo { status, code }) => {
                 return Handled::Answer(refusal(
@@ -1597,6 +1619,9 @@ pub fn refusal_after(
             .expect("a refusal"),
     }
 }
+
+/// What the service says when a test makes it refuse a request.
+const REFUSED_FOR_NOW: &str = "The service refuses that request for now.";
 
 /// What a caller with no account proof is told about storage.
 const NO_ACCOUNT: &str = "This installation has no backup storage. Sign this host in to an account whose plan includes backup storage, and try again.";
