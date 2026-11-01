@@ -1,9 +1,4 @@
 //! Collection keys: the wrap, the signed record and the rules between two records.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-20.11, the sync-collection half (the rule) | `removing_members_rotates_and_claims_no_retroactive_secrecy`, `a_drop_without_advancing_the_epoch_by_one_is_refused`, `removing_two_members_advances_the_epoch_once` |
-//! | KR-REQ-18.05, part (a key reaches a member only through its own wrap) | `a_collection_key_wrap_opens_only_for_its_recipient_collection_and_epoch`, `a_wrap_opened_from_its_sender_side_is_refused` |
 
 use kr_crypto::CryptoError;
 use kr_crypto::envelope::{
@@ -117,6 +112,8 @@ fn binding(result: kr_crypto::Result<()>) -> bool {
     matches!(result, Err(CryptoError::BindingMismatch { .. }))
 }
 
+/// KR-REQ-18.05, the part about a collection key reaching a member only through its own wrap: the
+/// wrap opens for its recipient, the collection and the epoch it names, and for no other.
 #[test]
 fn a_collection_key_wrap_opens_only_for_its_recipient_collection_and_epoch() {
     let (issuer, member, stranger) = (Device::new(), Device::new(), Device::new());
@@ -198,6 +195,8 @@ fn a_collection_key_wrap_opens_only_for_its_recipient_collection_and_epoch() {
     ));
 }
 
+/// KR-REQ-18.05, the part about a collection key reaching a member only through its own wrap: the
+/// issuer cannot open the wrap it made for a member.
 #[test]
 fn a_wrap_opened_from_its_sender_side_is_refused() {
     let (issuer, member) = (Device::new(), Device::new());
@@ -326,6 +325,8 @@ fn a_genesis_record_lists_only_its_home_at_revision_one() {
     ))));
 }
 
+/// KR-REQ-20.11, the part about a removal rotating the collection: a record that drops a member at
+/// the same epoch, or two epochs on, is refused, and one at the next epoch with a new key is not.
 #[test]
 fn a_drop_without_advancing_the_epoch_by_one_is_refused() {
     let (home, leaving) = (Device::new(), Device::new());
@@ -348,6 +349,9 @@ fn a_drop_without_advancing_the_epoch_by_one_is_refused() {
     check_successor(&second, &rekeyed).expect("a new key for the same members");
 }
 
+/// KR-REQ-20.11, the part about a removal rotating the collection: removing two members is one step
+/// to the next epoch, the object keys rotate, and the record that says so passes the rules between
+/// records.
 #[test]
 fn removing_two_members_advances_the_epoch_once() {
     let (home, first_leaving, second_leaving) = (Device::new(), Device::new(), Device::new());
@@ -488,6 +492,10 @@ fn a_broken_chain_or_a_skipped_revision_is_refused() {
     check_successor(&second, &by_member).expect("any member may issue");
 }
 
+/// KR-REQ-20.11, the part about a removal rotating the collection and claiming no retroactive
+/// secrecy: the members who stay open the new key, the one who left has no wrap in the new record,
+/// and its wrap in the earlier record still opens the old key, which the sentence shown to the
+/// person says.
 #[test]
 fn removing_members_rotates_and_claims_no_retroactive_secrecy() {
     let (home, staying, leaving) = (Device::new(), Device::new(), Device::new());

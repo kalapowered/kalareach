@@ -22,7 +22,6 @@
 //! | KR-REQ-13.01 | `a_host_that_refuses_the_visit_is_in_contact_and_listed_as_having_refused` |
 //! | KR-REQ-13.01 | `a_host_chosen_or_forgotten_while_it_is_visited_is_not_reported` |
 //! | KR-REQ-13.01 | `the_owner_watcher_visits_an_owned_host_beside_the_host_in_use` |
-//! | KR-REQ-23.32 | `a_paired_devices_questions_go_through_the_host` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;

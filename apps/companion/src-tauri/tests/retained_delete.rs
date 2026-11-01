@@ -1,5 +1,5 @@
 //! Deleting a copy that left the host, from the application on the computer the host runs on
-//! (KR-REQ-24.29, KR-ACC-033).
+//! (KR-ACC-033).
 //!
 //! The daemon is kr-controller's in-process host with a storage service selected, and the service is
 //! the stand-in, which answers as the deployed one does. The host has made two backups and they are
@@ -8,16 +8,6 @@
 //! The one thing a test answers for is the native dialog, which a person answers. Everything on the
 //! other side of it is real: the host's list of what left, the deletion the host sends, and what the
 //! service holds afterwards.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-24.29 | `a_yes_deletes_the_copy_the_host_listed_and_no_other` |
-//! | KR-REQ-24.29 | `a_no_mints_nothing_and_deletes_nothing` |
-//! | KR-REQ-24.29 | `nothing_is_asked_of_the_person_about_a_copy_the_host_does_not_offer` |
-//! | KR-REQ-24.29 | `a_confirmation_works_once` |
-//! | KR-REQ-24.29 | `a_cancelled_or_run_out_or_unknown_confirmation_deletes_nothing` |
-//! | KR-REQ-24.29 | `a_confirmation_does_not_outlast_a_change_of_privacy_mode` |
-//! | KR-REQ-24.29 | `the_page_cannot_confirm_for_the_person` |
 
 #![cfg(unix)]
 
@@ -571,6 +561,10 @@ fn enrolment(
 }
 
 /// The person says yes: the copy the host lists is deleted at the service, and no other.
+///
+/// KR-REQ-24.29, the part about an explicit, separately authorised deletion: the person's yes
+/// deletes the copy the host listed, and no other, and asking deletes nothing. Not shown here: that
+/// deletion is logical cleanup and not physical erase.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_yes_deletes_the_copy_the_host_listed_and_no_other() {
     let rig = Rig::after_two_backups_under_privacy_mode().await;
@@ -620,6 +614,9 @@ async fn a_yes_deletes_the_copy_the_host_listed_and_no_other() {
 }
 
 /// The person says no: no token is minted and nothing is sent.
+///
+/// KR-REQ-24.29, the part about no silent deletion: with the person's no no token is minted and
+/// every copy stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_no_mints_nothing_and_deletes_nothing() {
     let rig = Rig::after_two_backups_under_privacy_mode().await;
@@ -644,6 +641,10 @@ async fn a_no_mints_nothing_and_deletes_nothing() {
 
 /// A reference the host's list does not hold, and a copy it cannot ask the removal of, are refused
 /// before the person is asked anything.
+///
+/// KR-REQ-24.29, the part about the copies that can be deleted being the ones the host lists: a
+/// reference the host does not list, and a copy already deleted, are refused before the person is
+/// asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nothing_is_asked_of_the_person_about_a_copy_the_host_does_not_offer() {
     let rig = Rig::after_two_backups_under_privacy_mode().await;
@@ -676,6 +677,9 @@ async fn nothing_is_asked_of_the_person_about_a_copy_the_host_does_not_offer() {
 }
 
 /// A confirmation deletes once. Finishing it again asks the service for nothing.
+///
+/// KR-REQ-24.29, the part about each deletion being separately authorised: a confirmation deletes
+/// once, and finishing it again asks the service for nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_confirmation_works_once() {
     let rig = Rig::after_two_backups_under_privacy_mode().await;
@@ -706,6 +710,9 @@ async fn a_confirmation_works_once() {
 
 /// A token that was cancelled, one that ran out and one this application never minted delete
 /// nothing.
+///
+/// KR-REQ-24.29, the part about each deletion being separately authorised: a confirmation that was
+/// cancelled, one that ran out and one this application never minted delete nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancelled_or_run_out_or_unknown_confirmation_deletes_nothing() {
     let rig = Rig::after_two_backups_under_privacy_mode().await;
@@ -753,6 +760,9 @@ async fn a_cancelled_or_run_out_or_unknown_confirmation_deletes_nothing() {
 
 /// A yes was given for privacy mode as it stood. When it changes first, the host's list is not the
 /// one the person looked at, and the confirmation deletes nothing.
+///
+/// KR-REQ-24.29, the part about the authorisation being for what the person looked at: a
+/// confirmation given before privacy mode changed deletes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_confirmation_does_not_outlast_a_change_of_privacy_mode() {
     let rig = Rig::after_two_backups_under_privacy_mode().await;
@@ -784,6 +794,9 @@ async fn a_confirmation_does_not_outlast_a_change_of_privacy_mode() {
 
 /// The page can name a copy and cannot answer for the person. Through the commands the page calls,
 /// a token the page makes up deletes nothing, and the ask refuses a host that is not reached.
+///
+/// KR-REQ-24.29, the part about the authorisation being the person's own: a confirmation the page
+/// makes up deletes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_page_cannot_confirm_for_the_person() {
     let rig = Rig::after_two_backups_under_privacy_mode().await;

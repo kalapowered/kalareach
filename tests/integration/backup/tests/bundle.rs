@@ -15,7 +15,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-ACC-033, KR-REQ-20.15, KR-REQ-20.18 and KR-REQ-20.19 against a service | `a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin` |
+//! | KR-ACC-033, KR-REQ-20.18 and KR-REQ-20.19 against a service | `a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin` |
 //! | KR-REQ-20.18 several services, KR-REQ-20.19 a lost service | `a_kit_naming_two_services_reads_the_bundle_at_either`, then, once the first service is gone, `with_one_service_gone_the_same_kit_still_reads_at_the_other` |
 //!
 //! # What they leave

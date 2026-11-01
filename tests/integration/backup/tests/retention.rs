@@ -23,10 +23,6 @@
 //!    longer reported; the readable generations are as they were; the removed ciphertext cannot be
 //!    read.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-20.22 | the three phases together: `thirty_daily_snapshots_are_kept_and_a_deleted_generation_is_a_tombstone`, `a_sweep_inside_the_window_removes_nothing`, `after_the_window_the_sweep_removes_the_tombstone_and_its_charge_ends` |
-//!
 //! Not shown here: deleting a whole collection from the account console. That route takes a browser
 //! session and a fresh sign-in, which the driver's account does not hold; the web service's console
 //! suite shows it inside its own runtime (every object of the collection a tombstone for seven days,
@@ -197,6 +193,12 @@ fn start() -> Option<(Deployment, Arc<dyn AccountTokenSource>, RunDirectory)> {
 /// Phase 1: backup storage off, then on at thirty snapshots; thirty-one generations through the
 /// real services keep thirty; the objects of the generation pushed out are deleted and are
 /// tombstones for seven days that are still charged.
+///
+/// KR-REQ-20.22, the parts about backup being off until it is turned on, thirty daily snapshots and
+/// seven-day tombstones: the service publishes thirty snapshots, seven days of tombstone and a
+/// provider bound of thirty days, the chain keeps thirty generations, and the objects of the
+/// generation the thirty-first pushed out are a tombstone. Not shown here: the real clock for the
+/// seven days, or the provider's own thirty, which no client can observe.
 #[tokio::test]
 async fn thirty_daily_snapshots_are_kept_and_a_deleted_generation_is_a_tombstone() {
     let Some((deployment, tokens, run)) = start() else {
@@ -497,6 +499,9 @@ async fn objects_of(
 
 /// Phase 2: a sweep while the window is open removes nothing, and the status still reports the
 /// tombstones and the bytes they hold.
+///
+/// KR-REQ-20.22, the part about seven-day tombstones: a sweep inside the window removes nothing,
+/// and the status still reports the tombstones and the bytes they hold.
 #[tokio::test]
 async fn a_sweep_inside_the_window_removes_nothing() {
     let Some((deployment, tokens, run)) = start() else {
@@ -545,6 +550,10 @@ async fn a_sweep_inside_the_window_removes_nothing() {
 /// Phase 3: after the window was aged away and the sweep ran, the tombstones are gone, their bytes
 /// are no longer reported, the readable objects are as they were, and the removed ciphertext is not
 /// there to read.
+///
+/// KR-REQ-20.22, the part about seven-day tombstones: after the window a sweep removes the
+/// tombstones and their bytes are no longer reported, the readable generations are as they were,
+/// and the removed ciphertext cannot be read.
 #[tokio::test]
 async fn after_the_window_the_sweep_removes_the_tombstone_and_its_charge_ends() {
     let Some((deployment, tokens, run)) = start() else {

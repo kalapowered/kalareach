@@ -11,7 +11,6 @@
 //! | --- | --- |
 //! | KR-REQ-11.30 | the released table compiles for the executable its build record names, and classifies every method of the pinned schema |
 //! | KR-REQ-11.33 | the released table answers the two approvals Codex asks as responses, offers the four decisions the package's action labels, and trusts a binding that holds the two approval grants |
-//! | KR-REQ-12.06 | the released table says where the thread, the turn and the cleared request are named |
 //! | KR-REQ-12.12 | the released table's rich table lists prompt, steer and cancel and no queue, each a mutation needing the right of its own and with a template the package check accepted |
 //!
 //! Not claimed: Windows, where no gateway runs.

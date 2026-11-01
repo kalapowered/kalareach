@@ -17,7 +17,6 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-11.62 | every test below but the last |
-//! | KR-REQ-11.52, KR-REQ-23.31 | `a_helper_created_under_the_previous_helpers_identifier_within_one_second_is_refused_its_token` |
 
 use std::sync::Arc;
 
@@ -991,6 +990,12 @@ fn windows_process(pid: u32, created: u64) -> ProcessStartIdentity {
 /// helpers are injected as the readings the worker takes of them, from their creation times a
 /// quarter of a second apart; the second is another source, with another key, and the first one's
 /// caller token reaches nothing for it.
+///
+/// KR-REQ-11.52 and KR-REQ-23.31, the part about a helper being known by its process and start
+/// value and by its caller token: a helper that takes the identifier of the one before it within a
+/// second is another source, and the first helper's caller token reads and cancels nothing for it.
+/// Control: in whole seconds the two are one source and the next helper reads the previous one's
+/// question.
 #[test]
 fn a_helper_created_under_the_previous_helpers_identifier_within_one_second_is_refused_its_token() {
     // A tenth of a second into a second of September 2025, as a `FILETIME`, and a quarter of a

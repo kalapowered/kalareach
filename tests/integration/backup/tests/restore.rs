@@ -26,10 +26,6 @@
 //!    into the new history, the published draft's restored revision comes down beside the edited
 //!    one, and the draft whose answer was lost is ended at once without ever being sent again.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-20.13, KR-REQ-24.28, KR-REQ-18.05 and KR-REQ-24.13, client side across a restore | the three phases together, against a restored local deployment |
-//!
 //! # What it leaves
 //!
 //! Nothing outside the run directory and the two deployments' persistence, which the script
@@ -581,6 +577,12 @@ async fn after_the_export_the_device_writes_on_and_a_copy_meets_the_source_uncha
 /* -------------------------------------------------------------------------- */
 
 /// Phase 3: the stores made before the export meet the deployment restored from it.
+///
+/// KR-REQ-20.13, the part about conflicting content being kept for the person: where the device's
+/// note and the restored collection do not compare, a publication brings the restored settings down
+/// beside the device's own object as a copy, which stays beside it, and the published draft's
+/// restored revision comes down beside the edited one. Not shown here: that no clock decides the
+/// choice, or that a host's grants are never overwritten.
 #[tokio::test]
 async fn the_device_meets_the_deployment_restored_from_the_export() {
     let Some(run) = RunDirectory::from_variable(RUN_VARIABLE) else {

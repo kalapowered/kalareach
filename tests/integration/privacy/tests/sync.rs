@@ -11,7 +11,6 @@
 //! | --- | --- |
 //! | KR-REQ-24.27, client side of sync and settings backup | `kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publication_are_in_flight` |
 //! | KR-REQ-24.28, client side, sync upload in flight | the same leg |
-//! | KR-REQ-24.29, sync's own retained artifacts | the same leg: the writes that left are listed, and the copy the service kept goes only when asked |
 //!
 //! # Two devices, one installation
 //!
@@ -256,6 +255,10 @@ async fn held_draft(
 
 /// KR-REQ-24.27 and KR-REQ-24.28, the client's side: privacy mode is enabled while a settings write
 /// and a draft publication are at the service with their answers on the way back.
+///
+/// KR-REQ-24.29, the part about sync's own retained artifacts: the writes that left are listed with
+/// what can be deleted, what left before privacy mode is not erased, and the copy the service kept
+/// goes only when the person asks for exactly that. Not shown here: archives or notifications.
 #[tokio::test(flavor = "multi_thread")]
 async fn kr_req_24_28_privacy_enabled_while_a_settings_write_and_a_draft_publication_are_in_flight()
 {

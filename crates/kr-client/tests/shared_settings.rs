@@ -8,18 +8,6 @@
 //! claimed; what these cases show is that it still does it, with a real sealer and a real
 //! service, and what the adapter says of the two answers the single-object interface has no word
 //! for.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-20.13, compare and swap in a shared collection, the other device's content kept beside this device's own | `a_refused_write_in_a_claimed_collection_keeps_the_other_devices_settings_for_the_person` |
-//! | KR-REQ-20.13, a write is sealed and the service holds no plaintext | `settings_written_into_a_claimed_collection_are_read_back_sealed_under_its_key` |
-//! | KR-REQ-20.11, sync-collection half, a write under a retired epoch is not stored | `a_write_under_a_retired_epoch_stores_nothing_and_the_work_is_settled_as_never_run` |
-//! | KR-REQ-20.11, sync-collection half, a member reads what an earlier epoch's key sealed down to its floor, an object from before the floor is not believed until a member seals it again, a device that never held that key is told so, and an epoch the client was not built for is refused by name | `an_object_sealed_under_an_earlier_epoch_is_read_with_that_epochs_key_after_a_rekey`, `an_object_sealed_before_the_floor_is_refused_by_name_until_a_member_seals_it_again`, `a_device_given_only_the_newer_key_is_told_by_name_that_it_cannot_open_an_older_object`, `an_object_sealed_under_a_later_epoch_is_refused_by_name_and_not_as_tampering` |
-//! | KR-REQ-20.13, a draft removed on a device leaves the service no content, and its place is free | `a_removed_draft_leaves_nothing_to_read_and_a_second_removal_finds_it_gone` |
-//! | KR-REQ-20.13, a collection that holds as many drafts as it may takes another once one is removed | `a_full_collection_takes_another_draft_once_one_is_removed` |
-//! | KR-REQ-20.13, a removal never replaces what another device wrote, and keeps nothing | `a_removal_after_another_device_wrote_removes_nothing_and_keeps_no_copy` |
-//! | KR-REQ-24.28, no removal leaves while privacy mode is on | `no_removal_is_sent_while_privacy_mode_is_on` |
-//! | KR-REQ-24.27, no removal leaves while privacy mode is on: sync is off at once | `no_removal_is_sent_while_privacy_mode_is_on` |
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -268,6 +256,12 @@ async fn settings_written_into_a_claimed_collection_are_read_back_sealed_under_i
 /// Two stores edit from the same base; the second to publish is refused, and what the first wrote
 /// comes down beside its own for the person to choose, as it does in a collection nobody claimed.
 /// The service keeps the refused write too, until the choice drops it.
+///
+/// KR-REQ-20.13, the part about compare-and-swap and the content a refused write keeps for the
+/// person to choose from: in a collection a key record has claimed, the second store to publish is
+/// refused, the other device's settings come down beside its own, and the service keeps the refused
+/// write until the choice drops it. Not shown here: that no clock decides the choice, or that a
+/// host's grants are never overwritten.
 #[tokio::test]
 async fn a_refused_write_in_a_claimed_collection_keeps_the_other_devices_settings_for_the_person() {
     let web = Arc::new(ServiceWeb::new());
@@ -343,6 +337,10 @@ async fn a_refused_write_in_a_claimed_collection_keeps_the_other_devices_setting
 /// The collection moves to a newer epoch while a device still writes under the older one. The
 /// service stores nothing and keeps the refusal as the request's receipt; the client leaves the
 /// work outstanding, asks about it, and is told it never ran, which ends it with nothing kept.
+///
+/// KR-REQ-20.11, the part about a rotated collection: once the collection has moved to a newer
+/// epoch, a write under the retired epoch stores nothing and ends as never run. Not shown here: a
+/// revocation, or the removal of a wrap.
 #[tokio::test]
 async fn a_write_under_a_retired_epoch_stores_nothing_and_the_work_is_settled_as_never_run() {
     let web = Arc::new(ServiceWeb::new());
@@ -514,6 +512,10 @@ async fn a_device_given_only_the_newer_key_is_told_by_name_that_it_cannot_open_a
 /// once the collection has moved on: the object is refused by name before any key is tried, however
 /// many keys the reader holds. A member that holds the plaintext seals it again under the newer
 /// epoch, and that is read.
+///
+/// KR-REQ-20.11, the part about a device taken out of a rotated collection: it holds every key it
+/// held, and what it could seal is not believed once the collection has moved on, until a member
+/// seals it again under the newer epoch. Not shown here: that no future wrap reaches it.
 #[tokio::test]
 async fn an_object_sealed_before_the_floor_is_refused_by_name_until_a_member_seals_it_again() {
     let web = Arc::new(ServiceWeb::new());
@@ -821,6 +823,9 @@ async fn a_full_collection_takes_another_draft_once_one_is_removed() {
 /// Another device wrote the draft after this device last saw it, so a removal compared against the
 /// position this device holds is refused. It removes nothing and keeps nothing: a removal carries no
 /// content, and what the other device wrote stays where it is.
+///
+/// KR-REQ-20.13, the part about compare-and-swap writes: a removal compared against the position
+/// the device holds is refused once another device has written, and what that device wrote stays.
 #[tokio::test]
 async fn a_removal_after_another_device_wrote_removes_nothing_and_keeps_no_copy() {
     let web = Arc::new(ServiceWeb::new());
@@ -905,6 +910,10 @@ async fn a_removal_after_another_device_wrote_removes_nothing_and_keeps_no_copy(
 
 /// Privacy mode stops what leaves a device, and a removal is a request that leaves it: none is sent
 /// while the device's store is fenced, and the object stays where it is.
+///
+/// KR-REQ-24.27, the part about sync being off at once: a removal is a request that leaves the
+/// device, and none is sent while the device's store is fenced; it goes when production resumes.
+/// Not shown here: the other outboxes, or the cancel of undispatched work.
 #[tokio::test]
 async fn no_removal_is_sent_while_privacy_mode_is_on() {
     let web = Arc::new(ServiceWeb::new());

@@ -4,12 +4,6 @@
 //! Every case drives the real client over the real signed call, against the stand-in in process.
 //! Nothing here is a scripted answer.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-20.13, compare and swap, the refused content kept for the person | `a_stale_write_is_refused_and_its_content_is_kept_for_the_person` |
-//! | KR-REQ-20.13, a copy nobody chose against is never dropped | `a_collection_never_drops_a_copy_nobody_chose_against` |
-//! | KR-REQ-20.13, a write retried or lost | `a_request_identity_is_answered_from_its_receipt_and_a_fence_ends_it` |
-//!
 //! The whole of the route, member by member, is held to a recording by `settings_answers.rs`; the
 //! cases here are the ones that need the bytes of a sealed object, which a recording keeps no
 //! copy of, and a spent allowance, which a local Worker cannot be made to have.
@@ -105,6 +99,11 @@ fn refused(
 /// A write that loses its comparison is refused, and what it carried is kept beside the object for
 /// the person to choose between. Nothing is chosen by a clock: the object stays what it was until
 /// a write that names its revision replaces it.
+///
+/// KR-REQ-20.13, the part about compare-and-swap and the content kept for the person: a write that
+/// loses its comparison is refused, what it carried is kept beside the object until the person's
+/// choice drops it, and the object stays what it was until a write that names its revision replaces
+/// it. Not shown here: that a host's grants are never overwritten.
 #[tokio::test]
 async fn a_stale_write_is_refused_and_its_content_is_kept_for_the_person() {
     let web = Arc::new(ServiceWeb::new());
@@ -171,6 +170,10 @@ async fn a_stale_write_is_refused_and_its_content_is_kept_for_the_person() {
 /// An object holds at most as many copies as the service keeps. The write past them is refused
 /// outright: dropping the oldest to make room would choose by the clock, which settings sync never
 /// does, so every copy stays until the person has chosen against it.
+///
+/// KR-REQ-20.13, the part about conflicting copies being kept for the person's choice and not
+/// dropped by age: the write past the copies the service keeps is refused outright, and every copy
+/// stays, the oldest included, until a choice drops one.
 #[tokio::test]
 async fn a_collection_never_drops_a_copy_nobody_chose_against() {
     let web = Arc::new(ServiceWeb::new());

@@ -11,8 +11,6 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-12.27 | every test below |
-//! | KR-REQ-12.20 | the `gemini-cli` cases |
-//! | KR-REQ-12.22 | the `qoder-cli` cases |
 
 mod common;
 

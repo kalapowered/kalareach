@@ -13,7 +13,6 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-24.29, service side | `kr_req_24_29_what_is_at_the_services_stays_until_its_own_authorised_action_removes_it` |
-//! | KR-REQ-24.28, a notification in flight at the gateway | the same leg: the gateway is still retrying it when privacy mode is enabled |
 //!
 //! # Local only
 //!
@@ -175,6 +174,11 @@ fn forgot(answer: &kr_privacy_integration::local::Answer, notification: &str) ->
 
 /// KR-REQ-24.29: two backup collections and a notification the gateway holds are at the services
 /// when the client enables privacy mode, and each goes only through its own authorised action.
+///
+/// KR-REQ-24.28, the part about privacy mode enabled while upload and notification work is in
+/// flight: the write in flight is discarded when its answer arrives, nothing is outstanding when
+/// privacy mode completes, and the gateway goes on retrying the notification. Not shown here:
+/// description inference.
 #[tokio::test(flavor = "multi_thread")]
 async fn kr_req_24_29_what_is_at_the_services_stays_until_its_own_authorised_action_removes_it() {
     let Some(stack) = LocalStack::from_environment() else {

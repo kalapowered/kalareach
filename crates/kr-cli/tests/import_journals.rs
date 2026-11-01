@@ -1,9 +1,5 @@
 //! `kr host import-journals`, run the way a person runs it: the real `kr`, copied to the internal
 //! disk, against an environment tree of the test's own with no daemon running.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-24.30 | a journal older than this build's migrations is imported once, under the environment's singleton lock, and refused while something holds that lock |
 
 #![cfg(unix)]
 
@@ -78,6 +74,9 @@ fn document(output: &Output) -> Value {
     })
 }
 
+/// KR-REQ-24.30, the part about the explicit importer: `kr host import-journals` brings a
+/// version-one journal forward to the current schema while the environment is stopped, and a second
+/// run finds nothing to import. Not shown here: that a migration is transactional.
 #[test]
 fn a_version_one_journal_is_imported_once_while_the_environment_is_stopped() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -122,6 +121,8 @@ fn a_version_one_journal_is_imported_once_while_the_environment_is_stopped() {
     );
 }
 
+/// KR-REQ-24.30, the part about the explicit importer: it is refused while something holds the
+/// environment, and the journal is left at its version.
 #[test]
 fn the_import_is_refused_while_something_holds_the_environment() {
     // The singleton lock is what a running daemon holds. A command that took the files from
