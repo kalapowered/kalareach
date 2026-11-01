@@ -226,9 +226,16 @@ fn dispatch_after_load(
     now: Reading,
     load_ms: u64,
 ) -> (u64, SessionId, kr_describe::service::GenerationRequest) {
-    let Instruction::Load { id, .. } = service.next(&roomy(), now).expect("an instruction") else {
+    let Instruction::Load {
+        id, deadline_ms, ..
+    } = service.next(&roomy(), now).expect("an instruction")
+    else {
         panic!("a model is loaded before any job is sent");
     };
+    assert!(
+        load_ms <= deadline_ms,
+        "a load that takes {load_ms} ms is given {deadline_ms} ms"
+    );
     let loaded = now.after_ms(load_ms);
     assert!(matches!(
         service
