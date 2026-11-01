@@ -3771,11 +3771,6 @@ fn ask(
             ))));
         }
     };
-    let too_much = || {
-        Asked::Overran(unavailable(format!(
-            "{described} answered with more than a version and a directory"
-        )))
-    };
     let status = loop {
         heard.take_in(deadline);
         match has_ended(&mut child) {
@@ -3813,7 +3808,7 @@ fn ask(
         // ending it by its number is safe.
         if heard.overflowed() {
             end_probe(child);
-            return Err(too_much());
+            return Err(too_much(&described));
         }
         if time_is_up(deadline) {
             end_probe(child);
@@ -3823,24 +3818,7 @@ fn ask(
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    // What the program wrote is read to its end, but a process that left the group may still hold
-    // the pipe, so the wait for the end is short.
-    let drain = drain_until(Instant::now(), deadline);
-    loop {
-        heard.take_in(drain);
-        if heard.overflowed() {
-            return Err(too_much());
-        }
-        if heard.ended() {
-            break;
-        }
-        if Instant::now() >= drain {
-            return Err(Asked::Overran(unavailable(format!(
-                "{described} left its output open after it ended"
-            ))));
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    drain(&mut heard, &described, deadline)?;
     let answer = heard.answer(&described, deadline).map_err(|error| {
         Asked::Overran(passing(format!(
             "{described} produced output this host could not read: {error}"
@@ -3850,7 +3828,7 @@ fn ask(
     // program then exited with. On Unix the drain has already refused an answer past the limit, so
     // this is reached for it by the reader thread of the other platforms.
     if answer.truncated {
-        return Err(too_much());
+        return Err(too_much(&described));
     }
     if !status.success() {
         return Err(Asked::Declined(unavailable(format!(
@@ -3861,6 +3839,36 @@ fn ask(
         ))));
     }
     Ok(String::from_utf8_lossy(&answer.bytes).into_owned())
+}
+
+/// The refusal of a program whose answer is more than a version and a directory.
+fn too_much(described: &str) -> Asked {
+    Asked::Overran(ProjectError::GitUnavailable {
+        detail: format!("{described} answered with more than a version and a directory").into(),
+    })
+}
+
+/// Reads what a probe wrote to its end, once the probe has ended.
+///
+/// A process that left the probe's group may still hold the pipe, so the wait for the end is
+/// short: [`PROBE_DRAIN`], and never past the probe's own `deadline`.
+fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::Result<(), Asked> {
+    let drain = drain_until(Instant::now(), deadline);
+    loop {
+        heard.take_in(drain);
+        if heard.overflowed() {
+            return Err(too_much(described));
+        }
+        if heard.ended() {
+            return Ok(());
+        }
+        if Instant::now() >= drain {
+            return Err(Asked::Overran(ProjectError::GitUnavailable {
+                detail: format!("{described} left its output open after it ended").into(),
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Returns what a failure to start a program is. A host that is out of descriptors, processes or
