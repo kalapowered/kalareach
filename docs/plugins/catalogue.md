@@ -357,7 +357,8 @@ a package runs against an application:
   `plugin.enable` and undone with `plugin.disable`, each of which takes the environment and the
   package and answers the installation as it now stands;
 - it is **admitted**: supported on this host's operating system and architecture, whole in the
-  store, within the package limits in force, and not revoked by its repository;
+  store, within the package limits in force, not revoked by its repository, and named by the
+  organisation's adapter allowlist where an applied policy states one;
 - its declarative rules **recognise** what is running.
 
 The control daemon decides what is admitted, from the catalogue's current records, and hands each
