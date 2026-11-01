@@ -1645,9 +1645,11 @@ fn a_late_answer_is_dropped_and_counted() {
     assert_eq!(rig.driver.service().counts().dropped_answers, 0);
 }
 
-/// A load that takes more than a job's thirty seconds happens before the job is dequeued: the cold
-/// start is reported apart, and the job then has its whole deadline and is published. The control
-/// is a job whose answer arrives past that deadline, which is refused.
+/// A load that takes more than a job's thirty seconds, and the grace after them, happens before
+/// the job is dequeued: the cold start is reported apart, and the job is then published. The job
+/// takes a moment in the process, which a deadline the load had used up would end, so the process
+/// was sent the job's whole deadline. The control is a job whose answer arrives past that deadline,
+/// which is refused.
 ///
 /// The process holds its load until the case has seen the handshake, so the load's answer is told
 /// at the reading after the handshake's, whatever time the daemon's thread takes between them.
@@ -1655,6 +1657,7 @@ fn a_late_answer_is_dropped_and_counted() {
 fn a_load_over_thirty_seconds_is_followed_by_a_published_job() {
     let mut rig = Rig::new(&Script {
         load_until_released: true,
+        generate_ms: 300,
         ..Script::default()
     });
     queue(rig.service(), &session(1), Priority::Ordinary, at(0));
@@ -1662,7 +1665,7 @@ fn a_load_over_thirty_seconds_is_followed_by_a_published_job() {
         driver.background().is_some()
     });
     release_held_work(&rig.placed.directory("runtime"));
-    let loaded_at = 3_000 + DEADLINE_MS + 1_000;
+    let loaded_at = 3_000 + DEADLINE_MS + ANSWER_GRACE_MS + 1_000;
     let reports = rig.until(&roomy(), at(loaded_at), "the load", |reports, _| {
         outcomes(reports)
             .iter()

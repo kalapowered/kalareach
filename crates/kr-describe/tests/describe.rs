@@ -216,18 +216,29 @@ fn dispatch_one(
     service: &mut DescriptionService,
     now: Reading,
 ) -> (u64, SessionId, kr_describe::service::GenerationRequest) {
+    dispatch_after_load(service, now, 0)
+}
+
+/// Asks the service what to do at `now`, answers the load it asks for `load_ms` later, and returns
+/// the next job it sends then: its identifier, its session and the request.
+fn dispatch_after_load(
+    service: &mut DescriptionService,
+    now: Reading,
+    load_ms: u64,
+) -> (u64, SessionId, kr_describe::service::GenerationRequest) {
     let Instruction::Load { id, .. } = service.next(&roomy(), now).expect("an instruction") else {
         panic!("a model is loaded before any job is sent");
     };
+    let loaded = now.after_ms(load_ms);
     assert!(matches!(
         service
             .finished(
                 id,
                 Answered::Loaded {
-                    load_ms: 0,
+                    load_ms,
                     rss_bytes: 0
                 },
-                now
+                loaded
             )
             .expect("the load's answer"),
         Outcome::Loaded { .. }
@@ -236,7 +247,7 @@ fn dispatch_one(
         id,
         session_id,
         request,
-    } = service.next(&roomy(), now).expect("an instruction")
+    } = service.next(&roomy(), loaded).expect("an instruction")
     else {
         panic!("the loaded model is sent a job");
     };
@@ -372,13 +383,10 @@ fn a_model_load_that_passes_its_deadline_is_abandoned_and_publishes_nothing() {
 }
 
 /// KR-REQ-22.11: a load longer than a job's deadline happens before the job is dequeued, and the
-/// job still has its whole deadline after it; the control is a job that runs past that deadline.
+/// job is sent with its whole deadline after it; the control is a job that runs past that deadline.
 #[test]
 fn a_load_longer_than_a_jobs_deadline_leaves_the_job_its_whole_deadline() {
-    let behaviour = SharedBehaviour::new();
-    behaviour.set(Behaviour::SlowLoad {
-        duration_ms: 35_000,
-    });
+    let deadline_ms = Budgets::DEFAULTS.execution_deadline_ms;
     let mut service = service();
     queue_one(
         &mut service,
@@ -387,14 +395,27 @@ fn a_load_longer_than_a_jobs_deadline_leaves_the_job_its_whole_deadline() {
         Priority::Ordinary,
         at(0),
     );
-    let tick = turn(&mut service, &behaviour, &roomy(), at(3_000)).expect("a tick");
-    assert!(
-        matches!(tick, Tick::Published { session_id, execution_ms: 0, queue_wait_ms } if session_id == session(1) && queue_wait_ms >= 35_000),
-        "{tick:?}"
+    // The load takes 35 s, longer than the 30 s a job has, and the job waits through all of it.
+    let (id, session_id, request) = dispatch_after_load(&mut service, at(3_000), 35_000);
+    assert_eq!(session_id, session(1));
+    assert_eq!(
+        request.deadline_ms, deadline_ms,
+        "the load's time is not taken off the job's deadline"
+    );
+    assert_eq!(
+        service
+            .finished(id, produced(&request), at(38_500))
+            .expect("the answer"),
+        Outcome::Published {
+            session_id: session(1),
+            queue_wait_ms: 36_000,
+            execution_ms: 500
+        }
     );
 
+    let behaviour = SharedBehaviour::new();
     behaviour.set(Behaviour::Slow {
-        duration_ms: Budgets::DEFAULTS.execution_deadline_ms + 1,
+        duration_ms: deadline_ms + 1,
     });
     queue_one(
         &mut service,
