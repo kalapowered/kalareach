@@ -646,3 +646,24 @@ fn a_slow_list_does_not_take_the_time_given_for_the_questions_about_units_with_n
     );
     assert_eq!(manager.stopped(), [A_UNIT], "the unit was stopped");
 }
+
+/// A tree whose teardown could not establish that something its test started has ended is kept, and
+/// the test fails: what is unresolved outlives the test as surely as a job registered for it does,
+/// and a case that passed over it left a process running on a machine others share.
+#[test]
+fn a_tree_that_could_not_establish_what_its_test_started_has_ended_fails_the_test() {
+    let tree = teardown::Tree::create();
+    let root = tree.root().to_path_buf();
+    tree.hold("something that shares the tree's life could not be established as ended".to_owned());
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(tree)));
+    // The tree is kept, which is what the teardown is for; this case made it, and removes it.
+    let kept = root.is_dir();
+    std::fs::remove_dir_all(&root).expect("the kept tree is removed");
+    let said = failed.expect_err("a test that left something unresolved fails");
+    let said = said.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        said.contains("could not be established as ended"),
+        "the test's failure says what was left: {said}"
+    );
+    assert!(kept, "the tree was kept");
+}
