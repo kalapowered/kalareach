@@ -126,13 +126,18 @@ const LIFETIME: DurationMs = DurationMs::new(120_000);
 /// as the standard harness runs them on a machine with many processors, a mutation could outlast the
 /// daemon's bound on an effect. A few at a time keep the forks and that lock's queue short, so the
 /// cases do not crowd the disk they wait on. The daemons are also given a long wait for an effect
-/// ([`Host::start_holding_effects`], ten minutes), so a stalled disk slows a case and the
-/// daemon's wait does not end it unless the stall passes that.
+/// ([`Host::start_holding_effects`], ten minutes), so the daemon's own bound is no longer the first
+/// limit on a slow case.
 ///
-/// On a quiet disk a case alone takes a few seconds; on a stalled one it takes as long as the disk
-/// does. The places count case bodies and nothing else: the tasks a stopped daemon leaves behind
-/// and the effects a failed case abandons can overlap the case that follows. A case that never ends
-/// keeps its place until the process does, so four of them stop the cases after them from starting.
+/// The first limit is two minutes. A mutation asks for [`LIFETIME`], and the host refuses one whose
+/// effect has not begun by the deadline it accepted it under, which is at most that long after it
+/// received it. A raw device (`net_support::RawDevice`) stops waiting for an answer after two
+/// minutes as well. A stall of the disk that outlasts that still ends a case.
+///
+/// On a quiet disk a case alone takes a few seconds. The places count case bodies and nothing
+/// else: the tasks a stopped daemon leaves behind and the effects a failed case abandons can
+/// overlap the case that follows. A case that never ends keeps its place until the process does, so
+/// four of them stop the cases after them from starting.
 const CASES_AT_ONCE: usize = 4;
 
 static PLACES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CASES_AT_ONCE);

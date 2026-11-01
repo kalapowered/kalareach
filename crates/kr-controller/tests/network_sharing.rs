@@ -176,12 +176,25 @@ async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repea
     let action = ActionId::new(kr_ipc::new_uuid());
     let connection = RawDevice::connect(&host, &device, &record).await;
 
+    // The window is part of what an action is, so both presentations go under the one the
+    // connection holds now: a window the host renews to between them would make the second a
+    // different action.
+    let window = connection.action_window_id();
     let (arrived, go) = host.controller().sharing().grants().pause_before_effect();
-    // The 20 s is a limit on how long a hung request is waited for, not a measure: the host's wait
-    // is 250 ms, and the case fails if no answer has come in 20 s.
+    // The host's wait is 250 ms and the answer comes when it ends. The 40 s does not measure that
+    // wait: it is the detector of a host that did not end the request at the wait it was given,
+    // and of one that never answers. It sits under [`EFFECT_WAIT`] so a host that waits its own 45 s
+    // fails the case, and it is wide of 250 ms because the host writes the action's route before
+    // its timer starts, which a stalled disk can hold for some of the limit.
     let told = tokio::time::timeout(
-        Duration::from_secs(20),
-        connection.mutate(Method::GrantRedeem, action, on_the_host(&host), &redeem),
+        Duration::from_secs(40),
+        connection.mutate_in(
+            window.clone(),
+            Method::GrantRedeem,
+            action,
+            on_the_host(&host),
+            &redeem,
+        ),
     )
     .await
     .expect("the host gave up on the held effect at the wait it was given")
@@ -206,23 +219,18 @@ async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repea
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // The grant is active a moment before the action's receipt is kept, and an action presented in
-    // between is still one whose effect is running, which is told the outcome is unknown again.
-    let repeated = loop {
-        match connection
-            .mutate(Method::GrantRedeem, action, on_the_host(&host), &redeem)
-            .await
-        {
-            Ok(answer) => break answer,
-            Err(error) if error.code == ErrorCode::OutcomeUnknown => {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "the action presented again is answered as the effect ended: {error:?}"
-                );
-            }
-            Err(error) => panic!("the action presented again was refused: {error:?}"),
-        }
-    };
+    // The grant becomes active in the commit that keeps the action's receipt, so an action
+    // presented once the grant is active is answered from that receipt.
+    let repeated = connection
+        .mutate_in(
+            window,
+            Method::GrantRedeem,
+            action,
+            on_the_host(&host),
+            &redeem,
+        )
+        .await
+        .expect("the action presented again is answered as the effect ended");
     let redeemed: GrantRedeemResult = repeated.to_typed().expect("decodes");
     assert_eq!(redeemed.grant.grant_id, issued.grant.grant_id);
     connection.close();
