@@ -4058,9 +4058,9 @@ async fn a_listing_names_only_the_sessions_a_grant_admits() {
 ///
 /// Two doors. A session's answers are the same on both once the grant admits the subject, but for
 /// what a device is held back from on purpose: the socket of the session's worker, which this case
-/// shows, and the name of the desktop a session is bound to, which this session has none of. A
-/// grant's history bound can narrow a read too (the last command block), and this session has no
-/// block to narrow. The grant decides what a device may ask about, and a filter on one door beyond
+/// shows, the name of the desktop a session is bound to, and the detail of what a closed session
+/// left behind, which this session has neither of. A grant's history bound can narrow a read too
+/// (the last command block), and this session has no block to narrow. The grant decides what a device may ask about, and a filter on one door beyond
 /// those the host guide lists would make the two ingresses disagree about what the same method
 /// means. Two things each door reads differently here, on purpose. The owner at their own machine
 /// is told whose account the environment belongs to, where its directories are and the path of a

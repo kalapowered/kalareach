@@ -435,8 +435,7 @@ impl RemoteOutput {
     }
 
     /// An output whose frames are held to no bound, for a case that has no peer. A connection always
-    /// has one, so only [`Self::for_a_peer_receiving`] builds an output outside a case, and no
-    /// output outside a case can be built without a bound.
+    /// has one, so only [`Self::for_a_peer_receiving`] builds an output outside a case.
     #[cfg(test)]
     pub(super) fn writing_to(sink: Box<dyn FrameSink>, authority: Arc<Authorisation>) -> Self {
         Self::over(sink, authority, usize::MAX)
