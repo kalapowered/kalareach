@@ -1145,8 +1145,10 @@ fn ceiling_above(tree: &AuthorisedDirectory) -> Option<PathBuf> {
 /// recorded tree that has gone by then the same way ([`crate::boundary::OpenedDirectory::open`]).
 /// Every other failure of the open keeps the answer it always had: a parent that is now a file, a
 /// link that cannot be followed, a directory this account cannot enter. They are the arguments a
-/// caller got wrong, and not a source that changed. They are worded by the open's own error, and
-/// the path is not opened again to say them. (A platform that reports a parent that is a file as
+/// caller got wrong, and not a source that changed. The one exception is a host too short of
+/// descriptors, processes or memory to open the place, which says nothing of the place and is a
+/// fault that passes ([`crate::boundary::unopenable`]). They are worded by the open's own error,
+/// and the path is not opened again to say them. (A platform that reports a parent that is a file as
 /// not found, as Windows may, reads it as nothing there; that platform runs no Git, so no request
 /// reaches it.)
 fn open_recorded_root(
@@ -1700,8 +1702,9 @@ mod tests {
         assert_eq!(gone.code(), ErrorCode::SourceChanged, "{gone}");
     }
 
-    /// Every other failure of the open is the caller's argument and keeps its answer: a parent that
-    /// is now a regular file, and a link that cannot be followed, are not trees that went missing.
+    /// Every other failure of the open, but a host's shortage, is the caller's argument and keeps
+    /// its answer: a parent that is now a regular file, and a link that cannot be followed, are
+    /// not trees that went missing.
     #[cfg(unix)]
     #[test]
     fn a_recorded_trees_place_that_cannot_be_opened_for_another_reason_is_a_bad_argument() {
