@@ -2107,15 +2107,18 @@ async fn kr_req_11_35_a_journal_fault_after_the_rich_marker_leaves_the_rich_answ
     );
 }
 
-/// KR-REQ-11.33, KR-REQ-11.35 and KR-REQ-27.05, an upstream that disconnects after dispatch: a
+/// KR-REQ-11.33 and KR-REQ-11.35, an upstream that disconnects after dispatch: a
 /// committed marker followed by a transmission that fails part way is not a refusal. The server has
 /// the first bytes of the answer and then goes. The answer's fate is unknown, the connection a
 /// failed write ends serves the terminal nothing more, the request stays uncertain, and nobody
 /// sends it again: a second answer from either writer is refused.
 ///
 /// The key is for an approval's answer. A dispatched mutation whose connection ends is
-/// `agent_service.rs`'s `kr_req_09_05_a_connection_that_ended_settles_nothing`, which carries no key
-/// of this row.
+/// `agent_service.rs`'s `kr_req_09_05_a_connection_that_ended_settles_nothing`.
+///
+/// The stream is the gateway's, which no shipped package selects, so this case is not the fault
+/// tests' upstream disconnect; the application's channel is the route a package takes, and
+/// `channels.rs` holds that.
 ///
 /// Not claimed: Windows, where no gateway runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

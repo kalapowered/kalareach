@@ -725,7 +725,7 @@ async fn kr_req_23_30_a_connection_that_ended_while_the_component_prepared_rejec
     );
 }
 
-/// KR-REQ-23.30 and KR-REQ-27.05, plugin timeouts: an action is answered whatever its component
+/// KR-REQ-23.30, plugin timeouts: an action is answered whatever its component
 /// does. With the host's replies kept back, a call that is on its way to the plugin host (a frame
 /// passed the gate that holds the replies) and is never answered is given up on, and the action is
 /// rejected, while they are still kept back. The case does not show the component itself took the
@@ -828,7 +828,7 @@ async fn kr_req_11_31_the_native_terminal_goes_on_while_a_call_to_the_component_
     assert!(frames[1].contains("turn.cancel"), "{frames:?}");
 }
 
-/// KR-REQ-23.30 and KR-REQ-27.05, the plugin host kill: a plugin runtime that ends while an
+/// KR-REQ-23.30, the plugin host kill: a plugin runtime that ends while an
 /// action's component is being asked costs the action the code that says asking again can succeed,
 /// as one that was gone before the call does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
