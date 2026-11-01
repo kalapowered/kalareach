@@ -5381,6 +5381,38 @@ mod tests {
         );
     }
 
+    /// A pipe whose writers have gone, whose end is given only once `until` has passed, so that a
+    /// deadline that was ahead when the pass began is behind it by the time the read returns.
+    #[cfg(unix)]
+    struct EndsAfter {
+        until: Instant,
+    }
+
+    #[cfg(unix)]
+    impl std::io::Read for EndsAfter {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            while Instant::now() < self.until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(0)
+        }
+    }
+
+    /// The end of a pipe that is read after the deadline is not taken as the end. The time was
+    /// checked before the read and the read returned after it, so whether the end came in time is
+    /// not known, and a probe that gave an empty answer is not told from one that had not finished.
+    #[cfg(unix)]
+    #[test]
+    fn an_end_read_after_the_deadline_is_not_taken_as_the_end() {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let mut pipe = EndsAfter { until: deadline };
+        let mut seen = Bounded::default();
+
+        let left = gather(&mut pipe, &mut seen, deadline);
+
+        assert!(matches!(left, Gathered::Open), "{left:?}");
+    }
+
     /// An answer of exactly 64 KiB, the limit the documents state, is kept whole and is an answer;
     /// one byte more is too much. The lengths are written out, so that a limit that moved is not
     /// followed by the case.
