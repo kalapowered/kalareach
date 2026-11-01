@@ -131,9 +131,11 @@ pub const MECHANISM: &str = "Landlock rules attached to the directory handles th
 /// Why a machine of an instruction set this host holds no system-call numbers for runs no Git.
 ///
 /// The filter that refuses a process its sockets is written in the numbers of the calls it judges,
-/// and a filter written for the numbers of another machine would not mean what it says.
+/// and a filter written for the numbers of another machine would not mean what it says. No step on
+/// this host changes it, so the reason ends with a kind of host to use instead.
 const NO_SYSTEM_CALL_NUMBERS: &str = "this host does not hold the system-call numbers for this \
-                                      machine, so a Git invocation cannot be enclosed";
+                                      machine, so a Git invocation cannot be enclosed; use a \
+                                      host on an x86-64 or aarch64 machine";
 
 /// This platform has a boundary an invocation runs inside, on a machine whose system-call numbers
 /// this host holds.
@@ -1364,7 +1366,7 @@ mod tests {
     }
 
     /// A machine whose system-call numbers this host does not hold runs no Git, under the code of a
-    /// platform that runs none, and says what it lacks.
+    /// platform that runs none, and says what it lacks and what to use instead.
     #[test]
     fn a_machine_without_system_call_numbers_refuses_under_a_code_a_client_does_not_retry() {
         let refusal = no_system_call_numbers();
@@ -1378,9 +1380,11 @@ mod tests {
             kr_protocol::error::ErrorCode::HostNotConfigured
         );
         assert!(!refusal.code().retry_category().permits_automatic_retry());
+        let said = refusal.to_string();
+        assert!(said.contains("system-call numbers"), "{said}");
         assert!(
-            refusal.to_string().contains("system-call numbers"),
-            "{refusal}"
+            said.ends_with("use a host on an x86-64 or aarch64 machine"),
+            "it ends with the host to use: {said}"
         );
     }
 

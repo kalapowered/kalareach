@@ -145,9 +145,9 @@ pub const NO_GIT: Option<&str> = platform::NO_GIT;
 /// platform gives for running none.
 ///
 /// The condition does not pass: no wait, no retry and no install changes it. So the refusal says
-/// what the platform cannot do and names no step to take, and it is the one of a host that is not
-/// set up for the work, which a client does not send again, and not the one of an upstream that
-/// may answer later.
+/// what the platform cannot do and ends with the host to use instead, which each platform's reason
+/// names, and it is the one of a host that is not set up for the work, which a client does not send
+/// again, and not the one of an upstream that may answer later.
 pub(crate) fn no_git_refusal(why: &str) -> ProjectError {
     ProjectError::GitUnavailable {
         detail: format!("Git is not run on this platform: {why}").into(),

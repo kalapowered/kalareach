@@ -3,7 +3,8 @@
 //! The restricted profile is prepared whether or not Git can be found, because preparing it asks
 //! nothing of Git. Each invocation looks for Git first and is refused when there is none, with the
 //! step that installs it. A platform that runs no Git at all, which Windows is, gives its own
-//! refusal before it looks, installed or not. The cases that need no script run everywhere.
+//! refusal before it looks, installed or not, and ends it with the host to use instead. The cases
+//! that need no script run everywhere.
 
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
@@ -69,7 +70,7 @@ fn assert_refused_for_lack_of_git(refusal: &ProjectError) {
 }
 
 /// Installing Git would change nothing here, so the refusal says what the platform cannot do and
-/// names no install.
+/// names no install, only the host to use instead.
 #[cfg(windows)]
 fn assert_refused_for_lack_of_git(refusal: &ProjectError) {
     assert_eq!(
@@ -83,6 +84,10 @@ fn assert_refused_for_lack_of_git(refusal: &ProjectError) {
     );
     let said = refusal.to_string();
     assert!(said.contains("ports"), "{said}");
+    assert!(
+        said.ends_with("use a host on macOS or Linux"),
+        "it ends with the host to use: {said}"
+    );
     assert!(!said.contains("try again"), "{said}");
 }
 

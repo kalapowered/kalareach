@@ -15,8 +15,8 @@ use crate::error::Result;
 pub const MECHANISM: &str = "none: this platform has no boundary this service can build";
 
 /// Why no Git is run here.
-const WHY: &str =
-    "this platform has no boundary a Git invocation can be enclosed in, so none is run";
+const WHY: &str = "this platform has no boundary a Git invocation can be enclosed in, so none is \
+                   run; use a host on macOS or Linux";
 
 /// Why no Git is run here, as the platform modules give it.
 pub const NO_GIT: Option<&str> = Some(WHY);

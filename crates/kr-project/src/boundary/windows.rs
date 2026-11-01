@@ -132,14 +132,15 @@ pub const MECHANISM: &str = "none yet: a per-invocation application container ca
 const ENFORCED: bool = false;
 
 /// Why no Git is run here, which is what an invocation is refused with and what a request that
-/// needs Git is told before Git is looked for.
+/// needs Git is told before Git is looked for. No step on this host changes it, so the reason ends
+/// with the host to use instead.
 pub const NO_GIT: Option<&str> = if ENFORCED {
     None
 } else {
     Some(
         "an application container on this platform cannot keep a repository from being executed \
          from, and cannot bound which ports a remote operation reaches, so this host refuses \
-         rather than claiming a boundary it does not have",
+         rather than claiming a boundary it does not have; use a host on macOS or Linux",
     )
 };
 
