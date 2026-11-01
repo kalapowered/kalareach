@@ -289,16 +289,27 @@ the system does not hold is reported as not applied, with the reason.
   treat it as a failure of the process:
 
   - At the job's deadline the daemon asks the process to stop the job. A process whose control
-    thread says it has read the request is listening, and is given 30 seconds after the deadline
+    thread says it has read the request is listening, and is given 30 seconds from the request
     to answer: twice the longest stop seen in the class (15 seconds), and a session's cooldown.
-    The process holds one job at a time, so a stop that takes the whole bound delays the next job
-    of every session by as much. The process's own watchdog gives a job whose stop it has read
-    the same bound, where other work is overdue two seconds after its deadline. The job answers
-    as past its deadline, the model stays loaded, and no new load follows. A process whose
-    control thread does not say it has read the request is ended two seconds after the request,
-    and one that has read it and has not answered by the bound is ended then; each is a failure
-    of inference. A caller who cancels the job, or a pause or a closed session that stops it,
-    decides what it comes to, and not the deadline.
+    The request is made at the deadline, or at the daemon's first look after it. The daemon reads
+    a clock that counts the time a Mac sleeps and the process reads one that does not, so a
+    daemon that looks late after a sleep still gives the process that time from its request,
+    and does not end it before it could answer. The process holds one job at a time, so a stop
+    that takes the whole bound delays the next job of every session by as much. The process's own
+    watchdog gives a job whose stop it has read, a caller's cancellation included, 30 seconds
+    after the deadline on its own clock, where other work is overdue two seconds after its
+    deadline. The job answers as past its deadline, the model stays loaded, and no new load
+    follows. A process whose control thread does not say it has read the request is ended two
+    seconds after the request, and one that has read it and has not answered by the bound is
+    ended then; each is a failure of inference. The bound is about twice the longest stop seen,
+    so a host busier than that one brings a stop to the bound.
+
+    A caller who cancels the job decides what it comes to however it ends, and a job a caller
+    cancelled is never a miss. A pause, a closed session or a change that made the description
+    stale decides it when the process answers that it stopped, and then the job is no miss. When
+    the daemon ends the process at the bound, or the process answers on its own that the
+    deadline passed, the job ends past its deadline whatever else would have stopped it, and a
+    job a pause had stopped is not queued again.
   - A job that misses its deadline makes the next job wait, one second after the first miss and
     twice as long after each one in a row, up to five minutes, until a description is published.
     The cadence a client is shown does not count this wait. It does not by itself show the host
@@ -555,7 +566,7 @@ The daemon holds the process to its bounds, and ends it outright when it breaks 
 | --- | --- |
 | Answering hello | 10 s |
 | A load | its own deadline of five minutes, and 2 s more |
-| A job | its thirty seconds from dequeue, and 2 s more; 30 s after the deadline for a process whose control thread has said it read the request to stop that the daemon makes at the deadline |
+| A job | its thirty seconds from dequeue, which is when the daemon asks the process to stop it; 2 s after that request, or 30 s after it for a process whose control thread has said it read the request |
 | Answering a cancellation | 2 s |
 | The resident set, read every second during a load or a job | 4 GiB |
 
@@ -621,8 +632,8 @@ at all unloads after fifteen minutes.
 A load is cancelled when its reason goes: descriptions turned off, a pause, or no work left for it.
 A job is cancelled when privacy mode fences its session, when its session closes or opens again,
 when a change to the session settles, when a pause arrives, or when a caller cancels it, and a job
-stopped for a pause keeps its place in the queue. A cancellation and a passed deadline publish
-nothing.
+stopped for a pause keeps its place in the queue, unless the daemon ended its process for passing
+its deadline. A cancellation and a passed deadline publish nothing.
 
 A process that exits, breaks the wire or is ended for breaking a bound takes the model with it and
 nothing else. The store, the pins, the provenance, every session and every deterministic title
