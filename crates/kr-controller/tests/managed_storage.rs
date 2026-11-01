@@ -5909,22 +5909,27 @@ async fn a_deadline_that_passes_while_the_bundle_write_waits_for_its_own_token_s
 }
 
 /// The service names `delay` to a look at its storage state that the owner makes with
-/// `backup.status`, and the host owes it from then on. The case goes on from here only if it does:
-/// the look bounds its wait for the service in real time and, when that bound passes, says nothing
-/// was read and owes nothing, and a case that went on from such a look would fail at a later step
-/// that needs the delay, for a reason that is not the one that happened.
+/// `backup.status`, and the host owes it from then on. The case goes on from here only if it does.
+///
+/// A look bounds its wait for the sign-in and for the service in real time and, when a bound
+/// passes, says nothing was read and owes nothing: a runner that stops for that long cuts the first
+/// look and not the second. So the look is made again, with the fault armed before each one, until
+/// the host owes a delay. A look that meets the fault and is not cut owes it, so this ends at the
+/// first look that does.
 async fn the_service_names_a_delay_to_a_look_at_its_storage_state(rig: &Rig, delay: Moment) {
-    rig.served.web().fail(STATUS, 1, delay);
-    let storage = rig.backup_status().await.storage;
+    let quiet = rig.controller.backup_runtime().expect("a carrier").quiet();
+    let mut said = None;
+    let owed = tokio::time::timeout(Duration::from_secs(180), async {
+        while quiet.left().is_none() {
+            rig.served.web().fail(STATUS, 1, delay);
+            said = Some(rig.backup_status().await.storage);
+        }
+    })
+    .await;
     assert!(
-        rig.controller
-            .backup_runtime()
-            .expect("a carrier")
-            .quiet()
-            .left()
-            .is_some(),
-        "the look at the storage state did not leave the delay the service named owed; it said \
-         {storage:?}, as it does when its wait for the service passes the bound it keeps"
+        owed.is_ok(),
+        "the looks at the storage state did not leave the delay the service named owed; the last \
+         said {said:?}"
     );
 }
 
