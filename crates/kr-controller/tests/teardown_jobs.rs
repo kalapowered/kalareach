@@ -358,7 +358,8 @@ fn a_unit_the_manager_goes_on_having_is_left_however_often_it_is_asked() {
 /// transient unit files, and a tool that answers the teardown's questions from what a case wrote
 /// beside it. The tool lists the units in `listed`, answers a unit's working directory from
 /// `directory-of-<unit>` (nothing where the file is not there, a failure where `fail-asking` is,
-/// and a failure for each of the first `failures-left` times), records each unit it is asked about
+/// no answer where `stall-asking` is, and a failure for each of the first `failures-left` times),
+/// records each unit it is asked about
 /// in `asked` and each it is told to stop in `stopped`, and says a unit it has stopped is gone.
 #[cfg(target_os = "linux")]
 struct StandInManager {
@@ -392,6 +393,7 @@ case "$*" in
     if grep -qx "$unit" "$here/stopped" 2>/dev/null; then echo not-found; else echo loaded; fi ;;
   *--property=WorkingDirectory*)
     echo "$unit" >> "$here/asked"
+    [ -e "$here/stall-asking" ] && exec sleep 40
     [ -e "$here/fail-asking" ] && exit 1
     if [ -s "$here/failures-left" ]; then
       left="$(cat "$here/failures-left")"
@@ -624,6 +626,58 @@ fn units_with_no_file_are_not_asked_about_after_the_time_given_for_them_has_gone
         "each unit is counted as not established: {left:?}"
     );
     assert!(manager.asked().is_empty(), "{:?}", manager.asked());
+}
+
+/// The questions about units with no file share one allowance, and a manager that answers none of
+/// them costs the teardown that allowance once and not once for each unit: the first unit uses it
+/// up, the second is not asked about, and both are counted as not established.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_units_with_no_file_share_one_allowance_and_do_not_each_have_one() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let manager = StandInManager::new();
+    let other = "kr-plugin-host-6f0c2b1e-3a4d-4c5b-8e7f-0a1b2c3d4e5f.service";
+    manager.lists(A_UNIT);
+    manager.lists(other);
+    std::fs::write(manager.here.join("fail-asking"), "").expect("a mark");
+    let left = manager.remove_within(&tree, std::time::Duration::from_secs(3));
+    let mut asked = manager.asked();
+    asked.sort();
+    asked.dedup();
+    assert!(
+        asked.len() <= 1,
+        "a unit after the one that used the allowance up was asked about: {asked:?}"
+    );
+    assert_eq!(
+        left.iter()
+            .filter(|what| what.contains("could not be asked"))
+            .count(),
+        2,
+        "each unit is counted as not established: {left:?}"
+    );
+}
+
+/// A question about a unit with no file is given what is left of the allowance and no more: a
+/// manager that does not answer it is ended at the allowance's end, and the refusal says how long
+/// the question was given.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_question_about_a_unit_with_no_file_is_given_what_is_left_of_the_allowance_and_no_more() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let manager = StandInManager::new();
+    manager.lists(A_UNIT);
+    std::fs::write(manager.here.join("stall-asking"), "").expect("a mark");
+    let left = manager.remove_within(&tree, std::time::Duration::from_secs(2));
+    let said = left.join("; ");
+    assert!(said.contains("could not be asked"), "{said}");
+    assert!(
+        said.contains("did not finish within"),
+        "the question was begun and ended at its bound: {said}"
+    );
+    assert!(
+        !said.contains("within 10s"),
+        "the question was given the minimum a question is given elsewhere: {said}"
+    );
 }
 
 /// The time the questions about units with no file share starts when the list has been read, and a
