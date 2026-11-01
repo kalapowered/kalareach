@@ -4279,6 +4279,64 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
         printed.contains("not here: no user manager answers"),
         "a manager that says it is not there reads as a machine that cannot run the case: {printed}"
     );
+
+    // A manager that is there and fails its answer for another reason, or is ended by a signal,
+    // has not shown that this machine has none: the start fails the case.
+    for (what, body, said) in [
+        (
+            "a bus that timed out",
+            "echo 'Failed to connect to bus: Connection timed out' >&2; exit 1",
+            "without saying that none is there",
+        ),
+        (
+            "a property that could not be read",
+            "echo 'Failed to get properties: Connection timed out' >&2; exit 1",
+            "without saying that none is there",
+        ),
+        ("a systemctl that was killed", "kill -KILL $$", "signal"),
+    ] {
+        let failing = tempfile::tempdir().expect("a directory");
+        place(failing.path(), body);
+        let ran = run_with(ordinary, failing.path());
+        let stderr = String::from_utf8_lossy(&ran.stderr);
+        assert_eq!(
+            ran.status.code(),
+            Some(101),
+            "{what} fails the case and is not skipped: {stderr}"
+        );
+        assert!(stderr.contains(said), "{what}: {stderr}");
+    }
+}
+
+/// The words that mean no user manager is there are those, and a bus that timed out or a property
+/// that could not be read are not among them.
+#[test]
+fn only_the_words_that_mean_no_user_manager_is_there_are_read_as_that() {
+    for absent in [
+        "Failed to connect to bus: No such file or directory",
+        "Failed to connect to bus: No medium found",
+        "Failed to connect to user scope bus via local transport: No such file or directory",
+        "Failed to connect to bus: Connection refused",
+        "System has not been booted with systemd as init system (PID 1). Can't operate.\nFailed to connect to bus: Host is down",
+        "$DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined (consider using --machine=<user>@.host --user to connect to bus of other user)",
+    ] {
+        assert!(
+            user_manager::says_there_is_no_user_manager(absent),
+            "{absent}"
+        );
+    }
+    for there in [
+        "Failed to connect to bus: Connection timed out",
+        "Failed to get properties: Connection timed out",
+        "Failed to get properties: Access denied",
+        "Failed to get properties: No such file or directory",
+        "",
+    ] {
+        assert!(
+            !user_manager::says_there_is_no_user_manager(there),
+            "{there}"
+        );
+    }
 }
 
 /// The bounds the case below gives a run of `kr`, each below the twenty seconds a run of `kr`

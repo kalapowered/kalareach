@@ -140,6 +140,25 @@ pub fn end_and_collect(child: &mut std::process::Child) -> String {
     }
 }
 
+/// Whether what `systemctl --user` printed says that this machine has no user service manager to
+/// ask: no bus to reach it by (no session, no runtime directory, nothing at the socket, a refused
+/// connection, no medium), or no systemd as the init system at all. A bus that timed out, a
+/// property that could not be read and every other failure say nothing of the kind: a manager is
+/// there, and a case that needs it has to run.
+pub fn says_there_is_no_user_manager(stderr: &str) -> bool {
+    stderr.contains("System has not been booted with systemd")
+        || stderr.contains("$DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined")
+        || (stderr.contains("Failed to connect to")
+            && [
+                "No such file or directory",
+                "No medium found",
+                "Connection refused",
+                "Host is down",
+            ]
+            .iter()
+            .any(|words| stderr.contains(words)))
+}
+
 /// Runs a command to its end within `bound`, ending and collecting it when it has not ended.
 ///
 /// For teardown, which must not panic: every failure is returned as what it was, and none waits
@@ -269,10 +288,21 @@ impl UserManager {
             panic!("the machine's own user service manager was asked who it is: {why}")
         });
         if !answered.status.success() {
+            let said = String::from_utf8_lossy(&answered.stderr);
+            // A `systemctl` that was ended by a signal, or that failed without saying that no
+            // manager is there (a bus that timed out, a read of the manager's properties that
+            // failed), has not shown that this machine has no manager: that fails the case.
+            assert!(
+                answered.status.code().is_some() && says_there_is_no_user_manager(&said),
+                "the machine's own user service manager was asked who it is and failed, without \
+                 saying that none is there: {} {}",
+                answered.status,
+                said.trim()
+            );
             return Err(format!(
                 "no user manager answers for whoever runs these tests, so there is no scope to run \
                  a manager of the test's own in: {}",
-                String::from_utf8_lossy(&answered.stderr).trim()
+                said.trim()
             ));
         }
         let units = home.join(".config/systemd/user");
