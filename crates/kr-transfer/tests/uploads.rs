@@ -226,6 +226,16 @@ fn a_chunk_that_does_not_match_its_digest_is_refused_without_ending_the_upload()
         .expect("reserves the upload");
     let (chunk, _) = chunk_of(&bytes, 0);
     let corrupted = vec![9; bytes.len()];
+    // What the staged payload holds, read the same way before the chunk and after its refusal.
+    let staged_payload = || {
+        let entry = std::fs::read_dir(harness.service.staging().incomplete().display_path())
+            .expect("reads the incomplete area")
+            .next()
+            .expect("one staged payload")
+            .expect("a directory entry");
+        std::fs::read(entry.path()).expect("reads the staged payload")
+    };
+    let before = staged_payload();
     let refusal = harness
         .service
         .upload_chunk(
@@ -261,16 +271,10 @@ fn a_chunk_that_does_not_match_its_digest_is_refused_without_ending_the_upload()
         U64::new(0),
         "and none of its bytes are charged as received"
     );
-    let staged = std::fs::read_dir(harness.service.staging().incomplete().display_path())
-        .expect("reads the incomplete area")
-        .next()
-        .expect("one staged payload")
-        .expect("a directory entry")
-        .path();
-    let staged = std::fs::read(&staged).expect("reads the staged payload");
-    assert!(
-        !staged.starts_with(&corrupted),
-        "none of the corrupted bytes were written to the staged payload: {staged:?}"
+    assert_eq!(
+        staged_payload(),
+        before,
+        "the refusal left the staged payload as it was: not one of the corrupted bytes was written"
     );
 
     let (chunk, payload) = chunk_of(&bytes, 0);
