@@ -3605,15 +3605,14 @@ impl Container {
     /// A removal can be asked again, and a loaded machine's runtime can take longer than one call
     /// is given, so a call that gave no answer is asked again until the time a slow call is given
     /// has passed, each call given no more than what is left. A refusal is not asked again: it
-    /// would be refused again.
+    /// would be refused again. The first call is always made, and is given no more than the whole
+    /// time a slow call is given: a machine that stood still after that time was set has not used
+    /// any of it up.
     fn remove(&self) -> Result<(), String> {
         let until = Instant::now() + self.runtime.slow;
         let mut last = String::new();
+        let mut left = self.runtime.slow;
         loop {
-            let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(last);
-            }
             match self.runtime.run(
                 &[
                     "rm",
@@ -3645,6 +3644,10 @@ impl Container {
                 }
             }
             std::thread::sleep(Duration::from_millis(200));
+            left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(last);
+            }
         }
     }
 }
@@ -3833,7 +3836,8 @@ fn a_removal_that_stalls_is_an_error_and_aborts_nothing_while_an_assertion_fails
 
 /// A removal call is given no more than the time that is left for removals. The call here may take
 /// thirty seconds, and the time for removals is three, and the bound the failure says the call had
-/// is the three. A call that stalls is ended at its bound whatever that is, so no delay in the
+/// is the three. A call that stalls is ended at its bound whatever that is, and the first call is
+/// given the whole time and made whatever has gone by since the time was set, so no delay in the
 /// machine changes what the bound was.
 #[test]
 fn a_removal_call_is_given_no_more_than_what_is_left_of_the_time_for_removals() {

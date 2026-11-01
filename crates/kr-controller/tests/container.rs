@@ -253,7 +253,9 @@ impl Container {
     /// Removes the container, or says why it could not. A removal can be asked again and a loaded
     /// machine's runtime can take longer than one call is given, so a call that gave no answer is
     /// asked again until [`REMOVAL_WITHIN`] has passed, each call given no more than what is left;
-    /// a refusal is not asked again.
+    /// a refusal is not asked again. The first call is always made, and is given no more than the
+    /// whole time for removals: a machine that stood still after that time was set has not used any
+    /// of it up.
     fn remove(&self) -> Result<(), String> {
         self.remove_telling(&mut std::io::stderr())
     }
@@ -262,11 +264,8 @@ impl Container {
     fn remove_telling(&self, told: &mut dyn std::io::Write) -> Result<(), String> {
         let until = Instant::now() + self.runtime.removal;
         let mut last = String::new();
+        let mut left = self.runtime.removal;
         loop {
-            let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(last);
-            }
             match self.runtime.within(
                 &[
                     "rm",
@@ -293,6 +292,10 @@ impl Container {
                 }
             }
             std::thread::sleep(Duration::from_millis(200));
+            left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(last);
+            }
         }
     }
 }
@@ -621,8 +624,9 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// A removal that never answers is, when the time for removals has passed, an error that names the
-/// call and does not panic; each call is given no more than what is left of that time, and each that
-/// gave no answer leaves a line for whoever reads the run.
+/// call and does not panic; each call is given no more than what is left of that time (the first,
+/// the whole of it, whatever has gone by since it was set), and each that gave no answer leaves a
+/// line for whoever reads the run.
 #[test]
 fn a_removal_that_never_answers_is_reported_with_the_call_named() {
     let directory = tempfile::tempdir().expect("a directory");
