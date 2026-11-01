@@ -8376,8 +8376,8 @@ async fn a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_on
 /// the kill signal that ended the shell, the record names it, and the shell is gone. The shell is
 /// the package's own, as a managed session runs it, with its editor reader and its bridge; the root
 /// program the daemon fault suite kills is a script that stands in for one, and that suite is where
-/// the worker and the daemon are shown to go on after it. This case runs in the worker's own
-/// runtime, with no daemon.
+/// the worker is shown to end by itself and the daemon to keep the record. This case runs in the
+/// worker's own runtime, with no daemon.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them"]

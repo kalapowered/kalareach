@@ -775,9 +775,9 @@ impl Host {
         }
         let kr = programs.join("kr");
         // The guard is the program `kr attach` hands the terminal to. Each reports the version of its
-        // package, so a guard of another release fails here and a stale build of the same release
-        // does not: the programs are built together before a run of this crate alone, as the
-        // comment on `built_program` says.
+        // package, so a guard of another package version fails here, and a stale build of the same
+        // version does not (two releases can carry one): the programs are built together before a
+        // run of this crate alone, as the comment on `built_program` says.
         let version_of = |name: &str| {
             let said = std::process::Command::new(programs.join(name))
                 .arg("--version")
@@ -793,7 +793,7 @@ impl Host {
         assert_eq!(
             version_of("kr"),
             version_of("kr-attach-guard"),
-            "`kr` and its guard are of different releases; build both with `cargo build -p kr-cli`"
+            "`kr` and its guard report different versions; build both with `cargo build -p kr-cli`"
         );
         let pty = portable_pty::native_pty_system()
             // The session's own size: a terminal of another size is drawn a window of the screen,
