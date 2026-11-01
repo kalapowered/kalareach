@@ -114,7 +114,8 @@ fn withheld(error: &ClientError) -> bool {
 /// How long a mutation asks for. A clone reaches the filesystem and a materialisation copies it.
 const LIFETIME: DurationMs = DurationMs::new(120_000);
 
-/// How many cases of this file run at once. Every case takes a place with its first statement.
+/// How many case bodies of this file run at once. Every case takes a place before it starts its
+/// daemon.
 ///
 /// The cases are threads of one process and each starts a daemon of its own. The Git invocations a
 /// daemon runs for a request fork that process, and while the kernel copies the process's memory
@@ -122,15 +123,24 @@ const LIFETIME: DurationMs = DurationMs::new(120_000);
 /// threads the process holds. Each invocation also writes three lines to the daemon's record of its
 /// temporary directories, each synchronised to the disk under one lock the whole process shares, so
 /// a busy disk holds every daemon behind the one that writes. With all the cases running at once,
-/// as the standard harness runs them on a machine with many processors, a mutation can outlast the
-/// daemon's bound on an effect, which the daemon answers by saying it cannot report what happened.
-/// A case alone takes a few seconds at most, and a few at a time keep the forks and that lock's
-/// queue short.
+/// as the standard harness runs them on a machine with many processors, a mutation could outlast the
+/// daemon's bound on an effect. A few at a time keep the forks and that lock's queue short, so the
+/// cases do not crowd the disk they wait on. The daemons are also given a long wait for an effect
+/// ([`Host::start_holding_effects`], ten minutes), so a stalled disk slows a case and the
+/// daemon's wait does not end it unless the stall passes that.
+///
+/// On a quiet disk a case alone takes a few seconds; on a stalled one it takes as long as the disk
+/// does. The places count case bodies and nothing else: the tasks a stopped daemon leaves behind
+/// and the effects a failed case abandons can overlap the case that follows. A case that never ends
+/// keeps its place until the process does, so four of them stop the cases after them from starting.
 const CASES_AT_ONCE: usize = 4;
 
 static PLACES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CASES_AT_ONCE);
 
-/// Waits for a place among the cases that run at once, and keeps it until the case ends.
+/// Waits for a place among the cases that run at once.
+///
+/// The place is the permit this returns, so a case binds it to a local that lives to the end of its
+/// body: a permit dropped at once gives the place back at once.
 async fn take_a_place() -> tokio::sync::SemaphorePermit<'static> {
     PLACES.acquire().await.expect("the places are never closed")
 }
@@ -290,7 +300,7 @@ fn workspace_params(
 async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike() {
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let mut control = host.client().await;
     let (_device, session) = net_support::paired_device(&host, &owner, PROJECT_RIGHTS).await;
     let source = repository(host.work(), "source");
@@ -529,7 +539,7 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
 async fn an_unbounded_grant_is_refused_by_the_same_rule_and_the_owner_is_unaffected() {
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     as_unqualified(&host);
     let mut control = host.client().await;
     let (_device, session) = net_support::paired_device(&host, &owner, PROJECT_RIGHTS).await;
@@ -711,7 +721,7 @@ async fn an_unbounded_grant_is_refused_by_the_same_rule_and_the_owner_is_unaffec
 async fn a_device_is_refused_all_five_repository_methods() {
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     as_unqualified(&host);
     let mut control = host.client().await;
     let device = net_support::Device::create().await;
@@ -883,7 +893,7 @@ async fn a_device_is_refused_all_five_repository_methods() {
 async fn a_device_with_unadmitted_environment_or_session_sees_narrowed_lists() {
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let mut control = host.client().await;
     let _source = repository(host.work(), "source");
 
@@ -1020,7 +1030,7 @@ async fn a_device_with_unadmitted_environment_or_session_sees_narrowed_lists() {
 async fn a_read_of_one_working_copy_carries_only_the_sessions_the_grant_admits() {
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let mut control = host.client().await;
     let _source = repository(host.work(), "bound");
     let adopted: ProjectAdoptResult = typed(
@@ -1115,7 +1125,7 @@ async fn a_read_of_one_working_copy_carries_only_the_sessions_the_grant_admits()
 async fn a_device_with_admitted_environment_and_unadmitted_session_sees_narrowed_bound_sessions() {
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let mut control = host.client().await;
     let _source = repository(host.work(), "source");
 
@@ -1203,7 +1213,7 @@ async fn a_device_with_admitted_environment_and_unadmitted_session_sees_narrowed
 async fn a_device_without_session_view_is_refused_project_and_workspace_lists() {
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let (_device, session) =
         net_support::paired_device(&host, &owner, &[ActionRight::ProjectCreate]).await;
 
@@ -1258,7 +1268,7 @@ async fn a_device_without_session_view_is_refused_project_and_workspace_lists() 
 async fn a_device_reaches_only_the_project_methods_its_grant_carries() {
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let mut control = host.client().await;
     let (_device, session) =
         net_support::paired_device(&host, &owner, &[ActionRight::SessionView]).await;
@@ -1418,7 +1428,7 @@ async fn a_device_reaches_only_the_project_methods_its_grant_carries() {
 async fn a_project_envelope_naming_a_session_or_another_environment_is_refused_on_both_ingresses() {
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let mut control = host.client().await;
     let (_device, session) = net_support::paired_device(&host, &owner, PROJECT_RIGHTS).await;
 
@@ -1543,7 +1553,7 @@ async fn a_project_envelope_naming_a_session_or_another_environment_is_refused_o
 async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_performed_again() {
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let mut control = host.client().await;
     let device = net_support::Device::create().await;
     let record = net_support::pair_with(
@@ -1661,7 +1671,7 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
 async fn a_device_without_session_view_still_recovers_its_own_project_outcome() {
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let mut control = host.client().await;
     let device = net_support::Device::create().await;
     let record = net_support::pair_with(
@@ -1734,7 +1744,7 @@ async fn a_device_without_session_view_still_recovers_its_own_project_outcome() 
 async fn a_device_is_refused_the_owners_reconciliation_route() {
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let device = net_support::Device::create().await;
     let record = net_support::pair_with(
         &host,
@@ -1782,7 +1792,7 @@ async fn a_device_is_refused_the_owners_reconciliation_route() {
 async fn action_read_says_how_to_obtain_an_outcome_this_host_owns() {
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let device = net_support::Device::create().await;
     let record = net_support::pair_with(
         &host,
@@ -1872,7 +1882,7 @@ struct Recorded {
 impl Recorded {
     async fn start() -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
-        let host = Host::start(&owner).await;
+        let host = Host::start_holding_effects(&owner).await;
         let mut control = host.client().await;
         repository(host.work(), "recorded");
         let adopted: ProjectAdoptResult = typed(
@@ -3072,7 +3082,7 @@ async fn owner_methods_reject_every_nonlocal_ingress() {
 
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let mut control = host.client().await;
     let mut rights = PROJECT_RIGHTS.to_vec();
     rights.push(ActionRight::HostManage);
@@ -3281,7 +3291,7 @@ async fn the_owners_confirmation_of_a_devices_location_names_that_devices_four_k
 
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let mut control = host.client().await;
     let first = net_support::Device::create().await;
     let held =
@@ -3358,7 +3368,7 @@ async fn a_confirmation_issued_for_one_devices_location_does_not_verify_for_anot
 
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let first = net_support::Device::create().await;
     let held =
         net_support::pair_with(&host, &first, &owner, net_support::proposal(PROJECT_RIGHTS)).await;
@@ -3422,7 +3432,7 @@ async fn a_confirmation_for_a_device_that_then_rotated_its_keys_is_not_spent() {
 
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let device = net_support::Device::create().await;
     let held = net_support::pair_with(
         &host,
@@ -3484,7 +3494,7 @@ async fn a_location_confirmation_is_recorded_as_spent_only_while_the_device_hold
 
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let device = net_support::Device::create().await;
     let held = net_support::pair_with(
         &host,
@@ -3610,7 +3620,7 @@ async fn a_device_that_has_not_declared_its_keys_is_refused_a_confirmation_until
 
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let mut control = host.client().await;
     let device = net_support::Device::create().await;
     let record = net_support::pair_with(
@@ -3707,7 +3717,7 @@ async fn a_device_that_has_not_declared_its_keys_is_refused_a_confirmation_until
 /// Starts a host, or returns none and says so when it does not prove Git's reads confined: the
 /// test that asked for one is not run there.
 async fn qualified_host(owner: &DeviceKeys, test: &str) -> Option<Host> {
-    let host = Host::start(owner).await;
+    let host = Host::start_holding_effects(owner).await;
     let proved = host.controller().qualification();
     if proved.qualifies() {
         return Some(host);
@@ -6559,7 +6569,7 @@ async fn host_doctor_says_whether_a_paired_device_is_served_repository_operation
 
     let _place = take_a_place().await;
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let host = Host::start_holding_effects(&owner).await;
     let mut control = host.client().await;
     let (_device, session) = net_support::paired_device(&host, &owner, PROJECT_RIGHTS).await;
     let doctor: HostDoctorResult = locally(&mut control, Method::HostDoctor, &()).await;

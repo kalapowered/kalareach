@@ -107,6 +107,38 @@ pub(crate) fn git_read_bound() -> Option<Duration> {
     })
 }
 
+tokio::task_local! {
+    /// How long the daemon being started in this task waits for the effect of a mutation a paired
+    /// device sends.
+    static EFFECT_WAIT_BOUND: Duration;
+}
+
+/// Runs `start` so that the daemon it starts waits `bound` for the effect of a mutation a paired
+/// device sends before it answers that the outcome is unknown, in place of
+/// [`crate::service::net::dispatch::EFFECT_WAIT`].
+///
+/// The daemon's own bound is its choice of how long a caller is kept waiting. A suite that is about
+/// something other than that choice should not end because a loaded machine took longer than the
+/// bound to run a Git child or to write a file: it gives the daemon a long bound, and an effect
+/// that finishes inside it is answered whenever it does. A suite about the bound itself gives a
+/// short one.
+pub async fn with_effect_wait<F: Future>(bound: Duration, start: F) -> F::Output {
+    EFFECT_WAIT_BOUND.scope(bound, start).await
+}
+
+/// A long effect wait, ten minutes.
+///
+/// The one a suite that is about something other than the daemon's own bound gives its daemons
+/// through [`with_effect_wait`], as an allowance for a loaded machine: an effect that finishes
+/// inside it is answered whenever it does, and one that does not is told the outcome is unknown,
+/// as in the field.
+pub const HUNG_EFFECT: Duration = Duration::from_secs(600);
+
+/// The wait a suite gave the daemon being started for an effect, when it did.
+pub(crate) fn effect_wait() -> Option<Duration> {
+    EFFECT_WAIT_BOUND.try_with(|bound| *bound).ok()
+}
+
 /// The environment variable that stands the account service at an origin for a daemon a suite
 /// runs as a program of its own, which no task of the suite starts.
 pub const ACCOUNT_ORIGIN_VARIABLE: &str = "KR_TEST_ACCOUNT_ORIGIN";
