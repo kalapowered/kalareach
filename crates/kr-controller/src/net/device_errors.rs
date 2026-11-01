@@ -305,17 +305,16 @@ struct HostPath {
 
 /// The members that hold a place on this host and no failure: where a repository or a working copy
 /// is, the staging paths an operation kept or removed, the repository a clone was made from, the
-/// socket of a session's worker. A session's own working directory and shell, and the executable a
-/// question's source runs, are not among them: the product shows them to the person on purpose, as
-/// part of how a session or a question is described (the specification names a session's working
-/// directory and a question's verified executable). A grant that leaves out the live screen cannot
-/// attach to the terminal and can still read the session's summary, so the directory and the shell
-/// are shown as the session's description. The staged path of an attachment's read grant is shown
-/// on purpose too: the companion gives it to the person for the manual terminal workflow. A path
-/// under a home directory names the account, and a device cannot use one, so a device is given each
-/// as the withheld record of a path (the form the directory of a materialisation has), with the
-/// list of paths as long as it was.
-const HOST_PATHS: [HostPath; 5] = [
+/// socket of a session's worker, the staged path of an attachment's read grant. A session's own
+/// working directory and shell, and the executable a question's source runs, are not among them:
+/// the product shows them to the person on purpose, as part of how a session or a question is
+/// described (the specification names a session's working directory and a question's verified
+/// executable). A grant that leaves out the live screen cannot attach to the terminal and can still
+/// read the session's summary, so the directory and the shell are shown as the session's
+/// description. A path under a home directory names the account, and a device cannot use one, so a
+/// device is given each as the withheld record of a path (the form the directory of a
+/// materialisation has), with the list of paths as long as it was.
+const HOST_PATHS: [HostPath; 6] = [
     HostPath {
         key: "display_path",
         beside: &[("project_repository_id", None), ("environment_id", None)],
@@ -339,6 +338,16 @@ const HOST_PATHS: [HostPath; 5] = [
     HostPath {
         key: "endpoint",
         beside: &[("session", None)],
+    },
+    // The path of the file an attachment's read grant covers, in the environment's staging area:
+    // a device cannot open it, and the companion shows it only for the host's own computer.
+    HostPath {
+        key: "host_path",
+        beside: &[
+            ("grant_id", None),
+            ("transfer_id", None),
+            ("insertion_method", None),
+        ],
     },
 ];
 
@@ -3785,18 +3794,61 @@ mod tests {
             device.failure_detail.0.as_deref(),
             Some("why the attachment was not offered; the detail is not sent to a paired device")
         );
-        // The rest of the record is as it was. The staged file's path, which the person is shown
-        // to use in a terminal on purpose, is among it.
+        // The rest of the record is as it was but for the staged file's path, which has a case of
+        // its own.
+        use kr_protocol::transfer::DraftAttachment;
+        let but_for_its_path = |told: DraftAttachment, owner: &DraftAttachment| DraftAttachment {
+            read_grant: owner.read_grant.clone(),
+            ..told
+        };
         assert_eq!(
-            kr_protocol::transfer::DraftAttachment {
-                failure_detail: owner.failure_detail.clone(),
-                ..device
-            },
+            but_for_its_path(
+                DraftAttachment {
+                    failure_detail: owner.failure_detail.clone(),
+                    ..device
+                },
+                &owner
+            ),
             owner
         );
         // An attachment that did not fail has no failure to withhold.
         let sound = draft_attachment(None);
-        assert_eq!(read_by_a_device(&sound), sound);
+        assert_eq!(but_for_its_path(read_by_a_device(&sound), &sound), sound);
+    }
+
+    /// The path of the file an attachment's read grant covers lies in the environment's staging
+    /// area under the home directory, so it names the account, and a device cannot open it: it is
+    /// told as the withheld record of a path, and the rest of the grant is the owner's.
+    #[test]
+    fn the_staged_path_of_an_attachments_read_grant_is_withheld_from_a_device() {
+        let owner = draft_attachment(None);
+        let staged = owner.read_grant.0.clone().expect("the owner has a grant");
+        assert!(staged.host_path.starts_with("/Users/"), "{staged:?}");
+        let device = read_by_a_device(&owner);
+        let told = device.read_grant.0.clone().expect("a device has a grant");
+        assert_eq!(
+            told.host_path,
+            kr_protocol::hostinfo::export::withheld(
+                kr_protocol::hostinfo::export::ContentClass::Path,
+                &staged.host_path
+            )
+        );
+        assert_eq!(
+            kr_protocol::transfer::AttachmentReadGrant {
+                host_path: staged.host_path.clone(),
+                ..told
+            },
+            staged,
+            "the grant is the owner's but for its path"
+        );
+        assert_eq!(
+            kr_protocol::transfer::DraftAttachment {
+                read_grant: owner.read_grant.clone(),
+                ..device
+            },
+            owner,
+            "and so is the rest of the record"
+        );
     }
 
     /// The name of the desktop a session is bound to, as this host derives it: the login kind, the
@@ -4123,7 +4175,7 @@ mod tests {
         let text = |text: &str| CanonicalValue::Text(text.to_owned());
         let place = "/Users/marguerite/work/x";
         // The key, what it holds, and the members that make the record it is in.
-        let records: [Record; 16] = [
+        let records: [Record; 17] = [
             ("reason", place, &[("subsystem", "privacy")]),
             ("reason", place, &[("state", "unavailable")]),
             (
@@ -4166,6 +4218,15 @@ mod tests {
                 &[("remote_name", "origin"), ("transport", "local_path")],
             ),
             ("endpoint", place, &[("session", "s-1")]),
+            (
+                "host_path",
+                place,
+                &[
+                    ("grant_id", "g-1"),
+                    ("transfer_id", "t-1"),
+                    ("insertion_method", "manual_terminal_workflow"),
+                ],
+            ),
             (
                 "desktop_session_id",
                 A_DESKTOP_NAME,

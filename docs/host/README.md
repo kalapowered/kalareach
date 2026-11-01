@@ -3277,43 +3277,49 @@ upstream's refusal, and none of it is sent. The rest of the record is sent as it
 host that is no failure is withheld as a path, the way the directory of a materialisation is: the
 `display_path` of a repository or a working copy, the `retained_staging_paths` and
 `removed_staging_paths` of a repository operation, the `url` of a remote that is a place on this
-host (the repository a clone from a location was made from), and the `endpoint` of a session. Each
-is replaced by the withheld record of a path, and a list keeps its length. The name of the
-desktop a session is bound to (`desktop_session_id` in the session's `desktop`) spells out the
-account's name and number, so a device is given the marker the capability answers use, which says
-the session is bound to a desktop and not which one. The `actor_id` of the owner's own local caller
-(`local:` and the number of an account) is sent as `local`; no request a device makes carries an
-actor, so nothing needs the number back. A session's `cwd` and `shell_path`, the
-`session_description` and `working_directory` of `voice.context` (which repeat them), the `command`
-and `cwd` of its last command block, a question's `executable`, an attachment's staged `host_path`,
-the `command` of a materialisation (`changeset.read`) and in the offer of `shell.launch.surface`,
-and the `metadata_url` and `targets_url` of a catalogue are sent as they are. The specification
-names a question's verified executable, the command blocks of a session with their working
-directory, and the command a materialisation ran. A session's directory and shell are facts of the
-session that the specification shows the person: a session's description and the voice context's
-default both name the working directory. A grant that leaves out the live screen cannot attach to
-the terminal and can still read the session's summary, so these two are shown as the session's
-description. An attachment's staged `host_path` is the path of the narrow read grant an adapter
-obtains for an agent-readable staging location. The companion shows it only for the manual terminal
-workflow, so that the person can give it to the agent in the session's terminal. It lies in the
-environment's staging area, outside every repository, and is valid only while its grant is. The
-command in the launch offer comes from an admitted package, the companion shows it before the
-person chooses the launch, and the launch sends that command back to the host. A catalogue's two locations are a directory on this host when the
-catalogue is a local one; they are sent because an owner device rebuilds the digest of a trust plan
-from them and because the companion shows where the metadata is. Each reaches a device that holds
-the right of the method that reads it, and a catalogue's locations only a device that holds
-`host.manage`; the command block reaches only a device whose grant keeps history from the moment
-the command started or earlier. The `disabled_reason` of a capability record in `plugin.capabilities` is a sentence of
-the host's. For a signed qualification that the host accepted and whose state is not usable, it is
-followed by the statement of that qualification, which is the publisher's published text and not
-this host's, and is sent as it is. A qualification the host refused is reported as not tested, with
-the host's own sentence of the refusal and no statement. The `suspension_reason` of an agent
-instance's binding, which says why rich mutations wait, and the refusal of a rich mutation that
-repeats it, are sent as the host wrote them when the reason is one of the host's own sentences.
-A reason that quotes the method of a request that the connector's table does not classify, or what
-stopped the worker taking a conversation, is replaced by the kind of wait it was, and the quoted
-words are not sent. For a reason the host does not know, the device is told only that mutations
-wait. What a closure records of a resource it left is held to the same rule
+host (the repository a clone from a location was made from), the `endpoint` of a session, and the
+`host_path` of an attachment's read grant. Each is replaced by the withheld record of a path, and a
+list keeps its length. The name of the desktop a session is bound to (`desktop_session_id` in the
+session's `desktop`) spells out the account's name and number, so a device is given the marker the
+capability answers use, which says the session is bound to a desktop and not which one. The
+`actor_id` of the owner's own local caller (`local:` and the number of an account) is sent as
+`local`; no request a device makes carries an actor, so nothing needs the number back. A session's
+`cwd` and `shell_path`, the `command` and `cwd` of its last command block, the `session_description`
+and `working_directory` of `voice.context`, a question's `executable`, the `command` of a
+materialisation (`changeset.read`) and in the offer of `shell.launch.surface`, and the
+`metadata_url` and `targets_url` of a catalogue are sent as they are. The `session_description` of
+`voice.context` names the shell the session runs and, once the description host has observed the
+session, the directory it started in, beside a pinned name and the text a local model wrote of the
+session. Its `working_directory` is the session's `cwd` until then, and afterwards the name of the
+directory observed, with its repository and branch. The specification names a question's verified
+executable, the command blocks of a session with their working directory, and the command a
+materialisation ran. A session's directory and shell are how the host describes the session: the
+specification's default voice context is the session description and the current working directory,
+and the description the host writes names the shell and the directory. A grant that leaves out the
+live screen cannot attach to the terminal and can still read the session's summary, so these are
+shown as the session's description. The staged `host_path` of an attachment's read grant is not
+among them. It is the path of the narrow read grant an adapter obtains for an agent-readable staging
+location, in the environment's staging area and outside every repository. A device cannot open it,
+no shipped client reads it on a device (the companion shows it only on the host's own computer, for
+the manual terminal workflow), and the specification asks for no host path on a device, so a device
+is given it withheld, as the staging paths of an operation are. The command in the launch offer
+comes from an admitted package, the companion shows it before the person chooses the launch, and the
+launch sends that command back to the host. A catalogue's two locations are a directory on this host
+when the catalogue is a local one; they are sent because an owner device rebuilds the digest of a
+trust plan from them and because the companion shows where the metadata is. Each reaches a device
+that holds the right of the method that reads it, and a catalogue's locations only a device that
+holds `host.manage`; the command block reaches only a device whose grant keeps history from the
+moment the command started or earlier. The `disabled_reason` of a capability record in
+`plugin.capabilities` is a sentence of the host's. For a signed qualification that the host accepted
+and whose state is not usable, it is followed by the statement of that qualification, which is the
+publisher's published text and not this host's, and is sent as it is. A qualification the host
+refused is reported as not tested, with the host's own sentence of the refusal and no statement. The
+`suspension_reason` of an agent instance's binding, which says why rich mutations wait, and the
+refusal of a rich mutation that repeats it, are sent as the host wrote them when the reason is one
+of the host's own sentences. A reason that quotes the method of a request that the connector's table
+does not classify, or what stopped the worker taking a conversation, is replaced by the kind of wait
+it was, and the quoted words are not sent. For a reason the host does not know, the device is told
+only that mutations wait. What a closure records of a resource it left is held to the same rule
 and is replaced by the kind of resource. What the agent of a session says in refusing a prompt, a
 steer, a cancellation, an approval or a plugin's action is the agent's own words, and they quote
 what it was working on. The worker gives them as `INVALID_ARGUMENT`, `UPSTREAM_UNAVAILABLE` or
