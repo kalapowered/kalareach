@@ -26,7 +26,9 @@ pub struct PlatformObserver;
 /// # Errors
 ///
 /// Returns an invalid-argument failure for an access class that is not a process bridge, and a
-/// supervision failure when the platform's own command could not be run.
+/// supervision failure, naming the call, when the platform's own command could not be run, did not
+/// end in its time, ended without saying that it knows no such container, or answered a question
+/// about a container with something other than `true` or `false`.
 pub fn destination_state(
     access: EnvironmentAccess,
     target: &str,
@@ -101,8 +103,9 @@ fn observe_enrolment(
 }
 
 /// What an inspection that is acted on shows: a container the runtime says it does not know is
-/// stale, and an inspection that ended non-zero in any other way is the failure of the call, which
-/// is named and not read as a container that is not running.
+/// stale, and an inspection that ended non-zero in any other way, or that ended well with an answer
+/// that is neither `true` nor `false`, is the failure of the call, which is named and not read as a
+/// container that is not running.
 fn presence_after_inspection(call: &str, output: &CommandOutput) -> Result<EnvironmentPresence> {
     if output.code != Some(0) && !says_there_is_no_such_container(&output.text) {
         let ended = output.code.map_or_else(
@@ -111,6 +114,11 @@ fn presence_after_inspection(call: &str, output: &CommandOutput) -> Result<Envir
         );
         return Err(ControllerError::supervision(format!(
             "{call} ended {ended}"
+        )));
+    }
+    if output.code == Some(0) && !matches!(output.stdout.trim(), "true" | "false") {
+        return Err(ControllerError::supervision(format!(
+            "{call} ended well and answered neither true nor false"
         )));
     }
     Ok(container_state(output))
@@ -123,6 +131,9 @@ pub struct CommandOutput {
     pub code: Option<i32>,
     /// Standard output and standard error together, as text.
     pub text: String,
+    /// Standard output alone, as text: what a command answers, apart from what it says of itself
+    /// (a runtime's warnings are on standard error).
+    pub stdout: String,
 }
 
 /// Decodes process output bytes, reading UTF-16LE (with or without a byte order mark) and UTF-8.
@@ -445,19 +456,22 @@ fn run_within(
     limit: std::time::Duration,
 ) -> Result<CommandOutput> {
     let output = run_bounded(program, arguments, limit)?;
-    let mut text = decode_output(&output.stdout);
+    let mut stdout = decode_output(&output.stdout);
     let stderr = decode_output(&output.stderr);
+    // Retain any remaining non-null characters to guard against stray nulls.
+    stdout.retain(|character| character != '\0');
+    let mut text = stdout.clone();
     if !stderr.is_empty() {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
         text.push_str(&stderr);
     }
-    // Retain any remaining non-null characters to guard against stray nulls.
     text.retain(|character| character != '\0');
     Ok(CommandOutput {
         code: output.status.code(),
         text,
+        stdout,
     })
 }
 
@@ -521,14 +535,15 @@ fn lists(listing: &CommandOutput, target: &str) -> bool {
 
 /// Reads a container's state out of `podman container inspect --format {{.State.Running}}`.
 ///
-/// A container that exists answers `true` or `false`. A container that does not exist makes the
-/// runtime exit non-zero, and this host has then observed nothing about the identity it enrolled,
-/// which is stale rather than stopped.
+/// A container that exists answers `true` or `false` on standard output, whatever the runtime also
+/// says of itself on standard error. A container that does not exist makes the runtime exit
+/// non-zero, and this host has then observed nothing about the identity it enrolled, which is
+/// stale rather than stopped.
 fn container_state(output: &CommandOutput) -> EnvironmentPresence {
     if output.code != Some(0) {
         return EnvironmentPresence::Stale;
     }
-    match output.text.trim() {
+    match output.stdout.trim() {
         "true" => EnvironmentPresence::Running,
         "false" => EnvironmentPresence::EnvironmentStopped,
         _ => EnvironmentPresence::Stale,
@@ -595,17 +610,23 @@ mod tests {
     /// runtime says so; any other non-zero ending is the call's failure, named, with no value.
     #[test]
     fn an_inspection_that_failed_for_another_reason_is_the_calls_failure() {
-        let ended = |code: Option<i32>, text: &str| super::CommandOutput {
+        let ended = |code: Option<i32>, said: &str| super::CommandOutput {
             code,
-            text: text.to_owned(),
+            text: said.to_owned(),
+            stdout: String::new(),
+        };
+        let answered = |stdout: &str| super::CommandOutput {
+            code: Some(0),
+            text: stdout.to_owned(),
+            stdout: stdout.to_owned(),
         };
         let call = "podman container inspect";
         assert_eq!(
-            super::presence_after_inspection(call, &ended(Some(0), "true\n")).expect("answered"),
+            super::presence_after_inspection(call, &answered("true\n")).expect("answered"),
             super::EnvironmentPresence::Running
         );
         assert_eq!(
-            super::presence_after_inspection(call, &ended(Some(0), "false\n")).expect("answered"),
+            super::presence_after_inspection(call, &answered("false\n")).expect("answered"),
             super::EnvironmentPresence::EnvironmentStopped
         );
         assert_eq!(
@@ -617,6 +638,9 @@ mod tests {
             ended(Some(125), "Error: cannot connect to the store of a-value"),
             ended(Some(1), ""),
             ended(None, ""),
+            // Well ended, and the answer is neither of the two a container gives.
+            answered(""),
+            answered("a-value\n"),
         ] {
             let error = super::presence_after_inspection(call, &failed)
                 .expect_err("a failing runtime has shown nothing of the container");
@@ -783,6 +807,7 @@ mod tests {
         CommandOutput {
             code: Some(0),
             text: text.to_owned(),
+            stdout: text.to_owned(),
         }
     }
 
@@ -877,6 +902,7 @@ mod tests {
         let failed = |text: &str| CommandOutput {
             code: Some(1),
             text: text.to_owned(),
+            stdout: text.to_owned(),
         };
         // The text of a failure is in the host's language and may be anything, including a name.
         assert_eq!(
@@ -959,14 +985,17 @@ mod tests {
         let running = CommandOutput {
             code: Some(0),
             text: "true\n".to_owned(),
+            stdout: "true\n".to_owned(),
         };
         let stopped = CommandOutput {
             code: Some(0),
             text: "false\n".to_owned(),
+            stdout: "false\n".to_owned(),
         };
         let absent = CommandOutput {
             code: Some(125),
             text: "no such container\n".to_owned(),
+            stdout: String::new(),
         };
         assert_eq!(container_state(&running), EnvironmentPresence::Running);
         assert_eq!(
@@ -974,5 +1003,28 @@ mod tests {
             EnvironmentPresence::EnvironmentStopped
         );
         assert_eq!(container_state(&absent), EnvironmentPresence::Stale);
+    }
+
+    /// A runtime that warns on standard error while it answers `true` on standard output has a
+    /// running container: the answer is what is read, whatever else the runtime says of itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_running_container_is_read_as_running_whatever_its_runtime_warns() {
+        let output = run_within(
+            "/bin/sh",
+            &[
+                "-c".to_owned(),
+                "echo 'WARN[0000] a warning of the runtime' >&2; echo true".to_owned(),
+            ],
+            std::time::Duration::from_secs(60),
+        )
+        .expect("the command ends");
+        assert!(output.text.contains("WARN"), "{output:?}");
+        assert_eq!(container_state(&output), EnvironmentPresence::Running);
+        assert_eq!(
+            presence_after_inspection("podman container inspect", &output)
+                .expect("an inspection that answered"),
+            EnvironmentPresence::Running
+        );
     }
 }
