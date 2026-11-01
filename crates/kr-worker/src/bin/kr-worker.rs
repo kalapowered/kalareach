@@ -18,8 +18,8 @@
 // The lines this program says go through `kr_worker::diagnostics`, whose thread writes them, so that
 // a standard error that has stopped draining holds this program only for the short time `main`
 // waits for them at its end. `eprintln!` and `dbg!` write where they are called. The argument
-// parser writes its own message where it happens, for a command line it refuses, and so does a
-// panic.
+// parser writes its own message where it happens, for a command line it refuses, and so does the
+// standard library for a panic and for its other fatal messages, such as a failed allocation's.
 #![deny(clippy::print_stderr, clippy::dbg_macro)]
 
 use std::process::ExitCode;

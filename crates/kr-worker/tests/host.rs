@@ -165,9 +165,9 @@ impl WorkerSupervisor for RecordingSupervisor {
 
 /// A pipe that is the standard error of every worker a daemon starts, and that nothing reads.
 ///
-/// A standard error that has stopped draining is a pipe nobody reads, a journal that has stalled or
-/// a mount that has hung: a write to it waits for a reader and nothing can cancel the wait. The
-/// workers are children of this test, so it can see one end.
+/// A standard error that has stopped draining is a pipe nobody reads or a journal that has stalled:
+/// a write to it waits for a reader and nothing can cancel the wait. The workers are children of
+/// this test, so it can see one end.
 #[cfg(unix)]
 #[derive(Debug)]
 struct HeldStandardError {

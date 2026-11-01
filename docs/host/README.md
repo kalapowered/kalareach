@@ -4340,11 +4340,11 @@ that says a command was not integrated for its launch, go the same way, and so d
 worker's program, such as why it could not start, that the controller did not receive its ready
 report, and that an attachment had not been sent the closure when the worker ended. A line said just
 before the process ends can be lost to the exit, so the program waits up to two seconds for the
-thread to write what it has been handed before it ends. Two kinds of message are written where they
-happen: a panic's, by the standard library, and the argument parser's, for a command line it
-refuses. A line is handed over whole and written with `write_all`, so a volume that is nearly full
-can take part of it. Nothing bounds how
-long the host stays over the cap: the delays are random, and a holder that stops without ending
+thread to write what it has been handed before it ends. Two makers of messages write them where they
+happen: the standard library, for a panic and for its other fatal messages such as a failed
+allocation's, and the argument parser, for a command line it refuses. A line is handed over whole
+and written with `write_all`, so a volume that is nearly full can take part of it. Nothing bounds
+how long the host stays over the cap: the delays are random, and a holder that stops without ending
 keeps the lock while the others go on looking. The host also stays over the cap when the session
 that grew cannot give up the excess, as when its worker has ended, it holds less than the excess
 while the other workers have taken no output, or it cannot write its boundary: the other workers
