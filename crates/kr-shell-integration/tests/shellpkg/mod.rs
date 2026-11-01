@@ -35,7 +35,10 @@ use kr_protocol::scalars::{Bytes, DurationMs, Nullable, U64, Uuid};
 use kr_shell_integration::contract::events::BridgeEvent;
 use kr_shell_integration::contract::fixtures::{Scenario, replay, scenarios};
 use kr_shell_integration::contract::qualification::{BridgeAbi, ShellKind};
-use kr_shell_integration::contract::requests::{BridgeAnswer, WorkerRequest};
+use kr_shell_integration::contract::requests::{
+    BridgeAnswer, LaunchDecision, LaunchMailboxRequest, LaunchRejectionReason, LaunchTransactionId,
+    WorkerRequest,
+};
 use kr_shell_integration::contract::transport::{
     BOOTSTRAP_SECRET_LEN, BRIDGE_PROTOCOL, BridgeAccepted, BridgeEndpoint, BridgeFrame,
     BridgeHello, EventOutcome, HandshakeOutcome, ObservedPeer, WorkerExpectation, frame_codec,
@@ -1762,6 +1765,61 @@ impl Session {
         self.ask_before(request, deadline.0)
     }
 
+    /// Asks the reader for the launch `request` and returns what it decided.
+    ///
+    /// A reader that answers at its next step is given a key behind every frame the harness
+    /// writes. One that is slower to act on a key than the harness is to type the next judges a
+    /// launch with a key still unread in the terminal's queue, and refuses it as queued prior
+    /// input: keys typed first go first, as the contract says. A case that is about that refusal
+    /// asks for it with [`Session::ask`] and says what the keys were. A case that can meet it
+    /// without being about it asks here, and on such a reader a launch so refused is asked again,
+    /// as a new transaction, until the reader judges it with its keys taken or the window of one
+    /// reply ends; a reader that never takes its keys is refused for that long. A reader that is
+    /// given no keys is not asked again, and its decision is returned as it comes. An accepted
+    /// launch is checked to be the transaction that was asked.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reader answers a launch with something other than a decision, answers
+    /// after the window, or accepts a transaction other than the one it was asked.
+    pub fn launched(&mut self, request: LaunchMailboxRequest) -> LaunchDecision {
+        let until = self.deadline_for(REPLY).0;
+        let may_ask_again = dialect(self.package_kind).answers_at_the_next_step;
+        let mut asked = 0_u8;
+        loop {
+            let mut again = request.clone();
+            let mut identifier = *request.transaction.get().as_bytes();
+            identifier[0] = identifier[0].wrapping_add(asked);
+            again.transaction = LaunchTransactionId::new(Uuid::from_bytes(identifier));
+            let transaction = again.transaction;
+            let id = self.ask_before(WorkerRequest::Launch(again), until);
+            let BridgeAnswer::Launch(decision) = self.answer_before(id, until) else {
+                panic!("the reader answered a launch with something else")
+            };
+            if let LaunchDecision::Accepted(accepted) = &decision {
+                assert_eq!(
+                    accepted.transaction, transaction,
+                    "the reader accepted another launch than the one it was asked"
+                );
+            }
+            if !may_ask_again
+                || decision.rejection() != Some(LaunchRejectionReason::QueuedPriorInput)
+                || Instant::now() >= until
+                || asked == u8::MAX
+            {
+                return decision;
+            }
+            asked += 1;
+            eprintln!(
+                "a launch was refused for input the reader had not taken; asking again ({asked})"
+            );
+            self.pump_before(self.bounded(Duration::from_millis(50)), until);
+            if Instant::now() >= until {
+                return decision;
+            }
+        }
+    }
+
     /// Sends one request the endpoint has until `deadline` to take, and returns its identifier.
     pub fn ask_before(&mut self, request: WorkerRequest, deadline: Instant) -> RequestId {
         let id = RequestId::new(self.next_request);
@@ -1842,8 +1900,10 @@ impl Session {
             return;
         }
         self.type_bytes_before(&[0x06], deadline);
-        // The step is over before anything is asked of the reader: a key it has not taken yet is
-        // input of the person's, and the contract puts that ahead of anything the worker asks for.
+        // The step is given time to be taken before anything is asked of the reader: a key it has
+        // not taken yet is input of the person's, and the contract puts that ahead of anything the
+        // worker asks for. A reader slower than the step refuses what it is asked for the key it
+        // has not taken, which [`Session::launched`] answers for a launch.
         // A caller waiting under a deadline of its own never waits past it for the step, and a
         // budget in force bounds it as well.
         std::thread::sleep(
