@@ -3598,10 +3598,11 @@ mod tests {
         }
     }
 
-    /// The actor is held by its key, so it is held in every record that names one: where a change
-    /// set came from, what caused a resource's transition, and the same transition announced.
+    /// The actor is held by its key, so it is held in a result wherever a record names one (where a
+    /// change set came from, what caused a resource's transition) and in the same transition
+    /// announced.
     #[test]
-    fn the_actor_of_the_owners_local_caller_is_held_in_every_record_that_names_one() {
+    fn the_actor_of_the_owners_local_caller_is_held_by_its_key_in_a_result_and_an_announcement() {
         use kr_protocol::changeset::Provenance;
         use kr_protocol::projection::{
             AGENT_RESOURCE_EVENT, AgentResourceCause, AgentResourceContentClass, AgentResourceEvent,
