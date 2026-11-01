@@ -129,9 +129,9 @@ The requalification has parts, and each runs where it can. Fish's own suite and 
 either. The core workflow's `shell-packages` job runs, on x86-64 Linux, the patch check for all
 three packages, the upstream suites of Zsh and Bash (`--require-upstream-tests`), the contract
 suites of the packages, the startup customisations, the second Zsh build and the PowerShell
-package against a pinned PowerShell. The core workflow's `macos` job runs the PowerShell package's
-cases once more on the macOS runner, against the PowerShell its image carries. Before a macOS or Linux release tree is assembled, each of
-its four targets builds the Zsh, Bash and Fish packages natively and runs the contract suites of
+package against a pinned PowerShell. The core workflow's `macos-powershell` job runs the PowerShell
+package's cases once more, on the macOS runner, against the same pinned release. Before a macOS or
+Linux release tree is assembled, each of its four targets builds the Zsh, Bash and Fish packages natively and runs the contract suites of
 the three, the Fish source checks, the native-module proof of Zsh and the case that compares each
 package with its pin, against the packages it just built; a failing suite stops the tree before
 anything is assembled or signed. The Developer ID signature is put on the programs after that. The
@@ -139,8 +139,8 @@ startup customisations are pinned for two of the four targets (Apple silicon mac
 Linux); they run in no release-tree job, and the Apple silicon pins run in no workflow. A Windows
 release tree carries the PowerShell package as plain files, which `kr-release` holds to the
 repository's; no step of the Windows release workflow requalifies it. Its qualification runs in the
-core workflow, on x86-64 Linux against a pinned PowerShell and in the Windows jobs against the
-PowerShell the runner has. No release workflow reads the core workflow's result for the commit it
+core workflow, on x86-64 Linux and on Apple silicon macOS against a pinned PowerShell and in the
+Windows jobs against the PowerShell the runner has. No release workflow reads the core workflow's result for the commit it
 builds, so the whole corpus is not a gate of a release tree.
 
 ## A package that cannot meet its target
