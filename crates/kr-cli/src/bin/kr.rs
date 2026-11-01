@@ -290,7 +290,6 @@ async fn run(cli: Cli) -> Result<Completion> {
                 presentation,
                 kr_cli::session::UndeliveredTyping::new(typed_while_asking.len()),
                 typed_while_asking,
-                arguments.hold_on_failure && !cli.json && kr_cli::hold::waits(),
             )
             .await;
             Ok(creation_report(
@@ -362,7 +361,6 @@ async fn run(cli: Cli) -> Result<Completion> {
                     // Attaching asks this terminal nothing before its own handshake, so there is
                     // nothing owed from before it.
                     typed_before: Vec::new(),
-                    then_reads: false,
                 },
             )
             .await?;
@@ -1493,7 +1491,6 @@ async fn present(
     presentation: Presentation,
     owed: kr_cli::session::UndeliveredTyping,
     typed_before: Vec<u8>,
-    then_reads: bool,
 ) -> Result<Option<kr_cli::session::AttachOutcome>> {
     match presentation {
         Presentation::Invisible => Ok(None),
@@ -1515,7 +1512,6 @@ async fn present(
                     // What the person typed while the creation was asking this terminal for its
                     // colours. It is theirs, and this attachment is where it goes.
                     typed_before,
-                    then_reads,
                 },
             )
             .await?;
@@ -1879,7 +1875,6 @@ async fn new_in_enrolled(
                     no_probe: false,
                     follow_live: false,
                     typed_before: typed_while_asking,
-                    then_reads: arguments.hold_on_failure && !json && kr_cli::hold::waits(),
                 },
                 owed,
             )
@@ -1921,7 +1916,6 @@ async fn attach_in_enrolled(
             no_probe: arguments.no_probe,
             follow_live: arguments.follow_live,
             typed_before: Vec::new(),
-            then_reads: false,
         },
         kr_cli::session::UndeliveredTyping::new(0),
     )
