@@ -871,11 +871,14 @@ fn a_look_at_the_processes_that_never_ends_fails_the_case_and_names_the_look() {
 #[test]
 fn a_child_that_does_not_go_is_reported_within_the_time_given_and_not_waited_for() {
     let mut child = Command::new("/bin/sleep")
-        .arg("30")
+        .arg("300")
         .spawn()
         .expect("starts a child");
     let collected = collected_within(&mut child, Duration::from_millis(500));
+    // Ended before anything is asserted, and collected within a time of its own: a child that does
+    // not go is said to be there, and is not waited for.
     let _ = child.kill();
-    let _ = child.wait();
+    let ended = collected_within(&mut child, Duration::from_secs(10));
     assert!(!collected, "a child that is still running is not collected");
+    assert!(ended, "the child was still there 10 s after it was killed");
 }
