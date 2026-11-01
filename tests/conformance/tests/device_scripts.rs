@@ -225,7 +225,17 @@ fn collected_within(child: &mut std::process::Child, within: Duration) -> bool {
 /// Runs `command` to its end within `bound`, ending it when it has not ended, and gives what it
 /// printed. A command that outlasts the bound, or that leaves something running which holds its
 /// output, fails the case with the command named, where a wait for it would hold the suite.
-fn to_its_end(mut command: Command, bound: Duration) -> std::process::Output {
+fn to_its_end(command: Command, bound: Duration) -> std::process::Output {
+    to_its_end_with_streams(command, bound, None)
+}
+
+/// [`to_its_end`], giving what the command printed `streams_within` to reach its end where it
+/// ended, where it is otherwise given what is left of `bound` and at least a second.
+fn to_its_end_with_streams(
+    mut command: Command,
+    bound: Duration,
+    streams_within: Option<Duration>,
+) -> std::process::Output {
     use std::process::Stdio;
 
     fn read_aside(
@@ -270,9 +280,11 @@ fn to_its_end(mut command: Command, bound: Duration) -> std::process::Output {
             }
         }
     };
-    let rest = bound
-        .saturating_sub(begun.elapsed())
-        .max(Duration::from_secs(1));
+    let rest = streams_within.unwrap_or_else(|| {
+        bound
+            .saturating_sub(begun.elapsed())
+            .max(Duration::from_secs(1))
+    });
     let collect = |stream: &std::sync::mpsc::Receiver<Vec<u8>>| {
         stream.recv_timeout(rest).unwrap_or_else(|_| {
             panic!("{what} ended and something it started still holds its output after {rest:?}")
@@ -881,4 +893,48 @@ fn a_child_that_does_not_go_is_reported_within_the_time_given_and_not_waited_for
     let ended = collected_within(&mut child, Duration::from_secs(10));
     assert!(!collected, "a child that is still running is not collected");
     assert!(ended, "the child was still there 10 s after it was killed");
+}
+
+/// A command that ended while something it started still holds its output fails the case, naming
+/// the command, where an empty answer would pass a case that read only the status.
+///
+/// What holds the output holds it until the case lets it go, which is after the command has failed,
+/// so no delay in the machine can end it before the command has looked. The command has the time a
+/// script is given to end, and only the wait for its streams is short; the case then waits for the
+/// descendant to say that it has gone, so that none is left behind.
+#[test]
+fn a_command_that_ended_and_left_something_holding_its_output_fails_the_case() {
+    let directory = TempDir::new().expect("a directory");
+    let release = directory.path().join("release");
+    let gone = directory.path().join("gone");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            // The descendant ends when it is let go, or when this test process does, and says so.
+            "( while [ ! -e \"$1\" ] && kill -0 \"$3\" 2>/dev/null; do sleep 0.1; done; : > \"$2\" ) \
+             & exit 0",
+            "program",
+        ])
+        .arg(&release)
+        .arg(&gone)
+        .arg(std::process::id().to_string());
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        to_its_end_with_streams(command, SCRIPT_ENDS_WITHIN, Some(Duration::from_secs(1)))
+    }));
+    fs::write(&release, "").expect("lets the descendant go");
+    let begun = Instant::now();
+    while !gone.exists() && begun.elapsed() < Duration::from_secs(60) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        gone.exists(),
+        "the descendant did not end when it was let go"
+    );
+    let panic = failed.expect_err("output that is still held fails the case");
+    let said = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        said.contains("still holds its output") && said.contains("/bin/sh"),
+        "{said}"
+    );
 }
