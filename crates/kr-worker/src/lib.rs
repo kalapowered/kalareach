@@ -14,7 +14,7 @@
 //! | [`description_facts`] | What this session was doing, as the control daemon's descriptions read it |
 //! | [`broker`] | The trusted broker: agent processes, grants, decoding trust, action tokens, the gateway, the local listener and volatile-native mode |
 //! | [`default_shell`] | The shell a session starts when its create request names none |
-//! | `diagnostics` | What the worker says to its own standard error, written by a thread of its own so that no pass and no stop waits on it |
+//! | [`diagnostics`] | What the worker says to its own standard error, written by a thread of its own so that no pass and no stop waits on it |
 //! | [`desktop`] | The desktop a session runs on, whether it is still there, and what may be done on it |
 //! | [`environment`] | The root shell's environment: what is inherited, what is replaced, what is refused |
 //! | [`fence`] | The root editor's fence and detach machine, driven against the real clock and the real bridge |
@@ -44,9 +44,9 @@
 
 // A line to the standard error is written by the thread of `diagnostics`, which no pass, no session
 // call and no runtime waits for. `eprintln!` writes where it is called, and waits for a standard
-// error that has stopped draining, or panics at one that refuses the write. (The worker's own
-// program, a different crate, writes before it has a runtime and after its session has ended.)
-#![deny(clippy::print_stderr)]
+// error that has stopped draining, or panics at one that refuses the write; `dbg!` does the same.
+// The worker's own program, a different crate, holds itself to the same rule.
+#![deny(clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod action;
 pub mod application;
@@ -59,7 +59,7 @@ pub mod daemon_link;
 pub mod default_shell;
 pub mod description_facts;
 pub mod desktop;
-mod diagnostics;
+pub mod diagnostics;
 pub mod environment;
 pub mod error;
 pub mod fence;

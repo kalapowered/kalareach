@@ -10,14 +10,20 @@
 //! serves a person or keeps the host's records makes the write itself. A line is handed to a
 //! thread of its own, started when the first line is said, which writes the lines one at a time.
 //! That thread is not a task of the runtime, and the runtime does not wait for it when it is
-//! dropped: the process ends with the thread still in its write. At most [`WAITING`] lines wait
-//! for it. A line offered beyond that is dropped, not waited for.
+//! dropped: the process ends with the thread still in its write. At most eight lines wait for it.
+//! A line offered beyond that is dropped, not waited for.
+//!
+//! A line said just before the process ends is usually lost to the exit, because the thread has not
+//! reached it. A program that says its last lines on the way out, as the worker's does, calls
+//! [`drain`] before it ends, which waits for the lines said so far for a time the program names and
+//! no longer.
 //!
 //! The write can fail as well: a volume that is full refuses it as it refused what made the host
 //! say it. A write that fails is let go.
 
 use std::io::Write;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
+use std::time::Duration;
 
 /// How many lines wait for the thread that writes them before a further line is dropped.
 const WAITING: usize = 8;
@@ -31,22 +37,60 @@ struct Line {
     ended: Option<Ended>,
 }
 
+/// How many lines the thread has taken or been offered and has not finished with.
+#[derive(Default)]
+struct Unfinished {
+    count: Mutex<usize>,
+    none: Condvar,
+}
+
+impl Unfinished {
+    /// Counts a line that is about to be offered.
+    fn add(&self) {
+        *locked(&self.count) += 1;
+    }
+
+    /// Counts a line as finished with, whether it was written, refused or never taken.
+    fn finish(&self) {
+        let mut count = locked(&self.count);
+        *count -= 1;
+        if *count == 0 {
+            self.none.notify_all();
+        }
+    }
+
+    /// Waits for at most `within` until no line is unfinished, and says whether none is.
+    fn wait_for_none(&self, within: Duration) -> bool {
+        let (count, _) = self
+            .none
+            .wait_timeout_while(locked(&self.count), within, |count| *count > 0)
+            .unwrap_or_else(PoisonError::into_inner);
+        *count == 0
+    }
+}
+
 /// The thread that writes lines to one destination, one at a time.
 pub(crate) struct Writer {
     /// Where lines are handed to the thread; none when the thread could not be started.
     lines: Option<mpsc::SyncSender<Line>>,
+    unfinished: Arc<Unfinished>,
 }
 
 impl Writer {
     /// Starts the thread, which writes to `destination`.
     pub(crate) fn start(destination: impl Write + Send + 'static) -> Self {
         let (lines, waiting) = mpsc::sync_channel::<Line>(WAITING);
+        let unfinished = Arc::new(Unfinished::default());
         let started = std::thread::Builder::new()
             .name("kr-worker-diagnostics".to_owned())
-            .spawn(move || write_lines(destination, &waiting))
+            .spawn({
+                let unfinished = Arc::clone(&unfinished);
+                move || write_lines(destination, &waiting, &unfinished)
+            })
             .is_ok();
         Self {
             lines: started.then_some(lines),
+            unfinished,
         }
     }
 
@@ -54,59 +98,103 @@ impl Writer {
     /// when [`WAITING`] lines already wait, or when the thread could not be started. `ended` is
     /// called by the thread once the write has ended, and not at all for a line that is dropped.
     pub(crate) fn offer(&self, text: String, ended: Option<Ended>) -> bool {
-        self.lines
-            .as_ref()
-            .is_some_and(|lines| lines.try_send(Line { text, ended }).is_ok())
+        let Some(lines) = &self.lines else {
+            return false;
+        };
+        self.unfinished.add();
+        let taken = lines.try_send(Line { text, ended }).is_ok();
+        if !taken {
+            self.unfinished.finish();
+        }
+        taken
+    }
+
+    /// Waits for at most `within` until every line the thread took has been written or refused, and
+    /// says whether they have. A write that waits for a reader holds this for `within` and no
+    /// longer.
+    pub(crate) fn drain(&self, within: Duration) -> bool {
+        self.unfinished.wait_for_none(within)
     }
 }
 
 /// Writes each line that arrives to `destination`, and tells whether it was written.
-fn write_lines(mut destination: impl Write, waiting: &mpsc::Receiver<Line>) {
+fn write_lines(
+    mut destination: impl Write,
+    waiting: &mpsc::Receiver<Line>,
+    unfinished: &Unfinished,
+) {
     for line in waiting {
         let written = destination.write_all(line.text.as_bytes()).is_ok();
         if let Some(ended) = line.ended {
             ended(written);
         }
+        unfinished.finish();
     }
 }
 
 /// The writer of this process's standard error, which is started by the first line.
+static STANDARD_ERROR: OnceLock<Writer> = OnceLock::new();
+
+/// Returns the writer of this process's standard error, starting it if no line has been said.
 pub(crate) fn standard_error() -> &'static Writer {
-    static WRITER: OnceLock<Writer> = OnceLock::new();
-    WRITER.get_or_init(|| Writer::start(std::io::stderr()))
+    STANDARD_ERROR.get_or_init(|| Writer::start(std::io::stderr()))
 }
 
-/// Says one line to this worker's standard error, and lets it go if it cannot be written or the
+/// Says one line to this process's standard error, and lets it go if it cannot be written or the
 /// writer is behind. The line is handed over whole, and the thread writes it with `write_all`: a
-/// volume that is nearly full can take part of it.
-pub(crate) fn tell(line: std::fmt::Arguments<'_>) {
+/// volume that is nearly full can take part of it. This never waits for the write.
+pub fn tell(line: std::fmt::Arguments<'_>) {
     let _ = standard_error().offer(format!("kr-worker: {line}\n"), None);
 }
 
+/// Waits for at most `within` until every line said so far has been written to this process's
+/// standard error or refused by it, and says whether they have.
+///
+/// A program that says its last lines on its way out calls this before it ends, since a line the
+/// thread has not reached is lost to the exit. A standard error that has stopped draining holds
+/// this for `within` and no longer, and the lines still waiting are lost when the process ends.
+pub fn drain(within: Duration) -> bool {
+    STANDARD_ERROR
+        .get()
+        .is_none_or(|writer| writer.drain(within))
+}
+
 /// Takes `state`, whose holders never leave it half changed.
-fn locked(state: &Mutex<Said>) -> MutexGuard<'_, Said> {
+fn locked<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The reasons an output retention pass left output behind, as this worker has said them.
 #[derive(Debug, Default)]
 struct Said {
-    /// The reason whose line was last written.
+    /// The reason of the last line whose write ended while its offer still stood.
     said: Option<String>,
-    /// The reason whose line has been handed to the writer and not yet written or refused.
-    offered: Option<String>,
+    /// The offer whose line waits for the writer or is being written, and that no pass has
+    /// withdrawn.
+    offered: Option<Offered>,
+    /// How many offers have been made, which names the next one.
+    offers: u64,
+}
+
+/// A reason offered to the writer as a line.
+#[derive(Debug)]
+struct Offered {
+    /// Names this offer. The end of a write is told which offer it belongs to, because the same
+    /// reason can go and be offered again while the first line is still in its write.
+    id: u64,
+    reason: String,
 }
 
 impl Said {
-    /// Decides what a pass that left `reason` behind is to say, and returns it when it is a reason
-    /// that is neither said nor on its way.
+    /// Decides what a pass that left `reason` behind is to say, and returns the name of the offer
+    /// when it is a reason that is neither said nor on its way.
     ///
     /// A reason that goes and comes back is said again. A pass that applied no age bound
     /// (`age_applied` is false), as a look at the host's cap does not and as a pass on a wall clock
     /// the host cannot prove does not, keeps what was said when it finds no reason, since it
     /// cannot tell that a reason the age bound left has gone. The same holds for a reason of the
     /// byte caps while the wall clock cannot be proved.
-    fn offer(&mut self, reason: Option<&str>, age_applied: bool) -> Option<String> {
+    fn offer(&mut self, reason: Option<&str>, age_applied: bool) -> Option<u64> {
         match reason {
             None if !age_applied => None,
             None => {
@@ -116,27 +204,44 @@ impl Said {
             }
             Some(reason)
                 if self.said.as_deref() == Some(reason)
-                    || self.offered.as_deref() == Some(reason) =>
+                    || self
+                        .offered
+                        .as_ref()
+                        .is_some_and(|offered| offered.reason == reason) =>
             {
                 None
             }
             Some(reason) => {
-                self.offered = Some(reason.to_owned());
-                Some(reason.to_owned())
+                self.offers += 1;
+                self.offered = Some(Offered {
+                    id: self.offers,
+                    reason: reason.to_owned(),
+                });
+                Some(self.offers)
             }
         }
     }
 
-    /// Records that the line for `reason` was written, unless the reason has gone or changed since.
-    fn written(&mut self, reason: &str) {
-        if self.offered.as_deref() == Some(reason) {
-            self.said = self.offered.take();
+    /// Records that the line of offer `id` was written, unless that offer has been withdrawn or
+    /// replaced since.
+    fn written(&mut self, id: u64) {
+        if self
+            .offered
+            .as_ref()
+            .is_some_and(|offered| offered.id == id)
+        {
+            self.said = self.offered.take().map(|offered| offered.reason);
         }
     }
 
-    /// Records that the line for `reason` was not written, so that the next pass offers it again.
-    fn refused(&mut self, reason: &str) {
-        if self.offered.as_deref() == Some(reason) {
+    /// Records that the line of offer `id` was not written, so that the next pass offers its reason
+    /// again, unless that offer has been withdrawn or replaced since.
+    fn refused(&mut self, id: u64) {
+        if self
+            .offered
+            .as_ref()
+            .is_some_and(|offered| offered.id == id)
+        {
             self.offered = None;
         }
     }
@@ -164,37 +269,41 @@ impl OutputReasons {
         writer: impl FnOnce() -> &'w Writer,
     ) {
         let mut state = locked(&self.state);
-        let Some(reason) = state.offer(reason, age_applied) else {
+        let Some(reason) = reason else {
+            state.offer(None, age_applied);
+            return;
+        };
+        let Some(id) = state.offer(Some(reason), age_applied) else {
             return;
         };
         let line =
             format!("kr-worker: output retention left output it was asked to remove: {reason}\n");
         let ended: Ended = {
             let state = Arc::clone(&self.state);
-            let reason = reason.clone();
             Box::new(move |written| {
                 let mut state = locked(&state);
                 if written {
-                    state.written(&reason);
+                    state.written(id);
                 } else {
-                    state.refused(&reason);
+                    state.refused(id);
                 }
             })
         };
         if !writer().offer(line, Some(ended)) {
-            state.refused(&reason);
+            state.refused(id);
         }
     }
 
-    /// Returns the reason whose line was last written, for this host's own tests. It is compiled
-    /// away in every shipped build.
+    /// Returns the reason of the last line written while its offer still stood, for this host's
+    /// own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     pub(crate) fn said(&self) -> Option<String> {
         locked(&self.state).said.clone()
     }
 
-    /// Returns whether a line for a reason waits for its write or is being written, for this host's
-    /// own tests. It is compiled away in every shipped build.
+    /// Returns whether the line of the offer that stands waits for its write or is being written,
+    /// for this host's own tests. A reason that has gone since is not on its way, though its line
+    /// may still be in the write. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     pub(crate) fn being_written(&self) -> bool {
         locked(&self.state).offered.is_some()
@@ -302,31 +411,25 @@ mod tests {
     fn a_reason_is_offered_once_while_it_stands() {
         let mut said = Said::default();
         assert_eq!(said.offer(None, true), None);
-        assert_eq!(
-            said.offer(Some("the lock"), true).as_deref(),
-            Some("the lock")
-        );
+        let first = said.offer(Some("the lock"), true).expect("offered");
         assert_eq!(
             said.offer(Some("the lock"), true),
             None,
             "not again while its line is on its way"
         );
-        said.written("the lock");
+        said.written(first);
         assert_eq!(
             said.offer(Some("the lock"), true),
             None,
             "nor once it is written"
         );
         assert_eq!(said.offer(None, true), None, "it goes");
-        assert_eq!(
-            said.offer(Some("the lock"), true).as_deref(),
-            Some("the lock"),
-            "and is offered again when it comes back"
-        );
-        said.written("the lock");
-        assert_eq!(
-            said.offer(Some("the boundary"), true).as_deref(),
-            Some("the boundary"),
+        let second = said
+            .offer(Some("the lock"), true)
+            .expect("offered again when it comes back");
+        said.written(second);
+        assert!(
+            said.offer(Some("the boundary"), true).is_some(),
             "as is another"
         );
     }
@@ -336,17 +439,15 @@ mod tests {
     #[test]
     fn a_reason_refused_after_another_was_written_is_offered_until_it_is_written() {
         let mut said = Said::default();
-        assert!(said.offer(Some("the lock"), true).is_some());
-        said.written("the lock");
+        let lock = said.offer(Some("the lock"), true).expect("offered");
+        said.written(lock);
 
-        assert!(said.offer(Some("the boundary"), true).is_some());
-        said.refused("the boundary");
-        assert_eq!(
-            said.offer(Some("the boundary"), true).as_deref(),
-            Some("the boundary"),
-            "the second is offered again at the next pass"
-        );
-        said.written("the boundary");
+        let boundary = said.offer(Some("the boundary"), true).expect("offered");
+        said.refused(boundary);
+        let again = said
+            .offer(Some("the boundary"), true)
+            .expect("the second is offered again at the next pass");
+        said.written(again);
         assert_eq!(
             said.offer(Some("the boundary"), true),
             None,
@@ -360,8 +461,8 @@ mod tests {
     #[test]
     fn a_pass_that_applied_no_age_bound_does_not_make_a_reason_repeat() {
         let mut said = Said::default();
-        assert!(said.offer(Some("a segment"), true).is_some());
-        said.written("a segment");
+        let segment = said.offer(Some("a segment"), true).expect("offered");
+        said.written(segment);
         assert_eq!(
             said.offer(None, false),
             None,
@@ -387,13 +488,21 @@ mod tests {
     #[test]
     fn a_write_that_ends_after_its_reason_went_says_nothing() {
         let mut said = Said::default();
-        assert!(said.offer(Some("the lock"), true).is_some());
+        let old = said.offer(Some("the lock"), true).expect("offered");
         assert_eq!(said.offer(None, true), None, "it goes while its line waits");
-        said.written("the lock");
-        assert!(
-            said.offer(Some("the lock"), true).is_some(),
-            "so it is offered when it comes back"
+        said.written(old);
+        let new = said
+            .offer(Some("the lock"), true)
+            .expect("so it is offered when it comes back");
+        said.written(old);
+        said.refused(old);
+        assert_eq!(
+            said.offer(Some("the lock"), true),
+            None,
+            "the end of the old line leaves the new offer on its way"
         );
+        said.written(new);
+        assert_eq!(said.said.as_deref(), Some("the lock"));
     }
 
     /// Lines are written one at a time, in order, and each is told how its write ended.
@@ -482,6 +591,28 @@ mod tests {
         until(|| taken.lock().expect("not poisoned").ends_with(b"line 7\n"));
         let written = String::from_utf8(taken.lock().expect("not poisoned").clone()).expect("text");
         assert!(written.starts_with("first\nline 0\n"), "{written}");
+    }
+
+    /// A drain waits for the lines the thread took, for as long as its bound and no longer.
+    #[test]
+    fn a_drain_waits_for_the_lines_taken_and_gives_up_at_its_bound() {
+        let (begun, begun_at) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let writer = Writer::start(Stalled {
+            begun,
+            release: released,
+            taken: std::sync::Arc::default(),
+        });
+        assert!(writer.drain(Duration::ZERO), "nothing was taken");
+
+        assert!(writer.offer("first\n".to_owned(), None));
+        begun_at.recv_timeout(DEADLINE).expect("the write began");
+        assert!(
+            !writer.drain(Duration::from_millis(20)),
+            "a write that waits for a reader holds a drain to its bound"
+        );
+        release.send(true).expect("lets the write end");
+        assert!(writer.drain(DEADLINE), "the line was written");
     }
 
     /// A reason is not taken as said until its line is written, is offered again after a write
@@ -663,10 +794,12 @@ mod tests {
 
     /// A line told to a standard error that refuses the write, or that has stopped draining, waits
     /// for nothing: the caller goes on, and the process ends with the writer still in its write.
+    /// One told to a standard error that is read is there to read once the process has drained.
     ///
     /// The case runs itself again as a process of its own, once with a standard error whose
-    /// reading end is closed and once with a pipe that is full and that nobody reads. Told lines
-    /// are more than [`WAITING`], so the ones beyond are dropped.
+    /// reading end is closed, once with a pipe that is full and that nobody reads, and once with a
+    /// pipe that is read when the process has ended. Told lines are more than [`WAITING`] for the
+    /// first two, so the ones beyond are dropped.
     #[cfg(unix)]
     #[test]
     fn a_line_told_to_a_standard_error_that_refuses_or_has_stopped_draining_waits_for_nothing() {
@@ -677,6 +810,12 @@ mod tests {
         const CHILD: &str = "KR_TEST_TELL_PROCESS";
 
         if let Some(mode) = std::env::var_os(CHILD) {
+            if mode == "read" {
+                super::tell(format_args!("a line to a standard error that is read"));
+                assert!(super::drain(DEADLINE), "the line was written");
+                println!("told");
+                return;
+            }
             if mode == "full" {
                 fill_standard_error();
             }
@@ -687,7 +826,7 @@ mod tests {
             return;
         }
 
-        for mode in ["gone", "full"] {
+        for mode in ["gone", "full", "read"] {
             let mut worker = Command::new(std::env::current_exe().expect("this test's program"))
                 .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
                 .env(CHILD, mode)
@@ -697,9 +836,9 @@ mod tests {
                 .spawn()
                 .expect("starts the process");
             // Held without being read, or closed at once.
-            let pipe = worker.stderr.take();
+            let mut pipe = worker.stderr.take();
             if mode == "gone" {
-                drop(pipe);
+                pipe = None;
             }
             let started = std::time::Instant::now();
             let status = loop {
@@ -724,6 +863,17 @@ mod tests {
                 status.is_some_and(|status| status.success()) && output.contains("told"),
                 "the process with its standard error {mode} told its lines and ended: {output}"
             );
+            if mode == "read" {
+                let mut said = String::new();
+                pipe.as_mut()
+                    .expect("its standard error")
+                    .read_to_string(&mut said)
+                    .expect("reads its standard error");
+                assert!(
+                    said.contains("a line to a standard error that is read"),
+                    "the line was there to read: {said}"
+                );
+            }
         }
     }
 
