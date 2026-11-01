@@ -248,10 +248,11 @@ const MAX_HELD: usize = 64;
 /// waiting for its low one, to the end of the batch, wait for the next batch, so that the records
 /// after the half are kept in their order. A half is still waiting while every record after it is
 /// one the translation passes over without a trace (a key coming up, a modifier, the Alt going
-/// down and the keypad digits of the second half), and while the half and what follows it are no
-/// more than `MAX_HELD` records. The next batch completes the pair, or starts something else, and
-/// then the waiting records go out as they were: a high half with no low one is replaced by the
-/// translation, as it would be without any of this.
+/// down and the keypad digits of the second half), and while the half and the records after it are
+/// no more than 64: the half and 63 records wait, and one record more lets all of them go. The
+/// next batch completes the pair, or starts something else, and then the waiting records go out as
+/// they were: a high half with no low one is replaced by the translation, as it would be without
+/// any of this.
 ///
 /// Only key records pass through. A producer that also reads mouse, resize and focus records hands
 /// this the keys between them and sends the rest in its own order, so a half that waits stays

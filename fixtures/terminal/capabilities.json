@@ -60,11 +60,11 @@
         },
         {
           "path": "input-encodings.json",
-          "sha256": "c0c8acd815649a6aec54cacf9c0d526d2f9dc1157ea098dccba980e76edd3da1"
+          "sha256": "d923b06e693558bd97833ae182b3bf7152962bc460d6498bb28085586296a2d0"
         },
         {
           "path": "console-legacy-input.json",
-          "sha256": "2da83a146730395e5f95716f9c824536a8120d8748255311742c1cd2c0108b89"
+          "sha256": "43b427eacb52d64cb9953e02584189798f00ceec91eace249207b8e272a8e516"
         },
         {
           "path": "client-encodings.json",

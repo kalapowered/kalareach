@@ -1169,13 +1169,13 @@ const fn record(
 pub const WIN32_INPUT_CASES: &[InputCase] = &[
     InputCase {
         id: "composed-character",
-        covers: "KR-REQ-08.52 KR-REQ-08.56",
+        covers: "KR-REQ-08.52",
         records: &[record(0, 0, 0x3042, true, 0, 1)],
         bytes: b"\x1b[0;0;12354;1;0;1_",
     },
     InputCase {
         id: "character-outside-the-basic-plane",
-        covers: "KR-REQ-08.52 KR-REQ-08.56",
+        covers: "KR-REQ-08.52",
         records: &[
             record(0, 0, 0xD867, true, 0, 1),
             record(0, 0, 0xDE3D, true, 0, 1),
@@ -1184,7 +1184,7 @@ pub const WIN32_INPUT_CASES: &[InputCase] = &[
     },
     InputCase {
         id: "dead-key-then-the-character-it-composes",
-        covers: "KR-REQ-08.56",
+        covers: "KR-REQ-08.52",
         records: &[
             record(0xDD, 0x1A, 0, true, 0, 1),
             record(0x45, 0x12, 0x00EA, true, 0, 1),
@@ -1193,13 +1193,13 @@ pub const WIN32_INPUT_CASES: &[InputCase] = &[
     },
     InputCase {
         id: "alt-graph",
-        covers: "KR-REQ-08.52 KR-REQ-08.56",
+        covers: "KR-REQ-08.52",
         records: &[record(0x32, 0x03, 0x40, true, 0x0001 | 0x0008, 1)],
         bytes: b"\x1b[50;3;64;1;9;1_",
     },
     InputCase {
         id: "repeat-and-key-up",
-        covers: "KR-REQ-08.52 KR-REQ-08.56",
+        covers: "KR-REQ-08.52",
         records: &[
             record(0x41, 0x1E, 0x61, true, 0, 4),
             record(0x41, 0x1E, 0x61, false, 0, 1),
