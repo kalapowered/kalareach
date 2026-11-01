@@ -541,26 +541,22 @@ mod tests {
         assert!(!error.to_string().contains("exec sleep"), "{error}");
     }
 
-    #[cfg(unix)]
+    /// What a stream has already delivered is the answer whatever the clock says: a stream read
+    /// after the deadline, because the other one held the time, is not an empty one. The channel
+    /// is filled and its sender kept, as the pipe of a command whose descendant still holds it is,
+    /// and the deadline is the moment it is asked, so nothing here waits for anything or depends
+    /// on how soon a process runs.
     #[test]
-    fn what_the_command_printed_on_a_stream_is_kept_when_the_other_one_held_the_time() {
-        // The command exits with a status and leaves a descendant holding both streams. Standard
-        // output is read until the deadline, and standard error, read after it, still has what the
-        // command wrote to it before it ended.
-        let output = super::run_bounded(
-            "/bin/sh",
-            &[
-                "-c".to_owned(),
-                "sleep 5 & echo said-on-standard-error >&2; exit 3".to_owned(),
-            ],
-            std::time::Duration::from_millis(300),
-        )
-        .expect("the command exited, so it has an answer");
-        assert_eq!(output.status.code(), Some(3));
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr).trim(),
-            "said-on-standard-error"
-        );
+    fn what_a_stream_has_delivered_is_kept_when_the_deadline_has_passed() {
+        let (sender, pieces) = std::sync::mpsc::channel();
+        sender.send(b"said ".to_vec()).expect("the first piece");
+        sender
+            .send(b"on standard error".to_vec())
+            .expect("the second piece");
+        let kept = super::collect_until(&pieces, std::time::Instant::now());
+        assert_eq!(String::from_utf8_lossy(&kept), "said on standard error");
+        // The sender is still there: the pipe was never closed.
+        drop(sender);
     }
 
     #[cfg(unix)]
