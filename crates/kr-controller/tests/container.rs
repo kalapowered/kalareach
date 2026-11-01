@@ -33,32 +33,78 @@ use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 /// A small image with a shell, which every one of these starts a sleeping process in.
 const IMAGE: &str = "docker.io/library/alpine:3.20";
 
-/// Returns false and says why when this machine has no container runtime: the program is not there,
-/// or it is there and fails its version, which is no runtime this machine has. A runtime that is
-/// there and does not answer its version is not a missing one: it fails the case, with the call
-/// named, where a skip would pass every case that needs it.
-fn runtime_available(suite: &str) -> bool {
-    let why = match run_bounded(
-        launch::CONTAINER_RUNTIME,
-        &["--version".to_owned()],
-        PLATFORM_LIMIT,
-    ) {
-        Ok(output) if output.status.success() => return true,
-        Ok(output) => format!(
-            "{} is installed and `--version` ended with {}",
-            launch::CONTAINER_RUNTIME,
-            output.status
-        ),
-        Err(CallFailure::NotRun { error, .. }) if error.kind() == std::io::ErrorKind::NotFound => {
-            format!(
-                "{} is not installed on this machine",
-                launch::CONTAINER_RUNTIME
-            )
+/// The container runtime a case drives, and how long it gives each call and the removal of what it
+/// made. A call that never answers fails the case that made it, with the call named.
+#[derive(Clone)]
+struct Runtime {
+    program: String,
+    /// How long one ordinary call is given.
+    quick: Duration,
+    /// How long a removal that gives no answer is asked again.
+    removal: Duration,
+}
+
+impl Runtime {
+    /// The runtime of this machine.
+    fn podman() -> Self {
+        Self {
+            program: launch::CONTAINER_RUNTIME.to_owned(),
+            quick: PLATFORM_LIMIT,
+            removal: REMOVAL_WITHIN,
         }
-        Err(failure) => panic!("{failure}"),
-    };
-    eprintln!("{suite}: skipped, because {why}");
-    false
+    }
+
+    /// Runs the runtime once, with nothing on its standard input, within `bound`.
+    fn run(&self, arguments: &[&str], bound: Duration) -> Result<Output, CallFailure> {
+        let arguments: Vec<String> = arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect();
+        run_bounded(&self.program, &arguments, bound)
+    }
+
+    /// [`Runtime::run`], saying what went wrong with the call named.
+    fn within(&self, arguments: &[&str], bound: Duration) -> Result<Output, String> {
+        self.run(arguments, bound)
+            .map_err(|failure| failure.to_string())
+    }
+
+    /// Why a case that needs this runtime cannot run on this machine, or nothing where it can.
+    /// Only a program that is not there is a reason: one that is there and fails its `--version`
+    /// is a broken install, and one that does not answer it is a stall. Both fail the case, with
+    /// the call named, where a skip would pass every case that needs the runtime.
+    fn why_unavailable(&self) -> Option<String> {
+        match self.run(&["--version"], self.quick) {
+            Ok(output) if output.status.success() => None,
+            Ok(output) => panic!(
+                "{} is installed and `--version` ended with {}",
+                self.program, output.status
+            ),
+            Err(CallFailure::NotRun { error, .. })
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Some(format!("{} is not installed on this machine", self.program))
+            }
+            Err(failure) => panic!("{failure}"),
+        }
+    }
+}
+
+/// Returns false and says why when this machine has no container runtime.
+fn runtime_available(suite: &str) -> bool {
+    available_through(&Runtime::podman(), suite)
+}
+
+/// [`runtime_available`], for `runtime`. A machine without one has not disproved anything, and
+/// reporting these as passed would be a claim nothing made.
+fn available_through(runtime: &Runtime, suite: &str) -> bool {
+    match runtime.why_unavailable() {
+        None => true,
+        Some(why) => {
+            eprintln!("{suite}: skipped, because {why}");
+            false
+        }
+    }
 }
 
 /// How long a call that fetches an image is given. Any other call is given [`PLATFORM_LIMIT`].
@@ -67,11 +113,7 @@ const PULL_BOUND: Duration = Duration::from_secs(300);
 /// Runs the container runtime once, with nothing on its standard input, within `bound`, or says
 /// what went wrong with the call named.
 fn runtime_within(arguments: &[&str], bound: Duration) -> Result<Output, String> {
-    let arguments: Vec<String> = arguments
-        .iter()
-        .map(|argument| (*argument).to_owned())
-        .collect();
-    run_bounded(launch::CONTAINER_RUNTIME, &arguments, bound).map_err(|failure| failure.to_string())
+    Runtime::podman().within(arguments, bound)
 }
 
 /// Runs the container runtime once, and fails the case if the call does not end.
@@ -145,6 +187,7 @@ const REMOVAL_WITHIN: Duration = Duration::from_secs(300);
 /// A container this test made, removed when the test ends by any way that runs destructors. A test
 /// binary that is killed runs none, and leaves the container.
 struct Container {
+    runtime: Runtime,
     name: String,
     /// The identifier the runtime issued, empty until it has issued one.
     id: String,
@@ -158,6 +201,7 @@ impl Container {
         // then stalls, or prints no identifier, still leaves a guard that removes it by the name
         // given here.
         let mut container = Self {
+            runtime: Runtime::podman(),
             name: name.to_owned(),
             id: String::new(),
         };
@@ -211,14 +255,19 @@ impl Container {
     /// asked again until [`REMOVAL_WITHIN`] has passed, each call given no more than what is left;
     /// a refusal is not asked again.
     fn remove(&self) -> Result<(), String> {
-        let until = Instant::now() + REMOVAL_WITHIN;
+        self.remove_telling(&mut std::io::stderr())
+    }
+
+    /// [`Container::remove`], writing the line for a call that gave no answer to `told`.
+    fn remove_telling(&self, told: &mut dyn std::io::Write) -> Result<(), String> {
+        let until = Instant::now() + self.runtime.removal;
         let mut last = String::new();
         loop {
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(last);
             }
-            match runtime_within(
+            match self.runtime.within(
                 &[
                     "rm",
                     "--force",
@@ -228,7 +277,7 @@ impl Container {
                     "--",
                     self.target(),
                 ],
-                PLATFORM_LIMIT.min(left),
+                self.runtime.quick.min(left),
             ) {
                 Ok(output) if output.status.success() => return Ok(()),
                 Ok(output) => return Err(printed(&output)),
@@ -236,7 +285,7 @@ impl Container {
                     // A call that stalls and is answered the next time leaves no other trace, and
                     // a stall of the runtime is what this evidence is for.
                     let _ = writeln!(
-                        std::io::stderr(),
+                        told,
                         "the removal of the container {} did not answer ({why}); asking again",
                         self.name
                     );
@@ -508,4 +557,210 @@ async fn a_refresh_that_reached_a_running_environment_without_a_helper_scopes_no
         );
     }
     host.stop().await;
+}
+
+/// A runtime of this test's own: a program in `directory` that records each call's arguments, one
+/// line to a call, in `calls`, and then runs `body`, answering with success where `body` says
+/// nothing. A call is given ten seconds, which a call that answers does not come near, and a stalled
+/// one lasts forty; a removal that gives no answer is asked again for a minute.
+fn a_runtime_that(directory: &std::path::Path, body: &str) -> Runtime {
+    let text = directory.join("runtime.text");
+    std::fs::write(
+        &text,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{calls}'\n{body}\nexit 0\n",
+            calls = directory.join("calls").display()
+        ),
+    )
+    .expect("the stand-in runtime");
+    let program = directory.join("podman");
+    kr_ipc::testing::place_program(&text, &program);
+    Runtime {
+        program: program.display().to_string(),
+        quick: Duration::from_secs(10),
+        removal: Duration::from_secs(60),
+    }
+}
+
+/// The calls a stand-in runtime was given, one line of arguments each.
+fn recorded_calls(directory: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(directory.join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The removals among them.
+fn removals(directory: &std::path::Path) -> Vec<String> {
+    recorded_calls(directory)
+        .into_iter()
+        .filter(|call| call.starts_with("rm "))
+        .collect()
+}
+
+/// The identifier the stand-in runtime issued for the container the cases below hold.
+const STAND_IN_ID: &str = "3f1a9c0d5e7b2468a1c3e5f7092b4d6e8a0c2e4f61738495a6b7c8d9e0f1a2b3";
+
+/// A container held by the identifier a stand-in runtime issued.
+fn held_in(runtime: Runtime) -> Container {
+    Container {
+        runtime,
+        name: "kr-stand-in".to_owned(),
+        id: STAND_IN_ID.to_owned(),
+    }
+}
+
+/// What a panic said.
+fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+        .unwrap_or_default()
+}
+
+/// A removal that never answers is, when the time for removals has passed, an error that names the
+/// call and does not panic; each call is given no more than what is left of that time, and each that
+/// gave no answer leaves a line for whoever reads the run.
+#[test]
+fn a_removal_that_never_answers_is_reported_with_the_call_named() {
+    let directory = tempfile::tempdir().expect("a directory");
+    // A call is given far more than the time for removals, so that the call that is begun with what
+    // is left of that time shows in the bound it is told it had.
+    let container = held_in(Runtime {
+        quick: Duration::from_secs(30),
+        removal: Duration::from_secs(3),
+        ..a_runtime_that(directory.path(), "case \"$1\" in rm) exec sleep 40 ;; esac")
+    });
+    let mut told = Vec::new();
+    let why = container
+        .remove_telling(&mut told)
+        .expect_err("a removal that never ends is an error and not a panic");
+    assert!(
+        why.contains(" rm did not end within"),
+        "the call is named: {why}"
+    );
+    let asked = removals(directory.path());
+    assert!(!asked.is_empty(), "the runtime was asked to remove it");
+    // The runtime is told to remove it by force, whether or not it is running, at once, and to
+    // say nothing of a container that is not there.
+    assert_eq!(
+        asked[0],
+        format!("rm --force --ignore --time 0 -- {STAND_IN_ID}")
+    );
+    // The call was given what is left of the time for removals, which is less than a whole call.
+    assert!(
+        !why.contains("within 30 seconds"),
+        "the call was given a whole call's time: {why}"
+    );
+    let told = String::from_utf8_lossy(&told);
+    assert!(
+        told.contains("did not answer") && told.contains("asking again"),
+        "{told}"
+    );
+    // The runtime answers no removal, and the guard would ask again for as long as it is given and
+    // fail this case for what it was written to show.
+    std::mem::forget(container);
+}
+
+/// A removal that stalls once and is answered the next time succeeds, after a line that says it was
+/// asked again.
+#[test]
+fn a_removal_that_stalls_once_is_asked_again_and_answered() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let calls = directory.path().join("calls");
+    let container = held_in(a_runtime_that(
+        directory.path(),
+        &format!(
+            "case \"$1\" in rm) if [ \"$(grep -c '^rm ' '{}')\" -le 1 ]; then exec sleep 40; fi ;; esac",
+            calls.display()
+        ),
+    ));
+    let mut told = Vec::new();
+    container
+        .remove_telling(&mut told)
+        .expect("the second asking is answered");
+    assert!(removals(directory.path()).len() >= 2);
+    assert!(
+        String::from_utf8_lossy(&told).contains("asking again"),
+        "{}",
+        String::from_utf8_lossy(&told)
+    );
+}
+
+/// A removal the runtime refuses is not asked again: it would be refused again.
+#[test]
+fn a_removal_the_runtime_refuses_is_not_asked_again() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let container = held_in(a_runtime_that(
+        directory.path(),
+        "case \"$1\" in rm) echo 'Error: the stand-in refuses this call' >&2; exit 125 ;; esac",
+    ));
+    let why = container
+        .remove()
+        .expect_err("a refusal is an error and not a panic");
+    assert!(why.contains("the stand-in refuses this call"), "{why}");
+    assert_eq!(removals(directory.path()).len(), 1);
+    // The runtime refuses every removal, and the guard would ask again and fail this case for what
+    // it was written to show.
+    std::mem::forget(container);
+}
+
+/// A case that passes while its container could not be removed fails: the container is still
+/// there, running a process, on a machine that other cases and other people share.
+#[test]
+fn a_case_that_passes_fails_when_its_container_could_not_be_removed() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let container = held_in(a_runtime_that(
+        directory.path(),
+        "case \"$1\" in rm) echo 'Error: the stand-in refuses this call' >&2; exit 125 ;; esac",
+    ));
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _held = container;
+    }));
+    let said = panic_message(failed.expect_err("a container left behind fails the case"));
+    assert!(
+        said.contains("was not removed and may still be running"),
+        "{said}"
+    );
+}
+
+/// Only a runtime that is not there is a reason to leave out the cases that need one. One that is
+/// there and fails its `--version` is a broken install, and fails the case that asks.
+#[test]
+fn only_a_runtime_that_is_not_there_is_a_reason_to_skip() {
+    let missing = Runtime {
+        program: "/nonexistent-runtime/podman".to_owned(),
+        ..Runtime::podman()
+    };
+    assert!(
+        missing
+            .why_unavailable()
+            .is_some_and(|why| why.contains("is not installed")),
+    );
+    assert!(!available_through(
+        &missing,
+        "the_cases_of_a_machine_with_none"
+    ));
+
+    let working_directory = tempfile::tempdir().expect("a directory");
+    let working = a_runtime_that(
+        working_directory.path(),
+        "case \"$1\" in --version) echo 'podman version 5.0.0' ;; esac",
+    );
+    assert!(working.why_unavailable().is_none());
+
+    let broken_directory = tempfile::tempdir().expect("a directory");
+    let broken = a_runtime_that(
+        broken_directory.path(),
+        "case \"$1\" in --version) exit 1 ;; esac",
+    );
+    let failed =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| broken.why_unavailable()));
+    let said = panic_message(failed.expect_err("a runtime that fails its version fails the case"));
+    assert!(
+        said.contains("is installed and `--version` ended with"),
+        "{said}"
+    );
 }
