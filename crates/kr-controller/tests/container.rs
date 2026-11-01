@@ -641,14 +641,6 @@ fn a_removal_that_never_answers_is_reported_with_the_call_named() {
         why.contains(" rm did not end within"),
         "the call is named: {why}"
     );
-    let asked = removals(directory.path());
-    assert!(!asked.is_empty(), "the runtime was asked to remove it");
-    // The runtime is told to remove it by force, whether or not it is running, at once, and to
-    // say nothing of a container that is not there.
-    assert_eq!(
-        asked[0],
-        format!("rm --force --ignore --time 0 -- {STAND_IN_ID}")
-    );
     // The call was given what is left of the time for removals, which is less than a whole call.
     assert!(
         !why.contains("within 30 seconds"),
@@ -701,7 +693,12 @@ fn a_removal_the_runtime_refuses_is_not_asked_again() {
         .remove()
         .expect_err("a refusal is an error and not a panic");
     assert!(why.contains("the stand-in refuses this call"), "{why}");
-    assert_eq!(removals(directory.path()).len(), 1);
+    // The runtime is told to remove it by force, whether or not it is running, at once, and to
+    // say nothing of a container that is not there; and the refusal is asked once.
+    assert_eq!(
+        removals(directory.path()),
+        [format!("rm --force --ignore --time 0 -- {STAND_IN_ID}")]
+    );
     // The runtime refuses every removal, and the guard would ask again and fail this case for what
     // it was written to show.
     std::mem::forget(container);

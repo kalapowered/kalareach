@@ -3767,12 +3767,6 @@ fn a_removal_that_stalls_is_an_error_and_aborts_nothing_while_an_assertion_fails
             .map(String::as_str),
         Some(format!("rm --force --ignore --time 0 -- {STAND_IN_CONTAINER_ID}").as_str())
     );
-    // Each call is given no more than the time that is left for them all: the last of them, begun
-    // with less than a call is ordinarily given, is not given that.
-    assert!(
-        !why.contains(&format!("within {STAND_IN_BOUND:?}")),
-        "the last call was given a whole call's time and not what was left: {why}"
-    );
     let asked = removals(directory.path());
     assert!(
         asked >= 2,
@@ -3792,6 +3786,30 @@ fn a_removal_that_stalls_is_an_error_and_aborts_nothing_while_an_assertion_fails
         removals(directory.path()) > asked,
         "the unwinding case tried to remove it too"
     );
+}
+
+/// A removal call is given no more than the time that is left for removals. The call here may take
+/// thirty seconds, and the time for removals is three, and the bound the failure says the call had
+/// is the three. A call that stalls is ended at its bound whatever that is, so no delay in the
+/// machine changes what the bound was.
+#[test]
+fn a_removal_call_is_given_no_more_than_what_is_left_of_the_time_for_removals() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let container = held_in(Runtime {
+        quick: Duration::from_secs(30),
+        slow: Duration::from_secs(3),
+        ..stand_in_runtime(directory.path(), &["rm"], &[])
+    });
+    let why = container
+        .remove()
+        .expect_err("a removal that never ends is an error and not a panic");
+    assert!(why.contains("\"rm\""), "the call is named: {why}");
+    assert!(
+        !why.contains("within 30s"),
+        "the call was given a whole call's time and not what was left: {why}"
+    );
+    // Asking again would fail this case for what it was written to show.
+    std::mem::forget(container);
 }
 
 /// A stand-in runtime whose first removal never answers and whose second is answered.
@@ -4367,17 +4385,27 @@ fn a_call_that_ended_and_left_something_holding_one_of_its_streams_fails() {
 fn a_child_that_ignores_the_request_to_end_is_killed_after_it_and_collected() {
     let directory = tempfile::tempdir().expect("a directory");
     let ready = directory.path().join("ready");
-    let mut child = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        // It says that it ignores the request before the case asks it.
-        .arg("trap '' TERM; : > \"$1\"; while :; do sleep 1; done")
-        .arg("program")
-        .arg(&ready)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("starts a child");
+    // Held from the moment it exists, and ended with the case whatever the case does.
+    struct EndedWithTheCase(std::process::Child);
+    impl Drop for EndedWithTheCase {
+        fn drop(&mut self) {
+            let _ = user_manager::kill_and_collect(&mut self.0);
+        }
+    }
+    let mut child = EndedWithTheCase(
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            // It says that it ignores the request before the case asks it, and goes on as the one
+            // process that ignores it (an ignored signal stays ignored through the `exec`).
+            .arg("trap '' TERM; : > \"$1\"; exec /bin/sleep 300")
+            .arg("program")
+            .arg(&ready)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("starts a child"),
+    );
     let begun = Instant::now();
     while !ready.exists() {
         assert!(
@@ -4386,13 +4414,8 @@ fn a_child_that_ignores_the_request_to_end_is_killed_after_it_and_collected() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    let failed = user_manager::end_and_collect_asking_for(&mut child, Duration::from_millis(200));
-    let collected = child.try_wait().expect("its state").is_some();
-    if !collected {
-        // The harness did not end it: it is ended here, so that it does not outlast the case.
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+    let failed = user_manager::end_and_collect_asking_for(&mut child.0, Duration::from_millis(200));
+    let collected = child.0.try_wait().expect("its state").is_some();
     assert!(collected, "the child was not collected: {failed}");
     assert_eq!(failed, "", "ending it failed");
 }

@@ -5268,14 +5268,17 @@ fn a_pause_process_through(
 #[cfg(target_os = "linux")]
 #[test]
 fn a_child_a_case_fails_before_handing_it_on_is_ended_with_the_case() {
-    let child = std::process::Command::new("sleep")
-        .arg("300")
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .expect("starts a process");
-    let identity = process_start_identity(child.id()).expect("the child's identity");
+    // Held from the moment it exists: a read of its identity that fails leaves nothing behind.
+    let guard = EndedWithTheCase(
+        std::process::Command::new("sleep")
+            .arg("300")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("starts a process"),
+    );
+    let identity = process_start_identity(guard.id()).expect("the child's identity");
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        let _guard = EndedWithTheCase(child);
+        let _guard = guard;
         panic!("the case fails before it hands the child on");
     }));
     assert!(failed.is_err());
