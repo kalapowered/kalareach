@@ -15,9 +15,11 @@
 //!                          ───worker ready──▶  (controller publishes the descriptor)
 //! ```
 
-// Every line this program says goes through `kr_worker::diagnostics`, whose thread writes it, so
-// that a standard error that has stopped draining holds nothing here. `eprintln!` and `dbg!` write
-// where they are called.
+// The lines this program says go through `kr_worker::diagnostics`, whose thread writes them, so that
+// a standard error that has stopped draining holds this program only for the short time `main`
+// waits for them at its end. `eprintln!` and `dbg!` write where they are called. The argument
+// parser writes its own message where it happens, for a command line it refuses, and so does a
+// panic.
 #![deny(clippy::print_stderr, clippy::dbg_macro)]
 
 use std::process::ExitCode;
@@ -100,8 +102,8 @@ struct Arguments {
 
 /// How long the program gives its lines to be written to its standard error before it ends.
 ///
-/// A line said just before the process ends, as the one that says why it could not start is, is
-/// usually lost to the exit unless the thread that writes it is given the time. A standard error
+/// A line said just before the process ends, as the one that says why it could not start is, can
+/// be lost to the exit unless the thread that writes it is given the time. A standard error
 /// that drains takes a line in far less than this; one that has stopped draining holds the end of
 /// the process for this long and no longer.
 const DIAGNOSTICS_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
@@ -490,8 +492,8 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     // The worker exists for its session. When the session closes, the last record is written, every
     // attachment is told, and the process ends; nothing here restarts a shell. The worker's
     // diagnostics are written by a thread of their own, so a standard error that has stopped
-    // draining holds nothing here; `main` gives that thread a short time to write what it was
-    // handed, and the process ends after that with the thread still in its write.
+    // draining holds nothing in this function; `main` gives that thread a short time to write what
+    // it was handed, and the process ends after that with the thread still in its write.
     let _record = runtime.wait_closed().await;
     finish(&runtime, serving, bridge_server).await;
     Ok(())

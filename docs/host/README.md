@@ -4332,18 +4332,18 @@ pass hands the line to a thread of the worker's own, which writes the worker's d
 time, and waits for nothing: it is called with neither the session's lock nor the dispatch barrier
 held, and the reason counts as said only once the thread has written it. A write that fails, as
 one does on a full volume, costs nothing; the reason is offered again at the next pass. A standard
-error that has stopped draining, a pipe nobody reads, holds that thread and nothing else: the passes
-go on, a stop of the session is answered, and the process ends with the thread still in its write.
-At most eight lines wait for the thread, and a line beyond that is dropped. The other lines the
-worker writes there, such as the one that says a command was not integrated for its launch, go the
-same way, and so do the lines of the worker's program: why it could not start, that the controller
-did not receive its ready report, and that an attachment had not been sent the closure when the
-worker ended. A line said just before the process ends is usually lost to the exit, so the program
-gives the thread up to two seconds to write what it has been handed before it ends. A standard
-error that has stopped draining therefore holds the end of the process for two seconds and no
-longer. A panic is the exception: the standard library writes its message where it happens. A line
-is handed over whole and written with `write_all`, so a volume that is nearly full can take part of
-it. Nothing bounds how
+error that has stopped draining, a pipe nobody reads, holds that thread and nothing else while the
+worker runs: the passes go on, a stop of the session is answered, and the process ends with the
+thread still in its write, after a wait of two seconds at most. At most eight lines wait for the
+thread, and a line beyond that is dropped. The other lines the worker writes there, such as the one
+that says a command was not integrated for its launch, go the same way, and so do the lines of the
+worker's program, such as why it could not start, that the controller did not receive its ready
+report, and that an attachment had not been sent the closure when the worker ended. A line said just
+before the process ends can be lost to the exit, so the program waits up to two seconds for the
+thread to write what it has been handed before it ends. Two kinds of message are written where they
+happen: a panic's, by the standard library, and the argument parser's, for a command line it
+refuses. A line is handed over whole and written with `write_all`, so a volume that is nearly full
+can take part of it. Nothing bounds how
 long the host stays over the cap: the delays are random, and a holder that stops without ending
 keeps the lock while the others go on looking. The host also stays over the cap when the session
 that grew cannot give up the excess, as when its worker has ended, it holds less than the excess

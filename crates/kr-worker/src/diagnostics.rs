@@ -13,10 +13,10 @@
 //! dropped: the process ends with the thread still in its write. At most eight lines wait for it.
 //! A line offered beyond that is dropped, not waited for.
 //!
-//! A line said just before the process ends is usually lost to the exit, because the thread has not
+//! A line said just before the process ends can be lost to the exit, because the thread has not
 //! reached it. A program that says its last lines on the way out, as the worker's does, calls
-//! [`drain`] before it ends, which waits for the lines said so far for a time the program names and
-//! no longer.
+//! [`drain`] before it ends, which waits for the lines the thread took for a time the program names
+//! and no longer.
 //!
 //! The write can fail as well: a volume that is full refuses it as it refused what made the host
 //! say it. A write that fails is let go.
@@ -147,11 +147,12 @@ pub fn tell(line: std::fmt::Arguments<'_>) {
     let _ = standard_error().offer(format!("kr-worker: {line}\n"), None);
 }
 
-/// Waits for at most `within` until every line said so far has been written to this process's
-/// standard error or refused by it, and says whether they have.
+/// Waits for at most `within` until every line the thread took has been written to this process's
+/// standard error or refused by it, and says whether they have. A line that was dropped, or that
+/// had no thread to take it, is not waited for.
 ///
 /// A program that says its last lines on its way out calls this before it ends, since a line the
-/// thread has not reached is lost to the exit. A standard error that has stopped draining holds
+/// thread has not reached can be lost to the exit. A standard error that has stopped draining holds
 /// this for `within` and no longer, and the lines still waiting are lost when the process ends.
 pub fn drain(within: Duration) -> bool {
     STANDARD_ERROR
@@ -167,7 +168,7 @@ fn locked<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The reasons an output retention pass left output behind, as this worker has said them.
 #[derive(Debug, Default)]
 struct Said {
-    /// The reason of the last line whose write ended while its offer still stood.
+    /// The reason of the last line that was written while its offer still stood.
     said: Option<String>,
     /// The offer whose line waits for the writer or is being written, and that no pass has
     /// withdrawn.
