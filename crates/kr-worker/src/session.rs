@@ -356,9 +356,9 @@ pub struct Session {
     /// maintenance tick and cleared only by its own success. Reconciliation is not complete while
     /// either is set.
     privacy_cleanup: PrivacyCleanup,
-    /// The reason an output retention pass left output it was asked to remove, as last written to
-    /// this worker's diagnostics, so that a reason that stands is said once and not on every pass.
-    reported_output_reason: Option<String>,
+    /// Whether the last output retention pass applied the age bound, which decides what its
+    /// reason, or the lack of one, says about a reason an earlier pass left.
+    output_age_applied: bool,
     /// Privacy mode's durable state: the generation, and whether it is on.
     ///
     /// It is read back from the journal when the session opens, because the generation is what
@@ -721,7 +721,7 @@ impl Session {
             } else {
                 PrivacyCleanup::default()
             },
-            reported_output_reason: None,
+            output_age_applied: false,
             health,
             time,
             closure: None,
@@ -4787,6 +4787,21 @@ impl Session {
         self.history.awaits_the_host_cap_lock()
     }
 
+    /// Returns what the last output retention pass has to say about the output it left, for the
+    /// host to write once it has let go of this session.
+    ///
+    /// The session does not write it: the volume that made a pass leave output behind may well
+    /// refuse the write too, and a standard error that has stopped draining holds a write for as
+    /// long as it stands, so a write made here would hold the session, and with it a person's
+    /// stop, for that long.
+    #[must_use]
+    pub fn output_pass_report(&self) -> OutputPassReport {
+        OutputPassReport {
+            reason: self.history.left_behind().map(str::to_owned),
+            age_applied: self.output_age_applied,
+        }
+    }
+
     /// Applies output retention under `retention`, which is section 20's own figures for the
     /// host's pass and other ones for a test.
     pub fn collect_output_under(
@@ -4835,19 +4850,7 @@ impl Session {
                     .apply_retention(retention, held, now, age_permitted)
             }
         };
-        // A pass that could not remove what it was asked to says why to this worker's standard
-        // error. On Unix that is where a person looking into a host that keeps more than its cap
-        // finds it: a launchd job's or a detached process's diagnostics file, a transient unit's
-        // journal. A Windows worker has a console with no window, so nobody reads it there. The
-        // write is made under the session's lock, and one that fails is let go: the volume that
-        // made the pass leave output behind may well refuse it too, and a diagnostic is not worth
-        // the session.
-        say_output_reason(
-            &mut self.reported_output_reason,
-            self.history.left_behind(),
-            age_permitted,
-            &mut std::io::stderr().lock(),
-        );
+        self.output_age_applied = age_permitted;
         taken
     }
 
@@ -5630,15 +5633,29 @@ impl Answered {
     }
 }
 
+/// What an output retention pass has to say about the output it left behind.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutputPassReport {
+    /// Why the pass left output it was asked to remove, when it did.
+    pub reason: Option<String>,
+    /// Whether the pass applied the age bound. One that did not, as a look at the host's cap does
+    /// not and a pass on a wall clock the host cannot prove does not, cannot tell that a reason the
+    /// age bound left has gone.
+    pub age_applied: bool,
+}
+
 /// Says to `diagnostics` why an output retention pass left output behind, when it is not the
 /// reason last said.
 ///
 /// `said` is the reason last written, and follows `reason`: one that goes and comes back is said
 /// again. A write that fails is let go, and its reason is not taken as said, so that the next pass
-/// that can write it says it. A pass that removed nothing by age (`age_applied` is false: it is a
-/// look at the host's cap, or the host cannot prove its wall clock) cannot tell that a reason
-/// belonging to the age bound has gone, so it leaves what was said as it is.
-fn say_output_reason(
+/// that can write it says it. A pass that applied no age bound (`age_applied` is false) keeps what
+/// was said when it finds no reason, since it cannot tell that a reason the age bound left has
+/// gone; the same holds for a reason of the byte caps, which an unproved wall clock leaves said
+/// until a pass that applies age finds none.
+///
+/// The line is one write, so that nothing else writing to the same stream breaks it.
+pub(crate) fn say_output_reason(
     said: &mut Option<String>,
     reason: Option<&str>,
     age_applied: bool,
@@ -5650,11 +5667,10 @@ fn say_output_reason(
     match reason {
         None => *said = None,
         Some(reason) => {
-            let written = writeln!(
-                diagnostics,
-                "kr-worker: output retention left output it was asked to remove: {reason}"
+            let line = format!(
+                "kr-worker: output retention left output it was asked to remove: {reason}\n"
             );
-            if written.is_ok() {
+            if diagnostics.write_all(line.as_bytes()).is_ok() {
                 *said = Some(reason.to_owned());
             }
         }

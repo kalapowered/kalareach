@@ -4289,135 +4289,275 @@ fn a_segment_written(days_ago: u64) -> impl FnOnce(&std::path::Path) {
     }
 }
 
-/// A host whose pass cannot take the lock on the host's output cap: its session holds a segment,
-/// another session's spool holds the cap, and a directory stands where the lock file goes. The
-/// pass leaves output it was asked to remove, and says why.
+/// A session's spool for a host that is over its output cap: one segment of 4,096 bytes written
+/// `days_ago` days ago, beside another session's spool that holds the whole cap.
 #[cfg(unix)]
-async fn host_whose_pass_leaves_output_behind() -> Host {
-    let host = host_started(
-        |_| {},
-        a_segment_written(0),
-        kr_worker::action::time::TimeSources::system(),
-        "sleep 30",
-    )
-    .await;
-    let spools = host._temp.environment().spool_dir();
-    let other = spools.join("other.log");
-    std::fs::create_dir_all(&other).expect("another session's spool directory");
-    std::fs::File::create(other.join("0.out"))
-        .and_then(|segment| segment.set_len(OutputRetention::DEFAULT.host_cap_bytes))
-        .expect("a segment that holds the cap");
-    std::fs::create_dir(spools.join("host-cap.lock")).expect("a directory where the lock goes");
-    host
+fn a_spool_that_puts_the_host_over_its_cap(days_ago: u64) -> impl FnOnce(&std::path::Path) {
+    let segment = a_segment_written(days_ago);
+    move |spool| {
+        segment(spool);
+        let other = spool
+            .parent()
+            .expect("the spools' directory")
+            .join("other.log");
+        std::fs::create_dir_all(&other).expect("another session's spool directory");
+        std::fs::File::create(other.join("0.out"))
+            .and_then(|segment| segment.set_len(OutputRetention::DEFAULT.host_cap_bytes))
+            .expect("a segment that holds the cap");
+    }
 }
 
-/// A host whose pass cannot remove a segment a week and a day old, because a directory stands
-/// where the spool's boundary is written: the age bound leaves the output, and says why.
+/// A host over its output cap whose pass cannot take the lock on the cap, because a directory
+/// stands where the lock file goes: the pass leaves output it was asked to remove, and the reason
+/// is that the lock could not be taken. The directory is there before the host starts, so the
+/// host's own first pass already finds it.
 #[cfg(unix)]
-async fn host_whose_old_output_cannot_be_removed() -> Host {
-    let host = host_started(
+async fn host_that_cannot_take_the_cap_lock() -> Host {
+    host_started(
         |_| {},
-        a_segment_written(8),
+        |spool| {
+            a_spool_that_puts_the_host_over_its_cap(0)(spool);
+            std::fs::create_dir(
+                spool
+                    .parent()
+                    .expect("the spools' directory")
+                    .join("host-cap.lock"),
+            )
+            .expect("a directory where the lock goes");
+        },
         unix_time_service(true),
         "sleep 30",
     )
-    .await;
-    std::fs::create_dir(
-        host._temp
-            .environment()
-            .session_spool(host.session_id)
-            .join("boundary"),
-    )
-    .expect("a directory where the boundary goes");
-    host
+    .await
+}
+
+/// Set in the environment of a process that runs one of these cases again as the worker.
+#[cfg(unix)]
+const WORKER_PROCESS: &str = "KR_TEST_WORKER_PROCESS";
+
+/// How long a worker process these cases start is given to end.
+#[cfg(unix)]
+const WORKER_PROCESS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Whether this is the process a case started to run as the worker.
+#[cfg(unix)]
+fn in_the_worker_process() -> bool {
+    std::env::var_os(WORKER_PROCESS).is_some()
+}
+
+/// How the standard error of a worker process is kept.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum StandardError {
+    /// A pipe that the case reads when the process has ended.
+    Read,
+    /// A pipe whose reading end is closed: every write to it is refused.
+    ReaderGone,
+    /// A pipe that nothing reads.
+    NotRead,
+}
+
+/// What a worker process wrote, and whether it ended.
+#[cfg(unix)]
+struct WorkerProcess {
+    /// Whether the process ended with success, and within the deadline.
+    ended_well: bool,
+    standard_output: String,
+    standard_error: String,
+}
+
+/// Runs the case named `name` again as a process of its own, as the worker, with the standard error
+/// `standard_error`, and returns what it wrote. A process that has not ended by the deadline is
+/// ended by its pid.
+#[cfg(unix)]
+fn run_in_a_worker_process(name: &str, standard_error: StandardError) -> WorkerProcess {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+
+    let mut worker = Command::new(std::env::current_exe().expect("this test's program"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(WORKER_PROCESS, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("starts the worker");
+    let mut pipe = worker.stderr.take();
+    if matches!(standard_error, StandardError::ReaderGone) {
+        pipe = None;
+    }
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = worker.try_wait().expect("polls the worker") {
+            break Some(status);
+        }
+        if started.elapsed() > WORKER_PROCESS_DEADLINE {
+            worker.kill().expect("ends the worker by its pid");
+            worker.wait().expect("the worker ends");
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let mut standard_output = String::new();
+    worker
+        .stdout
+        .take()
+        .expect("its standard output")
+        .read_to_string(&mut standard_output)
+        .expect("reads its standard output");
+    let mut written = String::new();
+    if let (StandardError::Read, Some(pipe)) = (standard_error, pipe.as_mut()) {
+        pipe.read_to_string(&mut written)
+            .expect("reads its standard error");
+    }
+    WorkerProcess {
+        ended_well: status.is_some_and(|status| status.success()),
+        standard_output,
+        standard_error: written,
+    }
+}
+
+/// Fills this process's standard error, a pipe, to the last byte, so that the next write to it
+/// waits for a reader.
+#[cfg(unix)]
+fn fill_standard_error() {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+    let standard_error = std::io::stderr();
+    let flags = fcntl_getfl(&standard_error).expect("the flags of the standard error");
+    fcntl_setfl(&standard_error, flags | OFlags::NONBLOCK).expect("a write that does not wait");
+    for chunk in [1024_usize, 1] {
+        let bytes = vec![b'.'; chunk];
+        loop {
+            match rustix::io::write(&standard_error, &bytes) {
+                Ok(_) => {}
+                Err(rustix::io::Errno::AGAIN) => break,
+                Err(error) => panic!("filling the standard error: {error}"),
+            }
+        }
+    }
+    fcntl_setfl(&standard_error, flags).expect("a write that waits again");
 }
 
 /// Section 24 and section 20, KR-REQ-20.20: a worker says why a pass left output behind to its
 /// standard error, once while the reason stands, and a standard error that refuses the write
 /// costs the session nothing. A volume that is full is a cause of output left behind, and it
-/// refuses the diagnostic too; the stop of a session must not wait on it. A look at the host's
-/// cap applies no age bound, so it does not make the reason the age bound left be said again.
+/// refuses the diagnostic too; the stop of a session must not wait on it.
 ///
 /// The worker is this test's own program, started twice with the standard error the case needs:
-/// one that a person reads, and one whose reading end is closed. In each, one host makes two
-/// passes that cannot take the lock on the host's cap; another makes a pass, a look and a pass
-/// that cannot remove output for its age; and the first is stopped through the endpoint.
+/// one that a person reads, and one whose reading end is closed. In each, the host makes two
+/// passes that cannot take the lock on the host's cap, and the session is stopped through the
+/// endpoint.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_refused_write() {
-    use std::io::{Read as _, Write as _};
-    use std::process::{Command, Stdio};
-
     const NAME: &str =
         "a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_refused_write";
-    const CHILD: &str = "KR_TEST_WORKER_WITH_ITS_OWN_STANDARD_ERROR";
 
-    if std::env::var_os(CHILD).is_some() {
-        // A failure is told on the standard output, which this case reads, since the standard
+    if in_the_worker_process() {
+        // A failure is told on the standard output, which the starter reads, since the standard
         // error may be the one that refuses.
         std::panic::set_hook(Box::new(|failure| {
             println!("the worker panicked: {failure}")
         }));
-        // Waits until the starter has settled its end of the standard error.
-        std::io::stdin()
-            .read_exact(&mut [0_u8; 1])
-            .expect("the starter's go-ahead");
-        let host = host_whose_pass_leaves_output_behind().await;
+        let host = host_that_cannot_take_the_cap_lock().await;
         host.service.maintain_now();
         host.service.maintain_now();
-        let aged = host_whose_old_output_cannot_be_removed().await;
-        aged.service.maintain_now();
-        aged.runtime.session().collect_output_for_the_caps();
-        aged.service.maintain_now();
         let mut client = cli(&host).await;
         close(&mut client, &host).await;
+        println!("said {}", host.service.output_reason_said().is_some());
         return;
     }
 
-    let start = |readable: bool| {
-        let mut worker = Command::new(std::env::current_exe().expect("this test's program"))
-            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("starts the worker");
-        if !readable {
-            drop(worker.stderr.take());
-        }
-        let mut go_ahead = worker.stdin.take().expect("its standard input");
-        go_ahead.write_all(b"g").expect("the go-ahead");
-        drop(go_ahead);
-        let outcome = worker.wait_with_output().expect("the worker ends");
-        let standard_output = String::from_utf8_lossy(&outcome.stdout).into_owned();
-        assert!(
-            outcome.status.success() && standard_output.contains("1 passed"),
-            "the worker ended {:?}: {standard_output}",
-            outcome.status
-        );
-        String::from_utf8_lossy(&outcome.stderr).into_owned()
-    };
-
-    let said = start(true);
-    let reasons: Vec<&str> = said
+    let read = run_in_a_worker_process(NAME, StandardError::Read);
+    assert!(
+        read.ended_well && read.standard_output.contains("1 passed"),
+        "the worker ended badly: {}",
+        read.standard_output
+    );
+    let reasons: Vec<&str> = read
+        .standard_error
         .lines()
         .filter(|line| line.contains("output retention left output it was asked to remove"))
         .collect();
     assert_eq!(
         reasons.len(),
-        2,
-        "each host left its output for one reason, which is said once: {said}"
+        1,
+        "two passes left the output for one reason, which is said once: {}",
+        read.standard_error
     );
     assert!(
-        reasons.iter().any(|line| line.contains("host-cap.lock")),
-        "one names the lock: {reasons:?}"
+        reasons[0].contains("host-cap.lock"),
+        "and it names the lock: {reasons:?}"
+    );
+    assert!(read.standard_output.contains("said true"));
+
+    let refused = run_in_a_worker_process(NAME, StandardError::ReaderGone);
+    assert!(
+        refused.ended_well && refused.standard_output.contains("1 passed"),
+        "a refused write stopped the worker: {}",
+        refused.standard_output
     );
     assert!(
-        reasons.iter().any(|line| line.contains("boundary")),
-        "and the other the boundary: {reasons:?}"
+        refused.standard_output.contains("said false"),
+        "and a reason that was not written is not taken as said: {}",
+        refused.standard_output
     );
-    start(false);
+}
+
+/// Section 24 and section 20, KR-REQ-20.20: a standard error that has stopped draining, a pipe
+/// nobody reads, holds the write of a reason and nothing else: the person's stop of the session is
+/// answered. A write made while the session's lock and the dispatch barrier are held would hold
+/// the stop for as long as the pipe stands full.
+///
+/// The worker is this test's own program with its standard error filled to the last byte and read
+/// by no one. Its host's first pass finds the lock on the host's cap unavailable and has a reason
+/// to write; once that pass has let go of the session, the session is stopped through the endpoint.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_standard_error_that_stops_draining_does_not_hold_up_the_stop_of_a_session() {
+    const NAME: &str =
+        "a_standard_error_that_stops_draining_does_not_hold_up_the_stop_of_a_session";
+
+    if in_the_worker_process() {
+        std::panic::set_hook(Box::new(|failure| {
+            println!("the worker panicked: {failure}")
+        }));
+        fill_standard_error();
+        let host = host_that_cannot_take_the_cap_lock().await;
+        // The report of a pass can be read once the pass has let go of the session.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while host.runtime.session().output_pass_report().reason.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first pass left output behind"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mut client = cli(&host).await;
+            close(&mut client, &host).await
+        })
+        .await;
+        println!(
+            "{}",
+            if stopped.is_ok() {
+                "the stop was answered"
+            } else {
+                "the stop was not answered"
+            }
+        );
+        // The pass is still held in its write, and ends with the process.
+        std::process::exit(0);
+    }
+
+    let worker = run_in_a_worker_process(NAME, StandardError::NotRead);
+    assert!(
+        worker.ended_well && worker.standard_output.contains("the stop was answered"),
+        "the stop of the session waited for the standard error (ended well: {}): {}",
+        worker.ended_well,
+        worker.standard_output
+    );
 }
 
 /// The platform's time service as a host reads it: keeping the wall clock, or not.

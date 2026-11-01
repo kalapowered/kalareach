@@ -415,6 +415,10 @@ pub struct WorkerService {
     /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
     received: Mutex<Vec<(kr_protocol::method::MethodName, ParamsValue)>>,
+    /// The reason an output retention pass left output it was asked to remove, as last written to
+    /// this worker's standard error, so that a reason that stands is said once and not on every
+    /// pass. Only the host's maintenance takes it, and it holds it while it writes.
+    said_output_reason: Mutex<Option<String>>,
     /// How many times a host that found the host over its output cap while another held the lock
     /// on it has looked at the cap again, for this host's own tests. It is compiled away in every
     /// shipped build.
@@ -831,6 +835,7 @@ impl WorkerService {
             hold_next_delivery: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             received: Mutex::new(Vec::new()),
+            said_output_reason: Mutex::new(None),
             #[cfg(feature = "testing")]
             host_cap_looks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
@@ -1950,18 +1955,20 @@ impl WorkerService {
         #[cfg(feature = "testing")]
         self.host_cap_looks
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let (closed, awaits_the_host_cap_lock, times) = {
+        let (closed, awaits_the_host_cap_lock, times, output) = {
             let mut session = self.runtime.session();
             session.collect_output_for_the_caps();
             (
                 session.state() == kr_protocol::session::SessionState::Closed,
                 session.output_awaits_the_host_cap_lock(),
                 session.output_time_index(),
+                session.output_pass_report(),
             )
         };
         if let Some(times) = times {
             let _ = times.flush();
         }
+        self.say_output_reason(&output);
         MaintenancePass {
             closed,
             awaits_the_host_cap_lock,
@@ -1970,7 +1977,7 @@ impl WorkerService {
 
     /// One pass of the host's maintenance.
     fn maintain_once(&self) -> MaintenancePass {
-        let (closed, awaits_the_host_cap_lock, times) = {
+        let (closed, awaits_the_host_cap_lock, times, output) = {
             // Maintenance passes through the same serial boundary a mutation does. Section 9
             // puts the revalidation a discontinuity owes *before* the host serves a mutation,
             // and this barrier is what "before" means here: a mutation either sees the
@@ -2002,6 +2009,7 @@ impl WorkerService {
                     session.state() == kr_protocol::session::SessionState::Closed,
                     session.output_awaits_the_host_cap_lock(),
                     session.output_time_index(),
+                    session.output_pass_report(),
                 )
             }
         };
@@ -2019,10 +2027,36 @@ impl WorkerService {
         // here even when nobody is reading them, so the feed the daemon's attention store reads
         // and every client that follows it hear of it on this tick rather than at the next read.
         let _ = self.questions.sweep(self.question_clock());
+        // Last, since a standard error that has stopped draining holds this write for as long as it
+        // stands, and nothing else of the pass is to wait for it.
+        self.say_output_reason(&output);
         MaintenancePass {
             closed,
             awaits_the_host_cap_lock,
         }
+    }
+
+    /// Says to this worker's standard error why a pass of output retention left output it was
+    /// asked to remove, once while the reason stands.
+    ///
+    /// This is called with neither the session's lock nor the dispatch barrier held. On Unix the
+    /// standard error is where a person looking into a host that keeps more than its cap finds the
+    /// reason: a launchd job's or a detached process's diagnostics file, a transient unit's
+    /// journal. A Windows worker has a console with no window, so nobody reads it there. A write
+    /// that fails is let go: the volume that made the pass leave output behind may well refuse it
+    /// too, and a diagnostic is not worth the session. A write that does not return holds this
+    /// pass and so this host's maintenance, and nothing that serves a person.
+    fn say_output_reason(&self, report: &crate::session::OutputPassReport) {
+        let mut said = self
+            .said_output_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::session::say_output_reason(
+            &mut said,
+            report.reason.as_deref(),
+            report.age_applied,
+            &mut std::io::stderr(),
+        );
     }
 
     /// Runs one pass of the host's maintenance now, for this host's own tests.
@@ -2043,6 +2077,18 @@ impl WorkerService {
     pub fn host_cap_looks(&self) -> u64 {
         self.host_cap_looks
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The reason an output retention pass left output behind that this host last wrote to its
+    /// standard error, for this host's own tests. It waits for a write in progress. It is compiled
+    /// away in every shipped build.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn output_reason_said(&self) -> Option<String> {
+        self.said_output_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Runs the storage half of one maintenance pass now: the journal first, then the broker.
