@@ -213,7 +213,10 @@ fn bounded_chunks_are_verified_and_kept_apart_from_completed_files() {
     assert_eq!(finished.handle.content_digest, digest(&bytes));
 }
 
-/// KR-REQ-14.09: a chunk that does not match its own digest is refused and the upload survives.
+/// KR-REQ-14.09 and KR-REQ-27.05, corrupted chunks: a chunk whose bytes do not match the digest its
+/// sender declared for them is refused, and nothing of it is staged or counted. The upload stays
+/// open for the sender to retry: the same chunk sent whole afterwards is accepted as new, not as a
+/// duplicate of the corrupted one, and the file that publishes is the original, byte for byte.
 #[test]
 fn a_chunk_that_does_not_match_its_digest_is_refused_without_ending_the_upload() {
     let harness = Harness::create();
@@ -222,6 +225,7 @@ fn a_chunk_that_does_not_match_its_digest_is_refused_without_ending_the_upload()
         .begin(&bytes, "application/octet-stream", "notes.bin")
         .expect("reserves the upload");
     let (chunk, _) = chunk_of(&bytes, 0);
+    let corrupted = vec![9; bytes.len()];
     let refusal = harness
         .service
         .upload_chunk(
@@ -229,7 +233,7 @@ fn a_chunk_that_does_not_match_its_digest_is_refused_without_ending_the_upload()
             &UploadChunkParams {
                 transfer_id: begun.transfer_id,
                 chunk,
-                bytes: Bytes::new(vec![9; bytes.len()]),
+                bytes: Bytes::new(corrupted.clone()),
             },
             None,
         )
@@ -249,12 +253,57 @@ fn a_chunk_that_does_not_match_its_digest_is_refused_without_ending_the_upload()
         UploadState::Receiving,
         "a transmission fault is the caller's to retry"
     );
-    harness
-        .send_all(begun.transfer_id, &bytes)
+    let counted = ChunkBitmap::decode(&status.received_chunks, status.layout.chunk_count.get())
+        .expect("a bitmap for this layout");
+    assert_eq!(counted.received(), 0, "the refused chunk is not counted");
+    assert_eq!(
+        status.received_byte_len,
+        U64::new(0),
+        "and none of its bytes are charged as received"
+    );
+    let staged = std::fs::read_dir(harness.service.staging().incomplete().display_path())
+        .expect("reads the incomplete area")
+        .next()
+        .expect("one staged payload")
+        .expect("a directory entry")
+        .path();
+    let staged = std::fs::read(&staged).expect("reads the staged payload");
+    assert!(
+        !staged.starts_with(&corrupted),
+        "none of the corrupted bytes were written to the staged payload: {staged:?}"
+    );
+
+    let (chunk, payload) = chunk_of(&bytes, 0);
+    let retried = harness
+        .service
+        .upload_chunk(
+            &harness.actor,
+            &UploadChunkParams {
+                transfer_id: begun.transfer_id,
+                chunk,
+                bytes: payload,
+            },
+            None,
+        )
         .expect("the retry is accepted");
+    assert!(
+        !retried.duplicate,
+        "the whole chunk is new, not a repeat of the corrupted one"
+    );
     harness
         .finish(begun.transfer_id, &bytes)
         .expect("publishes the attachment");
+    let published = std::fs::read_dir(harness.service.staging().complete().display_path())
+        .expect("reads the completed area")
+        .next()
+        .expect("one published payload")
+        .expect("a directory entry")
+        .path();
+    assert_eq!(
+        std::fs::read(&published).expect("reads the published payload"),
+        bytes,
+        "the published file is the original"
+    );
 }
 
 /// KR-REQ-14.09: a matching duplicate is acknowledged and a conflicting one invalidates.
