@@ -2358,9 +2358,9 @@ fn the_wait_after_deadlines_missed_in_a_row_stops_at_five_minutes() {
 /// else stopped it, or would at the service's next look: a caller who cancelled it after the
 /// daemon's request, before the driver handled the answer, has it end cancelled; a pause that
 /// cancels it past its deadline puts it back in the queue; a session that closed, or a change that
-/// made its description stale, ends it cancelled, whether the service had cancelled the job
-/// already or the closure or the change came before the answer was read. None of those leaves the
-/// next job waiting. The control is a job the daemon never asked to stop, which the process
+/// made its description stale, or a fence on its session, ends it cancelled, whether the service
+/// had cancelled the job already or the closure, the change or the fence came before the answer
+/// was read. None of those leaves the next job waiting. The control is a job the daemon never asked to stop, which the process
 /// stopped and answered cancelled.
 #[test]
 fn a_job_stopped_at_its_deadline_ends_past_it_unless_something_else_stopped_it() {
@@ -2483,6 +2483,36 @@ fn a_job_stopped_at_its_deadline_ends_past_it_unless_something_else_stopped_it()
                 .is_some()
         );
         let after = after.after_ms(2_000);
+        if looked_first {
+            assert_eq!(
+                service.next(&roomy(), after).expect("an instruction"),
+                Instruction::Cancel {
+                    id,
+                    work: Work::Job
+                }
+            );
+        }
+        assert_eq!(
+            service
+                .finished(id, stopped.clone(), after)
+                .expect("the answer"),
+            Outcome::Cancelled {
+                session_id: session(1)
+            },
+            "the service looked first: {looked_first}"
+        );
+        assert_no_wait_for_the_next_job(&mut service, after);
+    }
+
+    // So does a fence on the session, raised without the cancellation that would have reached the
+    // job's token: privacy mode stops the job, whether the service looked first or the answer was.
+    for looked_first in [true, false] {
+        let mut service = self::service();
+        let id = sent(&mut service);
+        service.job_asked_to_stop_at_its_deadline(id);
+        service
+            .fence()
+            .raise(session(1), kr_worker::privacy::PrivacyGeneration::new(1));
         if looked_first {
             assert_eq!(
                 service.next(&roomy(), after).expect("an instruction"),

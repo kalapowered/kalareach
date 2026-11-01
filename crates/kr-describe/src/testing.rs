@@ -231,9 +231,7 @@ pub(crate) fn decided() {
 /// Runs `hook` the next time the service on this thread is about to close the running job's
 /// handle, which is the moment the fate of a job that did not publish is decided: a cancellation
 /// from another thread that arrives here is still accepted, and one that arrives after finds
-/// nothing running. The handle is closed once more when a job's records are cleared, after a
-/// publication or a decision that already closed it, and a cancellation there finds nothing to
-/// stop.
+/// nothing running.
 pub fn at_next_close(hook: impl FnOnce() + 'static) {
     AT_CLOSE.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
 }

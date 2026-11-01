@@ -2599,8 +2599,6 @@ impl InFlightRecords {
 
 impl Drop for InFlightRecords {
     fn drop(&mut self) {
-        #[cfg(feature = "testing")]
-        crate::testing::closing();
         self.running.finished();
         self.in_flight.reconciled(&self.session_id);
     }
