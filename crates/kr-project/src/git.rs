@@ -5981,6 +5981,34 @@ mod tests {
         assert!(refusal.code().retry_category().permits_automatic_retry());
     }
 
+    /// A probe whose time has run out is not waited on past it, and what it wrote is not taken for
+    /// its answer, though all of it is already in the pipe with its end: the pass over the pipe
+    /// stops at the time after the read that finds the bytes, before it reads the end. The writer
+    /// has ended before the pipe is read, so nothing here depends on a clock or on how fast a
+    /// process runs.
+    #[cfg(unix)]
+    #[test]
+    fn what_a_probe_wrote_after_its_time_ran_out_is_not_taken_for_its_answer() {
+        let mut writer = std::process::Command::new("sh")
+            .args(["-c", "echo git version 2.50.1"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("the writer starts");
+        let pipe = writer.stdout.take();
+        writer.wait().expect("the writer ends");
+        let mut heard = Heard::of(pipe).expect("the pipe is read without blocking");
+
+        let outcome = drain(&mut heard, "git --version", Instant::now());
+
+        let Err(Asked::Overran(refusal)) = outcome else {
+            panic!("an answer that was read past the time the probe was given is no answer");
+        };
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+    }
+
     #[test]
     fn a_look_whose_request_stops_is_ended_for_every_request_waiting_for_it() {
         let installation = Installation::looked_for_on(None, PROBE_BOUND);
