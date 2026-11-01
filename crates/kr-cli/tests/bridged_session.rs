@@ -3234,9 +3234,10 @@ impl Runtime {
         })
     }
 
-    /// Why a case that needs this runtime cannot run here, or nothing where it can. A program
-    /// that is there and fails `--version` is no runtime this machine has. One that is there and
-    /// does not answer it fails the case instead.
+    /// Why a case that needs this runtime cannot run here, or nothing where it can. Only a program
+    /// that is not there is a reason: one that is there and fails `--version` is a broken install,
+    /// and one that does not answer it is a stall, and both fail the case that asks, where a skip
+    /// would pass every case that needs the runtime.
     fn why_unavailable(&self) -> Option<String> {
         if !self.installed() {
             return Some(format!(
@@ -3245,13 +3246,13 @@ impl Runtime {
             ));
         }
         let answered = self.call(&["--version"]);
-        (!answered.status.success()).then(|| {
-            format!(
-                "{} is installed and `--version` ended with {}",
-                self.program.display(),
-                answered.status
-            )
-        })
+        assert!(
+            answered.status.success(),
+            "{} is installed and `--version` ended with {}",
+            self.program.display(),
+            answered.status
+        );
+        None
     }
 
     /// Whether this machine has the runtime: [`Runtime::why_unavailable`] has nothing to say.
@@ -3757,6 +3758,21 @@ fn a_removal_that_stalls_is_an_error_and_aborts_nothing_while_an_assertion_fails
             })
             .count()
     };
+    // The runtime is told to remove it by force, whether or not it is running, at once, and to
+    // say nothing of a container that is not there.
+    assert_eq!(
+        recorded_calls(directory.path())
+            .iter()
+            .find(|call| call.starts_with("rm "))
+            .map(String::as_str),
+        Some(format!("rm --force --ignore --time 0 -- {STAND_IN_CONTAINER_ID}").as_str())
+    );
+    // Each call is given no more than the time that is left for them all: the last of them, begun
+    // with less than a call is ordinarily given, is not given that.
+    assert!(
+        !why.contains(&format!("within {STAND_IN_BOUND:?}")),
+        "the last call was given a whole call's time and not what was left: {why}"
+    );
     let asked = removals(directory.path());
     assert!(
         asked >= 2,
@@ -3958,6 +3974,20 @@ fn a_runtime_that_never_answers_its_version_fails_the_case_and_is_not_skipped() 
     assert!(
         !absent.is_available(),
         "a runtime that is not installed is skipped"
+    );
+}
+
+/// A runtime that is installed and fails its `--version` fails the case that asks, where a skip
+/// would pass every case that needs one.
+#[test]
+fn a_runtime_that_fails_its_version_fails_the_case_and_is_not_skipped() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let broken = stand_in_runtime(directory.path(), &[], &["--version"]);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| broken.is_available()));
+    let said = panic_message(failed.expect_err("a runtime that fails its version fails the case"));
+    assert!(
+        said.contains("is installed and `--version` ended with"),
+        "{said}"
     );
 }
 
