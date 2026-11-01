@@ -675,30 +675,44 @@ fn whole_product_figures_are_reported_beside_the_model_ones() {
     assert_eq!(figures.product_without_model_cpu_centis(), 30);
 }
 
-/// KR-REQ-22.11: this host names the background class it actually applied, as the system reads it
-/// back.
+/// KR-REQ-22.11: this host names the background class it applied only where a read on the thread
+/// that took it finds the class: the processor class is named exactly when the thread holds the
+/// lowered one, and the I/O class exactly when the thread reports the one this build lowers to. A
+/// thread can read its own class on Linux and macOS; Windows reads the process's class from
+/// outside, in `tests/supervise.rs`.
 #[test]
 fn this_host_names_the_background_mechanism_it_actually_applied() {
     // The class is the thread's on Linux and the process's on macOS and Windows, so the test notes
     // what it found and puts it back, on a thread of its own.
-    let applied = std::thread::spawn(|| {
+    let (applied, held) = std::thread::spawn(|| {
         let saved = kr_ipc::background::save();
         let applied = enter_background();
+        #[cfg(unix)]
+        let held = support::held_by_this_thread();
+        #[cfg(not(unix))]
+        let held = ();
         saved.restore().expect("the classes are put back");
-        applied
+        (applied, held)
     })
     .join()
     .expect("the thread ends");
 
-    // Whether the change is permitted depends on the host, so the assertion is about honesty
-    // rather than about success: a class is named only when the system reports it, and a class
-    // that is not applied says why.
+    // Whether the change is permitted depends on the host, so what the host names has to agree with
+    // what a read finds: a class is named only when the thread holds it, and a class that is not
+    // applied says why.
     assert_eq!(applied.cpu, applied.mechanism.as_str() != "none");
     if applied.cpu && applied.io {
         assert!(applied.why.is_none());
     } else {
         assert!(applied.why.is_some());
     }
+    #[cfg(unix)]
+    {
+        assert_eq!(applied.cpu, held.cpu_is_lowered(), "{applied:?}: {held:?}");
+        assert_eq!(applied.io, held.io_is_lowered(), "{applied:?}: {held:?}");
+    }
+    #[cfg(not(unix))]
+    let () = held;
 }
 
 /// KR-REQ-22.13: what a platform's thermal zones say of the heat is the worst of them, by how far
