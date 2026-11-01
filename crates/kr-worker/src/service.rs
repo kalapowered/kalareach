@@ -2035,19 +2035,6 @@ impl WorkerService {
         self.maintain_pass();
     }
 
-    /// Runs one pass of the host's maintenance now and then looks again at the host's output cap as
-    /// maintenance does, until the host is not kept from the cap by the lock on it or a minute has
-    /// passed, for this host's own tests. It is compiled away in every shipped build.
-    #[cfg(feature = "testing")]
-    pub async fn maintain_and_look_again_now(&self) {
-        let pass = self.maintain_pass();
-        self.look_again_at_the_host_cap(
-            pass.awaits_the_host_cap_lock,
-            tokio::time::Instant::now() + HOST_MAINTENANCE,
-        )
-        .await;
-    }
-
     /// How many times this host has looked again at the host's output cap, having found the host
     /// over it while another held the lock on it, for this host's own tests. It is compiled away in
     /// every shipped build.
