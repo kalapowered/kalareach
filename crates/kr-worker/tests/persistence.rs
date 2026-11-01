@@ -4446,8 +4446,8 @@ fn fill_standard_error() {
 ///
 /// The worker is this test's own program, started twice with the standard error the case needs:
 /// one that a person reads, and one whose reading end is closed. In each, the host makes two
-/// passes that cannot take the lock on the host's cap, and the session is stopped through the
-/// endpoint.
+/// passes that cannot take the lock on the host's cap, one that finds the host under its cap, and
+/// one that cannot take the lock again, and the session is stopped through the endpoint. A reason that stands is said once; one that goes and comes back is said again.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_refused_write() {
@@ -4460,8 +4460,49 @@ async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_re
         std::panic::set_hook(Box::new(|failure| {
             println!("the worker panicked: {failure}")
         }));
-        let host = host_that_cannot_take_the_cap_lock().await;
+        let cap = OutputRetention::DEFAULT.host_cap_bytes;
+        // A session of two segments, over a host that holds 4,096 bytes over its cap, with a
+        // directory where the lock on the cap goes.
+        let host = host_started(
+            |_| {},
+            |spool| {
+                a_spool_that_puts_the_host_over_its_cap(0)(spool);
+                std::fs::write(spool.join("4096.out"), [b'x'; 4096]).expect("a second segment");
+                let spools = spool.parent().expect("the spools' directory");
+                std::fs::File::options()
+                    .write(true)
+                    .open(spools.join("other.log").join("0.out"))
+                    .and_then(|segment| segment.set_len(cap - 4096))
+                    .expect("the other session's segment");
+                std::fs::create_dir(spools.join("host-cap.lock"))
+                    .expect("a directory where the lock goes");
+            },
+            unix_time_service(true),
+            "sleep 30",
+        )
+        .await;
+        let spools = host._temp.environment().spool_dir();
+        let lock = spools.join("host-cap.lock");
+        // Two passes find the host over its cap and the lock unavailable.
         host.service.maintain_now();
+        host.service.maintain_now();
+        // The lock can be taken: the pass gives up the first segment, and no reason stands.
+        std::fs::remove_dir(&lock).expect("the place is free again");
+        host.service.maintain_now();
+        assert_eq!(
+            kr_worker::history::retained_bytes_under(&spools),
+            cap,
+            "the pass gave up output for the cap"
+        );
+        // The host is over its cap again, with output of this session's to give up, and the lock
+        // is unavailable again: the reason is back.
+        std::fs::File::options()
+            .write(true)
+            .open(spools.join("other.log").join("0.out"))
+            .and_then(|segment| segment.set_len(cap))
+            .expect("the other session's segment");
+        std::fs::remove_file(&lock).expect("the lock file made by the pass");
+        std::fs::create_dir(&lock).expect("a directory where the lock goes");
         host.service.maintain_now();
         let mut client = cli(&host).await;
         close(&mut client, &host).await;
@@ -4482,12 +4523,12 @@ async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_re
         .collect();
     assert_eq!(
         reasons.len(),
-        1,
-        "two passes left the output for one reason, which is said once: {}",
+        2,
+        "one reason, said once while it stood, and again when it came back: {}",
         read.standard_error
     );
     assert!(
-        reasons[0].contains("host-cap.lock"),
+        reasons.iter().all(|line| line.contains("host-cap.lock")),
         "and it names the lock: {reasons:?}"
     );
     assert!(read.standard_output.contains("said true"));
@@ -4635,18 +4676,17 @@ async fn a_standard_error_that_stops_draining_does_not_hold_up_the_stop_of_a_ses
     );
 }
 
-/// The platform's time service as a host reads it: keeping the wall clock, or not.
+/// What the platform's time service reports: keeping the wall clock, or not.
 #[cfg(unix)]
-fn unix_time_service(keeping_the_clock: bool) -> kr_worker::action::time::TimeSources {
-    use kr_worker::action::adapter::{RecordedTimeAdapter, UnixTimex, classify_unix, unix_model};
-    use kr_worker::action::time::{ManualActiveClock, ManualWallClock, TimeSources};
+fn unix_reading(keeping_the_clock: bool) -> kr_protocol::action::TimeAdapterReading {
+    use kr_worker::action::adapter::{UnixTimex, classify_unix, unix_model};
 
     let (status, time_state) = if keeping_the_clock {
         (unix_model::STA_PLL, unix_model::TIME_OK)
     } else {
         (unix_model::STA_UNSYNC, unix_model::TIME_ERROR)
     };
-    let reading = classify_unix(
+    classify_unix(
         "linux",
         "ntp_adjtime(2)",
         UnixTimex {
@@ -4656,46 +4696,193 @@ fn unix_time_service(keeping_the_clock: bool) -> kr_worker::action::time::TimeSo
             esterror_us: 500,
         },
         TimestampMs::new(1_700_000_000_000),
-    );
+    )
+}
+
+/// The clocks of a host that reads the time service through `adapter`.
+#[cfg(unix)]
+fn time_sources_over(
+    adapter: &kr_worker::action::adapter::RecordedTimeAdapter,
+) -> kr_worker::action::time::TimeSources {
+    use kr_worker::action::time::{ManualActiveClock, ManualWallClock, TimeSources};
+
     TimeSources {
         continuous: Arc::new(kr_ipc::clock::ManualSharedClock::new()),
         active: Arc::new(ManualActiveClock::new()),
         wall: Arc::new(ManualWallClock::new(1_700_000_000_000)),
-        adapter: Arc::new(RecordedTimeAdapter::new(reading)),
+        adapter: Arc::new(adapter.clone()),
         floor: None,
     }
 }
 
-/// Section 9, KR-REQ-20.20: the pass a host makes on its tick removes output for its age only
-/// while the host can prove its wall clock. Both hosts hold a segment a week and a day old; the
-/// platform's time service keeps the clock of the first and has stopped keeping the second's.
+/// The clocks of a host whose time service keeps the wall clock, or does not.
+#[cfg(unix)]
+fn unix_time_service(keeping_the_clock: bool) -> kr_worker::action::time::TimeSources {
+    time_sources_over(&kr_worker::action::adapter::RecordedTimeAdapter::new(
+        unix_reading(keeping_the_clock),
+    ))
+}
+
+/// Section 9, KR-REQ-20.20: the pass a host makes on its tick looks at the clocks before it acts,
+/// and removes output for its age only while the host can prove its wall clock. Both hosts hold a
+/// segment a week and a day old. The first pass of the second cannot write the spool's boundary, so
+/// it removes nothing though the clock is proved; then the platform's time service stops keeping
+/// the clock and the boundary can be written, and the second pass removes nothing again. The first
+/// host's time service goes on keeping its clock, and its pass removes the segment.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_pass_removes_output_by_age_only_while_the_hosts_wall_clock_can_be_proved() {
-    let proved = host_started(
+    use kr_worker::action::adapter::RecordedTimeAdapter;
+
+    let kept = RecordedTimeAdapter::new(unix_reading(true));
+    let lost = RecordedTimeAdapter::new(unix_reading(true));
+    let keeping = host_started(
         |_| {},
         a_segment_written(8),
-        unix_time_service(true),
+        time_sources_over(&kept),
         "sleep 30",
     )
     .await;
-    let unproved = host_started(
+    let losing = host_started(
         |_| {},
         a_segment_written(8),
-        unix_time_service(false),
+        time_sources_over(&lost),
         "sleep 30",
     )
     .await;
-    proved.service.maintain_now();
-    unproved.service.maintain_now();
+    let retained = |host: &Host| {
+        kr_worker::history::retained_bytes_under(&host._temp.environment().spool_dir())
+    };
+
+    let boundary = losing
+        ._temp
+        .environment()
+        .session_spool(losing.session_id)
+        .join("boundary");
+    std::fs::create_dir(&boundary).expect("a directory where the boundary goes");
+    losing.service.maintain_now();
     assert_eq!(
-        kr_worker::history::retained_bytes_under(&proved._temp.environment().spool_dir()),
-        0,
-        "a clock that can be proved calls the segment expired"
-    );
-    assert_eq!(
-        kr_worker::history::retained_bytes_under(&unproved._temp.environment().spool_dir()),
+        retained(&losing),
         4096,
-        "and one that cannot is not trusted to"
+        "a pass that cannot write the boundary removes nothing"
+    );
+
+    lost.set(unix_reading(false));
+    std::fs::remove_dir(&boundary).expect("the place is free again");
+    losing.service.maintain_now();
+    assert_eq!(
+        retained(&losing),
+        4096,
+        "and one that finds the time service has stopped keeping the clock removes nothing by age"
+    );
+
+    keeping.service.maintain_now();
+    assert_eq!(
+        retained(&keeping),
+        0,
+        "where the clock can be proved the segment is expired"
+    );
+}
+
+/// Section 9 and section 20, KR-REQ-20.20: a look at the host's cap says what it finds, and does
+/// not say again what the pass before it said. The host's output is a week and a day old, over the
+/// host's cap, and the lock on the cap is held by another host. The host's first pass cannot write
+/// the spool's boundary, so it says why it left the old output; the looks that follow apply no age
+/// bound and find no reason, which does not make the next pass say it again. Then the lock file is
+/// replaced by a directory, and the look that cannot take the lock says so.
+///
+/// The worker is this test's own program, with a standard error a person reads.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_look_at_the_host_cap_says_what_it_finds_and_does_not_say_again_what_a_pass_said() {
+    const NAME: &str =
+        "a_look_at_the_host_cap_says_what_it_finds_and_does_not_say_again_what_a_pass_said";
+
+    if in_the_worker_process() {
+        std::panic::set_hook(Box::new(|failure| {
+            println!("the worker panicked: {failure}")
+        }));
+        let host = host_started(
+            |_| {},
+            a_spool_that_puts_the_host_over_its_cap(8),
+            unix_time_service(true),
+            "sleep 30",
+        )
+        .await;
+        let spools = host._temp.environment().spool_dir();
+        // Another host is giving up output for the cap, and the boundary cannot be written. Both
+        // are set before the host's own maintenance, which runs once this case first waits.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(spools.join("host-cap.lock"))
+            .expect("the lock file");
+        kr_flush::lock::try_exclusive(&held).expect("nobody holds the lock");
+        std::fs::create_dir(
+            host._temp
+                .environment()
+                .session_spool(host.session_id)
+                .join("boundary"),
+        )
+        .expect("a directory where the boundary goes");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        // The first look has ended when the second begins.
+        while host.service.host_cap_looks() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the host looked at the cap twice"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // A pass that finds the same reason after those looks.
+        host.service.maintain_now();
+
+        std::fs::rename(spools.join("host-cap.lock"), spools.join("lock-held"))
+            .expect("the held lock file is moved aside");
+        std::fs::create_dir(spools.join("host-cap.lock")).expect("a directory where the lock goes");
+        while !host
+            .service
+            .output_reason_said()
+            .is_some_and(|reason| reason.contains("host-cap.lock"))
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a look found the lock unavailable and said so"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let mut client = cli(&host).await;
+        close(&mut client, &host).await;
+        drop(held);
+        return;
+    }
+
+    let read = run_in_a_worker_process(NAME, StandardError::Read);
+    assert!(
+        read.ended_well && read.standard_output.contains("1 passed"),
+        "the worker ended badly: {}",
+        read.standard_output
+    );
+    let reasons: Vec<&str> = read
+        .standard_error
+        .lines()
+        .filter(|line| line.contains("output retention left output it was asked to remove"))
+        .collect();
+    assert_eq!(
+        reasons.len(),
+        2,
+        "the pass said why it left the old output once, and the look said the lock: {}",
+        read.standard_error
+    );
+    assert!(
+        reasons[0].contains("boundary"),
+        "the pass says the boundary: {reasons:?}"
+    );
+    assert!(
+        reasons[1].contains("host-cap.lock"),
+        "and the look the lock: {reasons:?}"
     );
 }
