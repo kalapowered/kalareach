@@ -312,12 +312,16 @@ impl Drop for World {
         // The destination's daemon was started by a helper and is its own, so it is asked to make
         // way the way the product's own update asks, and the tree then ends what it started.
         self.stop_destination_daemon();
-        if let Some(mut daemon) = self.daemon.take()
-            && let Err(error) = daemon.kill().and_then(|()| daemon.wait().map(|_| ()))
-        {
-            self.source.hold(format!(
-                "the source daemon this test started could not be established as ended: {error}"
-            ));
+        if let Some(mut daemon) = self.daemon.take() {
+            // Killed and collected within a bound: a daemon that does not go is reported, and not
+            // waited for.
+            let failed = user_manager::kill_and_collect(&mut daemon);
+            if !failed.is_empty() {
+                self.source.hold(format!(
+                    "the source daemon this test started could not be established as \
+                     ended{failed}"
+                ));
+            }
         }
     }
 }
@@ -4282,6 +4286,85 @@ fn a_call_that_ended_and_left_something_holding_its_output_fails_and_names_the_c
         held.gone_within(Duration::from_secs(20)),
         "the descendant did not end when it was let go"
     );
+}
+
+/// A call that ended while something it started still holds one of its streams fails, whichever
+/// stream that is: a call that read only one of them would pass the case that holds the other.
+///
+/// What holds the stream holds it until the case lets it go, so the failure does not depend on how
+/// soon anything runs, and the call is given a second for its streams to end instead of ten.
+#[test]
+fn a_call_that_ended_and_left_something_holding_one_of_its_streams_fails() {
+    for (held, redirect) in [
+        ("standard output", "2>/dev/null"),
+        ("standard error", ">/dev/null"),
+    ] {
+        let directory = tempfile::tempdir().expect("a directory");
+        let descendant = HeldDescendant {
+            release: directory.path().join("release"),
+            pid: directory.path().join("descendant.pid"),
+        };
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "( while [ ! -e \"$1\" ] && kill -0 \"$3\" 2>/dev/null; do sleep 0.1; done ) \
+                 {redirect} & echo $! > \"$2\"; echo answered; exit 0"
+            ))
+            .arg("program")
+            .arg(&descendant.release)
+            .arg(&descendant.pid)
+            .arg(std::process::id().to_string());
+        let why =
+            user_manager::bounded_within(command, Duration::from_secs(60), Duration::from_secs(1))
+                .expect_err("a stream that is still held is a failure");
+        assert!(
+            why.contains("still holds its output"),
+            "{held} held by the descendant: {why}"
+        );
+        descendant.let_go();
+        assert!(
+            descendant.gone_within(Duration::from_secs(20)),
+            "the descendant did not end when it was let go"
+        );
+    }
+}
+
+/// A child that does not end when it is asked to is ended after it was asked, and collected, where
+/// a harness that only asked would wait for it to the end of the time it gives a child that is
+/// gone.
+#[test]
+fn a_child_that_ignores_the_request_to_end_is_killed_after_it_and_collected() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let ready = directory.path().join("ready");
+    let mut child = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        // It says that it ignores the request before the case asks it.
+        .arg("trap '' TERM; : > \"$1\"; while :; do sleep 1; done")
+        .arg("program")
+        .arg(&ready)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("starts a child");
+    let begun = Instant::now();
+    while !ready.exists() {
+        assert!(
+            begun.elapsed() < LIVENESS_DEADLINE,
+            "the child never said that it ignores the request"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let failed = user_manager::end_and_collect_asking_for(&mut child, Duration::from_millis(200));
+    let collected = child.try_wait().expect("its state").is_some();
+    if !collected {
+        // The harness did not end it: it is ended here, so that it does not outlast the case.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(collected, "the child was not collected: {failed}");
+    assert_eq!(failed, "", "ending it failed");
 }
 
 /// Run by the case below as a process of its own, with a `PATH` that holds a `systemctl` the case

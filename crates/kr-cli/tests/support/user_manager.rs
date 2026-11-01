@@ -103,17 +103,30 @@ const ASKED_TO_END_FOR: Duration = Duration::from_secs(5);
 /// step was running, which goes on after the build that wanted it. The request is a signal sent
 /// from this process, so it takes no turn to start a program and waits for nothing.
 pub fn end_and_collect(child: &mut std::process::Child) -> String {
-    let mut failed = String::new();
+    end_and_collect_asking_for(child, ASKED_TO_END_FOR)
+}
+
+/// [`end_and_collect`], giving the child `asked_for` to end when it is asked.
+pub fn end_and_collect_asking_for(child: &mut std::process::Child, asked_for: Duration) -> String {
     let asked = i32::try_from(child.id())
         .ok()
         .and_then(rustix::process::Pid::from_raw)
         .map(|pid| rustix::process::kill_process(pid, rustix::process::Signal::TERM));
     let begun = Instant::now();
     if matches!(asked, Some(Ok(()))) {
-        while matches!(child.try_wait(), Ok(None)) && begun.elapsed() < ASKED_TO_END_FOR {
+        while matches!(child.try_wait(), Ok(None)) && begun.elapsed() < asked_for {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+    kill_and_collect(child)
+}
+
+/// Kills one of this test's own children that it has not collected, if it is still running, and
+/// collects it within [`STREAMS_DEADLINE`], where a wait for it would hold the case for as long as
+/// a child that does not go (one stuck in the kernel) stays. Returns what of that failed, as text
+/// to add to a reason, or nothing.
+pub fn kill_and_collect(child: &mut std::process::Child) -> String {
+    let mut failed = String::new();
     if matches!(child.try_wait(), Ok(None))
         && let Err(error) = child.kill()
     {
@@ -167,7 +180,16 @@ pub fn says_there_is_no_user_manager(stderr: &str) -> bool {
 /// [`ASKED_TO_END_FOR`] to end when asked and [`STREAMS_DEADLINE`] to be collected, and what it
 /// printed is given [`STREAMS_DEADLINE`] to reach its end. A call that ended while something it
 /// started still holds its output is a failure, and names the call.
-pub fn bounded(mut command: Command, bound: Duration) -> Result<Output, String> {
+pub fn bounded(command: Command, bound: Duration) -> Result<Output, String> {
+    bounded_within(command, bound, STREAMS_DEADLINE)
+}
+
+/// [`bounded`], giving what the call printed `streams_within` to reach its end where it ended.
+pub fn bounded_within(
+    mut command: Command,
+    bound: Duration,
+    streams_within: Duration,
+) -> Result<Output, String> {
     let what = format!("{command:?}");
     let begun = Instant::now();
     let mut child = spawning_before(begun + bound, || {
@@ -206,7 +228,7 @@ pub fn bounded(mut command: Command, bound: Duration) -> Result<Output, String> 
             }
         }
     };
-    let until = Instant::now() + STREAMS_DEADLINE;
+    let until = Instant::now() + streams_within;
     let collect = |stream: Option<Receiver<Vec<u8>>>| match stream {
         None => Ok(Vec::new()),
         Some(stream) => stream
@@ -214,7 +236,7 @@ pub fn bounded(mut command: Command, bound: Duration) -> Result<Output, String> 
             .map_err(|_| {
                 format!(
                     "{what} ended, and something it started still holds its output after \
-                     {STREAMS_DEADLINE:?}"
+                     {streams_within:?}"
                 )
             }),
     };
@@ -437,9 +459,16 @@ impl Drop for UserManager {
             while matches!(process.try_wait(), Ok(None)) && begun.elapsed() < STREAMS_DEADLINE {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            // This test's own child, not collected yet, so the number is still its.
-            let _ = process.kill();
-            let _ = process.wait();
+            // This test's own child, not collected yet, so the number is still its. A child that
+            // does not go is reported, and not waited for.
+            let failed = kill_and_collect(&mut process);
+            if !failed.is_empty() {
+                eprintln!("the test's user manager's own process{failed}");
+                self.holder.hold(format!(
+                    "the process of the test's user manager could not be established as ended\
+                     {failed}"
+                ));
+            }
         }
         // Whether the scope is gone is asked of the manager that held it: a scope with nothing
         // left in it goes by itself, and the manager then describes it as inactive. Only an answer
