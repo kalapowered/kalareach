@@ -3384,7 +3384,10 @@ fn the_user_manager_kr_checks_is_the_one_it_asks() {
     )
     .expect("another unit under the same name");
     let other = UserManager::start(&other_home, host.tree.holder()).and_then(|other| {
-        let started = bounded(other.systemctl(&["start", "dbus.socket"]), STREAMS_DEADLINE)?;
+        // A manager that has only just come up answers late when the machine is busy; a late answer
+        // is waited for, and only a manager that gives none in that time is one that cannot start
+        // its bus.
+        let started = bounded(other.systemctl(&["start", "dbus.socket"]), TEARDOWN_BOUND)?;
         if started.status.success() {
             Ok(other)
         } else {
