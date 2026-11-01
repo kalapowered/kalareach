@@ -186,6 +186,9 @@ pub struct BackupSetup {
     /// Where a test stops the next `backup.status` between its two reads.
     #[cfg(feature = "testing")]
     status_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// How many reads of the storage state the service answered with a refusal.
+    #[cfg(feature = "testing")]
+    refused_reads: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for BackupSetup {
@@ -340,7 +343,17 @@ impl BackupSetup {
             calls: Arc::new(Mutex::new(Calls::default())),
             #[cfg(feature = "testing")]
             status_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            refused_reads: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// How many reads of the storage state that `backup.status` makes the service has answered with
+    /// a refusal, for a test that needs to tell a read the service refused from one that a bound cut
+    /// before the answer came.
+    #[cfg(feature = "testing")]
+    pub fn refused_reads(&self) -> u64 {
+        self.refused_reads.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Stops the next `backup.status` between its two reads. Returns the end that says it has
@@ -513,6 +526,11 @@ impl BackupSetup {
                 deleted_still_charged_bytes: U64::new(status.tombstoned.bytes),
             },
             Ok(Err(error)) => {
+                #[cfg(feature = "testing")]
+                if matches!(error, ClientError::Refused { .. }) {
+                    self.refused_reads
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 self.owe(Hold::of(&error));
                 BackupStorageState::Unread {
                     why: BackupStorageUnread::Failed,

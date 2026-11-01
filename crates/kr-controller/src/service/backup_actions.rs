@@ -183,6 +183,16 @@ impl Controller {
             .map(|setup| setup.pause_the_next_status_between_its_reads())
     }
 
+    /// How many reads of the storage state that `backup.status` makes the service has answered with
+    /// a refusal, for a suite that needs to tell a read the service refused from one that a bound
+    /// cut before the answer came.
+    #[cfg(feature = "testing")]
+    pub fn backup_status_reads_refused(&self) -> u64 {
+        self.backup_setup
+            .as_ref()
+            .map_or(0, |setup| setup.refused_reads())
+    }
+
     fn backup_setup_of(&self) -> Result<&std::sync::Arc<crate::backup::setup::BackupSetup>> {
         self.backup_setup.as_ref().ok_or_else(|| {
             ControllerError::NotConfigured(format!(
