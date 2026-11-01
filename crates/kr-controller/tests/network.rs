@@ -513,6 +513,23 @@ fn runs_where_the_host_put_it(host: &Host, session_id: SessionId) {
     let _ = pid;
 }
 
+/// Returns the socket the host gave the worker of `session_id`: the endpoint its paths derive from
+/// the worker's display number in the registry.
+fn workers_socket(host: &Host, session_id: SessionId) -> String {
+    let registry = Registry::open(host.paths().registry_database(), host.environment_id)
+        .expect("opens the registry");
+    let worker = registry
+        .workers()
+        .expect("reads the worker records")
+        .into_iter()
+        .find(|worker| worker.session_id == session_id)
+        .expect("the created session has a worker record");
+    host.paths()
+        .worker_endpoint(worker.display_number)
+        .expect("the worker's socket path fits the platform")
+        .as_text()
+}
+
 /// Returns the workspace this test was built from.
 fn workspace_root() -> PathBuf {
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -4078,12 +4095,14 @@ async fn a_listing_names_only_the_sessions_a_grant_admits() {
 /// what a device is held back from on purpose: the socket of the session's worker, which this case
 /// shows, the name of the desktop a session is bound to, and the detail of what a closed session
 /// left behind, which this session has neither of. A grant's history bound can narrow a read too
-/// (the last command block), and this session has no block to narrow. The grant decides what a device may ask about, and a filter on one door beyond
-/// those the host guide lists would make the two ingresses disagree about what the same method
-/// means. Two things each door reads differently here, on purpose. The owner at their own machine
-/// is told whose account the environment belongs to, where its directories are and the path of a
-/// worker's socket, and a paired device reads the same answers with every account name, local path
-/// and platform message held to its class and its length.
+/// (the last command block), and this session has no block to narrow. The grant decides what a
+/// device may ask about, and a filter on one door beyond those the host guide lists would make the
+/// two ingresses disagree about what the same method means.
+///
+/// The host reads differ on purpose. The owner at their own machine is told whose account the
+/// environment belongs to, where its directories are and the path of a worker's socket, and a
+/// paired device reads the same answers with every account name, local path and platform message
+/// held to its class and its length.
 ///
 /// What this demonstrates is both halves: parity for the session reads but for the socket, and the
 /// reduced form of `host.info`, `environment.list` and the session's `endpoint` for the device. The
@@ -4094,7 +4113,8 @@ async fn a_listing_names_only_the_sessions_a_grant_admits() {
 // silently when that binary was absent would report a pass for something it never ran.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_same_method_answers_both_ingresses_alike_once_the_grant_admits_the_subject() {
+async fn the_methods_a_grant_admits_answer_both_ingresses_but_for_what_a_device_is_held_back_from()
+{
     let host = Host::create();
     let owner = DeviceKeys::generate().expect("owner keys");
     let daemon = host.start(loopback(), &owner).await;
@@ -4232,10 +4252,22 @@ async fn the_same_method_answers_both_ingresses_alike_once_the_grant_admits_the_
         .0
         .clone()
         .expect("the owner is told the socket of the session's worker");
+    // The path itself is the one the host gave the worker, from the worker's display number in the
+    // registry and the paths the host derives its sockets with, and the create answered with it.
+    let given = workers_socket(&host, session_id);
     assert_eq!(
-        locally.endpoint, created.endpoint,
-        "the owner is told the socket the worker listens on, which the create answered with"
+        socket, given,
+        "the owner is told the socket the host gave the worker"
     );
+    assert_eq!(
+        created.endpoint.0.as_deref(),
+        Some(given.as_str()),
+        "and the create answered with the same socket"
+    );
+    // And it is the socket the worker listens on.
+    #[cfg(unix)]
+    std::os::unix::net::UnixStream::connect(&socket)
+        .unwrap_or_else(|error| panic!("the worker listens on {socket}: {error}"));
     assert_eq!(
         remotely.endpoint.0,
         Some(kr_protocol::hostinfo::export::withheld(
