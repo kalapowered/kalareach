@@ -2600,3 +2600,54 @@ fn each_kind_follows_the_journals_uncertainty_rules() {
         assert!(!view.detail.contains(SECRET_PART), "{view:?}");
     }
 }
+
+/// Diagnostic: an enabled webhook configured right after the owner is bootstrapped, and what the
+/// journal holds naming it a moment later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn probe_a_webhook_meets_the_pairing_notice() {
+    let rounds: usize = std::env::var("PROBE_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
+    let enabled = std::env::var("PROBE_ENABLED").map_or(true, |value| value != "0");
+    let mut history = 0;
+    for round in 0..rounds {
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host = net_support::Host::start(&owner).await;
+        let delivery = host.controller().delivery();
+        let mut record = webhook("configured");
+        record.enabled = enabled;
+        delivery.configure(&record).expect("a webhook");
+        let started = tokio::time::Instant::now();
+        let mut named = Vec::new();
+        while named.is_empty() && started.elapsed() < std::time::Duration::from_secs(4) {
+            named = delivery
+                .with(|producer| Ok(producer.journal().deliveries().expect("a read")))
+                .expect("a read")
+                .into_iter()
+                .filter(|held| held.destination_id == identifier("configured"))
+                .map(|held| {
+                    format!(
+                        "{:?} event={} detail={:?}",
+                        held.state,
+                        held.event.stored(),
+                        held.detail
+                    )
+                })
+                .collect();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let removal = delivery
+            .remove(&identifier("configured"), kr_ipc::now_ms().get())
+            .expect("the destination goes");
+        history += usize::from(removal.kept_as_history);
+        eprintln!(
+            "probe round {round}: enabled={enabled} found={} kept_as_history={} after={:?} named={named:?}",
+            removal.found,
+            removal.kept_as_history,
+            started.elapsed()
+        );
+        host.stop().await;
+    }
+    eprintln!("probe summary: enabled={enabled} kept_as_history in {history} of {rounds} rounds");
+}
