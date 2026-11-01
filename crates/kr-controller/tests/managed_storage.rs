@@ -6404,6 +6404,57 @@ async fn a_delay_named_in_an_answer_that_ends_the_call_at_once_is_owed() {
     }
 }
 
+/// KR-REQ-09.09: a delay the service names in the answer to a request that is out when a fence
+/// lands stays owed, though the call is refused for the fence and is not told it. The enrolment is
+/// held, the fence raised and the enrolment let go, and the service refuses it as rate limiting for
+/// 30 seconds. The control: with the fence let go, the same call is told the delay at its first
+/// request, which does not leave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delay_named_by_a_request_that_is_out_when_a_fence_lands_stays_owed_though_the_call_is_refused()
+ {
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(
+        MANIFEST,
+        1,
+        Moment::SlowRefuse {
+            status: 429,
+            code: "RATE_LIMITED",
+            retry_after_seconds: Some(30),
+        },
+    );
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the enrolment", web.requests_reach(MANIFEST, 1)).await;
+    assert_eq!(the_delay_the_host_owes(&rig), None);
+    rig.controller.hold_fence(true);
+    web.release_held();
+    let refusal = call
+        .await
+        .expect("the call ends")
+        .expect_err("a call is refused while a fence is owed, whatever else it meets");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(refusal.message.contains("fence"), "{}", refusal.message);
+    assert_eq!(web.requests_to(RETENTION), 0, "retention was not changed");
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+    assert_eq!(
+        the_delay_the_host_owes(&rig),
+        Some(Duration::from_secs(30)),
+        "the delay the refusal named was not owed"
+    );
+
+    rig.controller.hold_fence(false);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_some()
+    ));
+    assert_eq!(
+        web.requests_to(MANIFEST),
+        1,
+        "the delay kept the control call from enrolling again"
+    );
+}
+
 /// KR-REQ-09.09: a delay the service named while the call waits on it holds back the request that
 /// follows: the enrolment after the bundle write, the read of the storage state after the
 /// enrolment, and the retention change after that read. The call ends as unknown with the delay and
