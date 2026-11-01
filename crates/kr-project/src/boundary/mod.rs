@@ -656,6 +656,60 @@ mod tests {
         );
     }
 
+    /// A directory a record names that is not there when the invocation opens it is a source that
+    /// changed, as one that is another object is, and not an argument the caller got wrong. It is
+    /// the state of a recorded tree that goes after the caller opened it and before the invocation
+    /// does. A place that cannot be opened for another reason keeps its answer, and so does an open
+    /// that names no record.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_directory_that_is_gone_when_the_invocation_opens_it_is_a_source_that_changed() {
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([13; 16]));
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let directory = root.path().join("tree");
+        std::fs::create_dir(&directory).expect("the directory");
+        let recorded = AuthorisedDirectory::open_root(environment_id, &directory)
+            .expect("the directory opens")
+            .identity();
+        std::fs::remove_dir(&directory).expect("the directory goes");
+
+        let gone = OpenedDirectory::open(environment_id, &directory, Some(recorded))
+            .expect_err("nothing is there to open");
+        assert_eq!(
+            gone.code(),
+            kr_protocol::error::ErrorCode::SourceChanged,
+            "{gone}"
+        );
+
+        std::os::unix::fs::symlink(root.path().join("nowhere"), &directory)
+            .expect("a link to nothing takes the place");
+        let dangling = OpenedDirectory::open(environment_id, &directory, Some(recorded))
+            .expect_err("a link that leads nowhere is nothing at the place");
+        assert_eq!(
+            dangling.code(),
+            kr_protocol::error::ErrorCode::SourceChanged,
+            "{dangling}"
+        );
+
+        // With no record there is no source to have changed, and a parent that is now a file is
+        // the caller's to put right whether or not a record names the directory.
+        let unrecorded = OpenedDirectory::open(environment_id, &directory, None)
+            .expect_err("nothing is there to open");
+        assert!(
+            matches!(unrecorded, ProjectError::Destination { .. }),
+            "{unrecorded:?}"
+        );
+        let parent = root.path().join("parent");
+        std::fs::write(&parent, "a file now").expect("the parent is a regular file");
+        let beneath_a_file =
+            OpenedDirectory::open(environment_id, &parent.join("tree"), Some(recorded))
+                .expect_err("nothing can be below a file");
+        assert!(
+            matches!(beneath_a_file, ProjectError::Destination { .. }),
+            "{beneath_a_file:?}"
+        );
+    }
+
     /// A platform that runs no Git refuses every request that needs it under a code a client does
     /// not send again, with the platform's reason and no step to install Git, which would change
     /// nothing there.
