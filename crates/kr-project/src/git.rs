@@ -785,8 +785,7 @@ enum Unfound {
     /// The look was cut short by something that passes: the time it was given ran out, the host was
     /// short of what it needs to ask or to resolve it, it could not wait on, collect or read from
     /// the program, or the look ended without an answer. Nothing is known of the Git that was
-    /// being asked, and
-    /// asking again later can find it.
+    /// being asked, and asking again later can find it.
     Passing(Diagnostic),
 }
 
@@ -3907,7 +3906,11 @@ fn too_much(described: &str) -> Asked {
 /// probe's time took in nothing, since nothing is taken in then, so the end may have come in time.
 /// A read that returned at or after it is not known to have found the pipe as it was, since it may
 /// have waited for it. And a read that began before the second does not decide, however long the
-/// pause after it: the end may have come during the pause, so another read follows.
+/// pause after it: the end may have come during the pause, so another read follows. All of this
+/// is Unix's, where this host reads the pipe itself. Elsewhere a thread takes in the output and
+/// nothing stops it at the time: the wait there ends when that thread has, one still running at
+/// the second is blamed on the program, and what it took in after the time is not told from what
+/// came before. No request reaches that, since a platform that reads that way runs no Git.
 fn drain(heard: &mut Heard, described: &str, deadline: Instant) -> std::result::Result<(), Asked> {
     let drain = drain_until(Instant::now(), deadline);
     loop {

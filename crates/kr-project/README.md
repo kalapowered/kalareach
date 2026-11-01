@@ -31,13 +31,13 @@ the end of its output is seen, even when the wait is not looked at again until t
 whatever a read returns after it, bytes or an end, is not taken: the look is refused as
 `UPSTREAM_UNAVAILABLE`; the other refusals are `HOST_NOT_CONFIGURED`, among them a program that has
 ended and left its output open for a second inside the time it was given, as a read made after that
-second and inside the time found it. A look is made by one
-request at a time, and a request that arrives while one is under way waits for that look and shares
-its result, so a program that hangs is started once for all of them. A copy of Git under the helper
-directory that does not answer in time, or answers with more, refuses the whole look. One that
-cannot run, or answers differently, leaves the program on the search path as the one that runs. A
-host that is short of descriptors, processes or memory when a copy is started refuses the look
-rather than taking the copy for one that cannot run.
+second and inside the time found it. A look is made by one request at a time, and a request that
+arrives while one is under way waits for that look and shares its result, so a program that hangs is
+started once for all of them. A copy of Git under the helper directory that does not answer in time,
+or answers with more, refuses the whole look. One that cannot run, or answers differently, leaves
+the program on the search path as the one that runs. A host that is short of descriptors, processes
+or memory when a copy is started refuses the look rather than taking the copy for one that cannot
+run.
 
 ## Why there is one
 

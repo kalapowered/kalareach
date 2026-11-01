@@ -295,8 +295,8 @@ impl OpenedDirectory {
     ) -> Result<Self> {
         let gone = || ProjectError::IdentityChanged {
             detail: format!(
-                "this record names a directory, and {} holds nothing now; the invocation is not \
-                 enclosed around it",
+                "the directory this invocation is to run in was identified when it was opened, and \
+                 {} holds nothing now; the invocation is not enclosed around it",
                 crate::git::redact(&path.display().to_string())
             )
             .into(),
@@ -320,8 +320,9 @@ impl OpenedDirectory {
         {
             return Err(ProjectError::IdentityChanged {
                 detail: format!(
-                    "this record names the directory {expected}, and {} holds {identity}; the \
-                     invocation is not enclosed around it",
+                    "the directory this invocation is to run in was identified as {expected} when \
+                     it was opened, and {} holds {identity}; the invocation is not enclosed around \
+                     it",
                     crate::git::redact(&path.display().to_string())
                 )
                 .into(),
