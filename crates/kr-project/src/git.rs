@@ -3980,9 +3980,9 @@ fn could_not_run(described: &str, error: &std::io::Error) -> Asked {
     }
 }
 
-/// Whether a failure to start a program, or to resolve the path that names it, says the host, and
-/// not the program, is short of something.
-fn short_of_resources(error: &std::io::Error) -> bool {
+/// Whether a failure to start a program, to resolve the path that names it, or to open a directory,
+/// says the host, and not the program or the place, is short of something.
+pub(crate) fn short_of_resources(error: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
         use rustix::io::Errno;

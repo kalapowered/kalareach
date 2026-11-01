@@ -1174,8 +1174,8 @@ fn open_recorded_root(
 }
 
 /// Opens the directory at `path` with this process's own authority, which is how the place a
-/// record names for its tree is opened.
-fn open_directory(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+/// record names for its tree, and the directory an invocation runs in, are opened.
+pub(crate) fn open_directory(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
     // A case that asks for it has the tree go here, at the instant of the open. Whatever looked at
     // the path before the caller got here is behind it, and nothing else stands between it and the
     // open.
@@ -1185,7 +1185,21 @@ fn open_directory(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
             std::fs::remove_dir(going).expect("the case's tree goes");
         }
     });
-    cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
+    // A case that asks for it has the open fail as it does for a host that is out of descriptors.
+    #[cfg(all(test, unix))]
+    if let Some(error) = tests::OPEN_FAILS.with(std::cell::Cell::get) {
+        return Err(std::io::Error::from(error));
+    }
+    let opened = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority());
+    // A case that asks for it has the place change right after the open has answered, so that a
+    // second open, or any look at the place, finds something else.
+    #[cfg(all(test, unix))]
+    tests::AFTER_THE_OPEN.with(|after| {
+        if let Some(after) = after.take() {
+            after();
+        }
+    });
+    opened
 }
 
 /// Returns the refusal for a directory that is not the working tree a record names.
@@ -1656,6 +1670,13 @@ mod tests {
         /// of a recorded tree's place is made on its own thread, in the function that opens it.
         pub(super) static REMOVED_BEFORE_THE_OPEN: std::cell::Cell<Option<PathBuf>> =
             const { std::cell::Cell::new(None) };
+        /// Set by a case to make every open on its own thread fail with this error.
+        pub(super) static OPEN_FAILS: std::cell::Cell<Option<rustix::io::Errno>> =
+            const { std::cell::Cell::new(None) };
+        /// Set by a case to run something once on its own thread right after the next open has
+        /// answered, whether it opened the place or not.
+        pub(super) static AFTER_THE_OPEN: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::Cell::new(None) };
     }
 
     /// The tree is there until the open and gone when the open is made, as it is for a tree that
@@ -1741,6 +1762,124 @@ mod tests {
             return;
         };
         assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{refused}");
+    }
+
+    /// Opens the place `route` stands for, and returns what it was refused with: 0 is the place a
+    /// record names for its tree, 1 the directory an invocation runs in with no identity held for
+    /// it, and 2 the same with the identity of `held`.
+    #[cfg(unix)]
+    fn refused_open(
+        route: usize,
+        environment_id: EnvironmentId,
+        path: &Path,
+        recorded: RecordedIdentity,
+        held: ObjectIdentity,
+    ) -> ProjectError {
+        match route {
+            0 => open_recorded_root(environment_id, path, recorded).map(|_| ()),
+            1 => crate::boundary::OpenedDirectory::open(environment_id, path, None).map(|_| ()),
+            _ => {
+                crate::boundary::OpenedDirectory::open(environment_id, path, Some(held)).map(|_| ())
+            }
+        }
+        .expect_err("the open was refused")
+    }
+
+    /// A host out of descriptors, processes or memory says nothing of the place it was asked to
+    /// open, so the open is a fault that passes, which a client sends the request again after, on
+    /// each route that opens a place: a recorded tree's, and an invocation's with and without an
+    /// identity held for it. Any other failure of the open is still the caller's argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_descriptors_at_the_open_of_a_place_is_a_fault_that_passes() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let (environment_id, tree, recorded) = recorded_tree_in(root.path());
+        let held = AuthorisedDirectory::open_root(environment_id, &tree)
+            .expect("the tree opens")
+            .identity();
+
+        for (errno, passes) in [
+            (rustix::io::Errno::MFILE, true),
+            (rustix::io::Errno::NFILE, true),
+            (rustix::io::Errno::NOMEM, true),
+            (rustix::io::Errno::IO, false),
+        ] {
+            for route in 0..3 {
+                OPEN_FAILS.with(|fails| fails.set(Some(errno)));
+                let refused = refused_open(route, environment_id, &tree, recorded, held);
+                OPEN_FAILS.with(|fails| fails.set(None));
+
+                let row = format!("{errno} on route {route}: {refused}");
+                assert_eq!(
+                    refused.code(),
+                    if passes {
+                        ErrorCode::UpstreamUnavailable
+                    } else {
+                        ErrorCode::InvalidArgument
+                    },
+                    "{row}"
+                );
+                assert_eq!(
+                    refused.code().retry_category().permits_automatic_retry(),
+                    passes,
+                    "{row}"
+                );
+                let said = refused.to_string();
+                assert!(
+                    said.contains(&std::io::Error::from(errno).to_string())
+                        && said.contains(&tree.display().to_string()),
+                    "it says the place and the reason: {row}"
+                );
+            }
+        }
+    }
+
+    /// The first open of a place decides the answer. The place is a link that leads round to
+    /// itself when it is opened and a directory by the time anything looks again, which the case
+    /// makes of it right after the open has answered: the answer stays the open's own, in its
+    /// words, and nothing opens the place a second time to find another, on each route that opens
+    /// a place.
+    #[cfg(unix)]
+    #[test]
+    fn the_first_open_of_a_place_decides_the_answer_whatever_the_place_is_by_the_time_it_is_said() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let (environment_id, tree, recorded) = recorded_tree_in(root.path());
+        let held = AuthorisedDirectory::open_root(environment_id, &tree)
+            .expect("the tree opens")
+            .identity();
+        let (first, second) = (root.path().join("first"), root.path().join("second"));
+
+        for route in 0..3 {
+            std::os::unix::fs::symlink(&second, &first).expect("a link");
+            std::os::unix::fs::symlink(&first, &second).expect("and a link back");
+            let reason = std::fs::File::open(&first)
+                .expect_err("the system cannot follow it")
+                .to_string();
+            AFTER_THE_OPEN.with(|after| {
+                let (first, second) = (first.clone(), second.clone());
+                after.set(Some(Box::new(move || {
+                    std::fs::remove_file(&first).expect("the link goes");
+                    std::fs::remove_file(&second).expect("and the link back");
+                    std::fs::create_dir(&first).expect("a directory takes the place");
+                })));
+            });
+
+            let refused = refused_open(route, environment_id, &first, recorded, held);
+
+            AFTER_THE_OPEN.with(|after| drop(after.take()));
+            assert!(first.is_dir(), "the case changed the place after the open");
+            std::fs::remove_dir(&first).expect("the directory goes");
+            assert_eq!(
+                refused.code(),
+                ErrorCode::InvalidArgument,
+                "route {route}: {refused}"
+            );
+            let said = refused.to_string();
+            assert!(
+                said.contains(&reason) && said.contains(&first.display().to_string()),
+                "route {route}: {said}"
+            );
+        }
     }
 
     /// A directory at the place opens, whatever it is: that it is not the recorded tree is decided

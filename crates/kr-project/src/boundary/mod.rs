@@ -244,12 +244,21 @@ impl Reach {
 /// for it, in the open's own words. A directory an invocation runs in and a recorded tree are
 /// refused in these words alike. A link that cannot be followed reads as the system's reason for
 /// it, where `open_root` words it as a link for a root that no record names.
+///
+/// A host too short of descriptors, processes or memory to open the place has said nothing of the
+/// place, so the refusal is a fault that passes, which a client sends the request again after.
+/// Any other failure is the caller's argument.
 pub(crate) fn unopenable(path: &Path, error: &std::io::Error) -> ProjectError {
-    kr_transfer::Escape::Unopenable {
-        component: path.display().to_string(),
-        detail: error.to_string(),
+    let detail = crate::git::redact(&format!("{} could not be opened: {error}", path.display()));
+    if crate::git::short_of_resources(error) {
+        ProjectError::GitFailed {
+            detail: detail.into(),
+        }
+    } else {
+        ProjectError::Destination {
+            detail: detail.into(),
+        }
     }
-    .into()
 }
 
 /// An opened directory, the object it was opened on, and the path that object had.
@@ -304,8 +313,7 @@ impl OpenedDirectory {
         let nothing = |error: &std::io::Error| {
             expected.is_some() && error.kind() == std::io::ErrorKind::NotFound
         };
-        let directory = match cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
-        {
+        let directory = match crate::identity::open_directory(path) {
             Ok(handle) => {
                 AuthorisedDirectory::from_handle(environment_id, handle, path.to_path_buf())?
             }
