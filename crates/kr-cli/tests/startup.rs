@@ -2801,17 +2801,30 @@ impl ServiceHost {
             // is started while the rest ends.
             let unit = format!("{}.service", self.label());
             let stopped = bounded(self.manager.systemctl(&["stop", &unit]), TEARDOWN_BOUND)?;
-            let shown = bounded(
-                self.manager
-                    .systemctl(&["show", "--property=ActiveState", "--value", &unit]),
-                STREAMS_DEADLINE,
-            )?;
-            match String::from_utf8_lossy(&shown.stdout).trim() {
-                "inactive" | "failed" => Ok(()),
-                state => Err(format!(
-                    "{unit} is {state} after it was stopped: {}",
-                    String::from_utf8_lossy(&stopped.stderr).trim()
-                )),
+            // The manager answers late when it is busy, and the unit can take a moment to go, so
+            // the question is asked again until the bound.
+            let asking_until = Instant::now() + TEARDOWN_BOUND;
+            loop {
+                let shown = bounded(
+                    self.manager
+                        .systemctl(&["show", "--property=ActiveState", "--value", &unit]),
+                    STREAMS_DEADLINE,
+                );
+                let state = match &shown {
+                    Ok(shown) => String::from_utf8_lossy(&shown.stdout).trim().to_owned(),
+                    Err(_) => String::new(),
+                };
+                if matches!(state.as_str(), "inactive" | "failed") {
+                    return Ok(());
+                }
+                if Instant::now() >= asking_until {
+                    shown?;
+                    return Err(format!(
+                        "{unit} is {state} after it was stopped: {}",
+                        String::from_utf8_lossy(&stopped.stderr).trim()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(250));
             }
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]

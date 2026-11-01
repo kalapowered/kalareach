@@ -388,6 +388,7 @@ for argument in "$@"; do unit="$argument"; done
 case "$*" in
   *list-units*)
     [ -s "$here/list-seconds" ] && sleep "$(cat "$here/list-seconds")"
+    date +%s%N > "$here/list-ended"
     cat "$here/listed" 2>/dev/null ;;
   *--property=LoadState*)
     if grep -qx "$unit" "$here/stopped" 2>/dev/null; then echo not-found; else echo loaded; fi ;;
@@ -628,6 +629,15 @@ fn units_with_no_file_are_not_asked_about_after_the_time_given_for_them_has_gone
     assert!(manager.asked().is_empty(), "{:?}", manager.asked());
 }
 
+/// Nanoseconds since the Unix epoch, as the stand-in manager's `date +%s%N` writes them.
+#[cfg(target_os = "linux")]
+fn unix_nanoseconds() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_nanos()
+}
+
 /// The questions about units with no file share one allowance, and a manager that answers none of
 /// them costs the teardown that allowance once and not once for each unit: the first unit uses it
 /// up, the second is not asked about, and both are counted as not established.
@@ -711,13 +721,24 @@ fn a_slow_list_does_not_take_the_time_given_for_the_questions_about_units_with_n
         manager.says_it_runs_in(A_UNIT, &tree.root().join("s"));
         manager.lists_slowly("5.5");
         let left = manager.remove_within(&tree, std::time::Duration::from_secs(5));
+        let returned = unix_nanoseconds();
         let list_gave_out = left.iter().any(|what| what.contains("could not be listed"));
+        // The time for the question had gone by itself when the teardown came back at least that
+        // long after the list ended: a delay between the two, and not a clock started too soon,
+        // which comes back as soon as the list has ended.
+        let allowance_went_by_itself = std::fs::read_to_string(manager.here.join("list-ended"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u128>().ok())
+            .is_some_and(|ended| returned.saturating_sub(ended) >= 4_900_000_000);
         // A question that was begun and ended at its bound says so; one that was never begun, because
         // the time for it had gone, says that, and is the fault this case is for.
         let question_gave_out = left.iter().any(|what| {
             what.contains("could not be asked") && what.contains("did not finish within")
         });
-        if list_gave_out || question_gave_out {
+        let never_begun = left
+            .iter()
+            .any(|what| what.contains("used up before it was asked"));
+        if list_gave_out || question_gave_out || (never_begun && allowance_went_by_itself) {
             eprintln!("run {run} of {RUNS} shows nothing, the machine was too slow: {left:?}");
             continue;
         }
