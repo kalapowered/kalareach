@@ -239,7 +239,13 @@ case "$1" in
     fi
     case "$4" in
       '{{{{.Id}}}}') echo '{id}' ;;
-      '{{{{.State.Running}}}}') cat '{tools}/container-running' 2>/dev/null || echo true ;;
+      '{{{{.State.Running}}}}')
+        # A test that wants the question whether the container runs to fail says so with a file.
+        if [ -f '{tools}/running-fails' ]; then
+          echo 'Error: cannot connect to the store' >&2
+          exit 125
+        fi
+        cat '{tools}/container-running' 2>/dev/null || echo true ;;
       *) echo "the stand-in for podman has no answer for: $*" >&2; exit 2 ;;
     esac
     exit 0
@@ -1808,6 +1814,79 @@ async fn a_container_is_enrolled_by_name_and_a_refresh_of_it_starts_nothing() {
             .all(|line| line.starts_with("container inspect ")),
         "the runtime was asked about the container and nothing was started: {asked:?}"
     );
+}
+
+/// What `kr bridge enrol --probe --json` for the stand-in container printed as its failure, and the
+/// status it ended with.
+fn failed_probe_of_the_container(
+    world: &World,
+    account: &str,
+    helper: &str,
+) -> (Option<i32>, Value) {
+    let said = world.run(&[
+        "--json",
+        "bridge",
+        "enrol",
+        "--access",
+        "container",
+        "--label",
+        "box",
+        "--target",
+        STAND_IN_CONTAINER_NAME,
+        "--user",
+        account,
+        "--helper",
+        helper,
+        "--probe",
+    ]);
+    let document = serde_json::from_slice(&said.stdout).unwrap_or_else(|error| {
+        panic!(
+            "kr printed no document ({error}): {}; it said {}",
+            String::from_utf8_lossy(&said.stdout),
+            String::from_utf8_lossy(&said.stderr)
+        )
+    });
+    (said.status.code(), document)
+}
+
+/// A probe that fails because a program outside `kr` failed (the runtime on the second question,
+/// or the helper that is started in the container) exits as an outside program's failure does,
+/// with the code it has, and a destination that is shown not to be running is the person's to
+/// start: that is a usage failure, which is the control that the stand-ins reach the same path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_container_probe_that_fails_outside_kr_exits_as_an_outside_failure() {
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
+    let world = World::start().await;
+    world.stand_in_for_the_container_runtime();
+    let helper = support::kr().display().to_string();
+    let account = own_account();
+
+    // The container is not running: the person starts it. The control.
+    std::fs::write(world.tools.join("container-running"), "false\n").expect("the state");
+    let (status, document) = failed_probe_of_the_container(&world, &account, &helper);
+    assert_eq!(status, Some(2), "{document}");
+    assert_eq!(document["code"], "INVALID_ARGUMENT", "{document}");
+    std::fs::write(world.tools.join("container-running"), "true\n").expect("the state");
+
+    // The runtime resolves the name, and then fails the question whether the container runs.
+    let runs = world.tools.join("running-fails");
+    std::fs::write(&runs, "").expect("the switch");
+    let (status, document) = failed_probe_of_the_container(&world, &account, &helper);
+    assert_eq!(status, Some(1), "{document}");
+    assert_eq!(document["code"], "RESOURCE_UNAVAILABLE", "{document}");
+    assert!(
+        document["message"]
+            .as_str()
+            .is_some_and(|said| said.contains("podman")),
+        "the refusal names the runtime: {document}"
+    );
+    std::fs::remove_file(&runs).expect("the switch off");
+
+    // The container runs and the runtime cannot start the helper in it.
+    std::fs::write(world.tools.join("unreachable"), "").expect("the switch");
+    let (status, document) = failed_probe_of_the_container(&world, &account, &helper);
+    assert_eq!(status, Some(1), "{document}");
+    assert_eq!(document["code"], "RESOURCE_UNAVAILABLE", "{document}");
 }
 
 /// KR-REQ-18.11, the part about connection diagnostics, for a named SSH host and a named container:
