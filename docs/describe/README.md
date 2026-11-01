@@ -299,11 +299,15 @@ the system does not hold is reported as not applied, with the reason.
     arrived. The process holds one job at a time, so a stop that takes the whole bound delays
     the next job of every session by as much. The process's own watchdog gives a job whose stop
     it has read, a caller's cancellation included, 30 seconds after the deadline on its own
-    clock, where other work is overdue two seconds after its deadline. The job answers as past
-    its deadline, the model stays loaded, and no new load follows. A process whose control
-    thread has read neither the request nor a cancellation of the job is ended two seconds after
-    the request, and one that has read either and has not answered by the bound is ended then;
-    each is a failure of inference. A cancellation of the job sent after the control thread has
+    clock, where other work is overdue two seconds after its deadline. A job cancelled before
+    the process takes it in hand has that bound from the start, and the watchdog ends the
+    process on a bound only as it stands when it decides, so a stop read before the decision is
+    never missed; one read after the watchdog has decided to end the process comes too late.
+    The job answers as past its deadline, the model stays loaded, and no new load follows. A
+    process whose control thread has read neither the request nor a cancellation of the job is
+    ended two seconds after the request, or two seconds after an earlier cancellation if that is
+    sooner, and one that has read either and has not answered by the bound is ended then; each
+    is a failure of inference. A cancellation of the job sent after the control thread has
     read the request to stop it is held to the same bound, and not to the two seconds a
     cancellation is given: that control thread has shown that it listens. The bound is about
     twice the longest stop seen, so a host busier than that one brings a stop to the bound.
@@ -648,11 +652,11 @@ cancellation and a passed deadline publish nothing.
 A process that exits, breaks the wire or is ended for breaking a bound takes the model with it and
 nothing else. The store, the pins, the provenance, every session and every deterministic title
 survive. The job it was running is queued again once, with its aging position, unless the daemon
-ended the process for passing its deadline or its memory ceiling, or the process exited while
-the system had refused it memory, which the daemon reads as the ceiling; those end the job past
-its deadline or failed (a process that ends itself for passing its deadline reads as one that
-exited or broke the wire, and the job is queued again), and if the next process fails it as well
-it is not retried, however many pauses come between. A job a caller or
+ended the process for passing its deadline or its memory ceiling, or the process exited or broke
+the wire while the system had refused it memory, which the daemon reads as the ceiling; those end
+the job past its deadline or failed (a process that ends itself for passing its deadline reads as
+one that exited or broke the wire, and the job is queued again), and if the next process fails it
+as well it is not retried, however many pauses come between. A job a caller or
 privacy mode cancelled is never queued again, even when its process ends before the cancellation is
 answered, and even when a pause had already stopped it: a retry would run it under a new token that
 nobody had cancelled. The service's handle on the running job is the one way to cancel it from
