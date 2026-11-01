@@ -2199,7 +2199,7 @@ async fn a_soft_reset_with_a_wrap_pending_leaves_a_direct_terminal_shown_a_proje
     let narrow = Dimensions::new(4, 5);
     for (printed, expected) in [
         (
-            "d",
+            "|",
             (
                 Some(TerminalPresentationMode::Viewport),
                 Some(PresentationReason::RestorationIncomplete),
@@ -2208,11 +2208,16 @@ async fn a_soft_reset_with_a_wrap_pending_leaves_a_direct_terminal_shown_a_proje
         ("", (Some(TerminalPresentationMode::Direct), None)),
     ] {
         // Three of the four columns are written, so no wrap is pending when the terminal attaches.
-        // The fourth is written by the same step that sends the soft reset, or not at all.
+        // The fourth is written by a step of its own, or not at all, and the soft reset by the next.
+        // A Windows pseudo-console has been seen to deliver a soft reset ahead of the character
+        // written with it, so a character and a reset written together can reach the session in
+        // either order; the reset is not sent until the character has been retained. The
+        // character is one a Windows path cannot hold, so a title that is a path cannot satisfy
+        // the wait for it.
         let host = host_with(
             &format!(
-                "stty -echo -echonl || exit 1; printf 'abc'; read -r _; \
-                 printf '{printed}\\033[!p'; read -r _"
+                "stty -echo -echonl || exit 1; printf 'abc'; read -r _; printf '{printed}'; \
+                 read -r _; printf '\\033[!p'; read -r _"
             ),
             narrow,
             None,
@@ -2227,6 +2232,11 @@ async fn a_soft_reset_with_a_wrap_pending_leaves_a_direct_terminal_shown_a_proje
             Some(TerminalPresentationMode::Direct),
             "a terminal of the session's own size on a settled stream is handed the stream"
         );
+        let already = retained(&host.runtime).len();
+        typist.release(&host).await;
+        if !printed.is_empty() {
+            produced_after(&host.runtime, printed.as_bytes(), already).await;
+        }
         typist.release(&host).await;
         let events = collect_until_resync(
             &mut attached.client,
