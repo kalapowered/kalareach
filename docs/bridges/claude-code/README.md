@@ -72,7 +72,7 @@ kr-hook launch -- <executable> <command name> <arguments...>
 ```
 
 Any other command line, but for `--help` and `--version`, is refused on standard error before
-anything is read or connected, with exit code 64.
+anything of the application's is read or connected, with exit code 64.
 That code is deliberate. Claude Code reads a hook's exit code 2 as a request to block the action it
 observed, and on `PostToolUse` it hands the hook's standard error to the model. A forwarder invoked
 wrongly can do neither.
