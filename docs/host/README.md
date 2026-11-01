@@ -5191,7 +5191,8 @@ session, or a worker may still own its stores. Removals run one at a time, so a 
 while the tick is removing waits for it and reports what is left after it. While the obligation
 stands, `history.page`, `history.times` and `action.read` of that session are refused with
 `RESOURCE_UNAVAILABLE`, and the attention store serves no text from its journal. Once the output is
-removed they answer a gap with no bytes, and the journal's record keeps its text out of the store
+removed, `history.page` and `history.times` answer a gap with no bytes and no intervals, `action.read`
+answers the receipt with no result, and the journal's record keeps its text out of the store
 whether privacy mode is on or has been turned off again. A page that was
 read before privacy mode was turned on, and has not yet been written to the reader when it is, is
 written without its bytes, as a range that is gone. A `privacy.set` that turns privacy mode on runs
@@ -5506,9 +5507,11 @@ nothing.
 Copies held by authorised viewers are listed with the rest of what has left the host, because a device
 that was let see a session may hold what it was shown, on a screen or in its own scrollback, and this
 host cannot recall that: revoking the device ends what it can read from now on and nothing before.
-Each device that has held a grant with the right to view is listed once, as a *possible* copy, with
-the moment it first could view, whether the grant is still in force or was revoked, because the host
-records what a grant allows and not what a device was sent. A grant nobody has redeemed puts nothing
+Each device that has held a session share with the right to view (a grant of the sharing store) is
+listed once, as a *possible* copy, with the moment it first could view under a share, whether the
+share is still in force or was revoked, because the host records what a grant allows and not what a
+device was sent. A device's pairing grant is not in that store, so a paired device that has viewed
+only under its pairing grant is not listed. A grant nobody has redeemed puts nothing
 on a device and is not listed, nor is one that cannot view. The entry is never deletable: there is
 no route through which this host could ask a device's own store to forget, and it offers no action
 for one. A grant store that cannot be read is named among what could not be listed, and the list is
