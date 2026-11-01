@@ -5061,9 +5061,12 @@ async fn the_last_attempt_follows_the_answers_and_is_left_as_it_was_by_a_call_th
     let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
     let web = Arc::clone(rig.served.web());
     let made = rig.prepared_setup(archive_id(), false);
-    let attempt = |cause| {
+    // A second kit for the archive, for the calls that follow the first one's decline: what is kept
+    // names the kit of the last call that ended without setting backups up.
+    let other = rig.prepared_setup(archive_id(), false);
+    let attempt = |kit: &kr_client::recovery::PreparedSetup, cause| {
         Some(BackupLastAttempt {
-            kit_fingerprint: made.params.kit_fingerprint.clone(),
+            kit_fingerprint: kit.params.kit_fingerprint.clone(),
             cause,
         })
     };
@@ -5075,7 +5078,7 @@ async fn the_last_attempt_follows_the_answers_and_is_left_as_it_was_by_a_call_th
             cause: BackupEnableCause::NoAllowance {}
         }
     );
-    let declined = attempt(Nullable::some(BackupEnableCause::NoAllowance {}));
+    let declined = attempt(&made, Nullable::some(BackupEnableCause::NoAllowance {}));
     assert_eq!(rig.backup_status().await.last_attempt.0, declined);
 
     // A call the admission stops ends in no answer, so what was kept stays: the fence lands while
@@ -5093,7 +5096,7 @@ async fn the_last_attempt_follows_the_answers_and_is_left_as_it_was_by_a_call_th
     rig.controller.hold_fence(false);
     assert_eq!(rig.backup_status().await.last_attempt.0, declined);
 
-    // A call that ends as unknown replaces it, with no cause.
+    // A call that ends as unknown replaces it, kit and cause: the second kit's, with no cause.
     web.fail(
         MANIFEST,
         1,
@@ -5104,12 +5107,12 @@ async fn the_last_attempt_follows_the_answers_and_is_left_as_it_was_by_a_call_th
         },
     );
     assert!(matches!(
-        rig.enable(&made.params).await,
+        rig.enable(&other.params).await,
         BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_none()
     ));
     assert_eq!(
         rig.backup_status().await.last_attempt.0,
-        attempt(Nullable::null())
+        attempt(&other, Nullable::null())
     );
 
     // A call that sets backups up clears it.
@@ -5119,8 +5122,7 @@ async fn the_last_attempt_follows_the_answers_and_is_left_as_it_was_by_a_call_th
     ));
     assert_eq!(rig.backup_status().await.last_attempt.0, None);
 
-    // So does a repeat answered from the record, after another kit was declined for the archive.
-    let other = rig.prepared_setup(archive_id(), false);
+    // So does a repeat answered from the record, after the second kit was declined for the archive.
     assert_eq!(
         rig.enable(&other.params).await,
         BackupEnableResult::Declined {
