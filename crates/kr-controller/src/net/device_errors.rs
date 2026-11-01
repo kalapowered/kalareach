@@ -33,11 +33,14 @@
 //! knows by its wording: a number that follows a word for an account across a separator the rule
 //! does not read, or through a longer name for one (`uid: 501`, `owner: 502`, `user id 501`,
 //! `user  501`, `uid(501)`, `uid_501`); a path of which every slash follows a name (`~name/work`,
-//! `Users/name/work`, `.config/kalareach/x`); and an account's bare name in a clause that holds no
-//! path, number or command of its own (the error output of `systemctl` that `supervision.rs`
-//! quotes can hold one), even when a later clause does. A producer that writes one of these is
-//! mended by giving the refusal a wording that is shared with this module, as [`KNOWN_REASONS`]
-//! does for its last seven refusals.
+//! `Users/name/work`, `.config/kalareach/x`); a place in the words of a pointer's refusal, whatever
+//! stands ahead of `at` (`x at /Users/name/p carries a field it does not declare`), which the rule
+//! sets aside; and an account's bare name in a clause that holds no path, number or command of its
+//! own (the error output of `systemctl` that `supervision.rs` quotes can hold one), even when a
+//! later clause does. The words ahead of a clause of the host's own, in the detail of a plugin the
+//! admissions leave out, are read without the set-aside place. A producer that writes one of these
+//! is mended by giving the refusal a wording that is shared with this module, as
+//! [`KNOWN_REASONS`] does for its last seven refusals.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -898,13 +901,15 @@ fn shown_member(map: &CanonicalMap, key: &str, child: &CanonicalValue) -> Option
                 .min()
             {
                 // The subject before the clause is the host's own words only if it names nothing of
-                // the host. A subject that does is held to the rule, as a text with no clause is,
-                // up to the end of the clause, and the words after it are not sent. The guard has
-                // found a name, so when the rule over the text through the clause finds none (the
-                // clause can complete a pointer's refusal that hides the subject's path), what
-                // stands for it is the fixed sentence. A plugin identifier that reads as an
-                // account's number (`acme/user-1`) is held too.
-                Some((at, end)) if first_naming(&text[..at]).is_some() => {
+                // the host and quotes no command. A subject that does is held to the rule, as a
+                // text with no clause is, up to the end of the clause, and the words after it are
+                // not sent. The guard reads the subject by its words alone, with no place of a
+                // pointer's refusal set aside (a subject is a package and its hash, and has none),
+                // so when the rule over the text through the clause finds nothing (a path the
+                // pointer rule hides, or a clause that completes a pointer's refusal), what stands
+                // for it is the fixed sentence. A plugin identifier that reads as an account's
+                // number (`acme/user-1`) is held too.
+                Some((at, end)) if is_held_to_the_rule(&text[..at]) => {
                     Some(told_in_place(&text[..end], fixed).unwrap_or_else(fixed))
                 }
                 Some((_, end)) => (end < text.len()).then(|| text[..end].to_owned()),
@@ -1173,11 +1178,21 @@ fn survivor(map: &CanonicalMap) -> Option<CanonicalValue> {
     ]))
 }
 
+/// Whether the words of a subject, ahead of a clause that is the host's own, are held to the rule:
+/// they name something of this host anywhere in them, or they quote a command.
+fn is_held_to_the_rule(subject: &str) -> bool {
+    naming_outside(subject, None).is_some() || without_quoted_commands(subject).is_some()
+}
+
 /// Where in `text` the first thing that names this host begins, as a byte offset, when anything
-/// does.
+/// does. The place of a pointer's refusal is not one.
 fn first_naming(text: &str) -> Option<usize> {
-    let place = pointer_place(text);
-    let outside = |at: usize| place.as_ref().is_none_or(|place| !place.contains(&at));
+    naming_outside(text, pointer_place(text))
+}
+
+/// As [`first_naming`], with the bytes of `set_aside` not read.
+fn naming_outside(text: &str, set_aside: Option<std::ops::Range<usize>>) -> Option<usize> {
+    let outside = |at: usize| set_aside.as_ref().is_none_or(|place| !place.contains(&at));
     let mut found: Option<usize> = None;
     let mut note = |at: usize| {
         if outside(at) {
@@ -3985,6 +4000,39 @@ mod tests {
                 ),
             ] {
                 assert_eq!(left_out_detail_told_to_a_device(&said), nothing, "{said}");
+            }
+        }
+    }
+
+    /// The whole of the command rule holds for a subject: a command quoted in backticks is replaced
+    /// whether or not it begins with a program name the rule knows.
+    #[test]
+    fn a_command_quoted_in_a_subject_is_replaced_whatever_program_it_runs() {
+        for clause in LEFT_OUT_CLAUSES {
+            for command in ["chmod 700 p", "echo marguerite", "marguerite --force"] {
+                let said = format!("`{command}`{clause}: marguerite wrote this");
+                assert_eq!(
+                    left_out_detail_told_to_a_device(&said),
+                    format!("a command{clause}"),
+                    "{said}"
+                );
+            }
+        }
+    }
+
+    /// A subject is read for what it names, with no place set aside: the place a pointer's refusal
+    /// puts after `at` is a path in a subject, which has no field to point at.
+    #[test]
+    fn a_path_in_the_form_of_a_pointers_place_is_a_path_in_a_subject() {
+        let nothing = format!("why the admissions leave the installation out; {WHY_NOT_SHOWN}");
+        for clause in LEFT_OUT_CLAUSES {
+            for end in POINTER_ENDS {
+                for said in [
+                    format!("x at /Users/marguerite/p{end}{clause}: marguerite wrote this"),
+                    format!("x at /Users/marguerite/p{end}{clause}"),
+                ] {
+                    assert_eq!(left_out_detail_told_to_a_device(&said), nothing, "{said}");
+                }
             }
         }
     }
