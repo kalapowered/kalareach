@@ -170,9 +170,9 @@ impl HeldDeviceAction {
     }
 }
 
-/// KR-ACC-022 and KR-REQ-27.05, revoked devices, the part at the worker: a paired device's intent
-/// that the worker accepted durably and has not dispatched is taken back by a revocation committed
-/// while it is held, and never executes.
+/// KR-ACC-022, a revocation at the worker: a paired device's intent that the worker accepted
+/// durably and has not dispatched is taken back by a revocation committed while it is held, and
+/// never executes.
 ///
 /// The case announces the revision itself, at host reach, and does not revoke the device through
 /// the daemon. The worker's fence takes every undispatched intent whatever the reach, so a
