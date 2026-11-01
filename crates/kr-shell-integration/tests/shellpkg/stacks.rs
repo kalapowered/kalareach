@@ -2272,14 +2272,16 @@ impl Session {
 
     /// Takes the reader that is running now to a fenced empty prompt.
     ///
-    /// A reader that answers at its next step is given a key behind every frame the harness
-    /// writes. One that is slower to act on a key than the harness is to type the next judges the
-    /// fence with a key still unread in the terminal's queue, and reports that queue as holding
-    /// input: keys typed first go first, as the contract says. On such a reader a fence so
-    /// reported is asked again, as the worker would at its next boundary, until the reader judges
-    /// it with its keys taken or the window of the exchange ends; a reader that never takes its
-    /// keys reports them for that long and fails on it. A reader that is given no keys is not
-    /// asked again, and its report is the one that counts.
+    /// A reader that answers at its next step is given a key behind the frames the harness writes
+    /// that ask it for something. One that is slower to act on a key than the harness is to type
+    /// the next judges the fence with a key still unread, and reports an input queue as holding
+    /// input: keys typed first go first, as the contract says. On such a reader a fence whose
+    /// answer reports a queue so is asked again, about the same prompt, until the reader judges it
+    /// with its keys taken or the window of the exchange ends. A reader that never takes its keys,
+    /// or stays slower than the harness types them, reports them for that long and fails on it. A
+    /// reader that reports a partial key sequence is not asked again, since no key typed here
+    /// leaves one, and neither is a reader that is given no keys: their report is the one that
+    /// counts.
     ///
     /// # Panics
     ///
@@ -2304,20 +2306,27 @@ impl Session {
                 None => self.latest_prompt(),
             };
             let fence = fence_for(&enter, fence_id(index), attachment_id(1), epoch(4));
-            let asked = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
-                session_id: self.session_id,
-                fence_id: fence.fence_id,
-                prompt_generation: enter.prompt_generation,
-                reader_revision: enter.reader_revision,
-                deadline_ms: FENCE_EXCHANGE_TIMEOUT,
-                cause: FenceCause::EditorEntry,
-            }));
-            match self.answer(asked) {
+            // Every wait of the exchange answers to the one window, so a fence asked again late in
+            // it cannot be answered after it.
+            let until = deadline.earlier(self.deadline_for(REPLY)).0;
+            let asked = self.ask_before(
+                WorkerRequest::Fence(RootEditorFenceParams {
+                    session_id: self.session_id,
+                    fence_id: fence.fence_id,
+                    prompt_generation: enter.prompt_generation,
+                    reader_revision: enter.reader_revision,
+                    deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+                    cause: FenceCause::EditorEntry,
+                }),
+                until,
+            );
+            match self.answer_before(asked, until) {
                 BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement)) => {
-                    let drained = acknowledgement.queues.tty_typeahead_drained
-                        && acknowledgement.queues.macro_input_drained
-                        && acknowledgement.queues.partial_key_drained;
-                    if !drained && may_ask_again && !deadline.passed() {
+                    let queues = acknowledgement.queues;
+                    if !(queues.tty_typeahead_drained && queues.macro_input_drained)
+                        && may_ask_again
+                        && !deadline.passed()
+                    {
                         eprintln!(
                             "a fence found input the reader had not taken; asking again \
                              ({attempts})"
@@ -2327,9 +2336,9 @@ impl Session {
                         continue;
                     }
                     assert!(
-                        drained,
-                        "an idle reader reported a queue still holding input: {:?}",
-                        acknowledgement.queues
+                        queues.all_drained(),
+                        "an idle reader reported a queue still holding input in {attempts} \
+                         fences: {queues:?}"
                     );
                     self.publish(&fence);
                     return (enter, fence);
