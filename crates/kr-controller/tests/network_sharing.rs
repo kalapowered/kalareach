@@ -99,8 +99,18 @@ async fn kr_req_25_10_a_device_redeems_its_invitation_once_and_a_repeat_of_the_a
     };
     let action = ActionId::new(kr_ipc::new_uuid());
     let connection = RawDevice::connect(&host, &device, &record).await;
+    // The window is part of what an action is, and the host renews the one a connection holds
+    // every 150 s, so the action is presented the second time under the window it was first
+    // presented under: under a renewed one the repeat would be a different action.
+    let first_window = connection.action_window_id();
     let first = connection
-        .mutate(Method::GrantRedeem, action, on_the_host(&host), &redeem)
+        .mutate_in(
+            first_window.clone(),
+            Method::GrantRedeem,
+            action,
+            on_the_host(&host),
+            &redeem,
+        )
         .await
         .expect("the invitation is redeemed");
     let redeemed: GrantRedeemResult = first.to_typed().expect("decodes");
@@ -108,9 +118,7 @@ async fn kr_req_25_10_a_device_redeems_its_invitation_once_and_a_repeat_of_the_a
     assert_eq!(redeemed.invitation_id, issued.preview.invitation_id);
     assert!(is_active(&host, issued.grant.grant_id));
 
-    // The same action again, on a connection that never saw the first answer, presented with the
-    // window it was first admitted under.
-    let first_window = connection.action_window_id();
+    // The same action again, on a connection that never saw the first answer.
     connection.close();
     let later = RawDevice::connect(&host, &device, &record).await;
     let repeated = later

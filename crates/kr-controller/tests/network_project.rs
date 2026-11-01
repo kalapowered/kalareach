@@ -1572,6 +1572,12 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
     let raw = net_support::RawDevice::connect(&host, &device, &record).await;
     raw.claim();
 
+    // The window is part of what an action is, and the host renews the one a connection holds
+    // every 150 s, which the owner's calls below can take on a stalled disk. The action is
+    // presented under the window it was first presented under: under a renewed one the repeat
+    // would be a different action.
+    let window = raw.action_window_id();
+
     // The operation this cancellation names does not exist yet.
     let operation_id = ActionId::new(kr_ipc::new_uuid());
     let params = ProjectOperationCancelParams {
@@ -1581,7 +1587,8 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let target = ActionTarget::environment(host.environment_id);
     let first = raw
-        .mutate(
+        .mutate_in(
+            window.clone(),
             Method::ProjectOperationCancel,
             action_id,
             target.clone(),
@@ -1630,7 +1637,8 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
 
     // And the retry under the original identifier is the record, not another execution.
     let again = raw
-        .mutate(
+        .mutate_in(
+            window.clone(),
             Method::ProjectOperationCancel,
             action_id,
             target.clone(),
@@ -1643,7 +1651,8 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
 
     // The same identifier with a different payload is a different action, and section 9 refuses it.
     let conflicting = raw
-        .mutate(
+        .mutate_in(
+            window,
             Method::ProjectOperationCancel,
             action_id,
             target,
@@ -1690,6 +1699,8 @@ async fn a_device_without_session_view_still_recovers_its_own_project_outcome() 
     let raw = net_support::RawDevice::connect(&host, &device, &record).await;
     raw.claim();
 
+    // Both presentations go under the window the first is made under, as in the test above.
+    let window = raw.action_window_id();
     let operation_id = ActionId::new(kr_ipc::new_uuid());
     let params = ProjectOperationCancelParams {
         operation_action_id: operation_id,
@@ -1698,7 +1709,8 @@ async fn a_device_without_session_view_still_recovers_its_own_project_outcome() 
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let target = ActionTarget::environment(host.environment_id);
     let first = raw
-        .mutate(
+        .mutate_in(
+            window.clone(),
             Method::ProjectOperationCancel,
             action_id,
             target.clone(),
@@ -1723,7 +1735,13 @@ async fn a_device_without_session_view_still_recovers_its_own_project_outcome() 
             .expect("project.init succeeds locally"),
     );
     let again = raw
-        .mutate(Method::ProjectOperationCancel, action_id, target, &params)
+        .mutate_in(
+            window,
+            Method::ProjectOperationCancel,
+            action_id,
+            target,
+            &params,
+        )
         .await
         .expect_err("the repeat is answered rather than refused for an unrelated right");
     assert_eq!(first.code, again.code);
@@ -2137,14 +2155,18 @@ async fn a_device_reads_a_recorded_version_and_has_it_written_out_without_the_ho
         "no part of the answer names the directory"
     );
 
-    // A repeat under the same action is answered from the record, in the same form.
+    // A repeat under the same action is answered from the record, in the same form, and is
+    // presented under the window the first was, as the host renews a connection's window every
+    // 150 s.
     let raw = net_support::RawDevice::connect(&recorded.host, &device, &record).await;
     raw.claim();
+    let window = raw.action_window_id();
     let action = ActionId::new(kr_ipc::new_uuid());
     let target = ActionTarget::environment(env);
     let params = materialise_of(recorded.plain);
     let first: kr_protocol::changeset::ChangesetMaterializeResult = typed(
-        &raw.mutate(
+        &raw.mutate_in(
+            window.clone(),
             Method::ChangesetMaterialize,
             action,
             target.clone(),
@@ -2154,9 +2176,15 @@ async fn a_device_reads_a_recorded_version_and_has_it_written_out_without_the_ho
         .expect("a second materialisation of the version"),
     );
     let again: kr_protocol::changeset::ChangesetMaterializeResult = typed(
-        &raw.mutate(Method::ChangesetMaterialize, action, target, &params)
-            .await
-            .expect("the repeat is answered from the record"),
+        &raw.mutate_in(
+            window,
+            Method::ChangesetMaterialize,
+            action,
+            target,
+            &params,
+        )
+        .await
+        .expect("the repeat is answered from the record"),
     );
     assert_eq!(again, first, "the record answers the repeat");
     assert!(
