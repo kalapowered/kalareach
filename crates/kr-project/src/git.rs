@@ -1082,6 +1082,11 @@ fn record(profile: &cap_std::fs::Dir, line: &str) -> Result<()> {
     // each one whole, and a write that only half happened is cut back to where it began before the
     // next one is let in. A repair that itself fails ends the writing: appending after a half line
     // would make a line nothing can read, and there would be no way back from that.
+    //
+    // The lock belongs to the process and not to the record, and a line is synchronised to the disk
+    // while it is held. So every invocation in the process waits behind the disk for the line being
+    // written: a process that holds many daemons meets this, and so does one daemon whose requests
+    // run Git invocations at the same time, since the service does not limit how many do.
     static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
