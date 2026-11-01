@@ -240,6 +240,18 @@ impl Reach {
     }
 }
 
+/// The refusal for a directory that could not be opened: the place, and the reason the system gave
+/// for it, in the open's own words. A directory an invocation runs in and a recorded tree are
+/// refused in these words alike. A link that cannot be followed reads as the system's reason for
+/// it, where `open_root` words it as a link for a root that no record names.
+pub(crate) fn unopenable(path: &Path, error: &std::io::Error) -> ProjectError {
+    kr_transfer::Escape::Unopenable {
+        component: path.display().to_string(),
+        detail: error.to_string(),
+    }
+    .into()
+}
+
 /// An opened directory, the object it was opened on, and the path that object had.
 ///
 /// The handle is the authority. The path is what two of the three mechanisms write their rules
@@ -255,17 +267,27 @@ pub struct OpenedDirectory {
 }
 
 impl OpenedDirectory {
-    /// Opens one directory and requires it to be the object a record names.
+    /// Opens one directory and requires it to be the object the caller holds an identity for.
+    ///
+    /// The identity is the one a record names where a record does. Where none does, as for a
+    /// checkout that `project.adopt` is handed by path, or for the invocation's own private
+    /// temporary directory, it is the one this host read from the directory it opened a moment
+    /// before, and a directory that goes after that is a change just the same. With no identity at
+    /// all there is nothing to have changed.
     ///
     /// # Errors
     ///
     /// Returns [`ProjectError::Destination`] when the directory cannot be opened or its path
-    /// cannot be resolved, and [`ProjectError::IdentityChanged`] when the caller recorded an
-    /// identity and the object at the path is a different one, or the open or the resolution of the
-    /// path finds nothing there: the object the record names is gone, which is a source that
-    /// changed and not an argument the caller got wrong. Each step answers for what it found
-    /// itself, as it does where a recorded tree is first opened, and nothing looks at the path
-    /// again to decide.
+    /// cannot be resolved, and [`ProjectError::IdentityChanged`] when the caller holds an identity
+    /// and the object at the path is a different one, or the open or the resolution of the path
+    /// finds nothing there: the object the identity names is gone, which is a source that changed
+    /// and not an argument the caller got wrong. With no identity, a directory that is gone is the
+    /// caller's argument. Each step answers for what it found itself, as it does where a recorded
+    /// tree is first opened, and nothing looks at the path again to decide. A failure to open is
+    /// worded by the open's own error (`unopenable`), so a link that leads round to itself reads
+    /// as the system's reason for it and not as a link, as `open_root` words it for a root that no
+    /// record names. A platform that reports a parent that is a file as not found, as Windows
+    /// may, reads it as nothing there too; that platform runs no Git, so no request reaches it.
     pub fn open(
         environment_id: EnvironmentId,
         path: &Path,
@@ -288,15 +310,9 @@ impl OpenedDirectory {
                 AuthorisedDirectory::from_handle(environment_id, handle, path.to_path_buf())?
             }
             Err(error) if nothing(&error) => return Err(gone()),
-            // The open's own error is the answer and gives the words, as it does for any other
-            // root. Nothing opens the path again, so what is there by then cannot change them.
-            Err(error) => {
-                return Err(kr_transfer::Escape::Unopenable {
-                    component: path.display().to_string(),
-                    detail: error.to_string(),
-                }
-                .into());
-            }
+            // The open's own error is the answer and gives the words. Nothing opens the path
+            // again, so what is there by then cannot change them.
+            Err(error) => return Err(unopenable(path, &error)),
         };
         let identity = directory.identity();
         if let Some(expected) = expected
@@ -705,11 +721,12 @@ mod tests {
         );
     }
 
-    /// A directory a record names that is not there when the invocation opens it is a source that
+    /// A directory the caller holds an identity for, a record's or one this host read from the
+    /// directory it opened, that is not there when the invocation opens it is a source that
     /// changed, as one that is another object is, and not an argument the caller got wrong. It is
-    /// the state of a recorded tree that goes after the caller opened it and before the invocation
-    /// does. A place that cannot be opened for another reason keeps its answer, and so does an open
-    /// that names no record.
+    /// the state of a tree that goes after the caller opened it and before the invocation does. A
+    /// place that cannot be opened for another reason keeps its answer, and so does an open that
+    /// holds no identity.
     #[cfg(unix)]
     #[test]
     fn a_recorded_directory_that_is_gone_when_the_invocation_opens_it_is_a_source_that_changed() {
@@ -740,8 +757,8 @@ mod tests {
             "{dangling}"
         );
 
-        // With no record there is no source to have changed, and a parent that is now a file is
-        // the caller's to put right whether or not a record names the directory.
+        // With no identity there is no source to have changed, and a parent that is now a file is
+        // the caller's to put right whether or not an identity is held for the directory.
         let unrecorded = OpenedDirectory::open(environment_id, &directory, None)
             .expect_err("nothing is there to open");
         assert!(

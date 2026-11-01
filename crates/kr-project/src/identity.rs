@@ -1145,7 +1145,10 @@ fn ceiling_above(tree: &AuthorisedDirectory) -> Option<PathBuf> {
 /// recorded tree that has gone by then the same way ([`crate::boundary::OpenedDirectory::open`]).
 /// Every other failure of the open keeps the answer it always had: a parent that is now a file, a
 /// link that cannot be followed, a directory this account cannot enter. They are the arguments a
-/// caller got wrong, and not a source that changed.
+/// caller got wrong, and not a source that changed. They are worded by the open's own error, and
+/// the path is not opened again to say them. (A platform that reports a parent that is a file as
+/// not found, as Windows may, reads it as nothing there; that platform runs no Git, so no request
+/// reaches it.)
 fn open_recorded_root(
     environment_id: EnvironmentId,
     path: &Path,
@@ -1163,8 +1166,10 @@ fn open_recorded_root(
             };
             Err(not_the_recorded_tree(tree, path, &nothing))
         }
-        // Said by the one place that words an open's failure, as for every other root.
-        Err(_) => Ok(AuthorisedDirectory::open_root(environment_id, path)?),
+        // The open's own error is the answer and gives the words, as it does where the invocation
+        // opens the directory. Nothing opens the path again, so what is there by then cannot
+        // change them.
+        Err(error) => Err(crate::boundary::unopenable(path, &error)),
     }
 }
 
