@@ -1661,9 +1661,10 @@ nothing of the destination, or answers with something that is not an identifier 
 question whether a container runs, is neither `true` nor `false`) is a failure of an outside
 program: it exits 1, and a `--json` failure carries `RESOURCE_UNAVAILABLE`. So is a helper that a
 probe could not start, whose stream failed, that said nothing for long enough or that could not be
-ended after it answered. A target the runtime says it does not know, a destination that is shown
-not to be running, and a helper that answers as another user, as one of this host's own
-environments or in a way this host cannot use are usage failures (exit 2). A listing of WSL
+ended after it answered. A target the runtime says it does not know (also when the runtime ended
+without a status after saying so), a destination that is shown not to be running, and a helper
+that answers as another user, as one of this host's own environments or in a way this host cannot
+use are usage failures (exit 2). A listing of WSL
 distributions that ends with a failure shows nothing of the distribution, and is read as one that
 is not running, so it exits 2 too.
 
