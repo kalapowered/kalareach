@@ -306,20 +306,20 @@ the system does not hold is reported as not applied, with the reason.
     exists names a busy host, so the wait shows only as the delayed description; a reason of its
     own waits for the next protocol cut.
 
-  Measured on this Mac with the real weights, driven by the daemon's driver (the `inference`
-  tests of `kr-describe-model`), while a build in the same class kept the machine busy: the four
-  largest contexts each ended at the deadline, and none ended the process or loaded the model
-  again. The cases lasted 31 to 44 seconds, which includes the first load and the waits between
-  misses; the test's output gives no job time, and from the case's own time the longest job ran
-  about 40 seconds, the others a fraction of a second past 30. So one
-  job in this run went past the old two-second grace, and the daemon, which would have ended the
+  Measured on this Mac with the real weights, driven by the daemon's driver (the `inference` tests
+  of `kr-describe-model`), while a build in the same class kept the machine busy, in two runs: the
+  four largest contexts each ended at the deadline in both, and in the second the first job did too,
+  and none of them ended the process or loaded the model again. The cases lasted 31 to 49 seconds,
+  which includes a load and the waits between misses; the test's output gives no job time. From the
+  first run's own times the longest job ran about 40 seconds and the others a fraction of a second
+  past 30, so one job went past the old two-second grace, and the daemon, which would have ended the
   process there, did not. Before the stop was given time, the same cases on this Mac ended the
   process four times out of four in a run on a heavily loaded machine (load average 14) and two
-  times out of four in one at load 6.5; each end but the last of the four was followed by a load
-  of 8.0 to 14.9 seconds, with no description published in the first of those runs. A
-  cancellation was acknowledged in 5 ms and answered after 7.8 and 15 seconds. When the machine
-  was not busy, the same cases published their descriptions in 9 to 22 seconds. No daemon in
-  use was observed, and no measurement was taken on a Mac with its efficiency cores idle.
+  times out of four in one at load 6.5; each end but the last of the four was followed by a load of
+  8.0 to 14.9 seconds, with no description published in the first of those runs. A cancellation was
+  acknowledged in 5 ms and answered after 7.8 and 15 seconds. When the machine was not busy, the
+  same cases published their descriptions in 9 to 22 seconds. No daemon in use was observed, and no
+  measurement was taken on a Mac with its efficiency cores idle.
 
   The process's control thread and watchdog are in the class too, so the ends listed for Windows
   below can follow on a Mac whose efficiency cores stay busy for longer than a few seconds: a late
