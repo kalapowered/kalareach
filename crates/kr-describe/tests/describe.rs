@@ -534,8 +534,8 @@ fn a_fence_raised_while_a_job_runs_refuses_its_result() {
     assert!(service.store().generated(&session(1)).unwrap().is_none());
 }
 
-/// A result that arrives after its job's deadline, measured from dequeue, publishes nothing; the
-/// control is the same result inside the deadline.
+/// KR-REQ-22.10: a result that arrives after its job's deadline, measured from dequeue, publishes
+/// nothing; the control is the same result inside the deadline.
 #[test]
 fn a_result_that_arrives_past_its_deadline_publishes_nothing() {
     let mut service = service();

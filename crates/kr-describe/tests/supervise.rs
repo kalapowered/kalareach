@@ -1648,12 +1648,12 @@ fn a_late_answer_is_dropped_and_counted() {
     assert_eq!(rig.driver.service().counts().dropped_answers, 0);
 }
 
-/// A load that takes more than a job's thirty seconds, and the grace after them, happens before
-/// the job is dequeued: the load is not held to the job's deadline, the cold start is reported
-/// apart, and the job is then published. The job takes a moment in the process, which a deadline
-/// the load had used up would end, so the load did not use up the deadline the process was sent.
-/// The control is a job whose answer arrives past that deadline, which is refused. The first job
-/// after such a load is also held to the whole of its deadline from its send: the daemon ends a
+/// KR-REQ-22.10: a load that takes more than a job's thirty seconds, and the grace after them,
+/// happens before the job is dequeued: the load is not held to the job's deadline, the cold start is
+/// reported apart, and the job is then published. The job takes a moment in the process, which a
+/// deadline the load had used up would end, so the load did not use up the deadline the process was
+/// sent. The control is a job whose answer arrives past that deadline, which is refused. The first
+/// job after such a load is also held to the whole of its deadline from its send: the daemon ends a
 /// process that holds it at the deadline and the grace after the send, and not a moment before.
 ///
 /// The process holds its load until the case has seen the handshake and has taken a turn at the
