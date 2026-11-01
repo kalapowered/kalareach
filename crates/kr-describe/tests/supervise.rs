@@ -834,8 +834,8 @@ fn a_job_past_its_deadline_in_a_process_that_reads_the_stop_is_given_time_to_sto
     assert!(rig.driver.service().is_mapped());
 }
 
-/// A process that has read the stop and still has not answered when the stop bound ends is ended
-/// then, as past its deadline, and not a moment before.
+/// KR-REQ-22.11: a process that has read the stop and still has not answered when the stop bound
+/// ends is ended then, as past its deadline, and not a moment before.
 #[test]
 fn a_process_that_has_read_the_stop_and_does_not_answer_is_ended_at_the_stop_bound() {
     let mut rig = Rig::new(&Script {
@@ -885,12 +885,12 @@ fn a_process_that_has_read_the_stop_and_does_not_answer_is_ended_at_the_stop_bou
     assert_eq!(rig.driver.pid(), None);
 }
 
-/// A stop asked late is given its time from the request, not from the deadline: a daemon whose first
-/// look at a job comes long after its deadline (the host slept, and the clock the daemon reads
-/// counts the sleep) has not ended the process before it could answer. The next look, a millisecond
-/// later, leaves a process that has not read the request for the grace after it, and one that has
-/// for the stop bound after it. The control is a stop asked at the deadline, which is ended at the
-/// grace after it (the hung process, above).
+/// KR-REQ-22.11: a stop asked late is given its time from the request, not from the deadline. A
+/// daemon whose first look at a job comes long after its deadline (the host slept, and the clock
+/// the daemon reads counts the sleep) has not ended the process before it could answer. The next
+/// look, a millisecond later, leaves a process that has not read the request for the grace after
+/// it, and one that has for the stop bound after it. The control is a stop asked at the deadline,
+/// which is ended at the grace after it (the hung process, above).
 #[test]
 fn a_stop_asked_late_is_given_its_time_from_the_request() {
     // A process whose control thread reads nothing after the job: the request to stop is never read.
@@ -970,13 +970,13 @@ fn a_stop_asked_late_is_given_its_time_from_the_request() {
     );
 }
 
-/// A cancellation the control thread has said it has read is not a process that stopped listening:
-/// the job's own answer is bounded by its deadline and the stop bound after it, and the process is
-/// ended when that passes and not at the cancellation's bound, whether or not it reads the daemon's
-/// own request to stop at the deadline, as the process's watchdog gives it the same time either
-/// way. The job a caller cancelled ends cancelled, and the daemon ending its process makes it no
-/// deadline miss. The control is a cancellation nothing acknowledges, which is ended at the bound
-/// (the wedged control thread, above).
+/// KR-REQ-22.11: a cancellation the control thread has said it has read is not a process that
+/// stopped listening: the job's own answer is bounded by its deadline and the stop bound after it,
+/// and the process is ended when that passes and not at the cancellation's bound, whether or not
+/// it reads the daemon's own request to stop at the deadline, as the process's watchdog gives it
+/// the same time either way. The job a caller cancelled ends cancelled, and the daemon ending its
+/// process makes it no deadline miss. The control is a cancellation nothing acknowledges, which is
+/// ended at the bound (the wedged control thread, above).
 #[test]
 fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_bound() {
     // A model that does not look at its token for longer than this test needs, and a control thread
