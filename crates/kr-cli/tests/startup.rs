@@ -379,7 +379,12 @@ impl Standalone {
             loop {
                 match kr_ipc::identity::process_state(&identity) {
                     ProcessState::Ended => break,
-                    ProcessState::Running if begun.elapsed() < STREAMS_DEADLINE => {
+                    // A process that is ending can read as unknown for a moment (the kernel's
+                    // state of one that has exited and is not yet collected), so it is read again
+                    // until the bound, as a running one is.
+                    ProcessState::Running | ProcessState::Unknown { .. }
+                        if begun.elapsed() < STREAMS_DEADLINE =>
+                    {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     ProcessState::Running => {
@@ -2775,11 +2780,17 @@ impl ServiceHost {
                 let mut bootout = Command::new("/bin/launchctl");
                 bootout.args(["bootout", &target]);
                 let removed = bounded(bootout, TEARDOWN_BOUND)?;
-                if loaded(&target)? {
-                    return Err(format!(
-                        "{target} is still loaded after it was removed: {}",
-                        String::from_utf8_lossy(&removed.stderr).trim()
-                    ));
+                // The job goes a moment after `bootout` answers, so it is asked about again until
+                // the bound.
+                let until = Instant::now() + STREAMS_DEADLINE;
+                while loaded(&target)? {
+                    if Instant::now() >= until {
+                        return Err(format!(
+                            "{target} is still loaded after it was removed: {}",
+                            String::from_utf8_lossy(&removed.stderr).trim()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
                 }
             }
             Ok(())
