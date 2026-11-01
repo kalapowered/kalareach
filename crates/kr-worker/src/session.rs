@@ -356,6 +356,9 @@ pub struct Session {
     /// maintenance tick and cleared only by its own success. Reconciliation is not complete while
     /// either is set.
     privacy_cleanup: PrivacyCleanup,
+    /// The reason an output retention pass left output it was asked to remove, as last written to
+    /// this worker's diagnostics, so that a reason that stands is said once and not on every pass.
+    reported_output_reason: Option<String>,
     /// Privacy mode's durable state: the generation, and whether it is on.
     ///
     /// It is read back from the journal when the session opens, because the generation is what
@@ -718,6 +721,7 @@ impl Session {
             } else {
                 PrivacyCleanup::default()
             },
+            reported_output_reason: None,
             health,
             time,
             closure: None,
@@ -4815,7 +4819,7 @@ impl Session {
         age_permitted: bool,
     ) -> Vec<crate::persistence::retention::Eviction> {
         let now = kr_ipc::now_ms();
-        match self
+        let taken = match self
             .config
             .spool_directory
             .as_deref()
@@ -4830,7 +4834,15 @@ impl Session {
                 self.history
                     .apply_retention(retention, held, now, age_permitted)
             }
+        };
+        // A pass that could not remove what it was asked to says why to this worker's own
+        // diagnostics, where a person looking into a host that keeps more than its cap finds it.
+        if let Some(reason) =
+            new_output_reason(&mut self.reported_output_reason, self.history.left_behind())
+        {
+            eprintln!("kr-worker: output retention left output it was asked to remove: {reason}");
         }
+        taken
     }
 
     /// Writes down what the time contract has to survive a restart, when it has changed.
@@ -5612,11 +5624,51 @@ impl Answered {
     }
 }
 
+/// The reason an output retention pass left output behind that is to be said now: `now` when it is
+/// not the reason last said (`said`), and nothing when it is, or when there is none. `said` follows
+/// `now`, so a reason that goes and comes back is said again.
+fn new_output_reason(said: &mut Option<String>, now: Option<&str>) -> Option<String> {
+    if said.as_deref() == now {
+        return None;
+    }
+    *said = now.map(str::to_owned);
+    now.map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use kr_protocol::root::{CommandBypassReason, PromptGeneration};
 
-    use super::{Answered, StartTerms};
+    use super::{Answered, StartTerms, new_output_reason};
+
+    /// A reason an output retention pass left output behind is said when it first stands, once
+    /// while it goes on, and again if it goes and comes back or changes.
+    #[test]
+    fn a_reason_output_was_left_behind_is_said_once_while_it_stands() {
+        let mut said = None;
+        assert_eq!(new_output_reason(&mut said, None), None);
+        assert_eq!(
+            new_output_reason(&mut said, Some("the lock")),
+            Some("the lock".to_owned()),
+            "a new reason is said"
+        );
+        assert_eq!(
+            new_output_reason(&mut said, Some("the lock")),
+            None,
+            "and not again while it stands"
+        );
+        assert_eq!(new_output_reason(&mut said, None), None, "it goes");
+        assert_eq!(
+            new_output_reason(&mut said, Some("the lock")),
+            Some("the lock".to_owned()),
+            "and is said again when it comes back"
+        );
+        assert_eq!(
+            new_output_reason(&mut said, Some("the boundary")),
+            Some("the boundary".to_owned()),
+            "as is another"
+        );
+    }
 
     /// An adoption is given the bypass its own line was answered with, and none of an earlier
     /// line's: a later line that asked nothing, such as a pipeline, inherits nothing.
