@@ -93,14 +93,15 @@ pub const STOP_BOUND_MS: u64 = 30_000;
 /// How long a process has to say it has read a cancellation, and how long a load or a check of a
 /// file has to answer one.
 ///
-/// A job's cancellation is held to the first alone: the control thread says at once that it has
-/// read it, and the job's own answer is then bounded by the job's deadline and, for a stop that
-/// was read, [`STOP_BOUND_MS`] after the request to stop it, and by the process's own watchdog, so
-/// a busy host that takes a moment to stop a job is not mistaken for a process that is not
-/// listening. A load and a check of a file lose nothing when the process is ended, so each is held
-/// to this bound for its own answer too. A process that said it had read the cancellation and then
-/// did not stop the load or the check is ended without a failure of inference
-/// ([`ProcessEnd::StopOverdue`]); one that did not say so is not listening, which is one
+/// A job's cancellation is held to the first alone, and not at all once the control thread has
+/// said it read the request to stop that job at its deadline: the control thread says at once that
+/// it has read a cancellation, and the job's own answer is then bounded by the job's deadline and,
+/// for a stop that was read, [`STOP_BOUND_MS`] after the request to stop it, and by the process's
+/// own watchdog, so a busy host that takes a moment to stop a job is not mistaken for a process
+/// that is not listening. A load and a check of a file lose nothing when the process is ended, so
+/// each is held to this bound for its own answer too. A process that said it had read the
+/// cancellation and then did not stop the load or the check is ended without a failure of
+/// inference ([`ProcessEnd::StopOverdue`]); one that did not say so is not listening, which is one
 /// ([`ProcessEnd::CancelUnanswered`]).
 pub const CANCEL_MS: u64 = 2_000;
 
@@ -298,8 +299,11 @@ impl Running {
     /// stop bound ([`Self::work_ends_at_ms`]), so a second cancellation it has not yet read is no
     /// reason to end it sooner.
     fn timed_cancel(&self) -> Option<Cancel> {
-        self.cancel.filter(|cancel| {
-            cancel.timed() && !(matches!(cancel.kind, Kind::Job) && self.job_stop_read(cancel.id))
+        self.cancel.filter(|cancel| match cancel.kind {
+            Kind::Job => !self.job_stop_read(cancel.id),
+            // A load or a check is held to the bound for its own answer too, so an acknowledged
+            // cancellation of one is still timed.
+            Kind::Load | Kind::Check => true,
         })
     }
 
@@ -383,14 +387,6 @@ struct Cancel {
     at_ms: u64,
     kind: Kind,
     acknowledged: bool,
-}
-
-impl Cancel {
-    /// Whether this cancellation is still held to its timer: always before it is acknowledged, and
-    /// after it for a load or a check, whose own answer is bounded the same way.
-    const fn timed(self) -> bool {
-        !self.acknowledged || !matches!(self.kind, Kind::Job)
-    }
 }
 
 /// The daemon's driver of the description service and its process.

@@ -303,8 +303,8 @@ the system does not hold is reported as not applied, with the reason.
     its deadline, the model stays loaded, and no new load follows. A process whose control
     thread has read neither the request nor a cancellation of the job is ended two seconds after
     the request, and one that has read either and has not answered by the bound is ended then;
-    each is a failure of inference. A caller's cancellation sent after the control thread has
-    read the request to stop the job is held to the same bound, and not to the two seconds a
+    each is a failure of inference. A cancellation of the job sent after the control thread has
+    read the request to stop it is held to the same bound, and not to the two seconds a
     cancellation is given: that control thread has shown that it listens. The bound is about
     twice the longest stop seen, so a host busier than that one brings a stop to the bound.
 
@@ -651,8 +651,8 @@ survive. The job it was running is queued again once, with its aging position, u
 ended the process for passing its deadline or its memory ceiling, or the process exited while
 the system had refused it memory, which the daemon reads as the ceiling; those end the job past
 its deadline or failed (a process that ends itself for passing its deadline reads as one that
-exited, and the job is queued again), and if the next process fails it as well it is not
-retried, however many pauses come between. A job a caller or
+exited or broke the wire, and the job is queued again), and if the next process fails it as well
+it is not retried, however many pauses come between. A job a caller or
 privacy mode cancelled is never queued again, even when its process ends before the cancellation is
 answered, and even when a pause had already stopped it: a retry would run it under a new token that
 nobody had cancelled. The service's handle on the running job is the one way to cancel it from
@@ -660,7 +660,8 @@ outside, and the job's token never leaves the service. The moment the service de
 that did not finish comes to is the moment a cancellation stops counting, so a cancellation that
 comes first is honoured, and one that comes after finds nothing running and says so. The next load
 waits a second after the first failure, twice as long after each failure that follows, up to five
-minutes, and a published description or summary resets the wait.
+minutes, and a published description or summary resets the wait, unless the process passed its
+memory ceiling to produce it: the delay that follows is the memory pressure's.
 
 The runtime is a crate of its own, `kr-describe-model`, built on the description service in
 `kr-describe`, which holds no model: a process that links the service alone, as the control daemon

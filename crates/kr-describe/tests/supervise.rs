@@ -1527,6 +1527,9 @@ fn a_check_that_will_not_stop_is_ended_at_the_bound_and_one_nobody_hears_counts_
     rig.until(&roomy(), at(110), "the acknowledgement", |_, driver| {
         matches!(driver.cancelling(), Some((1, true)))
     });
+    // A check is held to the bound for its own answer after the acknowledgement, and nothing else
+    // wakes the driver: it says it is to look when the bound ends.
+    assert_eq!(rig.driver.due_ms(), Some(100 + CANCEL_MS));
     // Asking again, after the acknowledgement, sends nothing and moves nothing.
     let reports = rig.driver.cancel_check(at(1_000)).expect("a cancellation");
     assert!(reports.is_empty(), "{reports:?}");
