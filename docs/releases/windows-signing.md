@@ -392,8 +392,9 @@ run is suspected, or signing access must be revoked immediately:
    behind the `release-signing` environment: they are files on the machine that runs
    `scripts/sign-macos-release.sh`, and no run of a workflow reads them. The update channel's two
    release keys are secrets of the `update-signing` environment, which a weakened `release-signing`
-   environment does not reach. If either environment or that machine is in doubt, the project owner replaces the
-   credentials it held, as [the macOS and Linux procedure](macos-signing.md#keys-and-replacing-them) describes.
+   environment does not reach. If either environment or that machine is in doubt, the owner that [the key
+   table](keys.md) names for each credential replaces it, as [the macOS and Linux
+   procedure](macos-signing.md#keys-and-replacing-them) describes.
 6. Controlled restoration via identity and subject rotation (Required):
    - A GitHub Actions OIDC token assertion (`iss`, `aud`, `sub`) is bound to the repository and
      environment subject, not the Azure Client ID. Restoring under the same subject or reusing the old
