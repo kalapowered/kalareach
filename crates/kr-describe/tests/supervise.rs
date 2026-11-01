@@ -2483,8 +2483,10 @@ fn a_job_refused_for_its_size_leaves_the_process_and_counts_no_failure() {
 /// A resource pause while a job is in the process cancels it, keeps its place in the queue and
 /// ends the process; when the pause clears the job is described. Thermal pressure is the pause.
 ///
-/// The process holds the job until the case has seen the pause end the process, so the job cannot
-/// be answered before the daemon has heard of the pause. The next process is not held.
+/// The process holds the job until the pause cancels it, the case releases it, or its thirty
+/// second deadline passes in real time. The case releases it once it has seen the pause end the
+/// process, so a daemon that is slow to reach the pause does not let the job finish; a case held up
+/// for the whole deadline fails at the result. The next process is not held.
 #[test]
 fn a_pause_while_a_job_runs_cancels_it_and_keeps_its_place() {
     let hot = HostConditions::measured(
@@ -2526,10 +2528,14 @@ fn a_pause_while_a_job_runs_cancels_it_and_keeps_its_place() {
     let reports = rig.until(&roomy(), at(10_000), "the description", |reports, _| {
         a_job_ended(reports)
     });
+    // The job keeps the place it was queued at: it waited from 2,000, when its change settled, to
+    // the dispatch at 10,000, and the pause that sent it back did not start its wait again.
     assert!(
-        outcomes(&reports)
-            .iter()
-            .any(|outcome| matches!(outcome, Outcome::Published { session_id, .. } if *session_id == session(1))),
+        outcomes(&reports).contains(&&Outcome::Published {
+            session_id: session(1),
+            queue_wait_ms: 8_000,
+            execution_ms: 0,
+        }),
         "{reports:?}"
     );
     assert_eq!(rig.driver.started(), 2);
@@ -2584,8 +2590,10 @@ fn a_cancelled_job_whose_process_crashes_is_not_retried() {
 /// process stays, and the new revision is described once the session's cooldown has passed. The
 /// control is a change still inside its debounce, which leaves the job to publish.
 ///
-/// The process holds the job until the case has seen the cancellation end it, so the job cannot be
-/// answered before the cancellation reaches it. The job of the new revision is not held.
+/// The process holds the job until the change cancels it, the case releases it, or its thirty
+/// second deadline passes in real time. The case releases it once it has seen the cancellation end
+/// the job, so a daemon that is slow to reach the change does not let the job finish; a case held
+/// up for the whole deadline fails at the result. The job of the new revision is not held.
 #[test]
 fn a_change_that_settles_while_a_job_runs_cancels_it_in_the_process() {
     let mut rig = Rig::new(&Script {
@@ -2614,7 +2622,15 @@ fn a_change_that_settles_while_a_job_runs_cancels_it_in_the_process() {
         }]
     );
     assert_eq!(rig.driver.pid(), pid, "the process was not ended");
+    // The new revision waits for the cooldown that the job sent at 3,000 started: it is still
+    // queued, and nothing is in the process, up to the reading before the cooldown has passed.
     let next = 3_000 + Budgets::DEFAULTS.session_cooldown_ms;
+    assert_eq!(rig.driver.service().scheduler().queued(), 1);
+    assert_eq!(rig.driver.service().in_flight(), 0);
+    let reports = rig.driver.turn(&roomy(), at(next - 1)).expect("a turn");
+    assert!(outcomes(&reports).is_empty(), "{reports:?}");
+    assert_eq!(rig.driver.service().scheduler().queued(), 1);
+    assert_eq!(rig.driver.service().in_flight(), 0);
     let reports = rig.until(&roomy(), at(next), "the new revision", |reports, _| {
         a_job_ended(reports)
     });
