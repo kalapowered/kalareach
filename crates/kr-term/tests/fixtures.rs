@@ -270,6 +270,10 @@ fn every_case_names_its_requirement() {
 ///
 /// No `Q`, `S` or `X` event ever contributes a forwarded byte, the grid library never writes
 /// anything, and it never fails to recognise a sequence the engine approved.
+///
+/// KR-REQ-08.48, the sentence "Only the query broker can create them": in every case of the
+/// corpus the grid library writes no byte, so the broker is the only responder. Not shown here:
+/// that nothing in the worker outside the lane queues a reply.
 #[test]
 fn no_query_or_side_effect_escapes_in_any_case() {
     for name in ["classes.json", "byte-policy.json", "broker.json"] {

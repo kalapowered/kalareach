@@ -26,6 +26,9 @@ fn replies(engine: &mut Engine, input: &[u8], now_ms: u64) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// KR-REQ-08.48, the sentence "Only the query broker can create them": the device-attribute queries
+/// are answered from the broker's lane, and the grid library writes no byte. Not shown here: that
+/// nothing in the worker outside the lane queues a reply.
 #[test]
 fn the_profile_answers_device_attributes_and_never_a_physical_terminal() {
     let mut engine = engine();
