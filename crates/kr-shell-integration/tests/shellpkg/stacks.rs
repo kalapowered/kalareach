@@ -2272,9 +2272,19 @@ impl Session {
 
     /// Takes the reader that is running now to a fenced empty prompt.
     ///
+    /// A reader that answers at its next step is given a key behind every frame the harness
+    /// writes. One that is slower to act on a key than the harness is to type the next judges the
+    /// fence with a key still unread in the terminal's queue, and reports that queue as holding
+    /// input: keys typed first go first, as the contract says. On such a reader a fence so
+    /// reported is asked again, as the worker would at its next boundary, until the reader judges
+    /// it with its keys taken or the window of the exchange ends; a reader that never takes its
+    /// keys reports them for that long and fails on it. A reader that is given no keys is not
+    /// asked again, and its report is the one that counts.
+    ///
     /// # Panics
     ///
-    /// Panics when that reader reports a queue still holding input at an empty prompt.
+    /// Panics when that reader reports a queue still holding input at an empty prompt, and keeps
+    /// reporting it until the window ends where it is asked again.
     pub fn fenced_latest(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
         // A reader can leave between reporting itself and being asked — a prompt redrawn, a
         // nested read returning — and the reader's answer to that is honest: this is not the
@@ -2282,10 +2292,17 @@ impl Session {
         // its next boundary, which is what this does rather than calling the refusal a failure.
         // What ends the asking is the clock; the count is kept for the failure to report.
         let deadline = self.deadline_for(FENCE);
+        let may_ask_again = dialect(self.package_kind).answers_at_the_next_step;
+        // The prompt a fence was asked about whose answer found input unread: the reader is the one
+        // that is running still, so it is asked about again and no new entry is waited for.
+        let mut asked_about = None;
         let mut attempts = 0;
         loop {
             attempts += 1;
-            let enter = self.latest_prompt();
+            let enter = match asked_about.take() {
+                Some(enter) => enter,
+                None => self.latest_prompt(),
+            };
             let fence = fence_for(&enter, fence_id(index), attachment_id(1), epoch(4));
             let asked = self.ask(WorkerRequest::Fence(RootEditorFenceParams {
                 session_id: self.session_id,
@@ -2297,10 +2314,20 @@ impl Session {
             }));
             match self.answer(asked) {
                 BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement)) => {
+                    let drained = acknowledgement.queues.tty_typeahead_drained
+                        && acknowledgement.queues.macro_input_drained
+                        && acknowledgement.queues.partial_key_drained;
+                    if !drained && may_ask_again && !deadline.passed() {
+                        eprintln!(
+                            "a fence found input the reader had not taken; asking again \
+                             ({attempts})"
+                        );
+                        asked_about = Some(enter);
+                        self.pump(Duration::from_millis(50));
+                        continue;
+                    }
                     assert!(
-                        acknowledgement.queues.tty_typeahead_drained
-                            && acknowledgement.queues.macro_input_drained
-                            && acknowledgement.queues.partial_key_drained,
+                        drained,
                         "an idle reader reported a queue still holding input: {:?}",
                         acknowledgement.queues
                     );
