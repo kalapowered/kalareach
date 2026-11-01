@@ -3309,8 +3309,10 @@ directory on this host when the catalogue is a local one; they are sent because 
 rebuilds the digest of a trust plan from them and because the companion shows where the metadata is.
 Each reaches a device that holds the right of the method that reads it, and a catalogue's locations
 only a device that holds `host.manage`; the command block reaches only a device whose grant keeps
-history from the moment the command started or earlier. The `disabled_reason` of a capability record
-in `plugin.capabilities` is a sentence of the host's. For a signed qualification that the host
+history from the moment the command started or earlier, and the `session_description` and
+`working_directory` of `voice.context` only where the grant's history bound admits the moment each
+was produced. The `disabled_reason` of a capability record in `plugin.capabilities` is a sentence of
+the host's. For a signed qualification that the host
 accepted and whose state is not usable, it is followed by the statement of that qualification, which
 is the publisher's published text and not this host's, and is sent as it is. A qualification the
 host refused is reported as not tested, with the host's own sentence of the refusal and no
