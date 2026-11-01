@@ -36,9 +36,11 @@
 //! lowest priority, and a job of 195 prompt tokens that took about two seconds in the ordinary class
 //! ran into its 30-second deadline in 11 of 12 runs while other work kept the machine busy (the
 //! guide gives the figures and what they leave out). A job that misses its deadline gives the
-//! delayed or stale description that section 22 prescribes when demand exceeds capacity, and the
-//! service counts a miss, and a process ended for one, as a failure of inference, so the cost falls
-//! on the description and not on the terminal.
+//! delayed or stale description that section 22 prescribes when demand exceeds capacity. The
+//! daemon asks such a job to stop and gives a process that has read the request
+//! [`crate::supervise::STOP_BOUND_MS`] after the deadline to answer, so the model stays loaded; the
+//! service makes the next job wait and does not count a miss as a failure of inference. So the
+//! cost falls on the description and not on the terminal.
 //!
 //! Putting the control thread and the watchdog in the idle class has four consequences on Windows
 //! when other work keeps every core busy for longer than a few seconds (Windows lifts a thread that

@@ -285,26 +285,37 @@ the system does not hold is reported as not applied, with the reason.
 
   The deadline stays the 30 seconds that section 22 fixes, and a job that misses it gives the
   delayed or stale description that section 22 prescribes when demand exceeds capacity, as on
-  Linux and Windows. That is not all it costs on this Mac. In a run of the real weights driven by
-  the daemon's driver (the `inference` tests of `kr-describe-model`), the first job and each of
-  the four largest contexts ended at the deadline, and the daemon ended the process after each of
-  those four for passing the deadline by its two seconds of grace; each restart loaded the model
-  again, in 8.0 to 14.9 seconds. No job in that run published a description. The log does not say
-  which phase of the job the model was in. The model looks at its deadline between chunks of 128
-  prompt tokens and between output tokens, and a cancellation was acknowledged in 5 ms and
-  answered after 7.8 and 15 seconds. By the service's rules, a job that misses its deadline and a
-  process ended for it each count as a failure of inference, three in a row show the host as
-  paused for `inference_failed`, and the wait before the next load doubles from one second to five
-  minutes until a description is published. So on a Mac whose efficiency cores stay busy,
-  descriptions can stop for minutes at a time, and the terminal does not pay for it. No daemon in
-  use was observed in this state, and no measurement was taken on a Mac with its efficiency cores
-  idle.
+  Linux and Windows. A miss is demand beyond what the host can serve, and the daemon does not
+  treat it as a failure of the process:
+
+  - At the job's deadline the daemon asks the process to stop the job. A process whose control
+    thread says it has read the request is listening, and is given 30 seconds after the deadline
+    to answer: twice the longest stop seen in the class (15 seconds), and a session's cooldown,
+    so a stop within it delays no other description of that session. The process's own watchdog gives a job whose stop it has read the same
+    bound, where other work is overdue two seconds after its deadline. The job answers as past
+    its deadline, the model stays loaded, and no new load follows. A process whose control thread
+    does not say it has read the request is ended two seconds after the deadline, and one that
+    has read it and has not answered by the bound is ended then; each is a failure of inference.
+  - A job that misses its deadline makes the next job wait, one second after the first miss and
+    twice as long after each one in a row, up to five minutes, until a description is published.
+    It does not by itself show the host as paused: `inference_failed` is for a process or a model
+    that fails. No pause reason that exists names a busy host, so the wait shows only as the
+    delayed description; a reason of its own waits for the next protocol cut.
+
+  Measured on this Mac with the real weights, driven by the daemon's driver (the `inference`
+  tests of `kr-describe-model`), while a build in the same class kept the machine busy: the
+  four largest contexts each missed the deadline (31 to 44 seconds), and none ended the process
+  or loaded the model again. Before the stop was given time, the same cases on this Mac ended the
+  process four times out of four for passing the deadline by its two seconds of grace, each
+  followed by a load of 8.0 to 14.9 seconds, with no description published; a cancellation was
+  acknowledged in 5 ms and answered after 7.8 and 15 seconds. When the machine was not busy, the
+  same cases published their descriptions in 9 to 22 seconds. No daemon in use was observed, and
+  no measurement was taken on a Mac with its efficiency cores idle.
 
   The process's control thread and watchdog are in the class too, so the ends listed for Windows
   below can follow on a Mac whose efficiency cores stay busy for longer than a few seconds: a late
-  acknowledgement of a cancellation, the watchdog's bound on one request, and a late `ready`. The
-  one run of the real weights above saw the daemon end the process for a deadline and none of
-  those three.
+  acknowledgement of a cancellation, the watchdog's bound on one request, and a late `ready`. None
+  of those three was seen in the runs above.
 
   A utility quality-of-service clamp gave 2.0 to 3.3 seconds in the first measurement, but only
   the process that starts the description process can set it, through an interface the system does
@@ -534,14 +545,14 @@ The daemon holds the process to its bounds, and ends it outright when it breaks 
 | --- | --- |
 | Answering hello | 10 s |
 | A load | its own deadline of five minutes, and 2 s more |
-| A job | its thirty seconds from dequeue, and 2 s more |
+| A job | its thirty seconds from dequeue, and 2 s more; 30 s after the deadline for a process whose control thread has said it read the request to stop that the daemon makes at the deadline |
 | Answering a cancellation | 2 s |
 | The resident set, read every second during a load or a job | 4 GiB |
 
 The process holds itself to them as well, so no end depends on the daemon alone. Its watchdog ends
 it when its control thread has spent two seconds on one request (the wait at the first message for
 the model thread's report of its class is not counted), which is a daemon that stopped
-reading its answers, and when a load or a job runs two seconds past its deadline. The daemon passes
+reading its answers, and when a load or a job runs two seconds past its deadline (a job whose stop it has read, 30 seconds). The daemon passes
 its own start identity when it starts the process, and once a second the watchdog asks whether that
 daemon is still running: a control thread stuck inside a read never sees its input end, and the
 process still goes when its daemon does. The daemon reads its identity afresh for every start, and a

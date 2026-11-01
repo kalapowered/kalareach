@@ -74,8 +74,7 @@ pub const ANSWER_GRACE_MS: u64 = 2_000;
 /// A job past its deadline is asked to stop at the deadline. The grace after it ends a process that
 /// has not said it read the request: its control thread is not listening. A process that has said
 /// so is listening and has not yet reached a place where the model can stop, which a busy host in
-/// the background class takes a while to do: the longest stop seen there was 15 seconds, at a
-/// check between chunks of 128 prompt tokens. Ending it costs a new load of the model, 8 to 15
+/// the background class takes a while to do: the longest stop seen there was 15 seconds. Ending it costs a new load of the model, 8 to 15
 /// seconds, and a failure of inference. So it is given twice the longest stop seen, which is also
 /// a session's cooldown, 30 seconds: a session is not described again sooner than that, so a
 /// stop within it delays no other description of that session.

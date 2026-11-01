@@ -14,7 +14,8 @@
 //!   [`CONTROL_BOUND_MS`] on one request (not counting the wait of the first `hello` for the model
 //!   thread's report of its class, which the daemon's handshake bound limits), which is a control
 //!   thread stuck writing to a daemon that is not reading; when a load or a job is [`OVERDUE_GRACE_MS`] past its deadline, which is a
-//!   model that did not stop; and when the daemon that started it has ended, by its start
+//!   model that did not stop (a job whose stop the control thread has read is given [`STOP_BOUND_MS`]
+//!   after its deadline); and when the daemon that started it has ended, by its start
 //!   identity, whether or not the control thread saw its input end. No end of this process
 //!   depends on the daemon alone.
 //!

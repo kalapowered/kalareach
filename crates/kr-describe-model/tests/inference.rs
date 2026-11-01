@@ -153,9 +153,9 @@ impl Placed {
 /// and then a cancellation that ends past the deadline is a fault of the cancellation and fails.
 /// Where the daemon ended the process for both jobs, the case says it did not run.
 ///
-/// It does not show a description published: a job that ends at its deadline passes it. On a Mac,
-/// where the description process runs in the background class, the first job ended at its
-/// deadline in the run of this case that was made with the class.
+/// It does not show a description published: a job that ends at its deadline passes it. On a busy
+/// Mac, where the description process runs in the background class, the first job can end at its
+/// deadline.
 #[test]
 fn the_description_process_runs_the_real_model() {
     let Some(placed) = Placed::real_weights("the_description_process_runs_the_real_model") else {
@@ -339,11 +339,10 @@ fn queue_largest(service: &mut DescriptionService, session_id: SessionId, base: 
 /// descriptions are not delayed or paused for every session on the host because one session is
 /// large. A job that runs to its deadline on a host slower than the reference is the benchmark's to
 /// measure and is not what this decides; the limit of that is that a restart a size causes close to
-/// the daemon's grace cannot be told from a slow host here. On a Mac, where the description process
-/// runs in the background class, every one of the four contexts ended at its deadline and the
-/// daemon ended the process for each, in the run made with the class: the case passes there and
-/// shows neither a description published nor the absence of a restart, so a Mac run does not count
-/// for the clause that no process is ended for a size.
+/// the daemon's grace cannot be told from a slow host here. On a busy Mac, where the description
+/// process runs in the background class, a context can end at its deadline with no description
+/// published, and the case passes: it then shows no description published, and the absence of a
+/// restart only in the run's own output, which lists a process ended or started again.
 #[test]
 fn the_largest_contexts_are_sent_to_the_real_process_and_none_is_refused_for_its_size() {
     let Some(placed) = Placed::real_weights(
