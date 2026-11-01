@@ -144,7 +144,7 @@ pub trait SetupAdmission: Send + Sync + 'static {
     fn admitted(&self, write: &mut dyn FnMut() -> Result<()>) -> Result<()>;
 }
 
-/// The calls that are running, and how the last one that did not set backups up ended.
+/// The calls that are running, and how the last call that ended as declined or unknown ended.
 #[derive(Debug, Default)]
 struct Calls {
     next: u64,
@@ -244,8 +244,8 @@ impl Admitted {
     /// the answer returned here only stops the step.
     ///
     /// The read of the delay that follows a read which found no bundle at the locator is the one
-    /// read of it with no ask before it: it sends nothing and builds an answer, which
-    /// [`Self::ended`] gives only after it asks once more.
+    /// read of it with no ask before it: it sends nothing and builds an answer, and an answer that
+    /// tells a delay is given only after [`Self::ended`] asks once more.
     fn ask(&self) -> std::result::Result<(), Ended> {
         self.admission.stands().map_err(|refusal| {
             self.keep(refusal);
@@ -365,8 +365,8 @@ impl BackupSetup {
         self.calls.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The fingerprints of the calls that have not ended, oldest first, and how the last one that
-    /// did not set backups up ended. Read without waiting for any call.
+    /// The fingerprints of the calls that have not ended, oldest first, and how the last call that
+    /// ended as declined or unknown ended. Read without waiting for any call.
     #[must_use]
     pub fn progress(&self) -> (Vec<String>, Option<BackupLastAttempt>) {
         let calls = self.calls();
