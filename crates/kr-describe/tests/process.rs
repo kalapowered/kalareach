@@ -31,6 +31,13 @@ use support::{binding, default_profile};
 
 const SOON: Duration = Duration::from_secs(10);
 
+/// The deadline of a job that a case tells to stop, in milliseconds. The control thread has to read
+/// the stop before the deadline and the grace after it have passed, or the process ends as overdue
+/// before it can acknowledge, so a case that sends the stop after the job began leaves the process
+/// a margin of this and the grace, which is the time anything here is given to arrive.
+const STOP_DEADLINE_MS: u64 = 8_000;
+const _: () = assert!(STOP_DEADLINE_MS + OVERDUE_GRACE_MS == SOON.as_secs() * 1_000);
+
 /// How long past its deadline the guide gives work that its process has not been told to stop, and
 /// a job whose stop its control thread has read, written out so that a case that counts in them
 /// fails when either changes.
@@ -590,12 +597,13 @@ fn a_process_whose_job_does_not_stop_ends_itself() {
 /// for it at the usual grace after the deadline. The model here does not look at its token for
 /// longer than that grace, as a model in the background class on a busy host can take; the process
 /// answers the job as stopped. The control is the same job that was told nothing, which ends the
-/// process at the grace (above).
+/// process at the grace (above). The job's deadline leaves the control thread the margin of
+/// [`STOP_DEADLINE_MS`] to read the stop, and no part of the case depends on it being read sooner.
 #[test]
 fn a_job_past_its_deadline_that_was_told_to_stop_is_given_time_to_stop() {
     let placed = Placed::stub();
     let runtime = placed.directory("told-to-stop");
-    let slow_ms = 200 + OVERDUE_GRACE_MS + 1_500;
+    let slow_ms = STOP_DEADLINE_MS + OVERDUE_GRACE_MS + 1_500;
     let script = Script {
         ignore_token_ms: slow_ms,
         mark_work: true,
@@ -605,7 +613,7 @@ fn a_job_past_its_deadline_that_was_told_to_stop_is_given_time_to_stop() {
     process.hello();
     process.send(&load(1, &default_profile(), 300_000));
     process.expect_answer(SOON, "the load");
-    process.send(&generate(2, 1, 200));
+    process.send(&generate(2, 1, STOP_DEADLINE_MS));
     wait_until_began(&runtime, "job");
     process.send(&Request::Cancel { id: U64::new(2) });
     assert_eq!(
@@ -645,7 +653,7 @@ fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
     process.send(&load(1, &default_profile(), 300_000));
     process.expect_answer(SOON, "the load");
     let sent = Instant::now();
-    process.send(&generate(2, 1, 200));
+    process.send(&generate(2, 1, STOP_DEADLINE_MS));
     wait_until_began(&runtime, "job");
     assert_eq!(
         job_bounds(&runtime, 2),
@@ -658,10 +666,10 @@ fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
         Answer::Cancelling { id: U64::new(2) }
     );
     let status = process
-        .exit_within(Duration::from_millis(STOP_BOUND_MS) * 2)
+        .exit_within(Duration::from_millis(STOP_DEADLINE_MS + STOP_BOUND_MS) * 2)
         .expect("the process ends itself at the stop bound");
     assert_eq!(status.code(), Some(Exit::Overdue.code()));
-    assert!(sent.elapsed() >= Duration::from_millis(200 + STOP_BOUND_MS));
+    assert!(sent.elapsed() >= Duration::from_millis(STOP_DEADLINE_MS + STOP_BOUND_MS));
 }
 
 /// KR-REQ-22.11: a job the control thread has read the stop of is cancelled, and has the stop
