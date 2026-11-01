@@ -4052,10 +4052,11 @@ enum Gathered {
 /// the pipe from ever being empty, so without those two the pass would last as long as the writer
 /// does, and so would the memory it is given. Nothing is read once the limit is passed.
 ///
-/// The time is checked before a read and not after it, so a pass that begins after the time has run
-/// out reads nothing. A poll that wakes late therefore takes in neither what was written after the
-/// time ran out nor the end that follows it, and the end is first seen by a pass that began in
-/// time.
+/// The time is checked before a read, so a pass that begins after the time has run out reads
+/// nothing. A poll that wakes late therefore takes in neither what was written after the time ran
+/// out nor the end that follows it, and the end is first seen by a pass that began in time. An end
+/// that a read returns after the time has run out is not taken as the end either, since the read
+/// may have waited for it.
 #[cfg(unix)]
 fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) -> Gathered {
     let mut buffer = [0_u8; 4096];
@@ -4073,6 +4074,10 @@ fn gather(pipe: &mut impl std::io::Read, seen: &mut Bounded, deadline: Instant) 
             read
         };
         match read {
+            // The end counts only if it was read in time. The time was checked before this read,
+            // and a read that returns after the deadline may have waited for it, so what it found
+            // is not known to have been there in time.
+            Ok(0) if Instant::now() >= deadline => return Gathered::Open,
             Ok(0) => return Gathered::Closed,
             Ok(read) => {
                 let room = PROBE_OUTPUT_LIMIT.saturating_sub(seen.bytes.len());
