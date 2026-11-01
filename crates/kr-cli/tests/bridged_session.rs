@@ -4221,9 +4221,19 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
         kr_ipc::testing::place_program(&text, &directory.join("systemctl"));
     };
 
+    // The case runs with that `systemctl` first on its `PATH` and no runtime directory of the
+    // person's, so that the teardown of its tree does not ask the stand-in about units too.
+    let run_with = |path: &Path| {
+        let mut command = std::process::Command::new(std::env::current_exe().expect("this binary"));
+        command
+            .args(["--ignored", "--exact", case])
+            .env("PATH", path)
+            .env_remove("XDG_RUNTIME_DIR");
+        to_its_end(command, Duration::from_secs(120))
+    };
     let stalling = tempfile::tempdir().expect("a directory");
     place(stalling.path(), "exec sleep 60");
-    let ran = this_binary_with(&["--ignored", "--exact", case], Some(stalling.path()));
+    let ran = run_with(stalling.path());
     let said = String::from_utf8_lossy(&ran.stderr);
     assert_eq!(
         ran.status.code(),
@@ -4234,7 +4244,7 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
 
     let absent = tempfile::tempdir().expect("a directory");
     place(absent.path(), "echo 'Failed to connect to bus' >&2; exit 1");
-    let ran = this_binary_with(&["--ignored", "--exact", case], Some(absent.path()));
+    let ran = run_with(absent.path());
     let printed = String::from_utf8_lossy(&ran.stdout);
     assert!(
         ran.status.success(),
