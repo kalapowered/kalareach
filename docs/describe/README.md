@@ -308,13 +308,17 @@ the system does not hold is reported as not applied, with the reason.
 
     A job a caller cancelled before the service decided what it came to is never counted as a
     miss, whichever way it would have ended past its deadline. A pause the service has applied, a
-    closed session or a change that made the description stale decides it when the process
-    answers that it stopped, and then the job is no miss. When the daemon ends the process at
-    the bound, or the process answers on its own that the deadline passed, or answers with a
-    description after it, the job ends past its deadline whatever else would have stopped it but
-    a caller, and a job a pause had stopped is not queued again.
+    closed session, a change that made the description stale or a privacy fence on the session
+    decides it when the process answers that it stopped, and then the job is no miss. When the
+    daemon ends the process at the bound, or the process answers on its own that the deadline
+    passed, the job ends past its deadline whatever else would have stopped it but a caller, and
+    a job a pause had stopped is not queued again. A description that arrives after the deadline
+    is a miss only when nothing else stopped the job: a pause that was applied, or descriptions
+    turned off, put the job back in the queue, and a closed session, a change that made the
+    description stale or a privacy fence reject it.
   - A job that misses its deadline makes the next job wait, one second after the first miss and
-    twice as long after each one in a row, up to five minutes, until a description is published.
+    twice as long after each one in a row, up to five minutes, until a description or a summary
+    is published.
     The cadence a client is shown does not count this wait. It does not by itself show the host
     as paused: `inference_failed` is for a process or a model that fails. No pause reason that
     exists names a busy host, so the wait shows only as the delayed description; a reason of its
@@ -640,10 +644,11 @@ cancellation and a passed deadline publish nothing.
 
 A process that exits, breaks the wire or is ended for breaking a bound takes the model with it and
 nothing else. The store, the pins, the provenance, every session and every deterministic title
-survive. The job it was running is queued again once, with its aging position, unless the process
-was ended for passing its deadline or its memory ceiling, which ends the job past its deadline or
-failed, and if the next process fails it as well it is not retried, however many pauses come
-between. A job a caller or
+survive. The job it was running is queued again once, with its aging position, unless the daemon
+ended the process for passing its deadline or its memory ceiling, which ends the job past its
+deadline or failed (a process that ends itself for passing its deadline reads as one that
+exited, and the job is queued again), and if the next process fails it as well it is not
+retried, however many pauses come between. A job a caller or
 privacy mode cancelled is never queued again, even when its process ends before the cancellation is
 answered, and even when a pause had already stopped it: a retry would run it under a new token that
 nobody had cancelled. The service's handle on the running job is the one way to cancel it from

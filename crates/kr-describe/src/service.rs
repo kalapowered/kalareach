@@ -551,7 +551,9 @@ struct Restart {
     failures: u32,
     not_before_ms: u64,
     pause: Option<PauseReason>,
-    /// Jobs in a row that passed their deadline, none of them followed by a publication.
+    /// Jobs in a row that passed their deadline, none of them followed by a publication that
+    /// stayed within the memory ceiling: a description or a summary clears it, unless the process
+    /// passed its ceiling to produce it.
     late: u32,
     /// When the next job may be sent after the last one that passed its deadline.
     busy_until_ms: u64,
