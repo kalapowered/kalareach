@@ -3980,13 +3980,18 @@ const BOUNDS_TO_TRY: [Duration; 3] = [
     Duration::from_secs(45),
 ];
 
+/// How long the program of the case below goes on if it is not ended: longer than every bound the
+/// case tries, so that no bound is one the program ends before.
+const PROGRAM_GOES_ON_FOR: u32 = 120;
+
 /// A call that does not end within its bound is asked to end before it is killed, so that a
 /// program that cleans up after itself, as an image build does, is given the chance: a program that
 /// is killed outright leaves what it started.
 ///
 /// A program ended before it is ready to be asked is ended by a signal it has no say in, and that
 /// says nothing of the harness. So a run whose program was not ready within its bound is not
-/// counted, and the case is run again with a longer one.
+/// counted, and the case is run again with a longer one, and so is a run whose start did not get
+/// its turn within its bound: the decision is made after the run, from what the program left.
 #[test]
 fn a_call_that_does_not_end_is_asked_to_end_before_it_is_killed() {
     let directory = tempfile::tempdir().expect("a directory");
@@ -3996,17 +4001,26 @@ fn a_call_that_does_not_end_is_asked_to_end_before_it_is_killed() {
         let mut command = std::process::Command::new("/bin/sh");
         command
             .arg("-c")
-            .arg("trap ': > \"$2\"; kill $!; exit 0' TERM; sleep 30 & : > \"$1\"; wait")
+            .arg(format!(
+                "trap ': > \"$2\"; kill $!; exit 0' TERM; sleep {PROGRAM_GOES_ON_FOR} & \
+                 : > \"$1\"; wait"
+            ))
             .arg("program")
             .arg(&ready)
             .arg(&asked);
-        let why = user_manager::bounded(command, bound)
-            .expect_err("a program that never ends is ended and the call says so");
-        assert!(why.contains("did not end within"), "{why}");
+        let ended = match user_manager::bounded(command, bound) {
+            Err(why) if why.contains("did not end within") => why,
+            // The start did not get its turn in the bound, or the machine could not run it:
+            // nothing was tested, so it is run again.
+            Err(_) => continue,
+            Ok(output) => {
+                panic!("a program that goes on for longer than every bound ended: {output:?}")
+            }
+        };
         if ready.exists() {
             assert!(
                 asked.exists(),
-                "the program was killed without being asked to end: {why}"
+                "the program was killed without being asked to end: {ended}"
             );
             return;
         }
@@ -4103,21 +4117,28 @@ fn a_call_that_ended_and_left_something_holding_its_output_fails_and_names_the_c
     );
 }
 
+/// The bounds the case below gives a run of `kr`, each below the twenty seconds a run of `kr`
+/// that is waiting for a program that does not answer gives up in by itself, so that no bound is
+/// one the run ends before.
+const KR_BOUNDS_TO_TRY: [Duration; 3] = [
+    Duration::from_secs(3),
+    Duration::from_secs(10),
+    Duration::from_secs(15),
+];
+
 /// A run of `kr` that does not end within its bound fails the case that ran it, with the call
 /// named: a `kr` that waits for an `ssh` that never answers is the one that stalls here.
 ///
 /// A `kr` that was not yet at the `ssh` when its bound passed says nothing of the harness, so a run
 /// whose connection was never made is not counted, and the case is run again with a longer bound.
+/// So is a run that failed for another reason than its bound: the decision is made after the run,
+/// from whether the connection was made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_kr_run_that_does_not_end_within_its_bound_fails_the_case_and_names_the_call() {
     let mut world = World::start().await;
     std::fs::write(world.tools.join("stalls"), "").expect("a mark for the stand-in");
     let stalled = world.tools.join("stalled.pid");
-    for bound in [
-        Duration::from_secs(3),
-        Duration::from_secs(10),
-        Duration::from_secs(30),
-    ] {
+    for bound in KR_BOUNDS_TO_TRY {
         world.kr_bound = bound;
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             world.run(&[
@@ -4138,13 +4159,13 @@ async fn a_kr_run_that_does_not_end_within_its_bound_fails_the_case_and_names_th
             ])
         }));
         let said = panic_message(failed.expect_err("a run that outlasts its bound fails the case"));
-        assert!(
-            said.contains("\"enrol\"") && said.contains("within"),
-            "the call is named: {said}"
-        );
         let Ok(recorded) = std::fs::read_to_string(&stalled) else {
             continue;
         };
+        assert!(
+            said.contains("\"enrol\"") && said.contains("did not end within"),
+            "the call is named: {said}"
+        );
         // What `kr` was waiting for goes with it, and does not outlast the case.
         let pid = recorded
             .trim()
