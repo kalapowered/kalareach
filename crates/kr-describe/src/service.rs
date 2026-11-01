@@ -1601,8 +1601,14 @@ impl DescriptionService {
             let (session_id, stop) = (dispatched.job.session_id, dispatched.stopping);
             let outlived = dispatched.outlived;
             let summary = dispatched.job.work.is_summary();
+            // A change that moved the session's revision on, when the answer is read before the
+            // service has looked and stopped the job for it: the stop the next look would have
+            // applied, read before the answer's outcome closes the job.
+            let made_stale =
+                stop.is_none() && self.reason_to_stop(&dispatched) == Some(Stop::Superseded);
             let outcome = self.finish_job(dispatched, answer, now);
             let superseded = stop == Some(Stop::Superseded)
+                || (made_stale && matches!(outcome, Ok(Outcome::Cancelled { .. })))
                 || matches!(
                     outcome,
                     Ok(Outcome::Rejected {

@@ -1204,6 +1204,76 @@ fn a_superseded_job_that_outlives_its_session_leaves_no_mark() {
     }
 }
 
+/// KR-REQ-22.16: a job that a change made stale is superseded when the process answers it cancelled
+/// before the service has looked and stopped it, as it is when the service stopped it first: the job
+/// after it runs to its end while the session's next change waits for it, so a session that keeps
+/// changing is still described at least every other job. The job here was asked to stop at its
+/// deadline, which the process answers cancelled, and the change settled before the answer with no
+/// look between. The control is the same answer for a job no change reached, a miss that supersedes
+/// nothing, so the change after the next job begins settles as any other.
+#[test]
+fn a_job_made_stale_whose_answer_is_read_before_the_service_stops_it_is_superseded() {
+    let cooldown = Budgets::DEFAULTS.session_cooldown_ms;
+    for made_stale in [true, false] {
+        let mut service = service();
+        queue(&mut service, &session(1), "kalareach", at(0));
+        let Instruction::Generate { id, .. } = loaded(&mut service, at(3_000)) else {
+            panic!("the job is sent");
+        };
+        service.job_asked_to_stop_at_its_deadline(id);
+        if made_stale {
+            change(&mut service, &session(1), "crates", at(3_100));
+            assert!(
+                service
+                    .settle(&session(1), Priority::Ordinary, at(5_100))
+                    .is_some()
+            );
+        }
+        let outcome = service
+            .finished(
+                id,
+                Answered::Ended {
+                    why: JobEnd::Cancelled,
+                    detail: None,
+                },
+                at(5_200),
+            )
+            .expect("the answer");
+        let expected = if made_stale {
+            Outcome::Cancelled {
+                session_id: session(1),
+            }
+        } else {
+            Outcome::DeadlineExceeded {
+                session_id: session(1),
+            }
+        };
+        assert_eq!(outcome, expected, "stale: {made_stale}");
+        if !made_stale {
+            change(&mut service, &session(1), "crates", at(6_000));
+            assert!(
+                service
+                    .settle(&session(1), Priority::Ordinary, at(8_000))
+                    .is_some()
+            );
+        }
+        let next = at(3_000 + cooldown);
+        let Instruction::Generate { .. } = service.next(&roomy(), next).expect("a job") else {
+            panic!("stale {made_stale}: the next job is sent");
+        };
+        change(&mut service, &session(1), "tests", next.after_ms(100));
+        let settled = service.settle(&session(1), Priority::Ordinary, next.after_ms(2_100));
+        if made_stale {
+            assert_eq!(
+                settled, None,
+                "the change waits for the job after a superseded one"
+            );
+        } else {
+            assert!(settled.is_some(), "a job no change reached supersedes nothing");
+        }
+    }
+}
+
 /// A job that outlived its session publishes nothing and never comes back, however the session
 /// there now is identified. Its answer, arriving after the session closed and opened again under
 /// the same epoch and binding with a new directory already at revision 1, is refused; a crash after
