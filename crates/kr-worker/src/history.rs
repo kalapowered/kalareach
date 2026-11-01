@@ -4071,12 +4071,12 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// KR-REQ-20.20, KR-PERF-003: sessions whose passes fall together give up the host's excess
+    /// KR-REQ-20.20: sessions whose passes fall together give up the host's excess
     /// once. Six sessions of 64 bytes hold 384 under a cap of 360. Every pass reads the 384 before
     /// any pass gives anything up, as passes on one beat can, and each session on its own would
     /// give up the 24 bytes the host is over by.
     #[test]
-    fn kr_perf_003_passes_that_find_the_host_over_its_cap_together_give_up_its_excess_once() {
+    fn passes_that_find_the_host_over_its_cap_together_give_up_its_excess_once() {
         let root = spool_directory("host-cap-together");
         let retention = OutputRetention::new(
             std::time::Duration::from_secs(7 * 24 * 60 * 60),
@@ -4127,12 +4127,12 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// KR-REQ-20.20, KR-PERF-003: a session that takes the lock after another removed output reads
+    /// KR-REQ-20.20: a session that takes the lock after another removed output reads
     /// the host again, and finds nothing to give up. Both sessions read the 128 bytes the host
     /// holds under a cap of 100 before either removes anything; the second takes the lock only
     /// after the first has removed what it was over by and let go.
     #[test]
-    fn kr_perf_003_a_session_that_takes_the_lock_after_another_removed_output_gives_up_nothing() {
+    fn a_session_that_takes_the_lock_after_another_removed_output_gives_up_nothing() {
         use std::sync::{Condvar, Mutex};
 
         let root = spool_directory("host-cap-second-reader");
@@ -4189,7 +4189,7 @@ mod tests {
         });
         assert_eq!(
             given_by_first, 32,
-            "the first gives up the 28 it is over by"
+            "the first gives up the 28 it is over by, to the segment: four segments of 8"
         );
         assert_eq!(
             given_by_second, 0,
@@ -4213,11 +4213,11 @@ mod tests {
         file
     }
 
-    /// KR-REQ-20.20, KR-PERF-003: a session that does not get the host-wide lock gives up nothing
+    /// KR-REQ-20.20: a session that does not get the host-wide lock gives up nothing
     /// for the host's cap on that pass, and looks at the host again on its next, since what it read
     /// may be gone by then.
     #[test]
-    fn kr_perf_003_a_session_that_cannot_take_the_host_cap_lock_gives_up_nothing_and_looks_again() {
+    fn a_session_that_cannot_take_the_host_cap_lock_gives_up_nothing_and_looks_again() {
         let root = spool_directory("host-cap-held");
         let retention = OutputRetention::new(
             std::time::Duration::from_secs(7 * 24 * 60 * 60),
@@ -4266,13 +4266,12 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// KR-REQ-20.20, KR-PERF-003: the holder of the lock gives up only its own output. When that is
+    /// KR-REQ-20.20: the holder of the lock gives up only its own output. When that is
     /// less than the excess, the sessions that did not get the lock look again, and the excess is
     /// gone within a few rounds of looking, with no session having waited for the lock: each pass
     /// below returns at once, with the lock held elsewhere or not.
     #[test]
-    fn kr_perf_003_a_small_holder_that_wins_the_lock_first_leaves_the_rest_to_those_that_look_again()
-     {
+    fn a_small_holder_that_wins_the_lock_first_leaves_the_rest_to_those_that_look_again() {
         let root = spool_directory("host-cap-small-holder");
         let retention = OutputRetention::new(
             std::time::Duration::from_secs(7 * 24 * 60 * 60),
@@ -4338,10 +4337,10 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// KR-REQ-20.20, KR-PERF-003: a session that cannot take the lock at all, as opposed to finding
+    /// KR-REQ-20.20: a session that cannot take the lock at all, as opposed to finding
     /// it held, says why it left the host over its cap, and gives up output again once it can.
     #[test]
-    fn kr_perf_003_a_session_that_cannot_open_the_host_cap_lock_says_so_and_recovers() {
+    fn a_session_that_cannot_open_the_host_cap_lock_says_so_and_recovers() {
         let root = spool_directory("host-cap-unavailable");
         let retention = OutputRetention::new(
             std::time::Duration::from_secs(7 * 24 * 60 * 60),
@@ -4385,10 +4384,10 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// KR-REQ-20.20, KR-PERF-003: a session whose spool holds no output has none to give up for the
+    /// KR-REQ-20.20: a session whose spool holds no output has none to give up for the
     /// host's cap, so it does not take the lock the sessions that have some need.
     #[test]
-    fn kr_perf_003_a_session_with_no_output_in_its_spool_takes_no_host_cap_lock() {
+    fn a_session_with_no_output_in_its_spool_takes_no_host_cap_lock() {
         let root = spool_directory("host-cap-empty");
         let retention = OutputRetention::new(
             std::time::Duration::from_secs(7 * 24 * 60 * 60),

@@ -11881,11 +11881,11 @@ mod tests {
     };
     use crate::output::OutputDelivery;
 
-    /// KR-PERF-003: a host that found the host over its output cap while another held the lock on
-    /// it looks again after a few seconds, and no later than its next pass on the beat; a host that
-    /// was not kept from the cap by the lock keeps to the beat and draws no delay.
+    /// A host that found the host over its output cap while another held the lock on it looks again
+    /// after a few seconds, and no later than its next pass on the beat; a host that was not kept
+    /// from the cap by the lock keeps to the beat and draws no delay.
     #[test]
-    fn kr_perf_003_a_host_kept_from_the_cap_by_the_lock_looks_again_before_its_next_pass() {
+    fn a_host_kept_from_the_cap_by_the_lock_looks_again_before_its_next_pass() {
         use super::{
             HOST_CAP_RETRY_FROM, HOST_CAP_RETRY_SPREAD, host_cap_retry_at, host_cap_retry_delay,
         };
