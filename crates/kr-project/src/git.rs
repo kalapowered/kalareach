@@ -622,8 +622,10 @@ impl GitProgram {
     /// process's `PATH`, giving it `bound` to answer everything it is asked.
     fn discover_on(search: Option<&OsStr>, bound: Duration) -> Result<Self> {
         search_in(search, GIT_FILE_NAME)
-            .ok_or_else(|| ProjectError::GitUnavailable {
-                detail: "installed Git was not found on this host".to_owned().into(),
+            .and_then(|found| {
+                found.ok_or_else(|| ProjectError::GitUnavailable {
+                    detail: "installed Git was not found on this host".to_owned().into(),
+                })
             })
             .and_then(|program| Self::at_within(&program, bound))
             .map_err(with_install_step)
@@ -3333,11 +3335,41 @@ fn read_up_to<R: std::io::Read + Send + 'static>(pipe: R, ceiling: usize) -> Rea
     Reader { handle, read }
 }
 
-/// Finds one program on a search path.
-fn search_in(search: Option<&OsStr>, file_name: &str) -> Option<PathBuf> {
-    std::env::split_paths(search?)
-        .map(|directory| directory.join(file_name))
-        .find(|candidate| candidate.is_file())
+/// Finds one program on a search path. A candidate that cannot be examined is not there, except
+/// when the host is too short of descriptors, processes or memory to examine it: that host has not
+/// said that there is no Git, so the look is refused as a fault that passes and keeps nothing.
+fn search_in(search: Option<&OsStr>, file_name: &str) -> Result<Option<PathBuf>> {
+    let Some(search) = search else {
+        return Ok(None);
+    };
+    for directory in std::env::split_paths(search) {
+        let candidate = directory.join(file_name);
+        match examined(&candidate) {
+            Ok(found) if found.is_file() => return Ok(Some(candidate)),
+            Err(error) if short_of_resources(&error) => {
+                return Err(could_not_resolve(
+                    format!(
+                        "{} could not be examined: {error}",
+                        redact(&candidate.display().to_string())
+                    ),
+                    &error,
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+/// Examines one candidate for Git on a search path, following links.
+fn examined(candidate: &Path) -> std::io::Result<std::fs::Metadata> {
+    // A case that asks for it has the examination fail, as it does for a host that is short of
+    // memory.
+    #[cfg(all(test, unix))]
+    if let Some(error) = tests::EXAMINE_FAILS.with(std::cell::Cell::get) {
+        return Err(std::io::Error::from(error));
+    }
+    std::fs::metadata(candidate)
 }
 
 /// The step that installs Git on this platform, which a refusal for lack of it ends with.
@@ -5414,6 +5446,10 @@ mod tests {
         /// a probe's output, in place of the sleep's start. It is given the limits of that wait.
         pub(super) static BEFORE_THE_NEXT_POLL: std::cell::Cell<Option<Stall>> =
             const { std::cell::Cell::new(None) };
+        /// Set by a case to make the examination of each candidate for Git on a search path fail on
+        /// its own thread with that error.
+        pub(super) static EXAMINE_FAILS: std::cell::Cell<Option<rustix::io::Errno>> =
+            const { std::cell::Cell::new(None) };
         /// Set by a case to make the resolution of a path that names Git fail on its own thread,
         /// after that many resolutions have succeeded, with that error.
         pub(super) static RESOLUTION_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
@@ -7054,6 +7090,61 @@ mod tests {
             alone.program(),
             "and the program on the search path runs as itself"
         );
+    }
+
+    /// A host too short of descriptors, processes or memory to examine a candidate for Git on the
+    /// search path has not said that there is no Git, so the look is refused as a fault that
+    /// passes and names no step to install it. A candidate that cannot be examined for another
+    /// reason is not there, and with nothing else on the path the look finds no Git, with the
+    /// step. Without a failure the Git on the path is found.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_too_short_of_memory_to_examine_a_candidate_for_git_refuses_the_look_as_a_fault_that_passes()
+     {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let helpers = directory.path().join("helpers");
+        std::fs::create_dir(&helpers).expect("a helper directory");
+        place_stand_in(
+            directory.path(),
+            &format!(
+                "case \"$1\" in\n--exec-path) echo '{}' ;;\n--version) echo 'git version 2.50.1' ;;\nesac",
+                helpers.display()
+            ),
+        );
+        let search = directory.path().as_os_str().to_owned();
+
+        EXAMINE_FAILS.with(|fails| fails.set(Some(rustix::io::Errno::NOMEM)));
+        let refusal = GitProgram::discover_on(Some(&search), PROBE_BOUND)
+            .expect_err("a candidate that cannot be examined is not a Git");
+        EXAMINE_FAILS.with(|fails| fails.set(None));
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::UpstreamUnavailable
+        );
+        assert!(refusal.code().retry_category().permits_automatic_retry());
+        let said = refusal.to_string();
+        assert!(!said.contains("Install"), "it names no step: {said}");
+        assert!(
+            said.contains("could not be examined"),
+            "it says why: {said}"
+        );
+
+        EXAMINE_FAILS.with(|fails| fails.set(Some(rustix::io::Errno::IO)));
+        let absent = GitProgram::discover_on(Some(&search), PROBE_BOUND)
+            .expect_err("a candidate that cannot be examined is not there");
+        EXAMINE_FAILS.with(|fails| fails.set(None));
+        assert!(
+            matches!(absent, ProjectError::GitUnavailable { .. })
+                && absent.to_string().contains("Install"),
+            "a failure that is not the host's shortage is no Git here: {absent:?}"
+        );
+
+        GitProgram::discover_on(Some(&search), PROBE_BOUND)
+            .expect("without a failure the Git on the path is found");
     }
 
     /// A platform that runs no Git refuses before Git is looked for, installed or not, under the
