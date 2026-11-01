@@ -5107,7 +5107,7 @@ async fn the_last_attempt_follows_the_answers_and_is_left_as_it_was_by_a_call_th
     web.refuse_bundle_writes(false);
     web.fail(SYNC, 1, Moment::Slow);
     let sent = web.requests_to(SYNC);
-    let call = rig.enable_outcome_in_the_background(&made.params);
+    let call = rig.enable_outcome_in_the_background(&other.params);
     within("the bundle write", web.requests_reach(SYNC, sent + 1)).await;
     rig.controller.hold_fence(true);
     web.release_held();
