@@ -6081,14 +6081,15 @@ mod tests {
         );
     }
 
-    /// The wait for a probe's output ends at the drain's second, and a poll that comes after it
-    /// still reads what arrived before it. The pipe's last writer ends between two polls, so the
-    /// end is in the pipe when the second runs out, and the next poll comes only after it has.
-    /// The time the probe was given is far off, so the end is the program's own, read in time, and
-    /// the look does not refuse a program for a stall of this host's.
+    /// Drains the output of a `cat` that has said something and is still running, with the
+    /// probe's time ending `time` after the start. The first poll finds the pipe open. Between it
+    /// and the next one `cat` ends, so the end is in the pipe, and the thread then stalls until
+    /// `stalled` after the start: the next poll comes only then.
     #[cfg(unix)]
-    #[test]
-    fn an_end_that_arrived_before_the_drains_second_is_read_by_a_poll_that_comes_after_it() {
+    fn drain_with_a_stall_after_the_end_arrives(
+        time: Duration,
+        stalled: Duration,
+    ) -> std::result::Result<(), Asked> {
         use std::io::Write as _;
 
         let mut holder = std::process::Command::new("cat")
@@ -6107,16 +6108,27 @@ mod tests {
                 holder
                     .wait()
                     .expect("cat ends, and the pipe it held with it");
-                while Instant::now() < start + PROBE_DRAIN + Duration::from_millis(50) {
+                while Instant::now() < start + stalled {
                     std::thread::sleep(Duration::from_millis(5));
                 }
             })));
         });
 
-        let outcome = drain(
-            &mut heard,
-            "git --exec-path",
-            start + Duration::from_secs(60),
+        drain(&mut heard, "git --exec-path", start + time)
+    }
+
+    /// The wait for a probe's output ends at the drain's second, and a poll that comes after it
+    /// still reads what arrived before it, for as long as the probe's own time allows. The pipe's
+    /// last writer ends between two polls, so the end is in the pipe when the second runs out, and
+    /// the next poll comes only after it has. The time the probe was given is far off, so the end
+    /// is the program's own, read in time, and the look does not refuse a program for a stall of
+    /// this host's.
+    #[cfg(unix)]
+    #[test]
+    fn an_end_that_arrived_before_the_drains_second_is_read_by_a_poll_that_comes_after_it() {
+        let outcome = drain_with_a_stall_after_the_end_arrives(
+            Duration::from_secs(60),
+            PROBE_DRAIN + Duration::from_millis(50),
         );
 
         assert!(
@@ -6124,6 +6136,32 @@ mod tests {
             "an end that came in time is the end: {:?}",
             outcome.err().map(Asked::into_error)
         );
+    }
+
+    /// A poll that comes after the drain's second and after the probe's time too reads nothing, so
+    /// it cannot say the program left its output open, and the look is a fault that passes. The
+    /// end is in the pipe when the second runs out, as it is for a program that ended in time, and
+    /// the stall lasts past the probe's time, which is half a second after the second.
+    #[cfg(unix)]
+    #[test]
+    fn a_poll_after_both_the_drains_second_and_the_probes_time_does_not_blame_the_program() {
+        let outcome = drain_with_a_stall_after_the_end_arrives(
+            PROBE_DRAIN + Duration::from_millis(500),
+            PROBE_DRAIN + Duration::from_millis(700),
+        );
+
+        let Err(Asked::Overran(refusal)) = outcome else {
+            panic!("an end that was not read is not an answer");
+        };
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::UpstreamUnavailable
+        );
+        assert!(refusal.code().retry_category().permits_automatic_retry());
     }
 
     #[test]
