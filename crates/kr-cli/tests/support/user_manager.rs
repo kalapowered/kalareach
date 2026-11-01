@@ -479,26 +479,40 @@ impl Drop for UserManager {
         }
         // Whether the scope is gone is asked of the manager that held it: a scope with nothing
         // left in it goes by itself, and the manager then describes it as inactive. Only an answer
-        // that says so counts; a question that failed establishes nothing.
-        let mut shown = Command::new("systemctl");
-        shown.args([
-            "--user",
-            "show",
-            "--property=ActiveState",
-            "--value",
-            &self.scope,
-        ]);
-        let state = bounded(shown, STREAMS_DEADLINE).and_then(|answer| {
-            if answer.status.success() {
-                Ok(String::from_utf8_lossy(&answer.stdout).trim().to_owned())
-            } else {
-                Err(format!(
-                    "systemctl --user show answered {:?}: {}",
-                    answer.status.code(),
-                    String::from_utf8_lossy(&answer.stderr).trim()
-                ))
+        // that says so counts; a question that failed establishes nothing. The shared manager
+        // answers late when it is busy, and the scope can take a moment to go, so the question is
+        // asked again until [`TEARDOWN_BOUND`] has passed.
+        let asking_until = Instant::now() + TEARDOWN_BOUND;
+        let state = loop {
+            let mut shown = Command::new("systemctl");
+            shown.args([
+                "--user",
+                "show",
+                "--property=ActiveState",
+                "--value",
+                &self.scope,
+            ]);
+            let left = asking_until.saturating_duration_since(Instant::now());
+            let state = bounded(
+                shown,
+                STREAMS_DEADLINE.min(left.max(Duration::from_secs(1))),
+            )
+            .and_then(|answer| {
+                if answer.status.success() {
+                    Ok(String::from_utf8_lossy(&answer.stdout).trim().to_owned())
+                } else {
+                    Err(format!(
+                        "systemctl --user show answered {:?}: {}",
+                        answer.status.code(),
+                        String::from_utf8_lossy(&answer.stderr).trim()
+                    ))
+                }
+            });
+            if matches!(state.as_deref(), Ok("inactive" | "failed")) || left.is_zero() {
+                break state;
             }
-        });
+            std::thread::sleep(Duration::from_millis(250));
+        };
         if !matches!(state.as_deref(), Ok("inactive" | "failed")) {
             // Both are kept: something may still be running in them.
             self.holder.hold(format!(
