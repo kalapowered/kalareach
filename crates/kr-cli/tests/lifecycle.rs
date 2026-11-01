@@ -5172,6 +5172,21 @@ fn a_pause_process(runtime: &Path, environment: &Path) -> std::process::Child {
         .stdin(std::process::Stdio::null())
         .spawn()
         .expect("starts a process");
+    // A process that has just started shows no environment for a moment, though its program is
+    // running: the cases that read it wait until it shows the variable, and not for a time.
+    let wanted = format!("XDG_RUNTIME_DIR={}", environment.display());
+    let begun = Instant::now();
+    while !the_environment_of_a_process(child.id()).is_ok_and(|shown| {
+        shown
+            .split(|byte| *byte == 0)
+            .any(|v| v == wanted.as_bytes())
+    }) {
+        assert!(
+            begun.elapsed() < Duration::from_secs(30),
+            "the stand-in process never showed the environment it was given"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     std::fs::create_dir_all(runtime.join("libpod/tmp")).expect("the runtime's directory");
     std::fs::write(
         runtime.join("libpod/tmp/pause.pid"),
