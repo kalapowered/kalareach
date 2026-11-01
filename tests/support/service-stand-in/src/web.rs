@@ -834,7 +834,9 @@ impl ServiceWeb {
         }
     }
 
-    /// Lets every connection a [`Moment::Hold`] is holding go without an answer.
+    /// Lets every connection a [`Moment::Hold`], [`Moment::Gate`], [`Moment::Slow`] or
+    /// [`Moment::SlowRefuse`] is holding go. A request held by `Hold` goes without an answer; the
+    /// others are answered then, as each of them says.
     pub fn release_held(&self) {
         self.released.send_modify(|released| *released += 1);
     }
