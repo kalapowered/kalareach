@@ -55,8 +55,8 @@ pub struct RemoteOutput {
     /// Where the frames go: the connection's control stream.
     sink: Box<dyn FrameSink>,
     /// The most bytes of one frame the control stream carries, as the hello negotiated it. Every
-    /// connection has one; only an output built for a case that has no peer has none.
-    max_payload: Option<usize>,
+    /// connection has one; an output built for a case that has no peer carries the largest number.
+    max_payload: usize,
     /// The authority this connection writes under, read inside the turn.
     ///
     /// The latch above is set by whatever removes the registration, in the same critical section,
@@ -428,26 +428,21 @@ impl RemoteOutput {
         Self::over(
             sink,
             authority,
-            Some(
-                usize::try_from(receiving.max_control_frame_len.get())
-                    .unwrap_or(usize::MAX)
-                    .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN),
-            ),
+            usize::try_from(receiving.max_control_frame_len.get())
+                .unwrap_or(usize::MAX)
+                .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN),
         )
     }
 
-    /// An output with no peer to hold its frames to, for a case that has none. A connection always
-    /// has one, so only [`Self::for_a_peer_receiving`] builds an output outside a case.
+    /// An output whose frames are held to no bound, for a case that has no peer. A connection always
+    /// has one, so only [`Self::for_a_peer_receiving`] builds an output outside a case, and no
+    /// output outside a case can be built without a bound.
     #[cfg(test)]
     pub(super) fn writing_to(sink: Box<dyn FrameSink>, authority: Arc<Authorisation>) -> Self {
-        Self::over(sink, authority, None)
+        Self::over(sink, authority, usize::MAX)
     }
 
-    fn over(
-        sink: Box<dyn FrameSink>,
-        authority: Arc<Authorisation>,
-        max_payload: Option<usize>,
-    ) -> Self {
+    fn over(sink: Box<dyn FrameSink>, authority: Arc<Authorisation>, max_payload: usize) -> Self {
         // Tied to the registration before anything can be sent: a withdrawal that removes the
         // registration sets the latch with it, so the fence below needs no read of the connection
         // table, which a poll may not take.
@@ -533,10 +528,8 @@ impl RemoteOutput {
         // the turn is taken, for the one frame every attempt below writes.
         let shown = super::super::device_errors::frame_for_a_device(frame);
         let refusal;
-        let frame: &ControlFrame = match (&shown, self.max_payload) {
-            (Cow::Owned(mapped), Some(limit))
-                if !super::super::device_errors::fits(mapped, limit) =>
-            {
+        let frame: &ControlFrame = match &shown {
+            Cow::Owned(mapped) if !super::super::device_errors::fits(mapped, self.max_payload) => {
                 // The host's edits made the answer larger than the stream carries, and the stream
                 // ends the connection for a frame it cannot carry. A response is refused instead.
                 refusal = super::super::device_errors::too_large_for_the_device(mapped);
