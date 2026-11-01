@@ -4056,18 +4056,18 @@ async fn a_listing_names_only_the_sessions_a_grant_admits() {
 
 /// KR-REQ-23.25, KR-REQ-23.34, in part, and KR-REQ-26.44 for the host reads.
 ///
-/// Two doors. A session's answers are the same on both once the grant admits the subject: the
-/// grant decides what a device may ask about, and a second filter on one path and not the other
-/// would make the two ingresses disagree about what the same method means. The host's own
-/// metadata is the one thing each door reads differently, on purpose: the owner at their own
-/// machine is told whose account the environment belongs to and where its directories are, and a
-/// paired device reads the same answer with every account name, local path and platform message
-/// held to its class and its length.
+/// Two doors. A session's answers are the same on both once the grant admits the subject, but for
+/// the socket of the session's worker: the grant decides what a device may ask about, and a filter
+/// on one door beyond the held socket would make the two ingresses disagree about what the same
+/// method means. Two things each door reads differently, on purpose. The owner at their own machine
+/// is told whose account the environment belongs to, where its directories are and the path of a
+/// worker's socket, and a paired device reads the same answers with every account name, local path
+/// and platform message held to its class and its length.
 ///
-/// What this demonstrates is both halves: parity for the session reads, and the reduced form of
-/// `host.info` and `environment.list` for the device. The two callers are what they are: the
-/// environment's owner on one side and a paired device on the other, because no actor reaches this
-/// host through both doors.
+/// What this demonstrates is both halves: parity for the session reads but for the socket, and the
+/// reduced form of `host.info`, `environment.list` and the session's `endpoint` for the device. The
+/// two callers are what they are: the environment's owner on one side and a paired device on the
+/// other, because no actor reaches this host through both doors.
 // Ignored by default: this suite starts real processes, and the binary it launches is built by
 // `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
 // silently when that binary was absent would report a pass for something it never ran.
@@ -4211,6 +4211,10 @@ async fn the_same_method_answers_both_ingresses_alike_once_the_grant_admits_the_
         .0
         .clone()
         .expect("the owner is told the socket of the session's worker");
+    assert_eq!(
+        locally.endpoint, created.endpoint,
+        "the owner is told the socket the worker listens on, which the create answered with"
+    );
     assert_eq!(
         remotely.endpoint.0,
         Some(kr_protocol::hostinfo::export::withheld(
