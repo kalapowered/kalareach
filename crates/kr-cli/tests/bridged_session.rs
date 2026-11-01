@@ -4014,20 +4014,92 @@ fn a_call_that_does_not_end_is_asked_to_end_before_it_is_killed() {
     panic!("the program was not ready to be asked in any of the bounds it was given");
 }
 
+/// A descendant of a program that holds the program's output until it is let go, and is ended with
+/// the case whatever the case does: it is let go when the guard is, and a descendant that is still
+/// there then is waited for and ended.
+struct HeldDescendant {
+    release: PathBuf,
+    pid: PathBuf,
+}
+
+impl HeldDescendant {
+    /// Lets the descendant go.
+    fn let_go(&self) {
+        let _ = std::fs::write(&self.release, "");
+    }
+
+    /// Whether the descendant is gone within `within`.
+    fn gone_within(&self, within: Duration) -> bool {
+        let Some(pid) = std::fs::read_to_string(&self.pid)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .and_then(rustix::process::Pid::from_raw)
+        else {
+            return true;
+        };
+        let begun = Instant::now();
+        while rustix::process::test_kill_process(pid).is_ok() {
+            if begun.elapsed() >= within {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+}
+
+impl Drop for HeldDescendant {
+    fn drop(&mut self) {
+        self.let_go();
+        if self.gone_within(Duration::from_secs(10)) {
+            return;
+        }
+        // It is this case's own descendant, still there after it was let go: ended by its number.
+        if let Some(pid) = std::fs::read_to_string(&self.pid)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
 /// A call that ended while something it started still holds its output fails, naming the call,
 /// where an empty answer would pass a case that read only the status.
+///
+/// The descendant holds the output until the case lets it go, which is after the call has failed:
+/// no delay in the machine can end it before the call has looked, and none leaves it behind.
 #[test]
 fn a_call_that_ended_and_left_something_holding_its_output_fails_and_names_the_call() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let held = HeldDescendant {
+        release: directory.path().join("release"),
+        pid: directory.path().join("descendant.pid"),
+    };
     let mut command = std::process::Command::new("/bin/sh");
     command
         .arg("-c")
-        .arg("sleep 12 & echo answered; exit 0")
-        .arg("program");
+        // The descendant ends when it is let go, or when this test process does.
+        .arg(
+            "( while [ ! -e \"$1\" ] && kill -0 \"$3\" 2>/dev/null; do sleep 0.1; done ) & \
+             echo $! > \"$2\"; echo answered; exit 0",
+        )
+        .arg("program")
+        .arg(&held.release)
+        .arg(&held.pid)
+        .arg(std::process::id().to_string());
     let why = user_manager::bounded(command, Duration::from_secs(60))
         .expect_err("output that is still held is a failure and not an empty answer");
+    assert!(why.contains("still holds its output"), "{why}");
     assert!(
-        why.contains("still holds its output") && why.contains("sleep 12"),
-        "{why}"
+        held.pid.exists(),
+        "the call ended before the descendant started: {why}"
+    );
+    held.let_go();
+    assert!(
+        held.gone_within(Duration::from_secs(20)),
+        "the descendant did not end when it was let go"
     );
 }
 
