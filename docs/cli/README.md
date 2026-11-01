@@ -2778,8 +2778,10 @@ program is installed.
 `input`, `shell` and `offers` as the worker wrote them. Like `terminal_attachments`, it is null for
 a session read from the control daemon. When the worker answered the session read and not this
 question within 10 seconds of being asked, `launch_surface_unread` says why, and the text form says
-the launch surface was not read from the session's worker. The question is asked only of a worker of
-this release: `kr status` refuses a worker of another release before it asks anything.
+the launch surface was not read from the session's worker. The question is asked only of a worker at this `kr`'s
+compatibility level. `kr status` refuses a worker at another level of its own public major before it
+asks anything. A worker of another public major refuses the hello, so `kr status` reads the session
+from the control daemon and this member is null.
 
 ```json
 {
