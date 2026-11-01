@@ -5152,6 +5152,13 @@ async fn the_last_attempt_follows_the_answers_and_is_left_as_it_was_by_a_call_th
 /// A call goes on when the client that made it closes its connection: the daemon serves the call in
 /// line and withdraws the connection's registration only after the call has ended. The bundle write
 /// is held, the client's task dropped and the write let go, and the setup is recorded.
+///
+/// The case shows that the setup is recorded though the client's connection was closed while the
+/// call was out. It does not order the daemon's reading of the end of that connection before the
+/// release of the write: the daemon does nothing with the end of the stream while it serves the
+/// call in line, so there is nothing to wait for. A door that stops the call at the end of the
+/// stream fails the case when it reads that end before the call's last request, and the requests
+/// that follow the release give it time to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_call_goes_on_when_the_client_that_made_it_closes_its_connection() {
     let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
