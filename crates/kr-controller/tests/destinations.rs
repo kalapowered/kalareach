@@ -400,6 +400,14 @@ async fn a_paired_device_cannot_hand_over_a_credential_whatever_its_grant() {
     host.stop().await;
 }
 
+/// A webhook destination that is configured and takes nothing.
+///
+/// It is disabled because the daemon's delivery pass offers every notice it takes to every enabled
+/// destination, and a case about what a destination keeps cannot be left to meet one. The owner's
+/// own pairing, made when the host starts, is such a notice: the pass takes it about a second
+/// later, and an enabled destination configured by then, whose rule names no grant, is refused it
+/// with a record naming the destination, which keeps the destination as history when it is
+/// removed.
 fn webhook(id: &str) -> DestinationRecord {
     DestinationRecord {
         id: identifier(id),
@@ -413,7 +421,7 @@ fn webhook(id: &str) -> DestinationRecord {
             name: "on failure".to_owned(),
             grant_id: None,
         }),
-        enabled: true,
+        enabled: false,
         configured_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
     }
 }
