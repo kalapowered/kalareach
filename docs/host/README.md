@@ -905,9 +905,11 @@ host's, and an empty list turns every integration off at that level. `kr plugin 
 and `disable` edit the host's list, and the change reaches the sessions created afterwards.
 
 `kr doctor` reports each package the list names, with its state, and each integration an admitted
-release declares: what a new session gets of it and why, the mode its command runs in, the flags
-and variables it adds, and the executable the daemon's own search path resolves the command to,
-with the version the signed index gives that executable's digest. An installed release the
+release declares: what a new session gets of it and, where none could launch through it here, why,
+the mode its command runs in, the flags and variables it adds, and the executable the daemon's own
+search path resolves the command to, with the version the signed index gives that executable's
+digest. The reason the host records for an invocation that runs as typed is printed as its class
+and its length, not in words. An installed release the
 admissions leave out is reported only where the list names it, and where the admissions cannot be
 computed each listed package is reported as `unknown`. An integration a new session would be
 launched without for its size is reported as `too_large`. One answer carries at most 256 reports
