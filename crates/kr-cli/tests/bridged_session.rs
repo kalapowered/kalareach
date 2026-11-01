@@ -4047,7 +4047,12 @@ fn a_runtime_that_never_answers_its_version_fails_the_case_and_is_not_skipped() 
 #[test]
 fn a_runtime_that_fails_its_version_fails_the_case_and_is_not_skipped() {
     let directory = tempfile::tempdir().expect("a directory");
-    let broken = stand_in_runtime(directory.path(), &[], &["--version"]);
+    // It answers, so it is given the time a call that answers is given: a machine that is slow to
+    // start the stand-in's shell must not turn its answer into a call that did not end.
+    let broken = Runtime {
+        quick: QUICK_CALL_BOUND,
+        ..stand_in_runtime(directory.path(), &[], &["--version"])
+    };
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| broken.is_available()));
     let said = panic_message(failed.expect_err("a runtime that fails its version fails the case"));
     assert!(
