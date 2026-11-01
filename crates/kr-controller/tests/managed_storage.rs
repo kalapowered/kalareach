@@ -6422,9 +6422,9 @@ async fn a_deadline_that_passes_while_the_call_waits_on_the_service_refuses_it_a
     the_service_names_a_delay_to_a_look_at_its_storage_state(
         &rig,
         Moment::Refuse {
-            status: 429,
-            code: "RATE_LIMITED",
-            retry_after_seconds: Some(30),
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(5),
         },
     )
     .await;
@@ -6557,7 +6557,9 @@ async fn a_delay_named_in_an_answer_that_ends_the_call_at_once_is_owed() {
     let delayed = BackupStorageState::Unread {
         why: BackupStorageUnread::Delayed,
     };
-    for named in [Some(30_u64), None] {
+    // Five seconds is less than the longest delay a client waits out by itself, so a client that
+    // did not leave the delay to the caller would send the request again and see no refusal.
+    for named in [Some(5_u64), None] {
         let refusal = |status: u16, code: &'static str| Moment::Refuse {
             status,
             code,
