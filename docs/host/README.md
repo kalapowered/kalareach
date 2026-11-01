@@ -3309,9 +3309,11 @@ followed by the statement of that qualification, which is the publisher's publis
 this host's, and is sent as it is. A qualification the host refused is reported as not tested, with
 the host's own sentence of the refusal and no statement. The `suspension_reason` of an agent
 instance's binding, which says why rich mutations wait, and the refusal of a rich mutation that
-repeats it, are sent as the host wrote them when the reason is one of the host's own sentences. Otherwise the device is told what kind of wait it was: the method of a
-request that the connector's table does not classify, and what stopped the worker taking a
-conversation, are not sent. What a closure records of a resource it left is held to the same rule
+repeats it, are sent as the host wrote them when the reason is one of the host's own sentences.
+A reason that quotes the method of a request that the connector's table does not classify, or what
+stopped the worker taking a conversation, is replaced by the kind of wait it was, and the quoted
+words are not sent. For a reason the host does not know, the device is told only that mutations
+wait. What a closure records of a resource it left is held to the same rule
 and is replaced by the kind of resource. What the agent of a session says in refusing a prompt, a
 steer, a cancellation, an approval or a plugin's action is the agent's own words, and they quote
 what it was working on. The worker gives them as `INVALID_ARGUMENT`, `UPSTREAM_UNAVAILABLE` or
