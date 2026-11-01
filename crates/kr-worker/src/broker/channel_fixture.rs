@@ -243,6 +243,41 @@ impl Channel {
         Some(serde_json::from_str(&line).expect("a frame is JSON"))
     }
 
+    /// Reads exactly `len` bytes of what this host has written, and returns them.
+    ///
+    /// A verdict that is longer than the connection holds unread is in the connection only in part:
+    /// the first `len` bytes of it are what a reader that stops early has read.
+    pub async fn read_prefix(&mut self, len: usize) -> Vec<u8> {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut prefix = vec![0_u8; len];
+        tokio::time::timeout(DEADLINE, self.lines.get_mut().read_exact(&mut prefix))
+            .await
+            .expect("the channel writes that much in time")
+            .expect("the channel's bytes are read");
+        prefix
+    }
+
+    /// Ends the channel server's end of the connection, both directions, as an application that
+    /// exits does, and leaves the channel without the retirement a launch's end sends.
+    ///
+    /// The channel then ends only because its connection did: whatever it had begun to write fails
+    /// on the connection, and what it reads ends.
+    pub fn disconnect(self) -> Disconnected {
+        let Self {
+            lines,
+            writes,
+            served,
+            retire,
+        } = self;
+        drop(lines);
+        drop(writes);
+        Disconnected {
+            served,
+            _retire: retire,
+        }
+    }
+
     /// Waits for the consumer to end while the channel server's end stays open, and says how it
     /// did.
     pub async fn ended_while_open(&mut self) -> ChannelEnd {
@@ -258,6 +293,23 @@ impl Channel {
         tokio::time::timeout(DEADLINE, self.served)
             .await
             .expect("the consumer ends in time")
+            .expect("the consumer's task joins")
+    }
+}
+
+/// A channel whose application has gone, and which has not been retired.
+pub struct Disconnected {
+    served: tokio::task::JoinHandle<ChannelEnd>,
+    /// Held so that the launch's retirement is neither sent nor dropped while the channel ends.
+    _retire: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Disconnected {
+    /// Waits for the consumer to end, and says how it did.
+    pub async fn ended(self) -> ChannelEnd {
+        tokio::time::timeout(DEADLINE, self.served)
+            .await
+            .expect("the consumer ends in time without being retired")
             .expect("the consumer's task joins")
     }
 }

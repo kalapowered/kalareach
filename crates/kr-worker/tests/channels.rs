@@ -1640,12 +1640,17 @@ async fn kr_req_12_18_answers_racing_for_one_relayed_approval_carry_one_verdict_
 
     // Eight answers at once, half of them one decision and half the other.
     let third = interpreted(&broker, &mut channel, "ccccc").await;
+    // Every task is spawned and waits at the barrier before any of them answers, so the eight
+    // reach the resource together and not one after another as they are spawned.
+    let start = Arc::new(tokio::sync::Barrier::new(8));
     let answering: Vec<_> = (0..8_u8)
         .map(|index| {
             let broker = Arc::clone(&broker);
+            let start = Arc::clone(&start);
             let decision = if index % 2 == 0 { "allow" } else { "deny" };
             let params = respond(2, &third, decision);
             tokio::spawn(async move {
+                start.wait().await;
                 broker
                     .agent_approval_respond(&caller(), &params, TimestampMs::new(14))
                     .await
@@ -1711,15 +1716,16 @@ async fn kr_req_12_18_answers_racing_for_one_relayed_approval_carry_one_verdict_
 }
 
 /// KR-REQ-12.18 and KR-REQ-27.05, upstream disconnect after dispatch: the application goes after
-/// the marker is written and before the channel has taken the whole verdict (it holds 64 bytes
-/// unread, so only the first bytes of a verdict are in it). The answer is not applied, the approval
-/// stays uncertain rather than answerable, a further answer is refused as an answered approval, the
-/// failed transmission is counted once against the application's adapter, and nothing is written
-/// to the channel for the further answer.
+/// the marker is written and while the channel is writing the verdict. The connection holds 64
+/// bytes unread, so only the first bytes of a verdict are in it; the application reads a prefix of
+/// them, which is a part of a frame, and then its end of the connection closes. The channel is not
+/// retired: it ends because its connection did. The answer is not applied, the approval stays
+/// uncertain rather than answerable, a further answer is refused as an answered approval, and the
+/// failed transmission is counted once against the application's adapter.
 #[tokio::test]
 async fn kr_req_12_18_an_application_that_goes_after_the_marker_leaves_the_approval_uncertain() {
     let broker = memory_broker();
-    let (_package, channel, resource) = channel_nobody_reads(&broker).await;
+    let (_package, mut channel, resource) = channel_nobody_reads(&broker).await;
     let admitted = broker
         .admit_approval(
             &caller(),
@@ -1734,8 +1740,15 @@ async fn kr_req_12_18_an_application_that_goes_after_the_marker_leaves_the_appro
     let pending = dispatch
         .submit(&request)
         .expect("the channel's writer takes the answer");
-    // The application goes: it has read none of the verdict, and its end of the connection closes.
-    drop(channel);
+    // The application reads the start of the verdict, which the channel has begun to write, and
+    // goes. What it read is a part of one frame, and the rest was never read.
+    let prefix = channel.read_prefix(16).await;
+    assert!(
+        prefix.starts_with(b"{") && !prefix.contains(&b'\n'),
+        "the application read the start of a verdict and not the whole of one: {:?}",
+        String::from_utf8_lossy(&prefix)
+    );
+    let gone = channel.disconnect();
     let outcome = marked.submitted(pending).settled(TimestampMs::new(6)).await;
     assert!(
         outcome.is_err(),
@@ -1767,6 +1780,10 @@ async fn kr_req_12_18_an_application_that_goes_after_the_marker_leaves_the_appro
             1
         )],
         "and it is one failure of the application's adapter"
+    );
+    assert!(
+        matches!(gone.ended().await, ChannelEnd::Ended { .. }),
+        "the channel ended because its connection did, and no one retired it"
     );
 }
 
