@@ -4232,7 +4232,7 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
         to_its_end(command, Duration::from_secs(120))
     };
     let stalling = tempfile::tempdir().expect("a directory");
-    place(stalling.path(), "exec sleep 60");
+    place(stalling.path(), "exec /bin/sleep 60");
     let ran = run_with(stalling.path());
     let said = String::from_utf8_lossy(&ran.stderr);
     assert_eq!(
