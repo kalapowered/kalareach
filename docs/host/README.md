@@ -4311,10 +4311,16 @@ prove its wall clock, a reason of the byte caps that goes and comes back is ther
 again, until a pass that applies the age bound finds none. On Unix a launchd job's or a detached
 process's standard error is the job's diagnostics file, and a transient unit's is the user's
 journal. A Windows worker's is a console with no window, so nothing keeps the reason there. The
-write is made once the pass has let go of the session and the dispatch barrier. A write to the
-standard error that fails, as one does on a full volume, costs the pass nothing; the reason is
-written at the next pass that can. A standard error that has stopped draining, a pipe nobody reads,
-holds the write and with it the host's maintenance, and stops nothing that serves a person. Nothing bounds how
+pass hands the line to a thread of the worker's own, which writes the worker's diagnostics one at a
+time, and waits for nothing: it is called with neither the session's lock nor the dispatch barrier
+held, and the reason counts as said only once the thread has written it. A write that fails, as
+one does on a full volume, costs nothing; the reason is offered again at the next pass. A standard
+error that has stopped draining, a pipe nobody reads, holds that thread and nothing else: the passes
+go on, a stop of the session is answered, and the process ends with the thread still in its write.
+At most eight lines wait for the thread, and a line beyond that is dropped. The other lines the
+worker writes there, such as the one that says a command was not integrated for its launch, go the
+same way. A line is handed over whole and written with `write_all`, so a volume that is nearly full
+can take part of it. Nothing bounds how
 long the host stays over the cap: the delays are random, and a holder that stops without ending
 keeps the lock while the others go on looking. The host also stays over the cap when the session
 that grew cannot give up the excess, as when its worker has ended, it holds less than the excess

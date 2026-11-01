@@ -468,7 +468,9 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     drop(reader);
 
     // The worker exists for its session. When the session closes, the last record is written, every
-    // attachment is told, and the process ends; nothing here restarts a shell.
+    // attachment is told, and the process ends; nothing here restarts a shell. A standard error that
+    // has stopped draining does not hold the process: the worker's diagnostics are written by a
+    // thread of their own, which the end of the process leaves behind.
     let _record = runtime.wait_closed().await;
     finish(&runtime, serving, bridge_server).await;
     Ok(())
