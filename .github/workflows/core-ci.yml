@@ -2541,7 +2541,7 @@ jobs:
       # cancelled, so each reports its own result, and any one of them failing fails the job.
       - name: Clippy
         if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: What the disk holds after the lint
@@ -2554,7 +2554,7 @@ jobs:
       # only macOS compiles is read by this build and no other. The crates are that step's.
       - name: Documentation without warnings
         if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 8
+        timeout-minutes: 9
         env:
           RUSTDOCFLAGS: "-D warnings"
         run: |
@@ -2780,20 +2780,21 @@ jobs:
       # runtime has taken through .NET internals that differ by platform, and until this step only
       # the shell-packages job ran its cases. The runner image carries PowerShell, so none is
       # installed; the package refuses a release that a published advisory affects, so the version
-      # is printed first and the qualification, which is published before the cases because a run
-      # that has not published it leaves them out, names the refusal if the image carries such a
-      # release. The cases take about 400 seconds on a Linux build machine, and the limit leaves
-      # this runner several times that.
+      # is printed first and the qualification names the refusal if the image carries such a
+      # release. The qualification is published before the cases, which fail without it. The
+      # packages are selected as the workspace's test step selects them, so that the test programs
+      # that step built are the ones run here. The cases take about 400 seconds on a Linux build
+      # machine, and the limit is the time this leg has left to give.
       - name: Drive the PowerShell package through the contract
         if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 25
+        timeout-minutes: 14
         run: |
           set -euo pipefail
           pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
           pwsh -NoProfile -Command '
             Import-Module ./shells/psreadline/module/KalaReach.ShellBridge.psd1
             Publish-KalaReachQualification | Format-List'
-          cargo test --locked -p kr-shell-integration --test pwsh -- --test-threads=1 --include-ignored
+          cargo test --locked --workspace --exclude kr-sync-integration --test pwsh -- --test-threads=1 --include-ignored
 
       # Real processes, real sockets and real terminals, the suites the script names and nothing
       # else, each of which must demonstrate something, and no process of the run left behind. This
