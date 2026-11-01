@@ -47,7 +47,7 @@ use kr_protocol::archive::{
 };
 use kr_protocol::backup_read::{BackupBundle, BackupReadParams, BackupReadResult, BackupSignIn};
 use kr_protocol::backup_setup::{
-    BackupEnableCause, BackupEnableParams, BackupEnableResult, BackupSetupState,
+    BackupEnableCause, BackupEnableParams, BackupEnableResult, BackupLastAttempt, BackupSetupState,
     BackupStatusParams, BackupStatusResult, BackupStorageState, BackupStorageUnread,
     BackupUnusable,
 };
@@ -5051,6 +5051,73 @@ async fn a_bundle_the_service_refuses_is_followed_by_no_enrolment_and_no_setup()
     ));
     assert!(rig.backup_status().await.last_attempt.0.is_none());
     assert_eq!(rig.enrolments().len(), 1);
+}
+
+/// What `backup.status` keeps of the last call that did not set backups up follows the answers the
+/// calls give: a decline keeps its cause, a call that ends as unknown replaces it with none, a call
+/// that is refused leaves it as it was, and a call that sets backups up clears it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_last_attempt_follows_the_answers_and_is_left_as_it_was_by_a_call_that_is_refused() {
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    let attempt = |cause| {
+        Some(BackupLastAttempt {
+            kit_fingerprint: made.params.kit_fingerprint.clone(),
+            cause,
+        })
+    };
+
+    web.refuse_bundle_writes(true);
+    assert_eq!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Declined {
+            cause: BackupEnableCause::NoAllowance {}
+        }
+    );
+    let declined = attempt(Nullable::some(BackupEnableCause::NoAllowance {}));
+    assert_eq!(rig.backup_status().await.last_attempt.0, declined);
+
+    // A call the admission stops ends in no answer, so what was kept stays: the fence lands while
+    // the bundle write is out.
+    web.refuse_bundle_writes(false);
+    web.fail(SYNC, 1, Moment::Slow);
+    let sent = web.requests_to(SYNC);
+    let call = rig.enable_outcome_in_the_background(&made.params);
+    within("the bundle write", web.requests_reach(SYNC, sent + 1)).await;
+    rig.controller.hold_fence(true);
+    web.release_held();
+    call.await
+        .expect("the call ends")
+        .expect_err("a call is refused while a fence is owed");
+    rig.controller.hold_fence(false);
+    assert_eq!(rig.backup_status().await.last_attempt.0, declined);
+
+    // A call that ends as unknown replaces it, with no cause.
+    web.fail(
+        MANIFEST,
+        1,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: None,
+        },
+    );
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Unknown { retry_after_seconds } if retry_after_seconds.0.is_none()
+    ));
+    assert_eq!(
+        rig.backup_status().await.last_attempt.0,
+        attempt(Nullable::null())
+    );
+
+    // A call that sets backups up clears it.
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+    assert_eq!(rig.backup_status().await.last_attempt.0, None);
 }
 
 /// A write whose answer was lost is settled by reading the bundle: the same bytes are there, and
