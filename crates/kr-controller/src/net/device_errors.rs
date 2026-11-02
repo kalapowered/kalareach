@@ -4276,6 +4276,9 @@ mod tests {
             // The space turns a glued word into a web address, which names no place.
             "`a b`http://h uid: 501 failed".to_owned(),
             "`a b`http://h ~name/work failed".to_owned(),
+            // Both readings find a name, in different places: the run-together text finds the path
+            // and keeps a clause that holds the program, which only the readings apart find.
+            "x: `a b`(chmod 700 q) y: /Users/m".to_owned(),
             // A name found earlier makes the kept clause short, and a short clause passes the
             // limit that a long one did not.
             long.clone(),
