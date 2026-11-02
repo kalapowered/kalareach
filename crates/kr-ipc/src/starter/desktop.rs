@@ -79,7 +79,8 @@ pub(super) struct OwnDesktop {
 
 impl OwnDesktop {
     /// Makes the desktop `label` on this logon session's window station for processes that show
-    /// nothing, with the security of the starter's own station and desktop.
+    /// nothing, with the access list of the starter's own station and desktop, and their integrity
+    /// label where they have one and the starter may apply it.
     ///
     /// The starter is single-threaded, so switching its window station for the one call that
     /// makes the desktop there is not seen by any other thread of it. The switch is undone before
@@ -87,8 +88,9 @@ impl OwnDesktop {
     ///
     /// # Errors
     ///
-    /// Returns the operating system's error from the call that failed, or an invalid-input error
-    /// for a label that cannot name a desktop.
+    /// Returns the operating system's error from the call that failed, an invalid-input error for
+    /// a label that cannot name a desktop, or the error of [`Source::require_no_more_on`] when the
+    /// station or the desktop is not one the starter uses.
     pub(super) fn create(label: &str) -> io::Result<Self> {
         if label.is_empty() || label.contains('\\') {
             return Err(io::Error::new(
@@ -346,8 +348,7 @@ struct Source {
 impl Drop for Source {
     fn drop(&mut self) {
         // SAFETY: the descriptor was allocated by `GetSecurityInfo`, which asks for it to be freed
-        // with this call, and nothing else holds it. The two lists point inside it. A source whose
-        // descriptor is null holds nothing to free, and the call ignores a null handle.
+        // with this call, and nothing else holds it. The two lists point inside it.
         unsafe { LocalFree(self.descriptor) };
     }
 }
@@ -409,9 +410,10 @@ impl Source {
     /// # Errors
     ///
     /// Returns a permission error saying whether the target admits more or is only not one the
-    /// starter accepts, an invalid-data error when the text of a list cannot be read or does not
-    /// account for the entries of the list, or the operating system's error when the target's
-    /// security cannot be read.
+    /// starter accepts, an invalid-data error when the text of a list cannot be read, does not
+    /// account for the entries of the list, or belongs to a list that holds a condition whose
+    /// entries are not the same bytes as the starter's own, or the operating system's error when
+    /// the target's security cannot be read.
     fn require_no_more_on(&self, target: HANDLE) -> io::Result<()> {
         let there = security_of(target)?;
         let (own_access, own_label) = (
@@ -591,7 +593,9 @@ fn wide(text: &str) -> Vec<u16> {
 ///
 /// Every case makes desktops, so every case needs the right to create one on the station the test
 /// runs on, which the account and the session decide, and reads back what it made, which needs
-/// the list it gave to leave the caller the right to read it.
+/// the list it gave to leave the caller the right to read it. The case that sets a list on a
+/// desktop also needs the right to change the list, and the case that applies a label the right
+/// to change the label.
 ///
 /// The cases that judge against the reference desktop (`own`, `judged`, `refusal`) or use
 /// `own_access_list` take the list of the desktop the test runs on with two entries added, and
@@ -602,9 +606,9 @@ fn wide(text: &str) -> Vec<u16> {
 /// its assertion. The case that puts a label on a desktop also needs that list to grant the
 /// caller the right to change the label of the desktops it makes, which a standard account's
 /// session has; without it the label stays and the case fails by name. The other cases make their
-/// lists themselves and need no more than the first paragraph says, and the case with no label
-/// needs a new desktop to have none, which the runs on the test machine give at the medium and the
-/// high level (the case fails by name at its first assertion when it is not so).
+/// lists themselves, and the case with no label needs a new desktop to have none, which the runs
+/// as a standard account and as an administrator on the test machine give (the case fails by name
+/// at its first assertion when it is not so).
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -706,12 +710,6 @@ mod tests {
 
     /// A desktop made on this station with the attributes given.
     fn desktop_made(attributes: &SECURITY_ATTRIBUTES) -> Desktop {
-        try_desktop_made(attributes)
-            .unwrap_or_else(|error| panic!("the desktop was not made: {error}"))
-    }
-
-    /// A desktop made on this station with the attributes given, or the system's refusal.
-    fn try_desktop_made(attributes: &SECURITY_ATTRIBUTES) -> io::Result<Desktop> {
         let name = wide(&unique_name());
         // SAFETY: the name is terminated, the device and mode are absent, the attributes point at
         // a descriptor that lives until the call returns, and the call returns a handle or null.
@@ -725,10 +723,12 @@ mod tests {
                 attributes,
             )
         };
-        if handle.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Desktop(handle))
+        assert!(
+            !handle.is_null(),
+            "the desktop was not made: {}",
+            io::Error::last_os_error()
+        );
+        Desktop(handle)
     }
 
     /// What the starter makes of `target` as a desktop to use, given the reference desktop as its
@@ -980,10 +980,9 @@ mod tests {
         words
     }
 
-    /// The system's refusal or the desktop made with an access list of the entries given, given
-    /// `room` bytes more than they use.
-    fn try_desktop_with_entries(entries: &[Vec<u8>], room: usize) -> io::Result<Desktop> {
-        let mut words = acl_of(entries, room);
+    /// A desktop whose access list is made of the entries given, in their binary form.
+    fn desktop_with_entries(entries: &[Vec<u8>]) -> Desktop {
+        let mut words = acl_of(entries, 0);
         let acl: *mut ACL = words.as_mut_ptr().cast();
         // SAFETY: all-zero is the initial state `InitializeSecurityDescriptor` is given.
         let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
@@ -994,13 +993,7 @@ mod tests {
             InitializeSecurityDescriptor(pointer, 1);
             SetSecurityDescriptorDacl(pointer, 1, acl, 0);
         }
-        try_desktop_made(&attributes(&mut descriptor))
-    }
-
-    /// A desktop whose access list is made of the entries given, in their binary form.
-    fn desktop_with_entries(entries: &[Vec<u8>]) -> Desktop {
-        try_desktop_with_entries(entries, 0)
-            .unwrap_or_else(|error| panic!("the desktop was not made: {error}"))
+        desktop_made(&attributes(&mut descriptor))
     }
 
     /// The entries of a list with a condition, padded as asked.
@@ -1069,39 +1062,16 @@ mod tests {
         assert!(error.to_string().contains("could not be read"), "{error}");
     }
 
-    /// A source over an access list the system did not store: the list lives in the buffer given,
-    /// which must outlive the source and every slice read from it, and there is no descriptor to
-    /// free. The caller keeps the buffer in a binding declared before the source.
-    fn source_over(list: &[u32]) -> Source {
-        Source {
-            descriptor: std::ptr::null_mut(),
-            access: list.as_ptr().cast_mut().cast(),
-            label: std::ptr::null_mut(),
-        }
-    }
-
     /// The entries of a list are read without its header and without the room it was given: a
-    /// list given more room than its entries use is the same list as one that was not, as the
-    /// reading takes it from a list of its own and as the system holds one set on a desktop.
-    /// Created with room, a list is stored without it, which the case prints.
+    /// list given more room than its entries use is the same list as one that was not. The system
+    /// stores a list made with room without it, so the case sets a roomy list on a desktop that
+    /// exists, which keeps the room, and prints what each desktop holds.
     #[test]
     fn a_list_given_extra_room_is_read_as_the_entries_it_holds() {
         const ROOM: usize = 64;
         let entries = entries_with_a_condition(0);
         let held = entries.concat();
-        let (tight, roomy) = (acl_of(&entries, 0), acl_of(&entries, ROOM));
-        let (tight_source, roomy_source) = (source_over(&tight), source_over(&roomy));
-        let size = roomy_source.access_size().expect("the roomy list's size");
-        assert!(
-            usize::try_from(size.AclBytesFree).is_ok_and(|free| free >= ROOM),
-            "the list was given no room: {} bytes free",
-            size.AclBytesFree
-        );
-        assert_eq!(tight_source.access_bytes().expect("the tight list"), held);
-        assert_eq!(roomy_source.access_bytes().expect("the roomy list"), held);
-
-        // Created with room, the system stores the list without it. Set on a desktop that exists,
-        // it may keep the room.
+        let roomy = acl_of(&entries, ROOM);
         let (tight_desktop, set_desktop) = (
             desktop_with_entries(&entries),
             desktop_with_entries(&entries),
@@ -1129,11 +1099,21 @@ mod tests {
             security_of(tight_desktop.0).expect("the tight desktop's security"),
             security_of(set_desktop.0).expect("the set desktop's security"),
         );
-        println!(
-            "bytes free: {} for a list created tight, {} for one set with {ROOM} bytes of room",
-            tight_security.access_size().expect("size").AclBytesFree,
-            set_security.access_size().expect("size").AclBytesFree,
+        let (tight_size, set_size) = (
+            tight_security.access_size().expect("the tight list's size"),
+            set_security.access_size().expect("the set list's size"),
         );
+        println!(
+            "bytes free: {} for a list made tight, {} for one set with {ROOM} bytes of room",
+            tight_size.AclBytesFree, set_size.AclBytesFree
+        );
+        assert!(
+            usize::try_from(set_size.AclBytesFree).is_ok_and(|free| free >= ROOM),
+            "the system kept no room in the list it was set: {} bytes free",
+            set_size.AclBytesFree
+        );
+        assert_eq!(set_security.access_bytes().expect("the set list"), held);
+        assert_eq!(tight_security.access_bytes().expect("the tight list"), held);
         tight_security
             .require_no_more_on(set_desktop.0)
             .expect("a list set with extra room is used beside one that was not");
