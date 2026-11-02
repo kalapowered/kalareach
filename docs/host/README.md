@@ -1310,12 +1310,13 @@ allowing entry for a trustee that the starter's own allows nothing (other than t
 a denying entry whose trustee has none left while an allowing entry remains, a null or absent list
 where there are entries, or a lower integrity level or a weaker policy. These are readings of the
 entries, not an evaluation of which entry decides for a given process, so "admits more" does not
-always mean that access grows: a denying entry that is gone counts as wider while an allowing
-entry remains, whomever that entry is for. The text of an access list is read only when it
-holds as many entries as the list itself does, and a list that holds a condition (a double quote, a
-parenthesis inside an entry, or an entry of a callback kind) only when the starter's own list and
-the object's hold the same entries byte for byte, whichever of the two holds the condition, because
-one text can stand for two lists; any other is not read, and the start stops with an error that says
+always mean that access grows: a denying entry that is gone counts as wider while an allowing entry
+remains, whomever that entry is for. The text of an access list is read only when it holds as many
+entries as the list itself does, and a list that holds a condition (a double quote, a parenthesis
+inside an entry, or an entry of a callback kind) only when the starter's own list and the object's
+hold the same entries byte for byte, whichever of the two holds the condition, because the text of a
+string with a double quote in it can stand for two lists, and an entry of a callback kind is held to
+the same rule as a precaution; any other is not read, and the start stops with an error that says
 so. The same bytes are needed and are not enough: a text that does not account for the entries of
 its list is not read beside itself either. The starter refuses an object that differs in any other
 way as one it does not accept, and the refusal does not say that it admits more, because the

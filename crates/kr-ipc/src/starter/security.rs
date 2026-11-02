@@ -4,23 +4,22 @@
 //! The starter makes a headless worker's desktop with the access list and integrity label of its
 //! own. A window station that already exists keeps the access list it was made with. Where the
 //! starter's own object has an integrity label, the starter applies it to the object it uses and
-//! reads the label back, whether or not the change was allowed. Before it starts a child on
-//! either object, it asks whether the object admits more than the starter's own does. More is
-//! refused.
+//! reads the label back, whether or not the change was allowed. Before it starts a child on either
+//! object, it asks whether the object admits more than the starter's own does. More is refused.
 //! Less is not: a station made from an earlier reading of the interactive one has not the entries
 //! that were added to that one later (a "Run as different user", for one), and the worker, which
 //! runs as the starter does, is admitted to it all the same. What counts as less is narrow: the
-//! starter's own entries with allowing entries left out, other than one for the owner's rights,
-//! and denying entries put in, still in the starter's order. The flags that say which children
-//! inherit an entry, and entries that only children inherit, are not compared, except in an
-//! allowing entry for the owner's rights, which is compared whole.
+//! starter's own entries with allowing entries left out, other than one for the owner's rights, and
+//! denying entries put in, still in the starter's order. The flags that say which children inherit
+//! an entry, and entries that only children inherit, are not compared, except in an allowing entry
+//! for the owner's rights, which is compared whole, and in a list that holds a condition, as below.
 //!
 //! Any other list is refused as well, whether or not it admits more, and the refusal says which
-//! it is. An object "admits more" when its entries differ from the starter's own in a way that
-//! only widens them, as far as the entries show: no access list, a null one, an allowing entry
-//! for a trustee that the starter's own allows nothing (other than the owner's rights), a denying
-//! entry whose trustee has none left while an allowing entry remains, a lower integrity level or
-//! a weaker policy.
+//! it is. An object "admits more" when its entries hold a difference that this reading calls
+//! wider: no access list, a null one, an allowing entry for a trustee that the starter's own
+//! allows nothing (other than the owner's rights), a denying entry whose trustee has none left
+//! while an allowing entry remains, a lower integrity level or a weaker policy. An object may
+//! also differ in ways that narrow it, and is still called wider for the difference that widens.
 //! That is a reading of the entries, not an evaluation of which entry decides for a given
 //! process, so "admits more" does not always mean that access grows: an allowing entry behind a
 //! denying one is still called wider, and so is a list that lost a denying entry while the allowing
@@ -106,10 +105,10 @@ impl fmt::Display for Stop {
 /// Why an object that was read is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Refusal {
-    /// Whether the entries differ from the starter's own in a way that only widens them, as far as
-    /// they show, which is what "admits more" says. It is a reading of the entries and does not
-    /// always mean that access grows. If not, the object is one the starter does not accept, and
-    /// may admit no more.
+    /// Whether the entries hold a difference that the reading calls wider, which is what "admits
+    /// more" says. It is a reading of the entries and does not always mean that access grows, nor
+    /// that the object has no other difference. If not, the object is one the starter does not
+    /// accept, and may admit no more.
     admits_more: bool,
     /// What differs.
     why: String,
@@ -146,8 +145,8 @@ pub(super) fn require_no_more(own: &Texts<'_>, found: &Texts<'_>) -> Result<(), 
         return Err(Stop::Unreadable {
             what: "access list",
             why: "one of the two access lists holds a condition or an entry of a callback kind \
-                  and their entries are not the same bytes, which the text of such an entry \
-                  does not tell apart"
+                  and their entries are not the same bytes, and such lists are not compared by \
+                  their text"
                 .to_owned(),
         });
     }
@@ -176,12 +175,12 @@ pub(super) fn require_no_more(own: &Texts<'_>, found: &Texts<'_>) -> Result<(), 
 
 /// Whether the text of an access list holds a condition: a double quote, a parenthesis inside an
 /// entry, or an entry of a callback kind, which begins with `X` or `Z`. The system writes a
-/// condition in parentheses of its own inside the entry's, but it writes a callback entry with no
-/// data after its trustee with none, and the entry may carry data that the text shows no condition
-/// for. The kind is a precaution that holds whatever the system writes for such data. The entries
-/// of a list that holds none of these are told apart by their parentheses alone. A string of a
-/// condition can end early at a double quote the grammar has no form for, so the entries around a
-/// condition cannot be told apart from it.
+/// condition in parentheses of its own inside the entry's, and a callback entry with no data after
+/// its trustee with none. The data tried after a trustee that was not a condition could not be
+/// written as text at all (error 805). The kind is a precaution that holds whatever the system
+/// writes for such data. The entries of a list that holds none of these are told apart by their
+/// parentheses alone. A string of a condition can end early at a double quote the grammar has no
+/// form for, so the entries around a condition cannot be told apart from it.
 fn holds_a_condition(text: &str) -> bool {
     let mut depth = 0_u32;
     let mut characters = text.chars().peekable();
@@ -1027,8 +1026,9 @@ mod tests {
         assert!(refused(own, "D:(A;;0x1;;;SY)").is_some());
         assert!(refused("D:(A;;0x1;;;SY)", "D:(ZZ;;0x1;;;BG)(A;;0x1;;;SY)").is_some());
 
-        // Object and conditional entries put in that deny are denying entries put in; those left
-        // out that allow are allowing entries left out.
+        // Below the rule for a condition, which a list with a conditional entry meets first in
+        // `require_no_more`: object and conditional entries put in that deny are denying entries
+        // put in; those left out that allow are allowing entries left out.
         let allowing = "D:(OA;;0x1;;;WD)(XA;;0x1;;;WD;(@User.X==1))(ZA;;0x1;;;WD)(A;;0x1;;;SY)";
         assert_eq!(refused(allowing, "D:(A;;0x1;;;SY)"), None);
         assert_eq!(
@@ -1472,8 +1472,8 @@ mod tests {
 
     /// KR-REQ-03.24: an entry of a callback kind is a condition whether or not its text shows one,
     /// wherever it stands in the list. The system writes such an entry with no data after its
-    /// trustee with no condition, and may not show the data of another. That is a precaution: such
-    /// a list is used only beside a list of the same entries, whichever side holds it.
+    /// trustee with no condition, and could not write other data as text. That is a precaution:
+    /// such a list is used only beside a list of the same entries, whichever side holds it.
     #[test]
     fn an_entry_of_a_callback_kind_is_a_condition_whether_or_not_the_text_shows_one() {
         fn held_as<'a>(access: &'a str, access_bytes: &'a [u8]) -> Texts<'a> {
