@@ -46,6 +46,44 @@ fn available_through(runtime: &str, suite: &str) -> bool {
 
 /// [`available_through`], giving the runtime `bound` to answer `--version`.
 fn available_within(runtime: &str, suite: &str, bound: Duration) -> bool {
+    match asked_its_version(runtime, bound) {
+        Version::NotThere => {
+            eprintln!("{suite}: skipped, because {runtime} is not installed on this machine");
+            false
+        }
+        Version::Ended(status) => {
+            assert!(
+                status.success(),
+                "{runtime} is installed and `--version` ended with {status}"
+            );
+            true
+        }
+        Version::Stalled { collected } => panic!(
+            "{runtime} `--version` did not end within {bound:?}{}",
+            if collected {
+                ""
+            } else {
+                " and could not be ended"
+            }
+        ),
+    }
+}
+
+/// What asking a runtime for its version came to.
+#[derive(Debug)]
+enum Version {
+    /// There is no such program.
+    NotThere,
+    /// It answered, in the bound it was given.
+    Ended(std::process::ExitStatus),
+    /// It did not answer in that bound, and was ended; whether it was collected within
+    /// [`VERSION_BOUND`], where a program the kernel does not let go is reported and not waited for.
+    Stalled { collected: bool },
+}
+
+/// Asks `runtime` for its `--version`, giving it `bound` to answer. Any failure to start it other
+/// than its absence fails the case.
+fn asked_its_version(runtime: &str, bound: Duration) -> Version {
     let mut asked = match Command::new(runtime)
         .arg("--version")
         .stdin(Stdio::null())
@@ -54,36 +92,28 @@ fn available_within(runtime: &str, suite: &str, bound: Duration) -> bool {
         .spawn()
     {
         Ok(asked) => asked,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("{suite}: skipped, because {runtime} is not installed on this machine");
-            return false;
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Version::NotThere,
         Err(error) => panic!("{runtime} is installed and could not be started: {error}"),
     };
     let begun = Instant::now();
-    let status = loop {
+    loop {
         match asked.try_wait().expect("the state of the runtime's answer") {
-            Some(status) => break status,
+            Some(status) => return Version::Ended(status),
             None if begun.elapsed() < bound => {
                 std::thread::sleep(Duration::from_millis(20));
             }
             None => {
-                // Collected within a bound too: a program the kernel does not let go is reported,
-                // and not waited for.
                 let _ = asked.kill();
                 let collected_by = Instant::now() + VERSION_BOUND;
                 while matches!(asked.try_wait(), Ok(None)) && Instant::now() < collected_by {
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                panic!("{runtime} `--version` did not end within {bound:?}");
+                return Version::Stalled {
+                    collected: matches!(asked.try_wait(), Ok(Some(_))),
+                };
             }
         }
-    };
-    assert!(
-        status.success(),
-        "{runtime} is installed and `--version` ended with {status}"
-    );
-    true
+    }
 }
 
 /// The command, copied to a directory of this run's own so it can be mounted read-only.
@@ -208,7 +238,7 @@ fn only_a_runtime_that_is_not_there_is_a_reason_to_skip() {
     );
 
     // One that does not answer is a stall, ended at the bound it was given, and fails the case.
-    let stalled = runtime_that("stalled", "echo $$ > \"$0.pid\"; exec sleep 120");
+    let stalled = runtime_that("stalled", "exec sleep 120");
     let failed = std::panic::catch_unwind(|| {
         available_within(
             &stalled,
@@ -223,21 +253,13 @@ fn only_a_runtime_that_is_not_there_is_a_reason_to_skip() {
         "the call is named with the bound it was given: {said}"
     );
     // And it does not outlast the case: a runtime left running is left on a machine others share.
-    let pid = std::fs::read_to_string(format!("{stalled}.pid"))
-        .expect("the stand-in wrote its process number")
-        .trim()
-        .parse::<i32>()
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-        .expect("a process number");
-    let begun = Instant::now();
-    while rustix::process::test_kill_process(pid).is_ok() {
-        assert!(
-            begun.elapsed() < Duration::from_secs(10),
-            "the runtime that did not answer is still running"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // The case reads whether the helper collected the child it ended, and no process number, which
+    // the kernel may give to another process once the child is collected.
+    let asked = asked_its_version(&stalled, Duration::from_secs(2));
+    assert!(
+        matches!(asked, Version::Stalled { collected: true }),
+        "the runtime that did not answer was not ended and collected: {asked:?}"
+    );
 }
 
 fn read_exact(source: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<()> {
