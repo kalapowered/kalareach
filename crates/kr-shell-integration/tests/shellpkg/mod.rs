@@ -79,6 +79,31 @@ fn wait_until_ready(stream: &impl AsFd, flags: PollFlags, within: Duration) {
 /// How long the step given to an editor that only reaches its queue when the reader steps lasts.
 pub const STEP: Duration = Duration::from_millis(60);
 
+/// How long the PowerShell package's bridge waits for the worker's answer to a question about a
+/// command, or to the acceptance of a line, while a case waits for that answer in turn.
+///
+/// The bridge ships with a second, which is long beside a worker that answers in under a
+/// millisecond and the right thing to give up at when a worker has stopped answering. In a case
+/// the worker is this harness, and a runner that does not run the shell or the harness for a
+/// second leaves a question unanswered by a measure that says nothing about the package: the
+/// command runs as it was typed and the case fails. So a case lets the bridge wait for the answer
+/// as long as a case waits for anything, set in the bridge's own variable from the person's
+/// profile, and a case about what the bridge does when no answer comes gives the second back with
+/// [`Session::lets_the_bridge_give_up_on_a_question`].
+const PATIENT_ANSWER_WAIT_MS: u32 = 120_000;
+
+/// The wait the bridge ships with.
+const SHIPPED_ANSWER_WAIT_MS: u32 = 1_000;
+
+/// PowerShell that sets the bridge's wait for an answer, where the bridge is loaded and nowhere
+/// else, and leaves nothing behind in the session's scope.
+fn set_answer_wait(milliseconds: u32) -> String {
+    format!(
+        "& {{ $kr_bridge = Get-Module KalaReach.ShellBridge; if ($kr_bridge) {{ & $kr_bridge {{ \
+         $script:KR_ANSWER_WAIT_MS = {milliseconds} }} }} }}"
+    )
+}
+
 /// Which side of the endpoint has gone, or `None` where it is whole.
 ///
 /// A write that found the peer gone and a read that reached the end of the stream are separate
@@ -1010,6 +1035,19 @@ impl Session {
         let session_id = SessionId::new(Uuid::from_bytes([0x5e; 16]));
         let secret = bootstrap_secret();
 
+        let patient = format!(
+            "{}\n{}",
+            set_answer_wait(PATIENT_ANSWER_WAIT_MS),
+            profile.after_entry
+        );
+        let profile = if package.kind == ShellKind::PowerShell && profile.entry {
+            Profile {
+                after_entry: &patient,
+                ..profile
+            }
+        } else {
+            profile
+        };
         install_startup(package, &home, &prompt, profile);
 
         let pty = native_pty_system()
@@ -2237,6 +2275,31 @@ impl Session {
     pub fn answered(&mut self, marker: &str) -> bool {
         let command = print_assembled(self.package_kind, marker);
         self.run(&command, marker)
+    }
+
+    /// Gives the bridge back the second it ships with to wait for the worker's answer to a
+    /// question, for a case about what it does when the answer does not come. Every other case
+    /// lets it wait far longer; see [`PATIENT_ANSWER_WAIT_MS`]. Nothing is done for a shell whose
+    /// bridge has no such wait.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shell does not take the line.
+    pub fn lets_the_bridge_give_up_on_a_question(&mut self) {
+        if self.package_kind != ShellKind::PowerShell {
+            return;
+        }
+        let marker = "kr-wait-given-back";
+        let line = format!(
+            "{}; {}",
+            set_answer_wait(SHIPPED_ANSWER_WAIT_MS),
+            print_assembled(self.package_kind, marker)
+        );
+        assert!(
+            self.run(&line, marker),
+            "the bridge's wait for an answer was not set back:\n{}",
+            self.terminal_output()
+        );
     }
 
     /// Runs one command for a caller that owns a budget of its own.

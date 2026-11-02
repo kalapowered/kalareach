@@ -1050,6 +1050,7 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
     let mut session = a_session_with_probes(&package, &probes);
 
     let entries = session.commands.entries.len();
+    session.lets_the_bridge_give_up_on_a_question();
     session.commands.policy = ResolvePolicy::Silent;
     let asked = session.run_asking("kr-probe unanswered", "probe-ran");
     assert_eq!(asked.len(), 1, "the command asked: {asked:?}");
@@ -1122,6 +1123,7 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
 
     // A worker that answers nothing at all is not asked again while an answer is owed: the
     // commands after it run as they were typed without a question.
+    session.lets_the_bridge_give_up_on_a_question();
     session.commands.stuck = true;
     for word in ["after", "and-after"] {
         let asked = session.run_asking(&format!("kr-probe {word}"), "probe-ran");
@@ -2024,6 +2026,7 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
     ];
     // Nothing is answered after the resolve, so what the next reader does with those frames
     // depends on nothing more arriving.
+    session.lets_the_bridge_give_up_on_a_question();
     session.commands.silent_after_resolve = true;
 
     let asked = session.run_asking("kr-probe amid-traffic", "probe-ran");
