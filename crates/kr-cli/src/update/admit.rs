@@ -99,10 +99,10 @@ pub fn run_as_current() -> Result<()> {
 /// Starts the store's `kr` on this command's arguments, in place of this process. It returns only
 /// the failure to do so.
 fn start_stores_kr(store: &Store) -> CliError {
-    // A line that standard error refused before this point (the notice that this release is no
-    // newer than the current one, or the reason an update waits) is lost: the program that replaces
-    // this process knows nothing of it, and the command goes on in that program, as it does after
-    // any line that standard error refuses.
+    // A line that standard error refused before this point (a notice that this release is not
+    // offered as an update, or the reason an update waits) is lost: the program that replaces this
+    // process knows nothing of it, and the command goes on in that program, as it does after any
+    // line that standard error refuses.
     let error = std::process::Command::new(store.stable(Program::Kr))
         .args(std::env::args_os().skip(1))
         .exec();
@@ -250,9 +250,10 @@ fn not_to_admit(
 /// staging place that only this user reads, and the package manager is named once the release is
 /// current. An update that waits (exit 9) leaves the current release in place and is not a failure.
 /// An update that fails is a refusal, and is not offered again. The current `kr` says why on
-/// standard error; a reason that stream refuses is lost, and a wait still ends 9. What it prints to
-/// standard output is its report of the update, which the command that follows must not be
-/// preceded by. It reads nothing from standard input, which belongs to the command that follows.
+/// standard error; a reason that stream refuses is lost, and a current release of this version or
+/// a later one still ends a wait with 9. What it prints to standard output is its report of the
+/// update, which the command that follows must not be preceded by. It reads nothing from standard
+/// input, which belongs to the command that follows.
 fn hand_to_current(
     store: &Store,
     tree: &Path,

@@ -210,7 +210,9 @@ impl TerminalOutput {
     ///
     /// It is called before the command that writes to the terminal is started: the command asks
     /// the terminal what it is and gives up on an answer after one second, and a thread started
-    /// after it can be scheduled later than that.
+    /// after it can be scheduled later than that. The order does not prevent a delay of that length
+    /// after the thread has read the question and before it types the answer; such a delay makes
+    /// the command refuse the terminal and the case fail before it reaches what it tests.
     fn collect(reader: Box<dyn Read + Send>) -> Self {
         Self {
             seen: terminal::collect(reader),

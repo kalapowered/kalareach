@@ -306,11 +306,13 @@ fn an_update_that_waits_does_not_stop_the_command() {
 
 /// KR-REQ-27.05, full disks: the reason an update waits is lost when standard error refuses it, and
 /// the command goes on. The release in the prefix is newer, so the current release's `kr` is asked
-/// to take it in as an update, and another update holds the lock. That `kr` writes why it waits on
-/// the standard error it inherits, writes its report to a null standard output, and ends 9, which
-/// the command takes for a wait. With the line refused it still ends 9: nothing is replaced, the
-/// store's `kr` runs the command, and it ends as it ends with room, 0, with the roots it was asked
-/// for. The reason is lost as any line that standard error refuses is.
+/// to take it in as an update, with a null standard output and the standard error the command was
+/// given, and another update holds the lock. That `kr` writes why it waits on that standard error
+/// and ends 9, which the command takes for a wait. The case reads the end of the command: with the
+/// line refused it ends 0, as it does with room, with the same standard output, and the current
+/// release is unchanged. The command goes on only after an update that ends 0 or 9, so the case
+/// reads the update's own status no further than that. The reason is lost as any line that
+/// standard error refuses is.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_wait_standard_error_refuses_is_lost_and_the_command_still_runs_as_the_stores_kr() {

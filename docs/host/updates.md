@@ -136,7 +136,8 @@ A release that is already in the store and not staged, as one is after a rollbac
 newer than the current one is not offered again: the command goes on with the release that is
 current, and a rollback stands. The notice that says so goes to standard error. Where that stream
 refuses it, the command goes on and the notice is lost. So is the reason an update waits, which the
-current release's `kr` writes to the same stream: it still ends 9, and the command goes on. A
+current release's `kr` writes to the same stream: a current release of this version or a later one
+still ends 9, and the command goes on. A
 release that carries no update channel root, or cannot be checked, is refused with the reason, and
 the command does not run. Two first commands at once take the store's locks in turn, and the one
 that does not get them goes on with the release that is current.
