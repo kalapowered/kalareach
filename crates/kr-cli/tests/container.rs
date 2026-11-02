@@ -41,6 +41,11 @@ fn runtime_available(suite: &str) -> bool {
 /// answer it is a stall. Both fail the case, where a skip would pass every case that needs the
 /// runtime.
 fn available_through(runtime: &str, suite: &str) -> bool {
+    available_within(runtime, suite, VERSION_BOUND)
+}
+
+/// [`available_through`], giving the runtime `bound` to answer `--version`.
+fn available_within(runtime: &str, suite: &str, bound: Duration) -> bool {
     let mut asked = match Command::new(runtime)
         .arg("--version")
         .stdin(Stdio::null())
@@ -59,7 +64,7 @@ fn available_through(runtime: &str, suite: &str) -> bool {
     let status = loop {
         match asked.try_wait().expect("the state of the runtime's answer") {
             Some(status) => break status,
-            None if begun.elapsed() < VERSION_BOUND => {
+            None if begun.elapsed() < bound => {
                 std::thread::sleep(Duration::from_millis(20));
             }
             None => {
@@ -70,7 +75,7 @@ fn available_through(runtime: &str, suite: &str) -> bool {
                 while matches!(asked.try_wait(), Ok(None)) && Instant::now() < collected_by {
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                panic!("{runtime} `--version` did not end within {VERSION_BOUND:?}");
+                panic!("{runtime} `--version` did not end within {bound:?}");
             }
         }
     };
@@ -117,12 +122,9 @@ fn the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_act
         .spawn()
     {
         Ok(child) => child,
-        Err(error) => {
-            eprintln!(
-                "the_helper_inside_a_container: skipped, because the runtime could not start a container: {error}"
-            );
-            return;
-        }
+        // The runtime answered `--version` a moment ago, so one that cannot start the call is
+        // broken, and a skip would pass the case without running it.
+        Err(error) => panic!("{RUNTIME} could not start a container: {error}"),
     };
     let codec = FrameCodec::new(StreamKind::Control);
     let hello = BridgeFrame::Hello(Box::new(BridgeHello {
@@ -203,6 +205,22 @@ fn only_a_runtime_that_is_not_there_is_a_reason_to_skip() {
     assert!(
         said.contains("is installed and `--version` ended with"),
         "{said}"
+    );
+
+    // One that does not answer is a stall, ended at the bound it was given, and fails the case.
+    let stalled = runtime_that("stalled", "exec sleep 30");
+    let failed = std::panic::catch_unwind(|| {
+        available_within(
+            &stalled,
+            "the_cases_of_a_stalled_one",
+            Duration::from_secs(2),
+        )
+    });
+    let said = failed.expect_err("a runtime that does not answer fails the case");
+    let said = said.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        said.contains("`--version` did not end within 2s"),
+        "the call is named with the bound it was given: {said}"
     );
 }
 
