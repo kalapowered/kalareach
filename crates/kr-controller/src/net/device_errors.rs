@@ -17,7 +17,9 @@
 //! the sentence is kept. Anything else that names the host (a path of any kind, the number
 //! of an account, the name of a program that changes who may use a file) has no end this module
 //! can find, so the device is given the part of the message that comes before the first such name,
-//! if that is a clause of its own, and otherwise a sentence composed here from the code.
+//! if that is a clause of its own that fits in an error with the reason after it, and otherwise a
+//! sentence composed here from the code. A message that holds the place of a pointer's refusal is
+//! given a clause only when the whole message fits in an error as well.
 //!
 //! The same rule reaches an error wherever it is, because the text of an error that has already
 //! been made (a worker's, one a store kept, one a catalogue receipt holds) cannot be made again:
@@ -36,14 +38,16 @@
 //! the rule does not read, or through a longer name for one (`uid: 501`, `owner: 502`, `user id
 //! 501`, `user  501`, `uid(501)`, `uid_501`); a path of which every slash follows a name
 //! (`~name/work`, `Users/name/work`, `.config/kalareach/x`); a command of a program the rule does
-//! not know, written without backticks (`rm -rf x`); a place in the words of a pointer's refusal,
-//! whatever stands ahead of `at` (`x at /Users/name/p carries a field it does not declare`), which
-//! the rule sets aside; and an account's bare name in a clause that holds no path, number or
-//! command of its own (the error output of `systemctl` that `supervision.rs` quotes can hold one),
-//! even when a later clause does. The words ahead of a clause of the host's own, in the detail of a
-//! plugin the admissions leave out, are read without the set-aside place, and are held to the rule
-//! when they hold a backtick. A producer that writes one of these is mended by giving the refusal a
-//! wording that is shared with this module, as [`KNOWN_REASONS`] does for its last seven refusals.
+//! not know, written without backticks (`rm -rf x`); a program it knows that a mark joins to the
+//! word beside it (`sudo,x`, and `` `a b`,sudo x `` once the quotation is replaced); a place in the
+//! words of a pointer's refusal, whatever stands ahead of `at` (`x at /Users/name/p carries a field
+//! it does not declare`), which the rule sets aside; and an account's bare name in a clause that
+//! holds no path, number or command of its own (the error output of `systemctl` that
+//! `supervision.rs` quotes can hold one), even when a later clause does. The words ahead of a
+//! clause of the host's own, in the detail of a plugin the admissions leave out, are read without
+//! the set-aside place, and are held to the rule when they hold a backtick. A producer that writes
+//! one of these is mended by giving the refusal a wording that is shared with this module, as
+//! [`KNOWN_REASONS`] does for its last seven refusals.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -1396,9 +1400,11 @@ fn account_number(text: &str, outside: &impl Fn(usize) -> bool) -> Option<usize>
         .min()
 }
 
-/// Whether `character`, beside a quotation that is replaced, would run into the words `a command`
-/// and make one word of them and its neighbour: anything but white space and the marks that end a
-/// clause or close a bracket.
+/// Whether `character`, beside a quotation that is replaced, is parted from the words `a command`
+/// by a space in the second reading: anything but white space and the marks that end a clause or
+/// close a bracket. Such a mark stays against its neighbour, as it does in a text with no
+/// quotation, where white space alone parts words, so a program that one of them joins to the word
+/// beside it (`sudo,x`, `` `a b`,sudo x ``) is not found.
 fn joins_a_word(character: char) -> bool {
     !character.is_whitespace()
         && !matches!(
@@ -4212,8 +4218,10 @@ mod tests {
         }
     }
 
-    /// A quotation that is replaced leaves the words beside it words of their own, so a path, a
-    /// number or a program that touches its backticks is still read.
+    /// A quotation that is replaced is read once more with a space between it and the word beside
+    /// it, so a path, a number or a program that touches its backticks is still read. A mark that
+    /// ends a clause or closes a bracket is no space (`` `a b`.sudo x ``), as it is none without
+    /// the quotation, and the program behind it is not found.
     #[test]
     fn a_command_quoted_against_a_word_does_not_hide_the_word() {
         let nothing = format!("why the admissions leave the installation out; {WHY_NOT_SHOWN}");
