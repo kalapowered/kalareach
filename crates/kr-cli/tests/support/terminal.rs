@@ -87,11 +87,18 @@ pub type Collected = Arc<Mutex<Transcript>>;
 
 /// Collects what `reader` produces on a thread of its own, and types the replies owed as the
 /// questions they answer arrive.
+///
+/// It returns once that thread is running, so a command started after the call asks a terminal that
+/// is already being read. A command that is started first can ask its question, and give up on the
+/// answer a second later, before the thread that would give it has been scheduled.
 #[must_use]
 pub fn collect(mut reader: Box<dyn Read + Send>) -> Collected {
     let collected = Collected::default();
     let seen = Arc::clone(&collected);
+    let (running, started) = channel::<()>();
     std::thread::spawn(move || {
+        // Said before the first read, and `collect` does not return until it is heard.
+        let _ = running.send(());
         let mut buffer = [0_u8; 4096];
         while let Ok(read) = reader.read(&mut buffer) {
             if read == 0 {
@@ -112,6 +119,9 @@ pub fn collect(mut reader: Box<dyn Read + Send>) -> Collected {
         transcript.ended = true;
         transcript.owed.clear();
     });
+    started
+        .recv()
+        .expect("the thread that collects the terminal's output started");
     collected
 }
 

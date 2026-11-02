@@ -206,6 +206,11 @@ struct TerminalOutput {
 }
 
 impl TerminalOutput {
+    /// Starts reading the terminal, and returns once the thread that reads it is running.
+    ///
+    /// It is called before the command that writes to the terminal is started: the command asks
+    /// the terminal what it is and gives up on an answer after one second, and a thread started
+    /// after it can be scheduled later than that.
     fn collect(reader: Box<dyn Read + Send>) -> Self {
         Self {
             seen: terminal::collect(reader),
@@ -459,6 +464,9 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
         })
         .expect("opens a terminal");
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
+    let probe = keyboard.answers_the_probe(&output);
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -469,9 +477,6 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
-    let probe = keyboard.answers_the_probe(&output);
     output.expect_within(
         b"kr-ready.",
         LIVENESS_DEADLINE,
@@ -582,6 +587,9 @@ async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
         })
         .expect("opens a terminal");
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
+    let probe = keyboard.answers_the_probe(&output);
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -592,9 +600,6 @@ async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
-    let probe = keyboard.answers_the_probe(&output);
     output.expect_within(
         b"kr-ready.",
         LIVENESS_DEADLINE,
@@ -708,6 +713,9 @@ async fn mouse_reports_pass_through_and_a_wheel_event_is_never_an_arrow_key() {
         })
         .expect("opens a terminal");
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
+    let probe = keyboard.answers_the_probe(&output);
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -718,9 +726,6 @@ async fn mouse_reports_pass_through_and_a_wheel_event_is_never_an_arrow_key() {
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
-    let probe = keyboard.answers_the_probe(&output);
     output.expect_within(
         b"kr-ready.",
         LIVENESS_DEADLINE,
@@ -794,6 +799,7 @@ async fn a_view_without_the_lease_cannot_change_the_applications_focus_state() {
         })
         .expect("opens a terminal");
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -804,7 +810,6 @@ async fn a_view_without_the_lease_cannot_change_the_applications_focus_state() {
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     output.expect_within(
         b"kr-ready.",
         LIVENESS_DEADLINE,
@@ -895,6 +900,9 @@ fn attach_on_a_terminal(
             pixel_height: 0,
         })
         .expect("opens a terminal");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
+    let probe = keyboard.answers_the_probe(&output);
     let shell = pty
         .slave
         .spawn_command(shell_running(
@@ -906,9 +914,6 @@ fn attach_on_a_terminal(
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
-    let probe = keyboard.answers_the_probe(&output);
     output.expect_within(
         b"kr-ready.",
         LIVENESS_DEADLINE,
