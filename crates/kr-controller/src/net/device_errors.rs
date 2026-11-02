@@ -535,6 +535,13 @@ fn told_in_place(text: &str, fixed: impl Fn() -> String) -> Option<String> {
     let text = without_commands.as_deref().unwrap_or(text);
     let apart = read_apart.as_deref().unwrap_or(text);
     let (first, first_apart) = (first_naming(text), first_naming(apart));
+    // A pointer's place is set aside, and an account's number inside it does not hide one beyond
+    // it. That number can come before the name that would have come first, which leaves a shorter
+    // clause that fits where the longer one did not. So a text that holds a pointer's place is
+    // kept only when the whole of it is short enough to carry a clause, whichever name comes
+    // first. A text with no place has nothing set aside, and the limit below holds its clause.
+    let too_long_for_a_clause = pointer_place(text).is_some()
+        && text.len() + "; ".len() + WHY_NOT_SHOWN.len() > LONGEST_MESSAGE;
     // A refusal that is known by its wording is told by its reason whether or not the rule finds a
     // name in it: it can name an account that has no form the rule can find.
     let told = match known_reason(text) {
@@ -542,18 +549,15 @@ fn told_in_place(text: &str, fixed: impl Fn() -> String) -> Option<String> {
         None if first.map(|at| &text[..at]) != first_apart.map(|at| &apart[..at]) => fixed(),
         None => match first {
             None => without_commands?,
-            // Whether a clause is kept is decided by the length of the text and not by where the
-            // first name is, so that finding a name earlier cannot make a long text tell a clause
-            // that finding it later would have refused.
-            Some(_) if text.len() + "; ".len() + WHY_NOT_SHOWN.len() > LONGEST_MESSAGE => fixed(),
+            Some(_) if too_long_for_a_clause => fixed(),
             Some(at) => match clause_before(text, at) {
                 Some(clause) => format!("{clause}; {WHY_NOT_SHOWN}"),
                 None => fixed(),
             },
         },
     };
-    // A text never carries more than an error's limit, so a clause kept from a long one gives way
-    // to what stands for it.
+    // A text never carries more than an error's limit: a clause that cannot take its reason after
+    // it, and a text whose quotations are longer once replaced, give way to what stands for them.
     Some(if told.len() > LONGEST_MESSAGE {
         fixed()
     } else {
@@ -1576,6 +1580,34 @@ mod tests {
                 .message
                 .starts_with("the host could not make something"),
             "the clause gave way to the sentence of the code"
+        );
+        // Short enough to be an error, and longer than one once each quotation is replaced by the
+        // words `a command`, with nothing in it that names the host.
+        let grown = "`a b` ".repeat(170);
+        let told = error(ErrorCode::ResourceUnavailable, &grown);
+        assert!(told.is_consistent(), "{}", grown.len());
+        let shown = error_for_a_device(&told).into_owned();
+        assert!(shown.is_consistent(), "{}", shown.message.len());
+        assert!(
+            !shown.message.contains("a command"),
+            "the replaced text gave way to the sentence of the code"
+        );
+    }
+
+    /// A path that makes a text long takes nothing from the clause in front of it: the clause is
+    /// told as it is for a short text, while the clause and its reason fit in an error.
+    #[test]
+    fn a_long_path_does_not_withhold_the_short_clause_before_it() {
+        let clause = "the host could not make the session's directory";
+        let head = format!("{clause}: create /Users/marguerite/");
+        let said = format!("{head}{}", "p".repeat(LONGEST_MESSAGE - head.len()));
+        let told = error(ErrorCode::ResourceUnavailable, &said);
+        assert!(told.is_consistent(), "{}", said.len());
+        let shown = error_for_a_device(&told).into_owned();
+        assert_eq!(
+            shown.message,
+            format!("{clause}; {WHY_NOT_SHOWN}"),
+            "{said}"
         );
     }
 
