@@ -53,7 +53,7 @@ pub const BEGAN_PREFIX: &str = "stub-began-";
 pub const LOADED_PREFIX: &str = "stub-loaded-";
 
 /// The name of the file in a stub's runtime directory that [`release_held_work`] makes, and that
-/// ends the wait of a load or a job the script holds.
+/// ends the wait of a load, a job, the watchdog or a job start the script holds.
 const RELEASE_MARK: &str = "stub-released";
 
 /// The start of the name of the file a recording process ([`Raw::Recording`]) leaves in its runtime
@@ -72,7 +72,8 @@ pub const JOB_BOUNDS_PREFIX: &str = "stub-job-bounds-";
 
 /// The start of the name of the file a stub whose script marks work leaves in its runtime
 /// directory when its model thread has read the token of the job with an identifier and is about
-/// to set the job's bound, followed by that identifier.
+/// to set the job's bound, followed by that identifier. It holds whether the job was in hand when
+/// the token was read, in the form [`job_in_hand_at_the_read`] reads.
 pub const JOB_BOUND_CHOSEN_PREFIX: &str = "stub-job-bound-chosen-";
 
 /// The name of the file a stub whose script marks work leaves in its runtime directory each time
@@ -83,10 +84,6 @@ pub const WATCHDOG_FOUND: &str = "stub-watchdog-found";
 /// watchdog found work overdue and left the process alone, because the bound it had read no longer
 /// stood when it came to decide.
 pub const WATCHDOG_SPARED: &str = "stub-watchdog-spared";
-
-/// How long a held watchdog waits to be released, so that a case that never releases it leaves no
-/// process waiting for good.
-const WATCHDOG_HOLD: Duration = Duration::from_secs(60);
 
 /// Whether the watchdog of this process waits, when it finds work overdue, for
 /// [`release_held_work`]: set by a stub whose script holds its watchdog.
@@ -196,11 +193,7 @@ pub(crate) fn watchdog_found_overdue(previous_look: u64, look: u64, due: u64) {
         format!("{previous_look} {look} {due}"),
     );
     if HOLD_WATCHDOG.load(std::sync::atomic::Ordering::Acquire) {
-        let released = directory.join(RELEASE_MARK);
-        let until = Instant::now() + WATCHDOG_HOLD;
-        while !released.exists() && Instant::now() < until {
-            std::thread::sleep(LOOK);
-        }
+        hold_until_released(directory);
     }
 }
 
@@ -213,33 +206,34 @@ pub(crate) fn watchdog_spared() {
 }
 
 /// Records that the model thread has read the token of the job with this identifier and is about
-/// to set the job's bound, when the process is a stub whose script marks work, and holds it there
-/// when the script holds job starts, until [`release_held_work`].
-pub(crate) fn job_bound_chosen(id: u64) {
+/// to set the job's bound, and whether the job was in hand when it read the token, when the
+/// process is a stub whose script marks work, and holds it there when the script holds job starts,
+/// until [`release_held_work`].
+pub(crate) fn job_bound_chosen(id: u64, in_hand_at_the_read: bool) {
     let Some(directory) = RECORDS_DIRECTORY.get() else {
         return;
     };
     let _ = std::fs::write(
         directory.join(format!("{JOB_BOUND_CHOSEN_PREFIX}{id}")),
-        "chosen",
+        if in_hand_at_the_read { "1" } else { "0" },
     );
     if HOLD_JOB_START.load(std::sync::atomic::Ordering::Acquire) {
-        let released = directory.join(RELEASE_MARK);
-        let until = Instant::now() + WATCHDOG_HOLD;
-        while !released.exists() && Instant::now() < until {
-            std::thread::sleep(LOOK);
-        }
+        hold_until_released(directory);
     }
 }
 
-/// Returns whether the model thread of the stub process with `runtime_dir` as its runtime
-/// directory has read the token of the job with this identifier and is at the point where it sets
-/// the job's bound.
+/// Returns whether the job with this identifier was in hand when the model thread of the stub
+/// process with `runtime_dir` as its runtime directory read the job's token, once it has read it
+/// and is at the point where it sets the job's bound.
 #[must_use]
-pub fn job_bound_is_chosen(runtime_dir: &Path, id: u64) -> bool {
-    runtime_dir
-        .join(format!("{JOB_BOUND_CHOSEN_PREFIX}{id}"))
-        .exists()
+pub fn job_in_hand_at_the_read(runtime_dir: &Path, id: u64) -> Option<bool> {
+    let text =
+        std::fs::read_to_string(runtime_dir.join(format!("{JOB_BOUND_CHOSEN_PREFIX}{id}"))).ok()?;
+    match text.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
 }
 
 /// Returns what the watchdog of the stub process with `runtime_dir` as its runtime directory found

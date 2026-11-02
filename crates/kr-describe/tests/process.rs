@@ -21,7 +21,7 @@ use kr_describe::serve::{
 };
 use kr_describe::supervise::STOP_BOUND_MS;
 use kr_describe::testing::{
-    Script, acknowledging_state, job_bound_is_chosen, job_bounds, release_held_work,
+    Script, acknowledging_state, job_bounds, job_in_hand_at_the_read, release_held_work,
     watchdog_found, watchdog_has_spared,
 };
 use kr_describe::wire::{Answer, JobEnd, LoadEnd, Request, WIRE_VERSION, frame_of};
@@ -600,9 +600,9 @@ fn a_process_whose_job_does_not_stop_ends_itself() {
 /// A process whose standard error cannot be written to still ends itself when its job does not stop
 /// and when its control thread is stuck: the watchdog says why on a thread of its own and does not
 /// wait behind a write that has stopped for good. The script holds the lock on standard error from
-/// before the process serves, as a write waiting on a pipe nobody reads does, and the process says
-/// it holds it before the case sends anything. The control is the process with its standard error
-/// free, which ends the same way (above).
+/// before the process serves, as a write waiting on a pipe nobody reads does, and the process
+/// serves nothing until it holds it. The control is the process with its standard error free,
+/// which ends the same way (above).
 #[test]
 fn a_process_whose_standard_error_is_held_still_ends_when_it_must() {
     let placed = Placed::stub();
@@ -782,9 +782,9 @@ fn a_job_told_to_stop_is_cancelled_and_has_its_bound_before_the_acknowledgement_
     ));
 }
 
-/// KR-REQ-22.11: a stop the control thread reads after the watchdog has found a job overdue, and
+/// KR-REQ-22.11: a stop the control thread applies after the watchdog has found a job overdue, and
 /// before it has decided to end the process, is not missed: the watchdog ends the process only on
-/// the bound as it stands when it decides, and a job whose stop has been read since has the stop
+/// the bound as it stands when it decides, and a job whose stop has been applied since has the stop
 /// bound. The script holds the watchdog between its finding, which it records, and its decision;
 /// the case sends the stop once it has seen the record, reads the acknowledgement, which is written
 /// after the extension, and lets the watchdog go. The watchdog then leaves the process alone, and
@@ -889,7 +889,7 @@ fn a_stop_read_while_a_job_comes_into_hand_is_not_lost() {
     process.expect_answer(SOON, "the load");
     process.send(&generate(2, 1, 60_000));
     wait_for("the model thread to read the job's token", || {
-        job_bound_is_chosen(&runtime, 2)
+        job_in_hand_at_the_read(&runtime, 2).is_some()
     });
     process.send(&Request::Cancel { id: U64::new(2) });
     assert_eq!(
@@ -901,6 +901,11 @@ fn a_stop_read_while_a_job_comes_into_hand_is_not_lost() {
         process.expect_terminal(SOON, "the cancelled job"),
         Answer::Ended { id, why: JobEnd::Cancelled, .. } if id.get() == 2
     ));
+    assert_eq!(
+        job_in_hand_at_the_read(&runtime, 2),
+        Some(true),
+        "the job is in hand before its token is read"
+    );
     assert_eq!(
         job_bounds(&runtime, 2),
         Some((GUIDE_STOP_BOUND_MS, GUIDE_STOP_BOUND_MS)),

@@ -806,6 +806,9 @@ fn model_thread<M: Model>(
                 // the job in hand and finds it, or takes it before, and this thread reads the token
                 // cancelled: one of the two gives the job the stop bound.
                 shared.job_in_hand.store(id, Ordering::Release);
+                // Whether the job is in hand as the token is read, for a test to read back.
+                #[cfg(feature = "testing")]
+                let in_hand_at_the_read = shared.job_in_hand.load(Ordering::Acquire) == id;
                 // A job found cancelled is given the stop bound at once, as one whose stop is read
                 // after it is in hand. The bound is set in one step, so the watchdog is never
                 // shown the grace over a job that is cancelled, which a write of the
@@ -818,7 +821,7 @@ fn model_thread<M: Model>(
                     grace_due
                 };
                 #[cfg(feature = "testing")]
-                crate::testing::job_bound_chosen(id);
+                crate::testing::job_bound_chosen(id, in_hand_at_the_read);
                 shared.work_due.fetch_max(bound, Ordering::AcqRel);
                 // The bound the watchdog holds the job to as it comes into hand, and the stop
                 // bound, for a test to read back.

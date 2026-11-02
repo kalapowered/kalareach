@@ -301,7 +301,7 @@ the system does not hold is reported as not applied, with the reason.
     it has read, a caller's cancellation included, 30 seconds after the deadline on its own
     clock, where other work is overdue two seconds after its deadline. The job answers as past
     its deadline, the model stays loaded, and no new load follows. A job cancelled before the
-    process takes it in hand has that bound from the start. The watchdog ends the process on a
+    process takes it in hand has those 30 seconds from the start. The watchdog ends the process on a
     bound only if it still stands as the watchdog found it, so a stop that has given the job its
     bound by then is never missed; one that does so after the watchdog has decided to end the
     process comes too late, and the process ends as overdue. A process whose control thread has
