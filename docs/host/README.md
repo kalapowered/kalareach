@@ -1310,8 +1310,8 @@ allowing entry for a trustee that the starter's own allows nothing (other than t
 a denying entry whose trustee has none left while an allowing entry remains, a null or absent list
 where there are entries, or a lower integrity level or a weaker policy. These are readings of the
 entries, not an evaluation of which entry decides for a given process, so "admits more" does not
-always mean that access grows: a denying entry that is gone makes the object wider while an
-allowing entry remains, whomever that entry is for. The text of an access list is read only when it
+always mean that access grows: a denying entry that is gone counts as wider while an allowing
+entry remains, whomever that entry is for. The text of an access list is read only when it
 holds as many entries as the list itself does, and a list that holds a condition (a double quote, a
 parenthesis inside an entry, or an entry of a callback kind) only when the starter's own list and
 the object's hold the same entries byte for byte, whichever of the two holds the condition, because

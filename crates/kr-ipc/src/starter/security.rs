@@ -16,10 +16,11 @@
 //! allowing entry for the owner's rights, which is compared whole.
 //!
 //! Any other list is refused as well, whether or not it admits more, and the refusal says which
-//! it is. An object "admits more" when its entries show a loss that the starter's own does not
-//! have: no access list, a null one, an allowing entry for a trustee that the starter's own allows
-//! nothing (other than the owner's rights), a denying entry whose trustee has none left while an
-//! allowing entry remains, a lower integrity level or a weaker policy.
+//! it is. An object "admits more" when its entries differ from the starter's own in a way that
+//! only widens them, as far as the entries show: no access list, a null one, an allowing entry
+//! for a trustee that the starter's own allows nothing (other than the owner's rights), a denying
+//! entry whose trustee has none left while an allowing entry remains, a lower integrity level or
+//! a weaker policy.
 //! That is a reading of the entries, not an evaluation of which entry decides for a given
 //! process, so "admits more" does not always mean that access grows: an allowing entry behind a
 //! denying one is still called wider, and so is a list that lost a denying entry while the allowing
@@ -35,13 +36,15 @@
 //! whichever of the two holds the condition. That check comes before the entries are compared, so
 //! the flags that say which children inherit an entry count for such a list. A list holds a
 //! condition when its text holds a double quote, a parenthesis inside an entry, or an entry of a
-//! callback kind, whose data after the trustee the text may not show. The text is not enough for
-//! such a list: the grammar has no form for a double quote inside a string, and Windows Server
-//! 2025 writes one as it is, so a string ends early and one text can stand for two lists. Nothing
-//! else keeps the reading from losing the entries up to the next quote, and a count alone does
-//! not: false entries can stand in for the hidden ones. Equal bytes are needed and are not
-//! enough: a text whose strings end early holds fewer entries than its list, and is refused for
-//! it beside itself.
+//! callback kind. The system writes a callback entry with no data after its trustee with no
+//! condition at all, `(XD;;CC;;;BG)`, and could not write the other data tried as text (error
+//! 805), so the kind is a precaution that does not depend on what it writes for such data. The
+//! text is not enough for a list with a string: the grammar has no form for a double quote inside
+//! a string, and Windows Server 2025 writes one as it is, so a string ends early and one text can
+//! stand for two lists. Nothing else keeps the reading from losing the entries up to the next
+//! quote, and a count alone does not: false entries can stand in for the hidden ones. Equal bytes
+//! are needed and are not enough: a text whose strings end early can hold another number of
+//! entries than its list, and is then refused for it beside itself.
 //!
 //! The text is what the system writes for a descriptor, `D:` and its entries for an access list or
 //! `S:` and its label entry for the integrity label. Nothing here calls the system, so it is read
@@ -103,9 +106,10 @@ impl fmt::Display for Stop {
 /// Why an object that was read is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Refusal {
-    /// Whether the entries show a loss that the starter's own object does not have, which is what
-    /// "admits more" says. It is a reading of the entries and does not always mean that access
-    /// grows. If not, the object is one the starter does not accept, and may admit no more.
+    /// Whether the entries differ from the starter's own in a way that only widens them, as far as
+    /// they show, which is what "admits more" says. It is a reading of the entries and does not
+    /// always mean that access grows. If not, the object is one the starter does not accept, and
+    /// may admit no more.
     admits_more: bool,
     /// What differs.
     why: String,
@@ -171,12 +175,13 @@ pub(super) fn require_no_more(own: &Texts<'_>, found: &Texts<'_>) -> Result<(), 
 }
 
 /// Whether the text of an access list holds a condition: a double quote, a parenthesis inside an
-/// entry, or an entry of a callback kind, which begins with `X` or `Z`. The system writes the
-/// condition it understands in parentheses of its own inside the entry's, but a callback entry may
-/// carry other data after its trustee, and what the system writes for that is not known: the entry
-/// may show no condition at all. The entries of a list that holds none of these are told apart by
-/// their parentheses alone. A string of a condition can end early at a double quote the grammar
-/// has no form for, so the entries around a condition cannot be told apart from it.
+/// entry, or an entry of a callback kind, which begins with `X` or `Z`. The system writes a
+/// condition in parentheses of its own inside the entry's, but it writes a callback entry with no
+/// data after its trustee with none, and the entry may carry data that the text shows no condition
+/// for. The kind is a precaution that holds whatever the system writes for such data. The entries
+/// of a list that holds none of these are told apart by their parentheses alone. A string of a
+/// condition can end early at a double quote the grammar has no form for, so the entries around a
+/// condition cannot be told apart from it.
 fn holds_a_condition(text: &str) -> bool {
     let mut depth = 0_u32;
     let mut characters = text.chars().peekable();
@@ -437,10 +442,10 @@ fn entries_refusal(own: &[Entry], found: &[Entry]) -> Option<Refusal> {
         list.iter()
             .any(|entry| entry.decision == decision && entry.trustee == trustee)
     };
-    // The entries show a loss, which the refusal calls admitting more: nothing in the starter's own
-    // allows the trustee, or nothing in the found list denies the trustee that the starter's own
-    // denies while an allowing entry is left. Whether that allowing entry grants anything the lost
-    // denying entry took away is not weighed.
+    // The entries show a difference that the refusal calls admitting more: nothing in the
+    // starter's own allows the trustee, or nothing in the found list denies the trustee that the
+    // starter's own denies while an allowing entry is left. Whether that allowing entry grants
+    // anything the lost denying entry took away is not weighed.
     if let Some(entry) = found.iter().find(|entry| {
         entry.decision == Decision::Allow && !for_trustee(own, Decision::Allow, &entry.trustee)
     }) {
@@ -1225,8 +1230,8 @@ mod tests {
             matches!(&unread_label, Err(stop) if stop.is_unreadable()),
             "{unread_label:?}"
         );
-        // The starter's own label is read the same way: one that cannot be read is not taken for the
-        // medium label that no label stands for, against which the object would be used.
+        // The starter's own label is read the same way: one that cannot be read is not taken for
+        // the medium label that no label stands for, against which the object would be used.
         let unread_own_label = require_no_more(
             &texts(own_list, "S:(ML;;NW;;;XX)"),
             &texts(own_list, medium),
@@ -1465,9 +1470,10 @@ mod tests {
         assert_eq!(require_no_more(&plain(b"one"), &plain(b"another")), Ok(()));
     }
 
-    /// KR-REQ-03.24: an entry of a callback kind is a condition whether or not its text shows one:
-    /// the data after its trustee may not be in the text, so one text can stand for lists of other
-    /// bytes. Such a list is used only beside a list of the same entries, whichever side holds it.
+    /// KR-REQ-03.24: an entry of a callback kind is a condition whether or not its text shows one,
+    /// wherever it stands in the list. The system writes such an entry with no data after its
+    /// trustee with no condition, and may not show the data of another. That is a precaution: such
+    /// a list is used only beside a list of the same entries, whichever side holds it.
     #[test]
     fn an_entry_of_a_callback_kind_is_a_condition_whether_or_not_the_text_shows_one() {
         fn held_as<'a>(access: &'a str, access_bytes: &'a [u8]) -> Texts<'a> {
@@ -1502,6 +1508,18 @@ mod tests {
         assert!(why.contains("not the same bytes"), "{why}");
         let why = unread(require_no_more(
             &held_as(callback, b"one list"),
+            &held_as(plain, b"another list"),
+        ));
+        assert!(why.contains("not the same bytes"), "{why}");
+        // Not the first entry, on either side.
+        let last = "D:(A;;0x1;;;SY)(XD;;0x1;;;BG)";
+        let why = unread(require_no_more(
+            &held_as(plain, b"one list"),
+            &held_as(last, b"another list"),
+        ));
+        assert!(why.contains("not the same bytes"), "{why}");
+        let why = unread(require_no_more(
+            &held_as(last, b"one list"),
             &held_as(plain, b"another list"),
         ));
         assert!(why.contains("not the same bytes"), "{why}");
