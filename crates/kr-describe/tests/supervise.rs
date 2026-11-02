@@ -2015,8 +2015,10 @@ fn the_process_goes_when_its_daemon_dies() {
 
 /// KR-REQ-22.21: an idle description process whose control thread is stuck inside a read goes when
 /// its daemon dies. The end of its input never reaches that thread, so the watchdog looks for the
-/// daemon by the start identity the daemon passed it. The controls are the same stuck process while
-/// its daemon lives, which runs on, and an idle process that reads, which goes when its input ends.
+/// daemon by the start identity the daemon passed it, and says so on a thread of its own, so that a
+/// standard error nobody can write to does not hold it. The controls are the same stuck process
+/// while its daemon lives, which runs on, and an idle process that reads, which goes when its input
+/// ends.
 #[test]
 fn an_idle_process_stuck_inside_a_read_goes_when_its_daemon_dies() {
     for (child, what) in [
@@ -2026,6 +2028,14 @@ fn an_idle_process_stuck_inside_a_read_goes_when_its_daemon_dies() {
                 ..Script::default()
             },
             "stuck inside a read",
+        ),
+        (
+            Script {
+                wedge_input_after: Some(3),
+                hold_standard_error: true,
+                ..Script::default()
+            },
+            "stuck inside a read with its standard error held",
         ),
         (Script::default(), "reading"),
     ] {
