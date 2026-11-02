@@ -156,13 +156,7 @@ impl Process {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // A script that fills standard error leaves the pipe unread, as a daemon that never
-            // reads it does.
-            .stderr(if script.fill_standard_error {
-                Stdio::piped()
-            } else {
-                Stdio::inherit()
-            })
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("the stub starts");
         let input = child.stdin.take();

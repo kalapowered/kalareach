@@ -21,7 +21,8 @@ use kr_describe::serve::{
 };
 use kr_describe::supervise::STOP_BOUND_MS;
 use kr_describe::testing::{
-    Script, acknowledging_state, job_bounds, release_held_work, watchdog_found, watchdog_has_spared,
+    Script, acknowledging_state, job_bound_is_chosen, job_bounds, release_held_work,
+    watchdog_found, watchdog_has_spared,
 };
 use kr_describe::wire::{Answer, JobEnd, LoadEnd, Request, WIRE_VERSION, frame_of};
 use kr_protocol::ids::SessionEpoch;
@@ -516,7 +517,7 @@ fn a_process_ends_when_its_input_ends_even_inside_a_job() {
     );
     process.close_input();
     let status = process
-        .exit_within(Duration::from_secs(5))
+        .exit_within(SOON)
         .expect("the process ends when its input ends");
     assert_eq!(status.code(), Some(Exit::Ended.code()));
 }
@@ -596,16 +597,20 @@ fn a_process_whose_job_does_not_stop_ends_itself() {
     assert!(process.exit_within(Duration::from_millis(500)).is_none());
 }
 
-/// A process whose standard error nobody reads still ends itself when its job does not stop: the
-/// watchdog says why on a thread of its own and does not wait behind a write that has filled the
-/// pipe. The control is the process with its standard error read by whoever started it (above).
+/// A process whose standard error cannot be written to still ends itself when its job does not stop
+/// and when its control thread is stuck: the watchdog says why on a thread of its own and does not
+/// wait behind a write that has stopped for good. The script holds the lock on standard error from
+/// before the process serves, as a write waiting on a pipe nobody reads does, and the process says
+/// it holds it before the case sends anything. The control is the process with its standard error
+/// free, which ends the same way (above).
 #[test]
-fn a_process_whose_standard_error_is_full_still_ends_when_its_job_does_not_stop() {
+fn a_process_whose_standard_error_is_held_still_ends_when_it_must() {
     let placed = Placed::stub();
-    let runtime = placed.directory("full-standard-error");
+
+    let runtime = placed.directory("overdue");
     let script = Script {
         ignore_token_ms: 60_000,
-        fill_standard_error: true,
+        hold_standard_error: true,
         ..Script::default()
     };
     let mut process = Process::start(&placed, &script, &runtime);
@@ -617,6 +622,24 @@ fn a_process_whose_standard_error_is_full_still_ends_when_its_job_does_not_stop(
         .exit_within(SOON * 3)
         .expect("the process ends itself, though it cannot say why");
     assert_eq!(status.code(), Some(Exit::Overdue.code()));
+
+    let runtime = placed.directory("stuck");
+    let script = Script {
+        wedge_output_from: Some(1),
+        mark_start: true,
+        hold_standard_error: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    wait_until_started(&runtime);
+    process.send(&Request::Hello {
+        build: "kr-describe-tests/0".to_owned(),
+        wire: U64::new(WIRE_VERSION),
+    });
+    let status = process
+        .exit_within(SOON * 3)
+        .expect("the process ends itself, though it cannot say why");
+    assert_eq!(status.code(), Some(Exit::ControlStalled.code()));
 }
 
 /// KR-REQ-22.11: a job that is past its deadline and has been told to stop, with the stop read by
@@ -765,8 +788,9 @@ fn a_job_told_to_stop_is_cancelled_and_has_its_bound_before_the_acknowledgement_
 /// bound. The script holds the watchdog between its finding, which it records, and its decision;
 /// the case sends the stop once it has seen the record, reads the acknowledgement, which is written
 /// after the extension, and lets the watchdog go. The watchdog then leaves the process alone, and
-/// says so. No delay decides it. A watchdog that decides on the bound it read ends the process as
-/// overdue, with the stop it was told of read.
+/// the record it leaves says so; what the process does after that is the stop bound's. No delay
+/// decides it. A watchdog that decides on the bound it read ends the process as overdue, with the
+/// stop applied.
 #[test]
 fn a_stop_read_after_the_watchdog_found_the_job_overdue_is_not_missed() {
     let placed = Placed::stub();
@@ -794,12 +818,10 @@ fn a_stop_read_after_the_watchdog_found_the_job_overdue_is_not_missed() {
     wait_for("the watchdog to decide", || {
         watchdog_has_spared(&runtime) || process.exit_within(Duration::ZERO).is_some()
     });
-    assert_eq!(
-        process.exit_within(Duration::ZERO),
-        None,
-        "the process ended for a job whose stop was read before the watchdog decided"
+    assert!(
+        watchdog_has_spared(&runtime),
+        "the process ended for a job whose stop was applied before the watchdog decided"
     );
-    assert!(watchdog_has_spared(&runtime));
 }
 
 /// KR-REQ-22.11: a job whose stop the control thread read before the model thread took it in hand
@@ -841,6 +863,48 @@ fn a_job_cancelled_before_it_is_in_hand_is_held_to_the_stop_bound_from_the_start
         job_bounds(&runtime, 2),
         Some((GUIDE_STOP_BOUND_MS, GUIDE_STOP_BOUND_MS)),
         "the job is held to the stop bound as it comes into hand, in milliseconds past its deadline"
+    );
+}
+
+/// KR-REQ-22.11: a stop that arrives while a job is coming into hand, after the model thread has read
+/// the job's token and before it has set the job's bound, is not lost: the cancellation finds the job
+/// in hand and extends it, and the model thread's bound does not take the extension back. The script
+/// holds the model thread between the two; the case sends the stop once the process says it is
+/// there, reads the acknowledgement, which is written after the extension, and lets the model thread
+/// go. The bound the process holds the job to is then read back from the process: the stop bound.
+/// No delay decides it. A bound set in place of the extension, or a job put in hand after its bound,
+/// leaves the grace.
+#[test]
+fn a_stop_read_while_a_job_comes_into_hand_is_not_lost() {
+    let placed = Placed::stub();
+    let runtime = placed.directory("coming-into-hand");
+    let script = Script {
+        hold_job_start: true,
+        mark_work: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    process.expect_answer(SOON, "the load");
+    process.send(&generate(2, 1, 60_000));
+    wait_for("the model thread to read the job's token", || {
+        job_bound_is_chosen(&runtime, 2)
+    });
+    process.send(&Request::Cancel { id: U64::new(2) });
+    assert_eq!(
+        process.expect_answer(SOON, "the acknowledgement"),
+        Answer::Cancelling { id: U64::new(2) }
+    );
+    release_held_work(&runtime);
+    assert!(matches!(
+        process.expect_terminal(SOON, "the cancelled job"),
+        Answer::Ended { id, why: JobEnd::Cancelled, .. } if id.get() == 2
+    ));
+    assert_eq!(
+        job_bounds(&runtime, 2),
+        Some((GUIDE_STOP_BOUND_MS, GUIDE_STOP_BOUND_MS)),
+        "the job is held to the stop bound, in milliseconds past its deadline"
     );
 }
 
