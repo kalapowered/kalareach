@@ -1197,13 +1197,7 @@ pub(crate) fn open_unrecorded_root(
     };
     #[cfg(not(all(test, unix)))]
     let opened = open_directory(path);
-    let handle = opened.map_err(|error| ProjectError::Destination {
-        detail: format!(
-            "{} could not be opened: {error}",
-            crate::git::redact(&path.display().to_string())
-        )
-        .into(),
-    })?;
+    let handle = opened.map_err(|error| crate::boundary::unopenable(path, &error))?;
     Ok(AuthorisedDirectory::from_handle(
         environment_id,
         handle,

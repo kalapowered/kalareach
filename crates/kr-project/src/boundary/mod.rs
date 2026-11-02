@@ -249,7 +249,17 @@ impl Reach {
 /// place, so the refusal is a fault that passes, which a client sends the request again after.
 /// Any other failure is the caller's argument.
 pub(crate) fn unopenable(path: &Path, error: &std::io::Error) -> ProjectError {
-    let detail = crate::git::redact(&format!("{} could not be opened: {error}", path.display()));
+    refused_by(
+        error,
+        format!("{} could not be opened: {error}", path.display()),
+    )
+}
+
+/// The refusal for a failure to open or to resolve a directory, in `detail`: a fault that passes
+/// when the host was too short of descriptors, processes or memory, and the caller's argument
+/// otherwise.
+fn refused_by(error: &std::io::Error, detail: String) -> ProjectError {
+    let detail = crate::git::redact(&detail);
     if crate::git::short_of_resources(error) {
         ProjectError::GitFailed {
             detail: detail.into(),
@@ -343,13 +353,13 @@ impl OpenedDirectory {
             if nothing(&error) {
                 return gone();
             }
-            ProjectError::Destination {
-                detail: format!(
+            refused_by(
+                &error,
+                format!(
                     "{} could not be resolved to a directory this invocation may use: {error}",
-                    crate::git::redact(&path.display().to_string())
-                )
-                .into(),
-            }
+                    path.display()
+                ),
+            )
         })?;
         let created_at_ms = created_at_ms(directory.handle());
         Ok(Self {
@@ -394,17 +404,23 @@ impl OpenedDirectory {
     pub fn confirm_path(&self) -> Result<()> {
         // A name that no longer opens at all is the same answer as a name that opens on something
         // else, and it is said the same way rather than as whatever the open failed with.
-        let opened = crate::identity::open_directory(&self.path).map_err(|_| ());
-        let Ok(now) = opened.and_then(|handle| {
-            AuthorisedDirectory::from_handle(self.environment_id, handle, self.path.clone())
-                .map_err(|_| ())
-        }) else {
-            return Err(ProjectError::IdentityChanged {
-                detail: "the directory this invocation ran in could not be confirmed to be the \
-                         object it was started against, so what it produced is not served"
-                    .to_owned()
-                    .into(),
-            });
+        let unconfirmed = || ProjectError::IdentityChanged {
+            detail: "the directory this invocation ran in could not be confirmed to be the \
+                     object it was started against, so what it produced is not served"
+                .to_owned()
+                .into(),
+        };
+        let now = match crate::identity::open_directory(&self.path) {
+            Ok(handle) => {
+                AuthorisedDirectory::from_handle(self.environment_id, handle, self.path.clone())
+                    .map_err(|_| unconfirmed())?
+            }
+            // A host too short of descriptors, processes or memory to open the directory has said
+            // nothing of it, so it is not a directory that changed.
+            Err(error) if crate::git::short_of_resources(&error) => {
+                return Err(unopenable(&self.path, &error));
+            }
+            Err(_) => return Err(unconfirmed()),
         };
         if now.identity() != self.identity || created_at_ms(now.handle()) != self.created_at_ms {
             return Err(ProjectError::IdentityChanged {
