@@ -208,7 +208,7 @@ fn only_a_runtime_that_is_not_there_is_a_reason_to_skip() {
     );
 
     // One that does not answer is a stall, ended at the bound it was given, and fails the case.
-    let stalled = runtime_that("stalled", "exec sleep 30");
+    let stalled = runtime_that("stalled", "echo $$ > \"$0.pid\"; exec sleep 120");
     let failed = std::panic::catch_unwind(|| {
         available_within(
             &stalled,
@@ -222,6 +222,22 @@ fn only_a_runtime_that_is_not_there_is_a_reason_to_skip() {
         said.contains("`--version` did not end within 2s"),
         "the call is named with the bound it was given: {said}"
     );
+    // And it does not outlast the case: a runtime left running is left on a machine others share.
+    let pid = std::fs::read_to_string(format!("{stalled}.pid"))
+        .expect("the stand-in wrote its process number")
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .expect("a process number");
+    let begun = Instant::now();
+    while rustix::process::test_kill_process(pid).is_ok() {
+        assert!(
+            begun.elapsed() < Duration::from_secs(10),
+            "the runtime that did not answer is still running"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn read_exact(source: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<()> {
