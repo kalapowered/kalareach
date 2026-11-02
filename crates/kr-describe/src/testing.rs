@@ -71,9 +71,9 @@ pub const SENT_DEADLINE_PREFIX: &str = "stub-sent-deadline-";
 pub const JOB_BOUNDS_PREFIX: &str = "stub-job-bounds-";
 
 /// The start of the name of the file a stub whose script marks work leaves in its runtime
-/// directory when its model thread has read the token of the job with an identifier and is about
-/// to set the job's bound, followed by that identifier. It holds whether the job was in hand when
-/// the token was read, in the form [`job_in_hand_at_the_read`] reads.
+/// directory when its model thread reads the token of the job with an identifier, followed by that
+/// identifier. It holds whether the job was in hand when the token was read, in the form
+/// [`job_in_hand_at_the_read`] reads.
 pub const JOB_BOUND_CHOSEN_PREFIX: &str = "stub-job-bound-chosen-";
 
 /// The name of the file a stub whose script marks work leaves in its runtime directory each time
@@ -130,9 +130,6 @@ pub fn job_bounds(runtime_dir: &Path, id: u64) -> Option<(u64, u64)> {
 /// of a cancellation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Acknowledging {
-    /// Whether the work's token was cancelled when the control thread looked for the job in hand,
-    /// which it does after cancelling it: a look made before the cancellation shows it not.
-    pub cancelled: bool,
     /// When the watchdog holds the work overdue, in the process's stamps (milliseconds since its
     /// origin, plus one).
     pub work_due: u64,
@@ -145,12 +142,42 @@ pub struct Acknowledging {
 /// Records what the control thread had done as it begins to write the acknowledgement of the
 /// cancellation of the work with this identifier, when the process is a stub whose script marks
 /// work.
-pub(crate) fn acknowledging(id: u64, cancelled: bool, work_due: u64, job_stop_due: u64) {
+pub(crate) fn acknowledging(id: u64, work_due: u64, job_stop_due: u64) {
     if let Some(directory) = RECORDS_DIRECTORY.get() {
         let _ = std::fs::write(
             directory.join(format!("{ACKNOWLEDGING_PREFIX}{id}")),
-            format!("{} {work_due} {job_stop_due}", u8::from(cancelled)),
+            format!("{work_due} {job_stop_due}"),
         );
+    }
+}
+
+/// The start of the name of the file a stub whose script marks work leaves in its runtime
+/// directory as its control thread looks for the job in hand when it cancels the work with an
+/// identifier, followed by that identifier. It holds whether the work's token was cancelled at the
+/// look, in the form [`token_cancelled_at_the_look`] reads.
+pub const LOOKED_PREFIX: &str = "stub-looked-";
+
+/// Records whether the token of the work with this identifier was cancelled as the control thread
+/// looked for the job in hand, when the process is a stub whose script marks work.
+pub(crate) fn looked_for_the_job(id: u64, cancelled: bool) {
+    if let Some(directory) = RECORDS_DIRECTORY.get() {
+        let _ = std::fs::write(
+            directory.join(format!("{LOOKED_PREFIX}{id}")),
+            if cancelled { "1" } else { "0" },
+        );
+    }
+}
+
+/// Returns whether the token of the work with this identifier was cancelled when the control
+/// thread of the stub process with `runtime_dir` as its runtime directory looked for the job in
+/// hand, which it does after cancelling it: a look made before the cancellation shows it not.
+#[must_use]
+pub fn token_cancelled_at_the_look(runtime_dir: &Path, id: u64) -> Option<bool> {
+    let text = std::fs::read_to_string(runtime_dir.join(format!("{LOOKED_PREFIX}{id}"))).ok()?;
+    match text.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
     }
 }
 
@@ -163,7 +190,6 @@ pub fn acknowledging_state(runtime_dir: &Path, id: u64) -> Option<Acknowledging>
         std::fs::read_to_string(runtime_dir.join(format!("{ACKNOWLEDGING_PREFIX}{id}"))).ok()?;
     let mut parts = text.split_whitespace();
     Some(Acknowledging {
-        cancelled: parts.next()? == "1",
         work_due: parts.next()?.parse().ok()?,
         job_stop_due: parts.next()?.parse().ok()?,
     })
@@ -205,26 +231,29 @@ pub(crate) fn watchdog_spared() {
     }
 }
 
-/// Records that the model thread has read the token of the job with this identifier and is about
-/// to set the job's bound, and whether the job was in hand when it read the token, when the
-/// process is a stub whose script marks work, and holds it there when the script holds job starts,
-/// until [`release_held_work`].
-pub(crate) fn job_bound_chosen(id: u64, in_hand_at_the_read: bool) {
-    let Some(directory) = RECORDS_DIRECTORY.get() else {
-        return;
-    };
-    let _ = std::fs::write(
-        directory.join(format!("{JOB_BOUND_CHOSEN_PREFIX}{id}")),
-        if in_hand_at_the_read { "1" } else { "0" },
-    );
-    if HOLD_JOB_START.load(std::sync::atomic::Ordering::Acquire) {
+/// Records whether the job with this identifier was in hand as the model thread read its token,
+/// when the process is a stub whose script marks work.
+pub(crate) fn job_token_read(id: u64, in_hand: bool) {
+    if let Some(directory) = RECORDS_DIRECTORY.get() {
+        let _ = std::fs::write(
+            directory.join(format!("{JOB_BOUND_CHOSEN_PREFIX}{id}")),
+            if in_hand { "1" } else { "0" },
+        );
+    }
+}
+
+/// Holds the model thread between its read of a job's token and its setting of the job's bound
+/// when the process is a stub whose script holds job starts, until [`release_held_work`].
+pub(crate) fn job_bound_chosen(_id: u64) {
+    if let Some(directory) = RECORDS_DIRECTORY.get()
+        && HOLD_JOB_START.load(std::sync::atomic::Ordering::Acquire)
+    {
         hold_until_released(directory);
     }
 }
 
 /// Returns whether the job with this identifier was in hand when the model thread of the stub
-/// process with `runtime_dir` as its runtime directory read the job's token, once it has read it
-/// and is at the point where it sets the job's bound.
+/// process with `runtime_dir` as its runtime directory read the job's token, once it has read it.
 #[must_use]
 pub fn job_in_hand_at_the_read(runtime_dir: &Path, id: u64) -> Option<bool> {
     let text =

@@ -22,14 +22,16 @@ use kr_describe::serve::{
 use kr_describe::supervise::STOP_BOUND_MS;
 use kr_describe::testing::{
     Script, acknowledging_state, job_bounds, job_in_hand_at_the_read, release_held_work,
-    watchdog_found, watchdog_has_spared,
+    token_cancelled_at_the_look, watchdog_found, watchdog_has_spared,
 };
 use kr_describe::wire::{Answer, JobEnd, LoadEnd, Request, WIRE_VERSION, frame_of};
 use kr_protocol::ids::SessionEpoch;
 use kr_protocol::scalars::U64;
 use kr_worker::privacy::PrivacyGeneration;
 
-use stub::{Placed, Process, generate, load, wait_for, wait_until_began, wait_until_started};
+use stub::{
+    Placed, Process, began, generate, load, wait_for, wait_until_began, wait_until_started,
+};
 use support::{binding, default_profile};
 
 const SOON: Duration = Duration::from_secs(10);
@@ -743,12 +745,12 @@ fn a_job_told_to_stop_that_never_returns_ends_the_process_at_the_stop_bound() {
 /// the job's bound without a lock, so a write ahead of the extension would carry the watchdog past
 /// the grace before the job had its extension and the process would end as overdue. The process
 /// records what its control thread had done as the write begins, in the function that writes, and
-/// the case reads that back once the acknowledgement has arrived: the job's token cancelled when
-/// the control thread looked for the job in hand, and the bound the watchdog holds the job to the
-/// stop bound that was set as the job began, and not the grace. No delay decides it, and the job's
-/// deadline is far off. Written first, the acknowledgement shows a token not yet cancelled and the
-/// grace; a look made before the cancellation shows a token not yet cancelled; extending by more
-/// than the stop bound shows a bound past it.
+/// what the token showed as the control thread looked for the job in hand, and the case reads both
+/// back once the acknowledgement has arrived: the token cancelled at the look, and the bound the
+/// watchdog holds the job to the stop bound that was set as the job began, and not the grace. No
+/// delay decides it, and the job's deadline is far off. Written first, the acknowledgement shows
+/// the grace; a look made before the cancellation shows a token not yet cancelled; extending by
+/// more than the stop bound shows a bound past it.
 #[test]
 fn a_job_told_to_stop_is_cancelled_and_has_its_bound_before_the_acknowledgement_is_written() {
     let placed = Placed::stub();
@@ -769,8 +771,12 @@ fn a_job_told_to_stop_is_cancelled_and_has_its_bound_before_the_acknowledgement_
         process.expect_answer(SOON, "the acknowledgement"),
         Answer::Cancelling { id: U64::new(2) }
     );
+    assert_eq!(
+        token_cancelled_at_the_look(&runtime, 2),
+        Some(true),
+        "the job is looked for after its token is cancelled"
+    );
     let before_the_write = acknowledging_state(&runtime, 2).expect("the control thread's record");
-    assert!(before_the_write.cancelled, "{before_the_write:?}");
     assert_ne!(before_the_write.job_stop_due, 0, "{before_the_write:?}");
     assert_eq!(
         before_the_write.work_due, before_the_write.job_stop_due,
@@ -792,7 +798,7 @@ fn a_job_told_to_stop_is_cancelled_and_has_its_bound_before_the_acknowledgement_
 /// decides it. A watchdog that decides on the bound it read ends the process as overdue, with the
 /// stop applied.
 #[test]
-fn a_stop_read_after_the_watchdog_found_the_job_overdue_is_not_missed() {
+fn a_stop_applied_after_the_watchdog_found_the_job_overdue_is_not_missed() {
     let placed = Placed::stub();
     let runtime = placed.directory("held-watchdog");
     let script = Script {
@@ -821,6 +827,63 @@ fn a_stop_read_after_the_watchdog_found_the_job_overdue_is_not_missed() {
     assert!(
         watchdog_has_spared(&runtime),
         "the process ended for a job whose stop was applied before the watchdog decided"
+    );
+}
+
+/// KR-REQ-22.11: a job that ends after the watchdog has found it overdue, and before the watchdog
+/// has decided to end the process, leaves the process alone: the bound the watchdog found is gone,
+/// and the process is idle. The script holds the watchdog between its finding, which it records,
+/// and its decision; the job outlasts its deadline and the grace by [`SOON`] and answers, and a
+/// check of a file that the process refuses is answered after it, which shows the model thread has
+/// cleared the job's bound; then the case lets the watchdog go and reads its record that it left
+/// the process alone. The wait for the job's answer allows the time the job takes, so a host that
+/// is late by less than [`SOON`] does not fail it. A watchdog that ends the process unless the
+/// bound has moved later ends the idle process as overdue.
+#[test]
+fn a_job_that_ends_after_the_watchdog_found_it_overdue_does_not_end_the_process() {
+    let placed = Placed::stub();
+    let runtime = placed.directory("job-ends-while-held");
+    let script = Script {
+        ignore_token_ms: 200 + OVERDUE_GRACE_MS + SOON.as_secs() * 1_000,
+        mark_work: true,
+        hold_watchdog: true,
+        ..Script::default()
+    };
+    let mut process = Process::start(&placed, &script, &runtime);
+    process.hello();
+    process.send(&load(1, &default_profile(), 300_000));
+    process.expect_answer(SOON, "the load");
+    process.send(&generate(2, 1, 200));
+    wait_for("the watchdog to find the job overdue", || {
+        watchdog_found(&runtime).is_some()
+    });
+    let answer = process.expect_answer(SOON * 2, "the job's answer");
+    assert!(
+        matches!(
+            answer,
+            Answer::Produced { id, .. } | Answer::Ended { id, .. } if id.get() == 2
+        ),
+        "{answer:?}"
+    );
+    process.send(&Request::Verify {
+        id: U64::new(3),
+        profile_id: "a-profile-nobody-signed".to_owned(),
+        revision: U64::new(1),
+        file_name: "nothing.gguf".to_owned(),
+        path: "/nowhere/nothing.gguf".to_owned(),
+        deadline_ms: U64::new(60_000),
+    });
+    assert!(matches!(
+        process.expect_answer(SOON, "the check's answer"),
+        Answer::Verified { id, .. } if id.get() == 3
+    ));
+    release_held_work(&runtime);
+    wait_for("the watchdog to decide", || {
+        watchdog_has_spared(&runtime) || process.exit_within(Duration::ZERO).is_some()
+    });
+    assert!(
+        watchdog_has_spared(&runtime),
+        "the process ended after the job it was found overdue for had ended"
     );
 }
 
@@ -859,6 +922,10 @@ fn a_job_cancelled_before_it_is_in_hand_is_held_to_the_stop_bound_from_the_start
         process.expect_terminal(SOON, "the cancelled job"),
         Answer::Ended { id, why: JobEnd::Cancelled, .. } if id.get() == 2
     ));
+    assert!(
+        !began(&runtime, "job"),
+        "the cancelled job is answered without being run"
+    );
     assert_eq!(
         job_bounds(&runtime, 2),
         Some((GUIDE_STOP_BOUND_MS, GUIDE_STOP_BOUND_MS)),
@@ -905,6 +972,10 @@ fn a_stop_read_while_a_job_comes_into_hand_is_not_lost() {
         job_in_hand_at_the_read(&runtime, 2),
         Some(true),
         "the job is in hand before its token is read"
+    );
+    assert!(
+        !began(&runtime, "job"),
+        "the cancelled job is answered without being run"
     );
     assert_eq!(
         job_bounds(&runtime, 2),

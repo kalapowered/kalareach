@@ -599,40 +599,32 @@ impl Shared {
             return;
         };
         token.cancel();
-        // What the token shows as the look is made, for a test to read back: a look made before the
-        // cancellation shows it not made.
-        #[cfg(feature = "testing")]
-        let cancelled_at_the_look = token.is_cancelled();
         // A job whose stop has been read is not stuck, and is given the stop bound after its
         // deadline to reach a place where the model can stop, where other work is overdue at the
         // grace. The lock held here is the one the model thread takes to forget the job before it
         // answers, so the job is still in hand and the model thread sets the bound back to nought
         // after this.
-        if id.get() != 0 && self.job_in_hand.load(Ordering::Acquire) == id.get() {
+        let in_hand = {
+            // What the token shows as the look is made, for a test to read back: a look made before
+            // the cancellation shows it not made.
+            #[cfg(feature = "testing")]
+            crate::testing::looked_for_the_job(id.get(), token.is_cancelled());
+            id.get() != 0 && self.job_in_hand.load(Ordering::Acquire) == id.get()
+        };
+        if in_hand {
             self.work_due
                 .fetch_max(self.job_stop_due.load(Ordering::Acquire), Ordering::AcqRel);
         }
-        self.acknowledge(
-            &tokens,
-            id,
-            #[cfg(feature = "testing")]
-            cancelled_at_the_look,
-        );
+        self.acknowledge(&tokens, id);
     }
 
     /// Writes the acknowledgement of a cancellation, with `held` the guard of the lock it is
-    /// written under. What a test reads of the cancellation is recorded as the write begins, so it
-    /// shows the state the write is made in and no other.
-    fn acknowledge(
-        &self,
-        _held: &std::sync::MutexGuard<'_, BTreeMap<u64, Cancellation>>,
-        id: U64,
-        #[cfg(feature = "testing")] cancelled_at_the_look: bool,
-    ) {
+    /// written under. What a test reads of the bounds is recorded as the write begins, so it shows
+    /// the state the write is made in and no other.
+    fn acknowledge(&self, _held: &std::sync::MutexGuard<'_, BTreeMap<u64, Cancellation>>, id: U64) {
         #[cfg(feature = "testing")]
         crate::testing::acknowledging(
             id.get(),
-            cancelled_at_the_look,
             self.work_due.load(Ordering::Acquire),
             self.job_stop_due.load(Ordering::Acquire),
         );
@@ -806,22 +798,24 @@ fn model_thread<M: Model>(
                 // the job in hand and finds it, or takes it before, and this thread reads the token
                 // cancelled: one of the two gives the job the stop bound.
                 shared.job_in_hand.store(id, Ordering::Release);
-                // Whether the job is in hand as the token is read, for a test to read back.
-                #[cfg(feature = "testing")]
-                let in_hand_at_the_read = shared.job_in_hand.load(Ordering::Acquire) == id;
                 // A job found cancelled is given the stop bound at once, as one whose stop is read
                 // after it is in hand. The bound is set in one step, so the watchdog is never
                 // shown the grace over a job that is cancelled, which a write of the
                 // acknowledgement that outlasted it would carry the process past: this thread
                 // waits for that write's lock to forget the job. `fetch_max`, since a
                 // cancellation that finds the job in hand may have extended the bound already.
-                let bound = if token.is_cancelled() {
-                    stop_due
-                } else {
-                    grace_due
+                let cancelled = {
+                    // Whether the job is in hand as the token is read, for a test to read back.
+                    #[cfg(feature = "testing")]
+                    crate::testing::job_token_read(
+                        id,
+                        shared.job_in_hand.load(Ordering::Acquire) == id,
+                    );
+                    token.is_cancelled()
                 };
+                let bound = if cancelled { stop_due } else { grace_due };
                 #[cfg(feature = "testing")]
-                crate::testing::job_bound_chosen(id, in_hand_at_the_read);
+                crate::testing::job_bound_chosen(id);
                 shared.work_due.fetch_max(bound, Ordering::AcqRel);
                 // The bound the watchdog holds the job to as it comes into hand, and the stop
                 // bound, for a test to read back.
