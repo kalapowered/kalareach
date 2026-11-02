@@ -3605,9 +3605,8 @@ impl Container {
     /// A removal can be asked again, and a loaded machine's runtime can take longer than one call
     /// is given, so a call that gave no answer is asked again until the time a slow call is given
     /// has passed, each call given no more than what is left. A refusal is not asked again: it
-    /// would be refused again. The first call is always made, and is given no more than the whole
-    /// time a slow call is given: a machine that stood still after that time was set has not used
-    /// any of it up.
+    /// would be refused again. The first call is always made and is given the whole time a slow
+    /// call is given, whatever has gone by since that time was set.
     fn remove(&self) -> Result<(), String> {
         let until = Instant::now() + self.runtime.slow;
         let mut last: String;
@@ -3852,9 +3851,39 @@ fn a_removal_call_is_given_no_more_than_what_is_left_of_the_time_for_removals() 
         .expect_err("a removal that never ends is an error and not a panic");
     assert!(why.contains("\"rm\""), "the call is named: {why}");
     assert!(
-        !why.contains("within 30s"),
-        "the call was given a whole call's time and not what was left: {why}"
+        why.contains("within 3s"),
+        "the call was given the time for removals and no more: {why}"
     );
+    // Asking again would fail this case for what it was written to show.
+    std::mem::forget(container);
+}
+
+/// A call after the first is given no more than what is left of the time for removals. A call is
+/// given two seconds here and the time for removals is three, so a second call, begun with less than
+/// a second left, cannot be told it has two. A machine that stood still through the first call
+/// leaves no time for a second, and then there is nothing to read.
+#[test]
+fn a_later_removal_call_is_given_no_more_than_what_is_left_of_the_time_for_removals() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let container = held_in(Runtime {
+        quick: Duration::from_secs(2),
+        slow: Duration::from_secs(3),
+        ..stand_in_runtime(directory.path(), &["rm"], &[])
+    });
+    let why = container
+        .remove()
+        .expect_err("a removal that never ends is an error and not a panic");
+    assert!(why.contains("\"rm\""), "the call is named: {why}");
+    let asked = recorded_calls(directory.path())
+        .iter()
+        .filter(|call| call.starts_with("rm "))
+        .count();
+    if asked >= 2 {
+        assert!(
+            !why.contains("within 2s"),
+            "the last call was given a whole call's time and not what was left: {why}"
+        );
+    }
     // Asking again would fail this case for what it was written to show.
     std::mem::forget(container);
 }

@@ -253,9 +253,8 @@ impl Container {
     /// Removes the container, or says why it could not. A removal can be asked again and a loaded
     /// machine's runtime can take longer than one call is given, so a call that gave no answer is
     /// asked again until [`REMOVAL_WITHIN`] has passed, each call given no more than what is left;
-    /// a refusal is not asked again. The first call is always made, and is given no more than the
-    /// whole time for removals: a machine that stood still after that time was set has not used any
-    /// of it up.
+    /// a refusal is not asked again. The first call is always made and is given the whole time for
+    /// removals, whatever has gone by since that time was set.
     fn remove(&self) -> Result<(), String> {
         self.remove_telling(&mut std::io::stderr())
     }
@@ -630,8 +629,8 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
 #[test]
 fn a_removal_that_never_answers_is_reported_with_the_call_named() {
     let directory = tempfile::tempdir().expect("a directory");
-    // A call is given far more than the time for removals, so that the call that is begun with what
-    // is left of that time shows in the bound it is told it had.
+    // A call is given far more than the time for removals, so that a call given more than that time
+    // shows in the bound it is told it had.
     let container = held_in(Runtime {
         quick: Duration::from_secs(30),
         removal: Duration::from_secs(3),
@@ -645,10 +644,10 @@ fn a_removal_that_never_answers_is_reported_with_the_call_named() {
         why.contains(" rm did not end within"),
         "the call is named: {why}"
     );
-    // The call was given what is left of the time for removals, which is less than a whole call.
+    // The first call was given the whole time for removals, which is less than a whole call.
     assert!(
-        !why.contains("within 30 seconds"),
-        "the call was given a whole call's time: {why}"
+        why.contains("within 3 seconds"),
+        "the call was given the time for removals and no more: {why}"
     );
     let told = String::from_utf8_lossy(&told);
     assert!(
@@ -657,6 +656,36 @@ fn a_removal_that_never_answers_is_reported_with_the_call_named() {
     );
     // The runtime answers no removal, and the guard would ask again for as long as it is given and
     // fail this case for what it was written to show.
+    std::mem::forget(container);
+}
+
+/// A call after the first is given no more than what is left of the time for removals. A call is
+/// given two seconds here and the time for removals is three, so a second call, begun with less than
+/// a second left, cannot be told it has two. A machine that stood still through the first call
+/// leaves no time for a second, and then there is nothing to read.
+#[test]
+fn a_later_removal_call_is_given_no_more_than_what_is_left_of_the_time_for_removals() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let container = held_in(Runtime {
+        quick: Duration::from_secs(2),
+        removal: Duration::from_secs(3),
+        ..a_runtime_that(directory.path(), "case \"$1\" in rm) exec sleep 40 ;; esac")
+    });
+    let why = container
+        .remove_telling(&mut std::io::sink())
+        .expect_err("a removal that never ends is an error and not a panic");
+    assert!(
+        why.contains(" rm did not end within"),
+        "the call is named: {why}"
+    );
+    if removals(directory.path()).len() >= 2 {
+        assert!(
+            !why.contains("within 2 seconds"),
+            "the last call was given a whole call's time and not what was left: {why}"
+        );
+    }
+    // The runtime answers no removal, and the guard would ask again and fail this case for what it
+    // was written to show.
     std::mem::forget(container);
 }
 
