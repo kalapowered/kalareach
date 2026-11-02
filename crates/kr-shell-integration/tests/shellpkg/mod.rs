@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -45,12 +46,35 @@ use kr_shell_integration::contract::transport::{
 };
 use kr_shell_integration::host::{handshake, startup};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
-/// How long a reader is given to answer before a test calls it a failure.
+/// How long a wait for the shell, or for a reader's answer, goes on before a test gives up on it.
 ///
-/// Generous: these tests share a machine with compilation, and a reader that answers late is a
-/// different failure from one that does not answer.
-pub const REPLY: Duration = Duration::from_secs(20);
+/// The waits it bounds end when the thing they wait for happens, or sooner when it cannot: a shell
+/// that has ended without connecting, or an endpoint whose stream has ended, fails the wait at
+/// once. So the bound is reached only by a shell that is running and says nothing, and a runner
+/// that is slow to start a shell only makes the wait longer. It is far beyond what a loaded
+/// machine has taken: a shell started at background priority on a machine with its processors
+/// busy took more than twenty seconds to connect, where an idle machine takes a second or two.
+pub const REPLY: Duration = Duration::from_secs(240);
+
+/// Waits until the system says `stream` can be read or written, as `flags` ask, or until `within`
+/// has passed, whichever is first.
+///
+/// This is the wait for a reply, and it is not a sleep that asks again. The system holds a
+/// process that runs at background priority to a coarse timer, so that a sleep of two milliseconds
+/// takes a hundred, and a loop that sleeps between reads answers a reader that waits a second for
+/// its answer late by a measure that says nothing about the code under test. A wait on the
+/// stream's readiness returns when the data arrives. A wait that the system cut short, or ended
+/// for a signal, is asked again by the loop around it.
+fn wait_until_ready(stream: &impl AsFd, flags: PollFlags, within: Duration) {
+    let timeout = Timespec {
+        tv_sec: i64::try_from(within.as_secs()).unwrap_or(i64::MAX),
+        tv_nsec: within.subsec_nanos().into(),
+    };
+    let mut watched = [PollFd::new(stream, flags)];
+    let _ = poll(&mut watched, Some(&timeout));
+}
 
 /// How long the step given to an editor that only reaches its queue when the reader steps lasts.
 pub const STEP: Duration = Duration::from_millis(60);
@@ -1048,7 +1072,7 @@ impl Session {
             command.env(name, value);
         }
 
-        let child = pty
+        let mut child = pty
             .slave
             .spawn_command(command)
             .expect("the packaged shell starts");
@@ -1089,11 +1113,20 @@ impl Session {
         // A shell that is not managed connects to nothing. The stream a session reads is then one
         // whose other end this session holds and never writes to, so a read finds nothing.
         let (stream, bridge_peer) = if managed {
-            (
-                accept_within(&listener, REPLY)
-                    .expect("the shell connects to the endpoint it was given"),
-                None,
-            )
+            let connected =
+                accept_unless(&listener, REPLY, || matches!(child.try_wait(), Ok(Some(_))));
+            let Some(stream) = connected else {
+                let state = match child.try_wait() {
+                    Ok(Some(status)) => format!("it ended with {status:?}"),
+                    _ => format!("it was still running after {REPLY:?}"),
+                };
+                panic!(
+                    "the shell did not connect to the endpoint it was given: {state}; the terminal \
+                     showed:\n{}",
+                    String::from_utf8_lossy(&output.lock().expect("the output lock"))
+                );
+            };
+            (stream, None)
         } else {
             let (ours, theirs) = UnixStream::pair().expect("a stream that connects to nothing");
             (ours, Some(theirs))
@@ -1362,7 +1395,7 @@ impl Session {
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     let left = deadline.saturating_duration_since(Instant::now());
                     assert!(!left.is_zero(), "the bridge stopped reading");
-                    std::thread::sleep(left.min(Duration::from_millis(2)));
+                    wait_until_ready(&self.stream, PollFlags::OUT, left);
                 }
                 Err(error)
                     if matches!(
@@ -1422,10 +1455,11 @@ impl Session {
                 Ok(0) => self.peer_read_gone = true,
                 Ok(taken) => self.pending.extend_from_slice(&buffer[..taken]),
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
                         return None;
                     }
-                    std::thread::sleep(Duration::from_millis(2));
+                    wait_until_ready(&self.stream, PollFlags::IN, left);
                 }
                 Err(error)
                     if matches!(
@@ -1463,7 +1497,9 @@ impl Session {
             let Some(frame) = self.read_frame(left.min(Duration::from_millis(20))) else {
                 if self.peer_read_gone && self.pending.len() < 4 {
                     // Nothing more is coming and nothing whole is left to decode, so waiting out
-                    // the rest of this call would be waiting for a stream that has ended.
+                    // the rest of this call would be waiting for a stream that has ended. A caller
+                    // that goes on waiting for the terminal does not spin while it does.
+                    std::thread::sleep(left.min(Duration::from_millis(20)));
                     return;
                 }
                 if self.shut {
@@ -1698,7 +1734,8 @@ impl Session {
     ///
     /// # Panics
     ///
-    /// Panics when no such event arrives inside [`REPLY`].
+    /// Panics when no such event arrives inside [`REPLY`], or sooner when the stream it would come
+    /// on has ended and what it held has been taken.
     pub fn expect_event<F>(&mut self, what: &str, accept: F) -> (RequestId, BridgeEvent)
     where
         F: Fn(&BridgeEvent) -> bool,
@@ -1709,13 +1746,24 @@ impl Session {
                 return (received.id, received.event);
             }
             assert!(
-                !deadline.passed(),
-                "no {what} arrived; the events were {:?}\nterminal output:\n{}",
+                !deadline.passed() && !self.nothing_more_is_coming(),
+                "no {what} arrived{}; the events were {:?}\nterminal output:\n{}",
+                if deadline.passed() {
+                    ""
+                } else {
+                    " and the stream has ended"
+                },
                 self.events.waiting(),
                 self.terminal_output()
             );
             self.pump(Duration::from_millis(50));
         }
+    }
+
+    /// Whether the stream the bridge's frames come on has ended with no whole frame left in it, so
+    /// that a wait for one is a wait for something that cannot arrive.
+    fn nothing_more_is_coming(&self) -> bool {
+        self.shut || (self.peer_read_gone && self.whole_frame_len().is_none())
     }
 
     /// Returns true when an event the predicate accepts arrived inside `within`.
@@ -2618,15 +2666,37 @@ fn find(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn accept_within(listener: &UnixListener, within: Duration) -> Option<UnixStream> {
+    accept_unless(listener, within, || false)
+}
+
+/// Accepts the connection the shell makes to `listener`, waiting for it until `within` has passed
+/// or `gone` says that no connection is coming.
+///
+/// The wait is for the listener to become readable, which it does when the shell connects. A shell
+/// that has ended without connecting is not coming, and a connection it made just before it ended
+/// is still in the listener's queue, so the queue is asked once more before the wait is given up.
+fn accept_unless(
+    listener: &UnixListener,
+    within: Duration,
+    mut gone: impl FnMut() -> bool,
+) -> Option<UnixStream> {
     let deadline = Instant::now() + within;
     loop {
         match listener.accept() {
             Ok((stream, _)) => return Some(stream),
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
                     return None;
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                if gone() {
+                    return listener.accept().ok().map(|(stream, _)| stream);
+                }
+                wait_until_ready(
+                    listener,
+                    PollFlags::IN,
+                    left.min(Duration::from_millis(500)),
+                );
             }
             Err(error) => panic!("accepting the bridge: {error}"),
         }

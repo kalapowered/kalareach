@@ -51,5 +51,11 @@ portable-pty.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
+# The package tests wait on the bridge's endpoint for the system to say it is ready rather than
+# sleeping and asking again, so that the time a reply takes does not depend on a timer the system
+# may delay.
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true, features = ["event"] }
+
 [lints]
 workspace = true
