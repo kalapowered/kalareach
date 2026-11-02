@@ -721,7 +721,7 @@ fn a_slow_list_does_not_take_the_time_given_for_the_questions_about_units_with_n
             .iter()
             .any(|what| what.contains("used up before it was asked"));
         if list_gave_out || question_gave_out || never_begun {
-            eprintln!("run {run} of {RUNS} shows nothing, the machine was too slow: {left:?}");
+            eprintln!("run {run} of {RUNS} shows nothing about the allowance: {left:?}");
             continue;
         }
         assert!(
