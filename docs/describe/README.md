@@ -299,18 +299,19 @@ the system does not hold is reported as not applied, with the reason.
     arrived. The process holds one job at a time, so a stop that takes the whole bound delays
     the next job of every session by as much. The process's own watchdog gives a job whose stop
     it has read, a caller's cancellation included, 30 seconds after the deadline on its own
-    clock, where other work is overdue two seconds after its deadline. A job cancelled before
-    the process takes it in hand has that bound from the start, and the watchdog ends the
-    process on a bound only as it stands when it decides, so a stop read before the decision is
-    never missed; one read after the watchdog has decided to end the process comes too late.
-    The job answers as past its deadline, the model stays loaded, and no new load follows. A
-    process whose control thread has read neither the request nor a cancellation of the job is
-    ended two seconds after the request, or two seconds after an earlier cancellation if that is
-    sooner, and one that has read either and has not answered by the bound is ended then; each
-    is a failure of inference. A cancellation of the job sent after the control thread has
-    read the request to stop it is held to the same bound, and not to the two seconds a
-    cancellation is given: that control thread has shown that it listens. The bound is about
-    twice the longest stop seen, so a host busier than that one brings a stop to the bound.
+    clock, where other work is overdue two seconds after its deadline. The job answers as past
+    its deadline, the model stays loaded, and no new load follows. A job cancelled before the
+    process takes it in hand has that bound from the start. The watchdog ends the process on a
+    bound only if it still stands as the watchdog found it, so a stop that has given the job its
+    bound by then is never missed; one that does so after the watchdog has decided to end the
+    process comes too late, and the process ends as overdue. A process whose control thread has
+    read neither the request nor a cancellation of the job is ended two seconds after the
+    request, or two seconds after an earlier cancellation if that is sooner, and one that has
+    read either and has not answered by the bound is ended then; each is a failure of
+    inference. A cancellation of the job sent after the control thread has read the request to
+    stop it is held to the same bound, and not to the two seconds a cancellation is given: that
+    control thread has shown that it listens. The bound is about twice the longest stop seen, so
+    a host busier than that one brings a stop to the bound.
 
     A job a caller cancelled before the service decided what it came to is never counted as a
     miss, whichever way it would have ended past its deadline. A pause the service has applied, a
