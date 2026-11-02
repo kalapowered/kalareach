@@ -352,10 +352,13 @@ impl Drop for Source {
 }
 
 impl Source {
-    /// A descriptor that holds the access list alone. A descriptor that carries the label cannot
-    /// be given to a new object without a privilege the starter does not hold, so the label is
-    /// applied afterwards by [`Self::label_onto`], which asks for none up to the caller's own
-    /// level.
+    /// A descriptor that holds the access list alone, to give a new object. The label is applied
+    /// afterwards by [`Self::label_onto`], which is also the only way to give one to a station
+    /// that exists already, whose creation ignores the security asked for, so the label reaches
+    /// both in one way. Giving a new object the whole descriptor read from the starter's own, label
+    /// included, was refused in a service session for a privilege it did not hold (error 1314);
+    /// which part of the descriptor needed it is not read here, and a standard account's runs give
+    /// new objects a descriptor with a lower label without trouble.
     fn access_only(&self) -> SECURITY_DESCRIPTOR {
         // SAFETY: all-zero is the initial state `InitializeSecurityDescriptor` is given.
         let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
@@ -473,8 +476,9 @@ impl Source {
     }
 
     /// The entries of this object's access list as the system holds them, without the list's
-    /// header, which also holds how much room the list was given. Two lists with the same entries
-    /// admit the same, which the text of a list that holds a condition does not show.
+    /// header, which also holds how much room the list was given, and without that room. Two lists
+    /// with the same entries are the same list, which the text of a list that holds a condition
+    /// does not show.
     fn access_bytes(&self) -> io::Result<&[u8]> {
         if self.access.is_null() {
             return Ok(&[]);
@@ -582,8 +586,18 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 /// These cases make desktops on the window station the test runs on, give them security of their
-/// own, and ask what the starter makes of each against a reference desktop they make, whose list is
-/// that of the desktop the test runs on with two entries added.
+/// own, and ask what the starter makes of each against a reference desktop they make.
+///
+/// The cases that start from the desktop the test runs on (those that call `own_access_list`) take
+/// the list of that desktop with two entries added, and depend on the account and the session the
+/// test runs in. The list must be one the system writes without a condition and that a text can
+/// give back: a null list cannot take entries, and a list with a condition is split at every
+/// parenthesis by the order case and, with a quote the text has no form for, is not given back as
+/// it is, so those cases fail by name. A list that reads the same reversed fails the order case at
+/// its assertion. The case that puts a label on a desktop also needs that list to grant the
+/// caller the right to change the label of the desktops it makes, which a standard account's
+/// session has; without it the label stays and the case fails by name. The other cases make their
+/// lists themselves and depend on neither.
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -609,7 +623,7 @@ mod tests {
     }
 
     /// Two entries that differ, added to the list of the desktop this thread runs on so that the
-    /// list the cases take for the starter's own holds at least two, whatever that desktop has.
+    /// list the cases take for the starter's own holds at least two.
     const ADDED: &str = "(A;;0x1;;;SY)(A;;0x2;;;BA)";
 
     /// The security of the desktop this thread runs on.
@@ -685,6 +699,12 @@ mod tests {
 
     /// A desktop made on this station with the attributes given.
     fn desktop_made(attributes: &SECURITY_ATTRIBUTES) -> Desktop {
+        try_desktop_made(attributes)
+            .unwrap_or_else(|error| panic!("the desktop was not made: {error}"))
+    }
+
+    /// A desktop made on this station with the attributes given, or the system's refusal.
+    fn try_desktop_made(attributes: &SECURITY_ATTRIBUTES) -> io::Result<Desktop> {
         let name = wide(&unique_name());
         // SAFETY: the name is terminated, the device and mode are absent, the attributes point at
         // a descriptor that lives until the call returns, and the call returns a handle or null.
@@ -698,12 +718,10 @@ mod tests {
                 attributes,
             )
         };
-        assert!(
-            !handle.is_null(),
-            "the desktop was not made: {}",
-            io::Error::last_os_error()
-        );
-        Desktop(handle)
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Desktop(handle))
     }
 
     /// What the starter makes of `target` as a desktop to use, given the reference desktop as its
@@ -909,10 +927,11 @@ mod tests {
         bytes
     }
 
-    /// A desktop whose access list is made of the entries given, in their binary form, which the
-    /// text of a descriptor has no form for when a string holds a double quote.
-    fn desktop_with_entries(entries: &[Vec<u8>]) -> Desktop {
-        let size = 8 + entries.iter().map(Vec::len).sum::<usize>();
+    /// An access list made of the entries given, in their binary form, which the text of a
+    /// descriptor has no form for when a string holds a double quote. The list is given `room`
+    /// bytes more than its entries use, a multiple of four. The list is the buffer's start.
+    fn acl_of(entries: &[Vec<u8>], room: usize) -> Vec<u32> {
+        let size = 8 + entries.iter().map(Vec::len).sum::<usize>() + room;
         let mut words = vec![0_u32; size.div_ceil(4)];
         let acl: *mut ACL = words.as_mut_ptr().cast();
         // SAFETY: the list is a live buffer of the size given, aligned for one, and the revision
@@ -951,6 +970,14 @@ mod tests {
                 io::Error::last_os_error()
             );
         }
+        words
+    }
+
+    /// The system's refusal or the desktop made with an access list of the entries given, given
+    /// `room` bytes more than they use.
+    fn try_desktop_with_entries(entries: &[Vec<u8>], room: usize) -> io::Result<Desktop> {
+        let mut words = acl_of(entries, room);
+        let acl: *mut ACL = words.as_mut_ptr().cast();
         // SAFETY: all-zero is the initial state `InitializeSecurityDescriptor` is given.
         let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
         let pointer = (&raw mut descriptor).cast();
@@ -960,7 +987,13 @@ mod tests {
             InitializeSecurityDescriptor(pointer, 1);
             SetSecurityDescriptorDacl(pointer, 1, acl, 0);
         }
-        desktop_made(&attributes(&mut descriptor))
+        try_desktop_made(&attributes(&mut descriptor))
+    }
+
+    /// A desktop whose access list is made of the entries given, in their binary form.
+    fn desktop_with_entries(entries: &[Vec<u8>]) -> Desktop {
+        try_desktop_with_entries(entries, 0)
+            .unwrap_or_else(|error| panic!("the desktop was not made: {error}"))
     }
 
     /// The entries of a list with a condition, padded as asked.
@@ -971,9 +1004,9 @@ mod tests {
         ]
     }
 
-    /// A list that holds a condition is used beside a list of the same entries, and not beside a
-    /// list whose text is the same and whose entries are other bytes: the text of a condition does
-    /// not tell two lists apart.
+    /// A list that holds a condition is used beside a list of the same entries, when the text
+    /// accounts for the entries it holds, and not beside a list whose text is the same and whose
+    /// entries are other bytes: the text of a condition does not tell two lists apart.
     #[test]
     fn a_list_with_a_condition_is_used_only_beside_the_same_entries() {
         let own = desktop_with_entries(&entries_with_a_condition(0));
@@ -1027,5 +1060,182 @@ mod tests {
         let error = refusal(&target);
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
         assert!(error.to_string().contains("could not be read"), "{error}");
+    }
+
+    /// A source over an access list the system did not store: the list lives in the buffer given,
+    /// which must outlive the source, and there is no descriptor to free.
+    fn source_over(list: &[u32]) -> Source {
+        Source {
+            descriptor: std::ptr::null_mut(),
+            access: list.as_ptr().cast_mut().cast(),
+            label: std::ptr::null_mut(),
+        }
+    }
+
+    /// The entries of a list are read without its header and without the room it was given: a
+    /// list given more room than its entries use is the same list as one that was not, both as the
+    /// reading takes it from a list of its own and as the system stores it.
+    #[test]
+    fn a_list_given_extra_room_is_read_as_the_entries_it_holds() {
+        const ROOM: usize = 64;
+        let entries = entries_with_a_condition(0);
+        let held = entries.concat();
+        let (tight, roomy) = (acl_of(&entries, 0), acl_of(&entries, ROOM));
+        let (tight_source, roomy_source) = (source_over(&tight), source_over(&roomy));
+        let size = roomy_source.access_size().expect("the roomy list's size");
+        assert!(
+            usize::try_from(size.AclBytesFree).is_ok_and(|free| free >= ROOM),
+            "the list was given no room: {} bytes free",
+            size.AclBytesFree
+        );
+        assert_eq!(tight_source.access_bytes().expect("the tight list"), held);
+        assert_eq!(roomy_source.access_bytes().expect("the roomy list"), held);
+
+        let made = |room| {
+            try_desktop_with_entries(&entries, room)
+                .unwrap_or_else(|error| panic!("a desktop with {room} bytes of room: {error}"))
+        };
+        let (tight_desktop, roomy_desktop) = (made(0), made(ROOM));
+        let (tight_security, roomy_security) = (
+            security_of(tight_desktop.0).expect("the tight desktop's security"),
+            security_of(roomy_desktop.0).expect("the roomy desktop's security"),
+        );
+        println!(
+            "bytes free as the system stores the list: {} without room, {} with {ROOM}",
+            tight_security.access_size().expect("size").AclBytesFree,
+            roomy_security.access_size().expect("size").AclBytesFree,
+        );
+        tight_security
+            .require_no_more_on(roomy_desktop.0)
+            .expect("a list given extra room is used beside one that was not");
+        roomy_security
+            .require_no_more_on(tight_desktop.0)
+            .expect("a list that was not given extra room is used beside one that was");
+    }
+
+    /// An empty access list is a list that admits nobody, not a missing one: it has no entries and
+    /// no bytes, which is not an error, it is used beside another empty one, and a list that admits
+    /// someone is refused beside it.
+    #[test]
+    fn an_empty_access_list_has_no_entries_and_no_bytes() {
+        let empty = desktop_with("D:");
+        let source = security_of(empty.0).expect("the empty list's security");
+        println!(
+            "the empty list is read back as {:?}, with {} bytes in use",
+            source.text(DACL_SECURITY_INFORMATION),
+            source.access_size().expect("the size").AclBytesInUse
+        );
+        assert!(
+            !source.access.is_null(),
+            "the empty list was read back as null"
+        );
+        assert_eq!(source.access_entries().expect("the count"), 0);
+        assert_eq!(source.access_bytes().expect("the bytes"), b"");
+        source
+            .require_no_more_on(desktop_with("D:").0)
+            .expect("an empty list is used beside another");
+        let someone = desktop_with("D:(A;;GA;;;WD)");
+        let error = source
+            .require_no_more_on(someone.0)
+            .expect_err("a list that admits someone was used beside an empty one");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(error.to_string().contains("admits more"), "{error}");
+    }
+
+    /// The starter's copy of its own list, which it gives a new object through `access_only`, is
+    /// the same list: a list with a condition reaches the new object as the same entries, and the
+    /// object is used beside the list it was copied from.
+    #[test]
+    fn the_starters_copy_of_a_list_with_a_condition_is_used() {
+        let model = desktop_with_entries(&entries_with_a_condition(0));
+        let source = security_of(model.0).expect("the model's security");
+        let mut copied = source.access_only();
+        let copy = desktop_made(&attributes(&mut copied));
+        let there = security_of(copy.0).expect("the copy's security");
+        assert_eq!(
+            there.access_bytes().expect("the copy's entries"),
+            source.access_bytes().expect("the model's entries"),
+            "the system stored the entries of the copy as other bytes"
+        );
+        source
+            .require_no_more_on(copy.0)
+            .expect("the starter's copy of its own list is used");
+    }
+
+    /// An object with no integrity label has none to put on another: applying it leaves the label
+    /// the other has, and the other is still refused for being below the medium level. The lists
+    /// are the same on both and grant everyone every right, including the one that changes a
+    /// label, so the case depends on neither the account nor the desktop it runs on.
+    #[test]
+    fn an_object_with_no_integrity_label_leaves_the_label_it_is_applied_to() {
+        let access = "D:(A;;GA;;;WD)";
+        let model = desktop_with(access);
+        let source = security_of(model.0).expect("the model's security");
+        assert!(
+            source.label.is_null(),
+            "the model has an integrity label: {:?}",
+            source.text(LABEL_SECURITY_INFORMATION)
+        );
+        let lower = desktop_with(&format!("{access}S:(ML;;NW;;;S-1-16-0)"));
+        source.label_onto(lower.0);
+        let there = security_of(lower.0)
+            .expect("the target's security")
+            .text(LABEL_SECURITY_INFORMATION)
+            .expect("the target's label");
+        assert!(
+            there.contains("S-1-16-0"),
+            "the label was taken off: {there:?}"
+        );
+        let error = source
+            .require_no_more_on(lower.0)
+            .expect_err("a desktop below the medium level was used");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(error.to_string().contains("integrity label"), "{error}");
+    }
+
+    /// A list never passes as the same list when its bytes differ, whatever the entry of a
+    /// callback kind in it carries after its trustee and whatever text the system writes for it:
+    /// the system may write no condition at all for it, and the starter must not read the text as
+    /// the entries. The case prints what the system writes for each.
+    #[test]
+    fn a_callback_entry_the_text_shows_no_condition_for_is_judged_by_its_bytes() {
+        let data: [(&str, &[u8]); 3] = [("no data", b""), ("zeros", &[0; 4]), ("text", b"abcd")];
+        for kind in [0x09, 0x0A] {
+            let made: Vec<(&str, Option<Desktop>)> = data
+                .iter()
+                .map(|&(name, bytes)| {
+                    let list = [entry(kind, 0x1, "BG", bytes), entry(0x00, 0x1, "SY", &[])];
+                    let desktop = try_desktop_with_entries(&list, 0);
+                    match &desktop {
+                        Ok(desktop) => println!(
+                            "kind {kind:#x}, {name}: the system writes {:?}",
+                            security_of(desktop.0)
+                                .expect("the desktop's security")
+                                .text(DACL_SECURITY_INFORMATION)
+                        ),
+                        Err(error) => println!("kind {kind:#x}, {name}: refused: {error}"),
+                    }
+                    (name, desktop.ok())
+                })
+                .collect();
+            for (one, other) in [(0, 1), (0, 2), (1, 2)] {
+                let (Some(first), Some(second)) = (&made[one].1, &made[other].1) else {
+                    continue;
+                };
+                let verdict = security_of(first.0)
+                    .expect("the first desktop's security")
+                    .require_no_more_on(second.0);
+                println!(
+                    "kind {kind:#x}, {} beside {}: {verdict:?}",
+                    made[one].0, made[other].0
+                );
+                assert!(
+                    verdict.is_err(),
+                    "kind {kind:#x}: {} was used beside {}, though their bytes differ",
+                    made[one].0,
+                    made[other].0
+                );
+            }
+        }
     }
 }
