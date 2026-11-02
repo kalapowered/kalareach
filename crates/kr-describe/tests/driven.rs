@@ -1209,67 +1209,70 @@ fn a_superseded_job_that_outlives_its_session_leaves_no_mark() {
 /// after it runs to its end while the session's next change waits for it, so a session that keeps
 /// changing is still described at least every other job. The job here was asked to stop at its
 /// deadline, which the process answers cancelled, and the change settled before the answer with no
-/// look between. The control is the same answer for a job no change reached, a miss that supersedes
-/// nothing, so the change after the next job begins settles as any other.
+/// look between. The controls leave the next change to settle as any other: the same answer for a
+/// job no change reached (a miss), a job a change made stale that the process answered as past its
+/// deadline (also a miss), and a job a caller cancelled.
 #[test]
 fn a_job_made_stale_whose_answer_is_read_before_the_service_stops_it_is_superseded() {
     let cooldown = Budgets::DEFAULTS.session_cooldown_ms;
-    for made_stale in [true, false] {
+    let cancelled = Outcome::Cancelled {
+        session_id: session(1),
+    };
+    let missed = Outcome::DeadlineExceeded {
+        session_id: session(1),
+    };
+    for (form, made_stale, caller_cancelled, why, expected, next_change_waits) in [
+        ("stale, cancelled", true, false, JobEnd::Cancelled, &cancelled, true),
+        ("stale, past its deadline", true, false, JobEnd::DeadlineExceeded, &missed, false),
+        ("no change", false, false, JobEnd::Cancelled, &missed, false),
+        ("caller's cancellation", false, true, JobEnd::Cancelled, &cancelled, false),
+    ] {
         let mut service = service();
         queue(&mut service, &session(1), "kalareach", at(0));
         let Instruction::Generate { id, .. } = loaded(&mut service, at(3_000)) else {
             panic!("the job is sent");
         };
-        service.job_asked_to_stop_at_its_deadline(id);
+        if !caller_cancelled {
+            service.job_asked_to_stop_at_its_deadline(id);
+        }
         if made_stale {
             change(&mut service, &session(1), "crates", at(3_100));
             assert!(
                 service
                     .settle(&session(1), Priority::Ordinary, at(5_100))
-                    .is_some()
+                    .is_some(),
+                "{form}"
             );
         }
+        if caller_cancelled {
+            assert!(service.cancel_running(&session(1)), "{form}");
+        }
         let outcome = service
-            .finished(
-                id,
-                Answered::Ended {
-                    why: JobEnd::Cancelled,
-                    detail: None,
-                },
-                at(5_200),
-            )
+            .finished(id, Answered::Ended { why, detail: None }, at(5_200))
             .expect("the answer");
-        let expected = if made_stale {
-            Outcome::Cancelled {
-                session_id: session(1),
-            }
-        } else {
-            Outcome::DeadlineExceeded {
-                session_id: session(1),
-            }
-        };
-        assert_eq!(outcome, expected, "stale: {made_stale}");
+        assert_eq!(&outcome, expected, "{form}");
         if !made_stale {
             change(&mut service, &session(1), "crates", at(6_000));
             assert!(
                 service
                     .settle(&session(1), Priority::Ordinary, at(8_000))
-                    .is_some()
+                    .is_some(),
+                "{form}"
             );
         }
         let next = at(3_000 + cooldown);
         let Instruction::Generate { .. } = service.next(&roomy(), next).expect("a job") else {
-            panic!("stale {made_stale}: the next job is sent");
+            panic!("{form}: the next job is sent");
         };
         change(&mut service, &session(1), "tests", next.after_ms(100));
         let settled = service.settle(&session(1), Priority::Ordinary, next.after_ms(2_100));
-        if made_stale {
+        if next_change_waits {
             assert_eq!(
                 settled, None,
-                "the change waits for the job after a superseded one"
+                "{form}: the change waits for the job after a superseded one"
             );
         } else {
-            assert!(settled.is_some(), "a job no change reached supersedes nothing");
+            assert!(settled.is_some(), "{form}: nothing was superseded");
         }
     }
 }
