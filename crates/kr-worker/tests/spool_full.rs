@@ -163,8 +163,8 @@ async fn burst(full: bool) -> Burst {
     }
 }
 
-/// KR-REQ-27.05, full disks: a spool that meets a disk with no room refuses the write, and the
-/// session says so instead of pretending it holds the output.
+/// KR-REQ-27.05, full disks: a spool write that is refused leaves a gap whose cause is the spool,
+/// and the output that is held and the session go on.
 ///
 /// The shell prints far more than the resident window holds. With room, the spool holds the first
 /// lines and a read from the start of the session is whole, with no gap. With the first segment a
