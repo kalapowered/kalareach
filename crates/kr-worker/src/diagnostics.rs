@@ -859,12 +859,15 @@ mod tests {
 
         const NAME: &str = "diagnostics::tests::a_line_told_to_a_standard_error_that_refuses_or_has_stopped_draining_waits_for_nothing";
         const CHILD: &str = "KR_TEST_TELL_PROCESS";
+        // What the process prints once it has said its lines and gone on. The test harness prints
+        // this test's name too, which holds the word "told", so the word does not do.
+        const DONE: &str = "all lines said and the process went on";
 
         if let Some(mode) = std::env::var_os(CHILD) {
             if mode == "read" {
                 super::tell(format_args!("a line to a standard error that is read"));
                 assert!(super::drain(DEADLINE), "the line was written");
-                println!("told");
+                println!("{DONE}");
                 return;
             }
             if mode == "full" {
@@ -879,7 +882,7 @@ mod tests {
                 println!("a write that waits for a reader was drained");
                 return;
             }
-            println!("told");
+            println!("{DONE}");
             return;
         }
 
@@ -917,7 +920,7 @@ mod tests {
                 .read_to_string(&mut output)
                 .expect("reads its standard output");
             assert!(
-                status.is_some_and(|status| status.success()) && output.contains("told"),
+                status.is_some_and(|status| status.success()) && output.contains(DONE),
                 "the process with its standard error {mode} told its lines and ended: {output}"
             );
             if mode == "read" {
