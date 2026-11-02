@@ -250,9 +250,9 @@ fn not_to_admit(
 /// staging place that only this user reads, and the package manager is named once the release is
 /// current. An update that waits (exit 9) leaves the current release in place and is not a failure.
 /// An update that fails is a refusal, and is not offered again. The current `kr` says why on
-/// standard error; what it prints to standard output is its report of
-/// the update, which the command that follows must not be preceded by. It reads nothing from
-/// standard input, which belongs to the command that follows.
+/// standard error; a reason that stream refuses is lost, and a wait still ends 9. What it prints to
+/// standard output is its report of the update, which the command that follows must not be
+/// preceded by. It reads nothing from standard input, which belongs to the command that follows.
 fn hand_to_current(
     store: &Store,
     tree: &Path,

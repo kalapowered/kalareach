@@ -73,6 +73,22 @@ impl Home {
         finish_within(child, Duration::from_secs(300))
     }
 
+    /// Runs a program with standard error on the device that has no room for anything written to it.
+    #[cfg(target_os = "linux")]
+    fn run_on_a_full_stream(&self, program: &Path, arguments: &[&str]) -> Output {
+        let mut command = self.command(program, arguments);
+        command.stderr(Stdio::from(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .expect("opens the device that has no room"),
+        ));
+        let child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("{} did not start: {error}", program.display()));
+        finish_within(child, Duration::from_secs(300))
+    }
+
     /// Runs a program as a person's own shell does: under the umask 022 that most systems start a
     /// login with, with this home, a temporary directory of its own and nothing that names the
     /// runtime or the state root, so that both are the defaults of this home.
@@ -288,6 +304,65 @@ fn an_update_that_waits_does_not_stop_the_command() {
     );
 }
 
+/// KR-REQ-27.05, full disks: the reason an update waits is lost when standard error refuses it, and
+/// the command goes on. The release in the prefix is newer, so the current release's `kr` is asked
+/// to take it in as an update, and another update holds the lock. That `kr` writes why it waits on
+/// the standard error it inherits, writes its report to a null standard output, and ends 9, which
+/// the command takes for a wait. With the line refused it still ends 9: nothing is replaced, the
+/// store's `kr` runs the command, and it ends as it ends with room, 0, with the roots it was asked
+/// for. The reason is lost as any line that standard error refuses is.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_wait_standard_error_refuses_is_lost_and_the_command_still_runs_as_the_stores_kr() {
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    let first = home.prefix("Cellar", &one);
+    assert!(home.first_command(&kr(&first)).0.status.success());
+
+    // Another update of the host is under way: it holds the update lock.
+    let busy = home
+        .store
+        .try_lock_update()
+        .expect("the lock")
+        .expect("free");
+    let second = home.prefix("Cellar", &two);
+
+    // The control: with room, the reason is said and the command runs as the current release,
+    // printing the roots it was asked for.
+    let control = home.run(&kr(&second), &["host", "paths"]);
+    assert!(control.status.success(), "{}", said(&control));
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("another update of this host is running"),
+        "{}",
+        said(&control)
+    );
+    assert!(
+        !control.stdout.is_empty(),
+        "the command ran: {}",
+        said(&control)
+    );
+
+    let refused = home.run_on_a_full_stream(&kr(&second), &["host", "paths"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(0),
+        "the lost reason does not end the command: {}",
+        said(&refused)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&control.stdout),
+        "the command printed the roots it was asked for"
+    );
+    drop(busy);
+    assert_eq!(
+        home.store.current().expect("reads"),
+        Some(one.name().clone()),
+        "the wait left the current release in place"
+    );
+}
+
 /// KR-REQ-26.03: two first commands at once admit the release once, and both run.
 #[test]
 fn two_first_commands_at_once_admit_one_release() {
@@ -418,19 +493,7 @@ fn a_notice_standard_error_refuses_is_lost_and_the_command_still_runs_as_the_sto
         said(&control)
     );
 
-    let mut command = home.command(&kr(&older), &["host", "paths"]);
-    command.stderr(Stdio::from(
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/full")
-            .expect("opens the device that has no room"),
-    ));
-    let refused = finish_within(
-        command
-            .spawn()
-            .unwrap_or_else(|error| panic!("{} did not start: {error}", older.display())),
-        Duration::from_secs(300),
-    );
+    let refused = home.run_on_a_full_stream(&kr(&older), &["host", "paths"]);
     assert_eq!(
         refused.status.code(),
         Some(0),
