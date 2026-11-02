@@ -1407,6 +1407,18 @@ fn joins_a_word(character: char) -> bool {
         )
 }
 
+/// Whether `shown` ends in an opening bracket that begins a word of its own. A quotation that
+/// follows it is not parted from it in the second reading: nothing stands before the bracket to run
+/// into, and the space would only change the clause the quotation is in (`` (`a b`) ``). A bracket
+/// that touches a word (`` sudo(`a b`) ``) is parted, so the program before it is found.
+fn ends_in_a_bracket_that_begins_a_word(shown: &str) -> bool {
+    let mut backwards = shown.chars().rev();
+    backwards
+        .next()
+        .is_some_and(|last| matches!(last, '(' | '[' | '{'))
+        && backwards.next().is_none_or(char::is_whitespace)
+}
+
 /// `text` with every command quoted in backticks (more than one word between a pair of them)
 /// replaced by `a command`, or `None` when it quotes none. With `apart`, a space stands between the
 /// replacement and a neighbour that would run into it.
@@ -1422,7 +1434,10 @@ fn without_quoted_commands(text: &str, apart: bool) -> Option<String> {
         let quoted = &rest[opening + 1..closing];
         shown.push_str(&rest[..opening]);
         if quoted.chars().any(char::is_whitespace) {
-            if apart && shown.ends_with(joins_a_word) {
+            if apart
+                && shown.ends_with(joins_a_word)
+                && !ends_in_a_bracket_that_begins_a_word(&shown)
+            {
                 shown.push(' ');
             }
             shown.push_str("a command");
@@ -4309,6 +4324,32 @@ mod tests {
             ),
             "{said}"
         );
+    }
+
+    /// A bracket that begins a word of its own parts no word from the quotation after it, so the
+    /// clause the quotation is in is kept as it is without the bracket. A bracket that touches a
+    /// word does part it, and the program before the bracket is found.
+    #[test]
+    fn a_replaced_quotation_in_a_bracket_keeps_the_clause_it_is_in() {
+        let fixed = sentence_for(ErrorCode::InvalidArgument, WHY_NOT_SHOWN);
+        for (opening, closing) in [('(', ')'), ('[', ']'), ('{', '}')] {
+            for before in ["", "x "] {
+                let said = format!("{before}{opening}`a b`{closing} failed: /Users/m");
+                assert_eq!(
+                    message_for_a_device(ErrorCode::InvalidArgument, &said),
+                    Some(format!(
+                        "{before}{opening}a command{closing} failed; {WHY_NOT_SHOWN}"
+                    )),
+                    "{said}"
+                );
+            }
+            let said = format!("sudo{opening}`a b`{closing} failed: /Users/m");
+            assert_eq!(
+                message_for_a_device(ErrorCode::InvalidArgument, &said).as_deref(),
+                Some(fixed.as_str()),
+                "{said}"
+            );
+        }
     }
 
     #[test]
