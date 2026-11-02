@@ -288,7 +288,7 @@ impl OpenedDirectory {
     ///
     /// Returns [`ProjectError::Destination`] when the directory cannot be opened or its path
     /// cannot be resolved, except that a host too short of descriptors, processes or memory to
-    /// open it is [`ProjectError::GitFailed`], a fault that passes ([`unopenable`]), and
+    /// open it is [`ProjectError::GitFailed`], a fault that passes (`unopenable`), and
     /// [`ProjectError::IdentityChanged`] when the caller holds an identity
     /// and the object at the path is a different one, or the open or the resolution of the path
     /// finds nothing there: the object the identity names is gone, which is a source that changed
