@@ -145,7 +145,7 @@ fn write_lines(shared: &Shared) {
     }
 }
 
-/// The writer of this process's standard error, which is started by the first line.
+/// The writer of this process's standard error, which the first line makes.
 static STANDARD_ERROR: OnceLock<Writer> = OnceLock::new();
 
 /// Returns the writer of this process's standard error, making it if no line has been said.
@@ -574,7 +574,11 @@ mod tests {
     fn the_thread_ends_when_no_line_waits_and_a_later_line_starts_another() {
         let volume = Volume::new();
         let writer = Writer::new(volume.clone());
-        let thread_ended = || !locked(&writer.shared.queue).running;
+        // The thread holds a reference to what it shares until it returns.
+        let thread_ended = || {
+            !locked(&writer.shared.queue).running
+                && std::sync::Arc::strong_count(&writer.shared) == 1
+        };
         assert!(thread_ended(), "no thread runs before a line is said");
         for (number, text) in ["one\n", "two\n"].into_iter().enumerate() {
             assert!(writer.offer(text.to_owned(), None));
@@ -869,11 +873,11 @@ mod tests {
             for number in 0..WAITING * 3 {
                 super::tell(format_args!("a line to a standard error, number {number}"));
             }
-            if mode == "full" {
-                assert!(
-                    !super::drain(Duration::from_millis(20)),
-                    "a write that waits for a reader is not drained"
-                );
+            // The standard error is full, so a panic message would wait for a reader too: the
+            // fault is told on standard output, which the parent reads.
+            if mode == "full" && super::drain(Duration::from_millis(20)) {
+                println!("a write that waits for a reader was drained");
+                return;
             }
             println!("told");
             return;

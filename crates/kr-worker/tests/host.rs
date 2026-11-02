@@ -175,13 +175,24 @@ struct HeldStandardError {
     writer: std::io::PipeWriter,
     /// The end nothing reads while a case holds the pipe full, kept so that a write waits for a
     /// reader and is not refused. A case that lets the workers' lines drain reads what is there.
-    reader: std::io::PipeReader,
+    /// None for a pipe whose reading end is closed, which refuses every write.
+    reader: Option<std::io::PipeReader>,
     /// The workers this pipe was given to.
     workers: std::sync::Mutex<Vec<std::process::Child>>,
 }
 
 #[cfg(unix)]
 impl HeldStandardError {
+    /// A pipe whose reading end is closed, so that every write to it is refused.
+    fn refusing() -> Arc<Self> {
+        let (_, writer) = std::io::pipe().expect("a pipe");
+        Arc::new(Self {
+            writer,
+            reader: None,
+            workers: std::sync::Mutex::default(),
+        })
+    }
+
     fn new() -> Arc<Self> {
         use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
@@ -192,7 +203,7 @@ impl HeldStandardError {
         fcntl_setfl(&reader, flags | OFlags::NONBLOCK).expect("a read that does not wait");
         Arc::new(Self {
             writer,
-            reader,
+            reader: Some(reader),
             workers: std::sync::Mutex::default(),
         })
     }
@@ -208,10 +219,13 @@ impl HeldStandardError {
 
     /// What the workers have written to the pipe and nothing has read.
     fn said(&self) -> String {
+        let Some(reader) = &self.reader else {
+            return String::new();
+        };
         let mut said = Vec::new();
         let mut chunk = [0_u8; 4096];
         loop {
-            match rustix::io::read(&self.reader, &mut chunk) {
+            match rustix::io::read(reader, &mut chunk) {
                 Ok(0) | Err(rustix::io::Errno::AGAIN) => break,
                 Ok(count) => said.extend_from_slice(&chunk[..count]),
                 Err(error) => panic!("reading the pipe: {error}"),
@@ -410,6 +424,14 @@ impl Host {
     #[cfg(unix)]
     fn with_a_standard_error_nobody_reads(mut self) -> Self {
         self.standard_error = Some(HeldStandardError::new());
+        self
+    }
+
+    /// Starts the daemon's workers with a standard error whose reading end is closed, so that every
+    /// write to it is refused.
+    #[cfg(unix)]
+    fn with_a_standard_error_that_refuses(mut self) -> Self {
+        self.standard_error = Some(HeldStandardError::refusing());
         self
     }
 
@@ -1619,6 +1641,26 @@ async fn a_worker_that_waited_out_an_attachment_ends_whether_or_not_its_standard
             );
         }
     }
+}
+
+/// A worker whose standard error refuses every write starts, serves its session and ends with it.
+///
+/// The pipe's reading end is closed. The line every worker says at its start is let go, and so is
+/// any later line; a refused write does not end the worker, as a failed `eprintln!` would.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_whose_standard_error_refuses_every_write_starts_and_ends_with_its_session() {
+    let host = Host::create().with_a_standard_error_that_refuses();
+    let _daemon = host.start().await;
+    let mut client = host.client().await;
+    let created = create(&mut client, &host).await;
+    close(&mut client, &host, created.session.session_id).await;
+    until("the worker to end", || {
+        host.held_standard_error()
+            .every_worker_ended_well()
+            .then_some(())
+    })
+    .await;
 }
 
 /// A worker that cannot reach its controller says why on its standard error and ends with a
