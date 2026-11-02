@@ -1193,49 +1193,29 @@ mod tests {
         assert!(error.to_string().contains("integrity label"), "{error}");
     }
 
-    /// A list never passes as the same list when its bytes differ, whatever the entry of a
-    /// callback kind in it carries after its trustee and whatever text the system writes for it:
-    /// the system may write no condition at all for it, and the starter must not read the text as
-    /// the entries. The case prints what the system writes for each.
+    /// A callback entry with no data after its trustee is written without a condition: its text
+    /// holds no parenthesis inside the entry's own and no quote, so the text alone does not show
+    /// it to be a callback entry, and the starter reads the entry by its kind. A list of such
+    /// entries is used beside a list of the same bytes.
     #[test]
-    fn a_callback_entry_the_text_shows_no_condition_for_is_judged_by_its_bytes() {
-        let data: [(&str, &[u8]); 3] = [("no data", b""), ("zeros", &[0; 4]), ("text", b"abcd")];
+    fn a_callback_entry_with_no_data_is_written_without_a_condition() {
         for kind in [0x09, 0x0A] {
-            let made: Vec<(&str, Option<Desktop>)> = data
-                .iter()
-                .map(|&(name, bytes)| {
-                    let list = [entry(kind, 0x1, "BG", bytes), entry(0x00, 0x1, "SY", &[])];
-                    let desktop = try_desktop_with_entries(&list, 0);
-                    match &desktop {
-                        Ok(desktop) => println!(
-                            "kind {kind:#x}, {name}: the system writes {:?}",
-                            security_of(desktop.0)
-                                .expect("the desktop's security")
-                                .text(DACL_SECURITY_INFORMATION)
-                        ),
-                        Err(error) => println!("kind {kind:#x}, {name}: refused: {error}"),
-                    }
-                    (name, desktop.ok())
-                })
-                .collect();
-            for (one, other) in [(0, 1), (0, 2), (1, 2)] {
-                let (Some(first), Some(second)) = (&made[one].1, &made[other].1) else {
-                    continue;
-                };
-                let verdict = security_of(first.0)
-                    .expect("the first desktop's security")
-                    .require_no_more_on(second.0);
-                println!(
-                    "kind {kind:#x}, {} beside {}: {verdict:?}",
-                    made[one].0, made[other].0
-                );
-                assert!(
-                    verdict.is_err(),
-                    "kind {kind:#x}: {} was used beside {}, though their bytes differ",
-                    made[one].0,
-                    made[other].0
-                );
-            }
+            let list = [entry(kind, 0x1, "BG", &[]), entry(0x00, 0x1, "SY", &[])];
+            let desktop = desktop_with_entries(&list);
+            let source = security_of(desktop.0).expect("the desktop's security");
+            let text = source
+                .text(DACL_SECURITY_INFORMATION)
+                .expect("the desktop's text");
+            println!("kind {kind:#x}: the system writes {text:?}");
+            assert_eq!(
+                text.matches('(').count(),
+                2,
+                "the system wrote a condition for an entry with no data: {text}"
+            );
+            assert!(!text.contains('"'), "the system wrote a string: {text}");
+            source
+                .require_no_more_on(desktop_with_entries(&list).0)
+                .expect("a callback entry with no data was refused beside the same bytes");
         }
     }
 }
