@@ -834,7 +834,9 @@ fn the_linux_runs_of_the_workspace_tests_require_a_user_service_manager() {
         .expect("the landing workflow");
     let tests = steps_running(&job(&landing, "rust"), "cargo test --locked --workspace");
     assert!(
-        tests.iter().all(|step| step.contains(variable)),
+        tests
+            .iter()
+            .all(|step| step.lines().any(|line| line.trim() == variable)),
         "the step of the landing workflow's rust job that runs the workspace's tests does not \
          require a user service manager"
     );
