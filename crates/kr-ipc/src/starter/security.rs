@@ -21,19 +21,27 @@
 //! nothing (other than the owner's rights), a denying entry whose trustee has none left while an
 //! allowing entry remains, a lower integrity level or a weaker policy.
 //! That is a reading of the entries, not an evaluation of which entry decides for a given
-//! process, so an allowing entry behind a denying one is still called wider. An object whose
-//! entries differ in any other way (other rights on an entry, another order, an entry more or
+//! process, so "admits more" does not always mean that access grows: an allowing entry behind a
+//! denying one is still called wider, and so is a list that lost a denying entry while the allowing
+//! entry that remains is for another trustee or grants nothing the lost entry took away. An object
+//! whose entries differ in any other way (other rights on an entry, another order, an entry more or
 //! less often, an allowing entry for the owner's rights left out, a denying entry gone with no
 //! allowing entry left) "is not one the starter accepts", because this module does not evaluate
 //! what a difference in rights or in order does to access.
 //!
 //! The text of an access list is read only when it holds as many entries as the list itself, as
-//! the system counts them. A text that holds a condition, a double quote or a parenthesis inside
-//! an entry, is read only when the starter's own list and the object's hold the same entries byte
-//! for byte, which is what the text is not: the grammar has no form for a double quote inside a
-//! string, and Windows Server 2025 writes one as it is, so a string ends early, and one text can stand for
-//! two lists. Nothing else keeps the reading from losing the entries up to the next quote, and a
-//! count alone does not: false entries can stand in for the hidden ones.
+//! the system counts them. A list that holds a condition is read only when the starter's own list
+//! and the object's are the same list, which is to say that their entries are the same bytes,
+//! whichever of the two holds the condition. That check comes before the entries are compared, so
+//! the flags that say which children inherit an entry count for such a list. A list holds a
+//! condition when its text holds a double quote, a parenthesis inside an entry, or an entry of a
+//! callback kind, whose data after the trustee the text may not show. The text is not enough for
+//! such a list: the grammar has no form for a double quote inside a string, and Windows Server
+//! 2025 writes one as it is, so a string ends early and one text can stand for two lists. Nothing
+//! else keeps the reading from losing the entries up to the next quote, and a count alone does
+//! not: false entries can stand in for the hidden ones. Equal bytes are needed and are not
+//! enough: a text whose strings end early holds fewer entries than its list, and is refused for
+//! it beside itself.
 //!
 //! The text is what the system writes for a descriptor, `D:` and its entries for an access list or
 //! `S:` and its label entry for the integrity label. Nothing here calls the system, so it is read
@@ -49,7 +57,7 @@ pub(super) struct Texts<'a> {
     /// must account for.
     pub(super) access_entries: usize,
     /// The entries of the access list as the system holds them, without the list's header, or
-    /// nothing when it has no list. Two lists that hold the same entries admit the same.
+    /// nothing when it has no list. Two lists that hold the same entries are the same list.
     pub(super) access_bytes: &'a [u8],
     /// The integrity label, for a descriptor asked for it alone.
     pub(super) label: &'a str,
@@ -95,8 +103,9 @@ impl fmt::Display for Stop {
 /// Why an object that was read is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Refusal {
-    /// Whether the entries show that the object admits more than the starter's own does. If not,
-    /// the object is one the starter does not accept, and may admit no more.
+    /// Whether the entries show a loss that the starter's own object does not have, which is what
+    /// "admits more" says. It is a reading of the entries and does not always mean that access
+    /// grows. If not, the object is one the starter does not accept, and may admit no more.
     admits_more: bool,
     /// What differs.
     why: String,
@@ -132,9 +141,9 @@ pub(super) fn require_no_more(own: &Texts<'_>, found: &Texts<'_>) -> Result<(), 
     {
         return Err(Stop::Unreadable {
             what: "access list",
-            why: "one of the two access lists holds a condition and their entries are not the \
-                  same bytes, and the text around a condition's string or parentheses cannot be \
-                  told apart from it"
+            why: "one of the two access lists holds a condition or an entry of a callback kind \
+                  and their entries are not the same bytes, which the text of such an entry \
+                  does not tell apart"
                 .to_owned(),
         });
     }
@@ -161,19 +170,22 @@ pub(super) fn require_no_more(own: &Texts<'_>, found: &Texts<'_>) -> Result<(), 
     }
 }
 
-/// Whether the text of an access list holds a condition: a double quote, or a parenthesis inside
-/// an entry. Every conditional entry holds a parenthesis of its own inside the entry's, and the
-/// entries of a list that holds neither are told apart by their parentheses alone. A string of a
-/// condition can end early at a double quote the grammar has no form for, so the entries around a
-/// condition cannot be told apart from it.
+/// Whether the text of an access list holds a condition: a double quote, a parenthesis inside an
+/// entry, or an entry of a callback kind, which begins with `X` or `Z`. The system writes the
+/// condition it understands in parentheses of its own inside the entry's, but a callback entry may
+/// carry other data after its trustee, and what the system writes for that is not known: the entry
+/// may show no condition at all. The entries of a list that holds none of these are told apart by
+/// their parentheses alone. A string of a condition can end early at a double quote the grammar
+/// has no form for, so the entries around a condition cannot be told apart from it.
 fn holds_a_condition(text: &str) -> bool {
     let mut depth = 0_u32;
-    for character in text.chars() {
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
         match character {
             '"' => return true,
             '(' => {
                 depth += 1;
-                if depth > 1 {
+                if depth > 1 || matches!(characters.peek(), Some('X' | 'Z')) {
                     return true;
                 }
             }
@@ -425,9 +437,10 @@ fn entries_refusal(own: &[Entry], found: &[Entry]) -> Option<Refusal> {
         list.iter()
             .any(|entry| entry.decision == decision && entry.trustee == trustee)
     };
-    // The entries show that these admit more: nothing in the starter's own allows the trustee, or
-    // nothing in the found list denies the trustee that the starter's own denies while an
-    // allowing entry is left.
+    // The entries show a loss, which the refusal calls admitting more: nothing in the starter's own
+    // allows the trustee, or nothing in the found list denies the trustee that the starter's own
+    // denies while an allowing entry is left. Whether that allowing entry grants anything the lost
+    // denying entry took away is not weighed.
     if let Some(entry) = found.iter().find(|entry| {
         entry.decision == Decision::Allow && !for_trustee(own, Decision::Allow, &entry.trustee)
     }) {
@@ -933,9 +946,10 @@ mod tests {
         assert!(gone.why.contains("BG"), "{gone:?}");
     }
 
-    /// KR-REQ-03.24: a denying entry that is gone makes the object admit more only where access
-    /// can grow, which needs an allowing entry left in the object itself. With none left, the
-    /// refusal is in words that do not say it admits more.
+    /// KR-REQ-03.24: a denying entry that is gone is called admitting more only while an allowing
+    /// entry is left in the object itself. That is a reading of the entries and does not mean that
+    /// access grows: the allowing entry may be for another trustee, or grant nothing. With none
+    /// left, the refusal is in words that do not say it admits more.
     #[test]
     fn a_denying_entry_that_is_gone_is_called_wider_only_while_an_allowing_entry_is_left() {
         let none_left = why("D:(D;;0x1;;;WD)", "D:");
@@ -1211,13 +1225,29 @@ mod tests {
             matches!(&unread_label, Err(stop) if stop.is_unreadable()),
             "{unread_label:?}"
         );
+        // The starter's own label is read the same way: one that cannot be read is not taken for the
+        // medium label that no label stands for, against which the object would be used.
+        let unread_own_label = require_no_more(
+            &texts(own_list, "S:(ML;;NW;;;XX)"),
+            &texts(own_list, medium),
+        );
+        assert!(
+            matches!(
+                &unread_own_label,
+                Err(Stop::Unreadable {
+                    what: "integrity label",
+                    ..
+                })
+            ),
+            "{unread_own_label:?}"
+        );
     }
 
     /// KR-REQ-03.24: a text is read only when it holds as many entries as the list it was written
-    /// from, whichever way the two differ, and whichever of the two texts is the wrong one. The count
-    /// does not keep a condition from hiding entries, which the next case is for; it is what refuses
-    /// a text that is the same on both sides, and so is not refused for holding a condition: the
-    /// entries are the same bytes.
+    /// from, whichever way the two differ, and whichever of the two texts is the wrong one. The
+    /// count does not keep a condition from hiding entries, which the next case is for. It is what
+    /// refuses a text that is the same on both sides: the rule for a condition lets it by, because
+    /// the entries are the same bytes, and the text still does not account for its list.
     #[test]
     fn a_text_that_does_not_hold_as_many_entries_as_the_list_is_not_read() {
         let hiding = "D:(XD;;0x1;;;BG;(@User.X==\"a\"b\"))(A;;GA;;;WD)\
@@ -1273,6 +1303,20 @@ mod tests {
                 &with_count("D:(A;;0x1;;;SY)", 1),
             ),
             Ok(())
+        );
+        // An entry that only children inherit is in the list the system counts and in the text, and
+        // decides nothing about the object: the count is of the entries the text writes.
+        let inherited = "D:(A;OICIIO;0x1;;;WD)(A;;0x1;;;SY)";
+        assert_eq!(counted(inherited), 2);
+        assert_eq!(
+            require_no_more(&own, &with_count(inherited, 2)),
+            Ok(()),
+            "an entry that only children inherit was left out of the object's count"
+        );
+        assert_eq!(
+            require_no_more(&with_count(inherited, 2), &own),
+            Ok(()),
+            "an entry that only children inherit was left out of the starter's own count"
         );
         // A string outside an entry is not skipped: it is an error, and so is one never closed.
         assert!(access_list("D:(A;;0x1;;;SY)\"(A;;GA;;;WD)\"").is_err());
@@ -1419,6 +1463,56 @@ mod tests {
             label: "",
         };
         assert_eq!(require_no_more(&plain(b"one"), &plain(b"another")), Ok(()));
+    }
+
+    /// KR-REQ-03.24: an entry of a callback kind is a condition whether or not its text shows one:
+    /// the data after its trustee may not be in the text, so one text can stand for lists of other
+    /// bytes. Such a list is used only beside a list of the same entries, whichever side holds it.
+    #[test]
+    fn an_entry_of_a_callback_kind_is_a_condition_whether_or_not_the_text_shows_one() {
+        fn held_as<'a>(access: &'a str, access_bytes: &'a [u8]) -> Texts<'a> {
+            Texts {
+                access,
+                access_entries: 2,
+                access_bytes,
+                label: "",
+            }
+        }
+        // No double quote, and no parenthesis inside the entry's own.
+        for kind in ["XA", "XD", "ZA"] {
+            let text = format!("D:({kind};;0x1;;;BG)(A;;0x1;;;SY)");
+            let why = unread(require_no_more(
+                &held_as(&text, b"one list"),
+                &held_as(&text, b"another list"),
+            ));
+            assert!(why.contains("not the same bytes"), "{kind}: {why}");
+            assert_eq!(
+                require_no_more(&held_as(&text, b"one list"), &held_as(&text, b"one list")),
+                Ok(()),
+                "{kind}"
+            );
+        }
+        // On the side of the starter's own alone, and on the object's alone.
+        let plain = "D:(A;;0x1;;;SY)(A;;0x1;;;WD)";
+        let callback = "D:(XD;;0x1;;;BG)(A;;0x1;;;SY)";
+        let why = unread(require_no_more(
+            &held_as(plain, b"one list"),
+            &held_as(callback, b"another list"),
+        ));
+        assert!(why.contains("not the same bytes"), "{why}");
+        let why = unread(require_no_more(
+            &held_as(callback, b"one list"),
+            &held_as(plain, b"another list"),
+        ));
+        assert!(why.contains("not the same bytes"), "{why}");
+        // A list without one is read by its text, whatever its bytes.
+        assert_eq!(
+            require_no_more(
+                &held_as(plain, b"one list"),
+                &held_as(plain, b"another list")
+            ),
+            Ok(())
+        );
     }
 
     /// KR-REQ-03.24: what a person reads says whether the object admits more, or is only one the
