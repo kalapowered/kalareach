@@ -3605,8 +3605,8 @@ impl Container {
     /// A removal can be asked again, and a loaded machine's runtime can take longer than one call
     /// is given, so a call that gave no answer is asked again until the time a slow call is given
     /// has passed, each call given no more than what is left. A refusal is not asked again: it
-    /// would be refused again. The first call is always made and is given the whole time a slow
-    /// call is given, whatever has gone by since that time was set.
+    /// would be refused again. The first call is always made, whatever has gone by since the time
+    /// was set, and is given no more than all of it.
     fn remove(&self) -> Result<(), String> {
         let until = Instant::now() + self.runtime.slow;
         let mut last: String;
