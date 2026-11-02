@@ -1222,10 +1222,31 @@ fn a_job_made_stale_whose_answer_is_read_before_the_service_stops_it_is_supersed
         session_id: session(1),
     };
     for (form, made_stale, caller_cancelled, why, expected, next_change_waits) in [
-        ("stale, cancelled", true, false, JobEnd::Cancelled, &cancelled, true),
-        ("stale, past its deadline", true, false, JobEnd::DeadlineExceeded, &missed, false),
+        (
+            "stale, cancelled",
+            true,
+            false,
+            JobEnd::Cancelled,
+            &cancelled,
+            true,
+        ),
+        (
+            "stale, past its deadline",
+            true,
+            false,
+            JobEnd::DeadlineExceeded,
+            &missed,
+            false,
+        ),
         ("no change", false, false, JobEnd::Cancelled, &missed, false),
-        ("caller's cancellation", false, true, JobEnd::Cancelled, &cancelled, false),
+        (
+            "caller's cancellation",
+            false,
+            true,
+            JobEnd::Cancelled,
+            &cancelled,
+            false,
+        ),
     ] {
         let mut service = service();
         queue(&mut service, &session(1), "kalareach", at(0));
