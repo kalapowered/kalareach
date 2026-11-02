@@ -15,14 +15,15 @@
 //!                          ───worker ready──▶  (controller publishes the descriptor)
 //! ```
 
-// The lines this program says go through `kr_worker::diagnostics`, whose thread writes them, so that
-// a standard error that has stopped draining holds this program only for the short time `main`
-// waits for them at its end, and never its ready report, its final error or a closure line. Three
-// writes happen where they are said, and so can hold the start of a worker whose standard error
-// stopped draining before it began: the line every worker says at its start (`say_at_start`), the
-// argument parser's message for a command line it refuses, and the standard library's message for a
-// panic or another fatal error, such as a failed allocation. `eprintln!` and `dbg!` write where
-// they are called.
+// The lines this program says go through `kr_worker::diagnostics`, whose thread writes them. After
+// the first line of a worker, a standard error that has stopped draining holds nothing: the program
+// waits for the thread for two seconds at its end, and no more. Three writes happen where they are
+// said, and a standard error that has stopped draining holds them: the line every worker says at
+// its start (`say_at_start`), which then holds the worker there, so that it reports itself ready
+// and ends never; the argument parser's message for a command line it refuses; and the standard
+// library's message for a panic or another fatal error, such as a failed allocation, which can come
+// at any time and may keep the process from ending. `eprintln!` and `dbg!` write where they are
+// called.
 #![deny(clippy::print_stderr, clippy::dbg_macro)]
 
 use std::process::ExitCode;
@@ -495,8 +496,8 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     // The worker exists for its session. When the session closes, the last record is written, every
     // attachment is told, and the process ends; nothing here restarts a shell. The worker's
     // diagnostics are written by a thread of their own, so a standard error that has stopped
-    // draining holds nothing in this function; `main` gives that thread a short time to write what
-    // it was handed, and the process ends after that with the thread still in its write.
+    // draining holds nothing from here on; `main` gives that thread a short time to write what it
+    // was handed, and the process ends after that with the thread still in its write.
     let _record = runtime.wait_closed().await;
     finish(&runtime, serving, bridge_server).await;
     Ok(())
@@ -687,11 +688,12 @@ fn bridge_endpoint(
 /// Says one line to this process's standard error where it stands, and lets it go if it cannot be
 /// written.
 ///
-/// It is for the one line every worker says at its start, before the session exists, which no pass
-/// and no stop waits behind. The diagnostics thread would be started for that line alone, and a
-/// thread started in each worker costs about a hundred kibibytes of resident memory a worker, which
-/// the idle measurement counts. A standard error that has stopped draining before a worker starts
-/// holds its start, as it always did; every later line goes through the diagnostics thread.
+/// It is for the one line every worker says at its start, before the session exists. The
+/// diagnostics thread would be started for that line alone, in every worker, and a thread that
+/// starts and ends costs resident memory the idle measurement counts: about 200 kibibytes a worker
+/// when it ends, and about 100 when it stays. A standard error that has stopped draining before
+/// this line holds the worker here, as it always did, so that it does not report itself ready;
+/// every later line goes through the diagnostics thread.
 fn say_at_start(line: std::fmt::Arguments<'_>) {
     use std::io::Write as _;
 
