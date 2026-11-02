@@ -346,7 +346,8 @@ struct Source {
 impl Drop for Source {
     fn drop(&mut self) {
         // SAFETY: the descriptor was allocated by `GetSecurityInfo`, which asks for it to be freed
-        // with this call, and nothing else holds it. The two lists point inside it.
+        // with this call, and nothing else holds it. The two lists point inside it. A source whose
+        // descriptor is null holds nothing to free, and the call ignores a null handle.
         unsafe { LocalFree(self.descriptor) };
     }
 }
@@ -355,10 +356,10 @@ impl Source {
     /// A descriptor that holds the access list alone, to give a new object. The label is applied
     /// afterwards by [`Self::label_onto`], which is also the only way to give one to a station
     /// that exists already, whose creation ignores the security asked for, so the label reaches
-    /// both in one way. Giving a new object the whole descriptor read from the starter's own, label
-    /// included, was refused in a service session for a privilege it did not hold (error 1314);
-    /// which part of the descriptor needed it is not read here, and a standard account's runs give
-    /// new objects a descriptor with a lower label without trouble.
+    /// both in one way. Giving a new object the whole descriptor read from the starter's own was
+    /// refused in a service session for a privilege it did not hold (error 1314). Which part of
+    /// the descriptor needed it is not read here: runs as a standard account and as an
+    /// administrator give new objects a descriptor with a lower label without trouble.
     fn access_only(&self) -> SECURITY_DESCRIPTOR {
         // SAFETY: all-zero is the initial state `InitializeSecurityDescriptor` is given.
         let mut descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
@@ -588,16 +589,22 @@ fn wide(text: &str) -> Vec<u16> {
 /// These cases make desktops on the window station the test runs on, give them security of their
 /// own, and ask what the starter makes of each against a reference desktop they make.
 ///
-/// The cases that start from the desktop the test runs on (those that call `own_access_list`) take
-/// the list of that desktop with two entries added, and depend on the account and the session the
-/// test runs in. The list must be one the system writes without a condition and that a text can
+/// Every case makes desktops, so every case needs the right to create one on the station the test
+/// runs on, which the account and the session decide, and reads back what it made, which needs
+/// the list it gave to leave the caller the right to read it.
+///
+/// The cases that judge against the reference desktop (`own`, `judged`, `refusal`) or use
+/// `own_access_list` take the list of the desktop the test runs on with two entries added, and
+/// depend on that list. It must be one the system writes without a condition and that a text can
 /// give back: a null list cannot take entries, and a list with a condition is split at every
 /// parenthesis by the order case and, with a quote the text has no form for, is not given back as
 /// it is, so those cases fail by name. A list that reads the same reversed fails the order case at
 /// its assertion. The case that puts a label on a desktop also needs that list to grant the
 /// caller the right to change the label of the desktops it makes, which a standard account's
 /// session has; without it the label stays and the case fails by name. The other cases make their
-/// lists themselves and depend on neither.
+/// lists themselves and need no more than the first paragraph says, and the case with no label
+/// needs a new desktop to have none, which the runs on the test machine give at the medium and the
+/// high level (the case fails by name at its first assertion when it is not so).
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1063,7 +1070,8 @@ mod tests {
     }
 
     /// A source over an access list the system did not store: the list lives in the buffer given,
-    /// which must outlive the source, and there is no descriptor to free.
+    /// which must outlive the source and every slice read from it, and there is no descriptor to
+    /// free. The caller keeps the buffer in a binding declared before the source.
     fn source_over(list: &[u32]) -> Source {
         Source {
             descriptor: std::ptr::null_mut(),
@@ -1073,8 +1081,9 @@ mod tests {
     }
 
     /// The entries of a list are read without its header and without the room it was given: a
-    /// list given more room than its entries use is the same list as one that was not, both as the
-    /// reading takes it from a list of its own and as the system stores it.
+    /// list given more room than its entries use is the same list as one that was not, as the
+    /// reading takes it from a list of its own and as the system holds one set on a desktop.
+    /// Created with room, a list is stored without it, which the case prints.
     #[test]
     fn a_list_given_extra_room_is_read_as_the_entries_it_holds() {
         const ROOM: usize = 64;
@@ -1091,26 +1100,46 @@ mod tests {
         assert_eq!(tight_source.access_bytes().expect("the tight list"), held);
         assert_eq!(roomy_source.access_bytes().expect("the roomy list"), held);
 
-        let made = |room| {
-            try_desktop_with_entries(&entries, room)
-                .unwrap_or_else(|error| panic!("a desktop with {room} bytes of room: {error}"))
+        // Created with room, the system stores the list without it. Set on a desktop that exists,
+        // it may keep the room.
+        let (tight_desktop, set_desktop) = (
+            desktop_with_entries(&entries),
+            desktop_with_entries(&entries),
+        );
+        // SAFETY: the desktop is open with the right to change its list, the owner, group and
+        // label are absent, and the roomy list lives in this case until the call returns.
+        let set = unsafe {
+            SetSecurityInfo(
+                set_desktop.0,
+                SE_WINDOW_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                roomy.as_ptr().cast(),
+                std::ptr::null(),
+            )
         };
-        let (tight_desktop, roomy_desktop) = (made(0), made(ROOM));
-        let (tight_security, roomy_security) = (
+        assert_eq!(
+            set,
+            0,
+            "the roomy list was not set on the desktop: {}",
+            io::Error::from_raw_os_error(i32::try_from(set).unwrap_or(i32::MAX))
+        );
+        let (tight_security, set_security) = (
             security_of(tight_desktop.0).expect("the tight desktop's security"),
-            security_of(roomy_desktop.0).expect("the roomy desktop's security"),
+            security_of(set_desktop.0).expect("the set desktop's security"),
         );
         println!(
-            "bytes free as the system stores the list: {} without room, {} with {ROOM}",
+            "bytes free: {} for a list created tight, {} for one set with {ROOM} bytes of room",
             tight_security.access_size().expect("size").AclBytesFree,
-            roomy_security.access_size().expect("size").AclBytesFree,
+            set_security.access_size().expect("size").AclBytesFree,
         );
         tight_security
-            .require_no_more_on(roomy_desktop.0)
-            .expect("a list given extra room is used beside one that was not");
-        roomy_security
+            .require_no_more_on(set_desktop.0)
+            .expect("a list set with extra room is used beside one that was not");
+        set_security
             .require_no_more_on(tight_desktop.0)
-            .expect("a list that was not given extra room is used beside one that was");
+            .expect("a list that was not set with extra room is used beside one that was");
     }
 
     /// An empty access list is a list that admits nobody, not a missing one: it has no entries and
@@ -1165,7 +1194,7 @@ mod tests {
     /// An object with no integrity label has none to put on another: applying it leaves the label
     /// the other has, and the other is still refused for being below the medium level. The lists
     /// are the same on both and grant everyone every right, including the one that changes a
-    /// label, so the case depends on neither the account nor the desktop it runs on.
+    /// label, so the case does not depend on the list of the desktop it runs on.
     #[test]
     fn an_object_with_no_integrity_label_leaves_the_label_it_is_applied_to() {
         let access = "D:(A;;GA;;;WD)";
@@ -1193,29 +1222,37 @@ mod tests {
         assert!(error.to_string().contains("integrity label"), "{error}");
     }
 
-    /// A callback entry with no data after its trustee is written without a condition: its text
-    /// holds no parenthesis inside the entry's own and no quote, so the text alone does not show
-    /// it to be a callback entry, and the starter reads the entry by its kind. A list of such
-    /// entries is used beside a list of the same bytes.
+    /// A callback entry that the system writes with no condition changes the list the starter
+    /// judges all the same. Read by its text, a further denying entry of that kind would be one
+    /// that narrows the starter's own list and the object would be used, and a further allowing one
+    /// would be called wider. The starter reads such a list by its bytes instead, and stops with
+    /// an error that says the lists are not the same bytes. The case prints what the system
+    /// writes for the entry.
     #[test]
-    fn a_callback_entry_with_no_data_is_written_without_a_condition() {
+    fn a_callback_entry_the_text_shows_no_condition_for_is_judged_by_its_bytes() {
+        let own = desktop_with_entries(&[entry(0x00, 0x1, "SY", &[])]);
+        let source = security_of(own.0).expect("the starter's own security");
         for kind in [0x09, 0x0A] {
-            let list = [entry(kind, 0x1, "BG", &[]), entry(0x00, 0x1, "SY", &[])];
-            let desktop = desktop_with_entries(&list);
-            let source = security_of(desktop.0).expect("the desktop's security");
-            let text = source
-                .text(DACL_SECURITY_INFORMATION)
-                .expect("the desktop's text");
-            println!("kind {kind:#x}: the system writes {text:?}");
-            assert_eq!(
-                text.matches('(').count(),
-                2,
-                "the system wrote a condition for an entry with no data: {text}"
+            let target =
+                desktop_with_entries(&[entry(kind, 0x1, "BG", &[]), entry(0x00, 0x1, "SY", &[])]);
+            println!(
+                "kind {kind:#x}: the system writes {:?}",
+                security_of(target.0)
+                    .expect("the target's security")
+                    .text(DACL_SECURITY_INFORMATION)
             );
-            assert!(!text.contains('"'), "the system wrote a string: {text}");
-            source
-                .require_no_more_on(desktop_with_entries(&list).0)
-                .expect("a callback entry with no data was refused beside the same bytes");
+            let error = source
+                .require_no_more_on(target.0)
+                .expect_err("a list with a callback entry was used beside a list without one");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "kind {kind:#x}: {error}"
+            );
+            assert!(
+                error.to_string().contains("not the same bytes"),
+                "kind {kind:#x}: {error}"
+            );
         }
     }
 }
