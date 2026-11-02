@@ -542,9 +542,9 @@ fn told_in_place(text: &str, fixed: impl Fn() -> String) -> Option<String> {
     // first. A text with no place has nothing set aside, and the limit below holds its clause.
     let too_long_for_a_clause = pointer_place(text).is_some()
         && text.len() + "; ".len() + WHY_NOT_SHOWN.len() > LONGEST_MESSAGE;
-    // A refusal that is known by its wording is told by its reason whether or not the rule finds a
-    // name in it: it can name an account that has no form the rule can find.
-    let told = match known_reason(text) {
+    // A refusal that is known by its wording, in either reading, is told by its reason whether or
+    // not the rule finds a name in it: it can name an account that has no form the rule can find.
+    let told = match known_reason(text).or_else(|| known_reason(apart)) {
         Some(reason) => reason.to_owned(),
         None if first.map(|at| &text[..at]) != first_apart.map(|at| &apart[..at]) => fixed(),
         None => match first {
@@ -4294,6 +4294,21 @@ mod tests {
             let said = format!("{long}{clause}: marguerite wrote this");
             assert_eq!(left_out_detail_told_to_a_device(&said), nothing, "{said}");
         }
+    }
+
+    /// A refusal the module knows by its wording is told by its reason when a replaced quotation
+    /// stands where the marker's own space would be and only the readings apart complete the marker.
+    #[test]
+    fn a_known_refusal_that_a_replaced_quotation_runs_into_is_told_by_its_reason() {
+        let said = format!("{}`a b`marguerite said no", DID_NOT_REGISTER.trim_end());
+        assert_eq!(
+            message_for_a_device(ErrorCode::ResourceUnavailable, &said).as_deref(),
+            Some(
+                "the Task Scheduler did not register the environment's task; what it reported \
+                 is not sent to a paired device"
+            ),
+            "{said}"
+        );
     }
 
     #[test]
