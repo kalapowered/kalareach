@@ -612,8 +612,9 @@ impl GitProgram {
     /// an absolute path, answers with more than it was asked, ends and leaves its output open for
     /// a second inside [`PROBE_BOUND`], or is older than [`MINIMUM_GIT_VERSION`]. The message ends
     /// with the step that installs Git on this platform. Returns [`ProjectError::GitFailed`] when
-    /// Git does not answer within [`PROBE_BOUND`] or the host is short of what it needs to ask or
-    /// to resolve it: a fault that passes, and says nothing of the Git that was being asked.
+    /// Git does not answer within [`PROBE_BOUND`] or the host is short of what it needs to look for
+    /// it, to ask it or to resolve it: a fault that passes, and says nothing of the Git that was
+    /// being asked.
     pub fn discover() -> Result<Self> {
         Self::discover_on(std::env::var_os("PATH").as_deref(), PROBE_BOUND)
     }
@@ -785,9 +786,9 @@ enum Unfound {
     /// open. It stays so until the host changes, which is a host that is not set up for the work.
     Unusable(Diagnostic),
     /// The look was cut short by something that passes: the time it was given ran out, the host was
-    /// short of what it needs to ask or to resolve it, it could not wait on, collect or read from
-    /// the program, or the look ended without an answer. Nothing is known of the Git that was
-    /// being asked, and asking again later can find it.
+    /// short of what it needs to look for it, to ask it or to resolve it, it could not wait on,
+    /// collect or read from the program, or the look ended without an answer. Nothing is known of
+    /// the Git that was being asked, and asking again later can find it.
     Passing(Diagnostic),
 }
 
@@ -4012,8 +4013,8 @@ fn could_not_run(described: &str, error: &std::io::Error) -> Asked {
     }
 }
 
-/// Whether a failure to start a program, to resolve the path that names it, or to open a directory,
-/// says the host, and not the program or the place, is short of something.
+/// Whether a failure to start a program, to examine or resolve the path that names it, or to open a
+/// directory, says the host, and not the program or the place, is short of something.
 pub(crate) fn short_of_resources(error: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
@@ -7060,6 +7061,9 @@ mod tests {
     #[test]
     fn a_host_too_short_of_memory_to_resolve_a_path_of_git_refuses_the_look_as_a_fault_that_passes()
     {
+        // The clock stands still, so a process that another test starts and that holds the probe's
+        // pipe until it runs its program cannot make the wait for the end of the output run out.
+        let _clock = StandingClock::start();
         let directory = tempfile::tempdir().expect("a directory for this test");
         let helpers = directory.path().join("helpers");
         std::fs::create_dir(&helpers).expect("a helper directory");
@@ -7138,6 +7142,8 @@ mod tests {
     #[test]
     fn a_host_too_short_of_memory_to_examine_a_candidate_for_git_refuses_the_look_as_a_fault_that_passes()
      {
+        // The clock stands still, as in the case of the resolutions.
+        let _clock = StandingClock::start();
         let directory = tempfile::tempdir().expect("a directory for this test");
         let helpers = directory.path().join("helpers");
         std::fs::create_dir(&helpers).expect("a helper directory");
