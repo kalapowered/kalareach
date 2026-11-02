@@ -3386,8 +3386,9 @@ fn the_user_manager_kr_checks_is_the_one_it_asks() {
     let other = UserManager::start(&other_home, host.tree.holder()).and_then(|other| {
         // A manager that has only just come up answers late when the machine is busy, and
         // `systemctl` gives up on a bus that is slow to answer by itself. The start is therefore
-        // asked again until the bound, each call given what is left: only a manager that has not
-        // started its bus socket by then is one that cannot.
+        // asked again until the bound, each call given what is left of it (and never less than
+        // the time a call that answers needs): only a manager that has not started its bus socket
+        // by then is one that cannot.
         let asking_until = Instant::now() + TEARDOWN_BOUND;
         loop {
             let left = asking_until.saturating_duration_since(Instant::now());
