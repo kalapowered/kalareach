@@ -123,9 +123,10 @@ pub fn end_and_collect_asking_for(child: &mut std::process::Child, asked_for: Du
 
 /// Kills one of this test's own children that it has not collected, if it is still running, and
 /// collects it within [`TEARDOWN_BOUND`], where a wait for it would hold the case for as long as a
-/// child that does not go (one stuck in the kernel) stays. A process that is waiting on a disk that
-/// a stall has held for a minute is let go late, and a passing case fails for a child it is only
-/// slow to collect. Returns what of that failed, as text to add to a reason, or nothing.
+/// child that does not go (one stuck in the kernel) stays. The bound is long because a process
+/// that is waiting on a disk that a stall has held is let go late, and a passing case must not fail
+/// for a child it is only slow to collect. Returns what of that failed, as text to add to a reason,
+/// or nothing.
 pub fn kill_and_collect(child: &mut std::process::Child) -> String {
     let mut failed = String::new();
     if matches!(child.try_wait(), Ok(None))
