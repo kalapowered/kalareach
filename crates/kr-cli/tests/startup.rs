@@ -3384,17 +3384,28 @@ fn the_user_manager_kr_checks_is_the_one_it_asks() {
     )
     .expect("another unit under the same name");
     let other = UserManager::start(&other_home, host.tree.holder()).and_then(|other| {
-        // A manager that has only just come up answers late when the machine is busy; a late answer
-        // is waited for, and only a manager that gives none in that time is one that cannot start
-        // its bus.
-        let started = bounded(other.systemctl(&["start", "dbus.socket"]), TEARDOWN_BOUND)?;
-        if started.status.success() {
-            Ok(other)
-        } else {
-            Err(format!(
-                "its dbus.socket did not start: {}",
-                String::from_utf8_lossy(&started.stderr).trim()
-            ))
+        // A manager that has only just come up answers late when the machine is busy, and
+        // `systemctl` gives up on a bus that is slow to answer by itself. The start is therefore
+        // asked again until the bound, each call given what is left: only a manager that has not
+        // started its bus socket by then is one that cannot.
+        let asking_until = Instant::now() + TEARDOWN_BOUND;
+        loop {
+            let left = asking_until.saturating_duration_since(Instant::now());
+            let failed = match bounded(
+                other.systemctl(&["start", "dbus.socket"]),
+                left.max(STREAMS_DEADLINE),
+            ) {
+                Ok(started) if started.status.success() => return Ok(other),
+                Ok(started) => format!(
+                    "its dbus.socket did not start: {}",
+                    String::from_utf8_lossy(&started.stderr).trim()
+                ),
+                Err(why) => why,
+            };
+            if Instant::now() >= asking_until {
+                return Err(failed);
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
     });
     let other = match other {
