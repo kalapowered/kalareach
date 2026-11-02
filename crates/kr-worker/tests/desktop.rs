@@ -79,36 +79,6 @@ fn power_document(setting: SleepInhibitionSetting) -> String {
     configuration::contents(&document)
 }
 
-/// Starts each worker through `inner` with one more variable in its environment.
-#[cfg(unix)]
-#[derive(Debug)]
-struct WorkerWithVariable {
-    name: &'static str,
-    value: String,
-    inner: Box<dyn kr_controller::supervision::WorkerSupervisor>,
-}
-
-#[cfg(unix)]
-impl kr_controller::supervision::WorkerSupervisor for WorkerWithVariable {
-    fn start(
-        &self,
-        launch: &kr_controller::supervision::WorkerLaunch,
-    ) -> kr_controller::supervision::LaunchOutcome {
-        let mut told = launch.clone();
-        told.desktop_environment
-            .push((self.name.to_owned(), self.value.clone()));
-        self.inner.start(&told)
-    }
-
-    fn describe(&self) -> &'static str {
-        "this host's supervisor, with a variable added to each worker's environment"
-    }
-
-    fn readiness(&self) -> kr_controller::supervision::Readiness {
-        self.inner.readiness()
-    }
-}
-
 struct Host {
     /// The host tree, which ends every worker its daemon started before it goes.
     temp: teardown::Tree,
@@ -118,9 +88,6 @@ struct Host {
     task: kr_controller::supervision::windows::testing::TestTask,
     worker: PathBuf,
     environment_id: EnvironmentId,
-    /// A variable a test adds to the environment of each worker its daemon starts.
-    #[cfg(unix)]
-    worker_variable: Option<(&'static str, String)>,
 }
 
 impl Host {
@@ -153,16 +120,7 @@ impl Host {
             task,
             worker,
             environment_id,
-            #[cfg(unix)]
-            worker_variable: None,
         }
-    }
-
-    /// Starts each worker this host's daemon starts with the variable `name` set to `value`.
-    #[cfg(unix)]
-    fn with_worker_variable(mut self, name: &'static str, value: String) -> Self {
-        self.worker_variable = Some((name, value));
-        self
     }
 
     fn paths(&self) -> kr_ipc::paths::EnvironmentPaths {
@@ -179,17 +137,7 @@ impl Host {
         #[cfg(windows)]
         return self.task.product_supervisor(&self.paths());
         #[cfg(not(windows))]
-        {
-            let detached = Box::new(DetachedSupervisor::new());
-            match &self.worker_variable {
-                Some((name, value)) => Box::new(WorkerWithVariable {
-                    name,
-                    value: value.clone(),
-                    inner: detached,
-                }),
-                None => detached,
-            }
-        }
+        Box::new(DetachedSupervisor::new())
     }
 
     async fn start(&self) -> RunningDaemon {
@@ -1479,11 +1427,7 @@ async fn the_default_context_is_the_hosts_own_and_the_receipt_records_what_was_u
 async fn a_created_sessions_shell_reads_the_private_database_and_the_worker_says_so() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    // The worker's diagnostics thread writes nothing until this file exists, so the line the case
-    // reads below is late, as it is on a runner that gives that thread no time.
     let host = Host::create();
-    let hold = host.temp.root().join("hold-diagnostics");
-    let host = host.with_worker_variable("KR_TEST_HOLD_DIAGNOSTICS", hold.display().to_string());
     let daemon = host.start().await;
     let mut client = host.client().await;
 
@@ -1580,35 +1524,23 @@ async fn a_created_sessions_shell_reads_the_private_database_and_the_worker_says
         "the private entry has the truecolour flag"
     );
 
-    // The worker's own log, which is the job's diagnostics file, says the same. The worker hands
-    // the line to a thread of its own, so the line is waited for as a condition. The thread has
-    // been held since the worker started, and the shell has run by now: it is let go here.
-    std::fs::write(&hold, b"").expect("lets the worker's diagnostics thread write");
-    let started = std::time::Instant::now();
-    let line = loop {
-        let diagnostics = std::fs::read_dir(host.paths().jobs_dir())
-            .expect("the jobs directory")
-            .map(|entry| entry.expect("an entry").path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "diagnostics")
-            })
-            .map(|path| std::fs::read_to_string(path).unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if let Some(line) = diagnostics
-            .lines()
-            .find(|line| line.contains("terminfo: private database"))
-        {
-            break line.to_owned();
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(120),
-            "waited {:?} for the worker to say which terminfo database it selected: {diagnostics:?}",
-            started.elapsed()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    // The worker's own log, which is the job's diagnostics file, says the same.
+    let diagnostics = std::fs::read_dir(host.paths().jobs_dir())
+        .expect("the jobs directory")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "diagnostics")
+        })
+        .map(|path| std::fs::read_to_string(path).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let line = diagnostics
+        .lines()
+        .find(|line| line.contains("terminfo: private database"))
+        .unwrap_or_else(|| {
+            panic!("the worker's diagnostics say nothing of terminfo: {diagnostics:?}")
+        });
     assert!(line.contains(&private), "{line}");
     // The log says which of the creator's variables were kept and never what they held.
     assert!(line.contains("(TERMINFO, TERMINFO_DIRS)"), "{line}");

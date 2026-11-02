@@ -17,9 +17,12 @@
 
 // The lines this program says go through `kr_worker::diagnostics`, whose thread writes them, so that
 // a standard error that has stopped draining holds this program only for the short time `main`
-// waits for them at its end. `eprintln!` and `dbg!` write where they are called. The argument
-// parser writes its own message where it happens, for a command line it refuses, and so does the
-// standard library for a panic and for its other fatal messages, such as a failed allocation's.
+// waits for them at its end, and never its ready report, its final error or a closure line. Three
+// writes happen where they are said, and so can hold the start of a worker whose standard error
+// stopped draining before it began: the line every worker says at its start (`say_at_start`), the
+// argument parser's message for a command line it refuses, and the standard library's message for a
+// panic or another fatal error, such as a failed allocation. `eprintln!` and `dbg!` write where
+// they are called.
 #![deny(clippy::print_stderr, clippy::dbg_macro)]
 
 use std::process::ExitCode;
@@ -681,6 +684,20 @@ fn bridge_endpoint(
     )
 }
 
+/// Says one line to this process's standard error where it stands, and lets it go if it cannot be
+/// written.
+///
+/// It is for the one line every worker says at its start, before the session exists, which no pass
+/// and no stop waits behind. The diagnostics thread would be started for that line alone, and a
+/// thread started in each worker costs about a hundred kibibytes of resident memory a worker, which
+/// the idle measurement counts. A standard error that has stopped draining before a worker starts
+/// holds its start, as it always did; every later line goes through the diagnostics thread.
+fn say_at_start(line: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+
+    let _ = writeln!(std::io::stderr(), "kr-worker: {line}");
+}
+
 fn session_config(
     specification: &WorkerLaunchSpec,
     environment: &kr_ipc::paths::EnvironmentPaths,
@@ -734,7 +751,7 @@ fn session_config(
     );
     // The worker's own log says which terminfo database the session reads and what it kept of the
     // creator's, next to the other lines it writes about how it started the session.
-    tell(format_args!(
+    say_at_start(format_args!(
         "session {}: {}",
         specification.session_id,
         launch_environment.sources.terminfo.describe()

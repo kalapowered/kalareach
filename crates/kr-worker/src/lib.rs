@@ -45,7 +45,8 @@
 // A line to the standard error is written by the thread of `diagnostics`, which no pass, no session
 // call and no runtime waits for. `eprintln!` writes where it is called, and waits for a standard
 // error that has stopped draining, or panics at one that refuses the write; `dbg!` does the same.
-// The worker's own program, a different crate, holds itself to the same rule.
+// The worker's own program, a different crate, holds itself to the same rule, except for the one
+// line every worker says at its start, which it writes where it is said.
 #![deny(clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod action;
