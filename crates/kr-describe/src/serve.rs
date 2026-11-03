@@ -805,13 +805,14 @@ fn model_thread<M: Model>(
                 // waits for that write's lock to forget the job. `fetch_max`, since a
                 // cancellation that finds the job in hand may have extended the bound already.
                 let cancelled = {
-                    // Whether the job is in hand as the token is read, for a test to read back.
+                    // Whether the job is in hand as the token is read, for a test to read back once
+                    // the token has been read.
                     #[cfg(feature = "testing")]
-                    crate::testing::job_token_read(
-                        id,
-                        shared.job_in_hand.load(Ordering::Acquire) == id,
-                    );
-                    token.is_cancelled()
+                    let in_hand = shared.job_in_hand.load(Ordering::Acquire) == id;
+                    let cancelled = token.is_cancelled();
+                    #[cfg(feature = "testing")]
+                    crate::testing::job_token_read(id, in_hand);
+                    cancelled
                 };
                 let bound = if cancelled { stop_due } else { grace_due };
                 #[cfg(feature = "testing")]
