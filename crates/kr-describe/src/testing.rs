@@ -90,7 +90,7 @@ pub const WATCHDOG_FOUND: &str = "stub-watchdog-found";
 pub const WATCHDOG_SPARED: &str = "stub-watchdog-spared";
 
 /// Whether the watchdog of this process waits, when it finds work overdue, for
-/// [`release_held_work`]: set by a stub whose script holds its watchdog.
+/// [`release_held_watchdog`]: set by a stub whose script holds its watchdog.
 static HOLD_WATCHDOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the model thread of this process waits, once it has read a job's token and before it
@@ -618,10 +618,11 @@ pub struct Script {
     /// two, by an event it has seen and not by a delay. It needs `mark_work`, which it leaves its
     /// marks by.
     pub hold_job_start: bool,
-    /// Whether a job, once the time [`Self::ignore_token_ms`] gives is past, goes on without looking
-    /// at its token until [`release_held_work`] (or for a minute at most): what lets a case end a
-    /// job that has outlasted its deadline and its grace by an event it has seen, and not by a
-    /// delay. A job that is not released answers when it is.
+    /// Whether a job, once the time [`Self::ignore_token_ms`] gives is past, goes on without
+    /// looking at its token until [`release_held_work`] (or for a minute at most): what lets a
+    /// case end a job that has outlasted its deadline and its grace by an event it has seen, and
+    /// not by a delay. The job then answers as any job does: when the mark is made, or when the
+    /// minute ends.
     pub ignore_token_until_released: bool,
     /// Whether the process holds the lock on its standard error from before it serves, as a write
     /// that waits on a pipe nobody reads does: every other write to standard error waits for the

@@ -939,8 +939,8 @@ fn a_job_cancelled_before_it_is_in_hand_is_held_to_the_stop_bound_from_the_start
 /// holds the model thread between the two; the case sends the stop once the process says it has read
 /// the token (the record is left after the read, so the token is always read as not cancelled and
 /// the model thread always has the grace to set), reads the acknowledgement, which is written after
-/// the extension, and lets the model thread go. The bound the process holds the job to is then read back from the process: the stop bound.
-/// No delay decides it. A bound set in place of the extension, or a job put in hand after its bound,
+/// the extension, and lets the model thread go. The bound the process holds the job to is then read
+/// back from the process: the stop bound. No delay decides it. A bound set in place of the extension, or a job put in hand after its bound,
 /// leaves the grace.
 #[test]
 fn a_stop_read_while_a_job_comes_into_hand_is_not_lost() {
