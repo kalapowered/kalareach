@@ -21,8 +21,9 @@ use kr_describe::serve::{
 };
 use kr_describe::supervise::STOP_BOUND_MS;
 use kr_describe::testing::{
-    Script, acknowledging_state, job_bounds, job_in_hand_at_the_read, release_held_work,
-    token_cancelled_at_the_look, watchdog_found, watchdog_has_spared,
+    Script, acknowledging_state, bound_held_after_the_answer, job_bounds, job_in_hand_at_the_read,
+    release_held_watchdog, release_held_work, token_cancelled_at_the_look, watchdog_found,
+    watchdog_has_spared,
 };
 use kr_describe::wire::{Answer, JobEnd, LoadEnd, Request, WIRE_VERSION, frame_of};
 use kr_protocol::ids::SessionEpoch;
@@ -820,7 +821,7 @@ fn a_stop_applied_after_the_watchdog_found_the_job_overdue_is_not_missed() {
         process.expect_answer(SOON, "the acknowledgement"),
         Answer::Cancelling { id: U64::new(2) }
     );
-    release_held_work(&runtime);
+    release_held_watchdog(&runtime);
     wait_for("the watchdog to decide", || {
         watchdog_has_spared(&runtime) || process.exit_within(Duration::ZERO).is_some()
     });
@@ -833,18 +834,20 @@ fn a_stop_applied_after_the_watchdog_found_the_job_overdue_is_not_missed() {
 /// KR-REQ-22.11: a job that ends after the watchdog has found it overdue, and before the watchdog
 /// has decided to end the process, leaves the process alone: the bound the watchdog found is gone,
 /// and the process is idle. The script holds the watchdog between its finding, which it records,
-/// and its decision; the job outlasts its deadline and the grace by [`SOON`] and answers, and a
-/// check of a file that the process refuses is answered after it, which shows the model thread has
-/// cleared the job's bound; then the case lets the watchdog go and reads its record that it left
-/// the process alone. The wait for the job's answer allows the time the job takes, so a host that
-/// is late by less than [`SOON`] does not fail it. A watchdog that ends the process unless the
-/// bound has moved later ends the idle process as overdue.
+/// and its decision, and holds the job past its deadline and its grace until the case releases it;
+/// each has a release of its own. The case waits for the watchdog's record of the expired bound,
+/// so a watchdog that is late finds the job still there; releases the job; waits for the process's
+/// record that the job is answered and the bound it held is cleared, and reads that it is nought;
+/// and only then releases the watchdog and reads its record that it left the process alone. No
+/// delay decides it. A watchdog that ends the process unless the bound has moved later, or a model
+/// thread that does not clear the bound when the job is answered, ends or keeps an idle process
+/// as overdue.
 #[test]
 fn a_job_that_ends_after_the_watchdog_found_it_overdue_does_not_end_the_process() {
     let placed = Placed::stub();
     let runtime = placed.directory("job-ends-while-held");
     let script = Script {
-        ignore_token_ms: 200 + OVERDUE_GRACE_MS + SOON.as_secs() * 1_000,
+        ignore_token_until_released: true,
         mark_work: true,
         hold_watchdog: true,
         ..Script::default()
@@ -857,7 +860,8 @@ fn a_job_that_ends_after_the_watchdog_found_it_overdue_does_not_end_the_process(
     wait_for("the watchdog to find the job overdue", || {
         watchdog_found(&runtime).is_some()
     });
-    let answer = process.expect_answer(SOON * 2, "the job's answer");
+    release_held_work(&runtime);
+    let answer = process.expect_answer(SOON, "the job's answer");
     assert!(
         matches!(
             answer,
@@ -865,19 +869,15 @@ fn a_job_that_ends_after_the_watchdog_found_it_overdue_does_not_end_the_process(
         ),
         "{answer:?}"
     );
-    process.send(&Request::Verify {
-        id: U64::new(3),
-        profile_id: "a-profile-nobody-signed".to_owned(),
-        revision: U64::new(1),
-        file_name: "nothing.gguf".to_owned(),
-        path: "/nowhere/nothing.gguf".to_owned(),
-        deadline_ms: U64::new(60_000),
+    wait_for("the model thread to clear the job's bound", || {
+        bound_held_after_the_answer(&runtime, 2).is_some()
     });
-    assert!(matches!(
-        process.expect_answer(SOON, "the check's answer"),
-        Answer::Verified { id, .. } if id.get() == 3
-    ));
-    release_held_work(&runtime);
+    assert_eq!(
+        bound_held_after_the_answer(&runtime, 2),
+        Some(0),
+        "the bound the job was held to is cleared when it is answered"
+    );
+    release_held_watchdog(&runtime);
     wait_for("the watchdog to decide", || {
         watchdog_has_spared(&runtime) || process.exit_within(Duration::ZERO).is_some()
     });

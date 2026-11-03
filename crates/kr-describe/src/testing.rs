@@ -53,8 +53,12 @@ pub const BEGAN_PREFIX: &str = "stub-began-";
 pub const LOADED_PREFIX: &str = "stub-loaded-";
 
 /// The name of the file in a stub's runtime directory that [`release_held_work`] makes, and that
-/// ends the wait of a load, a job, the watchdog or a job start the script holds.
+/// ends the wait of a load, a job or a job start the script holds.
 const RELEASE_MARK: &str = "stub-released";
+
+/// The name of the file in a stub's runtime directory that [`release_held_watchdog`] makes, and
+/// that ends the wait of a watchdog the script holds.
+const WATCHDOG_RELEASE_MARK: &str = "stub-watchdog-released";
 
 /// The start of the name of the file a recording process ([`Raw::Recording`]) leaves in its runtime
 /// directory for each job it is sent, followed by the job's identifier. It holds the deadline in
@@ -209,7 +213,7 @@ pub struct WatchdogFound {
 
 /// Records that the watchdog found work overdue against `due` at `look`, when the process is a stub
 /// whose script marks work, and holds the watchdog there when the script holds it, until
-/// [`release_held_work`].
+/// [`release_held_watchdog`].
 pub(crate) fn watchdog_found_overdue(previous_look: u64, look: u64, due: u64) {
     let Some(directory) = RECORDS_DIRECTORY.get() else {
         return;
@@ -219,7 +223,7 @@ pub(crate) fn watchdog_found_overdue(previous_look: u64, look: u64, due: u64) {
         format!("{previous_look} {look} {due}"),
     );
     if HOLD_WATCHDOG.load(std::sync::atomic::Ordering::Acquire) {
-        hold_until_released(directory);
+        hold_until(directory, WATCHDOG_RELEASE_MARK);
     }
 }
 
@@ -229,6 +233,35 @@ pub(crate) fn watchdog_spared() {
     if let Some(directory) = RECORDS_DIRECTORY.get() {
         let _ = std::fs::write(directory.join(WATCHDOG_SPARED), "spared");
     }
+}
+
+/// The start of the name of the file a stub whose script marks work leaves in its runtime
+/// directory when its model thread has answered the job with an identifier and cleared the bound
+/// it held the job to, followed by that identifier. It holds the bound the process then holds, in
+/// the process's stamps, which is nought for a process with nothing in hand.
+pub const JOB_CLEARED_PREFIX: &str = "stub-job-cleared-";
+
+/// Records the bound the process holds once the job with this identifier is answered and its bound
+/// cleared, when the process is a stub whose script marks work.
+pub(crate) fn job_bound_cleared(id: u64, held: u64) {
+    if let Some(directory) = RECORDS_DIRECTORY.get() {
+        let _ = std::fs::write(
+            directory.join(format!("{JOB_CLEARED_PREFIX}{id}")),
+            held.to_string(),
+        );
+    }
+}
+
+/// Returns the bound, in the process's stamps, that the stub process with `runtime_dir` as its
+/// runtime directory held once the job with this identifier was answered and its bound cleared,
+/// once that has happened: nought when nothing is held.
+#[must_use]
+pub fn bound_held_after_the_answer(runtime_dir: &Path, id: u64) -> Option<u64> {
+    std::fs::read_to_string(runtime_dir.join(format!("{JOB_CLEARED_PREFIX}{id}")))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Records whether the job with this identifier was in hand as the model thread read its token,
@@ -309,10 +342,10 @@ pub fn job_deadlines_sent(runtime_dir: &Path) -> Vec<(u64, u64)> {
 }
 
 /// Lets the loads and the jobs run that stub processes with `runtime_dir` as their runtime
-/// directory hold ([`Script::load_until_released`] and [`Script::generate_until_released`]), the
-/// watchdog a script holds ([`Script::hold_watchdog`]) and the job starts it holds
+/// directory hold ([`Script::load_until_released`], [`Script::generate_until_released`] and
+/// [`Script::ignore_token_until_released`]) and the job starts they hold
 /// ([`Script::hold_job_start`]): the ones waiting now end, and the ones that begin afterwards are
-/// not held.
+/// not held. The watchdog a script holds has a release of its own, [`release_held_watchdog`].
 ///
 /// # Panics
 ///
@@ -321,6 +354,18 @@ pub fn job_deadlines_sent(runtime_dir: &Path) -> Vec<(u64, u64)> {
 pub fn release_held_work(runtime_dir: &Path) {
     std::fs::write(runtime_dir.join(RELEASE_MARK), "released")
         .expect("the mark that releases held work is made");
+}
+
+/// Lets the watchdog run that a stub process with `runtime_dir` as its runtime directory holds
+/// ([`Script::hold_watchdog`]): the one waiting now goes on to decide, and it is not held again.
+///
+/// # Panics
+///
+/// Panics when the mark cannot be made, since a case that cannot release its watchdog would wait
+/// for nothing.
+pub fn release_held_watchdog(runtime_dir: &Path) {
+    std::fs::write(runtime_dir.join(WATCHDOG_RELEASE_MARK), "released")
+        .expect("the mark that releases the held watchdog is made");
 }
 
 thread_local! {
@@ -563,7 +608,7 @@ pub struct Script {
     /// runtime directory as it starts, holding the daemon's start identity it was given as JSON, so
     /// a test can tell whether it was ever started and what it was told.
     pub mark_start: bool,
-    /// Whether the process's watchdog waits for [`release_held_work`] when it finds work overdue,
+    /// Whether the process's watchdog waits for [`release_held_watchdog`] when it finds work overdue,
     /// before it decides what to do about it: what lets a case make a cancellation arrive between
     /// the finding and the decision, by an event it has seen and not by a delay. It needs
     /// `mark_work`, which it leaves its marks by.
@@ -573,6 +618,11 @@ pub struct Script {
     /// two, by an event it has seen and not by a delay. It needs `mark_work`, which it leaves its
     /// marks by.
     pub hold_job_start: bool,
+    /// Whether a job, once the time [`Self::ignore_token_ms`] gives is past, goes on without looking
+    /// at its token until [`release_held_work`] (or for a minute at most): what lets a case end a
+    /// job that has outlasted its deadline and its grace by an event it has seen, and not by a
+    /// delay. A job that is not released answers when it is.
+    pub ignore_token_until_released: bool,
     /// Whether the process holds the lock on its standard error from before it serves, as a write
     /// that waits on a pipe nobody reads does: every other write to standard error waits for the
     /// lock, for good.
@@ -778,6 +828,10 @@ impl Script {
         flag("mark-start", self.mark_start);
         flag("hold-watchdog", self.hold_watchdog);
         flag("hold-job-start", self.hold_job_start);
+        flag(
+            "ignore-token-until-released",
+            self.ignore_token_until_released,
+        );
         flag("hold-standard-error", self.hold_standard_error);
         flag("spin", self.spin);
         match &self.output {
@@ -859,6 +913,7 @@ impl Script {
                 "mark-start" => script.mark_start = true,
                 "hold-watchdog" => script.hold_watchdog = true,
                 "hold-job-start" => script.hold_job_start = true,
+                "ignore-token-until-released" => script.ignore_token_until_released = true,
                 "hold-standard-error" => script.hold_standard_error = true,
                 "spin" => script.spin = true,
                 "output" => {
@@ -1052,6 +1107,11 @@ impl Model for StubModel {
         );
         if self.script.ignore_token_ms > 0 {
             std::thread::sleep(Duration::from_millis(self.script.ignore_token_ms));
+        }
+        if self.script.ignore_token_until_released
+            && let Some(runtime_dir) = &self.runtime_dir
+        {
+            hold_until_released(runtime_dir);
         }
         // Held to the end of the job, and written so that each page is resident.
         let wanted = usize::try_from(self.script.hold_bytes).unwrap_or(0);
@@ -1940,7 +2000,12 @@ fn run_raw(raw: Raw, script: &Script, runtime_dir: &Path) -> i32 {
 /// Waits until [`release_held_work`] has been called for `runtime_dir`, or for a minute, so that a
 /// test that never releases leaves no process waiting for good.
 fn hold_until_released(runtime_dir: &Path) {
-    let mark = runtime_dir.join(RELEASE_MARK);
+    hold_until(runtime_dir, RELEASE_MARK);
+}
+
+/// Waits until the file `mark` is in `runtime_dir`, or for a minute.
+fn hold_until(runtime_dir: &Path, mark: &str) {
+    let mark = runtime_dir.join(mark);
     let until = Instant::now() + Duration::from_secs(60);
     while !mark.exists() && Instant::now() < until {
         std::thread::sleep(LOOK);

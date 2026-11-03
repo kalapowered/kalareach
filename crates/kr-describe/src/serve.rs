@@ -873,6 +873,9 @@ fn model_thread<M: Model>(
                     },
                 });
                 shared.work_due.store(0, Ordering::Release);
+                // The bound held now that the job is answered, for a test to read back.
+                #[cfg(feature = "testing")]
+                crate::testing::job_bound_cleared(id, shared.work_due.load(Ordering::Acquire));
                 shared.job_in_hand.store(0, Ordering::Release);
             }
             Work::Verify {
