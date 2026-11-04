@@ -2772,6 +2772,176 @@ async fn the_contact_server_of_this_release_asks_the_worker_of_the_release_befor
     host.worker_ended(&updated.worker).await;
 }
 
+/// KR-REQ-11.63, KR-REQ-26.10: a kept answer's record of sends, written beside the answer by this
+/// release, is left behind by the release before, which lists the kept answers alone. That release
+/// reads the answer this release writes and sends it; it discards the answer and leaves the record,
+/// which names no answer, is ignored, and is swept by this release's next reading of the kept
+/// answers, after the update again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_of_sends_the_release_before_leaves_beside_a_sent_answer_is_swept_after_the_update_again()
+ {
+    use kr_client::answers::{ANSWER_FORMAT, AnswerDraft, AnswerDrafts, Leave, WRITTEN};
+
+    let updated = Updated::with_a_contact_session().await;
+    let host = &updated.host;
+    let client = updated.contact_client().await;
+    let (created, failed) = call_tool(
+        &client,
+        "ask_user",
+        json!({
+            "request_id": "ask-1",
+            "agent_name": "a test agent",
+            "context": "two ways to do it",
+            "question": "which one?",
+            "type": "select",
+            "choices": [
+                {"choice_id": "left", "label": "Left"},
+                {"choice_id": "right", "label": "Right"}
+            ]
+        }),
+    )
+    .await;
+    assert!(!failed, "the question was created: {created}");
+    let question_id = created["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+
+    // The worker is the release before's, which this release's `kr` does not read. The pair is
+    // written here as this release's `kr question answer` writes it before it sends: the answer, and
+    // the record of the send it goes out under.
+    let theirs = host.run(&updated.kr_before(), &["--json", "question", "list"]);
+    assert!(
+        theirs.status.success(),
+        "{}",
+        String::from_utf8_lossy(&theirs.stderr)
+    );
+    let theirs: serde_json::Value = serde_json::from_slice(&theirs.stdout).expect("a document");
+    let revision: u64 = theirs["questions"][0]["revision"]
+        .as_u64()
+        .or_else(|| {
+            theirs["questions"][0]["revision"]
+                .as_str()
+                .and_then(|text| text.parse().ok())
+        })
+        .expect("a revision");
+    let state_root = host.tree.paths().state_root().to_path_buf();
+    let kept = state_root.join("kept-answers");
+    let draft = AnswerDraft {
+        version: ANSWER_FORMAT,
+        target: kr_protocol::envelope::ActionTarget {
+            environment_id: host.tree.environment_id(),
+            session_id: kr_protocol::scalars::Nullable::some(updated.session_id),
+            session_epoch: kr_protocol::scalars::Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+            application_instance_id: kr_protocol::scalars::Nullable::null(),
+            agent_binding_revision: kr_protocol::scalars::Nullable::null(),
+        },
+        session_id: updated.session_id,
+        question_id: question_id.parse().expect("a question identifier"),
+        question_revision: kr_protocol::ids::QuestionRevision::new(revision),
+        answer: kr_protocol::question::QuestionAnswer::Choice {
+            choice_id: "left".to_owned(),
+        },
+        drafted_at_ms: kr_ipc::now_ms(),
+    };
+    let store = AnswerDrafts::open(&kept).expect("the store opens");
+    let writers = kr_ipc::install::hold_writers(
+        &kr_ipc::install::Writing::in_roots(host.tree.paths().runtime_root(), &state_root),
+        &mut || {},
+    )
+    .expect("the writers' lock");
+    let leave = Leave {
+        answers: writers.permit(&WRITTEN).expect("permitted"),
+        sends: writers
+            .permit(&kr_client::sends::WRITTEN)
+            .expect("permitted"),
+    };
+    let basis = store.basis(draft.question_id).expect("the pair reads");
+    store
+        .begin(
+            &draft,
+            &basis,
+            &[],
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            &leave,
+        )
+        .expect("the pair is recorded");
+    drop(leave);
+    drop(writers);
+    let answer_file = kept.join(format!("{question_id}.answer"));
+    let record_file = kept.join(format!("{question_id}.send"));
+    assert!(answer_file.is_file() && record_file.is_file());
+
+    // The host goes back to the release before: only its own session is live, so the rollback goes
+    // on. Its `kr` reads the answer this release wrote, sends it to its own worker, discards the
+    // answer, and leaves the record, which it does not list.
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(updated.one.name().clone())
+    );
+    let sent = host.run(&updated.kr_before(), &["question", "send", &question_id]);
+    assert!(
+        sent.status.success(),
+        "the release before sends the answer this release wrote: {}{}",
+        String::from_utf8_lossy(&sent.stdout),
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    assert!(
+        !answer_file.exists(),
+        "that release discards the answer it sent"
+    );
+    assert!(
+        record_file.is_file(),
+        "and leaves the record, which it does not list"
+    );
+
+    // Forward again. This release's reading of the kept answers sweeps the record, which names no
+    // answer, before it reads any worker.
+    let archive = host.scratch("archives").join("two-again.tar.gz");
+    updated.two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the update again goes on: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        record_file.is_file(),
+        "an update alone does not read the kept answers"
+    );
+    let drafts = host.run(&updated.kr_now(), &["--json", "question", "drafts"]);
+    assert!(
+        drafts.status.success(),
+        "{}",
+        String::from_utf8_lossy(&drafts.stderr)
+    );
+    let drafts: serde_json::Value = serde_json::from_slice(&drafts.stdout).expect("a document");
+    assert_eq!(drafts["drafts"], json!([]), "{drafts}");
+    assert!(
+        !record_file.exists(),
+        "the record that named no answer was swept"
+    );
+
+    // The question lives as long as the process that asked it, which is this one's client.
+    drop(client);
+    host.close(&updated.kr_now(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
 /// The catalogue's own builder of signed generations, for a package this suite writes.
 #[allow(dead_code)]
 #[path = "../../kr-plugin-catalogue/tests/support/mod.rs"]
