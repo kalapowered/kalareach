@@ -17,8 +17,8 @@ $script:KR_SECRET_VARIABLE = 'KR_SHELL_BRIDGE_SECRET'
 $script:KR_SESSION_VARIABLE = 'KR_SESSION'
 # The longest the module waits for the worker's answer to its hello. The environment may name
 # another, in milliseconds, for a host that cannot promise a worker's answer inside five seconds (a
-# harness driving the module on a loaded machine); anything that is not a positive whole number
-# leaves this one. Like the bootstrap values, the variable leaves the exported environment once the
+# harness driving the module on a loaded machine); anything that is not a whole number from 1 to
+# 4294967295 leaves this one. Like the bootstrap values, the variable leaves the exported environment once the
 # handshake is accepted, so no program the shell starts inherits it.
 $script:KR_HANDSHAKE_WAIT_MS = 5000
 $script:KR_HANDSHAKE_WAIT_VARIABLE = 'KR_SHELL_BRIDGE_HANDSHAKE_WAIT_MS'
