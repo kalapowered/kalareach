@@ -31,10 +31,12 @@
 //! escape section 7 lets outlive the terminal. A child of the worker is read as the root shell's
 //! session's only while that session is shown to be the recorded one: the root shell is still the
 //! process that was recorded, or a process in the session began while the root shell still held
-//! its number, which the shell's own waits say. Once the session has emptied, its number can name
-//! a new session, and the children of that one are not this session's. A process that began within
-//! a tick of the clock (ten milliseconds) of the root shell's collection is not shown that way
-//! when nothing older is left in the session; the record says it left such children out.
+//! its number, which the shell's own waits say, or one the worker's tree showed in the session
+//! earlier is still in it. Once the session has emptied, its number can name a new session, and
+//! the children of that one are not this session's. A process that began after the root shell's
+//! last wait (within a tick of the clock, ten milliseconds, of its collection, or later) is not
+//! shown that way until something older, or something already shown, is read in the session; the
+//! record says it left such children out when it does not hold them.
 //! Elsewhere the session's processes are the terminal's, and a descendant that calls `setsid`
 //! leaves the terminal and stops being visible. Nothing here pretends otherwise: such a host
 //! reports incomplete coverage and lists what it confirmed.
@@ -210,6 +212,12 @@ pub struct OwnedProcesses {
     /// [`Self::session_is_the_recorded_one`]. Shared with every copy, and with the root shell.
     #[cfg(target_os = "linux")]
     root_held: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The processes a reading of the worker's tree found while the root's session was shown to be
+    /// the recorded one, by identifier and start value. One of them that is still in that session
+    /// shows it still is, however long after the root shell's last wait it began. Shared with
+    /// every copy, and kept to about twice the record's bound.
+    #[cfg(target_os = "linux")]
+    proved: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<(u64, u64)>>>,
     /// The most processes `seen` holds.
     cap: usize,
     /// Whether a process was refused for want of room, and said so.
@@ -398,6 +406,8 @@ impl OwnedProcesses {
             noted_elsewhere: BTreeMap::new(),
             #[cfg(target_os = "linux")]
             root_held: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(target_os = "linux")]
+            proved: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
             cap: MAX_RECORDED_PROCESSES,
             refused_for_room: false,
             #[cfg(test)]
@@ -476,6 +486,8 @@ impl OwnedProcesses {
                 noted_elsewhere: BTreeMap::new(),
                 #[cfg(target_os = "linux")]
                 root_held: std::sync::Arc::clone(&self.root_held),
+                #[cfg(target_os = "linux")]
+                proved: std::sync::Arc::clone(&self.proved),
                 cap: self.cap,
                 refused_for_room: self.refused_for_room,
                 #[cfg(test)]
@@ -1983,7 +1995,10 @@ impl OwnedProcesses {
             if !in_the_session.is_empty() {
                 if self.session_is_the_recorded_one(root, &in_the_session) {
                     pending.extend(in_the_session);
-                } else {
+                } else if in_the_session
+                    .iter()
+                    .any(|(_, identity)| !self.seen.contains_key(&key(identity)))
+                {
                     self.note_unestablished(format!(
                         "the worker holds processes in the session numbered {root}, which was not \
                          shown to be the session this record began, so they were not recorded"
@@ -1991,8 +2006,24 @@ impl OwnedProcesses {
                 }
             }
             if pending.is_empty() {
+                #[cfg(target_os = "linux")]
+                self.keep_as_proved(&members);
                 return Some(members);
             }
+        }
+    }
+
+    /// Remembers the processes a reading of the worker's tree found, which it found only while the
+    /// root's session was shown to be the recorded one.
+    #[cfg(target_os = "linux")]
+    fn keep_as_proved(&self, members: &[ProcessStartIdentity]) {
+        let mut proved = self
+            .proved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        proved.extend(members.iter().map(key));
+        if proved.len() > self.cap.saturating_mul(2) {
+            proved.retain(|this| self.live.contains_key(this));
         }
     }
 
@@ -2009,7 +2040,9 @@ impl OwnedProcesses {
     /// still held the number: it can only have joined the session by being born in it, so the
     /// number has named this session since, and any other process in the session is in it too.
     /// How long the root shell held the number is [`Self::root_held`], and a process began before
-    /// it when the clock tick it began in ended before it.
+    /// it when the clock tick it began in ended before it. A process that an earlier reading of
+    /// the worker's tree found while the session was shown to be this one ([`Self::proved`]) is
+    /// as good: it was in the session then and is in it still.
     ///
     /// The candidates are the children of the worker just read in the session; the processes the
     /// record already holds are looked at too, whichever way they were recorded. Each is read once
@@ -2017,9 +2050,9 @@ impl OwnedProcesses {
     ///
     /// With no such process the session is not taken to be this one, whatever the host says about
     /// who holds the number: an answer that could not be had is no evidence either. That leaves
-    /// unrecorded the processes of a session whose root shell was collected within a clock tick
-    /// (ten milliseconds) of their beginning, when the record knows nothing older that is still in
-    /// the session; the record says so.
+    /// unrecorded the processes of a session that began after the root shell's last wait, when
+    /// nothing older and nothing shown earlier is left in the session; the record says so when it
+    /// does not hold them.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn session_is_the_recorded_one(
         &self,
@@ -2045,11 +2078,18 @@ impl OwnedProcesses {
                     .saturating_mul(1000)
                     <= held.saturating_mul(ticks)
             };
+            let proved = self
+                .proved
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             candidates
                 .iter()
                 .map(|(_, identity)| identity)
                 .chain(self.live.values())
-                .filter(|member| member.pid.get() != u64::from(root) && began_before(member))
+                .filter(|member| {
+                    member.pid.get() != u64::from(root)
+                        && (began_before(member) || proved.contains(&key(member)))
+                })
                 .any(|member| {
                     u32::try_from(member.pid.get())
                         .ok()
@@ -3623,18 +3663,36 @@ mod tests {
 
     /// KR-REQ-07.14 and KR-REQ-07.60: a process that holds the number of the record's root shell
     /// is not the root shell, and the children of the worker in the session of that number are
-    /// not the record's. The status of a child that has ended and waits for the worker is still
-    /// the worker's own to read.
+    /// not the record's. The status of that process, which has ended and waits for the worker, is
+    /// still the worker's own to read.
+    ///
+    /// The leader of the session holds the number as a process that has ended and is not
+    /// collected, and has left a process that the worker adopted.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_process_that_holds_the_roots_number_leaves_the_children_in_its_session_alone() {
         use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        use std::io::BufRead as _;
 
         adopt_orphans();
         let mut leader = std::process::Command::new("setsid")
-            .args(["sh", "-c", "exit 4"])
+            .args([
+                "sh",
+                "-c",
+                "sh -c 'sleep 600 >/dev/null 2>&1 & echo $!'; exit 4",
+            ])
+            .stdout(std::process::Stdio::piped())
             .spawn()
-            .expect("starts a leader that ends at once");
+            .expect("starts a leader that leaves a process and ends");
+        let left: u32 = std::io::BufReader::new(leader.stdout.take().expect("its output"))
+            .lines()
+            .next()
+            .expect("the leader names the process")
+            .expect("reads the line")
+            .trim()
+            .parse()
+            .expect("a process number");
+        let _ending = Adopted(vec![left]);
         waitid(
             WaitId::Pid(
                 Pid::from_raw(i32::try_from(leader.id()).expect("a number")).expect("a process"),
@@ -3644,6 +3702,7 @@ mod tests {
         .expect("the leader is waited for");
         let held = kr_ipc::identity::process_start_identity(leader.id())
             .expect("the leader is in the process table until it is collected");
+        let left = kr_ipc::identity::process_start_identity(left).expect("the process's identity");
         let mut owned = OwnedProcesses::establish(
             OwnershipBoundary::TerminalGroup {
                 group: 1,
@@ -3651,10 +3710,16 @@ mod tests {
             },
             ProcessStartIdentity::new(held.pid.get(), held.source, held.start_value.get() + 1),
         );
-        let found = tree_once_read(&mut owned);
-        owned.take(found);
-        let found = tree_once_read(&mut owned);
-        owned.take(found);
+        for _ in 0..2 {
+            let found = tree_once_read(&mut owned);
+            assert!(
+                !found.contains(&left),
+                "process {} is a child of the worker in the session of a process that holds the \
+                 root's number, and the walk read it as the record's",
+                left.pid
+            );
+            owned.take(found);
+        }
         assert_eq!(leader.wait().expect("the leader's status").code(), Some(4));
     }
 
@@ -3683,6 +3748,47 @@ mod tests {
                 found.contains(process),
                 "process {} is a child of the worker that began while the recorded session's root \
                  shell held its number, and the walk did not read it: {found:?}",
+                process.pid
+            );
+        }
+    }
+
+    /// KR-REQ-07.14 and KR-REQ-07.60: a process the walk found in the recorded session shows the
+    /// session for the walks after it, however late it began. The processes that began while the
+    /// root shell held its number have ended in the case (the moment the shell was last known to
+    /// hold it is before these began), and the children the earlier walk found are still found.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_the_walk_found_in_the_session_shows_it_to_the_walks_after_it() {
+        let session = a_session_whose_leader_was_collected(2);
+        let mut owned = OwnedProcesses::establish(
+            OwnershipBoundary::TerminalGroup {
+                group: 1,
+                terminal: None,
+            },
+            session.leader.clone(),
+        );
+        owned
+            .root_held
+            .store(session.held, std::sync::atomic::Ordering::Release);
+        let found = tree_once_read(&mut owned);
+        for process in &session.processes {
+            assert!(
+                found.contains(process),
+                "the first walk did not read process {}: {found:?}",
+                process.pid
+            );
+        }
+        owned.take(found);
+        owned
+            .root_held
+            .store(0, std::sync::atomic::Ordering::Release);
+        let found = tree_once_read(&mut owned);
+        for process in &session.processes {
+            assert!(
+                found.contains(process),
+                "process {} was found in the recorded session and the walk after it did not read \
+                 it: {found:?}",
                 process.pid
             );
         }
