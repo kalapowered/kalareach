@@ -231,7 +231,8 @@ impl Destination {
     /// # Errors
     ///
     /// Returns [`ProjectError::Destination`] when the name is taken or the directory cannot be
-    /// created.
+    /// created, except that a host too short of descriptors, processes or memory to make it is
+    /// [`ProjectError::GitFailed`], a fault that passes, or the location's refusal.
     pub fn reserve(&self) -> Result<AuthorisedDirectory> {
         let parent = self.reach()?;
         // A case that asks for it has the make fail, as it does for a host that is short of memory.
@@ -242,21 +243,21 @@ impl Destination {
         };
         #[cfg(not(all(test, unix)))]
         let made = parent.handle().create_dir(self.name.as_str());
-        made.map_err(|error| ProjectError::Destination {
-            detail: if error.kind() == std::io::ErrorKind::AlreadyExists {
-                format!(
-                    "{} is taken, and an isolated workspace is created rather than merged into \
-                         something",
-                    crate::git::redact(&self.path().display().to_string())
-                )
-                .into()
+        made.map_err(|error| {
+            let path = crate::git::redact(&self.path().display().to_string());
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ProjectError::Destination {
+                    detail: format!(
+                        "{path} is taken, and an isolated workspace is created rather than merged \
+                         into something"
+                    )
+                    .into(),
+                }
             } else {
-                format!(
-                    "{} could not be created: {error}",
-                    crate::git::redact(&self.path().display().to_string())
-                )
-                .into()
-            },
+                // A host too short of descriptors, processes or memory to make the directory has
+                // said nothing of the destination, so that is a fault that passes.
+                crate::boundary::refused_by(&error, format!("{path} could not be created: {error}"))
+            }
         })?;
         parent.sync(kr_flush::NameKind::Directory)?;
         Ok(parent.subdirectory(&self.name)?)
@@ -769,8 +770,9 @@ fn staged_in(directory: &AuthorisedDirectory) -> Result<StagedWitness> {
 /// # Errors
 ///
 /// Returns [`ProjectError::Destination`] when the destination name is taken or the rename fails,
-/// [`ProjectError::IdentityChanged`] when the staged object is not the recorded one, or the
-/// location's refusal.
+/// except that a host too short of descriptors, processes or memory to rename is
+/// [`ProjectError::GitFailed`], a fault that passes, [`ProjectError::IdentityChanged`] when the
+/// staged object is not the recorded one, or the location's refusal.
 pub fn publish(
     staging: &StagingSibling,
     destination: &Destination,
@@ -875,13 +877,18 @@ fn rename_no_replace(
             )
             .into(),
         },
-        other => ProjectError::Destination {
-            detail: format!(
-                "{} could not be published: {other}",
-                crate::git::redact(to_name.as_str())
+        other => {
+            // A host too short of descriptors, processes or memory to rename the tree has said
+            // nothing of the name, and the rename moved nothing, so that is a fault that passes.
+            let other = std::io::Error::from(other);
+            crate::boundary::refused_by(
+                &other,
+                format!(
+                    "{} could not be published: {other}",
+                    crate::git::redact(to_name.as_str())
+                ),
             )
-            .into(),
-        },
+        }
     })
 }
 
