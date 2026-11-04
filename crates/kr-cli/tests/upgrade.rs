@@ -2874,7 +2874,6 @@ async fn a_record_of_sends_the_release_before_leaves_beside_a_sent_answer_is_swe
         .expect("the pair is recorded");
     drop(leave);
     drop(writers);
-    drop(client);
     let answer_file = kept.join(format!("{question_id}.answer"));
     let record_file = kept.join(format!("{question_id}.send"));
     assert!(answer_file.is_file() && record_file.is_file());
@@ -2943,6 +2942,8 @@ async fn a_record_of_sends_the_release_before_leaves_beside_a_sent_answer_is_swe
         "the record that named no answer was swept"
     );
 
+    // The question lives as long as the process that asked it, which is this one's client.
+    drop(client);
     host.close(&updated.kr_now(), &updated.display);
     host.worker_ended(&updated.worker).await;
 }
