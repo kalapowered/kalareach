@@ -656,10 +656,24 @@ mod cases {
             &mut || {},
         )
         .expect("a client outside a store holds nothing");
-        let permit = writers
-            .permit(&crate::answers::WRITTEN)
-            .expect("a client outside a store may keep an answer");
-        drafts.keep(&kept, &permit).expect("kept");
+        let leave = crate::answers::Leave {
+            answers: writers
+                .permit(&crate::answers::WRITTEN)
+                .expect("a client outside a store may keep an answer"),
+            sends: writers
+                .permit(&crate::sends::WRITTEN)
+                .expect("a client outside a store may record a send"),
+        };
+        let basis = drafts.basis(kept.question_id).expect("the pair reads");
+        drafts
+            .begin(
+                &kept,
+                &basis,
+                &[],
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                &leave,
+            )
+            .expect("kept");
         for read in drafts.drafts().expect("the kept answers") {
             assert_unmarked("a kept answer", &debug_renderings(&read));
         }
@@ -873,7 +887,7 @@ mod cases {
         assert_unmarked("a kept answer", &debug_renderings(&kept));
         assert_unmarked(
             "an answer kept",
-            &debug_renderings(&crate::answers::Answered::Unconfirmed(kept)),
+            &debug_renderings(&crate::answers::Answered::Kept(kept)),
         );
 
         let label = crate::sync::PinnedLabel {
