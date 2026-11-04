@@ -52,10 +52,10 @@
 //! the reservation returned, and the invocation's own temporary directory by the identity this host
 //! read when it made it. A directory the caller holds no identity for, as a checkout handed over
 //! by path is, is the object that was opened, and it is that object that is confirmed after the
-//! run. The child then does not start at a path either: it moves into the open working directory before the
-//! boundary is applied and before Git runs, with `-C .` as its only directory argument. A tree
-//! substituted at a name afterwards is therefore neither the tree Git works in nor a tree the
-//! boundary was built around.
+//! run. The child then does not start at a path either: it moves into the open working directory
+//! before the boundary is applied and before Git runs, with `-C .` as its only directory argument.
+//! A tree substituted at a name afterwards is therefore neither the tree Git works in nor a tree
+//! the boundary was built around.
 //!
 //! What the kernels enforce is narrower than the sentence above, and is stated as what it is:
 //! **opens for writing succeed only inside the granted root objects' subtrees as they stand at open
