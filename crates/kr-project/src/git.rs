@@ -5588,14 +5588,15 @@ mod tests {
     #[cfg(unix)]
     pub(super) const WAIT_BOUND: Duration = Duration::from_secs(300);
 
-    /// Waits until `file` holds something.
+    /// Waits until `file` holds something, as [`look_until`] does: the case fails with `what` only
+    /// when a look made after `bound` has passed still finds the file empty.
     #[cfg(unix)]
-    pub(super) fn written_within(file: &Path, bound: Duration, _what: &str) {
-        let guard = Instant::now() + bound;
-        let written = || std::fs::metadata(file).is_ok_and(|file| file.len() > 0);
-        while !written() && Instant::now() < guard {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+    pub(super) fn written_within(file: &Path, bound: Duration, what: &str) {
+        look_until(bound, what, || {
+            std::fs::metadata(file)
+                .is_ok_and(|file| file.len() > 0)
+                .then_some(())
+        });
     }
 
     /// A wait for the file a stand-in writes fails the case when a look made after its bound still
@@ -5948,9 +5949,7 @@ mod tests {
     /// Waits until no process with this identifier is running, as [`look_until`] does.
     #[cfg(unix)]
     fn wait_until_gone(pid: &str, what: &str) {
-        look_until(Duration::from_secs(30), what, || {
-            (!running(pid)).then_some(())
-        });
+        look_until(WAIT_BOUND, what, || (!running(pid)).then_some(()));
     }
 
     /// A wait that is stopped after a look is not failed for what the next look finds. The clock
@@ -6040,7 +6039,7 @@ mod tests {
     #[cfg(unix)]
     fn number_of(own: &Path) -> String {
         look_until(
-            Duration::from_secs(30),
+            WAIT_BOUND,
             "the stand-in never ran: it was ended before it could start",
             || {
                 std::fs::read_to_string(own)
@@ -6414,7 +6413,7 @@ mod tests {
             .expect("the shell starts");
         let pid = child.id().to_string();
         // Ended and not collected: a zombie, which is the state the probe finds it in.
-        look_until(Duration::from_secs(30), "the shell never ended", || {
+        look_until(WAIT_BOUND, "the shell never ended", || {
             state(&pid).starts_with('Z').then_some(())
         });
         let sleeper = std::fs::read_to_string(&sleeper)
@@ -7454,7 +7453,7 @@ mod tests {
             // The request has joined the first look once a third holder of it exists: the slot,
             // this case and the request.
             look_until(
-                Duration::from_secs(30),
+                WAIT_BOUND,
                 "the request never joined the first look",
                 || (Arc::strong_count(&first) >= 3).then_some(()),
             );
