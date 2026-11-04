@@ -17,9 +17,9 @@
 //! the sentence is kept. Anything else that names the host (a path of any kind, the number
 //! of an account, the name of a program that changes who may use a file) has no end this module
 //! can find, so the device is given the part of the message that comes before the first such name,
-//! if that is a clause of its own that fits in an error with the reason after it, and otherwise a
-//! sentence composed here from the code. A message that holds the place of a pointer's refusal is
-//! given a clause only when the whole message and the reason after it fit in an error.
+//! if that is a clause of its own and the whole message and the reason after it fit in an error,
+//! and otherwise a sentence composed here from the code. A message that is longer than an error may
+//! be once its quotations are replaced is given that sentence too.
 //!
 //! The same rule reaches an error wherever it is, because the text of an error that has already
 //! been made (a worker's, one a store kept, one a catalogue receipt holds) cannot be made again:
