@@ -1271,38 +1271,15 @@ impl Session {
             .spawn_command(command)
             .expect("the packaged shell starts");
         drop(pty.slave);
-
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let stopped = Arc::new(AtomicBool::new(false));
-        let mut reader = pty.master.try_clone_reader().expect("a terminal reader");
-        let collected = Arc::clone(&output);
-        let finished = Arc::clone(&stopped);
-        let terminal = Arc::new(TerminalInput::of(
-            pty.master.take_writer().expect("a terminal writer"),
-        ));
-        let answering = Arc::clone(&terminal);
-        let cursor_answered = Arc::new(AtomicUsize::new(0));
-        let answered_to = Arc::clone(&cursor_answered);
-        let (finished_reading, stopped_reading) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buffer = [0u8; 4096];
-            let mut queries = TerminalQueries::new(Arc::clone(&answered_to));
-            while !finished.load(Ordering::Relaxed) {
-                match reader.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(taken) => {
-                        // A terminal that never answers a query is a terminal the editor waits
-                        // for, so this one answers the three an editor asks at every prompt.
-                        queries.answer(&buffer[..taken], &answering);
-                        collected
-                            .lock()
-                            .expect("the output lock")
-                            .extend_from_slice(&buffer[..taken]);
-                    }
-                }
-            }
-            drop(finished_reading);
-        });
+        // The terminal is read, and its queries answered, before the shell starts: the shell asks
+        // its first question as it draws its first prompt.
+        let TerminalReading {
+            output,
+            terminal,
+            cursor_answered,
+            stopped,
+            stopped_reading,
+        } = read_terminal(pty.master.as_ref());
 
         // A shell that is not managed connects to nothing. The stream a session reads is then one
         // whose other end this session holds and never writes to, so a read finds nothing.
@@ -3017,6 +2994,75 @@ impl TerminalQueries {
         let origin = self.read - kept;
         self.read += bytes.len();
         let mut reply: Vec<u8> = Vec::new();
+/// What reads one session's terminal: the transcript it fills, the side that types on it, where in
+/// the transcript the last cursor query it answered ends, the flag that ends the reading and the
+/// report that the reading has ended.
+struct TerminalReading {
+    output: Arc<Mutex<Vec<u8>>>,
+    terminal: Arc<TerminalInput>,
+    cursor_answered: Arc<AtomicUsize>,
+    stopped: Arc<AtomicBool>,
+    stopped_reading: mpsc::Receiver<()>,
+}
+
+/// Reads `master` on a thread of its own, answering the queries an editor asks at every prompt, and
+/// returns once that thread is running.
+///
+/// A shell is started after the call, so its first question goes to a terminal that is being read.
+/// A shell started first asks it into a terminal nothing has read yet, and an editor gives up on an
+/// answer that is late: what arrives after is read as keys a person typed, at a prompt the case
+/// does not think it is at.
+fn read_terminal(master: &dyn MasterPty) -> TerminalReading {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let mut reader = master.try_clone_reader().expect("a terminal reader");
+    let collected = Arc::clone(&output);
+    let finished = Arc::clone(&stopped);
+    let terminal = Arc::new(TerminalInput::of(
+        master.take_writer().expect("a terminal writer"),
+    ));
+    let answering = Arc::clone(&terminal);
+    let cursor_answered = Arc::new(AtomicUsize::new(0));
+    let answered_to = Arc::clone(&cursor_answered);
+    let (finished_reading, stopped_reading) = mpsc::channel();
+    let (running, started) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // Said before the first read, and the call that started this thread does not return until
+        // it is heard.
+        let _ = running.send(());
+        let mut buffer = [0u8; 4096];
+        // A terminal read ends wherever the kernel had bytes, which can be in the middle of a
+        // query an editor is waiting for an answer to, so the queries are read from the stream and
+        // not from one read of it.
+        let mut queries = TerminalQueries::new(Arc::clone(&answered_to));
+        while !finished.load(Ordering::Relaxed) {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(taken) => {
+                    // A terminal that never answers a query is a terminal the editor waits for,
+                    // so this one answers the ones an editor asks at every prompt.
+                    queries.answer(&buffer[..taken], &answering);
+                    collected
+                        .lock()
+                        .expect("the output lock")
+                        .extend_from_slice(&buffer[..taken]);
+                }
+            }
+        }
+        drop(finished_reading);
+    });
+    started
+        .recv()
+        .expect("the thread that reads the terminal started");
+    TerminalReading {
+        output,
+        terminal,
+        cursor_answered,
+        stopped,
+        stopped_reading,
+    }
+}
+
         let mut cursor_answered_to = None;
         let mut at = 0;
         while at < stream.len() {

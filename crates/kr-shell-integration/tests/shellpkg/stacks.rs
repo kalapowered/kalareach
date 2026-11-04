@@ -18,12 +18,11 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -1163,14 +1162,21 @@ impl Session {
             command.env("KR_SHELL_BRIDGE_TRACE", trace);
         }
 
+        // The terminal is read, and its queries answered, before the shell starts: the shell asks
+        // its first question as it draws its first prompt.
+        let TerminalReading {
+            output,
+            terminal,
+            cursor_answered,
+            stopped,
+            stopped_reading,
+        } = read_terminal(pty.master.as_ref());
         let child = pty
             .slave
             .spawn_command(command)
             .unwrap_or_else(|error| panic!("{} does not start: {error}", case.id));
         drop(pty.slave);
 
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let stopped = Arc::new(AtomicBool::new(false));
         // From here to the session being built, anything can fail: the shell may never connect,
         // or its opening frame may not arrive. The guard ends and reaps the shell and stops the
         // thread reading its terminal, because the session that would have done both does not
@@ -1179,36 +1185,6 @@ impl Session {
             child: Some(child),
             stopped: Arc::clone(&stopped),
         };
-        let mut reader = pty.master.try_clone_reader().expect("a terminal reader");
-        let collected = Arc::clone(&output);
-        let finished = Arc::clone(&stopped);
-        let terminal = Arc::new(TerminalInput::of(
-            pty.master.take_writer().expect("a terminal writer"),
-        ));
-        let answering = Arc::clone(&terminal);
-        let cursor_answered = Arc::new(AtomicUsize::new(0));
-        let answered_to = Arc::clone(&cursor_answered);
-        let (finished_reading, stopped_reading) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buffer = [0u8; 4096];
-            // A terminal read ends wherever the kernel had bytes, which can be in the middle of a
-            // query an editor is waiting for an answer to, so the queries are read from the stream
-            // and not from one read of it.
-            let mut queries = TerminalQueries::new(Arc::clone(&answered_to));
-            while !finished.load(Ordering::Relaxed) {
-                match reader.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(taken) => {
-                        queries.answer(&buffer[..taken], &answering);
-                        collected
-                            .lock()
-                            .expect("the output lock")
-                            .extend_from_slice(&buffer[..taken]);
-                    }
-                }
-            }
-            drop(finished_reading);
-        });
 
         let stream = accept_within(&listener, REPLY).unwrap_or_else(|| {
             panic!(
