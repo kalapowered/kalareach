@@ -616,11 +616,11 @@ fn a_job_cancelled_before_its_process_ends_is_not_retried() {
 
 /// KR-REQ-22.21: a job that was being stopped, or whose session was gone, when the daemon ended its
 /// process for passing the memory ceiling ends as that made it: cancelled for a caller's
-/// cancellation or a session that closed, and back in the queue with its place for a pause. The
-/// process passed the ceiling after the job was told to stop, and nothing says the job was the
-/// cause. The process's end is the same failure of inference in every form, and pauses inference for
-/// memory. The control is a job nothing was stopping, which is the one that held the process past
-/// the ceiling and ends failed.
+/// cancellation or a session that closed, and back in the queue with its place for a pause, where
+/// it runs again once inference resumes and fails if it passes the ceiling again with nothing
+/// stopping it. The process's end is the same failure of inference in every form, and pauses
+/// inference for memory. The control is a job nothing was stopping, which is the one that held the
+/// process past the ceiling and ends failed.
 #[test]
 fn a_job_that_was_being_stopped_when_its_process_passed_the_ceiling_ends_as_the_stop_made_it() {
     /// What was on the job when its process ended.
