@@ -1073,14 +1073,19 @@ fn say(why: &str) {
     }
 }
 
-/// Makes a panic say what it has to say as [`say`] does, for the rest of the process's life.
+/// Makes a panic say what it has to say as every other notice of this process does, on a thread of
+/// its own that it waits for no longer than a quarter of a second, for the rest of the process's life.
 ///
 /// The default hook writes to standard error before the panicking thread unwinds, and a pipe nobody
 /// reads holds it there: the model thread's failure is then not seen until a deadline passes. A
 /// program calls this once, as it starts and before it serves. It replaces the hook for the whole
 /// process, so code that shares its process with others, as a test does, leaves it alone.
 pub fn say_panics_without_waiting() {
-    std::panic::set_hook(Box::new(|panic| say(&panic.to_string())));
+    std::panic::set_hook(Box::new(|panic| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        say(&format!("thread '{name}' {panic}"));
+    }));
 }
 
 /// Ends the process with `exit`, after saying why as [`say`] does.
