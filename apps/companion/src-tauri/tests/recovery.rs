@@ -2351,6 +2351,10 @@ async fn with_an_unkept_record_and_the_setting_moved(
 /// the service the setting names is sent nothing; and the bundle is noted as that account's, so
 /// that deleting the account at the record's service clears the record and deleting an account at
 /// the service the setting names does not.
+///
+/// KR-REQ-20.18, the part about the stable locator: recovery going on with a record that was made
+/// and not kept writes the bundle once, to the record's service, at the locator of the record's
+/// first write. Not shown here: a kit, or a compare-and-swap update.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_goes_on_with_an_unkept_record_at_its_own_service_when_the_setting_names_another()
 {

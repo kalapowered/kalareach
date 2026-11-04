@@ -9,7 +9,8 @@
 //!
 //! A host in privacy mode stops what leaves for the sync service at its recorded generation, and a
 //! host that cannot be read is treated as private; the colour mode, which holds no session
-//! content, keeps going. A draft is a draft, never an execution request.
+//! content, keeps going. A draft another device wrote arrives as a copy kept beside this
+//! computer's own.
 //!
 //! Settings sync uses per-object revisions and compare-and-swap writes, keeps the content a
 //! refused write lost for the person to choose from instead of choosing by the clock, and never
@@ -2797,6 +2798,11 @@ async fn the_versions_are_listed_and_none_is_picked_for_the_person() {
 
 /// Keeping this computer's settings lets every copy go, on this computer and at the service, and
 /// sends them as the settings every device now holds.
+///
+/// KR-REQ-20.13, the part about the person's choice between conflicting copies: keeping this
+/// computer's settings lets the copy go on this computer and at the service, the service then holds
+/// the chosen settings and keeps no copy, and nothing waits. Not shown here: per-object revision
+/// identifiers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keeping_this_computers_settings_lets_the_other_content_go_and_sends_them() {
     let computer = Computer::new().await;
@@ -2827,6 +2833,11 @@ async fn keeping_this_computers_settings_lets_the_other_content_go_and_sends_the
 
 /// Keeping what another device wrote takes it as this computer's own: the settings file holds it,
 /// the service holds it as this computer's write, and the page is told.
+///
+/// KR-REQ-20.13, the part about the person's choice between conflicting copies: keeping what
+/// another device wrote takes it as this computer's own, the settings file holds it after a
+/// restart, the service keeps no copy, and nothing waits. Not shown here: per-object revision
+/// identifiers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keeping_what_another_device_wrote_takes_it_as_this_computers_own() {
     let computer = Computer::new().await;
@@ -3701,6 +3712,10 @@ async fn a_host_that_cannot_be_asked_is_asked_once_for_all_the_drafts_of_a_pass(
 /// Sending a draft to a session of another host makes it that host's draft: what the first host
 /// said of the old session says nothing of the new one, so the draft waits for the second host and
 /// is held to its mode, though the first host would let it go.
+///
+/// KR-REQ-24.28, the part about a draft sent to a session of another host: the draft is held to the
+/// second host's privacy mode though the first host would let it go, nothing more of it leaves, and
+/// the view says the draft is kept for that host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_draft_sent_to_a_session_of_another_host_is_held_to_that_hosts_mode() {
     let computer = Computer::new().await;
@@ -4712,6 +4727,11 @@ async fn a_device_taken_out_does_not_read_what_is_written_afterwards() {
 
 /// A device a host reports revoked is taken out of the shared settings at the next step, without
 /// asking the person: the key moves on, and the device reads nothing written after it.
+///
+/// KR-REQ-18.05, the part about encrypted settings sync across devices: a device a host reports
+/// revoked is taken out of the shared settings at the next step without asking the person, and it
+/// keeps the setting it last read, since what is written after the key moves on does not reach it.
+/// Not shown here: what the service holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_a_host_reports_revoked_is_taken_out_at_the_next_step() {
     let (this, other) = two_computers().await;
@@ -4938,6 +4958,10 @@ async fn a_revocation_that_arrives_while_a_step_waits_on_the_hosts_stops_that_st
 /// A draft saved after a revocation arrived, while the step in hand waits on the service, is not
 /// sent under the key the removed device holds: it goes out once, under the key that follows the
 /// device's removal.
+///
+/// KR-REQ-18.05, the part about the key that follows a device's removal: a draft saved after a
+/// revocation arrived is not sent by the step in hand and goes out once under the key that follows
+/// the removal, which the removed device's key does not open. Not shown here: a settings object.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_draft_saved_after_a_revocation_is_not_sent_under_the_key_the_removed_device_holds() {
     let (this, other) = two_computers().await;
