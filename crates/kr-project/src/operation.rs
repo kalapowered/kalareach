@@ -772,7 +772,7 @@ fn staged_in(directory: &AuthorisedDirectory) -> Result<StagedWitness> {
 /// # Errors
 ///
 /// Returns [`ProjectError::Destination`] when the destination name is taken or the rename fails,
-/// except that a host too short of descriptors, processes or memory to rename is
+/// except that on Unix a host too short of descriptors, processes or memory to rename is
 /// [`ProjectError::GitFailed`], a fault that passes, [`ProjectError::IdentityChanged`] when the
 /// staged object is not the recorded one, or the location's refusal.
 pub fn publish(
