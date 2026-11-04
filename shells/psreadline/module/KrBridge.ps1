@@ -15,9 +15,9 @@ $script:KR_PROTOCOL = 'kr-shell-bridge/1'
 $script:KR_ENDPOINT_VARIABLE = 'KR_SHELL_BRIDGE'
 $script:KR_SECRET_VARIABLE = 'KR_SHELL_BRIDGE_SECRET'
 $script:KR_SESSION_VARIABLE = 'KR_SESSION'
-# The longest the module waits for the worker's answer to its hello. The environment may name a
-# longer one, in milliseconds, for a host that cannot promise a worker's answer inside five seconds
-# (a harness driving the module on a loaded machine); anything that is not a positive whole number
+# The longest the module waits for the worker's answer to its hello. The environment may name
+# another, in milliseconds, for a host that cannot promise a worker's answer inside five seconds (a
+# harness driving the module on a loaded machine); anything that is not a positive whole number
 # leaves this one.
 $script:KR_HANDSHAKE_WAIT_MS = 5000
 $script:KR_HANDSHAKE_WAIT_VARIABLE = 'KR_SHELL_BRIDGE_HANDSHAKE_WAIT_MS'
