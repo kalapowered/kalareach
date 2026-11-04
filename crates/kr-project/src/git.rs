@@ -5891,10 +5891,21 @@ mod tests {
     /// `guard` has passed still finds nothing. The time is read before the look, so a stop between
     /// the look and the time, however long, cannot fail a case for what came meanwhile.
     #[cfg(unix)]
-    fn look_until<T>(guard: Duration, what: &str, mut look: impl FnMut() -> Option<T>) -> T {
-        let until = Instant::now() + guard;
+    fn look_until<T>(guard: Duration, what: &str, look: impl FnMut() -> Option<T>) -> T {
+        look_until_by(Instant::now, guard, what, look)
+    }
+
+    /// As [`look_until`], reading the time from `now`, so that a case can move it by hand.
+    #[cfg(unix)]
+    fn look_until_by<T>(
+        now: impl Fn() -> Instant,
+        guard: Duration,
+        what: &str,
+        mut look: impl FnMut() -> Option<T>,
+    ) -> T {
+        let until = now() + guard;
         loop {
-            let late = Instant::now() >= until;
+            let late = now() >= until;
             if let Some(found) = look() {
                 return found;
             }
@@ -5911,24 +5922,32 @@ mod tests {
         });
     }
 
-    /// A wait that is stopped after a look is not failed for what the next look finds. The first
-    /// look finds nothing, and the stop is inside it, longer than the time the wait is given and
-    /// taken after the time was read; the next look finds it. A wait that reads the time after
-    /// the look fails here.
+    /// A wait that is stopped after a look is not failed for what the next look finds. The clock
+    /// is the case's own and moves only as the case moves it: the first look finds nothing and
+    /// the stop is inside it, a move of the clock past the time the wait is given, made after the
+    /// time was read; the next look finds it. A wait that reads the time after the look fails
+    /// here, whatever the machine does, and one that reads it before does not.
     #[cfg(unix)]
     #[test]
     fn a_wait_that_is_stopped_after_a_look_still_finds_what_came_meanwhile() {
+        let guard = Duration::from_secs(30);
+        let clock = std::cell::Cell::new(Instant::now());
         let mut looks = 0;
 
-        let found = look_until(Duration::from_millis(300), "it was never found", || {
-            looks += 1;
-            if looks == 1 {
-                std::thread::sleep(Duration::from_millis(700));
-                None
-            } else {
-                Some(looks)
-            }
-        });
+        let found = look_until_by(
+            || clock.get(),
+            guard,
+            "it was never found",
+            || {
+                looks += 1;
+                if looks == 1 {
+                    clock.set(clock.get() + guard * 2);
+                    None
+                } else {
+                    Some(looks)
+                }
+            },
+        );
 
         assert_eq!(found, 2);
     }
@@ -6364,11 +6383,9 @@ mod tests {
             .expect("the shell starts");
         let pid = child.id().to_string();
         // Ended and not collected: a zombie, which is the state the probe finds it in.
-        let guard = Instant::now() + Duration::from_secs(30);
-        while !state(&pid).starts_with('Z') {
-            assert!(Instant::now() < guard, "the shell never ended");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        look_until(Duration::from_secs(30), "the shell never ended", || {
+            state(&pid).starts_with('Z').then_some(())
+        });
         let sleeper = std::fs::read_to_string(&sleeper)
             .expect("the shell recorded the process it left running")
             .trim()
