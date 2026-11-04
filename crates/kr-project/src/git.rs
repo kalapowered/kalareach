@@ -5592,7 +5592,13 @@ mod tests {
     /// when a look made after `bound` has passed still finds the file empty.
     #[cfg(unix)]
     pub(super) fn written_within(file: &Path, bound: Duration, what: &str) {
-        look_until(bound, what, || {
+        written_by(Instant::now, file, bound, what);
+    }
+
+    /// As [`written_within`], reading the time from `now`, so that a case can move it by hand.
+    #[cfg(unix)]
+    fn written_by(now: impl Fn() -> Instant, file: &Path, bound: Duration, what: &str) {
+        look_until_by(now, bound, what, || {
             std::fs::metadata(file)
                 .is_ok_and(|file| file.len() > 0)
                 .then_some(())
@@ -5600,16 +5606,24 @@ mod tests {
     }
 
     /// A wait for the file a stand-in writes fails the case when a look made after its bound still
-    /// finds the file empty, and does not go on without it.
+    /// finds the file empty, and does not go on without it. The clock is the case's own: each
+    /// reading of it is a minute later than the one before, so the bound has passed after a few
+    /// looks, however fast the machine runs.
     #[cfg(unix)]
     #[test]
     #[should_panic(expected = "the stand-in never wrote its number")]
     fn a_wait_for_the_file_a_stand_in_writes_fails_the_case_at_its_bound() {
         let directory = tempfile::tempdir().expect("a directory for this test");
+        let time = std::cell::Cell::new(Instant::now());
 
-        written_within(
+        written_by(
+            || {
+                let read = time.get();
+                time.set(read + Duration::from_secs(60));
+                read
+            },
             &directory.path().join("own"),
-            Duration::from_millis(300),
+            Duration::from_secs(150),
             "the stand-in never wrote its number",
         );
     }
@@ -6585,7 +6599,7 @@ mod tests {
             format!(
                 "#!/bin/sh\necho $$ > '{own}'\n\
                  while [ ! -e '{release}' ] && [ -d '{directory}' ] && kill -0 {tester} 2>/dev/null; \
-                 do sleep 0.02; done\n{body}\n",
+                 do sleep 0.02; done\n[ -e '{release}' ] || exit 0\n{body}\n",
                 own = own.display(),
                 release = release.display(),
                 directory = directory.path().display(),
