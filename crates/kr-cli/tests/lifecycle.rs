@@ -5452,7 +5452,6 @@ fn a_pause_process_that_is_still_there_after_the_stop_is_reported() {
 /// Whether the teardown of an emulator left nothing: no mount under its tree, and the container
 /// runtime's pause process ended or not there. A mount that is gone with a pause process that is
 /// not leaves the case with a process running on the machine.
-#[cfg(target_os = "linux")]
 fn nothing_is_left(mounts_left: &[PathBuf], pause: &Result<(), String>) -> bool {
     mounts_left.is_empty() && pause.is_ok()
 }
