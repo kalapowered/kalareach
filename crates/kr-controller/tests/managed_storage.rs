@@ -6425,6 +6425,80 @@ async fn a_fence_owed_while_the_call_waits_on_the_service_refuses_it_before_it_a
     assert_eq!(web.requests_to(RETENTION), 0, "retention was not changed");
 }
 
+/// KR-REQ-09.09: each request a setup makes for a token of the account is made under the account
+/// the call fixed when it began. The fence cases above hold only such requests at the gate on the
+/// account token, so a request made at another token source would pass the gate, and a call that
+/// asked for a token while a fence is owed would not be seen to. With no fence owed, the gate lets
+/// the next `passing` of the call's requests through and the one after waits: the first is the
+/// check that a token can be had, and then come the bundle write, the read of the storage state and
+/// the retention change, each waiting before the request that needs it leaves for the service. The
+/// writer's enrolment carries no token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_request_a_setup_makes_for_a_token_is_one_the_gate_on_the_account_token_holds() {
+    // What the service has been sent when the request after `passing` of them waits: the bundle
+    // writes, the enrolments, the reads of the storage state since the carrier's first pass, and
+    // the retention changes.
+    let rungs = [
+        (0, "the check that a token can be had", 0, 0, 0, 0),
+        (1, "the bundle write", 0, 0, 0, 0),
+        (2, "the read of the storage state", 1, 1, 0, 0),
+        (3, "the retention change", 1, 1, 1, 0),
+    ];
+    for (passing, request, bundle, enrolments, reads_made, changes) in rungs {
+        let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+        until_the_carriers_first_pass_has_ended(&rig).await;
+        let web = Arc::clone(rig.served.web());
+        let made = rig.prepared_setup(archive_id(), false);
+        let reads = web.requests_to(STATUS);
+        let gate = rig
+            .controller
+            .host_account()
+            .hold_token_requests_fixed_to_an_account(passing);
+        let mut call = rig.enable_outcome_in_the_background(&made.params);
+        tokio::select! {
+            ended = &mut call => panic!(
+                "the call ended without asking for the token of {request} under its account: \
+                 {ended:?}"
+            ),
+            () = until_a_request_waits_for_its_token(&rig) => {}
+        }
+        assert_eq!(rig.controller.host_account().token_requests_waiting(), 1);
+        assert_eq!(
+            rig.controller.host_account().token_passes_left(),
+            0,
+            "the requests before {request} went through the gate"
+        );
+        assert_eq!(
+            web.requests_to(SYNC),
+            bundle,
+            "bundle writes sent before {request}"
+        );
+        assert_eq!(
+            web.requests_to(MANIFEST),
+            enrolments,
+            "enrolments sent before {request}"
+        );
+        assert_eq!(
+            web.requests_to(STATUS) - reads,
+            reads_made,
+            "reads of the storage state sent before {request}"
+        );
+        assert_eq!(
+            web.requests_to(RETENTION),
+            changes,
+            "retention changes sent before {request}"
+        );
+        drop(gate);
+        assert!(
+            matches!(
+                call.await.expect("the call ends"),
+                Ok(BackupEnableResult::Enabled { .. })
+            ),
+            "the call let through goes on to enable the setup"
+        );
+    }
+}
+
 /// KR-REQ-09.09: a deadline that passes while the call waits on the service refuses it and does not
 /// tell a delay that was named meanwhile, as a fence does. The read that settles a bundle write
 /// finds the bundle absent, and the answer would tell the delay.
