@@ -270,6 +270,9 @@ fn an_isolated_workspace_copies_what_the_policy_includes_and_the_source_keeps_ev
     );
 }
 
+/// KR-REQ-14.20, the part about an isolated workspace by independent clone: with the base-only
+/// policy the workspace has an object store of its own and holds nothing uncommitted. Not shown
+/// here: the preview.
 #[test]
 fn an_independent_clone_has_its_own_object_store() {
     let fixture = Fixture::create();
@@ -317,6 +320,11 @@ fn an_independent_clone_has_its_own_object_store() {
 /// repository's own tree is no exception: the repository is read through the source location it is
 /// bound to, with that caller's reads bounded, or not at all. A repository adopted by its path is
 /// bound to none, so such a caller is refused before anything reads it.
+///
+/// KR-REQ-23.43, the part about a caller bounded by a grant: `workspace.create` of a shared
+/// workspace is refused as permission denied, with the reason, when the repository is bound to no
+/// source location, and the owner's same request makes the workspace. Not shown here: a caller
+/// without `workspace.manage`, or a read.
 #[test]
 fn a_caller_bounded_by_a_grant_reaches_a_shared_workspace_only_through_a_source_location() {
     let fixture = Fixture::create();
@@ -427,6 +435,11 @@ fn a_shared_workspace_is_the_users_own_tree_and_nothing_is_relocated() {
 /// a container's root filesystem is when the container starts again, is the repository that was
 /// registered, and its record takes the numbers it has now. A repository that is another object is
 /// refused under any number.
+///
+/// KR-REQ-14.06, the part about identity being the filesystem object: a registered repository whose
+/// recorded device number is stale is still the registered one and its record takes the numbers it
+/// has now; a repository that is another object is refused under any number. Not shown here: a
+/// rename, or a worktree.
 #[cfg(unix)]
 #[test]
 fn a_registered_repository_found_under_another_device_number_is_still_the_registered_one() {
@@ -653,17 +666,18 @@ fn numbers_of(path: &std::path::Path) -> (i64, i64) {
 
 /// A registered repository is refused on another filesystem that gives the directory at its path
 /// the inodes the registered one had, and accepted on the filesystem it was registered on.
+///
+/// KR-REQ-14.06, the part about identity including the filesystem: a registered repository is
+/// refused when another filesystem gives the directory at its path the inodes the registered one
+/// had, no Git invocation starts there, and the repository is accepted on the filesystem it was
+/// registered on. On Linux the case is ignored by default and runs where a mount namespace can be
+/// made; on macOS it runs by default. Not shown here: a rename, or a worktree.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 #[cfg_attr(
     target_os = "linux",
     ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"
 )]
-/// KR-REQ-14.06, the part about identity including the filesystem: a registered repository is
-/// refused when another filesystem gives the directory at its path the inodes the registered one
-/// had, no Git invocation starts there, and the repository is accepted on the filesystem it was
-/// registered on. The case is ignored by default and run where a second filesystem can be made.
-/// Not shown here: a rename, or a worktree.
 fn a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers() {
     volumes::with_volumes(
         "a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers",
@@ -2154,8 +2168,8 @@ fn a_workspace_of_a_repository_registered_through_a_subdirectory_is_still_read()
 ///
 /// KR-REQ-14.06, the part about identity including the filesystem: a directory bound over the
 /// parent of the directory a repository was registered through, with the device number the recorded
-/// tree has, is not read as the registered one, and no Git invocation starts in it. The case is ignored by
-/// default and run where a second filesystem can be made. Not shown here: a rename, or a
+/// tree has, is not read as the registered one, and no Git invocation starts in it. The case is
+/// ignored by default and runs where a mount namespace can be made. Not shown here: a rename, or a
 /// worktree.
 #[cfg(target_os = "linux")]
 #[test]
@@ -2284,16 +2298,17 @@ fn top_of(top: &std::path::Path) -> std::path::PathBuf {
 /// Another filesystem mounted over the directory a repository was registered through is not read
 /// as that directory: the climb from it to the recorded tree stops at the mount, so no Git
 /// invocation starts in it.
+///
+/// KR-REQ-14.06, the part about identity including the filesystem: another filesystem mounted over
+/// the directory a repository was registered through is not read as that directory, and no Git
+/// invocation starts in it. On Linux the case is ignored by default and runs where a mount
+/// namespace can be made; on macOS it runs by default. Not shown here: a rename, or a worktree.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 #[cfg_attr(
     target_os = "linux",
     ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"
 )]
-/// KR-REQ-14.06, the part about identity including the filesystem: another filesystem mounted over
-/// the directory a repository was registered through is not read as that directory, and no Git
-/// invocation starts in it. The case is ignored by default and run where a second filesystem can be
-/// made. Not shown here: a rename, or a worktree.
 fn a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it() {
     volumes::with_volumes(
         "a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it",
@@ -5117,6 +5132,10 @@ fn a_grant_withdrawn_before_a_removal_reserves_leaves_the_workspace_and_its_tree
     assert!(removed.working_files_removed);
 }
 
+/// KR-REQ-23.43, the part about removal being scoped: a caller bounded by a grant is refused the
+/// removal of a workspace made through no location as permission denied, nothing is removed or
+/// reserved, and the owner removes it. Not shown here: a caller without `workspace.manage`, or a
+/// read.
 #[test]
 fn source_permission_does_not_delete_an_outside_workspace() {
     // A workspace made through no location is reached through none, whatever authority a caller

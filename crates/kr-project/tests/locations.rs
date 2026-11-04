@@ -816,6 +816,12 @@ fn a_tree_removed_from_under_its_source_location_is_a_source_that_changed() {
 /// tree is never removed. The controls: a working copy made by naming a path is reached through no
 /// location and stays the owner's, and once the source location is withdrawn the removal is
 /// refused, so the grant reaches nothing the owner withdrew.
+///
+/// KR-REQ-23.43, the part about a grant-bounded `workspace.create` and `workspace.remove` of a
+/// shared workspace: the caller selects the repository's own tree through the source location it is
+/// bound to and removes the selection through it, which removes no file; the removal of a working
+/// copy made through no location is refused as permission denied, and so is a removal after the
+/// source location is withdrawn. Not shown here: a caller without `workspace.manage`, or a read.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_caller_bounded_by_a_grant_removes_the_shared_working_copy_it_selected_through_its_source() {
@@ -2635,6 +2641,11 @@ fn a_directory_that_is_not_the_bound_repository_is_not_read_through_its_source()
 
 /// A repository whose Git directory is not the one a source location's record names is refused
 /// before its configuration is read, whatever the tree around it is: nothing of it is audited.
+///
+/// KR-REQ-14.06, the part about identity being the object and not its contents: a bound repository
+/// whose Git directory was replaced by a copy with the same contents is refused as a source that
+/// changed, and the configuration of what took the directory's place is not read. Not shown here: a
+/// rename, or a worktree.
 #[cfg(unix)]
 #[test]
 fn a_bound_repository_whose_git_directory_was_replaced_is_refused_before_it_is_audited() {

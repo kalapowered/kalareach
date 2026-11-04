@@ -43,10 +43,10 @@ use support::{
 /// destination and the operation reports the removed staging path. Not shown here: a crash during
 /// publication.
 ///
-/// KR-REQ-23.42, the part about `project.init` and the reads that follow it: the action creates the
+/// KR-REQ-23.42, the part about the project methods themselves: `project.init` creates the
 /// repository through a destination, `project.read` returns its record and `project.list` for the
-/// environment names it once. Not shown here: a refusal for a missing right, or a read outside a
-/// caller's scope.
+/// environment names it once. Not shown here: a refusal for a missing right, a read outside a
+/// caller's scope, or the credential policy.
 #[test]
 fn an_initialised_repository_is_published_from_a_private_sibling_and_nothing_is_left_behind() {
     let fixture = Fixture::create();
@@ -1187,6 +1187,10 @@ fn a_cancellation_ends_the_subprocess_this_host_started() {
 /// undoes nothing and answers with the operation's completed state, no stopped process and the
 /// staging path the operation removed; another actor's cancellation is refused, and an unknown
 /// operation is not cancelled. Not shown here: the stopping of a running subprocess.
+///
+/// KR-REQ-23.42, the part about cancelling only authorised work: another actor's cancellation of an
+/// operation is refused as permission denied, and an operation the host has no record of is not
+/// cancelled. Not shown here: a scoped read, or `project.create`.
 #[test]
 fn a_cancellation_reaches_only_authorised_owned_work() {
     let fixture = Fixture::create();
@@ -1661,6 +1665,12 @@ fn a_recorded_staging_name_whose_object_was_replaced_is_left_alone() {
 /// settled the claim an earlier daemon left open is answered with the `project_repository_id` the
 /// first creation gave. Not shown here: `workspace_id`, the change set identifier and version, the
 /// workflow identifiers and `causal_root_id`.
+///
+/// KR-REQ-14.18, the part about reconciling against the original create action: a creation whose
+/// claim an earlier daemon left open is settled by recovery from the durable operation, a repeat of
+/// the action is answered with the repository the first creation made and not told the outcome is
+/// unknown, and a second recovery has nothing to settle. Not shown here: a publication interrupted
+/// before it was recorded.
 #[test]
 fn recovery_settles_a_claim_an_earlier_daemon_left_open() {
     // A claim is opened with the state it changes and filled in when the effect settles, so a
@@ -2407,6 +2417,12 @@ fn a_repository_that_takes_the_place_of_a_publication_being_finished_is_not_read
     );
 }
 
+/// KR-REQ-14.18, the part about publishing without replacing an unexpected existing entry: when
+/// something takes the destination's name while a clone runs, the publication replaces nothing; the
+/// operation fails with the rename's refusal, what took the name is left as it was, the staging
+/// directory is removed, a repeat of the action is answered with the same recorded failure and
+/// clones nothing again, and a replacement daemon has nothing to settle. Not shown here: an
+/// existing destination at admission.
 #[test]
 fn a_publication_that_meets_a_taken_name_fails_and_takes_its_staging_away() {
     // The rename that publishes a staged repository replaces nothing. Something takes the
@@ -2910,6 +2926,12 @@ fn an_owner_reconciliation_is_admitted_and_claimed_before_it_removes_anything() 
 /// behind. The configuration changes between the publication and the first read of the published
 /// repository, which is when the run that published it meets it, and again when the reconciliation
 /// that follows a failure after the publication finishes it.
+///
+/// KR-REQ-14.19, the part about validating the repository configuration: a published repository
+/// whose configuration gains a key no override removes (`remote.origin.vcs`) is refused as
+/// untrusted and not registered; the operation fails, and the repository is left where it was
+/// published with no private sibling. Not shown here: a fetch over the network, or the credential
+/// rules.
 #[cfg(unix)]
 #[test]
 fn a_published_repository_whose_configuration_no_override_removes_is_not_registered() {
