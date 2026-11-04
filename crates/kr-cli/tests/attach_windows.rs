@@ -39,13 +39,22 @@ struct ConsoleOutput {
 }
 
 impl ConsoleOutput {
+    /// Starts the thread that reads the console and answers its cursor query, and returns once that
+    /// thread is running.
+    ///
+    /// It is called before the command that writes to the console is started: the console serves
+    /// nothing to that command until its query is answered, so a command started first waits on a
+    /// thread that may not have been scheduled yet.
     fn collect(
         mut reader: Box<dyn Read + Send>,
         writer: Arc<Mutex<Box<dyn Write + Send>>>,
     ) -> Self {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let collected = Arc::clone(&seen);
+        let (running, started) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
+            // Said before the first read, and `collect` does not return until it is heard.
+            let _ = running.send(());
             // The pseudo-console asks this terminal where its cursor is when it starts, and serves
             // nothing to the process attached to it until the terminal answers. This stand-in
             // answers a fixed position, which is all the console host needs.
@@ -75,6 +84,9 @@ impl ConsoleOutput {
                 }
             }
         });
+        started
+            .recv()
+            .expect("the thread that reads the console started");
         Self { seen }
     }
 
@@ -137,14 +149,14 @@ impl Attached {
         command.env("KR_RUNTIME_DIR", host.tree.paths().runtime_root());
         command.env("KR_STATE_DIR", host.tree.paths().state_root());
         command.env("TERM", "xterm-256color");
-        let child = pty.slave.spawn_command(command).expect("starts kr");
-        drop(pty.slave);
         let writer: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(pty.master.take_writer().expect("a writer")));
         let output = ConsoleOutput::collect(
             pty.master.try_clone_reader().expect("a reader"),
             Arc::clone(&writer),
         );
+        let child = pty.slave.spawn_command(command).expect("starts kr");
+        drop(pty.slave);
         Self {
             child,
             output,
@@ -419,14 +431,14 @@ impl Probe {
         let mut command = CommandBuilder::new(std::env::current_exe().expect("this test binary"));
         command.args(["--exact", name, "--nocapture", "--test-threads=1"]);
         command.env(SPELL_PROBE, "1");
-        let child = pty.slave.spawn_command(command).expect("starts the probe");
-        drop(pty.slave);
         let writer: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(pty.master.take_writer().expect("a writer")));
         let output = ConsoleOutput::collect(
             pty.master.try_clone_reader().expect("a reader"),
             Arc::clone(&writer),
         );
+        let child = pty.slave.spawn_command(command).expect("starts the probe");
+        drop(pty.slave);
         Self {
             child,
             writer,
