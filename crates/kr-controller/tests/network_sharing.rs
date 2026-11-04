@@ -462,9 +462,10 @@ async fn kr_req_25_10_an_invitation_of_a_session_that_has_ended_activates_nothin
 /// been closed, so the connection is closed while the request is pending or it is not closed at
 /// all: the order of events decides the case, and no limit on how long the close takes. The share
 /// ends because the host's clocks are moved past its end, and not by the case waiting for it. The
-/// clocks are moved in two steps: after the first, which leaves the share standing, the connection
-/// still answers a read, so the close that follows the second is for the share's end and not for a
-/// move of the clocks. The
+/// clocks are moved in two steps, and after the first, which leaves the share standing, the
+/// connection still answers a read. A host that closed a connection because its clocks moved is
+/// caught there when its look at the grants comes before the case goes on; the case cannot see
+/// that the look has come, so a host whose look comes later is not caught by it. The
 /// host looks at the grants a connection stands on again at least once every 15 seconds, so the
 /// close can come that long after the move. [`RawDevice::answered_before_closing`] is given a
 /// guard for a case that went wrong and decides nothing for a run that closes the connection.
@@ -526,9 +527,9 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
         )
         .await;
     // The clocks move, short of the share's end, and the connection goes on: it answers a read. A
-    // host that closed a connection because its clocks moved would close it here, so the close
-    // below is for the share's end. (The close carries one code and reason whatever ended the
-    // connection, so the device cannot read the cause from it.)
+    // host that closed a connection because its clocks moved would close it at its next look at the
+    // grants, which this does not wait for. (The close carries one code and reason whatever ended
+    // the connection, so the device cannot read the cause from it.)
     moved.advance(CLOCK_STEP);
     assert!(
         connection

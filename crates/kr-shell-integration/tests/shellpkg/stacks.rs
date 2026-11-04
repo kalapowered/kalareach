@@ -2297,10 +2297,12 @@ impl Session {
     /// starts once that fence is written: its answer, and every fence asked again, answer to it
     /// and buy no other. A reader that never takes what it was given, or stays slower than the
     /// harness gives it, reports a queue holding input for that long and fails on it, with the
-    /// last report it made, wherever in the window it ends: between two fences, while one is
-    /// written to an endpoint the shell does not read, or while one waits for its answer. A reader
-    /// that reports a partial key sequence is not asked again, since no key typed here leaves one:
-    /// that report is the one that counts.
+    /// last report it made, when the window ends in one of three places: between two fences,
+    /// while one is written to an endpoint the shell does not read, or while one waits for its
+    /// answer. (A write the harness makes in answer to something the reader sent meanwhile, an
+    /// acknowledgement or a step, is not one of the three, and fails on its own.) A reader that
+    /// reports a partial key sequence is not asked again, since no key typed here leaves one: that
+    /// report is the one that counts.
     ///
     /// # Panics
     ///

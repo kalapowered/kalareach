@@ -1597,7 +1597,9 @@ impl Session {
     }
 
     /// As [`Session::write_frames_before`], and says that the endpoint took nothing more before
-    /// `deadline` instead of panicking, for a caller that has something to report with it.
+    /// `deadline` instead of panicking, for a caller that has something to report with it. Part of
+    /// the last frame may have been written, so the session takes no more frames after a stall: the
+    /// caller reports it and ends the case.
     fn try_write_frames_before(
         &mut self,
         frames: &[BridgeFrame],
@@ -2165,7 +2167,8 @@ impl Session {
     }
 
     /// As [`Session::ask_before`], and says that the endpoint took nothing more before `deadline`
-    /// instead of panicking, for a caller that has the reader's last report to give with it.
+    /// instead of panicking, for a caller that has the reader's last report to give with it. The
+    /// session takes no more frames after a stall: part of the request may have been written.
     pub fn try_ask_before(
         &mut self,
         request: WorkerRequest,
@@ -3008,10 +3011,11 @@ struct TerminalReading {
 /// Reads `master` on a thread of its own, answering the queries an editor asks at every prompt, and
 /// returns once that thread is running.
 ///
-/// A shell is started after the call, so its first question goes to a terminal that is being read.
-/// A shell started first asks it into a terminal nothing has read yet, and an editor gives up on an
-/// answer that is late: what arrives after is read as keys a person typed, at a prompt the case
-/// does not think it is at.
+/// A shell is started after the call, so its first question goes to a terminal whose reader is
+/// running: the terminal holds the question until that thread reads it, and the thread no longer
+/// waits to be scheduled after the shell has asked. A shell started first asks into a terminal no
+/// thread has been started for, and an editor gives up on an answer that is late: what arrives
+/// after is read as keys a person typed, at a prompt the case does not think it is at.
 fn read_terminal(master: &dyn MasterPty) -> TerminalReading {
     let output = Arc::new(Mutex::new(Vec::new()));
     let stopped = Arc::new(AtomicBool::new(false));
