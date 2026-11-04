@@ -625,6 +625,7 @@ function Initialize-KalaReachBridge {
     Clear-KrSecret
     Remove-Item -Path ('Env:' + $script:KR_ENDPOINT_VARIABLE) -ErrorAction SilentlyContinue
     Remove-Item -Path ('Env:' + $script:KR_SECRET_VARIABLE) -ErrorAction SilentlyContinue
+    Remove-Item -Path ('Env:' + $script:KR_HANDSHAKE_WAIT_VARIABLE) -ErrorAction SilentlyContinue
 
     Install-KrReadLineWrapper
 }
