@@ -73,7 +73,9 @@ pub struct Discovered {
 /// # Errors
 ///
 /// Returns [`ProjectError::PermissionDenied`] naming the value when the repository reaches
-/// anything the location does not, or [`ProjectError::Destination`] when it is not a repository.
+/// anything the location does not, [`ProjectError::Destination`] when it is not a repository, and
+/// [`ProjectError::GitFailed`], a fault that passes, when the host is too short of descriptors,
+/// processes or memory to copy a handle of it or to list a directory of it.
 pub fn discover(work_tree: AuthorisedDirectory, shown: &str) -> Result<Discovered> {
     let git_dir = match kind_of(&work_tree, ".git", shown)? {
         Some(ObjectKind::Directory) => work_tree.subdirectory(&name(".git")?)?,
@@ -346,12 +348,14 @@ fn refused(shown: &str, file: &str, what: &str) -> ProjectError {
     }
 }
 
+/// The refusal for a listing or a read that failed: a fault that passes when the host was too
+/// short of descriptors, processes or memory to make it, and the caller's argument otherwise.
 fn unreadable(shown: &str, error: &std::io::Error) -> ProjectError {
-    ProjectError::Destination {
-        detail: format!(
+    crate::boundary::refused_by(
+        error,
+        format!(
             "the repository at {} could not be read: {error}",
             crate::git::redact(shown)
-        )
-        .into(),
-    }
+        ),
+    )
 }

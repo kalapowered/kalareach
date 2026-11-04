@@ -52,10 +52,11 @@
 //! directory it opened a moment before; the Git common directory by its own; the reserved
 //! destination by the identity the reservation returned; and the invocation's own temporary
 //! directory by the identity this host read when it made it. A directory the request holds no
-//! identity for is held to the object that was opened. Git's own program and helper directory are
-//! what an invocation executes and does not write in, and nobody holds an identity for them: Linux
-//! opens each by its path when it makes its rules, and the profile on macOS names each by its
-//! path. After the run the directories it may write in (the working directory, the Git
+//! identity for is held to the object that was opened. The programs an invocation may execute
+//! (Git's, the approved ssh program and the shell of point 1) and Git's helper directory under
+//! its exec-path are not written in, and nobody holds an identity for them: Linux opens each by
+//! its path when it makes its rules, and the profile on macOS names each by its path. After the
+//! run the directories it may write in (the working directory, the Git
 //! common directory, a destination it reserved and its own temporary directory) are opened again
 //! and confirmed against the same identity. The child then does not start at a path either: it
 //! moves into the open working directory before the boundary is applied and before Git runs, with
@@ -266,7 +267,7 @@ pub(crate) fn unopenable(path: &Path, error: &std::io::Error) -> ProjectError {
 /// The refusal for a failure to open or to resolve a directory, in `detail`: a fault that passes
 /// when the host was too short of descriptors, processes or memory, and the caller's argument
 /// otherwise.
-fn refused_by(error: &std::io::Error, detail: String) -> ProjectError {
+pub(crate) fn refused_by(error: &std::io::Error, detail: String) -> ProjectError {
     let detail = crate::git::redact(&detail);
     if crate::git::short_of_resources(error) {
         ProjectError::GitFailed {
