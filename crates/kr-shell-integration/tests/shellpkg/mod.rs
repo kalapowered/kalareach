@@ -51,12 +51,39 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 /// How long a wait for the shell, or for a reader's answer, goes on before a test gives up on it.
 ///
 /// The waits it bounds end when the thing they wait for happens, or sooner when it cannot: a shell
-/// that has ended without connecting, or an endpoint whose stream has ended, fails the wait at
-/// once. So the bound is reached only by a shell that is running and says nothing, and a runner
-/// that is slow to start a shell only makes the wait longer. It is far beyond what a loaded
-/// machine has taken: a shell started at background priority on a machine with its processors
-/// busy took more than twenty seconds to connect, where an idle machine takes a second or two.
+/// that has ended without connecting is found within half a second, and a wait on an endpoint
+/// whose stream has ended, with nothing whole left in it, ends at once. So the bound is reached
+/// only by a shell that is running and says nothing, and a runner that is slow to start a shell
+/// only makes the wait longer. It is far beyond what a loaded machine has taken: a shell started
+/// at background priority on a machine with its processors busy took more than twenty seconds to
+/// connect, where an idle machine takes a second or two, and no case has taken a tenth of it.
 pub const REPLY: Duration = Duration::from_secs(240);
+
+/// What a wait goes on for once an earlier wait in this run has given up on a shell that was
+/// running and said nothing.
+///
+/// A package that fails in the same way for every case would otherwise cost [`REPLY`] in each of
+/// them, which is longer than the job that runs them, and the failure text libtest prints at the
+/// end of a run would be lost with the job. The run is already a failure when this applies, so it
+/// can fail no correct code.
+const REPLY_AFTER_A_GIVE_UP: Duration = Duration::from_secs(20);
+
+/// Whether a wait has given up on a silent shell in this run.
+static A_WAIT_GAVE_UP: AtomicBool = AtomicBool::new(false);
+
+/// Notes that a wait gave up on a silent shell, for the waits after it.
+fn note_that_a_wait_gave_up() {
+    A_WAIT_GAVE_UP.store(true, Ordering::Relaxed);
+}
+
+/// `within`, or [`REPLY_AFTER_A_GIVE_UP`] where that is shorter and a wait has given up already.
+fn after_any_give_up(within: Duration) -> Duration {
+    if A_WAIT_GAVE_UP.load(Ordering::Relaxed) {
+        within.min(REPLY_AFTER_A_GIVE_UP)
+    } else {
+        within
+    }
+}
 
 /// Waits until the system says `stream` can be read or written, as `flags` ask, or until `within`
 /// has passed, whichever is first.
@@ -65,15 +92,22 @@ pub const REPLY: Duration = Duration::from_secs(240);
 /// process that runs at background priority to a coarse timer, so that a sleep of two milliseconds
 /// takes a hundred, and a loop that sleeps between reads answers a reader that waits a second for
 /// its answer late by a measure that says nothing about the code under test. A wait on the
-/// stream's readiness returns when the data arrives. A wait that the system cut short, or ended
-/// for a signal, is asked again by the loop around it.
+/// stream's readiness returns when the data arrives. A wait that a signal cut short is asked again
+/// by the loop around it; any other error is a fault of the harness and is not waited out.
+///
+/// # Panics
+///
+/// Panics when the system refuses the wait for a reason other than a signal.
 fn wait_until_ready(stream: &impl AsFd, flags: PollFlags, within: Duration) {
     let timeout = Timespec {
         tv_sec: i64::try_from(within.as_secs()).unwrap_or(i64::MAX),
         tv_nsec: within.subsec_nanos().into(),
     };
     let mut watched = [PollFd::new(stream, flags)];
-    let _ = poll(&mut watched, Some(&timeout));
+    match poll(&mut watched, Some(&timeout)) {
+        Ok(_) | Err(rustix::io::Errno::INTR) => {}
+        Err(error) => panic!("waiting for the endpoint to be ready: {error}"),
+    }
 }
 
 /// How long the step given to an editor that only reaches its queue when the reader steps lasts.
@@ -85,15 +119,20 @@ pub const STEP: Duration = Duration::from_millis(60);
 /// The bridge ships with a second, which is long beside a worker that answers in under a
 /// millisecond and the right thing to give up at when a worker has stopped answering. In a case
 /// the worker is this harness, and a runner that does not run the shell or the harness for a
-/// second leaves a question unanswered by a measure that says nothing about the package: the
-/// command runs as it was typed and the case fails. So a case lets the bridge wait for the answer
-/// as long as a case waits for anything, set in the bridge's own variable from the person's
-/// profile, and a case about what the bridge does when no answer comes gives the second back with
+/// second leaves an answer unread by a measure that says nothing about the package: the command
+/// runs as it was typed and the case fails. So a case lets the bridge wait for the answer as long
+/// as a case waits for anything, set in the bridge's own variable from the person's profile, and a
+/// case in which the worker is silent by design gives a shorter wait back with
 /// [`Session::lets_the_bridge_give_up_on_a_question`].
 const PATIENT_ANSWER_WAIT_MS: u32 = 120_000;
 
-/// The wait the bridge ships with.
-const SHIPPED_ANSWER_WAIT_MS: u32 = 1_000;
+/// How long the bridge waits in a case in which the worker never answers something. What the case
+/// observes is the wait running out, which a stalled runner only lengthens; but the worker still
+/// answers every other line in that window, and those answers have to be read inside it. Ten
+/// seconds is ten times the second that failed when the harness polled on a timer a runner at
+/// background priority stretched to a hundred milliseconds, and the harness now reads on the
+/// endpoint's readiness, in well under a millisecond.
+const SILENT_WORKER_ANSWER_WAIT_MS: u32 = 10_000;
 
 /// PowerShell that sets the bridge's wait for an answer, where the bridge is loaded and nowhere
 /// else, and leaves nothing behind in the session's scope.
@@ -102,6 +141,26 @@ fn set_answer_wait(milliseconds: u32) -> String {
         "& {{ $kr_bridge = Get-Module KalaReach.ShellBridge; if ($kr_bridge) {{ & $kr_bridge {{ \
          $script:KR_ANSWER_WAIT_MS = {milliseconds} }} }} }}"
     )
+}
+
+/// PowerShell that sets the bridge's wait for an answer and prints what the bridge holds after it,
+/// as `kr-answer-wait-` and the number of milliseconds, nothing at all of it where the bridge is
+/// not loaded. The marker is put together by the line, so the echo of the line cannot print it.
+fn set_answer_wait_and_say(milliseconds: u32) -> String {
+    format!(
+        "& {{ $kr_bridge = Get-Module KalaReach.ShellBridge; $kr_wait = if ($kr_bridge) {{ \
+         & $kr_bridge {{ $script:KR_ANSWER_WAIT_MS = {milliseconds}; $script:KR_ANSWER_WAIT_MS }} \
+         }} else {{ 'unloaded' }}; Write-Output ('kr-answer-wait-' + $kr_wait) }}"
+    )
+}
+
+/// PowerShell that prints what the bridge's wait for an answer holds, as
+/// [`set_answer_wait_and_say`] does after it sets it.
+fn read_answer_wait_and_say() -> String {
+    "& { $kr_bridge = Get-Module KalaReach.ShellBridge; $kr_wait = if ($kr_bridge) { \
+     & $kr_bridge { $script:KR_ANSWER_WAIT_MS } } else { 'unloaded' }; \
+     Write-Output ('kr-answer-wait-' + $kr_wait) }"
+        .to_owned()
 }
 
 /// Which side of the endpoint has gone, or `None` where it is whole.
@@ -1156,7 +1215,10 @@ impl Session {
             let Some(stream) = connected else {
                 let state = match child.try_wait() {
                     Ok(Some(status)) => format!("it ended with {status:?}"),
-                    _ => format!("it was still running after {REPLY:?}"),
+                    _ => {
+                        note_that_a_wait_gave_up();
+                        format!("it was still running after {REPLY:?}")
+                    }
                 };
                 panic!(
                     "the shell did not connect to the endpoint it was given: {state}; the terminal \
@@ -1358,7 +1420,7 @@ impl Session {
     fn deadline_for(&self, default: Duration) -> Deadline {
         match self.budget {
             Some(deadline) => deadline,
-            None => Deadline::after(default),
+            None => Deadline::after(after_any_give_up(default)),
         }
     }
 
@@ -1366,7 +1428,7 @@ impl Session {
     fn bounded(&self, within: Duration) -> Duration {
         match self.budget {
             Some(deadline) => deadline.at_most(within),
-            None => within,
+            None => after_any_give_up(within),
         }
     }
 
@@ -1526,13 +1588,38 @@ impl Session {
     /// how long to read for and starting to read would otherwise begin an interval its caller has
     /// already spent.
     fn pump_before(&mut self, within: Duration, deadline: Instant) {
+        self.take_in(within, deadline, true);
+    }
+
+    /// Takes in what the bridge has already sent, acknowledging it as [`Session::pump`] does, and
+    /// waits for nothing more.
+    ///
+    /// A frame the bridge wrote before something the harness saw on the terminal is in the
+    /// endpoint already, and a check that has seen the terminal and not yet read the endpoint
+    /// reads it here. A short wait for it would not: its time can be spent before the frame is
+    /// reached.
+    pub fn take_in_what_has_arrived(&mut self) {
+        let deadline = self.deadline_for(REPLY).0;
+        self.take_in(REPLY, deadline, false);
+    }
+
+    /// [`Session::pump_before`], or with `waiting` false the reading of what is there and no more.
+    fn take_in(&mut self, within: Duration, deadline: Instant, waiting: bool) {
         let end = (Instant::now() + within).min(deadline);
         loop {
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return;
             }
-            let Some(frame) = self.read_frame(left.min(Duration::from_millis(20))) else {
+            let window = if waiting {
+                left.min(Duration::from_millis(20))
+            } else {
+                Duration::ZERO
+            };
+            let Some(frame) = self.read_frame(window) else {
+                if !waiting {
+                    return;
+                }
                 if self.peer_read_gone && self.pending.len() < 4 {
                     // Nothing more is coming and nothing whole is left to decode, so waiting out
                     // the rest of this call would be waiting for a stream that has ended. A caller
@@ -1783,10 +1870,14 @@ impl Session {
             if let Some(received) = self.events.take_first(|received| accept(&received.event)) {
                 return (received.id, received.event);
             }
+            let gave_up = deadline.passed();
+            if gave_up {
+                note_that_a_wait_gave_up();
+            }
             assert!(
-                !deadline.passed() && !self.nothing_more_is_coming(),
+                !gave_up && !self.read_to_the_end(),
                 "no {what} arrived{}; the events were {:?}\nterminal output:\n{}",
-                if deadline.passed() {
+                if gave_up {
                     ""
                 } else {
                     " and the stream has ended"
@@ -1796,12 +1887,6 @@ impl Session {
             );
             self.pump(Duration::from_millis(50));
         }
-    }
-
-    /// Whether the stream the bridge's frames come on has ended with no whole frame left in it, so
-    /// that a wait for one is a wait for something that cannot arrive.
-    fn nothing_more_is_coming(&self) -> bool {
-        self.shut || (self.peer_read_gone && self.whole_frame_len().is_none())
     }
 
     /// Returns true when an event the predicate accepts arrived inside `within`.
@@ -2286,29 +2371,56 @@ impl Session {
         self.run(&command, marker)
     }
 
-    /// Gives the bridge back the second it ships with to wait for the worker's answer to a
-    /// question, for a case about what it does when the answer does not come. Every other case
-    /// lets it wait far longer; see [`PATIENT_ANSWER_WAIT_MS`]. Nothing is done for a shell whose
-    /// bridge has no such wait.
+    /// Gives the bridge a short wait for the worker's answer, for a case in which the worker never
+    /// answers something and what the case looks at is the wait running out. Every other case lets
+    /// the bridge wait far longer; see [`PATIENT_ANSWER_WAIT_MS`] and
+    /// [`SILENT_WORKER_ANSWER_WAIT_MS`]. The wait applies to every question and every acceptance
+    /// the bridge sends until [`Session::lets_the_bridge_wait_for_answers`] is called. Nothing is
+    /// done for a shell whose bridge has no such wait.
     ///
     /// # Panics
     ///
-    /// Panics when the shell does not take the line.
+    /// Panics when the shell does not take the line or the bridge does not hold the wait after it.
     pub fn lets_the_bridge_give_up_on_a_question(&mut self) {
+        self.sets_the_bridge_answer_wait(SILENT_WORKER_ANSWER_WAIT_MS);
+    }
+
+    /// Makes the bridge wait for the worker's answers as long as a case waits for anything, as it
+    /// does when the case starts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shell does not take the line or the bridge does not hold the wait after it.
+    pub fn lets_the_bridge_wait_for_answers(&mut self) {
+        self.sets_the_bridge_answer_wait(PATIENT_ANSWER_WAIT_MS);
+    }
+
+    /// Whether the bridge holds the long wait for answers that a case starts with.
+    pub fn bridge_waits_for_answers(&mut self) -> bool {
+        self.package_kind != ShellKind::PowerShell || self.says_the_bridge_answer_wait(None)
+    }
+
+    fn sets_the_bridge_answer_wait(&mut self, milliseconds: u32) {
         if self.package_kind != ShellKind::PowerShell {
             return;
         }
-        let marker = "kr-wait-given-back";
-        let line = format!(
-            "{}; {}",
-            set_answer_wait(SHIPPED_ANSWER_WAIT_MS),
-            print_assembled(self.package_kind, marker)
-        );
         assert!(
-            self.run(&line, marker),
-            "the bridge's wait for an answer was not set back:\n{}",
+            self.says_the_bridge_answer_wait(Some(milliseconds)),
+            "the bridge does not hold a wait of {milliseconds} ms for answers:\n{}",
             self.terminal_output()
         );
+    }
+
+    /// Sets the bridge's wait to `set` where that is given, or reads it where it is not, and says
+    /// whether the bridge then holds the value the case expects: `set`, or the long wait a case
+    /// starts with.
+    fn says_the_bridge_answer_wait(&mut self, set: Option<u32>) -> bool {
+        let expected = set.unwrap_or(PATIENT_ANSWER_WAIT_MS);
+        let line = match set {
+            Some(milliseconds) => set_answer_wait_and_say(milliseconds),
+            None => read_answer_wait_and_say(),
+        };
+        self.run(&line, &format!("kr-answer-wait-{expected}"))
     }
 
     /// Runs one command for a caller that owns a budget of its own.

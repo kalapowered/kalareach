@@ -388,6 +388,7 @@ impl Session {
             "{command:?} did not print {marker:?}:\n{}",
             self.terminal_output()
         );
+        self.take_in_what_has_arrived();
         self.commands.resolves[before..].to_vec()
     }
 }
@@ -1049,6 +1050,14 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
 
+    // A case starts with the bridge waiting for answers as long as a case waits for anything. This
+    // one looks at the wait running out, so it shortens the wait for the question and puts the
+    // long one back as soon as the worker is answering again.
+    assert!(
+        session.bridge_waits_for_answers(),
+        "the bridge does not start a case holding the long wait for answers:\n{}",
+        session.terminal_output()
+    );
     let entries = session.commands.entries.len();
     session.lets_the_bridge_give_up_on_a_question();
     session.commands.policy = ResolvePolicy::Silent;
@@ -1066,6 +1075,7 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
         commands.entries.len() > entries
     });
     session.barrier();
+    session.lets_the_bridge_wait_for_answers();
     let asked = session.run_asking("kr-probe caught-up", "probe-ran");
     assert_eq!(
         asked.len(),
@@ -1965,9 +1975,6 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
     let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
-    // The line that gives the bridge its second back is a line of its own, accepted and answered
-    // like any other, so it comes before the frames this case queues for the lines after it.
-    session.lets_the_bridge_give_up_on_a_question();
 
     // A gesture at a fenced prompt leaves a detach waiting for the worker's answer, which comes
     // only after the next line has been typed. The fence stays held until the answer arrives.
