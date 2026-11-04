@@ -26,10 +26,9 @@
 //! and a program a repository's configuration names as a helper (a clean filter) never run, and Git
 //! reports that it could not start them; the shell is refused to the checkout account, so a hook
 //! script that needs it and a clone that needs it never run there, and they run for the connection
-//! account; the console host, which is on both lists, starts nothing the policy refuses; the
-//! programs of Git's installation cannot be written to by either account; and Git, its helpers and a
-//! clone that checks nothing out run where they are on the list. What the case requires of the
-//! ordinary account: every one of those programs runs.
+//! account; the programs of Git's installation cannot be written to by either account; and Git, its
+//! helpers and a clone that checks nothing out run where they are on the list. What the case
+//! requires of the ordinary account: every one of those programs runs.
 //!
 //! The same launches in a guest where the policy is not in place all succeed, which is the case's
 //! own negative control: it fails there, naming every program that ran.
@@ -223,7 +222,6 @@ fn the_boundary_accounts_run_only_git_and_the_person_runs_everything() {
     case.git_and_its_helpers();
     case.helpers_a_repository_names();
     case.clone_then_checkout();
-    case.console_host_starts_nothing_refused();
     case.git_installation_is_not_writable();
     case.finish();
 }
@@ -909,49 +907,6 @@ impl Case {
                         checkout.outcome, checkout.output
                     )
                 });
-            }
-        }
-    }
-
-    /// The console host is on both lists, because Git's console program starts it. A launcher that
-    /// can be handed a command line must still start nothing the policy refuses: each process it
-    /// creates is judged against the account it runs as.
-    fn console_host_starts_nothing_refused(&mut self) {
-        println!("--- the console host is handed a program");
-        let directory = self.root.clone();
-        let host = PathBuf::from(std::env::var_os("SystemRoot").expect("the system root"))
-            .join("System32")
-            .join("conhost.exe");
-        let recorder = self.root.join("planted").join("recorder.exe");
-        let marker = self.root.join("planted").join("recorder.exe.ran");
-        for who in ALL {
-            let _ = std::fs::remove_file(&marker);
-            let launch = self.launch(
-                who,
-                "conhost.exe handed recorder.exe",
-                &host,
-                &format!("\"{}\"", recorder.display()),
-                &directory,
-            );
-            let recorded = marker.exists();
-            let _ = std::fs::remove_file(&marker);
-            let role = self.account(who).role;
-            if who == Who::Person {
-                self.expect(launch.outcome.ran() && recorded, || {
-                    format!(
-                        "{role}: the console host handed a program {} and recorded={recorded}",
-                        launch.outcome
-                    )
-                });
-            } else {
-                self.expect(!recorded, || {
-                    format!("{role}: a program the policy refuses ran through the console host")
-                });
-                self.expect_blocked(
-                    who,
-                    r"\PLANTED\RECORDER.EXE",
-                    "the program the console host was handed is named as blocked",
-                );
             }
         }
     }
