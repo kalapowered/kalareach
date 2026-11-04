@@ -783,9 +783,12 @@ impl OpenedRepository {
     /// # Errors
     ///
     /// Returns [`ProjectError::IdentityChanged`] when either identity or the configuration
-    /// differs, [`ProjectError::GitFailed`] when the host is too short of descriptors, processes
-    /// or memory to open the top level or the Git directory again, and
-    /// [`ProjectError::Destination`] when either cannot be opened for another reason.
+    /// differs, and [`ProjectError::GitFailed`] when the repository cannot be read. For a
+    /// repository opened by path the top level and the Git directory are opened again by the
+    /// paths Git reports: [`ProjectError::GitFailed`] is also returned when the host is too short
+    /// of descriptors, processes or memory to do that, and [`ProjectError::Destination`] when
+    /// either cannot be opened for another reason. A repository reached through a location is
+    /// found again through it, and a shortage there is [`ProjectError::Destination`].
     pub fn confirm(&self, profile: &RestrictedProfile) -> Result<()> {
         // The repository is asked where its common directory and its top level are, rather than
         // reopened at the paths recorded earlier. A `.git` file rewritten to point elsewhere would
