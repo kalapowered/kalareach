@@ -363,7 +363,7 @@ fn a_program_started_from_the_release_current_names_runs_that_release_during_swi
         scope.spawn(|| {
             let mut round = 0_u32;
             while !finished.load(Ordering::SeqCst) {
-                test.switch(if round % 2 == 0 { &two } else { &one });
+                test.switch(if round.is_multiple_of(2) { &two } else { &one });
                 round += 1;
             }
         });
