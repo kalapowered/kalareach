@@ -21,13 +21,10 @@ use super::*;
 /// brackets, and returns its path.
 fn argument_printer(session: &Session) -> PathBuf {
     let program = session.home().join("show-arguments");
-    std::fs::write(
+    kr_ipc::testing::place_script(
         &program,
         "#!/bin/sh\nfor argument in \"$@\"; do printf '<%s>' \"$argument\"; done\nprintf '\\n'\n",
-    )
-    .expect("a program that prints its arguments");
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-        .expect("the program can be run");
+    );
     program
 }
 

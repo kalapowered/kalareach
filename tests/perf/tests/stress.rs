@@ -221,12 +221,7 @@ async fn host() -> Host {
     let plugin_host = temp.root().join("kr-plugin-host");
     kr_ipc::testing::place_program(&built("kr-plugin-host"), &plugin_host);
     let echo_root = temp.root().join("echo-root");
-    std::fs::write(&echo_root, ECHO_ROOT).expect("the echoing root program");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&echo_root, std::fs::Permissions::from_mode(0o700))
-            .expect("the echoing root program runs");
-    }
+    kr_ipc::testing::place_script(&echo_root, ECHO_ROOT);
     let secrets = environment.secrets_dir();
     let controller = Controller::start(ControllerSetup {
         paths: environment.clone(),

@@ -112,8 +112,6 @@ impl Launch {
     /// Puts a program in place of the second release's forwarder that writes down what it was
     /// started with, says it has started, and waits to be told to go on.
     fn install_recorder(&self) {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let script = format!(
             "#!/bin/sh\n\
              printf 'args:%s\\nmarker:%s\\n' \"$*\" \"$KR_HELPER_FROM\" > '{out}.tmp'\n\
@@ -130,9 +128,7 @@ impl Launch {
             .release_directory(&self.theirs)
             .join("bin")
             .join(Program::Hook.file_name());
-        std::fs::write(&program, script).expect("the recording program");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-            .expect("it can be run");
+        kr_ipc::testing::place_script(&program, script);
     }
 
     /// The launch's registration, naming `release` as the release of its worker when it names one.

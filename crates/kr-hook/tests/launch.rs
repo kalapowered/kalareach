@@ -2382,7 +2382,7 @@ fn kr_req_12_07_an_upgrade_while_the_program_runs_leaves_it_its_bridges() {
     );
     if cfg!(target_os = "linux") {
         let staged = path.with_extension("next");
-        std::fs::copy(another, &staged).expect("the new version");
+        kr_ipc::testing::place_program(another, &staged);
         std::fs::rename(&staged, &path).expect("installed over the running one");
     } else {
         retarget(&path, another);

@@ -2012,8 +2012,6 @@ fn launch_prints_what_was_named(
 /// the installed line, which carries quotes and no brackets, cannot produce it. The last launch is
 /// a pipeline the caller quoted for the shell itself, which runs as written.
 pub fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated(kind: ShellKind) {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
@@ -2023,13 +2021,10 @@ pub fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated(kind: ShellKind)
     let directory = session.home().join("kr launch directory");
     std::fs::create_dir_all(&directory).expect("a directory with a space in its name");
     let program = directory.join("show arguments");
-    std::fs::write(
+    kr_ipc::testing::place_script(
         &program,
         "#!/bin/sh\nfor argument in \"$@\"; do printf '<%s>' \"$argument\"; done\nprintf '\\n'\n",
-    )
-    .expect("a program that prints its arguments");
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-        .expect("the program can be run");
+    );
 
     let substitution = match kind {
         ShellKind::Fish => "(echo substituted)",

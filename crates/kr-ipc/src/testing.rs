@@ -369,6 +369,47 @@ pub fn place_program(source: &Path, destination: &Path) {
     }
 }
 
+/// Places a program whose text is `text` at `destination`, runnable, and leaves nothing holding it
+/// open for writing.
+///
+/// The same race as [`place_program`] describes holds for a script a test writes: the thread that
+/// writes it and then starts it, or has a shell or a daemon start it, is racing every child another
+/// thread starts meanwhile. Closing and syncing the file here would not end that race. A child
+/// started while the file is open for writing carries its own copy of the open file until its
+/// program takes over, and closing this process's descriptor does not take that copy away; the
+/// start then fails with "text file busy" for as long as the child has not yet taken over, which
+/// is longer the more the machine has to do.
+///
+/// So this process never opens the program for writing. The text goes to a file beside it that
+/// nothing starts, a separate process copies that file into place as [`place_program`] does, and
+/// the file of text is removed.
+///
+/// # Panics
+///
+/// Panics when the text cannot be written or the program cannot be placed.
+pub fn place_script(destination: &Path, text: impl AsRef<[u8]>) {
+    let mut name = destination
+        .file_name()
+        .expect("a program has a name")
+        .to_owned();
+    name.push(".text");
+    let text_file = destination.with_file_name(name);
+    std::fs::write(&text_file, text).unwrap_or_else(|error| {
+        panic!(
+            "the text of the program at {} could not be written: {error}",
+            destination.display()
+        )
+    });
+    place_program(&text_file, destination);
+    std::fs::remove_file(&text_file).unwrap_or_else(|error| {
+        panic!(
+            "the text of the program at {} could not be removed once the program was placed: \
+             {error}",
+            destination.display()
+        )
+    });
+}
+
 /// The descriptor numbers a program started by this process holds when it begins, from 3 up.
 ///
 /// A child is handed a copy of every descriptor of this process that is not marked to close when a

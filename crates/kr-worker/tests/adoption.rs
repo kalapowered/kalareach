@@ -1371,15 +1371,6 @@ async fn a_wrapper_that_execs_the_program_names_the_program_after_the_exec() {
     typing.close().await;
 }
 
-/// Writes an executable script at `path`.
-fn script(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    std::fs::write(path, body).expect("the script");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("the script can run");
-}
-
 /// When the shell's integration answered for exactly one command of the line and
 /// the foreground program is running it, as the interpreter a script names runs the script it is
 /// given, that command names the application and not the interpreter. Only that shows it: a
@@ -1397,7 +1388,7 @@ async fn the_command_the_integration_answered_for_names_the_program_that_runs_it
 
     let setup = Setup::new();
     let assistant = setup.host.root().join("assistant");
-    script(&assistant, "#!/bin/sh\nsleep 60\ntrue\n");
+    kr_ipc::testing::place_script(&assistant, "#!/bin/sh\nsleep 60\ntrue\n");
     let answered = vec![(assistant.display().to_string(), None)];
     let typing = Typing::start(&setup.host, kr_worker::testing::posix_script("exec cat"));
     let producer = kr_worker::application::Producer::new(Arc::downgrade(&typing.runtime));
@@ -1438,7 +1429,7 @@ async fn the_command_the_integration_answered_for_names_the_program_that_runs_it
     // A program that has the script among its arguments and is another program: `tail` reads the
     // script and runs nothing of it.
     let watcher = setup.host.root().join("watcher");
-    script(&watcher, "#!/bin/sh\nexec tail -f \"$0\"\n");
+    kr_ipc::testing::place_script(&watcher, "#!/bin/sh\nexec tail -f \"$0\"\n");
     let started = setup.start_script(&watcher);
     let foreground = Setup::foreground(&started, vec![(watcher.display().to_string(), None)]);
     let named = look_until_named(&mut following, &producer, &foreground);
@@ -1472,7 +1463,7 @@ async fn a_shell_that_execs_the_script_the_line_named_is_named_for_it_once_it_ru
     let setup = Setup::new();
     let go = setup.host.root().join("go");
     let assistant = setup.host.root().join("assistant");
-    script(&assistant, "#!/bin/sh\nsleep 60\ntrue\n");
+    kr_ipc::testing::place_script(&assistant, "#!/bin/sh\nsleep 60\ntrue\n");
     let typing = Typing::start(&setup.host, kr_worker::testing::posix_script("exec cat"));
     let producer = kr_worker::application::Producer::new(Arc::downgrade(&typing.runtime));
     let mut following = Following::new(Arc::clone(&producer));
@@ -1513,15 +1504,15 @@ async fn a_script_that_execs_its_interpreter_on_another_script_is_no_longer_name
         setup.host.root().join("assistant"),
         setup.host.root().join("other"),
     );
-    script(
+    kr_ipc::testing::place_script(
         &assistant,
-        &format!(
+        format!(
             "#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.05; done\nexec /bin/sh '{}'\n",
             go.display(),
             other.display()
         ),
     );
-    script(&other, "#!/bin/sh\nsleep 60\ntrue\n");
+    kr_ipc::testing::place_script(&other, "#!/bin/sh\nsleep 60\ntrue\n");
     let typing = Typing::start(&setup.host, kr_worker::testing::posix_script("exec cat"));
     let producer = kr_worker::application::Producer::new(Arc::downgrade(&typing.runtime));
     let mut following = Following::new(Arc::clone(&producer));

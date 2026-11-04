@@ -5145,6 +5145,7 @@ dependencies = [
  "aws-lc-rs",
  "clap",
  "jiff",
+ "kr-ipc",
  "kr-plugin-sdk",
  "kr-protocol",
  "kr-shell-integration",

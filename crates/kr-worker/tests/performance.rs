@@ -1699,13 +1699,7 @@ async fn input_under_output(host: &Host, owned: &mut Owned) -> Result<(), String
         create(host, owned).await?;
     }
     let program = host.temp.root().join("echoes-under-output.sh");
-    std::fs::write(&program, ECHOES_UNDER_OUTPUT)
-        .map_err(|error| format!("write the root program: {error}"))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("make the root program runnable: {error}"))?;
-    }
+    kr_ipc::testing::place_script(&program, ECHOES_UNDER_OUTPUT);
     let params = SessionCreateParams {
         shell: Nullable::some(program.display().to_string()),
         ..create_params(host)

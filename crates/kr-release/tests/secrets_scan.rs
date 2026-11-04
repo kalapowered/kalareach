@@ -8,7 +8,6 @@
 
 use std::collections::BTreeSet;
 use std::ops::Range;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -153,8 +152,7 @@ fn pack(tree: &Path, archive: &Path) {
 /// given, the directory is searched for a program before the rest of the path is.
 fn seal(scratch: &Path, tree: &Path, out: &Path, programs: Option<&Path>) -> Output {
     let signer = scratch.join("kr-release");
-    std::fs::write(&signer, "#!/bin/sh\nexit 0\n").expect("a stand-in signer");
-    std::fs::set_permissions(&signer, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    kr_ipc::testing::place_script(&signer, "#!/bin/sh\nexit 0\n");
     let root_file = scratch.join("root.json");
     std::fs::write(&root_file, "{}\n").expect("a root");
     let key_file = scratch.join("targets-1.pk8");
@@ -338,7 +336,7 @@ fn sealing_refuses_an_archive_that_holds_a_private_key_the_scan_of_the_tree_did_
     std::fs::create_dir_all(&programs).expect("a directory of programs");
     let late_key = scratch.path().join("late-key.pem");
     let stand_in = programs.join("tar");
-    std::fs::write(
+    kr_ipc::testing::place_script(
         &stand_in,
         format!(
             "#!/bin/sh\nif [ -f '{}' ]; then cp '{}' '{}'; fi\nexec /usr/bin/tar \"$@\"\n",
@@ -346,10 +344,7 @@ fn sealing_refuses_an_archive_that_holds_a_private_key_the_scan_of_the_tree_did_
             path_text(&late_key),
             path_text(&tree.join("share/late.pem")),
         ),
-    )
-    .expect("a stand-in tar");
-    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755))
-        .expect("executable");
+    );
 
     // The control: with no key to add, the stand-in packs the tree as it is, and the seal passes.
     let clean_out = scratch.path().join("clean-out");

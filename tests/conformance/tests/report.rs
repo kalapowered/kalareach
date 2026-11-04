@@ -1266,7 +1266,6 @@ fn a_result_line_that_follows_half_a_line_of_standard_error_is_still_the_tests_r
 /// leaves `record` as each binary's record when that is given.
 #[cfg(unix)]
 fn runner_that_asks_for_no_record(directory: &Path, record: Option<&str>) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = directory.join("runner");
     let leave = record.map_or_else(String::new, |text| {
         format!("printf '%s\\n' '{text}' > \"$KR_CONFORMANCE_RECORDS/$(basename \"$2\")\"\n")
@@ -1275,8 +1274,7 @@ fn runner_that_asks_for_no_record(directory: &Path, record: Option<&str>) -> Pat
         "#!/bin/sh\ncase \"$1\" in\n  run-one)\n{leave}    shift\n    exec \"$@\" ;;\n  *) exec '{}' \"$@\" ;;\nesac\n",
         lister().display()
     );
-    std::fs::write(&path, script).expect("a runner");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    kr_ipc::testing::place_script(&path, script);
     path
 }
 

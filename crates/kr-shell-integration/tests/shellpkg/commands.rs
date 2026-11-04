@@ -48,20 +48,6 @@ impl ProbeRun {
     }
 }
 
-/// Places a program whose contents are `bytes` at `path`.
-///
-/// The bytes are written beside it and placed by a process of its own, so this process never holds
-/// the program open for writing, and a child another test starts is never handed a descriptor that
-/// would keep the program from starting.
-fn place(path: &Path, bytes: &[u8]) {
-    let mut name = path.file_name().expect("a program has a name").to_owned();
-    name.push(".text");
-    let text = path.with_file_name(name);
-    std::fs::write(&text, bytes).unwrap_or_else(|error| panic!("{}: {error}", text.display()));
-    kr_ipc::testing::place_program(&text, path);
-    std::fs::remove_file(&text).unwrap_or_else(|error| panic!("{}: {error}", text.display()));
-}
-
 /// Writes a program that records its arguments and every reserved variable it was started with,
 /// then prints a word it puts together from two pieces.
 fn write_recorder(path: &Path, record: &Path, head: &str, tail: &str) {
@@ -78,7 +64,7 @@ fn write_recorder(path: &Path, record: &Path, head: &str, tail: &str) {
          printf '%s%s\\n' '{head}' '{tail}'\n",
         record = told(record)
     );
-    place(path, script.as_bytes());
+    kr_ipc::testing::place_script(path, &script);
     run_once(path, record);
 }
 
@@ -185,22 +171,24 @@ impl Probes {
             "ran",
         );
         // A launcher that is an executable file the system cannot start.
-        place(&root.join("launcher").join("kr-hook-broken"), &[0, 1, 2, 3]);
+        kr_ipc::testing::place_script(
+            &root.join("launcher").join("kr-hook-broken"),
+            [0_u8, 1, 2, 3],
+        );
         // A launcher that starts, records that it did and ends with a status of its own.
         let failing = root.join("launcher").join("kr-hook-fails");
-        place(
+        kr_ipc::testing::place_script(
             &failing,
             format!(
                 "#!/bin/sh\nprintf 'run\\nend\\n' >> '{}'\nexit 7\n",
                 told(&root.join("failing-launcher.record"))
-            )
-            .as_bytes(),
+            ),
         );
         start_once(&failing, 7);
         let _ = std::fs::remove_file(root.join("failing-launcher.record"));
         // A program on the search path that prints a word and ends with a status of its own.
         let failing_program = root.join("bin").join("kr-probe-fails");
-        place(
+        kr_ipc::testing::place_script(
             &failing_program,
             b"#!/bin/sh\nprintf '%s%s\\n' 'fails-' 'ran'\nexit 7\n",
         );
@@ -2299,7 +2287,7 @@ impl Corpus {
                  printf '%s%s\\n' '{name}-' 'ran'\n"
             );
             let program = root.join("bin").join(name);
-            place(&program, script.as_bytes());
+            kr_ipc::testing::place_script(&program, &script);
             // Started once here, outside every timed wait, with somewhere to record.
             let scratch = root.join("scratch");
             std::fs::create_dir_all(&scratch).expect("a scratch directory");

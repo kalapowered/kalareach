@@ -189,18 +189,12 @@ mod tests {
         /// Windows a copy of Windows PowerShell, since a batch file is not a program a probe starts.
         #[cfg(unix)]
         fn application(&self) -> (PathBuf, Vec<String>) {
-            use std::os::unix::fs::PermissionsExt as _;
-
             let directory = self.0.join("bin");
             std::fs::create_dir_all(&directory).expect("a directory");
-            let path = directory.join("codex");
-            std::fs::write(
-                &path,
+            kr_ipc::testing::place_script(
+                &directory.join("codex"),
                 format!("#!/bin/sh\ntouch {RAN}\nprintf '%s' '{PRINTED}'\nexit 1\n"),
-            )
-            .expect("the application is written");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("the application is made executable");
+            );
             (directory, vec!["doctor".to_owned(), "--json".to_owned()])
         }
 

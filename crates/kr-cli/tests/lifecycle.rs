@@ -255,29 +255,6 @@ fn worker() -> &'static Path {
     })
 }
 
-/// Puts a program whose text is `text` at `destination`, runnable, without this process ever
-/// holding it open for writing.
-///
-/// This binary's tests run on threads of one process, and a child another test starts is handed a
-/// copy of every descriptor open at that moment, a descriptor this process is writing a program
-/// through included. The child holds its copy until it starts its own program, and until then
-/// Linux refuses to start the program that is still open for writing. The programs placed here are
-/// started by a session's shell, not by this process, so no retry of this process's own could
-/// cover them. So the text goes to a file nothing starts, and a separate process copies it into
-/// place: no descriptor of this process is ever open on the program for writing, and no child can
-/// inherit one.
-fn place_script(destination: &Path, text: &str) {
-    let mut name = destination
-        .file_name()
-        .expect("a program has a name")
-        .to_owned();
-    name.push(".text");
-    let text_file = destination.with_file_name(name);
-    std::fs::write(&text_file, text).expect("the program's text is written");
-    kr_ipc::testing::place_program(&text_file, destination);
-    std::fs::remove_file(&text_file).expect("the program's text goes once it is in place");
-}
-
 /// Quotes a path for the POSIX shell lines this test writes.
 fn quoted(path: &Path) -> String {
     let text = path.display().to_string();
@@ -400,7 +377,7 @@ impl Host {
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
                 .expect("makes it the owner's alone");
         }
-        place_script(&work.join("agent"), SCRIPTED_AGENT);
+        kr_ipc::testing::place_script(&work.join("agent"), SCRIPTED_AGENT);
         // The agent's tool configuration: which `kr` to start, and the host it belongs to.
         std::fs::write(
             work.join("agent.conf"),
@@ -412,7 +389,7 @@ impl Host {
             ),
         )
         .expect("writes the agent's configuration");
-        place_script(&work.join("stubborn"), STUBBORN_JOB);
+        kr_ipc::testing::place_script(&work.join("stubborn"), STUBBORN_JOB);
         for gate in ["go-on", "finish"] {
             make_fifo(&work.join(gate));
         }
@@ -4213,17 +4190,14 @@ impl Releases {
             .release_directory(&theirs)
             .join("bin")
             .join(Program::Kr.file_name());
-        std::fs::write(
+        kr_ipc::testing::place_script(
             &recorder,
             format!(
                 "#!/bin/sh\nprintf 'args:%s\\nmarker:%s\\n' \"$*\" \"$KR_HELPER_FROM\" > '{path}.tmp'\n\
                  mv '{path}.tmp' '{path}'\n",
                 path = recorded.display()
             ),
-        )
-        .expect("the recording program");
-        std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o755))
-            .expect("it can be run");
+        );
         Self {
             store,
             kr: kr_here,
@@ -4873,11 +4847,10 @@ fn a_new_window_through_the_konsole_profile_creates_a_session_each_time() {
     let program_directory = host.root().join("kr dir");
     std::fs::create_dir(&program_directory).expect("a directory");
     for name in ["kr", "kr-attach-guard"] {
-        std::fs::copy(
-            support::command_binaries().join(name),
-            program_directory.join(name),
-        )
-        .expect("copies the program");
+        kr_ipc::testing::place_program(
+            &support::command_binaries().join(name),
+            &program_directory.join(name),
+        );
     }
     let programs = host.root().join("programs");
     std::fs::create_dir(&programs).expect("a directory");
@@ -5694,11 +5667,10 @@ fn windows_through_the_profile_create_a_session_each(
     let program_directory = host.root().join("kr dir");
     std::fs::create_dir(&program_directory).expect("a directory");
     for name in ["kr", "kr-attach-guard"] {
-        std::fs::copy(
-            support::command_binaries().join(name),
-            program_directory.join(name),
-        )
-        .expect("copies the program");
+        kr_ipc::testing::place_program(
+            &support::command_binaries().join(name),
+            &program_directory.join(name),
+        );
     }
     let (first, second) = (host.work.join("go-on"), host.work.join("finish"));
     let removal = host.work.join("removal.json");
@@ -5707,16 +5679,13 @@ fn windows_through_the_profile_create_a_session_each(
     let search_path = if without_a_scope_manager {
         std::fs::create_dir(&stand_in).expect("a directory");
         let program = stand_in.join("systemd-run");
-        std::fs::write(
+        kr_ipc::testing::place_script(
             &program,
             "#!/bin/sh\n\
              [ \"$1\" = --version ] && exec /usr/bin/systemd-run --version\n\
              while [ $# -gt 0 ]; do case \"$1\" in --*) shift ;; *) break ;; esac; done\n\
              exec \"$@\"\n",
-        )
-        .expect("the stand-in");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-            .expect("an executable");
+        );
         format!("PATH={}:\"$PATH\"\n", quoted(&stand_in))
     } else {
         String::new()

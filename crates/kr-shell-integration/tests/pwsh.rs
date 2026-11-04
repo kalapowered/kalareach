@@ -1616,14 +1616,10 @@ fn a_launch_of_a_name_only_a_lookup_hook_answers_is_refused() {
 #[test]
 #[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn a_launch_of_a_name_only_the_get_fallback_answers_is_refused() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let directory = tempfile::tempdir().expect("a temporary directory");
     for name in ["get-krfallback", "get-krfunction"] {
         let program = directory.path().join(name);
-        std::fs::write(&program, "#!/bin/sh\necho fallback-ran\n").expect("a program");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-            .expect("the program can be run");
+        kr_ipc::testing::place_script(&program, "#!/bin/sh\necho fallback-ran\n");
     }
     let here = shellpkg::told(directory.path());
     let output = in_the_package_host(&format!(
@@ -1674,8 +1670,6 @@ const POWERSHELL_LAUNCH_LINES: &str =
 #[test]
 #[ignore = "drives this tree's built PSReadLine package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn a_launch_installs_the_line_the_table_lists_for_its_vector() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let table: serde_json::Value =
         serde_json::from_str(POWERSHELL_LAUNCH_LINES).expect("the table of lines");
     let cases = table["cases"].as_array().expect("the table's cases");
@@ -1687,9 +1681,7 @@ fn a_launch_installs_the_line_the_table_lists_for_its_vector() {
         let file = programs.path().join(program);
         std::fs::create_dir_all(file.parent().expect("a directory for the program"))
             .expect("the program's directory");
-        std::fs::write(&file, "#!/bin/sh\n").expect("a program");
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
-            .expect("the program can be run");
+        kr_ipc::testing::place_script(&file, "#!/bin/sh\n");
     }
     let listed = tempfile::tempdir().expect("a temporary directory");
     let path = listed.path().join("powershell-launch-lines.json");
@@ -1729,12 +1721,8 @@ const SHOW_EACH: &str = "#!/bin/sh\ni=0\n: > \"$KR_CASE_OUT\"\nfor word in \"$@\
 /// Writes the program a launch is made to into `directory`, in the places a launch finds it, and
 /// says where they are.
 fn write_show_each(directory: &std::path::Path) -> batch_launch::Programs {
-    use std::os::unix::fs::PermissionsExt;
-
     let write = |program: std::path::PathBuf| {
-        std::fs::write(&program, SHOW_EACH).expect("a program that writes its arguments");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-            .expect("the program can be run");
+        kr_ipc::testing::place_script(&program, SHOW_EACH);
         program.display().to_string()
     };
     let each = write(directory.join("show-each"));

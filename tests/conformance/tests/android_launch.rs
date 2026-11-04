@@ -15,7 +15,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -116,12 +115,10 @@ fn launch_with_deadline(
 
     let device = fixtures().join("device.py");
     let adb = tools.join("adb");
-    fs::write(
+    kr_ipc::testing::place_script(
         &adb,
         format!("#!/bin/sh\nexec python3 \"{}\" \"$@\"\n", device.display()),
-    )
-    .expect("a stand-in");
-    fs::set_permissions(&adb, fs::Permissions::from_mode(0o755)).expect("executable");
+    );
     if moved_by_hand {
         for (name, body) in [
             (
@@ -134,9 +131,7 @@ fn launch_with_deadline(
                  echo $((now + $1)) > \"$KR_FAKE_DEVICE_DIR/clock\"\n",
             ),
         ] {
-            let tool = tools.join(name);
-            fs::write(&tool, body).expect("a stand-in");
-            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("executable");
+            kr_ipc::testing::place_script(&tools.join(name), body);
         }
     }
 

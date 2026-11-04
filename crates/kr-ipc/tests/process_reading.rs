@@ -108,7 +108,7 @@ fn a_process_that_refuses_its_executable_is_still_running() {
 
     let directory = kr_ipc::testing::PrivateTempDir::create();
     let program = directory.path().join("unreadable");
-    std::fs::copy(std::env::current_exe().expect("this binary"), &program).expect("a copy");
+    kr_ipc::testing::place_program(&std::env::current_exe().expect("this binary"), &program);
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o111))
         .expect("a program that can be run and not read");
     let child = child_of(&program, "wait_for_the_pipe_to_close");
