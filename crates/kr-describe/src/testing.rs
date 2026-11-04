@@ -268,7 +268,8 @@ pub fn bound_held_after_the_answer(runtime_dir: &Path, id: u64) -> Option<u64> {
 /// directory when it has written the answer to the work with an identifier, followed by that
 /// identifier. It holds the bound the process held as the write ended, in the process's stamps. The
 /// bound is cleared after the answer, and a clear that came before it would leave the write of the
-/// answer with no limit.
+/// answer with no limit. The acknowledgement of a cancellation is an answer to the work too, so a
+/// case that cancels work reads the record after the work's own answer, which is written last.
 pub const ANSWER_WRITTEN_PREFIX: &str = "stub-answer-written-";
 
 /// The start of the name of the file a stub whose script marks work leaves in its runtime

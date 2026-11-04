@@ -214,19 +214,45 @@ fn the_terminal_workload_runs_outside_the_class_of_the_model_process() {
         model_pid,
         "when the process has said it is in the class",
     );
-    let model_pid = benchmark
-        .model_pid
-        .expect("the benchmark started a description process of its own");
+    assert!(
+        benchmark.model_pid.is_some(),
+        "the benchmark started a description process of its own"
+    );
 
     // The model loads and runs its first job, with the workload beside it, and the classes are the
-    // same: a class applied to the benchmark's own process after that would show here.
+    // same: a class applied to the benchmark's own process after that would show here. The process
+    // to read is the one running now, which is another one if the first was ended and started
+    // again.
     while !printed.iter().any(|line| line.starts_with("warm_up_job:")) {
         let Some(line) = next_line(&lines, &printed, &errors, CASE) else {
             return;
         };
+        if let Some(rest) = line.strip_prefix("description_process: pid ") {
+            benchmark.model_pid = rest
+                .split_whitespace()
+                .next()
+                .and_then(|pid| pid.parse().ok());
+        }
         printed.push(line);
     }
-    assert_classes(benchmark_pid, model_pid, "after the first job");
+    assert!(
+        printed
+            .iter()
+            .any(|line| line.starts_with("cold_start_load_ms:")),
+        "the first job ended with no model loaded: {printed:#?}"
+    );
+    let model_pid = benchmark
+        .model_pid
+        .expect("the benchmark started a description process of its own");
+    if exists(model_pid) {
+        assert_classes(benchmark_pid, model_pid, "after the first job");
+    } else {
+        // A process the service ended for the job and has not started again has no threads to read.
+        eprintln!(
+            "the description process had ended by the end of the first job, so the classes are \
+             read once"
+        );
+    }
 
     // The benchmark goes, and the description process it started goes with it: its input ends.
     drop(benchmark);

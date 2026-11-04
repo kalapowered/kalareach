@@ -326,26 +326,34 @@ fn largest(readings: [Option<u64>; 2]) -> Option<u64> {
 /// Reports one phase's process ceiling, and records a breach or an absent measurement as unmet.
 ///
 /// A ceiling nothing was measured against is not a ceiling that held. Printing `held: true` over an
-/// absent reading is how a budget comes to be passed by not being checked.
+/// absent reading is how a budget comes to be passed by not being checked. A breach the service
+/// reported (it ended or unloaded the process for one, and recorded the missed target where it
+/// saw it) is a ceiling that did not hold, whatever the readings from outside came to.
 fn report_ceiling(
     line: &str,
     resident: Option<u64>,
     ceiling: u64,
     phase: &str,
     machine: &str,
+    reported_breach: bool,
     unmet: &mut Vec<String>,
 ) {
-    let held = resident.map(|bytes| bytes <= ceiling);
+    let held = if reported_breach {
+        Some(false)
+    } else {
+        resident.map(|bytes| bytes <= ceiling)
+    };
     println!(
         "{line}: {ceiling} held: {} [{machine}]",
         held.map_or_else(|| "not measured".to_owned(), |held| held.to_string())
     );
     match (held, resident) {
         (Some(true), _) => {}
-        (Some(false), Some(bytes)) => unmet.push(format!(
+        (Some(false), Some(bytes)) if bytes > ceiling => unmet.push(format!(
             "the {ceiling} byte process ceiling was breached during {phase}: {bytes} bytes"
         )),
-        _ => unmet.push(format!(
+        (Some(false), _) => {}
+        (None, _) => unmet.push(format!(
             "the {ceiling} byte process ceiling was not measured during {phase}"
         )),
     }
@@ -502,6 +510,9 @@ struct Watch<'a> {
     /// The peaks of the processes that went before the one running, in the passes, resident set
     /// first.
     earlier: (Option<u64>, Option<u64>),
+    /// Whether the service has reported the process past its memory ceiling, by ending it or by
+    /// unloading the model for memory pressure.
+    breached: bool,
     /// The targets this run missed.
     unmet: Vec<String>,
 }
@@ -584,6 +595,7 @@ impl Watch<'_> {
             self.ceiling_bytes,
             "model load",
             machine,
+            self.breached,
             &mut self.unmet,
         );
     }
@@ -598,6 +610,7 @@ impl Watch<'_> {
             Turn::Outcome(Outcome::ProcessEnded { why }) => {
                 println!("description_process_ended: {} [{machine}]", why.as_str());
                 if *why == ProcessEnd::MemoryCeiling {
+                    self.breached = true;
                     self.unmet.push(format!(
                         "the description process passed the {} byte process ceiling and was ended",
                         self.ceiling_bytes
@@ -610,6 +623,7 @@ impl Watch<'_> {
             Turn::Unloaded(why) => {
                 println!("description_process_unloaded: {why:?} [{machine}]");
                 if matches!(why, UnloadReason::Paused(PauseReason::MemoryPressure)) {
+                    self.breached = true;
                     self.unmet.push(format!(
                         "the service unloaded the model for memory pressure, as it does for a \
                          process past its {} byte ceiling",
@@ -649,8 +663,10 @@ impl Turn {
 
 /// Drives the service through the daemon's driver until it has an answer's outcome, a pause or
 /// nothing queued, with each job running in the description process. Work that waits for a time
-/// the service sets, as it does after a job that missed its deadline, is waited for, as the daemon
-/// waits for it.
+/// the service sets for a job that missed its deadline is waited for, as the daemon waits for it.
+/// A pause is returned at once, also one the service sets a time for, which the daemon would wait
+/// out: a pause after repeated failures or a breach of the ceiling ends the passes' turns as
+/// `paused`, and a breach fails the run.
 fn turn(
     driver: &mut Driver,
     watch: &mut Watch,
@@ -662,8 +678,6 @@ fn turn(
         let reports = driver
             .turn(conditions, reading_now())
             .map_err(|error| error.to_string())?;
-        watch.sampler.sample(driver.pid());
-        watch.note_class(driver);
         let mut ended: Vec<Turn> = Vec::new();
         for report in reports {
             match report {
@@ -676,6 +690,10 @@ fn turn(
                 Report::Checked { .. } => {}
             }
         }
+        // After the reports, so that a process that was started in this turn has been noted before
+        // it is read for the first time.
+        watch.sampler.sample(driver.pid());
+        watch.note_class(driver);
         for each in &ended {
             watch.note_end(each);
         }
@@ -826,6 +844,7 @@ fn run(profile: &ModelProfile, cache: &Path, program: &Path) -> Result<(), Strin
         loaded: false,
         passes_begun: false,
         earlier: (None, None),
+        breached: false,
         unmet: Vec::new(),
     };
 
@@ -994,6 +1013,7 @@ fn run(profile: &ModelProfile, cache: &Path, program: &Path) -> Result<(), Strin
         budgets.process_memory_ceiling_bytes,
         "active inference",
         &machine,
+        watch.breached,
         &mut watch.unmet,
     );
 
