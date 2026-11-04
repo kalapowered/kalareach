@@ -1093,17 +1093,21 @@ impl OutputHistory {
                 // Another session is giving up output for the cap, or this one has none to give:
                 // this pass applies the session's own bounds, and the host's cap is left to the
                 // next. A lock that cannot be taken at all is not another session holding it, so
-                // the pass says why it left output it was asked to remove.
+                // the pass says why it left output it was asked to remove, beside the reason its
+                // own bounds left output behind for when they did: either one alone would leave
+                // the other unsaid.
                 let taken = self.apply_retention(retention, session_bytes, now_ms, age_permitted);
                 match refused {
                     Some(Err(HostCapLockRefused::Held)) => self.awaits_the_host_cap_lock = true,
-                    Some(Err(HostCapLockRefused::Unavailable(detail)))
-                        if self.left_behind.is_none() =>
-                    {
-                        self.left_behind = Some(format!(
+                    Some(Err(HostCapLockRefused::Unavailable(detail))) => {
+                        let lock = format!(
                             "the lock for the host's output cap could not be taken, so no output \
                              was removed for the host's total: {detail}"
-                        ));
+                        );
+                        self.left_behind = Some(match self.left_behind.take() {
+                            Some(earlier) => format!("{earlier}; {lock}"),
+                            None => lock,
+                        });
                     }
                     _ => {}
                 }
