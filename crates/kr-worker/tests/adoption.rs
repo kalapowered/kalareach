@@ -175,7 +175,7 @@ impl Setup {
     }
 
     fn spawn_in_a_group(&self, mut command: Command) -> Started {
-        let child = command
+        let mut child = command
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -184,6 +184,24 @@ impl Setup {
             .expect("the program starts");
         let process = kr_ipc::identity::process_start_identity(child.id())
             .expect("the program is identified");
+        // The start is told to this process when the new program takes over, a little before the
+        // system has written the program's argument vector. A look taken in between reads an image
+        // with no arguments, cannot see what it was started with, and names the interpreter.
+        // Waited for by what the system says, the way a look reads it.
+        #[cfg(target_os = "linux")]
+        {
+            let began = std::time::Instant::now();
+            while std::fs::read(format!("/proc/{}/cmdline", child.id()))
+                .is_ok_and(|arguments| arguments.is_empty())
+                && child.try_wait().is_ok_and(|ended| ended.is_none())
+            {
+                assert!(
+                    began.elapsed() < LIVENESS,
+                    "the program's arguments were still not readable after {LIVENESS:?}"
+                );
+                std::thread::yield_now();
+            }
+        }
         Started { child, process }
     }
 
