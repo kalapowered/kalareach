@@ -682,7 +682,17 @@ pub fn connection_shell(exec_path: &Path) -> Vec<PathBuf> {
 /// (`refused_by`), which a client sends the request again after; any other failure is the
 /// caller's argument.
 fn copied(directory: &cap_std::fs::Dir) -> Result<cap_std::fs::Dir> {
-    crate::identity::copy_of(directory).map_err(|error| {
+    // A case that asks for it has the copy fail, after that many have been made, as it does for a
+    // host that is out of descriptors.
+    #[cfg(all(test, unix))]
+    let copy = match crate::identity::tests::due(&crate::identity::tests::MADE_DIRECTORY_COPY_FAILS)
+    {
+        Some(error) => Err(std::io::Error::from(error)),
+        None => directory.try_clone(),
+    };
+    #[cfg(not(all(test, unix)))]
+    let copy = directory.try_clone();
+    copy.map_err(|error| {
         refused_by(
             &error,
             format!("a directory this host made could not be identified: {error}"),
@@ -1006,7 +1016,7 @@ mod tests {
     #[test]
     fn a_host_out_of_descriptors_when_the_handle_of_a_directory_this_host_made_is_copied_is_a_fault_that_passes()
      {
-        use crate::identity::tests::{CLONE_FAILS, OPEN_ERRORS, assert_answered};
+        use crate::identity::tests::{MADE_DIRECTORY_COPY_FAILS, OPEN_ERRORS, assert_answered};
 
         let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([14; 16]));
         let root = tempfile::tempdir().expect("a temporary directory");
@@ -1017,7 +1027,7 @@ mod tests {
             .expect("a directory this host made has an identity");
 
         for (errno, passes) in OPEN_ERRORS {
-            CLONE_FAILS.with(|fails| fails.set(Some((0, errno))));
+            MADE_DIRECTORY_COPY_FAILS.with(|fails| fails.set(Some((0, errno))));
             let answers = [
                 (
                     "its identity",
@@ -1032,7 +1042,7 @@ mod tests {
                     settle_handle(environment_id, &directory, recorded).map(drop),
                 ),
             ];
-            CLONE_FAILS.with(|fails| fails.set(None));
+            MADE_DIRECTORY_COPY_FAILS.with(|fails| fails.set(None));
 
             for (what, answer) in answers {
                 let Err(refused) = answer else {

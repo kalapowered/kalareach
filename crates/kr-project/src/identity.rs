@@ -1212,26 +1212,22 @@ fn open_recorded_root(
 /// when it cannot be duplicated for another reason or the copy cannot be read for what it is.
 pub(crate) fn duplicated(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
     let path = directory.display_path();
-    let copy =
-        copy_of(directory.handle()).map_err(|error| crate::boundary::unopenable(path, &error))?;
+    // A case that asks for it has the duplication fail, after that many have been made, as it
+    // does for a host that is out of descriptors.
+    #[cfg(all(test, unix))]
+    let copy = match tests::due(&tests::CLONE_FAILS) {
+        Some(error) => Err(std::io::Error::from(error)),
+        None => directory.handle().try_clone(),
+    };
+    #[cfg(not(all(test, unix)))]
+    let copy = directory.handle().try_clone();
+    let copy = copy.map_err(|error| crate::boundary::unopenable(path, &error))?;
     let held =
         AuthorisedDirectory::from_handle(directory.environment_id(), copy, path.to_path_buf())?;
     Ok(match directory.mount() {
         Some(_) => held.confined_to_one_mount()?,
         None => held,
     })
-}
-
-/// Duplicates the handle of an open directory, which takes a descriptor as an open does, so that a
-/// host too short of descriptors, processes or memory fails it. The caller words the failure.
-pub(crate) fn copy_of(directory: &cap_std::fs::Dir) -> std::io::Result<cap_std::fs::Dir> {
-    // A case that asks for it has the duplication fail, after that many have been made, as it
-    // does for a host that is out of descriptors.
-    #[cfg(all(test, unix))]
-    if let Some(error) = tests::due(&tests::CLONE_FAILS) {
-        return Err(std::io::Error::from(error));
-    }
-    directory.try_clone()
 }
 
 /// Opens the directory at `path` as an authority for one environment: a checkout `project.adopt`
@@ -1786,6 +1782,11 @@ pub(crate) mod tests {
         /// with this error, after that many have been made.
         pub(crate) static CLONE_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
             const { std::cell::Cell::new(None) };
+        /// Set by a case to make the duplication of the handle of a directory this host made for its
+        /// own use (an invocation's temporary directory) fail on its own thread with this error,
+        /// after that many have been made.
+        pub(crate) static MADE_DIRECTORY_COPY_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
+            const { std::cell::Cell::new(None) };
         /// Set by a case to make the listing of a directory that a repository is discovered through
         /// fail on its own thread with this error, after that many have been made.
         pub(crate) static LISTING_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
@@ -2292,9 +2293,9 @@ pub(crate) mod tests {
             ("the directory, for the record", 3, true),
         ] {
             for (errno, passes) in OPEN_ERRORS {
-                CLONE_FAILS.with(|fails| fails.set(Some((passing, errno))));
+                MADE_DIRECTORY_COPY_FAILS.with(|fails| fails.set(Some((passing, errno))));
                 let head = opened.head(&made.profile);
-                CLONE_FAILS.with(|fails| fails.set(None));
+                MADE_DIRECTORY_COPY_FAILS.with(|fails| fails.set(None));
 
                 let Err(refused) = head else {
                     panic!("{what} could not be copied ({errno}), and the invocation ran");
