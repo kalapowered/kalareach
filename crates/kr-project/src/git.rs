@@ -5874,6 +5874,8 @@ mod tests {
         let mut listed = Vec::new();
         let mut buffer = [0_u8; 256];
         loop {
+            // What `ps` gives for a process is a few characters.
+            assert!(listed.len() <= 4096, "ps wrote more than a state");
             match output.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => listed.extend_from_slice(&buffer[..read]),
@@ -7601,7 +7603,8 @@ mod tests {
 
     /// A `ps` that does not answer fails the case that asked it, and is ended, within the bound it
     /// was given: it cannot hold a case without end. The stand-in never answers on its own: it
-    /// lives for as long as the test program and the case's directory do, and no longer, so
+    /// lives for as long as the test program (named by its number, which the script is given, as
+    /// a shell may find its parent already gone) and the case's directory do, and no longer, so
     /// nothing here depends on how fast the machine runs or on how long it is stopped.
     #[cfg(unix)]
     #[test]
@@ -7611,7 +7614,8 @@ mod tests {
         place_stand_in(
             directory.path(),
             &format!(
-                "while kill -0 $PPID 2>/dev/null && [ -d '{}' ]; do sleep 0.05; done",
+                "while kill -0 {} 2>/dev/null && [ -d '{}' ]; do sleep 0.05; done",
+                std::process::id(),
                 directory.path().display()
             ),
         );
