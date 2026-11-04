@@ -29,8 +29,11 @@
 //! process the ending forces is noted as forced.
 //!
 //! **A limit.** On Linux the worker is the child subreaper, so a command the server leaves behind
-//! and the ladder then ends is a child of the worker's that nothing collects: it stays in the
-//! process table, ended, until the worker exits. The record reads it as ended.
+//! and the ladder then ends is a child of the worker's once its parent has ended. The worker
+//! collects it at the first reading of the session's processes after both it and its parent have
+//! ended, and until then it stays in the process table, ended. A command that no reading of the
+//! server's tree saw running is never collected and stays there until the worker exits, and so
+//! does every one on a kernel that gives no process descriptor to wait on (before Linux 5.4).
 
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsString;

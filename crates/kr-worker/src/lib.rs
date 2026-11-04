@@ -53,6 +53,8 @@
 #![deny(clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod action;
+#[cfg(target_os = "linux")]
+mod adopted;
 pub mod application;
 pub mod attachments;
 pub mod attention_fence;

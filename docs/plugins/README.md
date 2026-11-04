@@ -294,10 +294,14 @@ session is closed. To end the server, the host closes its input and gives it a m
 commands it started, then asks it to terminate. It asks every process the session recorded below the
 server to terminate too, by the process's identity, and ends by force whatever is still running five
 seconds after the ending began. This is necessary because a command of the server's leaves the
-server's process group and outlives a server that dies. On Linux a command the
-server leaves behind stays in the process table, ended, until the worker exits. When the session is
-closed, this happens after the acceptance of the close has been delivered, because the command that
-asked for the close may be one the server started.
+server's process group and outlives a server that dies. On Linux a command the server leaves behind
+becomes a child of the worker's once its parent has ended. The worker collects it at the first
+reading of the session's processes after both it and its parent have ended, and until then it
+stays in the process table, ended. A command that no reading of the server's tree saw running is
+never collected and stays there until the worker exits, and so does every one on a kernel that
+gives no process descriptor to wait on (before Linux 5.4). When the session is closed, this
+happens after the acceptance of the close has been delivered, because the command that asked for
+the close may be one the server started.
 
 The host reads which conversation the terminal has selected out of the frames it carries only
 where the package's table says where they name it (the table's observation member, below). Until a
