@@ -7422,14 +7422,11 @@ mod tests {
             });
             // The request has joined the first look once a third holder of it exists: the slot,
             // this case and the request.
-            let guard = Instant::now() + Duration::from_secs(30);
-            while Arc::strong_count(&first) < 3 {
-                assert!(
-                    Instant::now() < guard,
-                    "the request never joined the first look"
-                );
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            look_until(
+                Duration::from_secs(30),
+                "the request never joined the first look",
+                || (Arc::strong_count(&first) >= 3).then_some(()),
+            );
 
             // The second look takes the slot and stays under way while the first one ends.
             let second = Arc::new(Look::default());
