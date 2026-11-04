@@ -214,6 +214,11 @@ fn inputs(tree: &Path) -> Inputs {
 /// KR-REQ-07.38: the manifest of a tree names, for each shell package, the pins of
 /// the shell and the identity the build recorded; the unedited tree passes, which is the control
 /// of the refusals below.
+///
+/// KR-REQ-07.86, the part about module trees and search paths: each module a package lists has its
+/// search path as a directory of the tree, and the editor ABI it records is the one the pins name.
+/// Not shown here: that a shell loads from that path, or what the profile order is (the case asks
+/// only that a package lists one).
 #[test]
 #[ignore = "builds a tree of this checkout's shell packages; it runs with --include-ignored where they are built"]
 fn the_manifest_of_a_tree_names_the_pins_and_the_identity_the_build_recorded() {
@@ -331,8 +336,13 @@ fn the_manifest_of_a_tree_names_the_pins_and_the_identity_the_build_recorded() {
     }
 }
 
-/// KR-REQ-07.38, KR-REQ-07.86: a tree is refused before it is signed when a package disagrees with
-/// the pins or the checkout, and for a file a release does not hold.
+/// KR-REQ-07.38: a tree is refused before it is signed when a package disagrees with the pins or
+/// the checkout, and for a file a release does not hold.
+///
+/// KR-REQ-07.86, the part about module trees and search paths: a package that states no module, one
+/// whose module directory is not in the tree, and one whose recorded search path is another
+/// directory than the pins name are each refused. Not shown here: that a shell loads a module from
+/// the path the manifest names, or a signature.
 #[test]
 #[ignore = "builds a tree of this checkout's shell packages; it runs with --include-ignored where they are built"]
 fn a_tree_that_disagrees_with_the_pins_is_refused_before_it_is_signed() {
@@ -501,6 +511,9 @@ fn a_tree_that_disagrees_with_the_pins_is_refused_before_it_is_signed() {
 /// KR-REQ-07.86: the shipped Zsh started from a copy of the release tree finds its module
 /// directory through the search path the manifest names, and a `release.json` whose profile order
 /// was edited after it was written is not signed.
+///
+/// Not shown here: the Bash and Fish packages, a tree for Windows, or that the profile order the
+/// manifest records is the order a shell runs its startup files in.
 #[test]
 #[ignore = "builds a tree of this checkout's shell packages; it runs with --include-ignored where they are built"]
 fn a_relocated_tree_finds_its_modules_through_the_search_path_the_manifest_names() {
@@ -585,6 +598,13 @@ fn a_relocated_tree_finds_its_modules_through_the_search_path_the_manifest_names
 
 /// A tree is signed by the threshold of keys the root names, and a host's check of
 /// what was signed refuses a tree that changed after it, or one that one key signed.
+///
+/// KR-REQ-07.86, the part about signed artefacts: the manifest that lists every file of the tree
+/// with its length, mode and digest is signed with the keys of a root made for the run, and the
+/// host's check refuses the tree that one key of the two signed, and the tree whose program gained
+/// a byte after both did; the tree both signed is the control. Not shown here: a code signature on
+/// an executable or a module, the published release's signatures, or the production channel's root,
+/// which the root made for the run is not.
 #[test]
 #[ignore = "builds a tree of this checkout's shell packages; it runs with --include-ignored where they are built"]
 fn a_signed_tree_verifies_and_a_changed_or_short_signed_one_does_not() {
@@ -663,7 +683,10 @@ fn a_signed_tree_verifies_and_a_changed_or_short_signed_one_does_not() {
 /// KR-REQ-07.86: a Windows release carries the PowerShell package as files, with no shell build to
 /// state, and its executables are the `.exe` programs of `bin/`; a file of the package that is not
 /// the checkout's, and a directory under `shells/` that is no part of it, are refused, and the
-/// unedited tree is the control.
+/// unedited tree is the control. A module script as Authenticode leaves it, the checkout's text and
+/// then the block of signature comment lines, is the checkout's; a signed script of another text,
+/// and code after the marker, are refused. Not shown here: that a script is signed, or that
+/// PowerShell loads it under a policy that asks for signed scripts.
 ///
 /// KR-REQ-08.41, the part about the private pinned terminfo: the tree carries the compiled database
 /// under both names a library looks for it by, equal to the bytes the pinned entry compiles to, and
