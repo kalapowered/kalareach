@@ -518,8 +518,8 @@ pub type Result<T> = std::result::Result<T, AnswerError>;
 /// says what became of it.
 #[derive(Debug)]
 pub struct AnswerFailure {
-    /// What failed.
-    pub error: ClientError,
+    /// What failed, boxed so that the result of a send stays small.
+    pub error: Box<ClientError>,
     /// Whether the request may have reached the host.
     pub written: bool,
 }
@@ -529,7 +529,7 @@ impl AnswerFailure {
     #[must_use]
     pub fn unwritten(error: ClientError) -> Self {
         Self {
-            error,
+            error: Box::new(error),
             written: false,
         }
     }
@@ -541,7 +541,7 @@ impl AnswerFailure {
         if !self.written {
             return true;
         }
-        match &self.error {
+        match &*self.error {
             ClientError::Host(_) | ClientError::Refused { .. } => !keeps_the_answer(&self.error),
             ClientError::NoActionWindow
             | ClientError::Misdirected { .. }
@@ -559,7 +559,7 @@ impl AnswerFailure {
 impl From<ClientError> for AnswerFailure {
     fn from(error: ClientError) -> Self {
         Self {
-            error,
+            error: Box::new(error),
             written: true,
         }
     }
@@ -1677,7 +1677,7 @@ async fn answered<H: QuestionHost + Sync, K: Keeper + Sync>(
             {
                 return Ok(Answered::Taken(taken));
             }
-            Err(AnswerError::Host(failure.error))
+            Err(AnswerError::Host(*failure.error))
         }
     }
 }
@@ -1921,7 +1921,7 @@ async fn sent<H: QuestionHost + Sync, K: Keeper + Sync>(
             {
                 return Ok(Answered::Taken(taken));
             }
-            Err(AnswerError::Host(failure.error))
+            Err(AnswerError::Host(*failure.error))
         }
     }
 }

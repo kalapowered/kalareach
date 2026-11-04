@@ -142,13 +142,13 @@ impl QuestionHost for Journal {
         async move { Ok(found) }
     }
 
-    fn answer(
+    async fn answer(
         &self,
         _target: ActionTarget,
         _params: QuestionAnswerParams,
         _dispatch: Dispatch,
-    ) -> impl Future<Output = Result<QuestionResolveResult, AnswerFailure>> + Send {
-        async move { Err(AnswerFailure::unwritten(ClientError::ConnectionEnded)) }
+    ) -> Result<QuestionResolveResult, AnswerFailure> {
+        Err(AnswerFailure::unwritten(ClientError::ConnectionEnded))
     }
 
     fn receipt(
@@ -186,11 +186,8 @@ impl QuestionHost for Journal {
         async move { outcome }
     }
 
-    fn session_ended(
-        &self,
-        _session_id: SessionId,
-    ) -> impl Future<Output = Result<bool, ClientError>> + Send {
-        async move { Ok(false) }
+    async fn session_ended(&self, _session_id: SessionId) -> Result<bool, ClientError> {
+        Ok(false)
     }
 }
 

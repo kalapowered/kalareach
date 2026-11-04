@@ -1980,10 +1980,6 @@ impl Host {
         self.state().arrivals.clone()
     }
 
-    fn receipt(&self, action_id: ActionId, held: ReceiptState) {
-        self.state().receipts.push((action_id, held));
-    }
-
     /// Records the answer `yes` under the send `id` and nothing more, as an attempt does before it
     /// sends: what a crash right after leaves.
     fn record_pair(&self, id: ActionId) {

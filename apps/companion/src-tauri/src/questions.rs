@@ -1216,7 +1216,7 @@ pub async fn send(
             }
             // The question ended: an earlier send may be the reason, and a send the host took is
             // told rather than hidden. The answer stays kept either way, until it is dismissed.
-            if let ClientError::Host(refused) = &failed.error
+            if let ClientError::Host(refused) = &*failed.error
                 && matches!(
                     refused.code,
                     ErrorCode::QuestionResolved | ErrorCode::QuestionExpired
@@ -1229,7 +1229,7 @@ pub async fn send(
             {
                 return Ok(Answer::Landed { action_id });
             }
-            return Err(CommandError::from(failed.error));
+            return Err(CommandError::from(*failed.error));
         }
     };
     // The worker has the answer. Taking the copy away is the last step, and a failure of it is

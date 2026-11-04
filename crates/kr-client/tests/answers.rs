@@ -1139,7 +1139,7 @@ fn link(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()>
 /// A draft to keep.
 fn something_to_keep() -> AnswerDraft {
     let asked = question(9);
-    let draft = AnswerDraft {
+    AnswerDraft {
         version: ANSWER_FORMAT,
         target: target(),
         session_id: asked.session_id,
@@ -1147,8 +1147,7 @@ fn something_to_keep() -> AnswerDraft {
         question_revision: asked.revision,
         answer: yes(),
         drafted_at_ms: TimestampMs::new(1),
-    };
-    draft
+    }
 }
 
 /// KR-REQ-26.10: the lock a write of a kept answer holds is opened without following a link. A link
