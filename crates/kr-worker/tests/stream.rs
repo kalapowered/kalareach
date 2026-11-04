@@ -7,18 +7,6 @@
 //! terminal sends goes in through the client end, what the server says through the upstream end.
 //! The instance's binding, its suspension and its capability map are read back from the broker.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-12.06 | the thread a success reply to a selecting request names is the instance's binding, the revision advances only when the thread changed, and rich mutations resume; they wait while a selection is in flight and after one whose outcome is unknown, an older reply never restores a conversation the terminal left, a conversation another execution owns is never published, a turn or a leave about another thread changes nothing, replies are applied in the order their requests were admitted once none is in flight (a success whose newer request is then refused is the binding; a leave of another conversation does not hide an older selection; a leave of the bound conversation survives a newer request that is refused), a notification that closes a conversation a kept reply selected, or reports a turn in it, leaves the terminal's conversation unknown instead of letting the reply restore it; and a request given up at its deadline keeps the instance suspended until a selection names the conversation |
-//! | KR-REQ-12.04 | a prompt, a steer or a cancellation admitted before a turn began or ended is stopped at its take, which reads the turn again; a turn reported in a conversation a kept reply selected is not taken without that reply being weighed; what the stream says of the conversation and the turn is recorded as history under the revision and the turn it was seen under, a turn the binding leaves running as dropped under the revision it ran in |
-//! | KR-REQ-11.30 | an unlisted frame keeps rich mutations suspended until a selection admitted after it has named the thread and every unlisted request before that has been answered |
-//! | KR-REQ-12.08 | a gateway connection's capability evidence says what its tables let a client do, follows each change of binding, and ends with the connection |
-//! | KR-REQ-11.33 | a request the connector's table answers as a response is interpreted under the binding's trust; the server's own word that it was answered settles what nobody answered and leaves an answer that is being written to its writer; an answer admitted before its decoder's authority was withdrawn is stopped at its take, and one admitted before a fault finishes |
-//! | KR-REQ-11.36 | a typed prompt reaches the server as the request the connector's table spells, naming the thread the binding holds, and the reply's turn is read where the table says |
-//! | KR-REQ-11.28 | an action the package declares as a cancellation is admitted with a token the host issues and spends against its own plan, and is written as the connector's template for a cancellation naming the thread and the running turn; with no turn running it is refused with nothing written |
-//! | KR-REQ-23.30 | a component's plan for the action declared as a cancellation is validated against the token the host issued and is written through the same template; a plan that prepares another operation, or whose arguments are not the ones the token covers, is refused before anything is written; a component's prompt has no source in the table and is refused before the marker |
-//! | KR-REQ-12.12 | the rich table lists exactly the operations the table declares; one it does not declare is refused with nothing written, and so is a prompt over a running turn, one that names a draft and a steer of a turn that is not the running one |
-//!
 //! Not claimed: Windows, where no gateway runs.
 
 #![cfg(unix)]
