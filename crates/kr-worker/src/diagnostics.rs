@@ -181,13 +181,17 @@ fn locked<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The reasons an output retention pass left output behind, as this worker has said them.
+///
+/// What a pass has to say is decided against what the log will end on, not against what was last
+/// offered: the writer writes lines in the order they were handed over, and a line can be refused
+/// or dropped, so the reason of the last line written is the only one the log is known to end on.
 #[derive(Debug, Default)]
 struct Said {
     /// The reason of the last line that was written while its offer still stood.
     said: Option<String>,
-    /// The offer whose line waits for the writer or is being written, and that no pass has
-    /// withdrawn.
-    offered: Option<Offered>,
+    /// The lines handed to the writer whose write has not ended, oldest first, which is the order
+    /// the writer writes them in.
+    pending: VecDeque<Offered>,
     /// How many offers have been made, which names the next one.
     offers: u64,
 }
@@ -199,67 +203,78 @@ struct Offered {
     /// reason can go and be offered again while the first line is still in its write.
     id: u64,
     reason: String,
+    /// Whether the reason has stood since the offer, or a pass has found none and withdrawn it.
+    /// The line of a withdrawn offer is written all the same, but it does not make the reason said.
+    stands: bool,
 }
 
 impl Said {
     /// Decides what a pass that left `reason` behind is to say, and returns the name of the offer
-    /// when it is a reason that is neither said nor on its way.
+    /// when the log does not end on that reason and will not once the lines handed over have been
+    /// written.
     ///
-    /// A reason that goes and comes back is said again. A pass that applied no age bound
-    /// (`age_applied` is false), as a look at the host's cap does not and as a pass on a wall clock
-    /// the host cannot prove does not, keeps what was said when it finds no reason, since it
-    /// cannot tell that a reason the age bound left has gone. The same holds for a reason of the
-    /// byte caps while the wall clock cannot be proved.
+    /// A reason that goes and comes back is said again. So is one that comes back after the log
+    /// came to end on another, as it does when the line of that other reason was written after the
+    /// first, even when that line was handed over after the pass found the first reason again. A
+    /// line that was refused or dropped is not one the log ends on, so its reason is offered again.
+    ///
+    /// A pass that applied no age bound (`age_applied` is false), as a look at the host's cap does
+    /// not and as a pass on a wall clock the host cannot prove does not, keeps what was said when
+    /// it finds no reason, since it cannot tell that a reason the age bound left has gone. The same
+    /// holds for a reason of the byte caps while the wall clock cannot be proved.
     fn offer(&mut self, reason: Option<&str>, age_applied: bool) -> Option<u64> {
         match reason {
             None if !age_applied => None,
             None => {
                 self.said = None;
-                self.offered = None;
+                for offered in &mut self.pending {
+                    offered.stands = false;
+                }
                 None
             }
-            Some(reason)
-                if self.said.as_deref() == Some(reason)
-                    || self
-                        .offered
-                        .as_ref()
-                        .is_some_and(|offered| offered.reason == reason) =>
-            {
-                None
-            }
+            Some(reason) if self.log_ends_on() == Some(reason) => None,
             Some(reason) => {
                 self.offers += 1;
-                self.offered = Some(Offered {
+                self.pending.push_back(Offered {
                     id: self.offers,
                     reason: reason.to_owned(),
+                    stands: true,
                 });
                 Some(self.offers)
             }
         }
     }
 
-    /// Records that the line of offer `id` was written, unless that offer has been withdrawn or
-    /// replaced since.
+    /// Returns the reason the log ends on once the lines handed over have been written: that of the
+    /// newest line whose reason still stands, else the last one written.
+    fn log_ends_on(&self) -> Option<&str> {
+        self.pending
+            .iter()
+            .rev()
+            .find(|offered| offered.stands)
+            .map(|offered| offered.reason.as_str())
+            .or(self.said.as_deref())
+    }
+
+    /// Takes the offer `id` out of those whose write has not ended, and returns it.
+    fn ended(&mut self, id: u64) -> Option<Offered> {
+        let position = self.pending.iter().position(|offered| offered.id == id)?;
+        self.pending.remove(position)
+    }
+
+    /// Records that the line of offer `id` was written, unless its offer was withdrawn since.
     fn written(&mut self, id: u64) {
-        if self
-            .offered
-            .as_ref()
-            .is_some_and(|offered| offered.id == id)
+        if let Some(offered) = self.ended(id)
+            && offered.stands
         {
-            self.said = self.offered.take().map(|offered| offered.reason);
+            self.said = Some(offered.reason);
         }
     }
 
-    /// Records that the line of offer `id` was not written, so that the next pass offers its reason
-    /// again, unless that offer has been withdrawn or replaced since.
+    /// Records that the line of offer `id` was not written, so that the log still ends on what it
+    /// ended on before it, and the next pass that finds a reason the log does not end on offers it.
     fn refused(&mut self, id: u64) {
-        if self
-            .offered
-            .as_ref()
-            .is_some_and(|offered| offered.id == id)
-        {
-            self.offered = None;
-        }
+        self.ended(id);
     }
 }
 
@@ -273,8 +288,9 @@ pub(crate) struct OutputReasons {
 }
 
 impl OutputReasons {
-    /// Says why a pass left output behind, when it is not the reason last said, through the writer
-    /// `writer` returns. The writer is asked for only when there is a line to hand it.
+    /// Says why a pass left output behind, when the log does not end on that reason and will not
+    /// once the lines already handed over are written, through the writer `writer` returns. The
+    /// writer is asked for only when there is a line to hand it.
     ///
     /// `reason` is why the pass left output it was asked to remove, when it did, and `age_applied`
     /// whether the pass applied the age bound. This never waits for the write.
@@ -322,7 +338,10 @@ impl OutputReasons {
     /// may still be in the write. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     pub(crate) fn being_written(&self) -> bool {
-        locked(&self.state).offered.is_some()
+        locked(&self.state)
+            .pending
+            .iter()
+            .any(|offered| offered.stands)
     }
 }
 
