@@ -1632,7 +1632,8 @@ async fn answered<H: QuestionHost + Sync, K: Keeper + Sync>(
     if !basis.sends().is_empty() {
         *earlier = learn(host, draft.session_id, basis.sends()).await;
         if let Some(taken) = earlier.taken() {
-            let _ = drafts.remove_if_unchanged(draft.question_id, &basis)?;
+            // The host took it; a copy that cannot be removed now is retired by the next reading.
+            let _ = drafts.remove_if_unchanged(draft.question_id, &basis);
             return Ok(Answered::Taken(taken));
         }
         if let Some(waiting) = earlier.waiting() {
@@ -1707,7 +1708,7 @@ async fn ended_after_send<H: QuestionHost>(
         learn(host, draft.session_id, basis.sends()).await
     };
     if let Some(taken) = again.taken() {
-        let _ = drafts.remove_if_unchanged(draft.question_id, &basis)?;
+        let _ = drafts.remove_if_unchanged(draft.question_id, &basis);
         return Ok(Some(taken));
     }
     if !again.failed() {
@@ -1867,7 +1868,7 @@ async fn sent<H: QuestionHost + Sync, K: Keeper + Sync>(
     if current.is_some() && !basis.sends().is_empty() {
         *earlier = learn(host, draft.session_id, basis.sends()).await;
         if let Some(taken) = earlier.taken() {
-            let _ = drafts.remove_if_unchanged(draft.question_id, basis)?;
+            let _ = drafts.remove_if_unchanged(draft.question_id, basis);
             return Ok(Answered::Taken(taken));
         }
     }

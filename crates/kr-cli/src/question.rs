@@ -211,6 +211,14 @@ pub async fn answer(
         // failure's kind suggests.
         Err(error) => Err(match (workers.delivery(), error) {
             (_, AnswerError::Keeping(_)) => keeping_failure(&keeper, question_id, &drafts),
+            (
+                Delivery::NotSent,
+                error @ (AnswerError::Store { .. }
+                | AnswerError::Unreadable { .. }
+                | AnswerError::NotPermitted
+                | AnswerError::Changed
+                | AnswerError::Full),
+            ) => not_recorded(question_id, &error, &kept_copy(&drafts, question_id)),
             (Delivery::Taken, error) => taken(
                 &workers,
                 descriptor.session_id,
@@ -272,11 +280,10 @@ fn settled(workers: &Workers, answered: Answered) -> Result<Question> {
     }
 }
 
-/// The failure reported when the answer could not be recorded on this device, so nothing was sent:
-/// an update that held one of its locks for the whole wait is exit 9 here as it is for every
-/// command. An answer kept earlier for the question is reported as the store has it.
-fn keeping_failure(keeper: &Hold<'_>, question_id: QuestionId, drafts: &AnswerDrafts) -> CliError {
-    let earlier = match kept_copy(drafts, question_id) {
+/// What the store says of an answer kept earlier for the question, to follow a report that nothing
+/// was sent: it is still kept, or whether it is cannot be read, and nothing when none is kept.
+fn older_copy(question_id: QuestionId, copy: &KeptCopy) -> Shown {
+    match copy {
         KeptCopy::Kept => shown!(
             "; an earlier answer to question {} is still kept on this device",
             question_id
@@ -287,7 +294,24 @@ fn keeping_failure(keeper: &Hold<'_>, question_id: QuestionId, drafts: &AnswerDr
             question_id,
             why
         ),
-    };
+    }
+}
+
+/// The failure reported when the pair could not be written to, read from or replaced on this
+/// device, so nothing was sent.
+fn not_recorded(question_id: QuestionId, error: &AnswerError, copy: &KeptCopy) -> CliError {
+    CliError::Other(shown!(
+        "this command sent no answer: {}{}",
+        error,
+        older_copy(question_id, copy)
+    ))
+}
+
+/// The failure reported when the answer could not be recorded on this device, so nothing was sent:
+/// an update that held one of its locks for the whole wait is exit 9 here as it is for every
+/// command. An answer kept earlier for the question is reported as the store has it.
+fn keeping_failure(keeper: &Hold<'_>, question_id: QuestionId, drafts: &AnswerDrafts) -> CliError {
+    let earlier = older_copy(question_id, &kept_copy(drafts, question_id));
     match keeper.refusal() {
         Some(CliError::UpdateDeferred(_)) => CliError::UpdateDeferred(shown!(
             "this command sent no answer and kept no new answer; an update of this host is \

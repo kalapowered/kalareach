@@ -916,3 +916,179 @@ async fn an_answer_the_worker_took_is_reported_taken_when_its_kept_copy_cannot_b
     assert_eq!(told["outcome"], "taken");
     assert_eq!(told["leftover"], true);
 }
+
+/// The worker's receipt of a send, as `action.read` answers it.
+fn receipt_of(
+    action_id: kr_protocol::ids::ActionId,
+    state: kr_protocol::receipt::ReceiptState,
+) -> kr_protocol::receipt::ActionReadResult {
+    kr_protocol::receipt::ActionReadResult {
+        receipt: kr_protocol::receipt::Receipt {
+            action_id,
+            actor_id: ActorId::new("local:1").expect("a principal"),
+            method: Method::QuestionAnswer.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            revision: kr_protocol::scalars::U64::new(3),
+            state,
+            reason: Nullable::null(),
+            payload_digest: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
+            accepted_deadline_ms: Nullable::null(),
+            error: Nullable::null(),
+            error_withheld: false,
+            updated_at_ms: TimestampMs::new(9_000),
+        },
+        result: Nullable::null(),
+    }
+}
+
+/// The files the application keeps for one environment's answers, by extension.
+fn kept_files(page: &Page, worker: &ScriptedWorker, extension: &str) -> usize {
+    let directory = page
+        .kept
+        .path()
+        .join("kept-answers")
+        .join(worker.paths().environment_id().to_string());
+    std::fs::read_dir(directory)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == extension))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// KR-REQ-11.63: the identifier an answer goes out under is recorded on this device before the
+/// answer reaches the worker, and a lost reply leaves it there. A settling then asks the worker what
+/// became of it: here the worker has no receipt of it, which is reported and decides nothing, and
+/// the answer stays offered.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_identifier_of_an_answer_is_recorded_before_it_reaches_the_worker() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let read = page.call("question_read", read_params(&worker));
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    answered(read).await.expect("the questions");
+
+    let asked = page.call(
+        "question_answer",
+        answer_params(&worker, 2, &choice("release")),
+    );
+    let call = link.expect(Method::QuestionAnswer).await;
+    let sent = call.action_id.expect("the answer goes out under an identifier");
+    assert_eq!(
+        kept_files(&page, &worker, "send"),
+        1,
+        "the record was on this device when the answer reached the worker"
+    );
+    drop(link);
+    answered(asked).await.expect("the answer is kept");
+
+    // The worker never saw it: it has no receipt, and says so.
+    let settling = page.call(
+        "question_settle",
+        json!({ "params": { "sessionId": worker.session_id.to_string() } }),
+    );
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    let call = link.expect(Method::ActionRead).await;
+    let params: kr_protocol::receipt::ActionReadParams = call.params();
+    assert_eq!(params.action_id, sent);
+    link.refuse(&call, &format!("no receipt for action {sent}")).await;
+    let settled = answered(settling).await.expect("the standing");
+    assert_eq!(settled[0]["standing"], "offered", "{settled}");
+    assert_eq!(settled[0]["earlier"][0]["state"], "no_record", "{settled}");
+}
+
+/// KR-REQ-11.63, KR-ACC-009: a send whose outcome the worker could not establish is shown first. A
+/// new answer meets it: it sends nothing, says what it found and keeps what was typed, and the press
+/// that names the send it was shown goes out quoting it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uncertain_send_is_held_back_until_the_press_that_names_it() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let read = page.call("question_read", read_params(&worker));
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    answered(read).await.expect("the questions");
+
+    // The first answer goes out and its reply is lost.
+    let asked = page.call(
+        "question_answer",
+        answer_params(&worker, 2, &choice("release")),
+    );
+    let call = link.expect(Method::QuestionAnswer).await;
+    let uncertain = call.action_id.expect("an identifier");
+    drop(link);
+    answered(asked).await.expect("the answer is kept");
+
+    // A new answer asks the worker what became of the first, which it could not establish: nothing
+    // is sent.
+    let second = page.call(
+        "question_answer",
+        answer_params(&worker, 2, &choice("main")),
+    );
+    let mut link = worker.link().await;
+    let call = link.expect(Method::ActionRead).await;
+    link.answer(
+        &call,
+        &receipt_of(uncertain, kr_protocol::receipt::ReceiptState::Unknown),
+    )
+    .await;
+    let held = answered(second).await.expect("held, not refused");
+    assert_eq!(held["outcome"], "held", "{held}");
+    assert_eq!(held["action_id"], uncertain.to_string());
+    assert!(
+        link.quiet_for(Duration::from_millis(300)).await,
+        "nothing was sent"
+    );
+
+    // The press that names the send it was shown goes out quoting it.
+    let third = page.call(
+        "question_answer",
+        json!({
+            "params": answer_params(&worker, 2, &choice("main"))["params"].clone(),
+            "acknowledged": uncertain.to_string()
+        }),
+    );
+    let call = link.expect(Method::ActionRead).await;
+    link.answer(
+        &call,
+        &receipt_of(uncertain, kr_protocol::receipt::ReceiptState::Unknown),
+    )
+    .await;
+    let call = link.expect(Method::QuestionAnswer).await;
+    let quoted = call.expected.clone().expect("a mutation's preconditions");
+    let kr_cbor::CanonicalValue::Map(quoted) = quoted.into_value() else {
+        panic!("preconditions are a map");
+    };
+    assert!(
+        quoted
+            .get(kr_protocol::action::SUPERSEDES_ACTION_KEY)
+            .is_some(),
+        "the answer names the uncertain send"
+    );
+    assert_ne!(call.action_id, Some(uncertain), "it is a new send");
+    link.answer(&call, &resolution(&worker, QuestionState::Answered))
+        .await;
+    let told = answered(third).await.expect("the worker took it");
+    assert_eq!(told["outcome"], "taken", "{told}");
+    assert_eq!(kept_files(&page, &worker, "answer"), 0);
+    assert_eq!(kept_files(&page, &worker, "send"), 0);
+}

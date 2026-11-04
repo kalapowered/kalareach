@@ -9914,16 +9914,16 @@ async fn no_file_of_a_state_root_goes_unnamed() {
     let table = stored_formats::table::table();
     let named = stored_formats::table::named();
     let root = host.tree.paths().state_root().to_path_buf();
-    // What a client leaves in the state root when it keeps an answer: the answer, and the lock the
-    // write of the next one holds.
+    // What a client leaves in the state root when it keeps an answer: the answer, the record of the
+    // sends it went out under, and the lock the write of the next one holds.
     let kept = root.join("kept-answers");
     std::fs::create_dir_all(&kept).expect("the directory of kept answers");
     std::fs::write(kept.join("answers.lock"), b"").expect("the lock a write holds");
-    std::fs::write(
-        kept.join(format!("{}.answer", kr_ipc::new_uuid())),
-        b"a kept answer",
-    )
-    .expect("a kept answer");
+    let question = kr_ipc::new_uuid();
+    std::fs::write(kept.join(format!("{question}.answer")), b"a kept answer")
+        .expect("a kept answer");
+    std::fs::write(kept.join(format!("{question}.send")), b"a record of sends")
+        .expect("the record of its sends");
     let unnamed = stored_formats::unnamed(&root, &table, &named);
     assert!(unnamed.is_empty(), "named by nothing: {unnamed:?}");
 

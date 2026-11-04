@@ -774,7 +774,7 @@ fn read(state: &Mutex<State>, params: &ParamsValue) -> Result<ParamsValue, Proto
 
 /// Notes an answer as it reaches the worker: its identifier, the send it names, and whether the
 /// store held a record of sends then.
-fn arrive(state: &Mutex<State>, mutation: &kr_protocol::action::MutationRequest) -> Arrival {
+fn arrive(state: &Mutex<State>, mutation: &kr_protocol::envelope::MutationRequest) -> Arrival {
     let quoted = match mutation.expected.clone().into_value() {
         kr_cbor::CanonicalValue::Map(map) => map
             .get(kr_protocol::action::SUPERSEDES_ACTION_KEY)
