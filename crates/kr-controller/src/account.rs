@@ -355,19 +355,20 @@ impl HostAccount {
         }
     }
 
-    /// As [`Self::hold_token_requests`], for the requests made under an account fixed when a call
-    /// began ([`Self::tokens_fixed_to`]) alone. Every other request for a token goes through and is
-    /// not counted by [`Self::token_requests_waiting`]: the check of the sign-in that `backup.status`
-    /// makes in a task that outlives a look which a bound cut, and the carrier's requests, can come
-    /// at any moment. Besides a call's, the only request held is the read of the storage state that
-    /// `backup.status` makes, which ends with the look.
+    /// As [`Self::hold_token_requests_after`], for the requests made under an account fixed when a
+    /// call began ([`Self::tokens_fixed_to`]) alone: the next `passing` of those go through and the
+    /// ones after wait. Every other request for a token goes through, takes none of the `passing`,
+    /// and is not counted by [`Self::token_requests_waiting`]: the check of the sign-in that
+    /// `backup.status` makes in a task that outlives a look which a bound cut, and the carrier's
+    /// requests, can come at any moment. Besides a call's, the only request held is the read of the
+    /// storage state that `backup.status` makes, which ends with the look.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub fn hold_token_requests_fixed_to_an_account(&self) -> TokenRequestsHeld {
+    pub fn hold_token_requests_fixed_to_an_account(&self, passing: usize) -> TokenRequestsHeld {
         self.inner
             .holds_fixed_only
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.hold_token_requests_after(0)
+        self.hold_token_requests_after(passing)
     }
 
     /// How many requests for a token the gate raised with [`Self::hold_token_requests_after`] has

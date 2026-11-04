@@ -601,7 +601,8 @@ impl Rig {
 
     /// Waits until the doctor's check of the producer says `words`, and returns what it said. Called
     /// after [`Self::production_looked_afresh`], it finds the words of a look that began after the
-    /// change, or of one after that.
+    /// change, or of one after that. Called after a generation is published, it finds what the
+    /// producer writes when its pass returns, which can come after the publication.
     async fn production_says(&self, words: &str) -> (DoctorStatus, String) {
         let mut said = None;
         let found = tokio::time::timeout(Duration::from_secs(180), async {
@@ -4666,7 +4667,9 @@ async fn a_session_that_cannot_be_read_makes_no_generation_each_day_and_is_tried
         ["host/configuration.json"],
         "the session that cannot be read is left out"
     );
-    let (_, detail) = rig.production_check().await;
+    // The producer says why once its pass has returned, which the carrier does not wait for before
+    // it publishes the generation.
+    let (_, detail) = rig.production_says("could not be read").await;
     assert!(detail.contains("could not be read"), "{detail}");
 
     // Two days on, nothing changed: no second generation, and the doctor still says why.
@@ -5995,7 +5998,13 @@ async fn a_fence_owed_while_the_call_waits_for_its_token_stops_the_bundle_write(
     let web = Arc::clone(rig.served.web());
     let made = rig.prepared_setup(archive_id(), false);
     until_the_carriers_first_pass_has_ended(&rig).await;
-    let tokens = rig.controller.host_account().hold_token_requests();
+    // The gate holds only the requests made under an account fixed when a call began, which are the
+    // call's: that the call's request waits here is what shows the gate selects them, and that the
+    // cases which count on it not holding another request are right to.
+    let tokens = rig
+        .controller
+        .host_account()
+        .hold_token_requests_fixed_to_an_account(0);
     let call = rig.enable_outcome_in_the_background(&made.params);
     until_a_request_waits_for_its_token(&rig).await;
     rig.controller.hold_fence(true);
@@ -6086,9 +6095,10 @@ async fn a_deadline_that_passes_while_the_bundle_write_waits_for_its_own_token_s
 ///
 /// A look that the service answered with the refusal and that left nothing owed lost the delay, and
 /// the case fails there. The host counts the refusals it was given, so a look is told from one a
-/// bound cut by what it was given and not by how long it took. A look that says it read is made
-/// again: the request of a look that was cut can take the fault late. The delay owed is the one the
-/// service named.
+/// bound cut by what it was given and not by how long it took. A look the service refused tells
+/// the owner that the read failed, and not that there was no token to read with. A look that says
+/// it read is made again: the request of a look that was cut can take the fault late. The delay
+/// owed is the one the service named.
 async fn the_service_names_a_delay_to_a_look_at_its_storage_state(rig: &Rig, delay: Moment) {
     let Moment::Refuse {
         retry_after_seconds: Some(named),
@@ -6105,11 +6115,21 @@ async fn the_service_names_a_delay_to_a_look_at_its_storage_state(rig: &Rig, del
             rig.served.web().fail(STATUS, 1, delay);
             let refused = rig.controller.backup_status_reads_refused();
             let storage = rig.backup_status().await.storage;
+            let was_refused = rig.controller.backup_status_reads_refused() != refused;
             assert!(
-                quiet.left().is_some() || rig.controller.backup_status_reads_refused() == refused,
+                quiet.left().is_some() || !was_refused,
                 "a look the service refused, naming {named} seconds, left nothing owed; it said \
                  {storage:?}"
             );
+            if was_refused {
+                assert_eq!(
+                    storage,
+                    BackupStorageState::Unread {
+                        why: BackupStorageUnread::Failed
+                    },
+                    "a look the service refused, naming {named} seconds, said something else"
+                );
+            }
             said = Some(storage);
         }
     })
@@ -6275,6 +6295,11 @@ async fn a_fence_owed_while_the_call_waits_on_the_service_refuses_it_and_does_no
 /// request go, and returns how the call ended. A call that asks for a token meanwhile waits at the
 /// gate for good, so the wait for its end races the wait for a request at the gate, and a call that
 /// does that fails the case at once and does not time out.
+///
+/// The gate holds only the requests made under an account fixed when a call began, and the next
+/// `passing` of those go through. A look that a bound cut leaves a task that asks for the sign-in's
+/// token later, and the carrier asks for tokens of its own; neither is held, and neither takes a
+/// pass from the call.
 async fn the_end_of_a_call_that_meets_a_fence_and_a_held_gate(
     rig: &Rig,
     call: tokio::task::JoinHandle<Result<BackupEnableResult, ProtocolError>>,
@@ -6284,7 +6309,7 @@ async fn the_end_of_a_call_that_meets_a_fence_and_a_held_gate(
     let gate = rig
         .controller
         .host_account()
-        .hold_token_requests_after(passing);
+        .hold_token_requests_fixed_to_an_account(passing);
     rig.controller.hold_fence(true);
     release();
     let ended = tokio::select! {
@@ -6735,7 +6760,7 @@ async fn a_delay_named_while_the_call_waits_on_the_service_holds_back_the_reques
     let gate = rig
         .controller
         .host_account()
-        .hold_token_requests_fixed_to_an_account();
+        .hold_token_requests_fixed_to_an_account(0);
     web.release_held();
     let ended = tokio::select! {
         ended = call => ended.expect("the call ends"),
