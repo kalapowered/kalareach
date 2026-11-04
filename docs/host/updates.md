@@ -59,9 +59,25 @@ What has to follow an update names its path through `current` instead, so it is 
 - the service definition `kr host startup --set service` writes, which starts `current/bin/kr-controller`;
 - the command an agent's configuration runs to reach the contact tools, `current/bin/kr`;
 - the forwarder a native bridge's registration starts, `current/bin/kr-hook`;
+- the command a terminal application's profile runs, `current/bin/kr`;
 - the file each shell's startup entry sources, `current/shells/<shell>/<entry>`, which only calls
   the running shell's own bridge builtin, so a shell of any release the host keeps reads it and runs
   its own release's integration.
+
+A program the host starts itself reads `current` once and starts the program of the release it
+names, by that release's own path, which has no link in it. That covers a `kr` that hands its
+command to the store's `kr`, a `kr` that takes in a package manager's release, the standalone
+start of the control daemon, and the start of a daemon again after an update. `kr shell` reads a
+shell's packages the same way, so everything it finds is of one release. The paths in the list
+above are written for something else to start later, so they keep the link; the host only checks,
+in the release it read, that the program is there.
+
+On Linux, a path walk through a link that a rename replaces rarely answers that the path does not
+exist: a few walks in tens of millions, whichever way the link is replaced. A program that an
+application, a terminal, a shell or the service manager starts through `current` at the moment of
+a switch can therefore fail to start with a missing program, and starting it again works. When it
+is the service manager's start of the control daemon, the refusal is said as any refused start is,
+nothing has been started or written, and the next command that needs a daemon asks again.
 
 A control daemon of a store holds the install lock, shared, while it takes its environment, and
 exits when `current` names another release: that release's daemon serves the host. It records the
@@ -222,7 +238,7 @@ says which, and keeps the update recorded, as below:
 kr: the update to 0.3.0+9f1c2b3a4d5e waits: session 7 runs kr-worker/0.2.0+4254aa6e62e5 with protocol 0.45.0, which the control daemon of 0.3.0+9f1c2b3a4d5e does not speak; run kr host update again once that has changed
 ```
 
-A daemon whose configuration document chooses the service start is started again by the service manager; any other is started through `current` with the arguments it was started with, in the directory it was started in, with the variables it had that decide its paths, writing to the environment's `controller.log`. A live session is never stopped, restarted or moved: its worker, its shell and its agents go on running the release they started from, and that release, its module tree among it, stays in the store until nothing holds it.
+A daemon whose configuration document chooses the service start is started again by the service manager; any other is started from the release `current` names, read once, with the arguments it was started with, in the directory it was started in, with the variables it had that decide its paths, writing to the environment's `controller.log`. A live session is never stopped, restarted or moved: its worker, its shell and its agents go on running the release they started from, and that release, its module tree among it, stays in the store until nothing holds it.
 
 ## What a release is, and how it is checked
 
