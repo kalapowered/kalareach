@@ -380,13 +380,14 @@ pub fn place_program(source: &Path, destination: &Path) {
 /// start then fails with "text file busy" for as long as the child has not yet taken over, which
 /// is longer the more the machine has to do.
 ///
-/// So this process never opens the program for writing. The text goes to a file beside it that
+/// So on Unix this process never opens the program for writing (on Windows a start is held up by
+/// the handle that started it, as [`place_program`] says). The text goes to a file beside it that
 /// nothing starts, a separate process copies that file into place as [`place_program`] does, and
 /// the file of text is removed.
 ///
 /// # Panics
 ///
-/// Panics when the text cannot be written or the program cannot be placed.
+/// Panics when the text cannot be written or removed, or the program cannot be placed.
 pub fn place_script(destination: &Path, text: impl AsRef<[u8]>) {
     let mut name = destination
         .file_name()
