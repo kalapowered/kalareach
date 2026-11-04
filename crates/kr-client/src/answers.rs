@@ -903,7 +903,7 @@ impl AnswerDrafts {
             && let Some(on_disk) = basis.draft
         {
             self.write_record(draft.question_id, vec![on_disk, new], carried)?;
-            crate::sends::reached(crate::sends::Stop::AfterCarry, &self.directory)?;
+            crate::sends::reached(crate::sends::Stop::Carried, &self.directory)?;
         }
         // Two: the answer, in a file of its own, renamed over its name.
         let unique = self.unique(&path)?;
@@ -916,7 +916,7 @@ impl AnswerDrafts {
             return Err(store(error));
         }
         kr_flush::flush_directory(&self.directory, kr_flush::NameKind::File).map_err(store)?;
-        crate::sends::reached(crate::sends::Stop::AfterDraft, &self.directory)?;
+        crate::sends::reached(crate::sends::Stop::Replaced, &self.directory)?;
         // Three: the record names the new answer alone, with every send it carries and this one.
         let mut sends = carried.to_vec();
         sends.push(send);
@@ -1235,7 +1235,7 @@ impl AnswerDrafts {
                 });
             }
         }
-        crate::sends::reached(crate::sends::Stop::AfterDraftRemoved, &self.directory)?;
+        crate::sends::reached(crate::sends::Stop::Removed, &self.directory)?;
         self.remove_record(question_id)
     }
 
@@ -1671,10 +1671,11 @@ async fn answered<H: QuestionHost + Sync, K: Keeper + Sync>(
             if keeps {
                 return Ok(Answered::Kept(draft));
             }
-            if ended(&failure.error) && !carried.is_empty() {
-                if let Some(taken) = ended_after_send(host, drafts, &draft).await? {
-                    return Ok(Answered::Taken(taken));
-                }
+            if ended(&failure.error)
+                && !carried.is_empty()
+                && let Some(taken) = ended_after_send(host, drafts, &draft).await?
+            {
+                return Ok(Answered::Taken(taken));
             }
             Err(AnswerError::Host(failure.error))
         }
@@ -1915,10 +1916,10 @@ async fn sent<H: QuestionHost + Sync, K: Keeper + Sync>(
             if failure.settled() {
                 settle_own(keeper, drafts, draft.question_id, digest, action_id, false);
             }
-            if ended(&failure.error) {
-                if let Some(taken) = ended_after_send(host, drafts, draft).await? {
-                    return Ok(Answered::Taken(taken));
-                }
+            if ended(&failure.error)
+                && let Some(taken) = ended_after_send(host, drafts, draft).await?
+            {
+                return Ok(Answered::Taken(taken));
             }
             Err(AnswerError::Host(failure.error))
         }

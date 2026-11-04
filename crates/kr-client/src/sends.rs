@@ -183,11 +183,11 @@ pub(crate) fn replaceable(path: &Path) -> Result<()> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stop {
     /// After the record that names the answer on disk and the one being written.
-    AfterCarry,
+    Carried,
     /// After the new answer is in place, before the record that names it alone.
-    AfterDraft,
+    Replaced,
     /// After the answer is removed, before its record is.
-    AfterDraftRemoved,
+    Removed,
 }
 
 #[cfg(test)]

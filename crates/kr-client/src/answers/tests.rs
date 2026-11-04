@@ -379,7 +379,7 @@ fn a_ninth_unsettled_send_is_refused_and_nothing_is_written() {
 /// reconcile then offers the answer with that send as the one a new send quotes.
 #[tokio::test]
 async fn a_crash_at_any_step_of_a_replacement_forgets_no_earlier_send() {
-    for (stop, replaced) in [(Stop::AfterCarry, false), (Stop::AfterDraft, true)] {
+    for (stop, replaced) in [(Stop::Carried, false), (Stop::Replaced, true)] {
         let (_directory, drafts) = store();
         let asked = question(5);
         let first = draft(&asked, true);
@@ -451,7 +451,7 @@ async fn a_crash_between_the_two_removals_leaves_an_inert_record_that_is_swept()
         .expect("reads")
         .expect("kept");
 
-    sends::stop_at(Some(Stop::AfterDraftRemoved));
+    sends::stop_at(Some(Stop::Removed));
     let stopped = drafts
         .remove_if_unchanged(asked.question_id, &basis)
         .expect_err("stopped");
