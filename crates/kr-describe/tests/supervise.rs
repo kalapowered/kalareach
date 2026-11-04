@@ -2346,6 +2346,29 @@ fn the_cadence_holds_under_mixed_demand_through_the_process() {
             now += 1_000;
             before = standing(&rig.driver, now);
             rig.driver.turn(&roomy(), at(now)).expect("a turn");
+            if rig.driver.service().in_flight() == 0 {
+                // Nothing was sent, so every session is waiting out its cadence or its cooldown, and
+                // the driver says it is to look when the first of them ends: the host sleeps until
+                // then and no sooner. It is worked out here from the times the jobs were sent.
+                let cadence = rig.driver.service().scheduler().cadence_ms(at(now));
+                let first_due = std::iter::once(ordinary)
+                    .chain(foreground.iter().copied())
+                    .map(|session_id| {
+                        let wait = if session_id == ordinary {
+                            cadence
+                        } else {
+                            cooldown_ms
+                        };
+                        last.get(&session_id)
+                            .map_or(now, |sent_at| (sent_at + wait).max(now))
+                    })
+                    .min();
+                assert_eq!(
+                    rig.driver.due_ms(),
+                    first_due,
+                    "the time to look again, with every session waiting at {now} ms"
+                );
+            }
         }
         dispatched_at = now;
     }

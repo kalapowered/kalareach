@@ -437,6 +437,79 @@ fn coalescing_keeps_the_aging_position_so_a_quiet_session_is_not_left_behind() {
     assert_eq!(first.session_id, session(1));
 }
 
+/// KR-REQ-22.14: a job put back because it did not finish keeps its aging position, and when its
+/// session queued a newer job meanwhile, the newer content takes that older position and is not
+/// left behind a session that queued between them. A job put back as priority work makes the newer
+/// job priority work too, and one put back as ordinary work lowers nothing. The control is a job put
+/// back with nothing newer, which keeps its own position and may be described again at once.
+#[test]
+fn a_job_put_back_gives_its_position_to_the_newer_job_its_session_queued_meanwhile() {
+    let mut scheduler = Scheduler::new(Budgets::DEFAULTS);
+    scheduler.enqueue(Priority::Ordinary, context_for(&session(1), 1), at(1_000));
+    scheduler.enqueue(Priority::Ordinary, context_for(&session(2), 1), at(5_000));
+    let taken = scheduler.dequeue(at(10_000)).expect("the oldest position");
+    assert_eq!(taken.session_id, session(1));
+    // The session changes while its job is out, and queues a job at a later position.
+    assert_eq!(
+        scheduler.enqueue(Priority::Ordinary, context_for(&session(1), 2), at(11_000)),
+        Enqueued::Admitted
+    );
+    scheduler.requeue(taken);
+    assert_eq!(scheduler.queued(), 2);
+    let job = scheduler.dequeue(at(11_000)).expect("the older position");
+    assert_eq!(
+        job.session_id,
+        session(1),
+        "the newer job took the older position"
+    );
+    assert_eq!(job.queued_at_ms, 1_000);
+    assert_eq!(
+        job.work.description().expect("a description").revision(),
+        ContextRevision::new(2),
+        "the newer content is kept"
+    );
+
+    // The control: nothing newer, and the job keeps its own position and is eligible at once.
+    let mut scheduler = Scheduler::new(Budgets::DEFAULTS);
+    scheduler.enqueue(Priority::Ordinary, context_for(&session(1), 1), at(1_000));
+    scheduler.enqueue(Priority::Ordinary, context_for(&session(2), 1), at(5_000));
+    let taken = scheduler.dequeue(at(10_000)).expect("the oldest position");
+    scheduler.requeue(taken);
+    let job = scheduler.dequeue(at(10_000)).expect("the job put back");
+    assert_eq!(job.session_id, session(1));
+    assert_eq!(job.queued_at_ms, 1_000);
+    assert_eq!(
+        job.work.description().expect("a description").revision(),
+        ContextRevision::new(1)
+    );
+
+    // Priority: the one put back raises the newer job, and the newer one is not lowered.
+    for (taken_as, newer_as, kept_as) in [
+        (
+            Priority::Foreground,
+            Priority::Ordinary,
+            Priority::Foreground,
+        ),
+        (
+            Priority::Ordinary,
+            Priority::Foreground,
+            Priority::Foreground,
+        ),
+        (Priority::Ordinary, Priority::Ordinary, Priority::Ordinary),
+    ] {
+        let mut scheduler = Scheduler::new(Budgets::DEFAULTS);
+        scheduler.enqueue(taken_as, context_for(&session(1), 1), at(1_000));
+        let taken = scheduler.dequeue(at(10_000)).expect("the job");
+        scheduler.enqueue(newer_as, context_for(&session(1), 2), at(11_000));
+        scheduler.requeue(taken);
+        let job = scheduler.dequeue(at(11_000)).expect("the job put back");
+        assert_eq!(
+            job.priority, kept_as,
+            "put back as {taken_as:?} beside a newer {newer_as:?}"
+        );
+    }
+}
+
 /// KR-REQ-22.14: an oldest ordinary job runs after at most three priority jobs.
 #[test]
 fn an_oldest_ordinary_job_runs_after_three_priority_jobs() {
