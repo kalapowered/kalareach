@@ -821,6 +821,10 @@ pub fn a_cancellation_during_an_unanswered_acceptance_leaves_the_prompt_working(
     let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
+    // This case records what a line does when the key does not end the module's wait for the
+    // answer, so it is the module's own wait that ends the line, and that is the second it ships
+    // with, not the long one the other cases give it.
+    session.lets_the_bridge_give_up_on_a_question();
     session.commands.silent_acceptance = true;
     let accepted = session.commands.accepted.len();
     let line = "kr-probe cancelled-in-the-acceptance";
