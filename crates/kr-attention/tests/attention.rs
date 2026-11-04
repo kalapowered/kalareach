@@ -2214,6 +2214,106 @@ fn a_viewer_with_a_bound_is_shown_no_range_that_went_missing() {
     );
 }
 
+/// A device that sees session 1 and manages automation, whose history reaches back to
+/// `history_from_ms`.
+fn automation_device_from(admits: &dyn Fn(SessionId) -> bool, history_from_ms: u64) -> Viewer<'_> {
+    Viewer::Device(DeviceScope {
+        grant_id: GrantId::new(Uuid::from_bytes([1; 16])),
+        session_view: true,
+        automation_manage: true,
+        host_manage: false,
+        admits_session: admits,
+        history_from_ms,
+    })
+}
+
+/// A workflow paused by one of its own limits, as the environment's workflow journal records it.
+fn workflow_paused(sequence: u64, at_ms: u64) -> SourceEvent {
+    SourceEvent::new(
+        EventCursor::new(AttentionSource::Automation, sequence),
+        TimestampMs::new(NOON + at_ms),
+        EventKind::AutomationPaused {
+            subject: AttentionAutomationSubject::Workflow {
+                workflow_id: WorkflowId::new(Uuid::from_bytes([4; 16])),
+                revision: U64::new(2),
+            },
+            reason: "max_concurrent_runs".to_owned(),
+            grant_id: Some(GrantId::new(Uuid::from_bytes([1; 16]))),
+        },
+    )
+}
+
+/// KR-REQ-10.49: a range of the retained events that the host could not read has no date, so the
+/// inbox lists none to a viewer whose history has a bound, whether the range is in a session's
+/// records or in the environment's workflow journal. An item the missing range could have settled
+/// stays uncertain. The owner, and a device whose history reaches every moment, are told of both.
+#[test]
+fn a_viewer_with_a_bound_is_shown_no_gap_in_the_inbox() {
+    let mut attention = engine();
+    attention
+        .apply(&approval(1, 1_000, "req-1"), reading(0))
+        .expect("the store records the decision");
+    // Receipt sequences two to eight were evicted before the host could read them.
+    attention
+        .apply(&approval(9, 9_000, "req-2"), reading(1_000))
+        .expect("the store records the decision");
+    // The workflow journal is found ahead of the store: what it still holds is replayed, and the
+    // sequences between are a gap in the environment's own records.
+    attention
+        .apply(&workflow_paused(1, 2_000), reading(2_000))
+        .expect("the store records the decision");
+    attention
+        .recover_source(
+            Origin::Environment,
+            AttentionSource::Automation,
+            &[workflow_paused(5, 3_000)],
+            5,
+            reading(3_000),
+        )
+        .expect("the recovery is recorded");
+
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let phone = actor("device:phone");
+    let everything = AttentionReadParams {
+        session_id: Nullable::null(),
+        include_acknowledged: true,
+        max_items: U64::new(50),
+        after: Nullable::null(),
+    };
+    let read = |viewer: &Viewer<'_>| {
+        attention
+            .read(&phone, viewer, &everything, reading(4_000), Content::Whole)
+            .expect("the page is served")
+            .result
+    };
+    let sources = |page: &AttentionReadResult| -> BTreeSet<AttentionSource> {
+        page.gaps.iter().map(|gap| gap.source).collect()
+    };
+    let both = BTreeSet::from([AttentionSource::Receipts, AttentionSource::Automation]);
+
+    assert_eq!(
+        sources(&read(&Viewer::Owner)),
+        both,
+        "the owner is told of both ranges"
+    );
+    assert_eq!(
+        sources(&read(&automation_device_from(&admits_one, 0))),
+        both,
+        "a device whose history reaches every moment is told of both"
+    );
+    let bounded = read(&automation_device_from(&admits_one, NOON + 500));
+    assert!(
+        bounded.gaps.is_empty(),
+        "a range has no date, so a bounded viewer is told of none: {:?}",
+        bounded.gaps
+    );
+    assert!(
+        bounded.items.iter().any(|item| item.uncertain),
+        "the host still cannot say whether the missing range settled the first approval: {:?}",
+        bounded.items
+    );
+}
+
 /// KR-REQ-10.49: a page of one change is followed by `more` while a change the viewer reaches
 /// follows, and by none once it does not.
 #[test]

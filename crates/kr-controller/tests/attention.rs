@@ -1727,6 +1727,64 @@ async fn a_device_under_a_grant_with_no_cursor_is_shown_what_is_first_seen_after
     host.stop().await;
 }
 
+/// KR-REQ-10.49: a range of the retained events that the host could not read has no date, so a
+/// device whose history has a bound is listed none in the inbox it reads, as the changed view lists
+/// none. The items stay as they were, and the first approval stays uncertain for the device that
+/// can see it. The controls: the owner is listed the range, and so is a device whose grant names a
+/// cursor at the start of time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_with_a_history_bound_is_listed_no_gap_in_the_inbox() {
+    let owner_keys = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner_keys).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    host.controller()
+        .attention()
+        .observe(&[approval(session_id, "before")])
+        .expect("the store records the approval");
+
+    let (_phone, bounded) =
+        net_support::paired_device(&host, &owner_keys, &[ActionRight::SessionView]).await;
+    let mut reaching = net_support::proposal(&[ActionRight::SessionView]);
+    reaching.history.lower_bound_ms = Nullable::some(TimestampMs::new(0));
+    let tablet = net_support::Device::create().await;
+    let record = net_support::pair_with(&host, &tablet, &owner_keys, reaching).await;
+    let whole = net_support::connect(&host, &tablet, &record).await;
+
+    // Receipt sequences two to eight were evicted before the host could read them.
+    host.controller()
+        .attention()
+        .observe(&[approval_at(session_id, 9, "after")])
+        .expect("the store records the approval");
+
+    let mut control = host.client().await;
+    let owner = owner_read(&mut control).await;
+    assert_eq!(owner.gaps.len(), 1, "the owner is listed the range");
+    assert_eq!(owner.gaps[0].from_sequence, U64::new(2));
+
+    let wide = device_inbox(&whole).await;
+    assert_eq!(
+        wide.gaps, owner.gaps,
+        "a grant whose cursor reaches back to the start of time is listed the range"
+    );
+    assert!(
+        wide.items.iter().any(|item| item.uncertain),
+        "and the first approval stays uncertain for it"
+    );
+
+    let narrow = device_inbox(&bounded).await;
+    assert!(
+        narrow.gaps.is_empty(),
+        "a device paired after the first approval is listed no range: {:?}",
+        narrow.gaps
+    );
+    assert_eq!(
+        narrow.items.len(),
+        1,
+        "and is shown the one approval it reaches, as before"
+    );
+    host.stop().await;
+}
+
 /// A paired device's read of what changed in a session, over the network path.
 async fn device_changes(
     device: &kr_client::session::Session,
@@ -2890,7 +2948,11 @@ fn night() -> QuietHours {
 }
 
 async fn owner_inbox(control: &mut LocalClient) -> Vec<AttentionItem> {
-    let read: AttentionReadResult = control
+    owner_read(control).await.items
+}
+
+async fn owner_read(control: &mut LocalClient) -> AttentionReadResult {
+    control
         .request(
             Method::AttentionRead,
             &AttentionReadParams {
@@ -2904,8 +2966,7 @@ async fn owner_inbox(control: &mut LocalClient) -> Vec<AttentionItem> {
         .expect("the call reaches the daemon")
         .expect("the inbox reads")
         .to_typed()
-        .expect("decodes");
-    read.items
+        .expect("decodes")
 }
 
 async fn owner_reviews(control: &mut LocalClient, session_id: SessionId) -> Vec<ReviewState> {
