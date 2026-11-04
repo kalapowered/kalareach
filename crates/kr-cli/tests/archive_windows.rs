@@ -19,7 +19,8 @@ const TOP: &str = "kalareach-x86_64-pc-windows-msvc-0.1.0+aaaaaaaaaaaa";
 
 /// One entry of an archive as it is written, nothing about it checked.
 struct Member {
-    name: String,
+    /// The name's bytes as stored, whatever they are.
+    name: Vec<u8>,
     /// The bytes as stored in the archive: the file itself, or its deflated form.
     stored: Vec<u8>,
     /// What the entry says the file holds, and the checksum it says the file has.
@@ -29,6 +30,9 @@ struct Member {
     flags: u16,
     /// The file's mode in the high half, as an archive made on Unix writes it.
     external: u32,
+    /// The system that made the entry, in the high byte, and its version of the format: Unix is 3
+    /// and Windows 0.
+    made_by: u16,
     /// Extra data the entry carries in the archive's directory.
     extra: Vec<u8>,
 }
@@ -36,13 +40,14 @@ struct Member {
 impl Member {
     fn stored(name: impl Into<String>, data: &[u8]) -> Self {
         Self {
-            name: name.into(),
+            name: name.into().into_bytes(),
             stored: data.to_vec(),
             declared_size: u32::try_from(data.len()).expect("small"),
             crc: crc32(data),
             method: 0,
             flags: 0,
             external: 0o100_644 << 16,
+            made_by: (3 << 8) | 20,
             extra: Vec::new(),
         }
     }
@@ -150,14 +155,13 @@ fn archive_of(members: &[Member]) -> Vec<u8> {
                 .to_le_bytes(),
         );
         bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes.extend_from_slice(member.name.as_bytes());
+        bytes.extend_from_slice(&member.name);
         bytes.extend_from_slice(&member.stored);
     }
     let directory_at = u32::try_from(bytes.len()).expect("small");
     for (member, offset) in members.iter().zip(&offsets) {
         bytes.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
-        // Made on Unix, so the high half of the external attributes is a mode.
-        bytes.extend_from_slice(&((3_u16 << 8) | 20).to_le_bytes());
+        bytes.extend_from_slice(&member.made_by.to_le_bytes());
         bytes.extend_from_slice(&20_u16.to_le_bytes());
         bytes.extend_from_slice(&member.flags.to_le_bytes());
         bytes.extend_from_slice(&member.method.to_le_bytes());
@@ -182,7 +186,7 @@ fn archive_of(members: &[Member]) -> Vec<u8> {
         bytes.extend_from_slice(&[0; 2 + 2 + 2]);
         bytes.extend_from_slice(&member.external.to_le_bytes());
         bytes.extend_from_slice(&offset.to_le_bytes());
-        bytes.extend_from_slice(member.name.as_bytes());
+        bytes.extend_from_slice(&member.name);
         bytes.extend_from_slice(&member.extra);
     }
     let directory_len = u32::try_from(bytes.len()).expect("small") - directory_at;
@@ -283,6 +287,26 @@ fn an_archive_of_a_releases_shape_is_read_whole() {
     assert_eq!(written["release.json"].0, 13);
 }
 
+/// KR-REQ-26.06: the control for a release packed on Windows, as the packer writes it there: the
+/// system that made each entry is Windows, and the mode in the high half of its attributes is the
+/// permissions alone, with no bits for the type. It is read whole.
+#[test]
+fn a_release_packed_on_windows_is_read_whole() {
+    let members: Vec<Member> = release()
+        .into_iter()
+        .map(|member| Member {
+            made_by: 20,
+            external: 0o755 << 16,
+            ..member
+        })
+        .collect();
+    let case = Case::new();
+    let (_, written) = case
+        .read(&archive_of(&members), &Limits::DEFAULT)
+        .expect("a release packed on Windows is read");
+    assert_eq!(written.len(), 3);
+}
+
 /// KR-REQ-26.06: an archive that is more than a release is, or that no zip reader would take, is
 /// refused before a byte is written: too many entries, too many bytes in all, a file larger than any
 /// a release holds, a file that is not a zip, nothing at all.
@@ -346,8 +370,8 @@ fn an_archive_beyond_the_bounds_of_a_release_is_refused_before_anything_is_writt
 }
 
 /// KR-REQ-26.06: an entry that is not a file or a directory, or that a release does not use, is
-/// refused before a byte is written: a symbolic link, a name written twice, an encrypted entry, one
-/// compressed in a way a release is not.
+/// refused before a byte is written: a symbolic link, whichever system its entry says made it, a
+/// name written twice, an encrypted entry, one compressed in a way a release is not.
 #[test]
 fn an_entry_that_is_a_link_a_duplicate_or_unreadable_is_refused_before_anything_is_written() {
     let mut encrypted = Member::stored(format!("{TOP}/bin/kr.exe"), b"x");
@@ -361,6 +385,16 @@ fn an_entry_that_is_a_link_a_duplicate_or_unreadable_is_refused_before_anything_
             ],
         ),
         (
+            "a link that says it was made on Windows",
+            vec![
+                Member::stored(format!("{TOP}/release.json"), b"{}"),
+                Member {
+                    made_by: 20,
+                    ..Member::link(format!("{TOP}/bin/kr.exe"), "C:/Windows/System32/cmd.exe")
+                },
+            ],
+        ),
+        (
             "the same name twice",
             vec![
                 Member::stored(format!("{TOP}/release.json"), b"{}"),
@@ -370,14 +404,19 @@ fn an_entry_that_is_a_link_a_duplicate_or_unreadable_is_refused_before_anything_
         ("an encrypted entry", vec![encrypted]),
     ] {
         let case = Case::new();
-        assert!(
-            case.read(&archive_of(&members), &Limits::DEFAULT).is_err(),
-            "{name} is refused"
-        );
+        let refused = case.read(&archive_of(&members), &Limits::DEFAULT);
+        assert!(refused.is_err(), "{name} is refused");
+        if name.starts_with("a link") {
+            assert!(
+                refused.is_err_and(|error| error.contains("is a link")),
+                "{name} is refused as a link"
+            );
+        }
         assert!(case.staged().is_empty(), "{name}: nothing was written");
     }
-    // One method that the parser reads an entry of and one that it gives up on (the method of an
-    // encrypted entry, which has no field to say how), refused for the same reason by the reader.
+    // A method the parser reads an entry of and one it does not know (99 is the method an
+    // encrypted entry carries), refused for the same reason by the reader, before the parser sees
+    // the archive.
     for (name, method) in [("bzip2", 12), ("an unknown method", 99)] {
         let mut member = Member::stored(format!("{TOP}/bin/kr.exe"), b"x");
         member.method = method;
@@ -391,6 +430,58 @@ fn an_entry_that_is_a_link_a_duplicate_or_unreadable_is_refused_before_anything_
         );
         assert!(case.staged().is_empty(), "{name}: nothing was written");
     }
+}
+
+/// KR-REQ-26.06: a name is read as its entry's own flag says it is written, UTF-8 when the flag is
+/// set (a byte that is not UTF-8 standing for the replacement character) and IBM code page 437 when
+/// it is not, so the file a name makes and the names that collide are the same whatever reads the
+/// archive.
+#[test]
+fn a_name_is_read_as_its_entrys_flag_says_it_is_written() {
+    const UTF8: u16 = 0x0800;
+    let entry = |flags: u16, name: &[u8]| Member {
+        name: [TOP.as_bytes(), b"/", name].concat(),
+        flags,
+        ..Member::stored("", b"x")
+    };
+    for (what, flags, name, read_as) in [
+        (
+            "UTF-8 under its flag",
+            UTF8,
+            "caf\u{e9}".as_bytes(),
+            "caf\u{e9}",
+        ),
+        (
+            "the same bytes without the flag",
+            0,
+            "caf\u{e9}".as_bytes(),
+            "caf\u{251c}\u{2310}",
+        ),
+        (
+            "bytes that are not UTF-8 under the flag",
+            UTF8,
+            b"a\xff",
+            "a\u{fffd}",
+        ),
+        ("the same bytes without the flag", 0, b"a\xff", "a\u{a0}"),
+    ] {
+        let case = Case::new();
+        let (_, written) = case
+            .read(&archive_of(&[entry(flags, name)]), &Limits::DEFAULT)
+            .unwrap_or_else(|error| panic!("{what} is read: {error}"));
+        let names: Vec<_> = written.keys().map(String::as_str).collect();
+        assert_eq!(names, [read_as], "{what}");
+    }
+    // Two entries whose bytes differ and whose names under the flag are one.
+    let case = Case::new();
+    let error = case
+        .read(
+            &archive_of(&[entry(UTF8, b"a\xfe"), entry(UTF8, b"a\xff")]),
+            &Limits::DEFAULT,
+        )
+        .expect_err("two names that are one are refused");
+    assert!(error.contains("same name twice"), "{error}");
+    assert!(case.staged().is_empty(), "nothing was written");
 }
 
 /// KR-REQ-26.06: a name that leaves the release, or that Windows would read as another, is refused
@@ -487,8 +578,10 @@ fn an_entry_that_inflates_beyond_what_it_says_writes_no_more_than_it_says() {
         .max()
         .unwrap_or(0);
     assert!(
-        outcome.is_err(),
-        "an entry that lies about its size is refused"
+        outcome
+            .as_ref()
+            .is_err_and(|error| error.contains("does not hold the bytes it says")),
+        "an entry that lies about its size is refused for it: {outcome:?}"
     );
     assert!(
         largest <= 4,
@@ -700,7 +793,8 @@ mod measured {
 }
 
 /// A Unicode path field (0x7075) that gives `shown` as the name of an entry, with the checksum of
-/// `of`: the parser refuses the field unless `of` is the name the entry carries.
+/// `of`: the parser takes `shown` for the entry's name when `of` is the name the entry carries, and
+/// ignores the field otherwise.
 fn unicode_path_field(of: &[u8], shown: &str) -> Vec<u8> {
     let mut field = 0x7075_u16.to_le_bytes().to_vec();
     field.extend_from_slice(&u16::try_from(5 + shown.len()).expect("short").to_le_bytes());
@@ -712,10 +806,10 @@ fn unicode_path_field(of: &[u8], shown: &str) -> Vec<u8> {
 
 /// KR-REQ-26.06: an entry that carries extra data is refused before the parser reads the archive,
 /// whatever the data holds. The parser gives up on a directory with an entry whose extra data it
-/// cannot take (a Unicode path field whose checksum is not the name's, a field too short for its
-/// kind or one that runs past the data) and then reads the archive by another end record, so what
-/// it can fail on is not left to be told apart: a release carries no extra data, and the packer
-/// writes none. The control is the release without any, which is read.
+/// cannot take (a field too short for its kind or one that runs past the data), and it names an
+/// entry by a Unicode path field whose checksum is the name's, so what it can fail on and what it
+/// can rename an entry by is not left to be told apart: a release carries no extra data, and the
+/// packer writes none. The control is the release without any, which is read.
 #[test]
 fn an_entry_with_extra_data_is_refused_before_the_parser_reads_the_archive() {
     let name = format!("{TOP}/share/big");
@@ -763,18 +857,18 @@ fn an_entry_with_extra_data_is_refused_before_the_parser_reads_the_archive() {
 /// How many entries the 64-bit end record that [`archive_spelling_a_64_bit_end`] spells counts.
 const SPELLED_ENTRIES: u64 = 50_000;
 
-/// The most the reader may ask for at once while it reads or refuses an archive: far below what
-/// the parser sizes its list of entries to, which is [`SPELLED_ENTRIES`] times the size of one
-/// entry's record.
+/// The most the reader may ask for at once while it reads or refuses an archive: far below what a
+/// parser that sized its list of entries by the record [`archive_spelling_a_64_bit_end`] spells
+/// would ask for, which is [`SPELLED_ENTRIES`] times the size of one entry's record.
 const MOST_AT_ONCE: usize = 1 << 20;
 
 /// An archive of three entries whose directory spells, in the fixed fields of its entries, the
-/// three records that the parser follows to a 64-bit archive when it gives up on the directory it
+/// three records that a parser follows to a 64-bit archive when it gives up on the directory it
 /// first took: the 64-bit end record (counting [`SPELLED_ENTRIES`] entries), its locator, and a
 /// 32-bit end record that sends it to them. None is in a name or in extra data. The last entry
-/// carries `extra`, which is what the parser gives up on when it is a Unicode path field with a
-/// checksum that is not the name's. The directory begins far enough into the file that the 64-bit
-/// record can be taken for one whose entries lie before it.
+/// carries `extra`, which is what the parser gives up on when it is a field too short for its kind.
+/// The directory begins far enough into the file that the 64-bit record can be taken for one whose
+/// entries lie before it.
 fn archive_spelling_a_64_bit_end(extra: &[u8]) -> Vec<u8> {
     let start = usize::try_from(SPELLED_ENTRIES).expect("small") * 47;
     let mut directory = vec![0_u8; 126 + 46 + 1 + extra.len()];
@@ -816,16 +910,18 @@ fn archive_spelling_a_64_bit_end(extra: &[u8]) -> Vec<u8> {
 
 /// KR-REQ-26.06: an archive whose directory spells the records of a 64-bit archive in the fixed
 /// fields of its entries, which no check of names or extra data reaches, does not send the parser
-/// to them. The parser gives up on a directory whose entry it cannot read and follows the nearest
-/// earlier end record it finds, here this one, and sizes its list for the entries that record
-/// counts before anything else checks them, so a reader that lets the parser fail lets an archive
-/// that no signature has vouched for make it ask for gigabytes. The archive is refused for the
-/// extra data of its last entry, and the most the reader asked for at once is small. The control is
-/// the same directory without the extra data, which the parser reads as it is and the reader
-/// refuses for the first entry's data, which is not there, asking for as little.
+/// to them. A parser that gives up on a directory whose entry it cannot read can follow the
+/// nearest earlier end record it finds, here this one, and size its list for the entries that
+/// record counts before anything else checks them, so a reader that lets the parser fail lets an
+/// archive that no signature has vouched for make it ask for gigabytes. zip 9.1.2 does not follow
+/// it for a directory that ends at its end record, as this one does, and keeps its list as it
+/// parses; the reader relies on neither. The archive is refused for the extra data of its last
+/// entry, and the most the reader asked for at once is small. The control is the same directory
+/// without the extra data, which the parser reads as it is and the reader refuses for the first
+/// entry's data, which is not there, asking for as little.
 #[test]
 fn a_directory_that_spells_a_64_bit_end_is_not_followed_to_it_when_an_entry_fails() {
-    let crafted = archive_spelling_a_64_bit_end(&unicode_path_field(b"not the name", "a"));
+    let crafted = archive_spelling_a_64_bit_end(&[0x75, 0x70, 2, 0, 1, 0]);
     let control = archive_spelling_a_64_bit_end(&[]);
     for (what, bytes, reason) in [
         ("the archive", &crafted, "extra data"),

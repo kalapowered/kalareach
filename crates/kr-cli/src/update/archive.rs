@@ -13,6 +13,7 @@
 //! What the archive holds is then held to the manifest by [`super::release::check_files`], as the
 //! files of a `.tar.gz` are.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -147,21 +148,24 @@ pub fn unpack(
         if member.encrypted() {
             return Err(unreadable("has an encrypted entry"));
         }
-        if member.is_symlink() {
+        // The mode an archive made on Unix keeps in the high half of the entry's external
+        // attributes. It is read as it stands, whatever system the entry says it was made on:
+        // the library takes it for some systems and ignores it for others, and an entry that
+        // says it is a link is refused wherever it says it was made.
+        let mode = member.external_attributes() >> 16;
+        if mode & MODE_LINK == MODE_LINK {
             return Err(unreadable(
                 "has an entry that is a link, which a release does not hold",
             ));
         }
-        if let Some(mode) = member.unix_mode()
-            && !matches!(mode & 0o170_000, 0 | 0o100_000 | 0o040_000)
-        {
+        if !matches!(mode & MODE_TYPE, 0 | MODE_FILE | MODE_DIRECTORY) {
             return Err(unreadable(
                 "has an entry that is neither a file nor a directory",
             ));
         }
-        let name = member.name();
-        let directory = name.ends_with('/');
-        let name = name.strip_suffix('/').unwrap_or(name);
+        let listed = entry_name(member.name_raw(), member.flags().as_u16());
+        let directory = listed.ends_with('/');
+        let name = listed.strip_suffix('/').unwrap_or(&listed);
         // Before the rules, which keep every prefix of the name.
         if name.len() > limits.name_bytes {
             return Err(unreadable(
@@ -229,14 +233,23 @@ pub fn unpack(
             .by_index(entry.index)
             .map_err(|_| unreadable("has an entry this host cannot read"))?;
         // No more than the entry says is written. A byte read past it, which writes nothing, shows
-        // that the entry holds more than it says.
+        // that the entry holds more than it says. The reader says so by failing, not by giving the
+        // byte, when it is asked for one past the size the entry declares.
         let summary = write_new(&destination, &mut (&mut member).take(entry.size))
             .map_err(|failure| write_failure(&destination, &failure))?;
         let mut past = [0_u8; 1];
-        let more = member
-            .read(&mut past)
-            .map_err(|_| unreadable("has an entry this host cannot read"))?;
-        if summary.0 != entry.size || more != 0 {
+        let more = match member.read(&mut past) {
+            Ok(read) => read != 0,
+            Err(failure) => {
+                if failure.kind() != std::io::ErrorKind::InvalidData
+                    || failure.to_string() != PAST_THE_DECLARED_SIZE
+                {
+                    return Err(unreadable("has an entry this host cannot read"));
+                }
+                true
+            }
+        };
+        if summary.0 != entry.size || more {
             return Err(unreadable(
                 "has an entry that does not hold the bytes it says",
             ));
@@ -269,6 +282,46 @@ const END_RECORD: [u8; 4] = *b"PK\x05\x06";
 const STORED: usize = 0;
 const DEFLATED: usize = 8;
 
+/// The bits of a Unix mode that say what an entry is, and what they are for a link, a file and a
+/// directory.
+const MODE_TYPE: u32 = 0o170_000;
+const MODE_LINK: u32 = 0o120_000;
+const MODE_FILE: u32 = 0o100_000;
+const MODE_DIRECTORY: u32 = 0o040_000;
+
+/// What the parser's reader says when it is asked for a byte beyond the size its entry declares.
+const PAST_THE_DECLARED_SIZE: &str = "File is larger than its declared uncompressed size";
+
+/// The bit of an entry's flags that says its name is UTF-8.
+const NAME_IS_UTF8: u16 = 0x0800;
+
+/// What IBM code page 437 gives the bytes 0x80 to 0xFF, in order: how a name is read when its entry
+/// does not say it is UTF-8.
+const CP437_HIGH: &str = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u{a0}";
+
+/// The name of an entry as its own flags say it is written: UTF-8 when the flag for that is set,
+/// where a byte that is not UTF-8 stands for the replacement character, and IBM code page 437
+/// when it is not. The parser reads a name by what its bytes are, not by what the entry says, and
+/// that gives another name to bytes that are UTF-8 under a clear flag and to bytes that are not
+/// under a set one; the names are judged and written as the flag says.
+fn entry_name(raw: &[u8], flags: u16) -> Cow<'_, str> {
+    if flags & NAME_IS_UTF8 != 0 || raw.is_ascii() {
+        return String::from_utf8_lossy(raw);
+    }
+    let high: Vec<char> = CP437_HIGH.chars().collect();
+    Cow::Owned(
+        raw.iter()
+            .map(|&byte| match byte.checked_sub(0x80) {
+                Some(index) => high
+                    .get(usize::from(index))
+                    .copied()
+                    .unwrap_or(char::REPLACEMENT_CHARACTER),
+                None => char::from(byte),
+            })
+            .collect(),
+    )
+}
+
 /// Reads the directory of entries and the end record from the tail of the file, and judges them
 /// whole: the end record is the last 22 bytes of the file with no comment, names one disk and
 /// counts and sizes that fit it (so no 64-bit record), and the directory is exactly the bytes
@@ -278,15 +331,17 @@ const DEFLATED: usize = 8;
 /// will read are the bytes judged here.
 ///
 /// The parser follows the last end record, and when an entry it reads does not parse it falls back
-/// to an earlier end record, found by its signature anywhere in the file, and sizes what it keeps
-/// for the entries that record counts before anything here checks them. The fixed fields of an entry
-/// can spell the signatures of such a record (a checksum is any four bytes, and no release is at
-/// fault for it), so the fallback is closed where it begins: no entry judged here fails to parse. In
-/// zip 8.6.0 an entry fails to parse by its extra data (each kind of field has lengths or content it
-/// refuses, and the Unicode path and comment fields a checksum), by its method when that is the one
-/// that needs an encryption field, and by nothing else: the other fields of its record are taken
-/// whatever they hold, and a name is decoded without failing. So an entry carries no extra data, and
-/// its method is stored or deflated, which are the two a release uses.
+/// to an earlier end record, found by its signature in the last 64 KiB or so of the file, and
+/// reads the entries that record counts before anything here checks them. The fixed fields of an
+/// entry can spell the signatures of such a record (a checksum is any four bytes, and no release is
+/// at fault for it), so the fallback is closed where it begins: no entry judged here fails to
+/// parse. In zip 9.1.2 an entry fails to parse by its extra data (a field too short for its kind,
+/// one that runs past the data, or one whose content its kind refuses) and by nothing else: the
+/// other fields of its record are taken whatever they hold. A Unicode path field whose checksum is
+/// the name's also replaces the name with its own text. So an entry carries no extra data, and,
+/// because a release holds nothing else, its method is stored or deflated. That version also gives
+/// up the fallback when the directory it read ends where the end record it found begins, which is the
+/// shape judged here, so the fallback is closed twice.
 ///
 /// Returns the refusal where the archive is not of this shape, or beyond the limits.
 fn read_tail(

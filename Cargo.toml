@@ -302,7 +302,7 @@ wit-parser = "=0.259.0"
 zeroize = { version = "=1.9.0", features = ["derive"] }
 # A Windows release archive, read by the host that installs it. Only the one compression the
 # release archives use is built; the library's other methods and its encryption are not.
-zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "=9.1.2", default-features = false, features = ["deflate-flate2"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"
