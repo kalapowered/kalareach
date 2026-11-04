@@ -325,17 +325,59 @@ async fn until<T, Fut>(what: &str, mut check: impl FnMut() -> Fut) -> T
 where
     Fut: std::future::Future<Output = Option<T>>,
 {
+    until_found(what, || {
+        let look = check();
+        async move { look.await.ok_or_else(String::new) }
+    })
+    .await
+}
+
+/// [`until`] for a look that says what it found when it found nothing, so that a wait that runs
+/// out of patience says what the last look saw and not only what it waited for.
+async fn until_found<T, Fut>(what: &str, mut check: impl FnMut() -> Fut) -> T
+where
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
-        if let Some(found) = check().await {
-            return found;
-        }
+        let seen = match check().await {
+            Ok(found) => return found,
+            Err(seen) => seen,
+        };
         assert!(
             tokio::time::Instant::now() < deadline,
-            "waited {PATIENCE:?} for {what}"
+            "waited {PATIENCE:?} for {what}{}",
+            if seen.is_empty() {
+                String::new()
+            } else {
+                format!("; the last look found {seen}")
+            }
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// What the workers' reports of components say, one binding to a phrase, for a wait that ran out.
+fn reports_in_words(
+    reports: &[(
+        kr_protocol::ids::BrokerBindingId,
+        kr_protocol::admission::ComponentReport,
+    )],
+) -> String {
+    if reports.is_empty() {
+        return "no binding".to_owned();
+    }
+    reports
+        .iter()
+        .map(|(binding, report)| {
+            format!(
+                "{binding:?} {:?} ({})",
+                report.state,
+                report.reason.0.as_deref().unwrap_or("no reason")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A person at a session's terminal: an attachment that holds the input lease and types.
@@ -1354,15 +1396,15 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
         report.state == ComponentState::Pending
             && report.reason.0.as_deref() == Some("registering with the plugin runtime")
     };
-    let second_binding = until(
+    let second_binding = until_found(
         "the second binding's registration to be sent and left unanswered",
         || async {
-            world
-                .reported()
-                .await
-                .into_iter()
+            let reports = world.reported().await;
+            reports
+                .iter()
                 .find(|(binding, report)| *binding != first_binding && registering(report))
-                .map(|(binding, _)| binding)
+                .map(|(binding, _)| *binding)
+                .ok_or_else(|| reports_in_words(&reports))
         },
     )
     .await;
