@@ -23,8 +23,9 @@
 //! say it. A write that fails is let go.
 //!
 //! Nothing else in the worker's library writes to its standard error, and a lint refuses a direct
-//! write. The worker's program makes three writes where they are said, which its own comments name
-//! and give the reasons for.
+//! write. Three writes of the worker's program are made where they are said: its own line at its
+//! start, the argument parser's message and the standard library's message for a panic. The
+//! program's comments name them and give the reasons.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -317,7 +318,7 @@ impl Said {
     }
 
     /// Returns the reason the log ends on once the lines handed over have been written: that of the
-    /// newest line whose reason still stands, else the last one written.
+    /// newest line whose reason still stands, else the last one written while its offer stood.
     fn log_ends_on(&self) -> Option<&str> {
         self.pending
             .iter()
@@ -590,7 +591,7 @@ mod tests {
         );
     }
 
-    /// A late end of a write does not mark as said a reason that has gone or changed since.
+    /// A late end of a write does not mark as said a reason that has gone since.
     #[test]
     fn a_write_that_ends_after_its_reason_went_says_nothing() {
         let mut said = Said::default();
@@ -955,17 +956,14 @@ mod tests {
         }
 
         /// The reasons of the lines of output retention that the writer took, in the order it took
-        /// them.
+        /// them: what follows the last colon of a line that has one. The other lines the cases
+        /// write have none.
         fn reasons(&self) -> Vec<String> {
             String::from_utf8(self.taken.lock().expect("not poisoned").clone())
                 .expect("text")
                 .lines()
-                .filter_map(|line| {
-                    line.strip_prefix(
-                        "kr-worker: output retention left output it was asked to remove: ",
-                    )
-                })
-                .map(str::to_owned)
+                .filter_map(|line| line.rsplit_once(": "))
+                .map(|(_, reason)| reason.to_owned())
                 .collect()
         }
     }
@@ -1001,6 +999,31 @@ mod tests {
         held.takes();
         assert!(held.writer.drain(DEADLINE));
         assert_eq!(held.reasons(), ["A", "B", "A"]);
+    }
+
+    /// A reason is judged against the newest line that waits, not the oldest.
+    ///
+    /// A is written, B is in its write, A comes back and waits behind B, and then B comes back. The
+    /// log is to end on A, so B is said again behind it.
+    #[test]
+    fn a_reason_is_judged_against_the_newest_line_that_waits() {
+        let held = Held::new();
+        let reasons = OutputReasons::default();
+
+        reasons.say(Some("A"), true, || &held.writer);
+        held.begins();
+        held.takes();
+        until(|| reasons.said().as_deref() == Some("A"));
+        reasons.say(Some("B"), true, || &held.writer);
+        held.begins();
+        reasons.say(Some("A"), true, || &held.writer);
+        reasons.say(Some("B"), true, || &held.writer);
+
+        for _ in 0..3 {
+            held.takes();
+        }
+        assert!(held.writer.drain(DEADLINE));
+        assert_eq!(held.reasons(), ["A", "B", "A", "B"]);
     }
 
     /// A reason that returns after the line of another was dropped is said again, since the log
