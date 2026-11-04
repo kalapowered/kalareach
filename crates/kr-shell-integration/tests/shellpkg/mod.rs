@@ -165,6 +165,27 @@ fn set_answer_wait_and_say(milliseconds: u32) -> String {
     )
 }
 
+/// PowerShell that has the next command lookup of `command`, typed at the prompt, set the
+/// bridge's wait for an answer to `milliseconds`, and prints `kr-lookup-armed` once it is in place.
+///
+/// The line the lookup belongs to has by then been accepted: the bridge asked for its acceptance
+/// answer, and waited for it, under the wait the session had. The question the lookup leads to is
+/// asked under the wait this sets. So a case in which the worker leaves a question unanswered gives
+/// the acceptance of that line the long wait, which the harness answers inside, and the short one
+/// only to the question it leaves. The handler goes at its first use, and the marker is put
+/// together by the line, so the echo of the line cannot print it.
+fn set_answer_wait_at_the_lookup_of(command: &str, milliseconds: u32) -> String {
+    format!(
+        "& {{ $kr_bridge = Get-Module KalaReach.ShellBridge; if ($kr_bridge) {{ \
+         $global:KR_LOOKUP_BRIDGE = $kr_bridge; \
+         $ExecutionContext.InvokeCommand.PreCommandLookupAction = {{ param($name, $lookup) \
+         if ($name -ceq '{command}' -and \"$($lookup.CommandOrigin)\" -ceq 'Runspace') {{ \
+         $ExecutionContext.InvokeCommand.PreCommandLookupAction = $null; \
+         & $global:KR_LOOKUP_BRIDGE {{ $script:KR_ANSWER_WAIT_MS = {milliseconds} }} }} }}; \
+         Write-Output ('kr-look' + 'up-armed') }} }}"
+    )
+}
+
 /// PowerShell that prints what the bridge's wait for an answer holds, as
 /// [`set_answer_wait_and_say`] does after it sets it.
 fn read_answer_wait_and_say() -> String {
@@ -2434,6 +2455,41 @@ impl Session {
     /// Panics when the shell does not take the line or the bridge does not hold the wait after it.
     pub fn lets_the_bridge_give_up_on_a_question(&mut self) {
         self.sets_the_bridge_answer_wait(SILENT_WORKER_ANSWER_WAIT_MS);
+    }
+
+    /// Gives the bridge a short wait for the worker's answer to the question the next line leads to
+    /// when it looks `command` up, and keeps the wait it has for everything before that, the
+    /// acceptance of the line included.
+    ///
+    /// This is [`Session::lets_the_bridge_give_up_on_a_question`] for a case in which the worker
+    /// answers the acceptance and leaves the question unanswered, and what the case looks at is the
+    /// question's wait running out: a runner that is slow to run the harness between the two only
+    /// lengthens it, and cannot leave the acceptance owed. The wait stays short until
+    /// [`Session::lets_the_bridge_wait_for_answers`] is called. Nothing is done for a shell whose
+    /// bridge has no such wait.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shell does not take the line.
+    pub fn lets_the_bridge_give_up_on_the_question_the_lookup_of(&mut self, command: &str) {
+        if self.package_kind != ShellKind::PowerShell {
+            return;
+        }
+        let line = set_answer_wait_at_the_lookup_of(command, SILENT_WORKER_ANSWER_WAIT_MS);
+        assert!(
+            self.run(&line, "kr-lookup-armed"),
+            "the shell does not take the line that sets the wait for the next question:\n{}",
+            self.terminal_output()
+        );
+    }
+
+    /// Whether the bridge holds the short wait for answers that the lookup it was armed for set.
+    pub fn bridge_gives_up_on_questions(&mut self) -> bool {
+        self.package_kind != ShellKind::PowerShell
+            || self.run(
+                &read_answer_wait_and_say(),
+                &format!("kr-answer-wait-{SILENT_WORKER_ANSWER_WAIT_MS}"),
+            )
     }
 
     /// Makes the bridge wait for the worker's answers as long as a case waits for anything, as it
