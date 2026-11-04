@@ -1032,26 +1032,42 @@ mod tests {
         assert_eq!(parse_strings(&variant_strings(&strings)), Some(strings));
     }
 
+    /// Writes `script` to `program` as an executable, by a process of its own. Tests in this
+    /// process start programs while this one runs, and a program written here is held open for
+    /// writing by this process for as long as the write takes: a child that another thread starts
+    /// in that time carries the open file until it has executed, and the system refuses to run a
+    /// file that any process holds open for writing. The program then does not start, which a call
+    /// of `gsettings` reports as the program missing. No file is held open by this process when it
+    /// is written by another.
+    #[cfg(unix)]
+    fn write_program(program: &std::path::Path, script: &str) {
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#)
+            .arg("write-program")
+            .arg(script)
+            .arg(program)
+            .status()
+            .expect("a shell to write the program");
+        assert!(status.success(), "the program was written: {status:?}");
+    }
+
     /// KR-REQ-01.21: a key that cannot be read is not written back, because whether it holds kr's
     /// value is not known: `gsettings` is run, and no `set` or `reset` reaches it.
     #[cfg(unix)]
     #[test]
     fn a_key_that_cannot_be_read_is_not_written_back() {
-        use std::os::unix::fs::PermissionsExt as _;
         let directory = std::env::temp_dir().join(format!("kr-gsettings-{}", std::process::id()));
         std::fs::create_dir_all(&directory).expect("a directory");
         let program = directory.join("gsettings");
         let log = directory.join("calls");
-        std::fs::write(
+        write_program(
             &program,
-            format!(
+            &format!(
                 "#!/bin/sh\necho \"$1\" >> '{}'\n[ \"$1\" = get ] && exit 1\nexit 0\n",
                 log.display()
             ),
-        )
-        .expect("a program");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-            .expect("executable");
+        );
         let gsettings = Gsettings {
             program,
             environment: Vec::new(),
