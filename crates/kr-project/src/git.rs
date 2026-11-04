@@ -5614,14 +5614,6 @@ mod tests {
         );
     }
 
-    /// Waits until the clock has reached `moment`.
-    #[cfg(unix)]
-    fn wait_until(moment: Instant) {
-        while Instant::now() < moment {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
     /// A pipe whose writers are faster than its reader: whenever it is asked, it has something to
     /// give. It runs dry after `lasts` reads, only so that a loop that does not stop ends the case.
     #[cfg(unix)]
@@ -7065,10 +7057,12 @@ mod tests {
     /// the pipe's last writer ends during the pause, so the end is in the pipe when the clock is
     /// read. A wait that decided by that read would say the program left its output open for the
     /// whole second; this one reads again, after the second, before it says so, and finds the end.
+    /// The clock is the case's own and moves only as the pause moves it.
     #[cfg(unix)]
     #[test]
     fn a_pause_between_a_read_and_the_clock_does_not_blame_a_program_that_ended_its_output_in_time()
     {
+        let clock = StandingClock::start();
         let mut holder = std::process::Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -7077,6 +7071,7 @@ mod tests {
         let said = holder.stdin.take().expect("cat's input");
         let mut heard = Heard::of(holder.stdout.take()).expect("the pipe is read without blocking");
         AFTER_THE_READ.with(|pause| {
+            let clock = clock.handle();
             pause.set(Some(Box::new(move || {
                 drop(said);
                 holder
@@ -7084,14 +7079,14 @@ mod tests {
                     .expect("cat ends, and the pipe it held with it");
                 // The wait began before this pause did, so its second is over by the time this one
                 // is.
-                wait_until(Instant::now() + PROBE_DRAIN + Duration::from_millis(100));
+                clock.advance_to(clock.now() + PROBE_DRAIN + Duration::from_millis(100));
             })));
         });
 
         let outcome = drain(
             &mut heard,
             "git --exec-path",
-            Instant::now() + Duration::from_secs(60),
+            clock.now() + Duration::from_secs(60),
         );
 
         assert!(
