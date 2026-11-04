@@ -675,19 +675,33 @@ pub fn connection_shell(exec_path: &Path) -> Vec<PathBuf> {
     candidates
 }
 
+/// Copies the handle of a directory this host made, for the three answers below.
+///
+/// The copy takes a descriptor as an open does. A host too short of descriptors, processes or
+/// memory to make it has said nothing of the directory, so the refusal is a fault that passes
+/// (`refused_by`), which a client sends the request again after; any other failure is the
+/// caller's argument.
+fn copied(directory: &cap_std::fs::Dir) -> Result<cap_std::fs::Dir> {
+    crate::identity::copy_of(directory).map_err(|error| {
+        refused_by(
+            &error,
+            format!("a directory this host made could not be identified: {error}"),
+        )
+    })
+}
+
 /// Returns the object one opened directory is.
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::Destination`] when the handle's identity cannot be read.
+/// Returns [`ProjectError::Destination`] when the handle's identity cannot be read, except that a
+/// host too short of descriptors, processes or memory to copy it is [`ProjectError::GitFailed`],
+/// a fault that passes.
 pub fn identity_of_handle(
     environment_id: EnvironmentId,
     directory: &cap_std::fs::Dir,
 ) -> Result<ObjectIdentity> {
-    let handle =
-        crate::identity::copy_of(directory).map_err(|error| ProjectError::Destination {
-            detail: format!("a directory this host made could not be identified: {error}").into(),
-        })?;
+    let handle = copied(directory)?;
     Ok(AuthorisedDirectory::from_handle(environment_id, handle, PathBuf::new())?.identity())
 }
 
@@ -696,15 +710,14 @@ pub fn identity_of_handle(
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::Destination`] when the handle's identity cannot be read.
+/// Returns [`ProjectError::Destination`] when the handle's identity cannot be read, except that a
+/// host too short of descriptors, processes or memory to copy it is [`ProjectError::GitFailed`],
+/// a fault that passes.
 pub fn recorded_of_handle(
     environment_id: EnvironmentId,
     directory: &cap_std::fs::Dir,
 ) -> Result<RecordedIdentity> {
-    let handle =
-        crate::identity::copy_of(directory).map_err(|error| ProjectError::Destination {
-            detail: format!("a directory this host made could not be identified: {error}").into(),
-        })?;
+    let handle = copied(directory)?;
     Ok(AuthorisedDirectory::from_handle(environment_id, handle, PathBuf::new())?.recorded()?)
 }
 
@@ -713,17 +726,15 @@ pub fn recorded_of_handle(
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::Destination`] when the handle cannot be read, and
-/// [`ProjectError::IdentityChanged`] when it is not the recorded directory.
+/// Returns [`ProjectError::Destination`] when the handle cannot be read, except that a host too
+/// short of descriptors, processes or memory to copy it is [`ProjectError::GitFailed`], a fault
+/// that passes, and [`ProjectError::IdentityChanged`] when it is not the recorded directory.
 pub fn settle_handle(
     environment_id: EnvironmentId,
     directory: &cap_std::fs::Dir,
     expected: RecordedIdentity,
 ) -> Result<Settled> {
-    let handle =
-        crate::identity::copy_of(directory).map_err(|error| ProjectError::Destination {
-            detail: format!("a directory this host made could not be identified: {error}").into(),
-        })?;
+    let handle = copied(directory)?;
     AuthorisedDirectory::from_handle(environment_id, handle, PathBuf::new())?
         .check_recorded(expected)
         .map_err(|refusal| ProjectError::IdentityChanged {
