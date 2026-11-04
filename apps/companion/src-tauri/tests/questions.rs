@@ -1330,3 +1330,165 @@ async fn the_send_of_a_kept_answer_names_the_newest_uncertain_send() {
     let told = answered(right).await.expect("the worker took it");
     assert_eq!(told["outcome"], "taken", "{told}");
 }
+
+/// The worker's next call is a receipt read of `recorded`, the send this device recorded, and of no
+/// other. It is counted in `asked_about`, and answered with `receipt`, or with "no receipt" when
+/// there is none.
+async fn read_of_the_recorded_receipt(
+    link: &mut scripted_worker::Link,
+    asked_about: &mut Vec<kr_protocol::ids::ActionId>,
+    recorded: kr_protocol::ids::ActionId,
+    receipt: Option<kr_protocol::receipt::ActionReadResult>,
+) {
+    let call = link.expect(Method::ActionRead).await;
+    let params: kr_protocol::receipt::ActionReadParams = call.params();
+    asked_about.push(params.action_id);
+    assert_eq!(
+        params.action_id, recorded,
+        "the worker is asked about the send this device recorded"
+    );
+    match receipt {
+        Some(receipt) => link.answer(&call, &receipt).await,
+        None => {
+            link.refuse(&call, &format!("no receipt for action {recorded}"))
+                .await;
+        }
+    }
+}
+
+/// Waits for a command to end, and fails when it asks the worker for anything more before then.
+async fn ends_without_asking_more(
+    mut command: tokio::task::JoinHandle<Result<Value, Value>>,
+    link: &mut scripted_worker::Link,
+) -> Result<Value, Value> {
+    tokio::select! {
+        done = &mut command => done.expect("the command's thread finished"),
+        call = link.call() => panic!(
+            "the command asked the worker for more: {} {:?}",
+            call.method, call.params
+        ),
+    }
+}
+
+/// KR-REQ-10.06, KR-REQ-11.63: the send a page says it was shown is only compared with the newest
+/// uncertain send this device recorded. It is no method's parameter: a kept answer's send naming
+/// another send is refused as a conflict, a new answer naming another is held, a send naming one
+/// when no uncertain send is recorded goes out quoting nothing, and across all of it the worker is
+/// asked about the send this device recorded and about no other.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_send_a_page_says_it_was_shown_is_only_compared_with_the_record() {
+    use kr_protocol::receipt::ReceiptState;
+
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let read = page.call("question_read", read_params(&worker));
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    answered(read).await.expect("the questions");
+
+    // The first answer goes out and its reply is lost. The page will name a send that is not this one.
+    let asked = page.call(
+        "question_answer",
+        answer_params(&worker, 2, &choice("release")),
+    );
+    let call = link.expect(Method::QuestionAnswer).await;
+    let recorded = call.action_id.expect("an identifier");
+    drop(link);
+    let kept = answered(asked).await.expect("the answer is kept");
+    let drafted_at = kept["draft"]["drafted_at_ms"].clone();
+    let claimed = kr_protocol::ids::ActionId::new(Uuid::from_bytes([9; 16]));
+    assert_ne!(claimed, recorded, "the page names a send never recorded");
+    let mut asked_about = Vec::new();
+
+    // A kept answer's send naming it is refused, after the worker was asked about the recorded send.
+    let wrong = page.call(
+        "question_send_kept",
+        json!({ "params": {
+            "questionId": question_id().to_string(),
+            "draftedAtMs": drafted_at,
+            "acknowledged": claimed.to_string()
+        } }),
+    );
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    read_of_the_recorded_receipt(
+        &mut link,
+        &mut asked_about,
+        recorded,
+        Some(receipt_of(recorded, ReceiptState::Unknown)),
+    )
+    .await;
+    let refused = ends_without_asking_more(wrong, &mut link)
+        .await
+        .expect_err("another send is named");
+    assert_eq!(code_of(&refused), "DRAFT_CONFLICT", "{refused}");
+
+    // A new answer naming it is held, and what it says was found is the recorded send.
+    let held = page.call(
+        "question_answer",
+        json!({
+            "params": answer_params(&worker, 2, &choice("main"))["params"].clone(),
+            "acknowledged": claimed.to_string()
+        }),
+    );
+    read_of_the_recorded_receipt(
+        &mut link,
+        &mut asked_about,
+        recorded,
+        Some(receipt_of(recorded, ReceiptState::Unknown)),
+    )
+    .await;
+    let told = ends_without_asking_more(held, &mut link)
+        .await
+        .expect("held, not refused");
+    assert_eq!(told["outcome"], "held", "{told}");
+    assert_eq!(told["action_id"], recorded.to_string(), "{told}");
+
+    // The worker has no receipt of the recorded send, so no uncertain send is recorded: the
+    // press that names one anyway goes out quoting none.
+    let sending = page.call(
+        "question_answer",
+        json!({
+            "params": answer_params(&worker, 2, &choice("main"))["params"].clone(),
+            "acknowledged": claimed.to_string()
+        }),
+    );
+    read_of_the_recorded_receipt(&mut link, &mut asked_about, recorded, None).await;
+    let call = link.expect(Method::QuestionAnswer).await;
+    let kr_cbor::CanonicalValue::Map(quoted) = call
+        .expected
+        .clone()
+        .expect("a mutation's preconditions")
+        .into_value()
+    else {
+        panic!("preconditions are a map");
+    };
+    assert!(
+        quoted
+            .get(kr_protocol::action::SUPERSEDES_ACTION_KEY)
+            .is_none(),
+        "the send quotes nothing, since the record holds no uncertain send"
+    );
+    link.answer(&call, &resolution(&worker, QuestionState::Answered))
+        .await;
+    let told = ends_without_asking_more(sending, &mut link)
+        .await
+        .expect("the worker took it");
+    assert_eq!(told["outcome"], "taken", "{told}");
+
+    assert_eq!(
+        asked_about,
+        vec![recorded; 3],
+        "the worker is asked about the recorded send each time, and never about the one named"
+    );
+}

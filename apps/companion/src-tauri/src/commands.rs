@@ -586,7 +586,9 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     ),
     // An answer is a page method, and before it goes this device asks the host what became of the
     // sends the question's kept answer went out under, so that a send the host took is not made
-    // again. The page names the answer, never the action asked about.
+    // again. The page names the answer, never the action asked about: the earlier send it says it
+    // was shown is only compared with the newest uncertain send recorded on this device, and the
+    // actions asked about are the ones recorded there.
     ("question_answer", &[Method::ActionRead]),
 ];
 
