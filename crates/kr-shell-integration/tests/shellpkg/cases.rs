@@ -204,7 +204,8 @@ impl Session {
     /// # Panics
     ///
     /// Panics when the reader still reports a queue holding input at the empty prompt, as its last
-    /// report or after the window for asking again.
+    /// report or after the window for asking again, whether the window ends between the exchanges
+    /// or inside one.
     pub fn fenced_prompt(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
         let mut entry = self.next_prompt();
         // One deadline covers the exchanges and the waits between them, so asking the reader again
@@ -224,7 +225,17 @@ impl Session {
             // that reader rather than one a redraw has since replaced.
             entry.prompt_generation = acknowledgement.prompt_generation;
             entry.reader_revision = acknowledgement.reader_revision;
-            acknowledgement = self.fence_exchange_before(&entry, fence_id(index), deadline);
+            // A window that ends inside the exchange ends the case with the report that was being
+            // asked about again, which is what failed, and says how the exchange ended after it.
+            acknowledgement = match self.settled_fence_exchange(&entry, fence_id(index), deadline) {
+                Ok(next) => next,
+                Err(why) => panic!(
+                    "an idle reader reported a queue still holding input: {:?}; asked again, \
+                     {why}:\n{}",
+                    acknowledgement.queues,
+                    self.terminal_output()
+                ),
+            };
         }
         assert!(
             acknowledgement.queues.tty_typeahead_drained
