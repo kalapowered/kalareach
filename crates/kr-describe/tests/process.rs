@@ -645,26 +645,28 @@ fn a_process_whose_standard_error_is_held_still_ends_when_it_must() {
     assert_eq!(status.code(), Some(Exit::ControlStalled.code()));
 }
 
-/// A process whose standard error cannot be written to ends as it must when it has something to say
-/// as it ends, and does not wait to say it: its answer cannot be written because its daemon is
-/// gone, its model has failed, or a request it was sent is not a message. Each of the three ends has
-/// its own exit status, and none of them has a bound of the process's own to end it, since the work
-/// in hand is nowhere near its deadline and the control thread is not stuck on a request. The script
-/// holds the lock on standard error from before the process serves, as a write waiting on a pipe
-/// nobody reads does. The control is the process with its standard error free, which ends the same
-/// way.
+/// A process whose standard error is a pipe nobody reads ends as it must when it has something to
+/// say as it ends, and does not wait to say it: its answer cannot be written because its daemon is
+/// gone, its model has failed (the panic hook speaks as the program installs it to), or a request it
+/// was sent is not a message. Each of the three ends has its own exit status. The first two have no
+/// bound of the process's own to end them, since the work in hand is nowhere near its deadline; the
+/// third would be ended by the bound on a control thread stuck on a request, with another exit
+/// status, and does not wait to be. The script fills the pipe before the process serves, as a pipe
+/// nobody reads is filled, so every write to standard error waits for good. The control is the
+/// process with its standard error free, which ends the same way.
+#[cfg(unix)]
 #[test]
 fn a_process_that_ends_with_something_to_say_does_not_wait_for_its_standard_error() {
     let placed = Placed::stub();
-    for (form, hold_standard_error) in [("held", true), ("free", false)] {
+    for (form, fill_standard_error) in [("full", true), ("free", false)] {
         // The daemon is gone: the answer to the load cannot be written.
         let runtime = placed.directory(&format!("gone-{form}"));
         let script = Script {
-            hold_standard_error,
+            fill_standard_error,
             fail_output_from: Some(2),
             ..Script::default()
         };
-        let mut process = Process::start(&placed, &script, &runtime);
+        let mut process = Process::start_with_unread_standard_error(&placed, &script, &runtime);
         process.hello();
         process.send(&load(1, &default_profile(), 300_000));
         let status = process
@@ -675,11 +677,11 @@ fn a_process_that_ends_with_something_to_say_does_not_wait_for_its_standard_erro
         // The model fails inside a job.
         let runtime = placed.directory(&format!("failed-{form}"));
         let script = Script {
-            hold_standard_error,
+            fill_standard_error,
             panic_in_generate: true,
             ..Script::default()
         };
-        let mut process = Process::start(&placed, &script, &runtime);
+        let mut process = Process::start_with_unread_standard_error(&placed, &script, &runtime);
         process.hello();
         process.send(&load(1, &default_profile(), 300_000));
         process.expect_answer(SOON, "the load");
@@ -692,10 +694,10 @@ fn a_process_that_ends_with_something_to_say_does_not_wait_for_its_standard_erro
         // A request that is not a message: a frame cut short by the end of the input.
         let runtime = placed.directory(&format!("refused-{form}"));
         let script = Script {
-            hold_standard_error,
+            fill_standard_error,
             ..Script::default()
         };
-        let mut process = Process::start(&placed, &script, &runtime);
+        let mut process = Process::start_with_unread_standard_error(&placed, &script, &runtime);
         process.hello();
         process.send_raw(&[0, 0]);
         process.close_input();

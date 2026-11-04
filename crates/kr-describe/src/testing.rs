@@ -704,6 +704,9 @@ pub struct Script {
     /// that waits on a pipe nobody reads does: every other write to standard error waits for the
     /// lock, for good.
     pub hold_standard_error: bool,
+    /// Whether the process fills its standard error before it serves, as a pipe nobody reads is
+    /// filled: every write to it, the panic hook's included, waits for good. It is read on Unix only.
+    pub fill_standard_error: bool,
 }
 
 /// Memory a job holds that the system is kept from taking back.
@@ -913,6 +916,7 @@ impl Script {
             self.ignore_token_until_released,
         );
         flag("hold-standard-error", self.hold_standard_error);
+        flag("fill-standard-error", self.fill_standard_error);
         flag("spin", self.spin);
         match &self.output {
             Output::WellFormed => {}
@@ -996,6 +1000,7 @@ impl Script {
                 "hold-job-start" => script.hold_job_start = true,
                 "ignore-token-until-released" => script.ignore_token_until_released = true,
                 "hold-standard-error" => script.hold_standard_error = true,
+                "fill-standard-error" => script.fill_standard_error = true,
                 "spin" => script.spin = true,
                 "output" => {
                     script.output = match value {
@@ -1727,6 +1732,11 @@ pub fn stub_main() -> i32 {
         });
         let _ = locked.recv();
     }
+    #[cfg(unix)]
+    if script.fill_standard_error {
+        fill_standard_error();
+    }
+    crate::serve::say_panics_without_waiting();
     let options = Options {
         build: stub_build(),
         runtime_dir,
@@ -1976,6 +1986,26 @@ impl<W: Write> Write for Wedging<W> {
         self.frames += 1;
         Ok(())
     }
+}
+
+/// Writes to the process's standard error until the system says it is full, and leaves it blocking
+/// again: what a pipe nobody reads comes to, after which any write to it waits for good.
+#[cfg(unix)]
+fn fill_standard_error() {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+    let standard_error = std::io::stderr();
+    let Ok(flags) = fcntl_getfl(&standard_error) else {
+        return;
+    };
+    if fcntl_setfl(&standard_error, flags | OFlags::NONBLOCK).is_err() {
+        return;
+    }
+    // A write that would wait is the pipe being full: whole blocks first, then single bytes, so that
+    // no room is left for a short message. Any other failure ends the filling too.
+    while rustix::io::write(&standard_error, &[b' '; 4096]).is_ok() {}
+    while rustix::io::write(&standard_error, b" ").is_ok() {}
+    let _ = fcntl_setfl(&standard_error, flags);
 }
 
 /// A stream whose writes fail from an answer on, as they do on a pipe that nothing reads any longer.

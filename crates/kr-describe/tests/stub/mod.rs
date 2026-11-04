@@ -10,7 +10,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -128,12 +128,24 @@ pub struct Process {
     child: Child,
     input: Option<ChildStdin>,
     answers: Receiver<Result<Answer, String>>,
+    /// The read end of a standard error that nobody reads, when the process was started with one.
+    unread_standard_error: Option<ChildStderr>,
 }
 
 impl Process {
     /// Starts the stub with a script and a runtime directory.
     pub fn start(placed: &Placed, script: &Script, runtime_dir: &Path) -> Self {
         Self::start_with(placed, script, runtime_dir, None)
+    }
+
+    /// Starts the stub with a script and a runtime directory, and its standard error a pipe that
+    /// this process holds the read end of and never reads.
+    pub fn start_with_unread_standard_error(
+        placed: &Placed,
+        script: &Script,
+        runtime_dir: &Path,
+    ) -> Self {
+        Self::spawn(placed, script, runtime_dir, None, Stdio::piped())
     }
 
     /// Starts the stub with a script and a runtime directory, and the test catalogue at
@@ -143,6 +155,16 @@ impl Process {
         script: &Script,
         runtime_dir: &Path,
         catalogue: Option<&Path>,
+    ) -> Self {
+        Self::spawn(placed, script, runtime_dir, catalogue, Stdio::inherit())
+    }
+
+    fn spawn(
+        placed: &Placed,
+        script: &Script,
+        runtime_dir: &Path,
+        catalogue: Option<&Path>,
+        standard_error: Stdio,
     ) -> Self {
         let mut command = Command::new(placed.program());
         command
@@ -156,10 +178,11 @@ impl Process {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(standard_error)
             .spawn()
             .expect("the stub starts");
         let input = child.stdin.take();
+        let unread_standard_error = child.stderr.take();
         let mut output = child.stdout.take().expect("the stub's output");
         let (tell, answers) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -182,6 +205,7 @@ impl Process {
             child,
             input,
             answers,
+            unread_standard_error,
         }
     }
 

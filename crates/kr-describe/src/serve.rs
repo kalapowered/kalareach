@@ -483,8 +483,10 @@ pub fn run<M: Model>(
             // daemon is not going to send anything more.
             Ok(None) | Err(WireError::Io(_)) => return shared.end(Exit::Ended),
             Err(error) => {
+                // The process has stopped serving, so it is not stuck on a request while it says why.
+                let exit = shared.end(Exit::WireBroken);
                 say(&format!("a request from the daemon was refused: {error}"));
-                return shared.end(Exit::WireBroken);
+                return exit;
             }
         }
     }
@@ -1069,6 +1071,16 @@ fn say(why: &str) {
     if spawned.is_ok() {
         let _ = wrote.recv_timeout(NOTICE_WAIT);
     }
+}
+
+/// Makes a panic say what it has to say as [`say`] does, for the rest of the process's life.
+///
+/// The default hook writes to standard error before the panicking thread unwinds, and a pipe nobody
+/// reads holds it there: the model thread's failure is then not seen until a deadline passes. A
+/// program calls this once, as it starts and before it serves. It replaces the hook for the whole
+/// process, so code that shares its process with others, as a test does, leaves it alone.
+pub fn say_panics_without_waiting() {
+    std::panic::set_hook(Box::new(|panic| say(&panic.to_string())));
 }
 
 /// Ends the process with `exit`, after saying why as [`say`] does.

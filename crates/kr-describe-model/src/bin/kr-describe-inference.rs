@@ -6,7 +6,9 @@
 //! watchdog ends it when it is stuck; `kr_describe::serve` is the whole of how it serves.
 
 use kr_describe::profile::catalogue::Catalogue;
-use kr_describe::serve::{DAEMON_IDENTITY_ARGUMENT, Options, arguments, run};
+use kr_describe::serve::{
+    DAEMON_IDENTITY_ARGUMENT, Options, arguments, run, say_panics_without_waiting,
+};
 use kr_describe_model::llama::Llama;
 
 fn main() {
@@ -17,6 +19,7 @@ fn main() {
         println!("kr-describe-inference {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    say_panics_without_waiting();
     let (runtime_dir, daemon) = match arguments(&given) {
         Ok(read) => read,
         Err(error) => {
