@@ -202,6 +202,12 @@ fn colour(object: &SyncObject) -> String {
 
 /// A device that writes a setting is read by a second store of the same collection, and what the
 /// service holds is the sealed object and nothing a reader without the key could use.
+///
+/// KR-REQ-18.05, the part about encrypted settings sync: a setting written into a claimed
+/// collection is held by the service as ciphertext that does not contain the setting's text, and a
+/// second store of the collection reads the setting back with the collection's key. Not shown here:
+/// history backups or recovery material, or that nothing else readable is held (the case looks for
+/// the setting's text alone).
 #[tokio::test]
 async fn settings_written_into_a_claimed_collection_are_read_back_sealed_under_its_key() {
     let web = Arc::new(ServiceWeb::new());
