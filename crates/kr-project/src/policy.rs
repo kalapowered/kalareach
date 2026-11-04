@@ -1868,4 +1868,57 @@ mod tests {
             authorise_request_digest(&other).expect("a digest")
         );
     }
+
+    /// A destination named under a location is resolved by copying the handle the policy holds for
+    /// the location, which takes a descriptor as an open does. A host out of descriptors,
+    /// processes or memory to copy it has said nothing of the destination, so that is a fault
+    /// that passes; any other failure of the copy is still the caller's argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_descriptors_when_the_handle_of_a_destinations_location_is_copied_is_a_fault_that_passes()
+     {
+        use crate::identity::tests::{CLONE_FAILS, OPEN_ERRORS, assert_answered};
+        use kr_protocol::project::{DestinationParent, DestinationRequest};
+
+        let location = held(None, LocationPurpose::Destination);
+        let (environment_id, location_id) = (location.row.environment_id, location.location_id());
+        let place = location.handle.display_path().to_path_buf();
+        let policy = LocationPolicy::default();
+        policy
+            .lock()
+            .expect("the policy's lock")
+            .insert(location_id, Arc::new(location));
+        let request = DestinationRequest {
+            environment_id,
+            parent: DestinationParent::Location { location_id },
+            name: "published".to_owned(),
+        };
+        let resolve = || {
+            crate::operation::Destination::resolve(
+                &request,
+                environment_id,
+                &policy,
+                Admitting::Caller(None),
+            )
+        };
+
+        for (errno, passes) in OPEN_ERRORS {
+            CLONE_FAILS.with(|fails| fails.set(Some((0, errno))));
+            let resolved = resolve();
+            CLONE_FAILS.with(|fails| fails.set(None));
+
+            let Err(refused) = resolved else {
+                panic!("the location could not be copied ({errno}), and the destination resolved");
+            };
+            assert_answered(
+                &refused,
+                errno,
+                passes,
+                ErrorCode::InvalidArgument,
+                &place,
+                &format!("{errno}"),
+            );
+        }
+        resolve().expect("without a failure the destination resolves");
+    }
 }

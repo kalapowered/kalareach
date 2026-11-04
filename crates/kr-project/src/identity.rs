@@ -1189,12 +1189,12 @@ fn open_recorded_root(
 ///
 /// The directory carries no rule that confines it to one mount, as none opened here does, and the
 /// copy carries none either.
-fn duplicated(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
+pub(crate) fn duplicated(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
     let path = directory.display_path();
-    // A case that asks for it has the duplication fail as it does for a host that is out of
-    // descriptors.
+    // A case that asks for it has the duplication fail, after that many have been made, as it
+    // does for a host that is out of descriptors.
     #[cfg(all(test, unix))]
-    let copy = match tests::CLONE_FAILS.with(std::cell::Cell::get) {
+    let copy = match tests::due(&tests::CLONE_FAILS) {
         Some(error) => Err(std::io::Error::from(error)),
         None => directory.handle().try_clone(),
     };
@@ -1224,12 +1224,8 @@ pub(crate) fn open_unrecorded_root(
     // A case that asks for it has the open fail, after that many roots have been opened, as it does
     // for a host that is out of descriptors.
     #[cfg(all(test, unix))]
-    let opened = match tests::ROOT_OPEN_FAILS.with(std::cell::Cell::get) {
-        Some((0, error)) => Err(std::io::Error::from(error)),
-        Some((passing, error)) => {
-            tests::ROOT_OPEN_FAILS.with(|fails| fails.set(Some((passing - 1, error))));
-            open_directory(path)
-        }
+    let opened = match tests::due(&tests::ROOT_OPEN_FAILS) {
+        Some(error) => Err(std::io::Error::from(error)),
         None => open_directory(path),
     };
     #[cfg(not(all(test, unix)))]
@@ -1400,7 +1396,7 @@ fn unlocated(error: &std::io::Error) -> ProjectError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[cfg(unix)]
     use kr_protocol::error::ErrorCode;
@@ -1747,27 +1743,41 @@ mod tests {
     thread_local! {
         /// Set by a case to have the directory at this path removed at the instant the next open
         /// of a recorded tree's place is made on its own thread, in the function that opens it.
-        pub(super) static REMOVED_BEFORE_THE_OPEN: std::cell::Cell<Option<PathBuf>> =
+        pub(crate) static REMOVED_BEFORE_THE_OPEN: std::cell::Cell<Option<PathBuf>> =
             const { std::cell::Cell::new(None) };
         /// Set by a case to make every open on its own thread fail with this error.
-        pub(super) static OPEN_FAILS: std::cell::Cell<Option<rustix::io::Errno>> =
+        pub(crate) static OPEN_FAILS: std::cell::Cell<Option<rustix::io::Errno>> =
             const { std::cell::Cell::new(None) };
         /// Set by a case to run something once on its own thread right after the next open has
         /// answered, whether it opened the place or not.
-        pub(super) static AFTER_THE_OPEN: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        pub(crate) static AFTER_THE_OPEN: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::Cell::new(None) };
         /// Set by a case to make the open of a root on its own thread fail with this error, after
         /// that many roots have been opened.
-        pub(super) static ROOT_OPEN_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
+        pub(crate) static ROOT_OPEN_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
             const { std::cell::Cell::new(None) };
         /// Set by a case to make the duplication of a directory's handle fail on its own thread
-        /// with this error.
-        pub(super) static CLONE_FAILS: std::cell::Cell<Option<rustix::io::Errno>> =
+        /// with this error, after that many have been made.
+        pub(crate) static CLONE_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
             const { std::cell::Cell::new(None) };
         /// Set by a case to make the resolution of the path of a directory that was opened fail on
         /// its own thread with this error.
-        pub(super) static RESOLVE_FAILS: std::cell::Cell<Option<rustix::io::Errno>> =
+        pub(crate) static RESOLVE_FAILS: std::cell::Cell<Option<rustix::io::Errno>> =
             const { std::cell::Cell::new(None) };
+    }
+
+    /// Returns the error a seam set by a case makes this call fail with, when this is the call it
+    /// is set for: the one after as many as it lets pass, and every one after that.
+    #[cfg(unix)]
+    pub(crate) fn due(
+        seam: &'static std::thread::LocalKey<std::cell::Cell<Option<(usize, rustix::io::Errno)>>>,
+    ) -> Option<rustix::io::Errno> {
+        let (passing, error) = seam.with(std::cell::Cell::get)?;
+        if passing == 0 {
+            return Some(error);
+        }
+        seam.with(|fails| fails.set(Some((passing - 1, error))));
+        None
     }
 
     /// The tree is there until the open and gone when the open is made, as it is for a tree that
@@ -1996,7 +2006,7 @@ mod tests {
     /// The errors a place is opened with when the host is short of descriptors, processes or
     /// memory, and one it is not: for each, whether it is the host's shortage.
     #[cfg(unix)]
-    const OPEN_ERRORS: [(rustix::io::Errno, bool); 4] = [
+    pub(crate) const OPEN_ERRORS: [(rustix::io::Errno, bool); 4] = [
         (rustix::io::Errno::MFILE, true),
         (rustix::io::Errno::NFILE, true),
         (rustix::io::Errno::NOMEM, true),
@@ -2007,7 +2017,7 @@ mod tests {
     /// which a client sends the request again after, and it says the place and the reason. Any
     /// other failure is not one a client sends again, and keeps the code `otherwise`.
     #[cfg(unix)]
-    fn assert_answered(
+    pub(crate) fn assert_answered(
         refused: &ProjectError,
         errno: rustix::io::Errno,
         passes: bool,
@@ -2167,7 +2177,7 @@ mod tests {
         let common = made.main.join(".git");
 
         for (errno, passes) in OPEN_ERRORS {
-            CLONE_FAILS.with(|fails| fails.set(Some(errno)));
+            CLONE_FAILS.with(|fails| fails.set(Some((0, errno))));
             let opened = OpenedRepository::open(&made.profile, made.environment_id, &made.main);
             CLONE_FAILS.with(|fails| fails.set(None));
 
@@ -2356,6 +2366,274 @@ mod tests {
                     &format!("{}, {errno}", directory.path().display()),
                 );
             }
+        }
+    }
+
+    /// The recorded route copies the handle of the directory it opened, and `require_within` copies
+    /// the ones it climbs from and asks the mount of. A copy takes a descriptor as an open does, so
+    /// a host out of descriptors, processes or memory to make one has said nothing of the tree: a
+    /// fault that passes, which a client sends the request again after. A copy that fails for
+    /// another reason keeps the answer it had, and so does the question of a mount, which a copy
+    /// that cannot be made leaves unanswered and so ends the climb: the directory is not the
+    /// recorded tree.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_descriptors_when_the_handle_of_a_recorded_tree_is_duplicated_is_a_fault_that_passes()
+     {
+        let made = repositories();
+        let environment_id = made.environment_id;
+        let recorded_of = |path: &Path| {
+            AuthorisedDirectory::open_root(environment_id, path)
+                .expect("it opens")
+                .recorded()
+                .expect("it reads its identity")
+        };
+        let common = made.main.join(".git");
+        let below = made.main.join("below");
+        std::fs::create_dir(&below).expect("a directory below the top level");
+        let above = below.join("..");
+        let (tree, git_dir) = (recorded_of(&made.main), recorded_of(&common));
+        let named = GitDirectory::Named {
+            recorded: git_dir,
+            path_is_top_level: false,
+        };
+
+        for (what, rule, path, passing, place, otherwise) in [
+            (
+                "the tree of a repository this host made",
+                GitDirectory::AtTree(git_dir),
+                &made.main,
+                0,
+                &made.main,
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                "the directory a repository was registered through, which is its top level",
+                named,
+                &made.main,
+                0,
+                &made.main,
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                "the mount of a directory below the top level",
+                named,
+                &below,
+                0,
+                &below,
+                ErrorCode::SourceChanged,
+            ),
+            (
+                "the handle the climb from a directory below the top level starts from",
+                named,
+                &below,
+                1,
+                &below,
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                "the mount of the directory above it",
+                named,
+                &below,
+                2,
+                &above,
+                ErrorCode::SourceChanged,
+            ),
+        ] {
+            let recorded = RecordedTree {
+                tree,
+                git_dir: rule,
+            };
+            for (errno, passes) in OPEN_ERRORS {
+                CLONE_FAILS.with(|fails| fails.set(Some((passing, errno))));
+                let opened = OpenedRepository::open_recorded_tree(
+                    &made.profile,
+                    environment_id,
+                    path,
+                    recorded,
+                );
+                CLONE_FAILS.with(|fails| fails.set(None));
+
+                let Err(refused) = opened else {
+                    panic!("{what} could not be duplicated ({errno}), and the repository opened");
+                };
+                assert_answered(
+                    &refused,
+                    errno,
+                    passes,
+                    otherwise,
+                    place,
+                    &format!("{what}, {errno}"),
+                );
+            }
+            OpenedRepository::open_recorded_tree(&made.profile, environment_id, path, recorded)
+                .unwrap_or_else(|error| {
+                    panic!("without a failure the repository opens ({what}): {error}")
+                });
+        }
+    }
+
+    /// A repository Git made in `base`, with no linked worktree, which a location reaches.
+    #[cfg(unix)]
+    fn plain_repository(base: &Path) -> PathBuf {
+        let path = base.join("plain");
+        let made = std::process::Command::new("git")
+            .arg("init")
+            .arg("--initial-branch=main")
+            .arg(&path)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", base)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git runs");
+        assert!(
+            made.status.success(),
+            "git init: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        path
+    }
+
+    /// A repository reached through a location is found by a descent from the location's handle,
+    /// which copies the Git directory's handle and each object directory's, and it keeps a copy of
+    /// its working tree's. A host out of descriptors, processes or memory to make one has said
+    /// nothing of the repository, so that is a fault that passes, and any other failure of the copy
+    /// is still the caller's argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_descriptors_when_a_repository_is_found_through_a_location_is_a_fault_that_passes()
+     {
+        let made = repositories();
+        let environment_id = made.environment_id;
+        let base = made.main.parent().expect("the directory of the repository");
+        let plain = plain_repository(base);
+        let location = open_unrecorded_root(environment_id, base)
+            .expect("the location opens")
+            .confined_to_one_mount()
+            .expect("it is on one mount");
+        let relative = RelativeName::parse("plain").expect("a name");
+        let find = || crate::discovery::discover_through(&location, &relative, "plain", None);
+        let common = plain.join(".git");
+        let objects = common.join("objects");
+
+        for (what, passing, place) in [
+            ("the Git directory", 0, &common),
+            ("the object directory", 1, &objects),
+        ] {
+            for (errno, passes) in OPEN_ERRORS {
+                CLONE_FAILS.with(|fails| fails.set(Some((passing, errno))));
+                let found = find();
+                CLONE_FAILS.with(|fails| fails.set(None));
+
+                let Err(refused) = found else {
+                    panic!(
+                        "{what} could not be duplicated ({errno}), and the repository was found"
+                    );
+                };
+                assert_answered(
+                    &refused,
+                    errno,
+                    passes,
+                    ErrorCode::InvalidArgument,
+                    place,
+                    &format!("{what}, {errno}"),
+                );
+            }
+        }
+        let take = |found| {
+            let through = (
+                location.try_clone().expect("the location is copied"),
+                relative.clone(),
+            );
+            OpenedRepository::discovered(&made.profile, found, through, None, None)
+        };
+        for (errno, passes) in OPEN_ERRORS {
+            let found = find().expect("the repository is found");
+            // The working tree's copy is the first one this call makes.
+            CLONE_FAILS.with(|fails| fails.set(Some((0, errno))));
+            let taken = take(found);
+            CLONE_FAILS.with(|fails| fails.set(None));
+
+            let Err(refused) = taken else {
+                panic!(
+                    "the working tree could not be duplicated ({errno}), and the repository was taken"
+                );
+            };
+            assert_answered(
+                &refused,
+                errno,
+                passes,
+                ErrorCode::InvalidArgument,
+                &plain,
+                &format!("the working tree, {errno}"),
+            );
+        }
+        take(find().expect("the repository is found"))
+            .expect("without a failure the repository is taken");
+    }
+
+    /// The rule that confines a directory to one mount goes with its copy: a copy of a confined
+    /// directory refuses what lies on another mount as the directory does, and a copy of one with no
+    /// rule has none.
+    #[cfg(unix)]
+    #[test]
+    fn the_copy_of_a_directory_confined_to_one_mount_is_confined_to_it_too() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([18; 16]));
+        let plain = open_unrecorded_root(environment_id, root.path()).expect("it opens");
+        let confined = open_unrecorded_root(environment_id, root.path())
+            .expect("it opens")
+            .confined_to_one_mount()
+            .expect("it is on one mount");
+        assert!(confined.mount().is_some(), "the directory is confined");
+
+        let copy = duplicated(&confined).expect("it is copied");
+
+        assert_eq!(
+            copy.mount(),
+            confined.mount(),
+            "the rule goes with the copy"
+        );
+        assert_eq!(
+            copy.identity(),
+            confined.identity(),
+            "and it is the same object"
+        );
+        assert_eq!(
+            duplicated(&plain).expect("it is copied").mount(),
+            None,
+            "a directory with no rule has a copy with none"
+        );
+    }
+
+    /// The object a path names, for a caller that records it, is read from a directory opened as
+    /// every other is, so a host out of descriptors, processes or memory to open it has said
+    /// nothing of the path: a fault that passes. Any other failure is still the caller's argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_descriptors_at_the_open_of_a_path_to_be_recorded_is_a_fault_that_passes() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let (environment_id, tree, _) = recorded_tree_in(root.path());
+        crate::boundary::identity_of(environment_id, &tree)
+            .expect("a directory that opens has an identity");
+
+        for (errno, passes) in OPEN_ERRORS {
+            ROOT_OPEN_FAILS.with(|fails| fails.set(Some((0, errno))));
+            let identified = crate::boundary::identity_of(environment_id, &tree);
+            ROOT_OPEN_FAILS.with(|fails| fails.set(None));
+
+            let Err(refused) = identified else {
+                panic!("the path could not be opened ({errno}), and it was identified");
+            };
+            assert_answered(
+                &refused,
+                errno,
+                passes,
+                ErrorCode::InvalidArgument,
+                &tree,
+                &format!("{errno}"),
+            );
         }
     }
 }
