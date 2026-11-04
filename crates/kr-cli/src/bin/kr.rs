@@ -2305,20 +2305,26 @@ async fn question(
 
 /// Reports an answer that was sent, or one that was kept on this device instead.
 ///
+/// What the host said of the answer's earlier sends is named before the result: a line on standard
+/// error for a person, issued before the new send went, and an `earlier` member of the document for
+/// a script, which a failed send carries too.
+///
 /// A kept answer is a failure, because its session's worker did not take it or whether it did is
 /// not known, and its document says it was kept, so a script can tell it from an answer that was
 /// refused.
 fn report_answered(
     question_id: kr_protocol::ids::QuestionId,
-    answered: Result<kr_protocol::question::Question>,
+    reported: kr_cli::question::Reported,
     json: bool,
 ) -> Result<Completion> {
-    match answered {
+    let earlier = kr_cli::question::earlier_documents(&reported.earlier);
+    match reported.outcome {
         Ok(item) => {
             if json {
                 output::document(
                     &Document::new()
                         .with("ok", true)
+                        .with("earlier", earlier)
                         .with("state", item.state.as_str())
                         .with("revision", item.revision.get())
                         .with("question_id", output::said(&item.question_id)),
@@ -2333,11 +2339,21 @@ fn report_answered(
                 output::document(
                     &report::failure(&error)
                         .with("kept", true)
+                        .with("earlier", earlier)
                         .with("question_id", output::said(&question_id)),
                 );
             } else {
                 report::failed(&error);
             }
+            Ok(Completion::Reported(error))
+        }
+        Err(error) if json && !earlier.is_empty() => {
+            output::document(&report::with_failure(
+                Document::new()
+                    .with("earlier", earlier)
+                    .with("question_id", output::said(&question_id)),
+                &error,
+            ));
             Ok(Completion::Reported(error))
         }
         Err(error) => Err(error),

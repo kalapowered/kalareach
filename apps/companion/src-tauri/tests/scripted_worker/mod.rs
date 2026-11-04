@@ -411,6 +411,11 @@ pub struct Call {
     pub kind: CallKind,
     /// What a mutation's envelope says it acts on; a read carries none.
     pub target: Option<kr_protocol::envelope::ActionTarget>,
+    /// The identifier a mutation goes out under; a read carries none.
+    pub action_id: Option<kr_protocol::ids::ActionId>,
+    /// The preconditions a mutation carries, which name an uncertain earlier send when it quotes
+    /// one; a read carries none.
+    pub expected: Option<ParamsValue>,
 }
 
 impl Call {
@@ -451,6 +456,8 @@ impl Link {
                 params: request.params,
                 kind: CallKind::Request,
                 target: None,
+                action_id: None,
+                expected: None,
             },
             ControlFrame::Mutation(mutation) => Call {
                 request_id: mutation.request_id,
@@ -458,6 +465,8 @@ impl Link {
                 params: mutation.params,
                 kind: CallKind::Mutation,
                 target: Some(mutation.target),
+                action_id: Some(mutation.action_id),
+                expected: Some(mutation.expected),
             },
             other => panic!("the view sent {other:?} rather than a call"),
         }
@@ -489,6 +498,8 @@ impl Link {
                         params: request.params,
                         kind: CallKind::Request,
                         target: None,
+                        action_id: None,
+                        expected: None,
                     }),
                     Ok(ControlFrame::Mutation(mutation)) => sent.push(Call {
                         request_id: mutation.request_id,
@@ -496,6 +507,8 @@ impl Link {
                         params: mutation.params,
                         kind: CallKind::Mutation,
                         target: Some(mutation.target),
+                        action_id: Some(mutation.action_id),
+                        expected: Some(mutation.expected),
                     }),
                     Ok(_) => {}
                     Err(_) => return,

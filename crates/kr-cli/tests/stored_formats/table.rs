@@ -1403,6 +1403,25 @@ pub fn table() -> Vec<Store> {
                 Kept::Source("crates/kr-client/src/answers.rs", &["AnswerDraft"]),
             ],
         },
+        // The identifiers a kept answer went out under, beside the answer, so a reconnect can ask the
+        // host what became of each.
+        Store {
+            levels: None,
+            writers: Writers::Barred(&kr_client::sends::WRITTEN),
+            entry: entry(
+                kr_client::sends::WRITTEN.store,
+                StoreScope::StateRoot,
+                "kept-answers/*.send",
+                cbor_member("version", 0),
+                kr_client::sends::WRITTEN.version,
+                0,
+            ),
+            owned: Vec::new(),
+            kept: vec![
+                protocol::<kr_protocol::ids::ActionId>("ActionId"),
+                Kept::Source("crates/kr-client/src/sends.rs", &["SendRecord"]),
+            ],
+        },
         Store {
             levels: None,
             writers: Writers::Barred(&kr_cli::machine::WRITTEN),

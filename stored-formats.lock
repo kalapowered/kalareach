@@ -42,6 +42,25 @@
     },
     {
       "entry": {
+        "store": "answer-sends",
+        "scope": "state_root",
+        "path": "kept-answers/*.send",
+        "recording": {
+          "kind": "cbor_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 0
+      },
+      "digest": "ea528256d37c6c269c134431095f7a8190daf4ef6c23c8b7e156c7fa5533df60",
+      "kept": [
+        "ActionId",
+        "SendRecord (crates/kr-client/src/sends.rs)"
+      ]
+    },
+    {
+      "entry": {
         "store": "attention",
         "scope": "environment",
         "path": "attention.sqlite3",

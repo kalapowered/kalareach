@@ -561,17 +561,23 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
         &[Method::EventsSnapshot, Method::AgentInstances],
     ),
     // A kept answer is settled, sent and dismissed on this device: settling reads the session's
-    // questions and, for a session the worker no longer serves, the daemon's record of it; sending
-    // reads them again first and then answers. The page names a question, never a method.
+    // questions and, for a session the worker no longer serves, the daemon's record of it, and asks
+    // the host what became of each send the answer went out under; sending reads them again first
+    // and then answers. The page names a question, never a method or an action.
     (
         "question_settle",
-        &[Method::QuestionRead, Method::SessionRead],
+        &[
+            Method::QuestionRead,
+            Method::SessionRead,
+            Method::ActionRead,
+        ],
     ),
     (
         "question_send_kept",
         &[
             Method::QuestionRead,
             Method::SessionRead,
+            Method::ActionRead,
             Method::QuestionAnswer,
         ],
     ),
@@ -1417,9 +1423,11 @@ pub async fn question_answer(
     state: State<'_, AppState>,
     params: Value,
     opening: Option<String>,
+    acknowledged: Option<kr_protocol::ids::ActionId>,
 ) -> Result<Value> {
     let typed: kr_protocol::question::QuestionAnswerParams = decode(params)?;
-    let answer = crate::questions::answer(&state, &links, opening.as_deref(), typed).await?;
+    let answer =
+        crate::questions::answer(&state, &links, opening.as_deref(), typed, acknowledged).await?;
     encode(&answer)
 }
 
