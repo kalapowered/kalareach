@@ -128,6 +128,15 @@ pub const STEP: Duration = Duration::from_millis(60);
 /// [`Session::lets_the_bridge_give_up_on_a_question`].
 const PATIENT_ANSWER_WAIT_MS: u32 = 120_000;
 
+/// How long the PowerShell package's module waits for the worker's answer to its hello.
+///
+/// The module ships with five seconds, which is long beside a worker that answers in under a
+/// millisecond. In a case the worker is this harness, and a runner that does not run the harness
+/// or the shell for five seconds between the hello and the answer fails every case on a handshake
+/// that says nothing about the package. The module takes a longer wait from the environment, before
+/// it has run a line of the profile, so a case gives it the wait that a case gives any answer.
+const PATIENT_HANDSHAKE_WAIT_MS: u32 = 120_000;
+
 /// How long the bridge waits in a case in which the worker never answers something. What the case
 /// observes is the wait running out, which a stalled runner only lengthens; but the worker still
 /// answers every other line in that window, and those answers have to be read inside it. Ten
@@ -1181,6 +1190,12 @@ impl Session {
                 "KR_SHELL_BRIDGE_SECRET",
                 kr_protocol::scalars::to_base64url(&secret),
             );
+            if package.kind == ShellKind::PowerShell {
+                command.env(
+                    "KR_SHELL_BRIDGE_HANDSHAKE_WAIT_MS",
+                    PATIENT_HANDSHAKE_WAIT_MS.to_string(),
+                );
+            }
             // A run that asked a package for diagnostics passes that through to the shell it starts.
             if let Some(trace) = std::env::var_os("KR_SHELL_BRIDGE_TRACE") {
                 command.env("KR_SHELL_BRIDGE_TRACE", trace);
