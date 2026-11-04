@@ -215,15 +215,11 @@ impl Session {
         let mut entry = self.next_prompt();
         // One deadline covers the exchanges and the waits between them, so asking the reader again
         // never buys it another reply window.
-        let deadline = self.deadline_for(REPLY).0;
-        let mut acknowledgement = self.fence_exchange_before(&entry, fence_id(index), deadline);
-        while Self::input_not_yet_taken(acknowledgement.queues) && Instant::now() < deadline {
-            std::thread::sleep(
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(20)),
-            );
-            if Instant::now() >= deadline {
+        let deadline = self.deadline_for(REPLY);
+        let mut acknowledgement = self.fence_exchange_before(&entry, fence_id(index), deadline.0);
+        while Self::input_not_yet_taken(acknowledgement.queues) && !deadline.passed() {
+            std::thread::sleep(deadline.left().min(Duration::from_millis(20)));
+            if deadline.passed() {
                 break;
             }
             // The exchange before settled on the reader that is running, so the next one asks
@@ -232,14 +228,19 @@ impl Session {
             entry.reader_revision = acknowledgement.reader_revision;
             // A window that ends inside the exchange ends the case with the report that was being
             // asked about again, which is what failed, and says how the exchange ended after it.
-            acknowledgement = match self.settled_fence_exchange(&entry, fence_id(index), deadline) {
+            acknowledgement = match self.settled_fence_exchange(&entry, fence_id(index), deadline.0)
+            {
                 Ok(next) => next,
-                Err(why) => panic!(
-                    "an idle reader reported a queue still holding input: {:?}; asked again, \
-                     {why}:\n{}",
-                    acknowledgement.queues,
-                    self.terminal_output()
-                ),
+                Err(why) => {
+                    // A window that ran out notes the give-up when it is asked.
+                    let _ = deadline.passed();
+                    panic!(
+                        "an idle reader reported a queue still holding input: {:?}; asked again, \
+                         {why}:\n{}",
+                        acknowledgement.queues,
+                        self.terminal_output()
+                    );
+                }
             };
         }
         assert!(
@@ -777,22 +778,18 @@ pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKin
     // sequence together, at one instant. The reader reaches that instant once the bytes its own
     // startup left behind have drained, so this asks again until the state it reports has settled.
     // One deadline covers every exchange and every wait between them.
-    let deadline = session.deadline_for(REPLY).0;
-    let mut acknowledgement = session.fence_exchange_before(&first, fence_id(1), deadline);
-    while Instant::now() < deadline
+    let deadline = session.deadline_for(REPLY);
+    let mut acknowledgement = session.fence_exchange_before(&first, fence_id(1), deadline.0);
+    while !deadline.passed()
         && (!acknowledgement.editor.buffer_empty
             || acknowledgement.snapshot.queued_keys != U64::new(0)
             || acknowledgement.snapshot.pending_bytes != U64::new(0))
     {
-        std::thread::sleep(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(10)),
-        );
-        if Instant::now() >= deadline {
+        std::thread::sleep(deadline.left().min(Duration::from_millis(10)));
+        if deadline.passed() {
             break;
         }
-        acknowledgement = session.fence_exchange_before(&first, fence_id(1), deadline);
+        acknowledgement = session.fence_exchange_before(&first, fence_id(1), deadline.0);
     }
     assert_eq!(acknowledgement.fence_id, fence_id(1));
     assert_eq!(acknowledgement.prompt_generation, first.prompt_generation);
@@ -2642,10 +2639,10 @@ pub fn a_reader_that_holds_input_does_not_report_idle_again_when_the_worker_with
     }
     // The reader is holding input once an exchange finds it so, and every report it made on the way
     // there was sent before the answer that says so.
-    let deadline = session.deadline_for(REPLY).0;
-    let mut held = session.fence_exchange_before(&enter, fence_id(30), deadline);
-    while held.queues.partial_key_drained && Instant::now() < deadline {
-        held = session.fence_exchange_before(&enter, fence_id(30), deadline);
+    let deadline = session.deadline_for(REPLY);
+    let mut held = session.fence_exchange_before(&enter, fence_id(30), deadline.0);
+    while held.queues.partial_key_drained && !deadline.passed() {
+        held = session.fence_exchange_before(&enter, fence_id(30), deadline.0);
     }
     assert!(
         !held.queues.partial_key_drained,
@@ -2658,13 +2655,13 @@ pub fn a_reader_that_holds_input_does_not_report_idle_again_when_the_worker_with
     // The reader answers what it reads in the order it read it, and takes the retry after it has
     // answered, so a report the withheld frame brought is sent before the answer to an exchange
     // that is asked after the first one's answer has come.
-    let after = session.fence_exchange_before(&enter, fence_id(31), deadline);
+    let after = session.fence_exchange_before(&enter, fence_id(31), deadline.0);
     assert!(
         !after.queues.partial_key_drained,
         "what the reader was holding ended on its own: {:?}",
         after.queues
     );
-    let _ = session.fence_exchange_before(&enter, fence_id(32), deadline);
+    let _ = session.fence_exchange_before(&enter, fence_id(32), deadline.0);
     assert!(
         !session.saw_event(Duration::ZERO, |event| matches!(
             event,
@@ -2696,7 +2693,7 @@ pub fn a_reader_that_holds_input_does_not_report_idle_again_when_the_worker_with
         idle.snapshot.queued_keys == U64::new(0) && idle.snapshot.pending_bytes == U64::new(0),
         "the report after the reader let go was not an idle reader's: {idle:?}"
     );
-    let recovered = session.fence_exchange_before(&enter, fence_id(33), deadline);
+    let recovered = session.fence_exchange_before(&enter, fence_id(33), deadline.0);
     assert!(
         recovered.queues.all_drained() && recovered.snapshot.is_drained(),
         "the reader did not clear its queues once it let go of what it held: {:?} {:?}",
@@ -2770,14 +2767,14 @@ pub fn a_gesture_typed_while_the_editor_waits_for_the_terminal_is_still_a_gestur
     session.type_bytes(CTRL_D);
     // The editor's own report of its queue says when it has the key: asking is an exchange the
     // editor answers while it waits for the terminal.
-    let deadline = session.deadline_for(REPLY).0;
+    let deadline = session.deadline_for(REPLY);
     loop {
-        let held = session.fence_exchange_before(&enter, fence_id(41), deadline);
+        let held = session.fence_exchange_before(&enter, fence_id(41), deadline.0);
         if held.snapshot.queued_keys > U64::new(0) {
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            !deadline.passed(),
             "the editor never took the key it was typed:\n{}",
             session.terminal_output()
         );
@@ -2829,14 +2826,14 @@ pub fn a_gesture_a_binding_hands_back_is_the_editors_own_input(kind: ShellKind) 
 
     let before_keys = session.written();
     session.type_bytes(b"\x18\x04");
-    let deadline = session.deadline_for(REPLY).0;
+    let deadline = session.deadline_for(REPLY);
     loop {
-        let held = session.fence_exchange_before(&enter, fence_id(42), deadline);
+        let held = session.fence_exchange_before(&enter, fence_id(42), deadline.0);
         if held.snapshot.queued_keys >= U64::new(2) {
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            !deadline.passed(),
             "the editor never took both keys it was typed:\n{}",
             session.terminal_output()
         );

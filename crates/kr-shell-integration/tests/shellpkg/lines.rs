@@ -821,8 +821,9 @@ pub fn a_prompt_a_line_opens_keeps_the_lines_block_and_capability(kind: ShellKin
 /// The key has to arrive while the module waits for the answer, and nothing about the harness's
 /// pace may decide that. So the module waits for longer than the harness waits for anything, the
 /// worker holds the answer back, and it is answered only once the key is in the terminal: what
-/// ends the wait is the answer, which comes after the key by construction. A line that had run
-/// before the key was typed would be a module that did not wait, and fails the case.
+/// ends the wait is the answer, which comes after the key by construction. When the acceptance
+/// arrives the case also checks that the line has not run, which is all that a module that did not
+/// wait at all is held to.
 pub fn a_cancellation_during_an_unanswered_acceptance_leaves_the_prompt_working(kind: ShellKind) {
     let package = Package::built(kind);
     let probes = Probes::new();

@@ -1493,7 +1493,7 @@ impl Session {
     /// than assumed from the keys that were typed. The report says which reader wrote it, so a
     /// drive can ask later whether the key it offered went to that same one.
     pub fn reader_said(&mut self, within: Duration) -> Option<ReaderReport> {
-        let deadline = self.window(within);
+        let deadline = self.probe_window(within);
         self.next_reader_report(deadline, |_| true)
     }
 
@@ -1792,7 +1792,7 @@ impl Session {
             deadline_ms: FENCE_EXCHANGE_TIMEOUT,
             cause: FenceCause::Retry,
         }));
-        let deadline = self.deadline_for(REPLY);
+        let deadline = self.probe_window(REPLY);
         match self.answer_by(id, deadline) {
             Some(BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement))) => {
                 replay_seen(&acknowledgement)

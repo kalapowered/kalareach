@@ -1530,12 +1530,21 @@ impl Session {
     /// The moment a wait for `within` ends at, cut to what is left of the budget in force.
     ///
     /// This is [`Session::bounded`] as a deadline. Where no budget is in force and `within` is a
-    /// whole [`REPLY`], the deadline notes that the wait gave up when it passes.
+    /// whole [`REPLY`], the deadline notes that the wait gave up when it passes. Use it for a wait
+    /// whose running out is a failure of the case. [`Session::probe_window`] is for one whose
+    /// running out is an answer.
     fn window(&self, within: Duration) -> Deadline {
         match self.budget {
             Some(deadline) => Deadline::after(deadline.at_most(within)),
             None => Deadline::reply_window(within),
         }
+    }
+
+    /// The moment a wait for `within` ends at, for a wait whose running out is an answer and not
+    /// a failure: a reader that says nothing is a reader the caller did not see do something, and
+    /// the caller records a smaller claim. It never notes a give-up.
+    fn probe_window(&self, within: Duration) -> Deadline {
+        Deadline::after(self.bounded(within))
     }
 
     /// `within`, cut to what is left of the budget in force.
@@ -1989,13 +1998,15 @@ impl Session {
     where
         F: Fn(&BridgeEvent) -> bool,
     {
+        // Read before the deadline is made, which is where the cap is applied: a wait that runs out
+        // the whole window has not been cut short, whatever it notes when it does.
+        let cut_short = A_WAIT_GAVE_UP.load(Ordering::Relaxed);
         let deadline = self.deadline_for(REPLY);
         loop {
             if let Some(received) = self.events.take_first(|received| accept(&received.event)) {
                 return (received.id, received.event);
             }
             let gave_up = deadline.passed();
-            let cut_short = A_WAIT_GAVE_UP.load(Ordering::Relaxed);
             if gave_up {
                 note_that_a_wait_gave_up();
             }
@@ -2021,7 +2032,7 @@ impl Session {
     where
         F: Fn(&BridgeEvent) -> bool,
     {
-        let deadline = Instant::now() + self.bounded(within);
+        let deadline = self.window(within);
         loop {
             if self
                 .events
@@ -2030,7 +2041,7 @@ impl Session {
             {
                 return true;
             }
-            if Instant::now() >= deadline {
+            if deadline.passed() {
                 return false;
             }
             self.pump(Duration::from_millis(50));
@@ -2565,7 +2576,8 @@ impl Session {
     ///
     /// Panics when the shell does not take the line or the bridge does not hold the wait after it.
     pub fn lets_the_bridge_wait_beyond_any_reply(&mut self) {
-        const _: () = assert!(WAIT_BEYOND_ANY_REPLY_MS as u64 > REPLY.as_millis() as u64);
+        // The harness can spend two windows before the key: one for the acceptance, one to type.
+        const _: () = assert!(WAIT_BEYOND_ANY_REPLY_MS as u128 > 2 * REPLY.as_millis());
         self.sets_the_bridge_answer_wait(WAIT_BEYOND_ANY_REPLY_MS);
     }
 
