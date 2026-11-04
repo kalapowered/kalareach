@@ -789,12 +789,16 @@ impl Case {
                 });
                 continue;
             }
+            // Git has to have ended for its diagnostic to be the whole of what it said, and for the
+            // hook not to be one that has not run yet.
             self.expect(
-                !binary_hook_ran && binary_hook.output.contains("cannot spawn"),
+                binary_hook.outcome.ran()
+                    && !binary_hook_ran
+                    && binary_hook.output.contains("cannot spawn"),
                 || {
                     format!(
-                        "{role}: the hook that is a program ran={binary_hook_ran} and Git said {:?}",
-                        binary_hook.output
+                        "{role}: the hook that is a program: Git {}, ran={binary_hook_ran} and Git said {:?}",
+                        binary_hook.outcome, binary_hook.output
                     )
                 },
             );
@@ -823,12 +827,13 @@ impl Case {
             );
             // The hook script needs the shell: only the connection account's list holds it.
             self.expect(
-                hook_ran == (who == Who::Connect)
+                commit.outcome.ran()
+                    && hook_ran == (who == Who::Connect)
                     && (who == Who::Connect || commit.output.contains("cannot spawn")),
                 || {
                     format!(
-                        "{role}: the hook script ran={hook_ran} and Git said {:?}, which the shell on its list does not allow",
-                        commit.output
+                        "{role}: the hook script: Git {}, ran={hook_ran} and Git said {:?}, which the shell on its list does not allow",
+                        commit.outcome, commit.output
                     )
                 },
             );
@@ -926,7 +931,10 @@ impl Case {
         ];
         for who in [Who::Checkout, Who::Connect] {
             for place in &listed {
-                let probe = place.join("kr-write-check");
+                // A name of this launch alone. A directory of that name that was there already is
+                // not this launch's to find or to remove, and one that is there afterwards was made
+                // by it.
+                let probe = place.join(format!("kr-write-check-{}", uuid::Uuid::new_v4().simple()));
                 let launch = self.launch(
                     who,
                     "git init inside a directory on the lists",
@@ -943,7 +951,7 @@ impl Case {
                     !made && matches!(launch.outcome, Outcome::Ran(code) if code != 0),
                     || {
                         format!(
-                            "{role}: made a directory in {} ({})",
+                            "{role}: in {} the directory was made={made} and Git {}",
                             place.display(),
                             launch.outcome
                         )
@@ -1417,32 +1425,51 @@ fn create_process_as(
     Launch { outcome, output }
 }
 
-/// Returns the record number of the newest event in the log, or zero.
+/// Reads events from the application-control log, newest first, as the XML the tool prints.
+///
+/// A query that fails ends the case. Reading a failed query as an empty log would put the mark that
+/// separates this case's events from older ones at zero, and an older event of the same account
+/// could then answer for a launch this case made.
+fn query_log(count: &str, filter: Option<&str>) -> String {
+    let mut command = Command::new("wevtutil.exe");
+    command.args(["qe", LOG, "/rd:true", count, "/f:xml", "/e:Events"]);
+    if let Some(filter) = filter {
+        command.arg(filter);
+    }
+    let output = command.output().expect("the event-log tool starts");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "the application-control log could not be read ({}): {text}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    text
+}
+
+/// Returns the record number of the newest event in the log, or zero for a log with no event.
 fn newest_record() -> u64 {
-    let text = output_of(Command::new("wevtutil.exe").args([
-        "qe",
-        LOG,
-        "/rd:true",
-        "/c:1",
-        "/f:xml",
-        "/e:Events",
-    ]));
-    element(&text, "EventRecordID")
-        .and_then(|record| record.parse().ok())
-        .unwrap_or(0)
+    let text = query_log("/c:1", None);
+    match element(&text, "EventRecordID") {
+        Some(record) => record
+            .parse()
+            .unwrap_or_else(|_| panic!("the newest record number {record:?} is not a number")),
+        None => {
+            assert!(
+                !text.contains("</Event>"),
+                "the newest event of the log has no record number: {text}"
+            );
+            0
+        }
+    }
 }
 
 /// Returns the blocked and allowed launches the log recorded after a record.
 fn events_after(watermark: u64) -> Vec<Event> {
-    let text = output_of(Command::new("wevtutil.exe").args([
-        "qe",
-        LOG,
-        "/rd:true",
+    let text = query_log(
         "/c:20000",
-        "/f:xml",
-        "/e:Events",
-        "/q:*[System[(EventID=8002 or EventID=8004)]]",
-    ]));
+        Some("/q:*[System[(EventID=8002 or EventID=8004)]]"),
+    );
     text.split("</Event>")
         .filter_map(|chunk| {
             let record: u64 = element(chunk, "EventRecordID")?.parse().ok()?;
