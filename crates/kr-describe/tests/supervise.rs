@@ -3305,15 +3305,17 @@ fn a_frame_thread_that_cannot_start_leaves_no_process_behind() {
     }
 }
 
-/// A start that returns after it created the process ends the process. The system will not let it
-/// run, so the start returns an error with the process there and its pipes in the hands of the
-/// threads that carry its frames. The process is made to outlive the end of its input, as one stuck
-/// inside a read does, so that only the start can end it before the daemon goes. It is looked for
-/// by its identifier and its start as soon as the call returns: the control is the same process,
-/// found running at the point the system refuses it. The platforms read a child that has ended and
-/// not been collected as ended, so this shows the end and not the collection.
+/// A start that returns after it created the process ends the process and collects it. The system
+/// will not let it run, so the start returns an error with the process there and its pipes in the
+/// hands of the threads that carry its frames. The process is made to outlive the end of its input,
+/// as one stuck inside a read does, so that only the start can end it before the daemon goes. It is
+/// looked for by its identifier and its start as soon as the call returns: the control is the same
+/// process, found running at the point the system refuses it. The platforms read a child that has
+/// ended and not been collected as ended, so the end alone does not show the collection. On Unix a
+/// look at the child that leaves it as it is does: a child that has ended and waits to be collected
+/// is still there to be waited for, and a collected one is not the daemon's child any longer.
 #[test]
-fn a_start_that_returns_after_creating_the_process_ends_it() {
+fn a_start_that_returns_after_creating_the_process_ends_and_collects_it() {
     let mut rig = Rig::new(&Script {
         wedge_input_after: Some(0),
         ..Script::default()
@@ -3328,7 +3330,7 @@ fn a_start_that_returns_after_creating_the_process_ends_it() {
             kr_ipc::identity::ProcessState::Running,
             "the process is there when the system refuses it"
         );
-        *seen.borrow_mut() = Some(identity);
+        *seen.borrow_mut() = Some((pid, identity));
     });
     queue(rig.service(), &session(1), Priority::Ordinary, at(0));
     let reports = rig.driver.turn(&roomy(), at(3_000)).expect("a turn");
@@ -3338,7 +3340,7 @@ fn a_start_that_returns_after_creating_the_process_ends_it() {
         }),
         "{reports:?}"
     );
-    let identity = created
+    let (pid, identity) = created
         .borrow_mut()
         .take()
         .expect("the process was created");
@@ -3347,6 +3349,32 @@ fn a_start_that_returns_after_creating_the_process_ends_it() {
         kr_ipc::identity::ProcessState::Ended,
         "the start left the process it created behind: {identity:?}"
     );
+    #[cfg(unix)]
+    assert!(
+        collected(pid),
+        "the start ended the process it created and did not collect it: {identity:?}"
+    );
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// Whether the child of this process with the identifier `pid` has been collected: asking the system
+/// to report a child that has ended, without collecting it, finds one that is waiting to be
+/// collected and says there is no such child of a collected one. A child still running is not
+/// collected either.
+#[cfg(unix)]
+fn collected(pid: u32) -> bool {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .expect("a process identifier");
+    let look = waitid(
+        WaitId::Pid(pid),
+        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+    );
+    matches!(look, Err(rustix::io::Errno::CHILD))
 }
 
 /// The end that the reader of a process the system would not let run tells is not taken for the end

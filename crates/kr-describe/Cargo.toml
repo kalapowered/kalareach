@@ -57,6 +57,11 @@ unicode-segmentation.workspace = true
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+# Looks at a child that has ended without collecting it, so a test can tell a start that collected the
+# process it ended from one that left it waiting to be collected.
+rustix = { workspace = true, features = ["process"] }
+
 [dev-dependencies]
 kr-describe = { path = ".", features = ["testing"] }
 # The test that stands the store in the interval its previous holder is letting go of its index.
