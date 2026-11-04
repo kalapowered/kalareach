@@ -265,33 +265,60 @@ pub fn bound_held_after_the_answer(runtime_dir: &Path, id: u64) -> Option<u64> {
 }
 
 /// The start of the name of the file a stub whose script marks work leaves in its runtime
-/// directory when its model thread has written the answer to the job with an identifier, followed
-/// by that identifier. It holds the bound the process held as the answer was written, in the
-/// process's stamps, which is the bound of the job and not nought: the bound is cleared after the
-/// answer, and a clear that came before it would leave the write of the answer with no limit.
-pub const JOB_ANSWERED_PREFIX: &str = "stub-job-answered-";
+/// directory when it has written the answer to the work with an identifier, followed by that
+/// identifier. It holds the bound the process held as the write ended, in the process's stamps. The
+/// bound is cleared after the answer, and a clear that came before it would leave the write of the
+/// answer with no limit.
+pub const ANSWER_WRITTEN_PREFIX: &str = "stub-answer-written-";
 
-/// Records the bound the process holds as the answer to the job with this identifier has been
-/// written, when the process is a stub whose script marks work.
-pub(crate) fn job_answered(id: u64, held: u64) {
+/// The start of the name of the file a stub whose script marks work leaves in its runtime
+/// directory when it has forgotten the work with an identifier, followed by that identifier. It
+/// holds the bound the process held as the work was forgotten. The work is forgotten before it is
+/// answered, so that a cancellation read after the answer finds nothing in hand; a clear that came
+/// before the forgetting would give an idle process the stop bound again, if a stop came between.
+pub const WORK_FORGOTTEN_PREFIX: &str = "stub-work-forgotten-";
+
+/// Writes the bound a process held, in the file with this prefix and this identifier.
+fn record_bound(prefix: &str, id: u64, held: u64) {
     if let Some(directory) = RECORDS_DIRECTORY.get() {
-        let _ = std::fs::write(
-            directory.join(format!("{JOB_ANSWERED_PREFIX}{id}")),
-            held.to_string(),
-        );
+        let _ = std::fs::write(directory.join(format!("{prefix}{id}")), held.to_string());
     }
 }
 
-/// Returns the bound, in the process's stamps, that the stub process with `runtime_dir` as its
-/// runtime directory held as the answer to the job with this identifier was written, once it has
-/// been.
-#[must_use]
-pub fn bound_held_at_the_answer(runtime_dir: &Path, id: u64) -> Option<u64> {
-    std::fs::read_to_string(runtime_dir.join(format!("{JOB_ANSWERED_PREFIX}{id}")))
+/// Reads the bound recorded in the file with this prefix and this identifier.
+fn recorded_bound(runtime_dir: &Path, prefix: &str, id: u64) -> Option<u64> {
+    std::fs::read_to_string(runtime_dir.join(format!("{prefix}{id}")))
         .ok()?
         .trim()
         .parse()
         .ok()
+}
+
+/// Records the bound the process holds as the answer to the work with this identifier has been
+/// written, when the process is a stub whose script marks work.
+pub(crate) fn answer_written(id: u64, held: u64) {
+    record_bound(ANSWER_WRITTEN_PREFIX, id, held);
+}
+
+/// Records the bound the process holds as the work with this identifier is forgotten, when the
+/// process is a stub whose script marks work.
+pub(crate) fn work_forgotten(id: u64, held: u64) {
+    record_bound(WORK_FORGOTTEN_PREFIX, id, held);
+}
+
+/// Returns the bound, in the process's stamps, that the stub process with `runtime_dir` as its
+/// runtime directory held as the answer to the work with this identifier was written, once it has
+/// been.
+#[must_use]
+pub fn bound_held_at_the_answer(runtime_dir: &Path, id: u64) -> Option<u64> {
+    recorded_bound(runtime_dir, ANSWER_WRITTEN_PREFIX, id)
+}
+
+/// Returns the bound, in the process's stamps, that the stub process with `runtime_dir` as its
+/// runtime directory held as the work with this identifier was forgotten, once it has been.
+#[must_use]
+pub fn bound_held_at_the_forgetting(runtime_dir: &Path, id: u64) -> Option<u64> {
+    recorded_bound(runtime_dir, WORK_FORGOTTEN_PREFIX, id)
 }
 
 /// What the model thread of a stub process found as it read a job's token.

@@ -551,6 +551,11 @@ impl Shared {
             );
             std::process::exit(Exit::DaemonGone.code());
         }
+        // The bound held as the write ends, for a test to read back.
+        #[cfg(feature = "testing")]
+        if let Some(id) = answer.id() {
+            crate::testing::answer_written(id, self.work_due.load(Ordering::Acquire));
+        }
     }
 
     fn token_for(&self, id: u64) -> Cancellation {
@@ -567,6 +572,9 @@ impl Shared {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
+        // The bound held as the work is forgotten, for a test to read back.
+        #[cfg(feature = "testing")]
+        crate::testing::work_forgotten(id, self.work_due.load(Ordering::Acquire));
     }
 
     /// Cancels the work with this identifier, gives a job in hand the stop bound, and acknowledges
@@ -875,10 +883,8 @@ fn model_thread<M: Model>(
                         detail: Nullable(detail),
                     },
                 });
-                // The bound is cleared after the answer is written, so the write is held to it. The
-                // bound held as the write ends, for a test to read back.
-                #[cfg(feature = "testing")]
-                crate::testing::job_answered(id, shared.work_due.load(Ordering::Acquire));
+                // The bound is cleared after the work is forgotten and its answer is written, so
+                // that the write is held to it.
                 shared.work_due.store(0, Ordering::Release);
                 // The bound held now that the job is answered, for a test to read back.
                 #[cfg(feature = "testing")]

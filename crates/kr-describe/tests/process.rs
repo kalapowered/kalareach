@@ -22,8 +22,8 @@ use kr_describe::serve::{
 use kr_describe::supervise::STOP_BOUND_MS;
 use kr_describe::testing::{
     Script, TokenRead, acknowledging_state, bound_held_after_the_answer, bound_held_at_the_answer,
-    job_bounds, job_token_as_read, release_held_watchdog, release_held_work,
-    token_cancelled_at_the_look, watchdog_found, watchdog_has_spared,
+    bound_held_at_the_forgetting, job_bounds, job_token_as_read, release_held_watchdog,
+    release_held_work, token_cancelled_at_the_look, watchdog_found, watchdog_has_spared,
 };
 use kr_describe::wire::{Answer, JobEnd, LoadEnd, Request, WIRE_VERSION, frame_of};
 use kr_protocol::ids::SessionEpoch;
@@ -841,9 +841,10 @@ fn a_stop_applied_after_the_watchdog_found_the_job_overdue_is_not_missed() {
 /// and only then releases the watchdog and reads its record that it left the process alone. No
 /// delay decides it. A watchdog that ends the process unless the bound has moved later, or a model
 /// thread that does not clear the bound when the job is answered, ends or keeps an idle process
-/// as overdue. The process also records the bound it holds as the answer is written, which the
-/// case reads as not nought: a clear before the write leaves the write with no limit, and a stop
-/// that comes between the clear and the forgetting of the job gives an idle process the stop bound.
+/// as overdue. The process also records the bound it holds as the job is forgotten and as its answer
+/// is written, which the case reads as not nought: a clear before the write leaves the write with no
+/// limit, and a stop that comes between the clear and the forgetting of the job gives an idle
+/// process the stop bound.
 #[test]
 fn a_job_that_ends_after_the_watchdog_found_it_overdue_does_not_end_the_process() {
     let placed = Placed::stub();
@@ -874,10 +875,15 @@ fn a_job_that_ends_after_the_watchdog_found_it_overdue_does_not_end_the_process(
     wait_for("the model thread to clear the job's bound", || {
         bound_held_after_the_answer(&runtime, 2).is_some()
     });
-    assert!(
-        bound_held_at_the_answer(&runtime, 2).is_some_and(|held| held != 0),
-        "the bound the job was held to is still held as its answer is written"
-    );
+    for (record, as_it) in [
+        (bound_held_at_the_forgetting(&runtime, 2), "forgotten"),
+        (bound_held_at_the_answer(&runtime, 2), "answered"),
+    ] {
+        assert!(
+            record.is_some_and(|held| held != 0),
+            "the bound the job was held to is still held as the job is {as_it}: {record:?}"
+        );
+    }
     assert_eq!(
         bound_held_after_the_answer(&runtime, 2),
         Some(0),
