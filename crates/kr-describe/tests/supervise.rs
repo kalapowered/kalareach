@@ -2366,17 +2366,20 @@ fn the_cadence_holds_under_mixed_demand_through_the_process() {
 /// so that the host sleeps until then and no sooner. A look one millisecond short of it sends
 /// nothing, and a look at it sends the job. The time is worked out from the reading at which the job
 /// was sent. The cases are an ordinary session, which waits the cadence, and a priority session,
-/// which waits the cooldown.
+/// which waits the cooldown. The jobs here take no time on the readings, so the cadence is at its
+/// floor, the cooldown; the scheduler's own case tells the two waits apart, and this one shows that
+/// the driver says the time the scheduler gives.
 #[test]
 fn a_session_that_changed_again_is_looked_for_the_moment_its_wait_ends() {
-    for priority in [Priority::Ordinary, Priority::Foreground] {
+    // The change helper makes the first session's changes ordinary and any other's priority.
+    for (priority, number) in [(Priority::Ordinary, 1), (Priority::Foreground, 2)] {
         let mut rig = Rig::new(&Script::default());
-        queue(rig.service(), &session(1), priority, at(0));
+        queue(rig.service(), &session(number), priority, at(0));
         let sent_at = 3_000;
         rig.until(&roomy(), at(sent_at), "the description", |reports, _| {
             a_job_ended(reports)
         });
-        change_and_settle(rig.service(), &session(1), 1, sent_at + 100);
+        change_and_settle(rig.service(), &session(number), 1, sent_at + 100);
         let wait = match priority {
             Priority::Ordinary => rig
                 .driver
