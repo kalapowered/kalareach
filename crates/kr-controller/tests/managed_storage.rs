@@ -5999,8 +5999,8 @@ async fn a_fence_owed_while_the_call_waits_for_its_token_stops_the_bundle_write(
     let made = rig.prepared_setup(archive_id(), false);
     until_the_carriers_first_pass_has_ended(&rig).await;
     // The gate holds only the requests made under an account fixed when a call began, which are the
-    // call's: that the call's request waits here is what shows the gate selects them, and that the
-    // cases which count on it not holding another request are right to.
+    // call's: that the call's request waits here is what shows the gate selects them, so a gate
+    // that holds nothing, or a call that asks at another token source, fails this case.
     let tokens = rig
         .controller
         .host_account()

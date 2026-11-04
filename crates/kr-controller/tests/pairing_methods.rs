@@ -1514,11 +1514,13 @@ async fn an_owner_devices_completion_is_answered_again_only_under_its_own_action
     );
     // The window is part of what an action is, and the host renews the one a connection holds, so
     // every presentation of an action goes under the one it was first presented under: under a
-    // renewed one a swapped proof or a repeat would be another action.
-    let window = raw.action_window_id();
+    // renewed one a swapped proof or a repeat would be another action. Each action takes the window
+    // the connection holds when it is first presented, not the first action's: a window that has
+    // run out between the two presentations refuses the second.
+    let window_of_a = raw.action_window_id();
     let answered_p = raw
         .mutate_in(
-            window.clone(),
+            window_of_a.clone(),
             Method::OwnerConfirmationComplete,
             a,
             target.clone(),
@@ -1526,9 +1528,10 @@ async fn an_owner_devices_completion_is_answered_again_only_under_its_own_action
         )
         .await
         .expect("the owner device answers the first under its action");
+    let window_of_b = raw.action_window_id();
     let answered_q = raw
         .mutate_in(
-            window.clone(),
+            window_of_b.clone(),
             Method::OwnerConfirmationComplete,
             b,
             target.clone(),
@@ -1539,10 +1542,13 @@ async fn an_owner_devices_completion_is_answered_again_only_under_its_own_action
 
     // Each accepted proof under the other's action: another payload under an identifier already
     // spent.
-    for (action, proof) in [(a, q.clone()), (b, p.clone())] {
+    for (action, window, proof) in [
+        (a, window_of_a.clone(), q.clone()),
+        (b, window_of_b.clone(), p.clone()),
+    ] {
         let swapped = raw
             .mutate_in(
-                window.clone(),
+                window,
                 Method::OwnerConfirmationComplete,
                 action,
                 target.clone(),
@@ -1554,7 +1560,7 @@ async fn an_owner_devices_completion_is_answered_again_only_under_its_own_action
     // The exact repeats are answered from their own records.
     assert_eq!(
         raw.mutate_in(
-            window.clone(),
+            window_of_a,
             Method::OwnerConfirmationComplete,
             a,
             target.clone(),
@@ -1566,7 +1572,7 @@ async fn an_owner_devices_completion_is_answered_again_only_under_its_own_action
     );
     assert_eq!(
         raw.mutate_in(
-            window,
+            window_of_b,
             Method::OwnerConfirmationComplete,
             b,
             target,
