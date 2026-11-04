@@ -545,7 +545,8 @@ pub fn half_a_character_the_terminal_delivered_is_input_the_reader_has_not_taken
 /// the runtime whether the terminal has input, and that is the whole of the count here: the runtime
 /// holds nothing of it, and the editor's queue is empty. The case runs the module's count on a
 /// terminal nobody reads, before a line is typed at it and after, and expects none and then the
-/// line.
+/// line. The second count is taken once the harness has typed the line and said so by making a
+/// file, so no length of time stands between the line and the count.
 ///
 /// # Panics
 ///
@@ -558,13 +559,19 @@ pub fn a_byte_waiting_in_the_terminals_queue_is_input_the_reader_has_not_taken(k
         .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
         .display()
         .to_string();
-    let script = format!(
-        "Import-Module '{module}'; $module = Get-Module KalaReach.ShellBridge; \
-         Write-Output (('kr-be' + 'fore=[') + (& $module {{ Read-KrRuntimeUnread }}) + ']'); \
-         Start-Sleep -Seconds 2; \
-         Write-Output (('kr-af' + 'ter=[') + (& $module {{ Read-KrRuntimeUnread }}) + ']')"
-    );
-    let shown = package.ask_with_input_typed_after(&script, "kr-before=[", b"x\n");
+    let script = |typed: &Path| {
+        let typed = typed.display();
+        let seconds = REPLY.as_secs();
+        format!(
+            "Import-Module '{module}'; $module = Get-Module KalaReach.ShellBridge; \
+             Write-Output (('kr-be' + 'fore=[') + (& $module {{ Read-KrRuntimeUnread }}) + ']'); \
+             $until = [DateTime]::UtcNow.AddSeconds({seconds}); \
+             while (-not (Test-Path -LiteralPath '{typed}') -and [DateTime]::UtcNow -lt $until) \
+             {{ Start-Sleep -Milliseconds 20 }}; \
+             Write-Output (('kr-af' + 'ter=[') + (& $module {{ Read-KrRuntimeUnread }}) + ']')"
+        )
+    };
+    let shown = package.ask_with_input_typed_after(script, "kr-before=[", b"x\n");
     assert!(
         shown.contains("kr-before=[0]"),
         "a terminal nobody typed at has nothing unread: {shown:?}"
@@ -608,7 +615,7 @@ pub fn bytes_the_runtime_has_read_from_the_terminal_are_input_the_reader_has_not
     );
     // The key, an answer to a primary device-attributes query, and the end of the line that makes
     // all of it readable at once.
-    let shown = package.ask_with_input_typed_after(&script, "kr-before=[", b"x\x1b[?62;22c\n");
+    let shown = package.ask_with_input_typed_after(|_| script, "kr-before=[", b"x\x1b[?62;22c\n");
     let count = shown
         .split("kr-after=[")
         .nth(1)
