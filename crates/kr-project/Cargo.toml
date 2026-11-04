@@ -78,8 +78,9 @@ git-fixtures = []
 
 # The workspace forbids unsafe code, which a crate that applies an operating-system boundary to a
 # child process cannot honour: each platform's mechanism is a call with no safe form. This crate
-# denies it instead and allows it in the four modules of `boundary` that own those calls. Nothing
-# else in this crate may relax the rule.
+# denies it instead and allows it in the modules of `boundary` that own those calls, and in the
+# Windows enforcement case, which launches programs as other accounts. Nothing else in this crate
+# may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"

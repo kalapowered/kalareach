@@ -12,25 +12,30 @@
 //!   program starts, and no shell.
 //! * The **connection account** is the one the clone that checks nothing out runs as. Its list is the
 //!   checkout account's, with the shell Git builds its connection as a command string for, and the
-//!   two programs that shell starts to serve a repository. The policy is installed once, so the two
-//!   lists are two accounts' rules and not two policies.
+//!   program that shell starts to serve a repository. The policy is installed once, so the two lists
+//!   are two accounts' rules and not two policies.
 //! * An **ordinary account** stands for the person. It runs every program the boundary accounts are
 //!   refused, from a place the person owns as well as from the system's, so a refusal that is the
 //!   result of anything but the policy shows here too.
 //!
 //! What the case requires of each boundary account: a signed system program (`cmd.exe`, and the
 //! system's `hostname.exe`), a signed program copied to a place a repository could put it, a copy of
-//! Git itself outside its installation and an unsigned program are all refused to create a process
+//! Git itself outside its installation and an unsigned program are all refused to create a process,
 //! and each refusal is a blocked-launch event of the application-control log that names the rule
-//! (and the rule is the account's own deny rule); a program a repository's configuration names as a
-//! helper (a clean filter, which is how a binary hook is planted on this platform, because Git for
-//! Windows cannot start a hook that is a program) never runs; the shell is refused to the checkout
-//! account and a hook script that needs it never runs there, and it runs for the connection account;
-//! and Git, its helpers and a clone that checks nothing out run where they are on the list. What the
-//! case requires of the ordinary account: every one of those programs runs.
+//! (and the rule is the account's own deny rule); a program planted as a hook (`post-commit.exe`)
+//! and a program a repository's configuration names as a helper (a clean filter) never run, and Git
+//! reports that it could not start them; the shell is refused to the checkout account, so a hook
+//! script that needs it and a clone that needs it never run there, and they run for the connection
+//! account; the console host, which is on both lists, starts nothing the policy refuses; the
+//! programs of Git's installation cannot be written to by either account; and Git, its helpers and a
+//! clone that checks nothing out run where they are on the list. What the case requires of the
+//! ordinary account: every one of those programs runs.
 //!
 //! The same launches in a guest where the policy is not in place all succeed, which is the case's
-//! own negative control: it fails there, naming the first program that ran.
+//! own negative control: it fails there, naming every program that ran.
+//!
+//! The permissions the case gives its accounts on its own window station and desktop last as long as
+//! that session does.
 //!
 //! It makes a local account for the person, resets the two boundary accounts' passwords to values
 //! only this process holds, writes under `%ProgramData%` and gives the accounts it launches access to
@@ -51,7 +56,8 @@
     unsafe_code,
     reason = "launching a program as another account, naming an account's identifier and editing the \
               permissions of a window station are calls with out-parameters and handle ownership \
-              that only the caller can promise; this file holds those calls and nothing else"
+              that only the caller can promise; the case's own steps use them through a few \
+              functions"
 )]
 
 use std::collections::BTreeSet;
@@ -123,6 +129,8 @@ enum Outcome {
     Ran(u32),
     /// The process ran for too long and was ended.
     Hung,
+    /// The process ended and its exit code could not be read.
+    Unread,
 }
 
 impl Outcome {
@@ -141,6 +149,7 @@ impl std::fmt::Display for Outcome {
             Self::Refused(code) => write!(formatter, "refused, error {code}"),
             Self::Ran(code) => write!(formatter, "ran, exit {code:#x}"),
             Self::Hung => formatter.write_str("did not end"),
+            Self::Unread => formatter.write_str("ended and its exit code could not be read"),
         }
     }
 }
@@ -172,8 +181,25 @@ struct Expected {
     what: String,
 }
 
+/// What the case made outside itself: the directory it writes in and the person's account. Both are
+/// taken away when this goes, however the case ends.
+struct Cleanup {
+    root: PathBuf,
+    person: Option<String>,
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        if let Some(name) = &self.person {
+            delete_account(name);
+        }
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 /// The whole case.
 struct Case {
+    _cleanup: Cleanup,
     git_root: PathBuf,
     git: PathBuf,
     exec_path: PathBuf,
@@ -197,6 +223,8 @@ fn the_boundary_accounts_run_only_git_and_the_person_runs_everything() {
     case.git_and_its_helpers();
     case.helpers_a_repository_names();
     case.clone_then_checkout();
+    case.console_host_starts_nothing_refused();
+    case.git_installation_is_not_writable();
     case.finish();
 }
 
@@ -224,7 +252,7 @@ impl Case {
             "VerifiedAndReputablePolicyState",
         ]));
         assert!(
-            !smart_app_control.contains("0x1"),
+            smart_app_control.split_whitespace().last() != Some("0x1"),
             "Smart App Control is enforcing, so it can refuse the unsigned program for a reason \
              that is not this policy:\n{smart_app_control}"
         );
@@ -252,6 +280,10 @@ impl Case {
         let root =
             PathBuf::from(std::env::var_os("ProgramData").expect("the program data directory"))
                 .join(format!("kr-enforcement-{}", uuid::Uuid::new_v4().simple()));
+        let mut cleanup = Cleanup {
+            root: root.clone(),
+            person: None,
+        };
         std::fs::create_dir_all(root.join("tmp")).expect("the fixture directory");
         std::fs::create_dir_all(root.join("home")).expect("the home directory");
         run_checked(
@@ -262,9 +294,9 @@ impl Case {
         give_session_access(&checkout.sid);
         give_session_access(&connect.sid);
 
-        // The person's account is the last thing made before the case that takes it away.
-        let person = person_account();
+        let person = person_account(&mut cleanup);
         let case = Self {
+            _cleanup: cleanup,
             git_root,
             git,
             exec_path,
@@ -347,6 +379,16 @@ impl Case {
             "#!/bin/sh\n: > \"$0.ran\"\n",
         )
         .expect("a hook script");
+
+        // A repository with a hook that is a program. Git for Windows looks for a hook by its name
+        // and by its name with `.exe`, and starts the program it finds.
+        let hooked = self.root.join("hooked");
+        self.git_as_admin(&["init", "-q", &hooked.to_string_lossy()]);
+        std::fs::copy(
+            planted.join("recorder.exe"),
+            hooked.join(".git").join("hooks").join("post-commit.exe"),
+        )
+        .expect("a hook that is a program");
 
         // A bare repository to clone from.
         let source_repository = self.root.join("source.git");
@@ -681,7 +723,24 @@ impl Case {
         let filtered = self.root.join("filtered");
         let scripted = self.root.join("scripted");
         let ran_hook = scripted.join(".git").join("hooks").join("post-commit.ran");
+        let ran_binary_hook = self
+            .root
+            .join("hooked")
+            .join(".git")
+            .join("hooks")
+            .join("post-commit.exe.ran");
         for who in ALL {
+            let _ = std::fs::remove_file(&ran_binary_hook);
+            let binary_hook = self.launch(
+                who,
+                "git commit (the repository's hook is a program)",
+                &git,
+                "-C hooked -c user.name=case -c user.email=case@example.invalid commit -q --allow-empty -m hook",
+                &directory,
+            );
+            let binary_hook_ran = ran_binary_hook.exists();
+            let _ = std::fs::remove_file(&ran_binary_hook);
+
             let _ = std::fs::remove_file(&ran_filter);
             let _ = std::fs::remove_file(filtered.join(".git").join("index"));
             std::fs::write(filtered.join("file.txt"), uuid::Uuid::new_v4().to_string())
@@ -709,6 +768,15 @@ impl Case {
 
             let role = self.account(who).role;
             if who == Who::Person {
+                self.expect(
+                    binary_hook.outcome == Outcome::Ran(0) && binary_hook_ran,
+                    || {
+                        format!(
+                            "{role}: the hook that is a program {} and ran={binary_hook_ran}",
+                            binary_hook.outcome
+                        )
+                    },
+                );
                 self.expect(add.outcome == Outcome::Ran(0) && filter_ran, || {
                     format!(
                         "{role}: the program named as a filter {} and ran={filter_ran}",
@@ -723,21 +791,49 @@ impl Case {
                 });
                 continue;
             }
+            self.expect(
+                !binary_hook_ran && binary_hook.output.contains("cannot spawn"),
+                || {
+                    format!(
+                        "{role}: the hook that is a program ran={binary_hook_ran} and Git said {:?}",
+                        binary_hook.output
+                    )
+                },
+            );
+            self.expect_blocked(
+                who,
+                r"\HOOKS\POST-COMMIT.EXE",
+                "the program planted as a hook is named as blocked",
+            );
             self.expect(!filter_ran, || {
                 format!("{role}: the program named as a clean filter ran")
             });
-            self.expect(add.outcome != Outcome::Ran(0), || {
-                format!("{role}: git add succeeded although its required filter was refused")
-            });
+            self.expect(
+                matches!(add.outcome, Outcome::Ran(code) if code != 0)
+                    && add.output.contains("cannot spawn"),
+                || {
+                    format!(
+                        "{role}: git add {} {:?}, which is not Git reporting that it could not start its required filter",
+                        add.outcome, add.output
+                    )
+                },
+            );
             self.expect_blocked(
                 who,
                 r"\PLANTED\RECORDER.EXE",
                 "the program named as a filter is named as blocked",
             );
             // The hook script needs the shell: only the connection account's list holds it.
-            self.expect(hook_ran == (who == Who::Connect), || {
-                format!("{role}: the hook script ran={hook_ran}, which the shell on its list does not allow")
-            });
+            self.expect(
+                hook_ran == (who == Who::Connect)
+                    && (who == Who::Connect || commit.output.contains("cannot spawn")),
+                || {
+                    format!(
+                        "{role}: the hook script ran={hook_ran} and Git said {:?}, which the shell on its list does not allow",
+                        commit.output
+                    )
+                },
+            );
             if who == Who::Connect {
                 self.expect_allowed(who, r"\USR\BIN\SH.EXE", "the shell is named as allowed");
             } else {
@@ -769,9 +865,17 @@ impl Case {
             let made = destination.join(".git").join("HEAD").exists();
             let role = self.account(who).role;
             if who == Who::Checkout {
-                self.expect(!made, || {
-                    format!("{role}: the clone was made although its list holds no shell")
-                });
+                self.expect(
+                    !made
+                        && matches!(clone.outcome, Outcome::Ran(code) if code != 0)
+                        && clone.output.contains("sh.exe"),
+                    || {
+                        format!(
+                            "{role}: the clone {} and made={made} {:?}, which a list with no shell does not allow",
+                            clone.outcome, clone.output
+                        )
+                    },
+                );
                 self.expect_blocked(
                     who,
                     r"\USR\BIN\SH.EXE",
@@ -809,6 +913,89 @@ impl Case {
         }
     }
 
+    /// The console host is on both lists, because Git's console program starts it. A launcher that
+    /// can be handed a command line must still start nothing the policy refuses: each process it
+    /// creates is judged against the account it runs as.
+    fn console_host_starts_nothing_refused(&mut self) {
+        println!("--- the console host is handed a program");
+        let directory = self.root.clone();
+        let host = PathBuf::from(std::env::var_os("SystemRoot").expect("the system root"))
+            .join("System32")
+            .join("conhost.exe");
+        let recorder = self.root.join("planted").join("recorder.exe");
+        let marker = self.root.join("planted").join("recorder.exe.ran");
+        for who in ALL {
+            let _ = std::fs::remove_file(&marker);
+            let launch = self.launch(
+                who,
+                "conhost.exe handed recorder.exe",
+                &host,
+                &format!("\"{}\"", recorder.display()),
+                &directory,
+            );
+            let recorded = marker.exists();
+            let _ = std::fs::remove_file(&marker);
+            let role = self.account(who).role;
+            if who == Who::Person {
+                self.expect(launch.outcome.ran() && recorded, || {
+                    format!(
+                        "{role}: the console host handed a program {} and recorded={recorded}",
+                        launch.outcome
+                    )
+                });
+            } else {
+                self.expect(!recorded, || {
+                    format!("{role}: a program the policy refuses ran through the console host")
+                });
+                self.expect_blocked(
+                    who,
+                    r"\PLANTED\RECORDER.EXE",
+                    "the program the console host was handed is named as blocked",
+                );
+            }
+        }
+    }
+
+    /// A path rule on Git's installation holds only while neither boundary account can write there:
+    /// a program either account could put in a listed directory would be on the list.
+    fn git_installation_is_not_writable(&mut self) {
+        println!("--- the directories on the lists cannot be written by the boundary accounts");
+        let directory = self.root.clone();
+        let git = self.git.clone();
+        let listed = [
+            self.exec_path.clone(),
+            self.git.parent().expect("Git's directory").to_owned(),
+            self.git_root.join("usr").join("bin"),
+        ];
+        for who in [Who::Checkout, Who::Connect] {
+            for place in &listed {
+                let probe = place.join("kr-write-check");
+                let launch = self.launch(
+                    who,
+                    "git init inside a directory on the lists",
+                    &git,
+                    &format!("init -q \"{}\"", probe.display()),
+                    &directory,
+                );
+                let made = probe.exists();
+                if made {
+                    let _ = std::fs::remove_dir_all(&probe);
+                }
+                let role = self.account(who).role;
+                self.expect(
+                    !made && matches!(launch.outcome, Outcome::Ran(code) if code != 0),
+                    || {
+                        format!(
+                            "{role}: made a directory in {} ({})",
+                            place.display(),
+                            launch.outcome
+                        )
+                    },
+                );
+            }
+        }
+    }
+
     /// Reads the log for every event the case expects, requires them, and ends the case.
     fn finish(mut self) {
         println!("--- the application-control log");
@@ -816,10 +1003,9 @@ impl Case {
         let mut events;
         loop {
             events = events_after(self.watermark);
-            if self
-                .expected
+            if assign(&events, &self.expected)
                 .iter()
-                .all(|wanted| find(&events, wanted).is_some())
+                .all(std::option::Option::is_some)
                 || Instant::now() >= deadline
             {
                 break;
@@ -829,10 +1015,11 @@ impl Case {
         println!("{} events were written during the case", events.len());
         let mut rules: BTreeSet<String> = BTreeSet::new();
         let expected = std::mem::take(&mut self.expected);
-        for wanted in &expected {
-            match find(&events, wanted) {
+        let assigned = assign(&events, &expected);
+        for (wanted, at) in expected.iter().zip(assigned) {
+            match at.map(|at| &events[at]) {
                 None => self.fail(format!(
-                    "the log shows no event {} for: {}",
+                    "the log shows no event {} of its own for: {}",
                     wanted.id, wanted.what
                 )),
                 Some(event) => {
@@ -841,8 +1028,8 @@ impl Case {
                         event.id, event.rule, event.file, wanted.what
                     );
                     if let Some(sid) = &wanted.scoped_to {
-                        let scoped =
-                            event.sddl.contains(sid.as_str()) && event.sddl.starts_with("D:(XD");
+                        let scoped = event.sddl.contains(&format!(";;;{sid};"))
+                            && event.sddl.starts_with("D:(XD");
                         if !scoped {
                             self.fail(format!(
                                 "the rule that blocked it is not a deny rule scoped to {sid}: {} ({})",
@@ -867,14 +1054,6 @@ impl Case {
     }
 }
 
-impl Drop for Case {
-    fn drop(&mut self) {
-        // Whether the case ended or panicked, it takes away the account it made and what it wrote.
-        delete_account(&self.person.name);
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
 /// Which account a program is launched as.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Who {
@@ -883,13 +1062,24 @@ enum Who {
     Person,
 }
 
-/// Returns the event of the log the case expected, if the log has it.
-fn find<'a>(events: &'a [Event], wanted: &Expected) -> Option<&'a Event> {
-    events.iter().find(|event| {
-        event.id == wanted.id
-            && event.user == wanted.sid
-            && event.file.to_uppercase().ends_with(&wanted.file)
-    })
+/// Pairs each event the case expected with an event of its own in the log.
+///
+/// Two expectations that name the same image need two events: one launch cannot answer for two.
+fn assign(events: &[Event], expected: &[Expected]) -> Vec<Option<usize>> {
+    let mut taken = vec![false; events.len()];
+    expected
+        .iter()
+        .map(|wanted| {
+            let at = events.iter().enumerate().position(|(index, event)| {
+                !taken[index]
+                    && event.id == wanted.id
+                    && event.user == wanted.sid
+                    && event.file.to_uppercase().ends_with(&wanted.file)
+            })?;
+            taken[at] = true;
+            Some(at)
+        })
+        .collect()
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -978,7 +1168,7 @@ fn sid_text(account: &str) -> Option<String> {
     if sid_length == 0 {
         return None;
     }
-    let mut sid = vec![0_u8; sid_length as usize];
+    let mut sid = vec![0_u32; (sid_length as usize).div_ceil(4)];
     let mut domain = vec![0_u16; domain_length as usize];
     // SAFETY: both buffers are the sizes the first call asked for.
     let found = unsafe {
@@ -1046,7 +1236,7 @@ fn boundary_account(role: &'static str, name: &str) -> Account {
 }
 
 /// Makes the ordinary account the person stands for.
-fn person_account() -> Account {
+fn person_account(cleanup: &mut Cleanup) -> Account {
     let name = format!(
         "krperson{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
@@ -1070,6 +1260,7 @@ fn person_account() -> Account {
         status, NERR_Success,
         "the ordinary account could not be made"
     );
+    cleanup.person = Some(name.clone());
     let sid = sid_text(&name).expect("the ordinary account has an identifier");
     Account {
         role: "person",
@@ -1082,8 +1273,9 @@ fn person_account() -> Account {
 fn delete_account(name: &str) {
     let account = wide(name);
     // SAFETY: the name is this function's own NUL-terminated buffer.
-    unsafe {
-        NetUserDel(null(), account.as_ptr());
+    let status = unsafe { NetUserDel(null(), account.as_ptr()) };
+    if status != NERR_Success {
+        eprintln!("the account {name} could not be removed (status {status})");
     }
 }
 
@@ -1245,8 +1437,11 @@ fn create_process_as(
         );
         let outcome = if waited == WAIT_OBJECT_0 {
             let mut code = 0_u32;
-            GetExitCodeProcess(information.hProcess, &raw mut code);
-            Outcome::Ran(code)
+            if GetExitCodeProcess(information.hProcess, &raw mut code) == 0 {
+                Outcome::Unread
+            } else {
+                Outcome::Ran(code)
+            }
         } else {
             TerminateProcess(information.hProcess, 1);
             Outcome::Hung
