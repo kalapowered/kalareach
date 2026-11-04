@@ -2440,27 +2440,53 @@ impl DescriptionService {
                 self.counts.deadline_exceeded = self.counts.deadline_exceeded.saturating_add(1);
                 Outcome::DeadlineExceeded { session_id }
             }
-            ProcessEnd::MemoryCeiling => {
-                self.counts.failed = self.counts.failed.saturating_add(1);
+            // A job that was being stopped, or whose session is gone, ends as that made it: the
+            // process passed its ceiling after the job was told to stop, and nothing says the job
+            // was the cause. Any other job is the one that held the process past it.
+            ProcessEnd::MemoryCeiling => self.ended_as_stopped_or(dispatched, |service, job| {
+                if service.session_gone(&job) {
+                    service.counts.cancelled = service.counts.cancelled.saturating_add(1);
+                    return Outcome::Cancelled { session_id };
+                }
+                service.counts.failed = service.counts.failed.saturating_add(1);
                 Outcome::Failed {
                     session_id,
                     detail: "the process passed its ceiling".to_owned(),
                 }
+            }),
+            _ => {
+                let detail = format!("the description process ended: {}", why.as_str());
+                self.retry_or_end(dispatched, detail)
             }
-            _ => self.retry_or_end(
-                dispatched,
-                format!("the description process ended: {}", why.as_str()),
-            ),
         }
     }
 
-    /// Decides what a job that did not finish comes to: a job a caller cancelled ends cancelled, a
-    /// job being stopped for a pause goes back in the queue, a job being stopped for any other
-    /// reason ends cancelled, and any other job is queued again once.
+    /// Decides what a job that did not finish comes to: a job being stopped ends as the stop made
+    /// it ([`Self::ended_as_stopped_or`]), and any other job is queued again once.
+    fn retry_or_end(&mut self, dispatched: Dispatched, detail: String) -> Outcome {
+        self.ended_as_stopped_or(dispatched, |service, dispatched| {
+            let session_id = dispatched.job.session_id;
+            if dispatched.requeued_before {
+                service.counts.failed = service.counts.failed.saturating_add(1);
+                Outcome::Failed { session_id, detail }
+            } else {
+                service.requeue(dispatched, true)
+            }
+        })
+    }
+
+    /// Ends a job its process could not finish as the stop that was on it made it, and as
+    /// `otherwise` says when nothing was stopping it: a job a caller cancelled ends cancelled, a job
+    /// being stopped for a pause goes back in the queue, and a job being stopped for any other
+    /// reason ends cancelled.
     ///
     /// A caller's cancellation is read at the moment of the decision, and it outranks the
     /// service's own reasons: a job queued again would get a new token that nothing had cancelled.
-    fn retry_or_end(&mut self, dispatched: Dispatched, detail: String) -> Outcome {
+    fn ended_as_stopped_or(
+        &mut self,
+        dispatched: Dispatched,
+        otherwise: impl FnOnce(&mut Self, Dispatched) -> Outcome,
+    ) -> Outcome {
         let session_id = dispatched.job.session_id;
         if let Some(cancelled) = self.cancelled_first(&dispatched) {
             return cancelled;
@@ -2471,11 +2497,7 @@ impl DescriptionService {
                 self.counts.cancelled = self.counts.cancelled.saturating_add(1);
                 Outcome::Cancelled { session_id }
             }
-            None if dispatched.requeued_before => {
-                self.counts.failed = self.counts.failed.saturating_add(1);
-                Outcome::Failed { session_id, detail }
-            }
-            None => self.requeue(dispatched, true),
+            None => otherwise(self, dispatched),
         }
     }
 
@@ -2532,15 +2554,19 @@ impl DescriptionService {
         by_caller
     }
 
+    /// Returns whether a job belongs to a session that is gone: one that closed, or opened again,
+    /// or that privacy mode has fenced.
+    fn session_gone(&self, dispatched: &Dispatched) -> bool {
+        dispatched.outlived
+            || !self.live_sessions.contains(&dispatched.job.session_id)
+            || self.fence.is_fenced(&dispatched.job.session_id)
+    }
+
     /// Puts a job back in the queue with its aging position. A job put back after a failure is put
     /// back once: its session's next failure is not retried, however many pauses come between.
     fn requeue(&mut self, dispatched: Dispatched, after_failure: bool) -> Outcome {
         let session_id = dispatched.job.session_id;
-        // A job whose session closed, or opened again, belongs to a session that is gone.
-        if dispatched.outlived
-            || !self.live_sessions.contains(&session_id)
-            || self.fence.is_fenced(&session_id)
-        {
+        if self.session_gone(&dispatched) {
             self.counts.cancelled = self.counts.cancelled.saturating_add(1);
             return Outcome::Cancelled { session_id };
         }

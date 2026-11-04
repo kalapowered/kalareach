@@ -614,6 +614,116 @@ fn a_job_cancelled_before_its_process_ends_is_not_retried() {
     assert_eq!(paused.counts().cancelled, 0);
 }
 
+/// KR-REQ-22.21: a job that was being stopped, or whose session was gone, when the daemon ended its
+/// process for passing the memory ceiling ends as that made it: cancelled for a caller's
+/// cancellation or a session that closed, and back in the queue with its place for a pause. The
+/// process passed the ceiling after the job was told to stop, and nothing says the job was the
+/// cause. The process's end is the same failure of inference in every form, and pauses inference for
+/// memory. The control is a job nothing was stopping, which is the one that held the process past
+/// the ceiling and ends failed.
+#[test]
+fn a_job_that_was_being_stopped_when_its_process_passed_the_ceiling_ends_as_the_stop_made_it() {
+    /// What was on the job when its process ended.
+    #[derive(Clone, Copy, Debug)]
+    enum OnTheJob {
+        CallerCancelled,
+        Paused,
+        SessionClosed,
+        Nothing,
+    }
+
+    let hot = HostConditions::measured(
+        16 * GIB,
+        12 * GIB,
+        PowerSource::Mains,
+        ThermalState::Critical,
+    );
+    // The form, the job's outcome, and how many jobs were counted cancelled, failed and queued
+    // again, and wait in the queue.
+    let forms = [
+        (
+            OnTheJob::CallerCancelled,
+            Outcome::Cancelled {
+                session_id: session(1),
+            },
+            (1, 0, 0, 0),
+        ),
+        (
+            OnTheJob::Paused,
+            Outcome::Requeued {
+                session_id: session(1),
+            },
+            (0, 0, 1, 1),
+        ),
+        (
+            OnTheJob::SessionClosed,
+            Outcome::Cancelled {
+                session_id: session(1),
+            },
+            (1, 0, 0, 0),
+        ),
+        (
+            OnTheJob::Nothing,
+            Outcome::Failed {
+                session_id: session(1),
+                detail: "the process passed its ceiling".to_owned(),
+            },
+            (0, 1, 0, 0),
+        ),
+    ];
+    for (form, outcome, (cancelled, failed, requeued, waiting)) in forms {
+        let mut service = service();
+        queue(&mut service, &session(1), "kalareach", at(0));
+        let Instruction::Generate { id, .. } = loaded(&mut service, at(3_000)) else {
+            panic!("the job is sent");
+        };
+        match form {
+            OnTheJob::CallerCancelled => assert!(service.cancel_running(&session(1))),
+            OnTheJob::Paused => assert_eq!(
+                service.next(&hot, at(3_050)).expect("an instruction"),
+                Instruction::Cancel {
+                    id,
+                    work: Work::Job
+                }
+            ),
+            OnTheJob::SessionClosed => service.session_closed(&session(1), at(3_050)),
+            OnTheJob::Nothing => {}
+        }
+        assert_eq!(
+            service
+                .process_ended(ProcessEnd::MemoryCeiling, at(3_100))
+                .expect("the end"),
+            vec![
+                outcome,
+                Outcome::ProcessEnded {
+                    why: ProcessEnd::MemoryCeiling
+                }
+            ],
+            "{form:?}"
+        );
+        let counts = service.counts();
+        assert_eq!(
+            (
+                counts.cancelled,
+                counts.failed,
+                counts.requeued,
+                service.scheduler().queued()
+            ),
+            (cancelled, failed, requeued, waiting),
+            "{form:?}"
+        );
+        assert_eq!(service.inference_restarts(), 1, "{form:?}");
+        assert_eq!(
+            service.resource_state(),
+            ResourceState::ResourcePaused {
+                reason: PauseReason::MemoryPressure,
+                unloaded: true
+            },
+            "{form:?}"
+        );
+    }
+}
+
 /// KR-PERF-009: every attempt is measured once, however it ends. Its queue wait and execution go
 /// into the latency ledger, and its execution into the service time the cadence is worked out
 /// from: a job past its deadline, a cancelled job and a job whose process ended count as a

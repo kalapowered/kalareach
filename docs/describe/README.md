@@ -171,7 +171,10 @@ runs a job and ends it past the ceiling, and the process ends a job itself when 
 ceiling between tokens. A description whose job took the process past the ceiling stays published.
 The process is ended after it, and inference pauses with `memory_pressure` until the next load may
 happen. A job that held its process past the ceiling without ever finishing is ended by the daemon's
-reading alone, publishes nothing, is not queued again, and pauses inference the same way.
+reading alone, publishes nothing, is not queued again, and pauses inference the same way. A job that
+was already being stopped when its process passed the ceiling, or whose session had gone, ends as
+that made it: cancelled, or back in the queue with its place for a pause. Nothing says it was the
+cause, and the process's end pauses inference the same way.
 
 The first reading of a load or a job is due one reading period (one second) after it starts, and
 each later one a period after the last, until the work answers. A process that passes the ceiling
@@ -658,8 +661,10 @@ survive. The job it was running is queued again once, with its aging position, u
 ended the process for passing its deadline or its memory ceiling, or the process exited or broke
 the wire while the system had refused it memory, which the daemon reads as the ceiling; those end
 the job past its deadline or failed (a process that ends itself for passing its deadline reads as
-one that exited or broke the wire, and the job is queued again), and if the next process fails it
-as well it is not retried, however many pauses come between. A job a caller or
+one that exited or broke the wire, and the job is queued again), except that a job already being
+stopped when the process passed its memory ceiling, or whose session had gone, ends as the stop or
+the session made it, and if the next process fails it as well it is not retried, however many
+pauses come between. A job a caller or
 privacy mode cancelled is never queued again, even when its process ends before the cancellation is
 answered, and even when a pause had already stopped it: a retry would run it under a new token that
 nobody had cancelled. The service's handle on the running job is the one way to cancel it from
