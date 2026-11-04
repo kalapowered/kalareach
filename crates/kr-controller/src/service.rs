@@ -1156,7 +1156,11 @@ impl Controller {
     ) -> std::result::Result<F::Output, EffectWaitEnded> {
         #[cfg(feature = "testing")]
         if let Some(wait) = &self.effect_wait {
-            return wait.within(effect).await.ok_or(EffectWaitEnded);
+            let settled = wait.within(effect).await;
+            if settled.is_none() {
+                wait.note_told();
+            }
+            return settled.ok_or(EffectWaitEnded);
         }
         tokio::time::timeout(net::dispatch::EFFECT_WAIT, effect)
             .await

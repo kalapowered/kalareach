@@ -4,7 +4,7 @@
 //! ships enables.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -126,6 +126,34 @@ tokio::task_local! {
 pub struct EffectWait {
     bound: Duration,
     timer: Arc<dyn Timer>,
+    told: Option<Told>,
+}
+
+/// The events of a suite and of the daemon it starts, in the order they happened: each place is
+/// taken from one counter, so a place taken after another is a later event whichever task took it.
+#[derive(Clone, Debug, Default)]
+pub struct EventOrder(Arc<AtomicU64>);
+
+impl EventOrder {
+    /// A new order, with no event taken yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Takes the next place in the order.
+    #[must_use]
+    pub fn next(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+/// The places in an [`EventOrder`] at which a daemon was about to answer that an outcome is unknown
+/// because its wait for the effect had ended.
+#[derive(Clone, Debug)]
+struct Told {
+    order: EventOrder,
+    places: Arc<Mutex<Vec<u64>>>,
 }
 
 impl EffectWait {
@@ -135,6 +163,7 @@ impl EffectWait {
         Self {
             bound,
             timer: Arc::new(crate::quiet::RealTimer),
+            told: None,
         }
     }
 
@@ -145,6 +174,47 @@ impl EffectWait {
         Self {
             bound: crate::service::net::dispatch::EFFECT_WAIT,
             timer,
+            told: None,
+        }
+    }
+
+    /// As this wait, taking a place in `order` each time the daemon is about to answer that the
+    /// outcome is unknown because the wait ended ([`Self::told_at`]). The daemon takes it before it
+    /// writes the answer, so the place says when the daemon decided to answer, and not when a
+    /// suite came to read the answer.
+    #[must_use]
+    pub fn telling_in(mut self, order: EventOrder) -> Self {
+        self.told = Some(Told {
+            order,
+            places: Arc::default(),
+        });
+        self
+    }
+
+    /// The places at which the daemon told a caller that the outcome is unknown because the wait
+    /// had ended, in the order it did.
+    ///
+    /// # Panics
+    ///
+    /// Panics when this wait was not given an order by [`Self::telling_in`].
+    #[must_use]
+    pub fn told_at(&self) -> Vec<u64> {
+        self.told
+            .as_ref()
+            .expect("a wait that numbers its answers")
+            .places
+            .lock()
+            .expect("the places")
+            .clone()
+    }
+
+    /// Notes that the daemon is about to tell a caller the outcome is unknown.
+    pub(crate) fn note_told(&self) {
+        if let Some(told) = &self.told {
+            told.places
+                .lock()
+                .expect("the places")
+                .push(told.order.next());
         }
     }
 

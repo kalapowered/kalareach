@@ -1743,11 +1743,6 @@ fn paired_dial_by(host: &Host, device: &Device, record: &DeviceRecord) -> Paired
 ///
 /// A task reads the control stream from the moment of the connection, as a client's session does,
 /// so a window the host renews to is the one the next mutation is presented under.
-///
-/// The task numbers each frame as it finds it, in an order of events that a case can number its own
-/// events in too ([`Self::mark`]): a case that is about what the host did before it answered
-/// compares the number its answer arrived with against the number of the event it must follow, and
-/// not the moment the case came to read the answer, which can be well after it arrived.
 pub struct RawDevice {
     transport: Arc<NetworkTransport>,
     /// The action window the connection started with.
@@ -1756,14 +1751,11 @@ pub struct RawDevice {
     next_request: std::sync::atomic::AtomicU64,
     /// The frames the reading task has found, in the order they arrived.
     heard: tokio::sync::Mutex<Heard>,
-    /// The events numbered so far, the frames the reading task found and the marks a case took.
-    events: Arc<std::sync::atomic::AtomicU64>,
     reading: tokio::task::JoinHandle<()>,
 }
 
-/// The frames a task reading a control stream passes on, in the order they arrived, each with its
-/// place in the order of events.
-type Heard = tokio::sync::mpsc::UnboundedReceiver<(u64, kr_protocol::envelope::ControlFrame)>;
+/// The frames a task reading a control stream passes on, in the order they arrived.
+type Heard = tokio::sync::mpsc::UnboundedReceiver<kr_protocol::envelope::ControlFrame>;
 
 /// The action windows the host has given one connection: the one it started with, and then each
 /// one the host renewed it to.
@@ -1827,17 +1819,14 @@ impl RawDevice {
             renewals: tokio::sync::watch::channel(0).0,
         });
         let (found, heard) = tokio::sync::mpsc::unbounded_channel();
-        let events = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let reading = tokio::spawn({
             use kr_client::transport::ControlTransport as _;
             use kr_protocol::envelope::{ControlEvent, ControlFrame};
 
             let transport = Arc::clone(&transport);
             let windows = Arc::clone(&windows);
-            let events = Arc::clone(&events);
             async move {
                 while let Ok(Some(frame)) = transport.recv().await {
-                    let arrived = events.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     if let ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) = &frame {
                         *windows
                             .current
@@ -1846,7 +1835,7 @@ impl RawDevice {
                             window.action_window_id.clone();
                         windows.renewals.send_modify(|renewals| *renewals += 1);
                     }
-                    if found.send((arrived, frame)).is_err() {
+                    if found.send(frame).is_err() {
                         break;
                     }
                 }
@@ -1858,7 +1847,6 @@ impl RawDevice {
             windows,
             next_request: std::sync::atomic::AtomicU64::new(1),
             heard: tokio::sync::Mutex::new(heard),
-            events,
             reading,
         })
     }
@@ -1866,20 +1854,7 @@ impl RawDevice {
     /// The next frame the host sent that nothing has read, or `None` when the control stream has
     /// ended.
     async fn heard_next(&self) -> Option<kr_protocol::envelope::ControlFrame> {
-        self.heard_next_numbered().await.map(|(_, frame)| frame)
-    }
-
-    /// As [`Self::heard_next`], with the frame's place in the order of events.
-    async fn heard_next_numbered(&self) -> Option<(u64, kr_protocol::envelope::ControlFrame)> {
         self.heard.lock().await.recv().await
-    }
-
-    /// Takes the next place in the order of events, for an event of the case's own: a frame the host
-    /// sends after this arrives with a later place than the one returned, whenever the case reads it.
-    pub fn mark(&self) -> u64 {
-        self.events
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1
     }
 
     /// The action window this connection started with, which the host's renewals leave behind.
@@ -2047,40 +2022,6 @@ impl RawDevice {
         target: kr_protocol::envelope::ActionTarget,
         params: &P,
     ) -> Option<std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError>> {
-        self.try_mutate_in_numbered(action_window_id, method, action_id, target, params)
-            .await
-            .map(|(answer, _)| answer)
-    }
-
-    /// As [`Self::mutate_in`], with the answer's place in the order of events when it arrived
-    /// ([`Self::mark`]), which is not when this came to read it.
-    pub async fn mutate_in_numbered<P: serde::Serialize + ?Sized>(
-        &self,
-        action_window_id: kr_protocol::ids::ActionWindowId,
-        method: Method,
-        action_id: kr_protocol::ids::ActionId,
-        target: kr_protocol::envelope::ActionTarget,
-        params: &P,
-    ) -> (
-        std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError>,
-        u64,
-    ) {
-        self.try_mutate_in_numbered(action_window_id, method, action_id, target, params)
-            .await
-            .expect("the host answers on an open control stream")
-    }
-
-    async fn try_mutate_in_numbered<P: serde::Serialize + ?Sized>(
-        &self,
-        action_window_id: kr_protocol::ids::ActionWindowId,
-        method: Method,
-        action_id: kr_protocol::ids::ActionId,
-        target: kr_protocol::envelope::ActionTarget,
-        params: &P,
-    ) -> Option<(
-        std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError>,
-        u64,
-    )> {
         use kr_client::transport::ControlTransport as _;
         use kr_protocol::envelope::{ControlFrame, Outcome};
 
@@ -2091,20 +2032,17 @@ impl RawDevice {
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         loop {
-            let heard = tokio::time::timeout_at(deadline, self.heard_next_numbered())
+            let frame = tokio::time::timeout_at(deadline, self.heard_next())
                 .await
                 .expect("the host answers in time");
-            let (arrived, frame) = heard?;
+            let frame = frame?;
             if let ControlFrame::Response(response) = frame
                 && response.request_id == request_id
             {
-                return Some((
-                    match response.outcome {
-                        Outcome::Ok(value) => Ok(value),
-                        Outcome::Error(error) => Err(error),
-                    },
-                    arrived,
-                ));
+                return Some(match response.outcome {
+                    Outcome::Ok(value) => Ok(value),
+                    Outcome::Error(error) => Err(error),
+                });
             }
         }
     }
