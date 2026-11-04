@@ -817,22 +817,35 @@ pub fn a_prompt_a_line_opens_keeps_the_lines_block_and_capability(kind: ShellKin
 /// What the console does with the key while the module waits is not something this package can
 /// prove, so this case records what the line did and requires what the module owes: the line's
 /// block and a prompt that works.
+///
+/// The key has to arrive while the module waits for the answer, and nothing about the harness's
+/// pace may decide that. So the module keeps the long wait every case gives it, the worker holds
+/// the answer back, and it is answered only once the key is in the terminal: what ends the wait is
+/// the answer, which comes after the key by construction. A line that had run before the key was
+/// typed would be a key that missed the wait, and fails the case.
 pub fn a_cancellation_during_an_unanswered_acceptance_leaves_the_prompt_working(kind: ShellKind) {
     let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
-    // This case records what a line does when the key does not end the module's wait for the
-    // answer, so it is the module's own wait that ends the line, and that is a short one, not the
-    // long one the other cases give it.
-    session.lets_the_bridge_give_up_on_a_question();
     session.commands.silent_acceptance = true;
-    let accepted = session.commands.accepted.len();
     let line = "kr-probe cancelled-in-the-acceptance";
+    session.forget_events();
     let _ = session.submit(line, "probe-ran");
-    session.until("the acceptance", |commands| {
-        commands.accepted.len() > accepted
+    let (id, event) = session.expect_event("the acceptance", |event| {
+        matches!(event, BridgeEvent::CommandAccepted(_))
     });
+    let BridgeEvent::CommandAccepted(accepted) = event else {
+        unreachable!()
+    };
+    assert!(
+        probes.runs().is_empty(),
+        "the line ran before the key was typed, so the key did not arrive while the module waited \
+         for the answer: {:?}",
+        probes.runs()
+    );
     session.type_bytes(CTRL_C);
+    let answer = session.acceptance_answer(&accepted);
+    session.answer_event(id, answer);
     let status = session.status_of(line);
     session.commands.silent_acceptance = false;
     assert!(session.answered("kr-after-the-acceptance"));
