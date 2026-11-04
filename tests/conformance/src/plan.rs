@@ -2167,6 +2167,14 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
+        package: "kr-project",
+        target: "--test windows_enforcement",
+        cases: &[],
+        runs: Runs::ByHand {
+            why: "it needs an elevated session in a disposable Windows guest with the application-control policy and the two boundary accounts in place, and it changes that guest's accounts and window station",
+        },
+    },
+    IgnoredRun {
         package: "kr-ipc",
         target: "--test install",
         cases: &["a_store_on_a_volume_that_is_not_ntfs_is_refused"],
