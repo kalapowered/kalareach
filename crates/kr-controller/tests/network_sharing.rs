@@ -284,6 +284,10 @@ async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repea
 /// How long the share a connection is ended with lasts, on the clocks the case moves.
 const SHARE_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
+/// A move of the clocks that leaves the share standing and the connection's action window, which
+/// lasts five minutes, valid for the request that follows.
+const CLOCK_STEP: Duration = Duration::from_secs(60);
+
 /// The longest [`RawDevice::answered_before_closing`] waits for the close, which only a host that
 /// does not close the connection at the share's end reaches: the case decides on what the host
 /// did, and this only keeps a case that went wrong from hanging.
@@ -455,6 +459,9 @@ async fn kr_req_25_10_an_invitation_of_a_session_that_has_ended_activates_nothin
 /// been closed, so the connection is closed while the request is pending or it is not closed at
 /// all: the order of events decides the case, and no limit on how long the close takes. The share
 /// ends because the host's clocks are moved past its end, and not by the case waiting for it. The
+/// clocks are moved in two steps: after the first, which leaves the share standing, the connection
+/// still answers a read, so the close that follows the second is for the share's end and not for a
+/// move of the clocks. The
 /// host looks at the grants a connection stands on again at least once every 15 seconds, so the
 /// close can come that long after the move. [`RawDevice::answered_before_closing`] is given a
 /// guard for a case that went wrong and decides nothing for a run that closes the connection.
@@ -515,6 +522,21 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
             &kr_protocol::session::SessionReadParams { session_id },
         )
         .await;
+    // The clocks move, short of the share's end, and the connection goes on: it answers a read. A
+    // host that closed a connection because its clocks moved would close it here, so the close
+    // below is for the share's end. (The close carries one code and reason whatever ended the
+    // connection, so the device cannot read the cause from it.)
+    moved.advance(CLOCK_STEP);
+    assert!(
+        connection
+            .try_read(
+                Method::SessionRead,
+                &kr_protocol::session::SessionReadParams { session_id },
+            )
+            .await
+            .is_some(),
+        "the connection was closed by a move of the clocks that left its share standing"
+    );
 
     let (arrived, go) = host.controller().sharing().grants().pause_before_effect();
     let held = connection
@@ -545,7 +567,7 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
     // The share ends while the request is held. The connection is closed then, and the request
     // is never answered. A connection that is only looked at between requests is closed after the
     // host gives up on the request, which does not happen while the case holds the wait.
-    moved.advance(SHARE_LIFETIME + Duration::from_secs(60));
+    moved.advance(SHARE_LIFETIME - CLOCK_STEP + Duration::from_secs(60));
     let answered = connection
         .answered_before_closing(held, CLOSE_GUARD)
         .await
