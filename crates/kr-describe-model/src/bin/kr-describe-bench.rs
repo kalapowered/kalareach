@@ -40,7 +40,7 @@ use kr_describe::resource::{
     HostConditions, PauseReason, ResourceSettings, ResourceState, platform,
 };
 use kr_describe::service::{
-    DescriptionService, HostPlacement, LOAD_DEADLINE_MS, Outcome, UnloadReason,
+    DescriptionService, HostPlacement, LOAD_DEADLINE_MS, Outcome, ProcessEnd, UnloadReason,
 };
 use kr_describe::store::DescriptionStore;
 use kr_describe::supervise::{Driver, Launch, Report};
@@ -56,6 +56,10 @@ const MAX_SESSIONS: u32 = 50;
 /// The longest the benchmark waits for the driver between its turns. The driver wakes sooner when
 /// the process says something.
 const TURN_WAIT: Duration = Duration::from_millis(100);
+
+/// The longest the benchmark waits for queued work that the service holds back to a time it sets,
+/// as it does for the wait after a job that missed its deadline, which doubles up to five minutes.
+const QUEUED_WAIT_BOUND: Duration = Duration::from_secs(6 * 60);
 
 /// Background terminal actor that absorbs escape sequences without allocating.
 struct BenchTerminalActor;
@@ -305,8 +309,11 @@ impl Sampler {
         }
     }
 
-    /// Returns the peaks since the last take, resident set first, and starts a new window.
+    /// Returns the peaks since the last take, resident set first, and starts a new window. The
+    /// first read of the new window is a refresh and not a reading, so that the processor use of
+    /// the new window never covers time from the one before.
     fn take(&mut self) -> (Option<u64>, Option<u64>) {
+        self.refreshes = 0;
         (self.resident.take(), self.processor.take())
     }
 }
@@ -490,6 +497,11 @@ struct Watch<'a> {
     class_printed: bool,
     /// Whether a load has been seen to end with a model.
     loaded: bool,
+    /// Whether the passes have begun, from which a process's peaks are the passes'.
+    passes_begun: bool,
+    /// The peaks of the processes that went before the one running, in the passes, resident set
+    /// first.
+    earlier: (Option<u64>, Option<u64>),
     /// The targets this run missed.
     unmet: Vec<String>,
 }
@@ -519,6 +531,34 @@ impl Watch<'_> {
         );
     }
 
+    /// Notes a process that was started. In the passes, what was read so far is of the process
+    /// before it, and is kept apart from the new one's.
+    fn note_started(&mut self, pid: u32) {
+        println!("description_process: pid {pid} [{}]", self.machine);
+        if self.passes_begun {
+            let (resident, processor) = self.sampler.take();
+            self.earlier = (
+                largest([self.earlier.0, resident]),
+                largest([self.earlier.1, processor]),
+            );
+        }
+    }
+
+    /// Begins the passes: nothing read before them is theirs.
+    fn begin_passes(&mut self) {
+        self.sampler.take();
+        self.passes_begun = true;
+    }
+
+    /// Returns the peaks of the passes over every process they ran in, resident set first.
+    fn passes_peaks(&mut self) -> (Option<u64>, Option<u64>) {
+        let (resident, processor) = self.sampler.take();
+        (
+            largest([self.earlier.0, resident]),
+            largest([self.earlier.1, processor]),
+        )
+    }
+
     /// Prints what the load came to, with the process's peaks over it.
     fn note_load(&mut self, pid: Option<u32>, cold_start_ms: u64) {
         self.loaded = true;
@@ -526,8 +566,9 @@ impl Watch<'_> {
         let resident = largest([resident, pid.and_then(process_rss_bytes)]);
         let machine = self.machine;
         println!(
-            "cold_start_load_ms: {cold_start_ms} (the description process's account, from the \
-             request to the answer, its check of the weights' digest included) [{machine}]"
+            "cold_start_load_ms: {cold_start_ms} (the service's account, from its request for the \
+             load to the answer: the start of the process, its handshake and its check of the \
+             weights' digest are in it) [{machine}]"
         );
         println!(
             "measured_load_rss_bytes: description process {} (the model and its runtime) [{machine}]",
@@ -546,6 +587,39 @@ impl Watch<'_> {
             &mut self.unmet,
         );
     }
+
+    /// Prints a report that the process ended or was unloaded, and records as a missed target the
+    /// ones a memory budget causes. The ceiling is read from outside at intervals, and the service
+    /// ends or unloads the process on the process's own figure, so a breach is as likely to be
+    /// seen here as in the samples.
+    fn note_end(&mut self, ended: &Turn) {
+        let machine = self.machine;
+        match ended {
+            Turn::Outcome(Outcome::ProcessEnded { why }) => {
+                println!("description_process_ended: {} [{machine}]", why.as_str());
+                if *why == ProcessEnd::MemoryCeiling {
+                    self.unmet.push(format!(
+                        "the description process passed the {} byte process ceiling and was ended",
+                        self.ceiling_bytes
+                    ));
+                }
+            }
+            Turn::Outcome(Outcome::Dropped { id }) => {
+                println!("answer_dropped: {id}, work nobody was waiting for [{machine}]");
+            }
+            Turn::Unloaded(why) => {
+                println!("description_process_unloaded: {why:?} [{machine}]");
+                if matches!(why, UnloadReason::Paused(PauseReason::MemoryPressure)) {
+                    self.unmet.push(format!(
+                        "the service unloaded the model for memory pressure, as it does for a \
+                         process past its {} byte ceiling",
+                        self.ceiling_bytes
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// What one turn of the benchmark's driver came to.
@@ -557,51 +631,68 @@ enum Turn {
     Paused(PauseReason),
     /// The service had the process ended.
     Unloaded(UnloadReason),
-    /// Nothing was due.
+    /// Nothing was queued, or nothing came due within the longest wait the service sets.
     Idle,
 }
 
+impl Turn {
+    /// Which of the reports of one driver turn the turn is returned as: the end of a job before the
+    /// end of a process, an answer nobody waited for, or an unload.
+    const fn rank(&self) -> u8 {
+        match self {
+            Self::Outcome(Outcome::ProcessEnded { .. } | Outcome::Dropped { .. }) => 1,
+            Self::Unloaded(_) => 2,
+            _ => 0,
+        }
+    }
+}
+
 /// Drives the service through the daemon's driver until it has an answer's outcome, a pause or
-/// nothing due, with each job running in the description process.
+/// nothing queued, with each job running in the description process. Work that waits for a time
+/// the service sets, as it does after a job that missed its deadline, is waited for, as the daemon
+/// waits for it.
 fn turn(
     driver: &mut Driver,
     watch: &mut Watch,
     conditions: &HostConditions,
     reading_now: &dyn Fn() -> Reading,
 ) -> Result<Turn, String> {
+    let mut idle_since: Option<Instant> = None;
     loop {
         let reports = driver
             .turn(conditions, reading_now())
             .map_err(|error| error.to_string())?;
         watch.sampler.sample(driver.pid());
         watch.note_class(driver);
-        let mut ended = None;
+        let mut ended: Vec<Turn> = Vec::new();
         for report in reports {
             match report {
-                Report::Started { pid } => {
-                    println!("description_process: pid {pid} [{}]", watch.machine);
-                }
+                Report::Started { pid } => watch.note_started(pid),
                 Report::Outcome(Outcome::Loaded { cold_start_ms }) => {
                     watch.note_load(driver.pid(), cold_start_ms);
                 }
-                Report::Outcome(outcome) => {
-                    ended.get_or_insert(Turn::Outcome(outcome));
-                }
-                Report::Unloaded { why } => {
-                    ended.get_or_insert(Turn::Unloaded(why));
-                }
+                Report::Outcome(outcome) => ended.push(Turn::Outcome(outcome)),
+                Report::Unloaded { why } => ended.push(Turn::Unloaded(why)),
                 Report::Checked { .. } => {}
             }
         }
-        if let Some(ended) = ended {
-            return Ok(ended);
+        for each in &ended {
+            watch.note_end(each);
+        }
+        if let Some(first) = ended.into_iter().min_by_key(Turn::rank) {
+            return Ok(first);
         }
         let service = driver.service();
         if service.in_flight() == 0 && !service.is_loading() {
-            return Ok(match service.resource_state() {
-                ResourceState::ResourcePaused { reason, .. } => Turn::Paused(reason),
-                _ => Turn::Idle,
-            });
+            if let ResourceState::ResourcePaused { reason, .. } = service.resource_state() {
+                return Ok(Turn::Paused(reason));
+            }
+            let since = *idle_since.get_or_insert_with(Instant::now);
+            if service.scheduler().queued() == 0 || since.elapsed() >= QUEUED_WAIT_BOUND {
+                return Ok(Turn::Idle);
+            }
+        } else {
+            idle_since = None;
         }
         driver.wait(TURN_WAIT);
         watch.sampler.sample(driver.pid());
@@ -610,6 +701,12 @@ fn turn(
 
 #[allow(clippy::too_many_lines)]
 fn run(profile: &ModelProfile, cache: &Path, program: &Path) -> Result<(), String> {
+    // The description process runs in a directory of its own, so every path it is given, or finds
+    // its files by, is absolute.
+    let cache =
+        &std::path::absolute(cache).map_err(|error| format!("{}: {error}", cache.display()))?;
+    let program =
+        &std::path::absolute(program).map_err(|error| format!("{}: {error}", program.display()))?;
     let machine = hardware();
     println!("# KR-PERF-009: local session descriptions");
     println!("hardware: {machine}");
@@ -668,9 +765,10 @@ fn run(profile: &ModelProfile, cache: &Path, program: &Path) -> Result<(), Strin
         declared.weights_bytes,
         declared.beyond_the_weights()
     );
-    // Every figure of the model below is of the description process alone, which holds the runtime
-    // and the model and nothing of this harness, and it is named that way. They are read from
-    // outside it, at the cadence `sysinfo` computes processor use over.
+    // Every figure of the model's memory and processor use below is of the description process
+    // alone, which holds the runtime and the model and nothing of this harness, and it is named
+    // that way. They are read from outside it, at the cadence `sysinfo` computes processor use
+    // over. The cold start is the service's own account of the load.
     println!(
         "whole_product_rss_cpu: not measured by this run, which drives one description process \
          beside the benchmark's own; the controller, the workers and the shared services are not \
@@ -726,13 +824,15 @@ fn run(profile: &ModelProfile, cache: &Path, program: &Path) -> Result<(), Strin
         ceiling_bytes: budgets.process_memory_ceiling_bytes,
         class_printed: false,
         loaded: false,
+        passes_begun: false,
+        earlier: (None, None),
         unmet: Vec::new(),
     };
 
-    // The terminal workload is this run's contention, and it runs in this process, which no class
-    // holds: the description process puts itself in the background class, and this one never does.
-    // Its own cost is read first, with the process not yet started, so that it is never taken for
-    // the model's.
+    // The terminal workload is this run's contention, and it runs in this process, which the
+    // benchmark puts in no class: the description process puts itself in the background class, and
+    // this one never does. Its own cost is read first, with the process not yet started, so that it
+    // is never taken for the model's.
     let stop_workload = Arc::new(AtomicBool::new(false));
     let stop_clone = stop_workload.clone();
     let workload_thread = std::thread::Builder::new()
@@ -797,7 +897,7 @@ fn run(profile: &ModelProfile, cache: &Path, program: &Path) -> Result<(), Strin
     // has to stay distinguishable from nought: a pass that refuses every job can be over before the
     // sampler has two refreshes to compute processor use from, and a nought printed then would be a
     // measurement nobody took.
-    watch.sampler.take();
+    watch.begin_passes();
 
     for sessions in PUBLISHED_SESSION_COUNTS {
         if sessions > MAX_SESSIONS {
@@ -833,13 +933,17 @@ fn run(profile: &ModelProfile, cache: &Path, program: &Path) -> Result<(), Strin
             );
         }
         for _ in 0..sessions {
-            let started = Instant::now();
             let turned = turn(&mut driver, &mut watch, &conditions, &reading_now)?;
-            let elapsed_ms = started.elapsed().as_millis() as u64;
             match turned {
-                Turn::Outcome(Outcome::Published { queue_wait_ms, .. }) => {
+                // The service's own account of the two waits: from the job's queueing to its
+                // dispatch, and from its dispatch to its publication.
+                Turn::Outcome(Outcome::Published {
+                    queue_wait_ms,
+                    execution_ms,
+                    ..
+                }) => {
                     ended.described += 1;
-                    ledger.record(sessions, queue_wait_ms, elapsed_ms);
+                    ledger.record(sessions, queue_wait_ms, execution_ms);
                 }
                 Turn::Outcome(Outcome::DeadlineExceeded { .. }) => ended.past_deadline += 1,
                 Turn::Outcome(Outcome::Rejected { rejection, .. }) => {
@@ -874,7 +978,7 @@ fn run(profile: &ModelProfile, cache: &Path, program: &Path) -> Result<(), Strin
     // when they were over before the sampler's second refresh. Processor use has no such reading:
     // it exists only between two refreshes, and a pass too short for them is reported as unmeasured
     // rather than as nought.
-    let (peak_resident, active_cpu) = watch.sampler.take();
+    let (peak_resident, active_cpu) = watch.passes_peaks();
     let active_rss = largest([peak_resident, driver.pid().and_then(process_rss_bytes)]);
     println!(
         "measured_active_inference_rss_bytes: description process {} (the model, its runtime and the work of the passes) [{machine}]",
@@ -970,7 +1074,9 @@ fn run(profile: &ModelProfile, cache: &Path, program: &Path) -> Result<(), Strin
             .unmet
             .push("no description was produced, so nothing here is a measurement".to_owned());
     } else {
-        println!("--- {total} descriptions produced against real weights on {machine} ---");
+        println!(
+            "--- {total} descriptions produced in the passes against real weights on {machine} ---"
+        );
     }
 
     if watch.unmet.is_empty() {

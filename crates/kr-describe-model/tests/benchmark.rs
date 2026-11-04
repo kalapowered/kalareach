@@ -8,34 +8,46 @@
 //! the terminal at background priority. The case starts the benchmark against the real weights,
 //! where this host has them, and reads from outside the base priority the kernel holds for every
 //! thread of the benchmark's process, where the workload runs, and of the description process it
-//! started.
+//! started: once the process has said it is in the class and the workload runs, and again after the
+//! model has loaded and run its first job.
 #![cfg(target_os = "macos")]
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use kr_ipc::background::{BACKGROUND_THREAD_PRIORITY, thread_priorities_of};
 
 mod support;
 
-/// How long the case waits for the benchmark to have its workload running and the model in the
-/// class. The case decides by what the benchmark prints; this ends a benchmark that never prints
-/// it.
-const STARTED_BOUND: Duration = Duration::from_secs(900);
+/// How long the case waits for each of the benchmark's lines. The case decides by what the
+/// benchmark prints; this ends a benchmark that never prints it.
+const LINE_BOUND: Duration = Duration::from_secs(900);
 
 /// How long the description process has to end once the benchmark that started it has been ended.
 const LEAVE_BOUND: Duration = Duration::from_secs(120);
 
-/// A benchmark the case started, ended and collected when the case ends.
-struct Benchmark(Child);
+/// A benchmark the case started: ended and collected when the case ends, and the description
+/// process it started waited for.
+struct Benchmark {
+    child: Child,
+    model_pid: Option<u32>,
+}
 
 impl Drop for Benchmark {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // The description process ends when its input does. A case that fails early waits for that
+        // too, and leaves a process that does not end for the case's failure to name.
+        if let Some(pid) = self.model_pid {
+            let leave = Instant::now() + LEAVE_BOUND;
+            while exists(pid) && Instant::now() < leave {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
 }
 
@@ -45,6 +57,54 @@ fn exists(pid: u32) -> bool {
     let mut system = sysinfo::System::new();
     system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
     system.process(pid).is_some()
+}
+
+/// Reads the benchmark's next line, or says what the benchmark had printed and wrote to its error
+/// output when it ended or took too long. `None` is a host that cannot run the case now: the
+/// service pauses inference on a host without the free memory the policy asks for, and then no
+/// process is started.
+fn next_line(
+    lines: &Receiver<String>,
+    printed: &[String],
+    errors: &Path,
+    case: &str,
+) -> Option<String> {
+    match lines.recv_timeout(LINE_BOUND) {
+        Ok(line) => Some(line),
+        Err(why) => {
+            let errors = std::fs::read_to_string(errors).unwrap_or_default();
+            if errors.contains("this host pauses inference") {
+                support::did_not_run(case, errors.trim());
+                return None;
+            }
+            panic!("the benchmark ended or stopped printing ({why}): {printed:#?}\n{errors}");
+        }
+    }
+}
+
+/// Asserts what the kernel reports for every thread of the benchmark's process and of the
+/// description process it started.
+fn assert_classes(benchmark_pid: u32, model_pid: u32, when: &str) {
+    let own = thread_priorities_of(benchmark_pid)
+        .expect("the kernel lists the threads of the benchmark's process");
+    let model = thread_priorities_of(model_pid)
+        .expect("the kernel lists the threads of the description process");
+    eprintln!(
+        "the kernel's base priorities {when}: benchmark process {own:?}, description process \
+         {model:?} (the background priority is {BACKGROUND_THREAD_PRIORITY})"
+    );
+    assert!(
+        own.iter()
+            .all(|priority| *priority > BACKGROUND_THREAD_PRIORITY),
+        "a thread of the benchmark's own process, where its terminal workload runs, is in the \
+         background class {when} (the background priority is {BACKGROUND_THREAD_PRIORITY}): {own:?}"
+    );
+    assert!(
+        model
+            .iter()
+            .all(|priority| *priority <= BACKGROUND_THREAD_PRIORITY),
+        "a thread of the description process is outside the background class {when}: {model:?}"
+    );
 }
 
 /// The terminal workload runs in a process the background class does not hold, while the model runs
@@ -103,8 +163,15 @@ fn the_terminal_workload_runs_outside_the_class_of_the_model_process() {
     let outside = support::OutsideTheClass::enter();
     let started = command.spawn().expect("the benchmark starts");
     drop(outside);
-    let mut benchmark = Benchmark(started);
-    let output = benchmark.0.stdout.take().expect("the benchmark's output");
+    let mut benchmark = Benchmark {
+        child: started,
+        model_pid: None,
+    };
+    let output = benchmark
+        .child
+        .stdout
+        .take()
+        .expect("the benchmark's output");
     let (tell, lines) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(output).lines().map_while(Result::ok) {
@@ -114,68 +181,55 @@ fn the_terminal_workload_runs_outside_the_class_of_the_model_process() {
         }
     });
 
+    // The workload runs from the start, and the description process says it is in the class.
     let mut printed: Vec<String> = Vec::new();
     let mut workload_runs = false;
     let mut model_in_the_class = false;
-    let mut model_pid: Option<u32> = None;
-    let give_up = Instant::now() + STARTED_BOUND;
     while !(workload_runs && model_in_the_class) {
-        let line = match lines.recv_timeout(give_up.saturating_duration_since(Instant::now())) {
-            Ok(line) => line,
-            Err(why) => {
-                let errors = std::fs::read_to_string(&errors).unwrap_or_default();
-                // The service pauses inference on a host without the free memory the policy asks
-                // for, and then no process is started: this host cannot run the case now.
-                if errors.contains("this host pauses inference") {
-                    support::did_not_run(CASE, errors.trim());
-                    return;
-                }
-                panic!(
-                    "the benchmark did not get as far as running its workload with the model in \
-                     the class ({why}): {printed:#?}\n{errors}"
-                );
-            }
+        let Some(line) = next_line(&lines, &printed, &errors, CASE) else {
+            return;
         };
         workload_runs |= line.starts_with("terminal_workload_cpu_centis:");
-        model_in_the_class |= line.starts_with("background priority:");
+        if line.starts_with("background priority:") {
+            assert!(
+                line.contains("(cpu true,"),
+                "the description process does not report the class it was to be in: {line}"
+            );
+            model_in_the_class = true;
+        }
         if let Some(rest) = line.strip_prefix("description_process: pid ") {
-            model_pid = rest
+            benchmark.model_pid = rest
                 .split_whitespace()
                 .next()
                 .and_then(|pid| pid.parse().ok());
         }
         printed.push(line);
     }
+    let benchmark_pid = benchmark.child.id();
+    // A benchmark that is not given a description process of its own has no pid to read: its own
+    // process is then read first, which is where it fails.
+    let model_pid = benchmark.model_pid.unwrap_or(benchmark_pid);
+    assert_classes(
+        benchmark_pid,
+        model_pid,
+        "when the process has said it is in the class",
+    );
+    let model_pid = benchmark
+        .model_pid
+        .expect("the benchmark started a description process of its own");
 
-    let own = thread_priorities_of(benchmark.0.id())
-        .expect("the kernel lists the threads of the benchmark's process");
-    eprintln!(
-        "the kernel's base priorities: benchmark process {own:?}, description process {:?} \
-         (the background priority is {BACKGROUND_THREAD_PRIORITY})",
-        model_pid.and_then(thread_priorities_of)
-    );
-    assert!(
-        own.iter()
-            .all(|priority| *priority > BACKGROUND_THREAD_PRIORITY),
-        "a thread of the benchmark's own process, where its terminal workload runs, is in the \
-         background class (the background priority is {BACKGROUND_THREAD_PRIORITY}): {own:?}"
-    );
-    let model_pid = model_pid.expect("the benchmark started a description process of its own");
-    let model = thread_priorities_of(model_pid)
-        .expect("the kernel lists the threads of the description process");
-    assert!(
-        model
-            .iter()
-            .all(|priority| *priority <= BACKGROUND_THREAD_PRIORITY),
-        "a thread of the description process is outside the background class: {model:?}"
-    );
+    // The model loads and runs its first job, with the workload beside it, and the classes are the
+    // same: a class applied to the benchmark's own process after that would show here.
+    while !printed.iter().any(|line| line.starts_with("warm_up_job:")) {
+        let Some(line) = next_line(&lines, &printed, &errors, CASE) else {
+            return;
+        };
+        printed.push(line);
+    }
+    assert_classes(benchmark_pid, model_pid, "after the first job");
 
     // The benchmark goes, and the description process it started goes with it: its input ends.
     drop(benchmark);
-    let leave = Instant::now() + LEAVE_BOUND;
-    while exists(model_pid) && Instant::now() < leave {
-        std::thread::sleep(Duration::from_millis(100));
-    }
     assert!(
         !exists(model_pid),
         "the description process outlived the benchmark that started it"

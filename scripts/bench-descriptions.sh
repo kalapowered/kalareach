@@ -9,7 +9,8 @@
 #
 # The benchmark runs the product's own description process (`kr-describe-inference`) the way the
 # control daemon does, as a process of its own, and keeps the terminal workload in the benchmark's
-# process. So the model is in the background class and the workload is not.
+# process. So the model is in the background class and the workload is not. Run this script outside
+# the class: a process started under `taskpolicy -b` is in it, and so is everything it starts.
 #
 # Everything the run touches lives on local storage: the assets, the store the benchmark writes and
 # both binaries. The workspace may be on a removable volume, and a measurement that waited on a

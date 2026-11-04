@@ -677,10 +677,11 @@ does, has no inference library anywhere in its dependency graph.
 `scripts/bench-descriptions.sh` runs the real model against real weights, in the description process
 the product ships. It downloads the selected profile's assets once into a cache on local storage,
 and `kr-describe-bench` verifies every size and digest before it starts that process. The run is
-pinned to four processors, states the hardware beside every figure, and reports:
+pinned to four processors where the platform has `taskset` and held to the profile's four threads
+elsewhere, states the hardware beside every figure, and reports:
 
-- cold-start load time, as the description process reports it, with its own check of the weights'
-  digest in it;
+- cold-start load time, as the service counts it from its request for the load to the answer, so
+  that the start of the process, its handshake and its own check of the weights' digest are in it;
 - the declared itemised resident cost beside the description process's measured resident set;
 - queue-wait and execution latency at 1, 5, 20 and 50 sessions, separately;
 - how many descriptions were produced, how many passed the deadline and how many were refused;
@@ -704,8 +705,10 @@ Each figure of the model is of the description process alone, which holds the ru
 and none of the harness, and each line says so. The benchmark reads the process's resident set and
 processor use from outside it, no oftener than `sysinfo` computes processor use over. A first job
 loads the model and is not recorded, so the passes run against a loaded model and the cold start is
-reported apart; the load runs while the workload runs. The workload's own processor use is read
-before the process starts. Whole-product RSS and CPU are not measured here at all, because the
+reported apart; the load runs while the workload runs. After a job that misses its deadline the
+service holds the next one back, and the benchmark waits for it as the daemon does, up to six
+minutes, so one miss does not end a pass. The latencies are the service's own account of each job.
+The workload's own processor use is read before the process starts. Whole-product RSS and CPU are not measured here at all, because the
 controller, the workers and the shared services are not running beside the two processes; the
 release matrix measures them.
 
