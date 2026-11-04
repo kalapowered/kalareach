@@ -2973,6 +2973,138 @@ async fn a_lone_escape_reaches_the_application_while_a_question_s_caller_is_bein
         .release();
 }
 
+/// KR-REQ-11.63: an answer to a question is never inserted into the session's terminal.
+///
+/// A real session runs a program that records every byte it reads from its terminal. A question is
+/// asked in the session, a local owner answers it with a text no one types, and then the person
+/// types a sentinel, which is how the recording is known to be complete. The recording holds the
+/// sentinel and nothing of the answer, and the program that asked still reads its answer through its
+/// token.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_to_a_question_is_never_inserted_into_the_terminal() {
+    use kr_protocol::question::{
+        QuestionAnswer, QuestionAnswerParams, QuestionCreateParams, QuestionKind,
+        QuestionReadOwnParams,
+    };
+    use kr_worker::questions::Now;
+
+    const ANSWER: &str = "an-answer-nobody-typed-4172";
+    const SENTINEL: &[u8] = b"typed-by-the-person-9931";
+
+    let kept = tempfile::tempdir().expect("a directory for what the application keeps");
+    let received = kept.path().join("received");
+    let wired = wired(&bracketed_recording(&received)).await;
+    let (mut client, attachment, epoch) = typist(&wired).await;
+    let now = || Now {
+        utc_ms: kr_ipc::now_ms(),
+        boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+    };
+    let asker = kr_worker::questions::binding::VerifiedSource {
+        process: kr_ipc::identity::current_process_start_identity().expect("a process identity"),
+        executable: Some("kr-test-agent".to_owned()),
+        session_member: true,
+        ancestry: true,
+        launch_channel: true,
+        connection_id: ConnectionId::new(kr_ipc::new_uuid()),
+    };
+
+    let (created, _) = wired
+        .service
+        .questions()
+        .create(
+            &asker,
+            &QuestionCreateParams {
+                session_id: wired.session_id,
+                request_id: "release-name".to_owned(),
+                kind: QuestionKind::Input,
+                context: "The build finished.".to_owned(),
+                question: "What should the release be called?".to_owned(),
+                choices: Vec::new(),
+                agent_name: Nullable::some("kr-test-agent".to_owned()),
+                requested_expiry_ms: Nullable::some(kr_protocol::scalars::DurationMs::new(600_000)),
+                wait_ms: Nullable::null(),
+            },
+            now(),
+        )
+        .expect("the agent asks");
+
+    // A local owner answers it over the wire.
+    let mut owner = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    owner
+        .mutate(
+            Method::QuestionAnswer,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &QuestionAnswerParams {
+                session_id: wired.session_id,
+                question_id: created.question.question_id,
+                expected_revision: created.question.revision,
+                answer: QuestionAnswer::Input {
+                    text: ANSWER.to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("the answer goes")
+        .expect("the worker takes it");
+
+    // The person types, and the recording is read once it holds that.
+    write_over(&mut client, &wired, attachment, epoch, 0, SENTINEL)
+        .await
+        .expect("the sentinel is accepted");
+    let arrived = tokio::time::timeout(LIVENESS_DEADLINE, async {
+        loop {
+            if std::fs::read(&received).is_ok_and(|seen| contains(&seen, SENTINEL)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        arrived.is_ok(),
+        "what the person typed reached the application"
+    );
+    let seen = std::fs::read(&received).expect("the recording");
+    assert!(
+        !contains(&seen, ANSWER.as_bytes()),
+        "the answer was inserted into the terminal"
+    );
+
+    // The program that asked reads its answer through its own token.
+    let (own, _) = wired
+        .service
+        .questions()
+        .read_own(
+            &asker,
+            &QuestionReadOwnParams {
+                session_id: wired.session_id,
+                question_id: created.question.question_id,
+                caller_token: created.caller_token,
+                wait_ms: Nullable::null(),
+            },
+            now(),
+        )
+        .expect("the agent reads its own question");
+    assert_eq!(
+        own.question.answer.as_ref().map(|record| &record.answer),
+        Some(&QuestionAnswer::Input {
+            text: ANSWER.to_owned()
+        })
+    );
+
+    drop(client);
+    drop(owner);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
 /// KR-PERF-002: a close that is admitted discards the prefix the recogniser holds and accepts no
 /// input after it.
 ///
