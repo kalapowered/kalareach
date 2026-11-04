@@ -1632,9 +1632,10 @@ impl DescriptionService {
     ///
     /// The model goes with it and nothing else. The work in flight ends: a job the process was
     /// cancelling ends cancelled, a job whose process the daemon ended for passing its deadline
-    /// ends so, one whose process the daemon ended for its memory ceiling fails, and any other job
-    /// is queued again once with its aging position (a process that ended itself for passing its
-    /// deadline reads as one that exited). The next load waits out the restart delay.
+    /// ends so, one whose process the daemon ended for its memory ceiling fails unless it was being
+    /// stopped or its session was gone, which it ends as, and any other job is queued again once
+    /// with its aging position (a process that ended itself for passing its deadline reads as one
+    /// that exited). The next load waits out the restart delay.
     ///
     /// # Errors
     ///
