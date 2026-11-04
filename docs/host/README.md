@@ -4612,7 +4612,10 @@ worker's job object held the whole tree and closed with the worker; the cleanup 
 ends by handle only what is left. A worker that ran as a systemd service also ran in that service's
 control group, named from the reservation and unable to name anything else. The cleanup reads the
 group from the kernel, asks the manager to kill what it still holds, and reaches a process the
-worker never saw. A recorded process that the group held and the manager's delivered kill found is
+worker never saw. A number the group lists is held only if the group still lists it after its
+process was described and a second reading gives the same process, so a number that passed to a
+process outside the group between the list and the reading is not attributed to the session. A
+recorded process that the group held and the manager's delivered kill found is
 listed as forced; a kill the cleanup stopped waiting for is not counted, a kill the manager reported
 as failed is not counted, a group the host could not read to the end beforehand attributes nothing,
 and a process that ended by itself between that reading and the kill is counted: the flag is the

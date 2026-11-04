@@ -781,47 +781,25 @@ impl Group {
     }
 }
 
-/// Adds the identity of every process in the group at `directory` and in every group below it,
-/// which is what the manager's kill reaches.
+/// The identity of every process in the group at `directory` and in every group below it, which is
+/// what the manager's kill reaches.
 ///
-/// The groups are walked by the one reader the session's own control group is read with
-/// (`kr_worker::session_group::members`).
+/// The groups are walked by the reader the worker names its service's members with
+/// (`kr_worker::session_group::identities`), which keeps a listed number only when the group still
+/// lists it after its process was described and the process is the same on a second reading: a
+/// number that passed to a process outside the group between the list and the reading is not held.
 ///
 /// # Errors
 ///
 /// Returns why the walk could not read all of them: a list or a directory the kernel would not
-/// give, a process it would not describe (asked twice), a process the kernel listed and `/proc`
-/// does not show, or more groups than the walk reads. A process that moves from one group to
-/// another while the walk runs can be read twice or not at all, which only the group's `populated`
-/// line, never this list, answers for.
+/// give, a process it would not describe (asked twice), or more groups than the walk reads. A
+/// process that moves from one group to another while the walk runs can be read twice or not at
+/// all, which only the group's `populated` line, never this list, answers for.
 #[cfg(target_os = "linux")]
 fn members_below(
     directory: &std::path::Path,
-    held: &mut Vec<ProcessStartIdentity>,
-) -> std::result::Result<(), String> {
-    for pid in kr_worker::session_group::members(directory)? {
-        // Asked twice: a process that ends while it is described reads as unestablished once,
-        // and as gone the second time.
-        let described = match kr_ipc::identity::query_process(pid) {
-            kr_ipc::identity::ProcessQuery::CannotEstablish(_) => {
-                kr_ipc::identity::query_process(pid)
-            }
-            answer => answer,
-        };
-        match described {
-            kr_ipc::identity::ProcessQuery::Present(identity) => {
-                if !held.contains(&identity) {
-                    held.push(identity);
-                }
-            }
-            // Listed by the group a moment ago and held by nobody now: it ended.
-            kr_ipc::identity::ProcessQuery::Gone => {}
-            kr_ipc::identity::ProcessQuery::CannotEstablish(error) => {
-                return Err(format!("process {pid} could not be described: {error}"));
-            }
-        }
-    }
-    Ok(())
+) -> std::result::Result<Vec<ProcessStartIdentity>, String> {
+    kr_worker::session_group::identities(directory)
 }
 
 /// Reads a control group from the unified hierarchy's files; `members` says whether to list who is
@@ -861,18 +839,15 @@ fn read_group_under(root: &std::path::Path, path: &str, members: bool) -> Holder
             match populated {
                 Some("0") => Holders::None,
                 Some("1") if !members => Holders::Some(Vec::new()),
-                Some("1") => {
-                    let mut held = Vec::new();
-                    match members_below(&directory, &mut held) {
-                        Err(why) => Holders::Unreadable(format!(
-                            "the control group {path} could not be read to the end: {why}"
-                        )),
-                        Ok(()) if held.is_empty() => Holders::Unreadable(format!(
-                            "the control group {path} holds processes this host could not describe"
-                        )),
-                        Ok(()) => Holders::Some(held),
-                    }
-                }
+                Some("1") => match members_below(&directory) {
+                    Err(why) => Holders::Unreadable(format!(
+                        "the control group {path} could not be read to the end: {why}"
+                    )),
+                    Ok(held) if held.is_empty() => Holders::Unreadable(format!(
+                        "the control group {path} holds processes this host could not describe"
+                    )),
+                    Ok(held) => Holders::Some(held),
+                },
                 _ => Holders::Unreadable(format!("the control group {path} has no populated line")),
             }
         }
@@ -918,6 +893,41 @@ mod tests {
             read_group_under(root.path(), UNIT_PATH, true),
             Holders::Unreadable(why) if why.contains("cannot name")
         ));
+    }
+
+    /// A number the group listed can pass to another process before that process is described. The
+    /// newcomer is no member of the group, so the read does not name it: the group is listed again
+    /// once the identities are read, and a number it no longer lists is not held.
+    ///
+    /// The listing is a directory's file, as the kernel's is, and the seam empties it as the
+    /// number's process is read, which is what the kernel's list would say once the member had gone
+    /// and a process outside the group held its number.
+    #[test]
+    fn a_number_that_passes_to_a_process_outside_the_group_after_it_was_listed_is_not_held() {
+        let mut newcomer = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("starts a process");
+        let number = newcomer.id();
+        let (root, unit) = unit_holding(&format!("{number}\n"));
+        let list = unit.join("cgroup.procs");
+        let read = kr_ipc::identity::after_each_read(
+            move |pid, file| {
+                if pid == number && file == "stat" {
+                    std::fs::write(&list, "").expect("the list after the member went");
+                }
+            },
+            || read_group_under(root.path(), UNIT_PATH, true),
+        );
+        newcomer.kill().expect("ends the process");
+        let _ = newcomer.wait();
+        assert!(
+            !matches!(
+                &read,
+                Holders::Some(held) if held.iter().any(|identity| identity.pid.get() == u64::from(number))
+            ),
+            "the process that holds the number now is not in the group: {read:?}"
+        );
     }
 
     /// The walk reads at most [`GROUP_BUDGET`] groups, counting the ones it has queued: a

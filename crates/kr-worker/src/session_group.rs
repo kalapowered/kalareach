@@ -355,6 +355,72 @@ pub fn members(_path: &Path) -> Result<Vec<u32>, String> {
     Err("this platform makes no session group".to_owned())
 }
 
+/// Every process in the control group at `directory` and in every group below it, named by its
+/// identity, each one a process that the group lists after its identity was read.
+///
+/// A list names numbers, and a number can pass to another process before that process is read:
+/// the member it named ended and a process outside the group took its number. So the identities are
+/// read from the first list, the group is listed again, and a number is kept only when the second
+/// list still names it and a second reading of it gives the identity the first did. A number the
+/// group no longer lists, and one whose identity changed between the readings, are not members.
+/// A process the kernel no longer describes is one that ended.
+///
+/// # Errors
+///
+/// Returns why the group could not be read, as [`members`] does, or the process the kernel listed
+/// and would not describe (asked twice, since a process that ends while it is described reads as
+/// unestablished once and as gone the second time).
+#[cfg(target_os = "linux")]
+pub fn identities(
+    directory: &Path,
+) -> Result<Vec<kr_protocol::identity::ProcessStartIdentity>, String> {
+    identities_describing(directory, |pid| {
+        match kr_ipc::identity::query_process(pid) {
+            kr_ipc::identity::ProcessQuery::CannotEstablish(_) => {
+                kr_ipc::identity::query_process(pid)
+            }
+            answer => answer,
+        }
+    })
+}
+
+/// [`identities`], with the reading of one process given.
+#[cfg(target_os = "linux")]
+fn identities_describing(
+    directory: &Path,
+    mut describe: impl FnMut(u32) -> kr_ipc::identity::ProcessQuery,
+) -> Result<Vec<kr_protocol::identity::ProcessStartIdentity>, String> {
+    use kr_ipc::identity::ProcessQuery;
+
+    let mut described = Vec::new();
+    for pid in members(directory)? {
+        match describe(pid) {
+            ProcessQuery::Present(identity) => described.push((pid, identity)),
+            // Listed a moment ago and held by nobody now: it ended.
+            ProcessQuery::Gone => {}
+            ProcessQuery::CannotEstablish(error) => {
+                return Err(format!("process {pid} could not be described: {error}"));
+            }
+        }
+    }
+    let listed_again = members(directory)?;
+    let mut held = Vec::new();
+    for (pid, identity) in described {
+        if listed_again.binary_search(&pid).is_err() {
+            continue;
+        }
+        match describe(pid) {
+            ProcessQuery::Present(now) if now == identity => held.push(identity),
+            // The number is another process's now, or nobody's.
+            ProcessQuery::Present(_) | ProcessQuery::Gone => {}
+            ProcessQuery::CannotEstablish(error) => {
+                return Err(format!("process {pid} could not be described: {error}"));
+            }
+        }
+    }
+    Ok(held)
+}
+
 /// Whether the kernel says the control group at `directory`, with every group below it, holds a
 /// process: its `populated` line, which answers for the whole at once where a walk of the lists
 /// can miss a process that moves between two groups while they are read. A group that is not there
@@ -523,6 +589,54 @@ mod tests {
         assert!(
             members(&unreadable).is_err(),
             "a list that cannot be read is not an empty group"
+        );
+    }
+
+    /// KR-REQ-07.60: a listed number is held only by the process that was described, when the
+    /// group lists it again afterwards and a second reading gives the same identity. A number the
+    /// group stops listing, one whose reading changes, and one that is nobody's by then are not
+    /// members. The kernel never gives a number two identities at once, so the readings are told.
+    #[test]
+    fn a_listed_number_is_held_only_by_the_process_described_before_and_after_the_second_listing() {
+        use kr_ipc::identity::ProcessQuery;
+        use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
+
+        let at = |pid: u64, start: u64| {
+            ProcessStartIdentity::new(pid, ProcessStartSource::LinuxProcStat, start)
+        };
+        let root = tempfile::tempdir().expect("a directory");
+        let group = root.path().join("session");
+        std::fs::create_dir(&group).expect("the group");
+        let list = group.join("cgroup.procs");
+        std::fs::write(&list, "10\n20\n30\n40\n").expect("the group's list");
+
+        let mut readings: Vec<(u32, u64)> = Vec::new();
+        let held = identities_describing(&group, |pid| {
+            let earlier = readings.iter().filter(|(read, _)| *read == pid).count();
+            readings.push((pid, 0));
+            match (pid, earlier) {
+                // Described as the same process both times: held.
+                (10, _) => ProcessQuery::Present(at(10, 1)),
+                // Another process holds the number at the second reading.
+                (20, 0) => ProcessQuery::Present(at(20, 1)),
+                (20, _) => ProcessQuery::Present(at(20, 2)),
+                // Nobody holds the number at the second reading.
+                (30, 0) => ProcessQuery::Present(at(30, 1)),
+                (30, _) => ProcessQuery::Gone,
+                // The group stops listing the number as it is described, so it is read no more.
+                (40, _) => {
+                    std::fs::write(&list, "10\n20\n30\n").expect("the list after 40 went");
+                    ProcessQuery::Present(at(40, 1))
+                }
+                _ => ProcessQuery::Gone,
+            }
+        })
+        .expect("the group is read");
+        assert_eq!(held, vec![at(10, 1)]);
+        assert_eq!(
+            readings.iter().filter(|(pid, _)| *pid == 40).count(),
+            1,
+            "a number the second listing lacks is not described again"
         );
     }
 

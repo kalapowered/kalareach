@@ -1305,14 +1305,16 @@ impl OwnedProcesses {
     /// it is in nothing the session reads. It is the service's, not the session's, and the closure
     /// does not call the session covered while one runs. A process the worker runs for itself
     /// (a probe, a query of the login manager) is one the session did not record, and a close that
-    /// finds one still running reads incomplete rather than complete.
+    /// finds one still running reads incomplete rather than complete. A number the service lists is
+    /// counted only if it still lists it once the process is described, as the same process: a
+    /// number that passed to a process outside the service is no stranger in it.
     #[cfg(target_os = "linux")]
     fn the_service_holds_only_the_workers(&self, session: &std::path::Path) -> bool {
         let Some(service) = session.parent() else {
             return true;
         };
-        let listed = match crate::session_group::members(service) {
-            Ok(listed) => listed,
+        let held = match crate::session_group::identities(service) {
+            Ok(held) => held,
             Err(error) => {
                 self.note_unestablished(format!(
                     "the worker's service at {} would not say what it holds: {error}",
@@ -1321,24 +1323,11 @@ impl OwnedProcesses {
                 return false;
             }
         };
-        let mut strangers = 0_usize;
-        for pid in listed.into_iter().filter(|pid| *pid != std::process::id()) {
-            match kr_ipc::identity::query_process(pid) {
-                kr_ipc::identity::ProcessQuery::Present(identity) => {
-                    if !self.seen.contains_key(&key(&identity)) {
-                        strangers += 1;
-                    }
-                }
-                // Listed a moment ago and held by nobody now: it ended.
-                kr_ipc::identity::ProcessQuery::Gone => {}
-                kr_ipc::identity::ProcessQuery::CannotEstablish(error) => {
-                    self.note_unestablished(format!(
-                        "process {pid} in the worker's service could not be described: {error}"
-                    ));
-                    return false;
-                }
-            }
-        }
+        let strangers = held
+            .iter()
+            .filter(|identity| identity.pid.get() != u64::from(std::process::id()))
+            .filter(|identity| !self.seen.contains_key(&key(identity)))
+            .count();
         if strangers == 0 {
             return true;
         }
@@ -2383,6 +2372,47 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("did not record")),
             "and the receipt says why: {:?}",
+            owned.unestablished()
+        );
+    }
+
+    /// KR-REQ-07.60: a number the service listed can pass to a process outside the service before
+    /// that process is described. The newcomer is no stranger of the service's, so the cover does
+    /// not read incomplete for it: the service is listed again once the processes are described,
+    /// and a number it no longer lists is not counted.
+    ///
+    /// The listing is a directory's file, as the kernel's is, and the seam empties it as the
+    /// number's process is read, which is what the kernel's list would say once the member had gone
+    /// and a process outside the service held its number.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_number_that_passes_to_a_process_outside_the_service_is_not_a_stranger_in_it() {
+        let (groups, session) = an_empty_group();
+        let mut newcomer = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("starts a process");
+        let number = newcomer.id();
+        let list = groups.path().join("service").join("cgroup.procs");
+        std::fs::write(&list, format!("{number}\n")).expect("the service's list");
+        let owned = OwnedProcesses::establish(
+            OwnershipBoundary::ControlGroup { path: session },
+            identity(u64::from(u32::MAX) + 1),
+        );
+        let coverage = kr_ipc::identity::after_each_read(
+            move |pid, file| {
+                if pid == number && file == "stat" {
+                    std::fs::write(&list, "").expect("the list after the member went");
+                }
+            },
+            || owned.coverage(),
+        );
+        newcomer.kill().expect("ends the process");
+        let _ = newcomer.wait();
+        assert_eq!(
+            coverage,
+            OwnershipCoverage::Complete,
+            "{:?}",
             owned.unestablished()
         );
     }
