@@ -1432,7 +1432,9 @@ async fn the_command_the_integration_answered_for_names_the_program_that_runs_it
     // script and runs nothing of it.
     let watcher = setup.host.root().join("watcher");
     std::fs::write(&watcher, "#!/bin/sh\nexec tail -f \"$0\"\n").expect("the script tail reads");
-    let started = setup.spawn_in_a_group(Command::new("tail").arg("-f").arg(&watcher));
+    let mut tail = Command::new("tail");
+    tail.arg("-f").arg(&watcher);
+    let started = setup.spawn_in_a_group(tail);
     let foreground = Setup::foreground(&started, vec![(watcher.display().to_string(), None)]);
     let named = look_until_named(&mut following, &producer, &foreground);
     assert_eq!(
