@@ -196,6 +196,24 @@ impl SessionGroup {
     pub fn discard(self) {
         let _ = std::fs::remove_dir(&self.path);
     }
+
+    /// Ends whatever is in the group, then removes it: for a launch that was refused, which may
+    /// have started the shell and so may have put processes in the group it was placed in. A
+    /// kernel without `cgroup.kill` (before 5.14) is asked to end each process the group lists,
+    /// by its identity. Nothing is reported: a group that still holds a process the kernel is
+    /// ending, or one that could not be read, is removed with the service.
+    pub fn end(self) {
+        #[cfg(target_os = "linux")]
+        if let Err(error) = kill(&self.path)
+            && error.kind() == std::io::ErrorKind::NotFound
+            && let Ok(held) = identities(&self.path)
+        {
+            for identity in held {
+                let _ = kr_ipc::identity::stop_process(&identity, kr_ipc::identity::Stop::Kill);
+            }
+        }
+        self.discard();
+    }
 }
 
 /// Whether the process is in the group named `relative`, or in one below it.

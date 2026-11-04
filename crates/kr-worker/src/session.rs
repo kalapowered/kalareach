@@ -872,8 +872,10 @@ impl Session {
                 Ok(())
             }
             Err(error) => {
+                // A shell that started and could not be recorded was ended with its process
+                // group; the session's control group, if it has one, is ended too.
                 if let Some(placed) = placed {
-                    placed.discard();
+                    placed.end();
                 }
                 self.record_closure(ClosureReason::RootLaunchFailed, None);
                 Err(error)

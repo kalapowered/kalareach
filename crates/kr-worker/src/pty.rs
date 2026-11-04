@@ -189,11 +189,23 @@ impl Pty {
     /// # Errors
     ///
     /// Returns what `admit` returns when it refuses, and [`WorkerError::Pty`] when the shell
-    /// cannot be started, or when a shell has already been started in this terminal.
+    /// cannot be started, or when a shell has already been started in this terminal. A shell that
+    /// was started and whose identity cannot be read is ended and collected before the launch
+    /// returns that refusal.
     pub fn launch(
         &mut self,
         command: &ShellCommand,
+        admit: impl FnMut(bool) -> Result<()>,
+    ) -> Result<RootShell> {
+        self.launch_reading(command, admit, kr_ipc::identity::started_process_identity)
+    }
+
+    /// [`Self::launch`], with the reading of the started shell's identity given.
+    fn launch_reading(
+        &mut self,
+        command: &ShellCommand,
         mut admit: impl FnMut(bool) -> Result<()>,
+        read_identity: impl FnOnce(u32) -> kr_ipc::Result<ProcessStartIdentity>,
     ) -> Result<RootShell> {
         let running = || WorkerError::pty("start the root shell", "a shell is already running");
         if self.slave.is_none() {
@@ -208,12 +220,12 @@ impl Pty {
         admit(named_is_there)?;
         let slave = self.slave.take().ok_or_else(running)?;
         #[cfg(unix)]
-        let child: Box<dyn portable_pty::Child + Send + Sync> = Box::new(
+        let mut child: Box<dyn portable_pty::Child + Send + Sync> = Box::new(
             spawn::start(&slave, reads, command, self.session_procs.take())
                 .map_err(|error| WorkerError::pty("start the root shell", error))?,
         );
         #[cfg(windows)]
-        let child = {
+        let mut child = {
             let mut builder = CommandBuilder::new(&command.program);
             for argument in &command.arguments {
                 builder.arg(argument);
@@ -236,9 +248,6 @@ impl Pty {
         // after the shell exits, so the read loop would never see end of file and the session
         // would look busy for ever.
         drop(slave);
-        let pid = child
-            .process_id()
-            .ok_or_else(|| WorkerError::pty("start the root shell", "no process identifier"))?;
         // A shell can be gone before this reads it. `exit 0` in a startup file, a shell that cannot
         // open something it needs, a program that is not the shell it was declared to be: all of
         // them run and leave inside the moment between the spawn above and the reading here, and on
@@ -246,7 +255,22 @@ impl Pty {
         // failure. The shell ran, and the session it belongs to closes on the root shell's exit
         // through the ordinary sequence, with its status read from the child itself; what this
         // needs is an identity that says so rather than an error that loses it.
-        let identity = kr_ipc::identity::started_process_identity(pid)?;
+        let identity = match child.process_id() {
+            Some(pid) => read_identity(pid).map_err(WorkerError::from),
+            None => Err(WorkerError::pty(
+                "start the root shell",
+                "no process identifier",
+            )),
+        };
+        let identity = match identity {
+            Ok(identity) => identity,
+            // A shell that is running and cannot be recorded would run on with no session to
+            // end it.
+            Err(refusal) => {
+                end_unrecorded(&mut *child);
+                return Err(refusal);
+            }
+        };
         Ok(RootShell {
             child,
             identity,
@@ -415,6 +439,27 @@ impl Pty {
         self.dimensions = dimensions;
         Ok(())
     }
+}
+
+/// Ends a shell that was started and could not be recorded, and collects it, so that the launch
+/// that refuses leaves no process behind.
+///
+/// The shell leads its session and its process group, and what it started in that group ends with
+/// it. A job it put in a group of its own is outside this: where the session has a control group,
+/// the caller ends the group; elsewhere nothing records the job, and it is the account's to stop.
+/// The child has not been collected, so its number cannot have passed to another process and the
+/// group is still its own.
+fn end_unrecorded(child: &mut (dyn portable_pty::Child + Send + Sync)) {
+    #[cfg(unix)]
+    if let Some(group) = child
+        .process_id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// The root shell running in a session's terminal.
@@ -854,6 +899,55 @@ mod tests {
             pty.launch(&crate::testing::posix_script("exit 0"), |_| Ok(())),
             Err(WorkerError::Pty { .. })
         ));
+    }
+
+    /// A shell that was started and whose identity cannot be read is ended and collected before the
+    /// launch refuses: the refusal leaves no process running and none waiting to be collected.
+    ///
+    /// A shell that is not collected holds its number, even as a zombie, so the case asks whether
+    /// the number still names the shell it started, which says nothing about another process that
+    /// has the number now and takes no status from one. A shell that is left is ended and
+    /// collected by the case itself, so that a failure leaves nothing behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_whose_identity_cannot_be_read_is_ended_and_collected_before_the_launch_refuses() {
+        use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
+
+        let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
+        let mut started = None;
+        let refused = pty.launch_reading(
+            &crate::testing::posix_script("sleep 600"),
+            |_| Ok(()),
+            |pid| {
+                started = Some((pid, kr_ipc::identity::started_process_identity(pid).ok()));
+                Err(kr_ipc::IpcError::IdentityUnavailable {
+                    what: "process start identity",
+                    detail: "the case would not say".to_owned(),
+                })
+            },
+        );
+        let (number, shell) = started.expect("the shell was started");
+        let left = shell.is_some_and(|shell| {
+            kr_ipc::identity::process_start_identity(number).is_ok_and(|now| now == shell)
+        });
+        if left {
+            // The number still names the shell, which nothing has collected, so it is still the
+            // test's child and the number is not another process's.
+            let pid = i32::try_from(number)
+                .ok()
+                .and_then(Pid::from_raw)
+                .expect("a process number");
+            let _ = kill_process(pid, Signal::KILL);
+            let _ = waitpid(Some(pid), WaitOptions::empty());
+        }
+        assert!(
+            matches!(refused, Err(WorkerError::Ipc(_))),
+            "the refusal says why: {refused:?}"
+        );
+        assert!(
+            !left,
+            "the shell was still there, running or waiting to be collected, when the launch refused"
+        );
     }
 
     /// KR-REQ-19.04 and KR-REQ-25.14: a start the admission refuses has created no process and
