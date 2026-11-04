@@ -1037,21 +1037,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_key_that_cannot_be_read_is_not_written_back() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let directory = std::env::temp_dir().join(format!("kr-gsettings-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).expect("a directory");
-        let program = directory.join("gsettings");
-        let log = directory.join("calls");
-        std::fs::write(
+        // A directory of this run's own, so that no record an earlier run left can stand for a call
+        // this one made.
+        let directory = kr_ipc::testing::PrivateTempDir::create();
+        let program = directory.path().join("gsettings");
+        let log = directory.path().join("calls");
+        kr_ipc::testing::place_script(
             &program,
             format!(
                 "#!/bin/sh\necho \"$1\" >> '{}'\n[ \"$1\" = get ] && exit 1\nexit 0\n",
                 log.display()
             ),
-        )
-        .expect("a program");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-            .expect("executable");
+        );
         let gsettings = Gsettings {
             program,
             environment: Vec::new(),
@@ -1066,12 +1063,11 @@ mod tests {
             "custom-command",
             Some("'/bin/x'")
         ));
-        let calls = std::fs::read_to_string(&log).expect("the calls");
+        let calls = std::fs::read_to_string(&log).expect("gsettings was run, and recorded a call");
         assert!(
-            calls.lines().all(|call| call == "get"),
-            "only reads reached it: {calls}"
+            calls.lines().next().is_some() && calls.lines().all(|call| call == "get"),
+            "gsettings was run, and only reads reached it: {calls}"
         );
-        let _ = std::fs::remove_dir_all(directory);
     }
 
     /// Two readings of one string are one value whatever quotes they are printed in.
