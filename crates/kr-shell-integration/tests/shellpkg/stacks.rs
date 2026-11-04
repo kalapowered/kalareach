@@ -2285,19 +2285,22 @@ impl Session {
 
     /// Takes the reader that is running now to a fenced empty prompt.
     ///
-    /// A reader that answers at its next step is given a key behind the frames the harness writes
-    /// that ask it for something. One that is slower to act on a key than the harness is to type
-    /// the next judges the fence with a key still unread, and reports an input queue as holding
-    /// input: keys typed first go first, as the contract says. On such a reader a fence whose
-    /// answer reports the terminal's or the macro queue so is asked again, about the same prompt,
-    /// until the reader judges it with its keys taken or the reply window of that prompt ends. The
-    /// first fence is written under a reply window of its own, whatever the wait for the entry
-    /// took. The reply window of the prompt starts once that fence is written: its answer, and
-    /// every fence asked again, answer to it and buy no other. A reader that never takes its keys,
-    /// or stays slower than the harness types them, reports them for that long and fails on it,
-    /// with the last report it made, wherever in the window it ends. A reader that reports a
-    /// partial key sequence is not asked again, since no key typed here leaves one, and neither is
-    /// a reader that is given no keys: their report is the one that counts.
+    /// A reader that has not yet taken what is in the terminal's queue judges the fence with it
+    /// still unread, and reports an input queue as holding input: keys typed first go first, as
+    /// the contract says. A reader that answers at its next step is given a key behind the frames
+    /// the harness writes that ask it for something, and is slower to act on it than the harness
+    /// is to type the next; Fish has reported its terminal queue as holding input at a fresh
+    /// prompt. On every reader a fence whose answer reports the terminal's or the macro queue so
+    /// is asked again, about the same prompt, until the reader judges it with what it was given
+    /// taken or the reply window of that prompt ends. The first fence is written under a reply
+    /// window of its own, whatever the wait for the entry took. The reply window of the prompt
+    /// starts once that fence is written: its answer, and every fence asked again, answer to it
+    /// and buy no other. A reader that never takes what it was given, or stays slower than the
+    /// harness gives it, reports a queue holding input for that long and fails on it, with the
+    /// last report it made, wherever in the window it ends: between two fences, while one is
+    /// written to an endpoint the shell does not read, or while one waits for its answer. A reader
+    /// that reports a partial key sequence is not asked again, since no key typed here leaves one:
+    /// that report is the one that counts.
     ///
     /// # Panics
     ///
@@ -2311,7 +2314,6 @@ impl Session {
         // its next boundary, which is what this does rather than calling the refusal a failure.
         // What ends the asking is the clock; the count is kept for the failure to report.
         let deadline = self.deadline_for(FENCE);
-        let may_ask_again = dialect(self.package_kind).answers_at_the_next_step;
         // The prompt a fence was asked about whose answer found input unread, with the end of the
         // reply window of that prompt and what the answer reported: the reader is the one that is
         // running still, so it is asked about again and no new entry is waited for.
@@ -2336,7 +2338,21 @@ impl Session {
             // window the answers answer to starts once it is written: the write is not taken from
             // the reader's time to answer.
             let (asked, until) = match &window {
-                Some((until, _)) => (self.ask_before(request, *until), *until),
+                // A window that ends while a fence asked again is written ends the case with the
+                // last report the reader made, as one that ends before it is answered does.
+                Some((until, reported)) => (
+                    self.try_ask_before(request, *until)
+                        .unwrap_or_else(|Stalled| {
+                            panic!(
+                                "an idle reader reported a queue still holding input in {} fences, \
+                             and the shell did not read the next before the window ended: \
+                             {reported:?}\nterminal output:\n{}",
+                                attempts - 1,
+                                self.terminal_output()
+                            )
+                        }),
+                    *until,
+                ),
                 None => (self.ask(request), self.deadline_for(REPLY).0),
             };
             let answer = match window {
@@ -2359,8 +2375,7 @@ impl Session {
             match answer {
                 BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement)) => {
                     let queues = acknowledgement.queues;
-                    if may_ask_again && Self::input_not_yet_taken(queues) && Instant::now() < until
-                    {
+                    if Self::input_not_yet_taken(queues) && Instant::now() < until {
                         eprintln!(
                             "a fence found input the reader had not taken; asking again \
                              ({attempts})"

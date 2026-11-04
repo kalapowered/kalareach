@@ -144,7 +144,7 @@ impl Session {
         let mut attempts = 0;
         loop {
             attempts += 1;
-            let id = self.ask_before(
+            let Ok(id) = self.try_ask_before(
                 WorkerRequest::Fence(RootEditorFenceParams {
                     session_id: self.session_id,
                     fence_id: fence,
@@ -154,7 +154,12 @@ impl Session {
                     cause: FenceCause::EditorEntry,
                 }),
                 deadline.0,
-            );
+            ) else {
+                return Err(format!(
+                    "the shell stopped reading its end of the endpoint while fence {attempts} \
+                     was written, and the deadline of this wait passed"
+                ));
+            };
             match self.answer_by(id, deadline) {
                 Some(BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement))) => {
                     return Ok(acknowledgement);

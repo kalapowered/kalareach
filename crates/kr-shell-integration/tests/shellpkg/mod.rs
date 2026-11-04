@@ -306,6 +306,11 @@ pub enum Delivery {
     PeerGone,
 }
 
+/// The bridge took nothing more of a write before the deadline the write was given: the shell is
+/// not reading its end of the endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stalled;
+
 /// How long a torn-down session waits for the thread reading its terminal to stop.
 const READER_STOP: Duration = Duration::from_secs(5);
 
@@ -1266,11 +1271,6 @@ impl Session {
             command.env(name, value);
         }
 
-        let mut child = pty
-            .slave
-            .spawn_command(command)
-            .expect("the packaged shell starts");
-        drop(pty.slave);
         // The terminal is read, and its queries answered, before the shell starts: the shell asks
         // its first question as it draws its first prompt.
         let TerminalReading {
@@ -1280,6 +1280,11 @@ impl Session {
             stopped,
             stopped_reading,
         } = read_terminal(pty.master.as_ref());
+        let mut child = pty
+            .slave
+            .spawn_command(command)
+            .expect("the packaged shell starts");
+        drop(pty.slave);
 
         // A shell that is not managed connects to nothing. The stream a session reads is then one
         // whose other end this session holds and never writes to, so a read finds nothing.
@@ -1544,13 +1549,25 @@ impl Session {
     ///
     /// Panics when the bridge has gone and no caller expected it to.
     pub fn write_frame_before(&mut self, frame: &BridgeFrame, deadline: Instant) {
-        let delivery = self.write_frames_before(std::slice::from_ref(frame), deadline);
+        self.try_write_frame_before(frame, deadline)
+            .unwrap_or_else(|Stalled| panic!("the bridge stopped reading"));
+    }
+
+    /// As [`Session::write_frame_before`], and says that the endpoint took nothing more before
+    /// `deadline` instead of panicking.
+    fn try_write_frame_before(
+        &mut self,
+        frame: &BridgeFrame,
+        deadline: Instant,
+    ) -> Result<(), Stalled> {
+        let delivery = self.try_write_frames_before(std::slice::from_ref(frame), deadline)?;
         assert!(
             delivery == Delivery::Delivered || self.closure_expected,
             "the bridge's side of the endpoint has gone and this write did not expect it; the \
              terminal showed:\n{}",
             self.terminal_output()
         );
+        Ok(())
     }
 
     /// Sends several frames in one write, so the reader takes them off the endpoint together.
@@ -1569,10 +1586,25 @@ impl Session {
     ///
     /// A caller waiting for one condition under a deadline of its own passes it here, so neither
     /// the endpoint's backpressure nor the step the editor is given afterwards outlasts it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint takes none of the rest by `deadline`.
     #[must_use]
     pub fn write_frames_before(&mut self, frames: &[BridgeFrame], deadline: Instant) -> Delivery {
+        self.try_write_frames_before(frames, deadline)
+            .unwrap_or_else(|Stalled| panic!("the bridge stopped reading"))
+    }
+
+    /// As [`Session::write_frames_before`], and says that the endpoint took nothing more before
+    /// `deadline` instead of panicking, for a caller that has something to report with it.
+    fn try_write_frames_before(
+        &mut self,
+        frames: &[BridgeFrame],
+        deadline: Instant,
+    ) -> Result<Delivery, Stalled> {
         if self.shut || self.peer_write_gone {
-            return Delivery::PeerGone;
+            return Ok(Delivery::PeerGone);
         }
         let mut bytes = Vec::new();
         for frame in frames {
@@ -1594,12 +1626,14 @@ impl Session {
             match self.stream.write(&bytes[written..]) {
                 Ok(0) => {
                     self.peer_write_gone = true;
-                    return Delivery::PeerGone;
+                    return Ok(Delivery::PeerGone);
                 }
                 Ok(count) => written += count,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     let left = deadline.saturating_duration_since(Instant::now());
-                    assert!(!left.is_zero(), "the bridge stopped reading");
+                    if left.is_zero() {
+                        return Err(Stalled);
+                    }
                     wait_until_ready(&self.stream, PollFlags::OUT, left);
                 }
                 Err(error)
@@ -1609,7 +1643,7 @@ impl Session {
                     ) =>
                 {
                     self.peer_write_gone = true;
-                    return Delivery::PeerGone;
+                    return Ok(Delivery::PeerGone);
                 }
                 Err(error) => panic!("writing to the bridge: {error}"),
             }
@@ -1617,7 +1651,7 @@ impl Session {
         // An editor that reaches its own queue only when the reader steps is given that step here,
         // which is the one a person at the keyboard gives it by typing at all.
         self.nudge_before(deadline);
-        Delivery::Delivered
+        Ok(Delivery::Delivered)
     }
 
     /// The length of the whole frame at the front of what has been received, where one is there.
@@ -2121,11 +2155,26 @@ impl Session {
     }
 
     /// Sends one request the endpoint has until `deadline` to take, and returns its identifier.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint takes none of the rest by `deadline`.
     pub fn ask_before(&mut self, request: WorkerRequest, deadline: Instant) -> RequestId {
+        self.try_ask_before(request, deadline)
+            .unwrap_or_else(|Stalled| panic!("the bridge stopped reading"))
+    }
+
+    /// As [`Session::ask_before`], and says that the endpoint took nothing more before `deadline`
+    /// instead of panicking, for a caller that has the reader's last report to give with it.
+    pub fn try_ask_before(
+        &mut self,
+        request: WorkerRequest,
+        deadline: Instant,
+    ) -> Result<RequestId, Stalled> {
         let id = RequestId::new(self.next_request);
         self.next_request += 1;
-        self.write_frame_before(&BridgeFrame::Request { id, request }, deadline);
-        id
+        self.try_write_frame_before(&BridgeFrame::Request { id, request }, deadline)?;
+        Ok(id)
     }
 
     /// Sends one request to a reader that has been given its step already, without giving it
@@ -2945,55 +2994,6 @@ impl TerminalInput {
     }
 }
 
-/// The queries an editor asks the terminal at every prompt, each with the reply a terminal gives.
-const TERMINAL_QUERIES: &[(&[u8], &[u8])] = &[
-    (b"\x1b[6n", b"\x1b[1;1R"),
-    (b"\x1b[c", b"\x1b[?6c"),
-    (b"\x1b[0c", b"\x1b[?6c"),
-    (b"\x1b]11;?", b"\x1b]11;rgb:0000/0000/0000\x1b\\"),
-];
-
-/// Answers the queries a terminal is expected to answer while an editor draws a prompt.
-///
-/// An editor that asks where the cursor is and waits for the reply cannot start its read loop
-/// until something answers, so this terminal answers rather than leaving it waiting. It answers on
-/// this thread, the one that read the query: an answer that arrives after the editor has stopped
-/// waiting for it is read as keys a person typed, and the prompt the test then types at is not the
-/// one it thinks.
-///
-/// A query is a sequence in the stream the terminal shows, not in one read of it: a pseudo-terminal
-/// hands over what has arrived, and on a loaded machine that can be the first bytes of a query and
-/// then the rest. So what could be the start of one is kept from each read, a query cut between two
-/// reads is found once it is whole, and a query that ended in an earlier read is not answered
-/// again.
-struct TerminalQueries {
-    /// The last bytes read, which could be the start of a query the next read finishes.
-    carry: Vec<u8>,
-    /// How many bytes of the terminal's output have been read.
-    read: usize,
-    /// Where, in the terminal's output, the last cursor query this has answered ends. The editor
-    /// reads the keys typed at it once it has the answer, so a line typed before that is typed
-    /// while the editor is still starting to read.
-    cursor_answered_to: Arc<AtomicUsize>,
-}
-
-impl TerminalQueries {
-    fn new(cursor_answered_to: Arc<AtomicUsize>) -> Self {
-        Self {
-            carry: Vec::new(),
-            read: 0,
-            cursor_answered_to,
-        }
-    }
-
-    /// Takes the next bytes the terminal showed and answers each query that ended in them.
-    fn answer(&mut self, bytes: &[u8], terminal: &TerminalInput) {
-        let kept = self.carry.len();
-        let stream = [self.carry.as_slice(), bytes].concat();
-        // Where the first byte of `stream` is in the terminal's output as a whole.
-        let origin = self.read - kept;
-        self.read += bytes.len();
-        let mut reply: Vec<u8> = Vec::new();
 /// What reads one session's terminal: the transcript it fills, the side that types on it, where in
 /// the transcript the last cursor query it answered ends, the flag that ends the reading and the
 /// report that the reading has ended.
@@ -3063,6 +3063,55 @@ fn read_terminal(master: &dyn MasterPty) -> TerminalReading {
     }
 }
 
+/// The queries an editor asks the terminal at every prompt, each with the reply a terminal gives.
+const TERMINAL_QUERIES: &[(&[u8], &[u8])] = &[
+    (b"\x1b[6n", b"\x1b[1;1R"),
+    (b"\x1b[c", b"\x1b[?6c"),
+    (b"\x1b[0c", b"\x1b[?6c"),
+    (b"\x1b]11;?", b"\x1b]11;rgb:0000/0000/0000\x1b\\"),
+];
+
+/// Answers the queries a terminal is expected to answer while an editor draws a prompt.
+///
+/// An editor that asks where the cursor is and waits for the reply cannot start its read loop
+/// until something answers, so this terminal answers rather than leaving it waiting. It answers on
+/// this thread, the one that read the query: an answer that arrives after the editor has stopped
+/// waiting for it is read as keys a person typed, and the prompt the test then types at is not the
+/// one it thinks.
+///
+/// A query is a sequence in the stream the terminal shows, not in one read of it: a pseudo-terminal
+/// hands over what has arrived, and on a loaded machine that can be the first bytes of a query and
+/// then the rest. So what could be the start of one is kept from each read, a query cut between two
+/// reads is found once it is whole, and a query that ended in an earlier read is not answered
+/// again.
+struct TerminalQueries {
+    /// The last bytes read, which could be the start of a query the next read finishes.
+    carry: Vec<u8>,
+    /// How many bytes of the terminal's output have been read.
+    read: usize,
+    /// Where, in the terminal's output, the last cursor query this has answered ends. The editor
+    /// reads the keys typed at it once it has the answer, so a line typed before that is typed
+    /// while the editor is still starting to read.
+    cursor_answered_to: Arc<AtomicUsize>,
+}
+
+impl TerminalQueries {
+    fn new(cursor_answered_to: Arc<AtomicUsize>) -> Self {
+        Self {
+            carry: Vec::new(),
+            read: 0,
+            cursor_answered_to,
+        }
+    }
+
+    /// Takes the next bytes the terminal showed and answers each query that ended in them.
+    fn answer(&mut self, bytes: &[u8], terminal: &TerminalInput) {
+        let kept = self.carry.len();
+        let stream = [self.carry.as_slice(), bytes].concat();
+        // Where the first byte of `stream` is in the terminal's output as a whole.
+        let origin = self.read - kept;
+        self.read += bytes.len();
+        let mut reply: Vec<u8> = Vec::new();
         let mut cursor_answered_to = None;
         let mut at = 0;
         while at < stream.len() {
