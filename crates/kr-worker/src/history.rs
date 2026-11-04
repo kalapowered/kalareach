@@ -4398,6 +4398,38 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// KR-REQ-20.20: a pass that cannot take the lock at all says so beside the reason its own
+    /// bounds already left output behind for, and does not leave it unsaid because another stands.
+    #[test]
+    fn a_lock_that_cannot_be_taken_is_said_beside_a_reason_that_already_stands() {
+        let root = spool_directory("host-cap-unavailable-beside");
+        // A session cap below what this session holds, so that its own bounds give up output.
+        let retention =
+            OutputRetention::new(std::time::Duration::from_secs(7 * 24 * 60 * 60), 100, 32);
+        let layout = || SpoolLayout::new(8, 1 << 20);
+        let mut other =
+            OutputHistory::with_spool(8, root.join("other.log"), layout()).expect("a spool");
+        other.append(&[b'o'; 80]);
+        let mut this =
+            OutputHistory::with_spool(8, root.join("this.log"), layout()).expect("a spool");
+        this.append(&[b't'; 64]);
+        this.spool.as_mut().expect("a spool").refuse_remove = true;
+        let now = kr_ipc::now_ms();
+
+        std::fs::create_dir(root.join("host-cap.lock")).expect("a directory in its place");
+        this.apply_retention_to_host(&root, retention, now, true);
+        let reason = this.left_behind().expect("the pass left output behind");
+        assert!(
+            reason.contains("could not be removed"),
+            "the segment that could not go is said: {reason}"
+        );
+        assert!(
+            reason.contains("host-cap.lock"),
+            "and so is the lock that could not be taken: {reason}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// KR-REQ-20.20: a session whose spool holds no output has none to give up for the
     /// host's cap, so it does not take the lock the sessions that have some need.
     #[test]

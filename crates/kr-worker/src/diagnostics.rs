@@ -821,6 +821,164 @@ mod tests {
         );
     }
 
+    /// A writer whose writes wait for the case, as [`Stalled`] does, with what the case holds to
+    /// steer it.
+    struct Held {
+        writer: Writer,
+        /// Told once for each write that begins.
+        begun: mpsc::Receiver<()>,
+        /// Lets the write that waits end: true takes its bytes, false refuses them.
+        release: mpsc::Sender<bool>,
+        taken: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl Held {
+        fn new() -> Self {
+            let (begun, begun_at) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let taken = std::sync::Arc::default();
+            Self {
+                writer: Writer::new(Stalled {
+                    begun,
+                    release: released,
+                    taken: std::sync::Arc::clone(&taken),
+                }),
+                begun: begun_at,
+                release,
+                taken,
+            }
+        }
+
+        /// Waits until a write has begun.
+        fn begins(&self) {
+            self.begun.recv_timeout(DEADLINE).expect("a write began");
+        }
+
+        /// Lets one write end, taking its bytes.
+        fn takes(&self) {
+            self.release.send(true).expect("lets a write end");
+        }
+
+        /// Lets one write end, refusing its bytes.
+        fn refuses(&self) {
+            self.release.send(false).expect("lets a write end");
+        }
+
+        /// The reasons of the lines of output retention that the writer took, in the order it took
+        /// them.
+        fn reasons(&self) -> Vec<String> {
+            String::from_utf8(self.taken.lock().expect("not poisoned").clone())
+                .expect("text")
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix(
+                        "kr-worker: output retention left output it was asked to remove: ",
+                    )
+                })
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// A reason that returns after the line of another was refused is said again, since the log
+    /// ends on the one that was written before.
+    ///
+    /// A is written, B is in its write, C waits behind it and is refused, and A comes back. The log
+    /// ends on B, and A stands.
+    #[test]
+    fn a_reason_that_returns_after_a_line_was_refused_is_said_again() {
+        let held = Held::new();
+        let reasons = OutputReasons::default();
+
+        reasons.say(Some("A"), true, || &held.writer);
+        held.begins();
+        held.takes();
+        until(|| reasons.said().as_deref() == Some("A"));
+        reasons.say(Some("B"), true, || &held.writer);
+        held.begins();
+        reasons.say(Some("C"), true, || &held.writer);
+        held.takes();
+        held.begins();
+        held.refuses();
+        until(|| !reasons.being_written());
+        assert_eq!(held.reasons(), ["A", "B"], "the log ends on B");
+
+        reasons.say(Some("A"), true, || &held.writer);
+        assert!(
+            reasons.being_written(),
+            "A stands and the log ends on B, so A is said again"
+        );
+        held.takes();
+        assert!(held.writer.drain(DEADLINE));
+        assert_eq!(held.reasons(), ["A", "B", "A"]);
+    }
+
+    /// A reason that returns after the line of another was dropped is said again, since the log
+    /// ends on the one that was written before.
+    ///
+    /// A is written, B is in its write, the writer drops C because its queue is full, and A comes
+    /// back.
+    #[test]
+    fn a_reason_that_returns_after_a_line_was_dropped_is_said_again() {
+        let held = Held::new();
+        let reasons = OutputReasons::default();
+
+        reasons.say(Some("A"), true, || &held.writer);
+        held.begins();
+        held.takes();
+        until(|| reasons.said().as_deref() == Some("A"));
+        reasons.say(Some("B"), true, || &held.writer);
+        held.begins();
+        for number in 0..WAITING {
+            assert!(held.writer.offer(format!("line {number}\n"), None));
+        }
+        reasons.say(Some("C"), true, || &held.writer);
+        for _ in 0..=WAITING {
+            held.takes();
+        }
+        assert!(held.writer.drain(DEADLINE));
+        assert_eq!(held.reasons(), ["A", "B"], "the log ends on B");
+
+        reasons.say(Some("A"), true, || &held.writer);
+        assert!(
+            reasons.being_written(),
+            "A stands and the log ends on B, so A is said again"
+        );
+        held.takes();
+        assert!(held.writer.drain(DEADLINE));
+        assert_eq!(held.reasons(), ["A", "B", "A"]);
+    }
+
+    /// A reason that returns to the one last written while the line of another waits is said after
+    /// that line, and not at a later pass.
+    ///
+    /// A is written, B is in its write, and A comes back. The log is to end on A once B is written.
+    #[test]
+    fn a_reason_that_returns_while_the_line_of_another_waits_is_said_after_it() {
+        let held = Held::new();
+        let reasons = OutputReasons::default();
+
+        reasons.say(Some("A"), true, || &held.writer);
+        held.begins();
+        held.takes();
+        until(|| reasons.said().as_deref() == Some("A"));
+        reasons.say(Some("B"), true, || &held.writer);
+        held.begins();
+        reasons.say(Some("A"), true, || &held.writer);
+
+        held.takes();
+        held.takes();
+        assert!(held.writer.drain(DEADLINE));
+        assert_eq!(
+            held.reasons(),
+            ["A", "B", "A"],
+            "the log ends on the reason that stands"
+        );
+        reasons.say(Some("A"), true, || {
+            panic!("the log ends on A, so it is not said again")
+        });
+    }
+
     /// Fills this process's standard error, a pipe, to the last byte, so that the next write to it
     /// waits for a reader.
     #[cfg(unix)]
