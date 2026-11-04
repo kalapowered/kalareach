@@ -1,0 +1,9 @@
+# Clippy reads the nearest clippy.toml, so this file stands in for the repository's for this package
+# alone. It sets no minimum Rust version of its own: the package's `rust-version`, which is the
+# repository's, is the one Clippy then uses.
+
+disallowed-methods = [
+    # `eprintln!` and `dbg!` are refused by `clippy::print_stderr` and `clippy::dbg_macro`, in the
+    # library and in the worker's program; this refuses the route that lint does not see.
+    { path = "std::io::stderr", reason = "a write to a standard error that has stopped draining waits for a reader and nothing can cancel it; say the line with diagnostics::tell, whose thread takes the wait. The writer of diagnostics and the worker program's line at its start allow this, with the reason beside them" },
+]

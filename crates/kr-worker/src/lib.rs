@@ -46,7 +46,10 @@
 // call and no runtime waits for. `eprintln!` writes where it is called, and waits for a standard
 // error that has stopped draining, or panics at one that refuses the write; `dbg!` does the same.
 // The worker's own program, a different crate, holds itself to the same rule, except for the one
-// line every worker says at its start, which it writes where it is said.
+// line every worker says at its start, which it writes where it is said. A call of
+// `std::io::stderr()` is the route those two lints do not see, and this package's clippy.toml
+// refuses it: the writer of `diagnostics` and the cases that fill a pipe to the last byte allow it,
+// each with its reason beside it.
 #![deny(clippy::print_stderr, clippy::dbg_macro)]
 
 pub mod action;

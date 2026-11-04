@@ -21,6 +21,10 @@
 //!
 //! The write can fail as well: a volume that is full refuses it as it refused what made the host
 //! say it. A write that fails is let go.
+//!
+//! Nothing else in the worker's library writes to its standard error, and a lint refuses a direct
+//! write. The worker's program makes three writes where they are said, which its own comments name
+//! and give the reasons for.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -155,6 +159,10 @@ pub(crate) fn standard_error() -> &'static Writer {
 
 /// Where the writer of this process's standard error writes.
 #[cfg(not(feature = "testing"))]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "this is the writer whose thread takes the wait that a write to a standard error can be"
+)]
 fn destination() -> std::io::Stderr {
     std::io::stderr()
 }
@@ -175,6 +183,10 @@ static DRAIN_CALLED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new()
 /// until the program calls [`drain`]. Without the variable nothing waits, and the feature that
 /// compiles this in is one no shipped build enables.
 #[cfg(feature = "testing")]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "this is the writer whose thread takes the wait that a write to a standard error can be"
+)]
 fn destination() -> impl Write + Send + 'static {
     struct HeldForATest {
         inner: std::io::Stderr,
@@ -1060,6 +1072,10 @@ mod tests {
     /// Fills this process's standard error, a pipe, to the last byte, so that the next write to it
     /// waits for a reader.
     #[cfg(unix)]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the case needs the descriptor itself, to fill it without a write that waits"
+    )]
     fn fill_standard_error() {
         use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 

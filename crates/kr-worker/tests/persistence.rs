@@ -4420,6 +4420,10 @@ fn run_in_a_worker_process(name: &str, standard_error: StandardError) -> WorkerP
 /// Fills this process's standard error, a pipe, to the last byte, so that the next write to it
 /// waits for a reader.
 #[cfg(unix)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the case needs the descriptor itself, to fill it without a write that waits"
+)]
 fn fill_standard_error() {
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 

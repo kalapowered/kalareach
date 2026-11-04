@@ -18,12 +18,15 @@
 // The lines this program says go through `kr_worker::diagnostics`, whose thread writes them. After
 // the first line of a worker, a standard error that has stopped draining holds nothing: the program
 // waits for the thread for two seconds at its end, and no more. Three writes happen where they are
-// said, and a standard error that has stopped draining holds them: the line every worker says at
-// its start (`say_at_start`), which then holds the worker there, so that it reports itself ready
-// and ends never; the argument parser's message for a command line it refuses; and the standard
-// library's message for a panic or another fatal error, such as a failed allocation, which can come
-// at any time and may keep the process from ending. `eprintln!` and `dbg!` write where they are
-// called.
+// said, and a standard error that has stopped draining holds them. The line every worker says at
+// its start (`say_at_start`) is written there because the thread would be started for that line
+// alone, in every worker, at a cost in resident memory that the idle measurement counts; a stalled
+// standard error then holds the worker there, so that it reports itself ready and ends never. The
+// argument parser writes its message for a command line it refuses itself, and ends the process
+// before this program can hand the message over. The standard library writes the message for a
+// panic or another fatal error, such as a failed allocation, where the fault happens, at any time,
+// and it may keep the process from ending. `eprintln!`, `dbg!` and `std::io::stderr()` are refused
+// everywhere else in this package.
 #![deny(clippy::print_stderr, clippy::dbg_macro)]
 
 use std::process::ExitCode;
@@ -694,6 +697,10 @@ fn bridge_endpoint(
 /// when it ends, and about 100 when it stays. A standard error that has stopped draining before
 /// this line holds the worker here, as it always did, so that it does not report itself ready;
 /// every later line goes through the diagnostics thread.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "this is the one write to a standard error that is made where it is said, for the cost above"
+)]
 fn say_at_start(line: std::fmt::Arguments<'_>) {
     use std::io::Write as _;
 
