@@ -3264,15 +3264,15 @@ device: the write boundary of an authorised connection, the refusal of a connect
 admitted, and the pairing surface a candidate reaches before it is paired. An error keeps its code,
 its retry category and its diagnostic identifier. Its message is kept when it names nothing of this
 host. A command quoted in backticks is replaced by `a command` and the rest of the sentence stays,
-unless reading the replacement apart from the words beside it puts the first name somewhere else
-(`` `a b`(chmod 700 q) ``): then the device is given a sentence made from the code. A message that
-names a path of any kind, the number of an account, the program `kr` followed by another word or the
-program that changes who may use a file is not sent: the device is given the clause that comes
-before the first such name, when there is one and it fits in an error with the reason after it (`the
-host could not make the session's directory`), and otherwise a sentence made from the code. A
-message that quotes the place of a field in another message (`Terminal at /terminal carries a
-field it does not declare`) is given its clause only when the whole message and the reason after it
-fit in an error. Nine refusals give a fixed
+unless reading the replacement apart from the words beside it changes what comes before the first
+name (`` `a b`(chmod 700 q) ``): then none of the sentence is kept and the device is given a
+sentence made from the code. A message that names a path of any kind, the number of an account, the
+program `kr` followed by another word or the program that changes who may use a file is not sent:
+the device is given the clause that comes before the first such name, when there is one that fits in
+an error with its reason (`the host could not make the session's directory`), and otherwise a
+sentence made from the code. A message that quotes the place of a field in another message
+(`Terminal at /terminal carries a field it does not declare`) is given its clause only when the
+whole message and the reason after it fit in an error. Nine refusals give a fixed
 reason, because their text names a place or an account: a filesystem mounted beneath the location a
 grant names and a repository whose alternates file names objects outside it, both told in terms of
 that location, a worker that could not be started over a scheduled task under the environment's name

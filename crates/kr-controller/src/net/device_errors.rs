@@ -19,7 +19,7 @@
 //! can find, so the device is given the part of the message that comes before the first such name,
 //! if that is a clause of its own that fits in an error with the reason after it, and otherwise a
 //! sentence composed here from the code. A message that holds the place of a pointer's refusal is
-//! given a clause only when the whole message fits in an error as well.
+//! given a clause only when the whole message and the reason after it fit in an error.
 //!
 //! The same rule reaches an error wherever it is, because the text of an error that has already
 //! been made (a worker's, one a store kept, one a catalogue receipt holds) cannot be made again:
@@ -1404,7 +1404,8 @@ fn account_number(text: &str, outside: &impl Fn(usize) -> bool) -> Option<usize>
 /// by a space in the second reading: anything but white space and the marks that end a clause or
 /// close a bracket. Such a mark stays against its neighbour, as it does in a text with no
 /// quotation, where white space alone parts words, so a program that one of them joins to the word
-/// beside it (`sudo,x`, `` `a b`,sudo x ``) is not found.
+/// beside it (`sudo,x`, `` `a b`,sudo x ``) is not found. A bracket that opens a word of its own is
+/// parted from the quotation after it by [`ends_in_a_bracket_that_begins_a_word`] and not here.
 fn joins_a_word(character: char) -> bool {
     !character.is_whitespace()
         && !matches!(
@@ -4283,7 +4284,7 @@ mod tests {
     fn a_replaced_quotation_never_lets_the_rule_tell_more_than_the_text_without_it_would() {
         let fixed = sentence_for(ErrorCode::InvalidArgument, WHY_NOT_SHOWN);
         let nothing = format!("why the admissions leave the installation out; {WHY_NOT_SHOWN}");
-        let long = format!("uid: 501; `a b`(chmod 700 q) {}; user 502", "x".repeat(930));
+        let long = format!("uid: 501; `a b`(chmod 700 q) {}; user 502", "x".repeat(929));
         let beyond = format!(
             "uid: 509; Params at /field uid 501 carries a field it does not declare; user 502; \
              {}; /Users/alice/private",
@@ -4302,7 +4303,8 @@ mod tests {
             // Both readings find a name, in different places: the run-together text finds the path
             // and keeps a clause that holds the program, which only the readings apart find.
             "x: `a b`(chmod 700 q) y: /Users/m".to_owned(),
-            // The readings differ in a long text, so nothing of it is told.
+            // The readings differ, and the text is as long as an error may be with the clause
+            // the run-together reading keeps: only the comparison withholds it.
             long.clone(),
             // An account found beyond a pointer's place makes the kept clause short, and a short
             // clause passes the limit that a long one did not.
@@ -4321,7 +4323,8 @@ mod tests {
     }
 
     /// A refusal the module knows by its wording is told by its reason when a replaced quotation
-    /// stands where the marker's own space would be and only the readings apart complete the marker.
+    /// stands where the marker's own space would be, and only the reading apart completes the
+    /// marker.
     #[test]
     fn a_known_refusal_that_a_replaced_quotation_runs_into_is_told_by_its_reason() {
         let said = format!("{}`a b`marguerite said no", DID_NOT_REGISTER.trim_end());
