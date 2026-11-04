@@ -414,8 +414,9 @@ writes no file of its own.
 
 The PSReadLine module waits five seconds for the worker's answer to its hello. A session whose
 environment names a whole number of milliseconds from 1 to 4294967295 in
-`KR_SHELL_BRIDGE_HANDSHAKE_WAIT_MS` gets that wait instead; any other value leaves five seconds. The other packages wait two seconds
-and read no such variable.
+`KR_SHELL_BRIDGE_HANDSHAKE_WAIT_MS` gets that wait instead; any other value leaves five seconds.
+Like the bootstrap values, the variable leaves the exported environment once the handshake is
+accepted. The other packages wait two seconds and read no such variable.
 
 ## The reader-thread rules
 
