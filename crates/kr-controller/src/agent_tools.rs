@@ -2022,11 +2022,13 @@ fn entry_key(entry: &str) -> &str {
 /// starts after an update runs the new release's tools. Outside a store, the `kr` beside this
 /// daemon when there is one, so an installation from a build that is not on the path still reaches
 /// that build. Otherwise the plain command name, which the person's path resolves.
+///
+/// Whether the `kr` is there is asked of the release `current` names, read once, so a switch under
+/// way cannot make the command fall back to the plain name in a configuration written for good.
 fn entry_command() -> String {
     kr_ipc::install::this_process()
         .ok()
-        .map(|running| running.stable(kr_ipc::install::Program::Kr))
-        .filter(|path| path.is_file())
+        .and_then(|running| running.stable_if_present(kr_ipc::install::Program::Kr))
         .map_or_else(|| "kr".to_owned(), |path| display(&path))
 }
 

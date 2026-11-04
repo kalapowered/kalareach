@@ -742,6 +742,8 @@ async fn answered_by(
 /// search path finds the daemon beside the program itself rather than beside the link. It is
 /// never looked for on the search path.
 ///
+/// This is the path to write down. A daemon started now is started from `daemon_program_now`.
+///
 /// # Errors
 ///
 /// Returns [`CliError::HostUnavailable`] when where this command is installed cannot be read.
@@ -777,6 +779,41 @@ pub fn daemon_program() -> Result<PathBuf> {
     Ok(directory.join(format!("kr-controller{}", std::env::consts::EXE_SUFFIX)))
 }
 
+/// The control daemon to start now: [`daemon_program`], except that a command of an installed
+/// release starts the daemon of the release `current` names, with the link read once.
+///
+/// The path has no link in it, so the start walks nothing a switch replaces, and it starts the one
+/// release that was read. A daemon of a release that is not current when it takes its environment
+/// ends there and says so, as it would had it been started through the link a moment earlier.
+///
+/// # Errors
+///
+/// Returns [`CliError::HostUnavailable`] when where this command is installed cannot be read, or
+/// when the store has no current release to start the daemon of.
+#[cfg(unix)]
+fn daemon_program_now() -> Result<PathBuf> {
+    let recorded = daemon_program()?;
+    let Some(store) = kr_ipc::install::this_process()
+        .ok()
+        .and_then(kr_ipc::install::Running::store)
+    else {
+        return Ok(recorded);
+    };
+    match store.current_program(kr_ipc::install::Program::Controller) {
+        Ok(Some(program)) => Ok(program),
+        Ok(None) => Err(CliError::HostUnavailable(shown!(
+            "the standalone start runs the control daemon of the current release, and the store \
+             at {} names none",
+            Shown::root(store.root())
+        ))),
+        Err(error) => Err(CliError::HostUnavailable(shown!(
+            "the standalone start runs the control daemon of the current release, and which \
+             release that is could not be read: {}",
+            crate::update::said(&error)
+        ))),
+    }
+}
+
 /// Starts the daemon detached from this command and waits for it to answer.
 ///
 /// It inherits this command's environment, as a daemon started by hand from the same shell does.
@@ -787,7 +824,7 @@ async fn standalone(
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
 ) -> Result<(LocalClient, Option<Started>)> {
-    let program = daemon_program()?;
+    let program = daemon_program_now()?;
     if !program.is_file() {
         return Err(CliError::HostUnavailable(shown!(
             "the standalone start runs the control daemon installed beside this command, {}, and \
@@ -854,7 +891,7 @@ async fn standalone(
 }
 
 /// Starts a control daemon as a daemon was started before an update stopped it: `program`, the
-/// daemon through the store's `current`, with the arguments it was started with and in the
+/// daemon of the release `current` names, with the arguments it was started with and in the
 /// directory it was started in, writing where the standalone start's daemon writes.
 ///
 /// It does not wait for the daemon to answer; an update waits for each daemon it starts to answer

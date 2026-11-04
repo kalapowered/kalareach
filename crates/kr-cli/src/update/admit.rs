@@ -96,14 +96,36 @@ pub fn run_as_current() -> Result<()> {
     Err(start_stores_kr(&store))
 }
 
+/// The `kr` of the release `current` names, with the link read once. The path has no link in it,
+/// so the start that follows walks nothing a switch replaces and runs the release that was read.
+fn current_kr(store: &Store) -> std::result::Result<PathBuf, Shown> {
+    match store.current_program(Program::Kr) {
+        Ok(Some(program)) => Ok(program),
+        Ok(None) => Err(shown!(
+            "the store at {} names no current release",
+            Shown::root(store.root())
+        )),
+        Err(error) => Err(said(&error)),
+    }
+}
+
 /// Starts the store's `kr` on this command's arguments, in place of this process. It returns only
 /// the failure to do so.
 fn start_stores_kr(store: &Store) -> CliError {
+    let program = match current_kr(store) {
+        Ok(program) => program,
+        Err(why) => {
+            return CliError::Other(shown!(
+                "the release this host keeps could not be started: {}",
+                why
+            ));
+        }
+    };
     // A line that standard error refused before this point (a notice that this release is not
     // offered as an update, or the reason an update waits) is lost: the program that replaces this
     // process knows nothing of it, and the command goes on in that program, as it does after any
     // line that standard error refuses.
-    let error = std::process::Command::new(store.stable(Program::Kr))
+    let error = std::process::Command::new(program)
         .args(std::env::args_os().skip(1))
         .exec();
     CliError::Other(shown!(
@@ -316,7 +338,14 @@ fn pack_and_hand(
     let top = format!("kalareach-{}-{release}", release::this_target());
     let archive = staging.join(format!("{top}.tar.gz"));
     release::pack_tree(tree, &top, &archive)?;
-    std::process::Command::new(store.stable(Program::Kr))
+    let program = current_kr(store).map_err(|why| {
+        CliError::Other(shown!(
+            "the current release's kr could not be started to take in the release at {}: {}",
+            Shown::root(tree),
+            why
+        ))
+    })?;
+    std::process::Command::new(program)
         .args(["host", "update", "--archive"])
         .arg(&archive)
         .stdin(Stdio::null())
