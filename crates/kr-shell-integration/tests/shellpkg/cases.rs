@@ -1260,12 +1260,21 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
         session.type_line(command);
         std::thread::sleep(Duration::from_millis(500));
         session.forget_events();
+        let decisions = session.events.managed_decisions();
         session.type_bytes(CTRL_D);
+        // The read ends on the key, and the shell comes back to its prompt and runs a command of
+        // this session's own. The root editor reads the keys in the order they were typed, so a
+        // decision for the key was sent before that command was accepted, and it is on the endpoint
+        // once the command has answered.
         assert!(
-            !session.saw_event(Duration::from_millis(600), |event| matches!(
-                event,
-                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-            )),
+            session.answered("kr-read-done"),
+            "the shell did not come back from the read builtin after the gesture:\n{}",
+            session.terminal_output()
+        );
+        session.take_in_what_has_arrived();
+        assert_eq!(
+            session.events.managed_decisions(),
+            decisions,
             "a gesture inside the read builtin was treated as the root editor's"
         );
         assert!(
@@ -1273,7 +1282,6 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
             "the read builtin's gesture ended the shell"
         );
         driven.push(DetachExclusion::ReadBuiltin);
-        assert!(session.answered("kr-read-done"));
     }
 
     // A vi motion waits for its target, and the gesture belongs to that wait. It needs the vi
@@ -1318,7 +1326,11 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
             session.type_bytes(b"d");
             std::thread::sleep(Duration::from_millis(120));
         }
+        let decisions = session.events.managed_decisions();
         session.type_bytes(CTRL_D);
+        // The window is the key's own room before the interrupt: an interrupt typed at once behind
+        // it ended the shell in Fish. What decides the verdict is the count at the end of the
+        // block, which a command of this session's own has run behind.
         assert!(
             !session.saw_event(Duration::from_millis(600), |event| matches!(
                 event,
@@ -1358,6 +1370,12 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
             std::thread::sleep(Duration::from_millis(150));
         }
         assert!(session.run(emacs_mode, "kr-vi-off"));
+        session.take_in_what_has_arrived();
+        assert_eq!(
+            session.events.managed_decisions(),
+            decisions,
+            "a gesture a vi motion was waiting for was treated as a detach, late"
+        );
     }
 
     // A macro the reader is replaying is the reader's own input, not a gesture a person made, and
@@ -1369,17 +1387,18 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
         let bound = session.latest_prompt();
         std::thread::sleep(Duration::from_millis(300));
         session.forget_events();
+        let decisions = session.events.managed_decisions();
         session.type_bytes(CTRL_T);
         // Whether the reader replayed anything is the reader's own answer. A binding that did
         // nothing looks exactly like one whose replay the worker refused: both are silence and a
         // live shell. So the state is asked for, and where the reader does not report a replay the
         // drive keeps what it saw and claims no more.
         let replayed = session.reader_replaying(&bound, fence_id(23));
-        assert!(
-            !session.saw_event(Duration::from_millis(600), |event| matches!(
-                event,
-                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-            )),
+        // The replay is the reader's own input, read before it says it has read what was typed.
+        session.until_the_reader_has_acted_on_what_was_typed(&bound);
+        assert_eq!(
+            session.events.managed_decisions(),
+            decisions,
             "a gesture a macro produced was treated as one a person made"
         );
         assert!(session.alive(), "macro input ended the shell");
@@ -1400,19 +1419,19 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
         let mut session = a_shell_of_its_own(kind, &package);
         session.clear_line();
         session.type_line(open);
-        session.expect_event("a continuation reader", |event| {
+        let (_, continuation) = session.expect_event("a continuation reader", |event| {
             matches!(
                 event,
                 BridgeEvent::EditorEnter(params)
                     if params.reader_context == kr_protocol::root::ReaderContext::Continuation
             )
         });
+        let decisions = session.events.managed_decisions();
         session.type_bytes(CTRL_D);
-        assert!(
-            !session.saw_event(Duration::from_millis(500), |event| matches!(
-                event,
-                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-            )),
+        session.until_the_reader_has_acted_on_what_was_typed(as_enter(&continuation));
+        assert_eq!(
+            session.events.managed_decisions(),
+            decisions,
             "a continuation line did not exclude the gesture"
         );
         assert!(
@@ -1537,15 +1556,9 @@ fn one_excluded_state_keeps_the_key(kind: ShellKind, package: &Package, drive: &
         );
     }
 
+    // A decision for the key is judged at the end of the drive, when a command of this session's
+    // own has run behind it: the count the end reads is of everything since the boundary above.
     session.type_bytes(CTRL_D);
-    assert!(
-        !session.saw_event(Duration::from_millis(500), |event| matches!(
-            event,
-            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-        )),
-        "{named} did not exclude the gesture:\n{}",
-        session.terminal_output()
-    );
     // The keys that end the state come before the shell is asked to run anything, and nothing is
     // typed until the reader says they worked: a reader left where a typed line is motions
     // swallows the command, and the silence would read as the gesture having ended the shell.
@@ -1672,18 +1685,18 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
         }
     );
 
-    let (_, fence) = session.fenced_prompt(6);
+    let (entry, fence) = session.fenced_prompt(6);
     if speech.ignore_eof_on.is_none() {
         // Nothing of the editor's own ends a shell whose buffer is not empty.
         session.type_bytes(b"kr");
         std::thread::sleep(Duration::from_millis(80));
     }
+    let decisions = session.events.managed_decisions();
     session.type_bytes(CTRL_D);
-    assert!(
-        !session.saw_event(Duration::from_millis(500), |event| matches!(
-            event,
-            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-        )),
+    session.until_the_reader_has_acted_on_what_was_typed(&entry);
+    assert_eq!(
+        session.events.managed_decisions(),
+        decisions,
         "a character that is no longer the gesture was treated as one"
     );
     session.clear_line();
@@ -1710,13 +1723,12 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
         unreachable!()
     };
     let (enter, _) = session.fenced_prompt(7);
-    let _ = enter;
+    let decisions = session.events.managed_decisions();
     session.type_bytes(CTRL_G);
-    assert!(
-        !session.saw_event(Duration::from_millis(500), |event| matches!(
-            event,
-            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-        )),
+    session.until_the_reader_has_acted_on_what_was_typed(&enter);
+    assert_eq!(
+        session.events.managed_decisions(),
+        decisions,
         "a terminal with no gesture still produced one"
     );
     assert!(session.alive());
@@ -2406,6 +2418,7 @@ pub fn a_revoked_launch_installs_nothing(kind: ShellKind) {
     assert!(session.answered("kr-ready"));
 
     let (enter, fence) = session.fenced_prompt(11);
+    let accepted = session.commands.accepted.len();
     let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x73; 16]));
 
     // The endpoint delivers frames in order, so a revocation the worker sent before the reader's
@@ -2435,18 +2448,24 @@ pub fn a_revoked_launch_installs_nothing(kind: ShellKind) {
         acknowledgement.editor.buffer_empty,
         "a revoked launch left text in the editor"
     );
+    // Nothing happened is only an answer where something was there for it to happen to. The
+    // command of this session's own runs behind anything the revoked launch would have run, and
+    // the terminal shows them in the order they ran.
+    session
+        .still_serving("kr-after-the-revocation")
+        .unwrap_or_else(|why| panic!("a revoked launch left nothing working: {why}"));
     assert!(
-        !session.saw_event(Duration::from_millis(400), |event| matches!(
-            event,
-            BridgeEvent::CommandAccepted(_)
-        )),
+        !session.terminal_output().contains("kr-revoked"),
+        "a revoked launch accepted a line and ran it:\n{}",
+        session.terminal_output()
+    );
+    // The acceptances the session was told of since the launch are the served command's alone.
+    session.take_in_what_has_arrived();
+    assert_eq!(
+        session.commands.accepted.len(),
+        accepted + 1,
         "a revoked launch accepted a line"
     );
-    assert!(!session.terminal_output().contains("kr-revoked"));
-    // Nothing happened is only an answer where something was there for it to happen to.
-    session
-        .still_serving("kr-revoked-served")
-        .unwrap_or_else(|why| panic!("a revoked launch left nothing working: {why}"));
 }
 
 /// A revocation in the same read binds the launch, in whichever order the two frames arrive.
@@ -3050,9 +3069,16 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
 
     // The reader is waiting for a key with nothing in progress, so there is nothing of the old
     // lease's for this cancellation to end and nothing for it to throw away.
-    session.type_bytes(dialect(kind).arithmetic.0.as_bytes());
-    std::thread::sleep(Duration::from_millis(120));
+    if dialect(kind).answers_at_the_next_step {
+        session.type_bytes(dialect(kind).arithmetic.0.as_bytes());
+        std::thread::sleep(Duration::from_millis(120));
+    } else {
+        // The reader's own report that it holds the text is the proof that it has dealt with the
+        // keys, so no report of theirs is still to come when the count below is first read.
+        session.type_text(dialect(kind).arithmetic.0.as_bytes());
+    }
     session.forget_events();
+    let reports = session.idle_reports;
     let idle = session.ask(WorkerRequest::Cancel(CancelKeyWait {
         session_id: session.session_id,
         sequence: U64::new(1),
@@ -3078,11 +3104,16 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
     // was given a step to answer with, so the step is what it reports rather than the
     // cancellation.
     if !dialect(kind).answers_at_the_next_step {
-        assert!(
-            !session.saw_event(Duration::from_millis(600), |event| matches!(
-                event,
-                BridgeEvent::ReaderIdle(_)
-            )),
+        // A reader that left its wait for a pass boundary reads the endpoint there before it is
+        // back in the wait and reports itself idle: twice in Zsh, once in Fish, not at all in Bash.
+        // So the third exchange is the first one that is read in the wait, after the report, and
+        // the count of reports the session was told of, which a wait taking events off the queue
+        // does not lower, is read once it has been answered.
+        let _ = session.fence_exchange(&enter, fence_id(19));
+        let _ = session.fence_exchange(&enter, fence_id(18));
+        let _ = session.fence_exchange(&enter, fence_id(17));
+        assert_eq!(
+            session.idle_reports, reports,
             "the reader left a wait that the cancellation had nothing to end"
         );
     }

@@ -1802,6 +1802,43 @@ impl Session {
         }
     }
 
+    /// Waits until the reader that `enter` names, or the one that has replaced it, says that it
+    /// has read and acted on everything typed before this call.
+    ///
+    /// What the reader sent while it acted on those keys is on the endpoint before the answer that
+    /// says so, because the reader writes in the order it acts and answers last. So a check made
+    /// after this reads the whole of what the keys brought, whether the reader was quick or slow
+    /// about it: it is decided by that order and not by a window of time for a late frame to arrive
+    /// in. The count of managed decisions the inbox keeps is the reading to compare, since a wait
+    /// on the way takes events off the queue and the count stays.
+    ///
+    /// This holds for the three native readers, which answer only from their wait, at a key
+    /// boundary with the key selected counted as unread, or at the end of a pass, after the key's
+    /// binding has run. The PowerShell reader reads its mailbox
+    /// before it decides on the gesture, when no queue holds the key yet, so a fence asked just
+    /// after the gesture can be answered as drained before the decision is sent: this refuses that
+    /// reader.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reader is PowerShell's, and when the reader does not say so inside the window
+    /// for asking, naming why.
+    pub fn until_the_reader_has_acted_on_what_was_typed(&mut self, enter: &RootEditorEnterParams) {
+        assert_ne!(
+            self.package_kind,
+            ShellKind::PowerShell,
+            "an answer of the PowerShell reader does not order what a key brought"
+        );
+        if let Err(why) =
+            self.reader_has_read_what_was_typed_by((enter.prompt_generation, enter.reader_revision))
+        {
+            panic!(
+                "the reader did not say it had acted on what was typed: {why}:\n{}",
+                self.terminal_output()
+            );
+        }
+    }
+
     /// Whether no more than `allowed` managed decisions arrived since the drive's boundary.
     ///
     /// Not a window, and not the queue. The inbox counts every decision as it arrives, so one
@@ -2451,8 +2488,7 @@ impl Session {
         &mut self,
         after: Option<&ReaderMark>,
     ) -> Result<ReaderMark, String> {
-        let deadline = self.deadline_for(FENCE);
-        let (mut prompt_generation, mut reader_revision) = after.map_or_else(
+        let asking_about = after.map_or_else(
             || {
                 self.last_entry.as_ref().map_or_else(
                     || {
@@ -2471,6 +2507,20 @@ impl Session {
                 )
             },
         );
+        self.reader_has_read_what_was_typed_by(asking_about)
+    }
+
+    /// [`Session::reader_has_read_what_was_typed`], asking about the reader a given prompt
+    /// generation and reader revision name.
+    fn reader_has_read_what_was_typed_by(
+        &mut self,
+        asking_about: (
+            kr_protocol::root::PromptGeneration,
+            kr_protocol::root::ReaderRevision,
+        ),
+    ) -> Result<ReaderMark, String> {
+        let deadline = self.deadline_for(FENCE);
+        let (mut prompt_generation, mut reader_revision) = asking_about;
         let mut asked = 0;
         loop {
             asked += 1;
