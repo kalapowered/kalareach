@@ -1054,14 +1054,16 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
     let mut session = a_session_with_probes(&package, &probes);
 
     // A case starts with the bridge waiting for answers as long as a case waits for anything. This
-    // one looks at the wait running out, so it shortens the wait for the question and puts the
-    // long one back as soon as the worker is answering again.
+    // one looks at the wait running out, so it shortens the wait for the question the next line
+    // leads to, and puts the long one back as soon as the worker is answering again. The line's
+    // acceptance is answered, and the bridge waits for it under the long wait: it is only the
+    // question that the worker leaves unanswered.
     assert!(
         session.bridge_waits_for_answers(),
         "the bridge does not start a case holding the long wait for answers:\n{}",
         session.terminal_output()
     );
-    session.lets_the_bridge_give_up_on_a_question();
+    session.lets_the_bridge_give_up_on_the_question_the_lookup_of("kr-probe");
     session.commands.policy = ResolvePolicy::Silent;
     let asked = session.run_asking("kr-probe unanswered", "probe-ran");
     assert_eq!(asked.len(), 1, "the command asked: {asked:?}");
@@ -1086,6 +1088,11 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
         })
     });
     session.barrier();
+    assert!(
+        session.bridge_gives_up_on_questions(),
+        "the unanswered question was not asked under the short wait:\n{}",
+        session.terminal_output()
+    );
     session.lets_the_bridge_wait_for_answers();
     let asked = session.run_asking("kr-probe caught-up", "probe-ran");
     assert_eq!(
