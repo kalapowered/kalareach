@@ -821,9 +821,13 @@ pub const fn outcome_text(outcome: PathOutcome) -> &'static str {
 ///
 /// Returns [`ProjectError::QuotaExceeded`] when the total passes [`MAX_WORKSPACE_COPY_BYTES`], or
 /// [`ProjectError::GitFailed`], a fault that passes, when the host is too short of descriptors,
-/// processes or memory to read or write a path: the paths carried before stay, and none after it
-/// is tried. A path that cannot be carried for another reason is reported in the copy's report,
-/// not refused.
+/// processes or memory to read the mode of a path it has opened, or to read or write that path:
+/// the paths carried before stay, and none after it is tried. A host that is short at the open of
+/// the source, at the making of a directory or of the temporary file, or at the rename is not told
+/// from any other failure there, and the path is reported as not applied. A path that cannot be
+/// carried for another reason is reported in the copy's report, not refused. It returns
+/// [`ProjectError::Destination`] when the directory cannot be flushed after a rename, and the
+/// refusal of the admission or of the journal of progress.
 pub fn copy_included(
     source: &AuthorisedDirectory,
     destination: &AuthorisedDirectory,
@@ -924,6 +928,16 @@ fn at<T>(step: &str, operation: impl FnOnce() -> std::io::Result<T>) -> std::io:
     #[cfg(not(all(test, unix)))]
     let _ = step;
     operation()
+}
+
+/// Takes this host's own temporary file away again, and says whether it could. A case that asks
+/// for it has the removal fail, as it does for a file that cannot be unlinked.
+fn took_away(target: &AuthorisedDirectory, temporary: &RelativeName) -> bool {
+    #[cfg(all(test, unix))]
+    if tests::removal_fails() {
+        return false;
+    }
+    target.remove(temporary).is_ok()
 }
 
 /// Whether a failure of the copy of one path stops the whole inclusion: the quota, and a host
@@ -1047,7 +1061,7 @@ fn copy_one(
     // Whatever went wrong, the destination keeps what it had. What is reported is whether this
     // host managed to take its own temporary file away again.
     if let Err(error) = outcome {
-        if target.remove(&temporary).is_err() {
+        if !took_away(target, &temporary) {
             report.leftover.push(temporary_path);
         }
         // A quota, and a host too short of descriptors, processes or memory to read or write
@@ -1069,7 +1083,7 @@ fn copy_one(
         // Something this host could not replace is at the name: a directory where the source has a
         // file. The destination keeps whatever it had and the path is named rather than written
         // over.
-        if target.remove(&temporary).is_err() {
+        if !took_away(target, &temporary) {
             report.leftover.push(temporary_path);
         }
         return Ok(false);
@@ -1083,7 +1097,9 @@ fn copy_one(
 /// # Errors
 ///
 /// Returns [`ProjectError::Destination`] when the source's own metadata cannot be read, because a
-/// copy that cannot carry the mode is a copy of a different file.
+/// copy that cannot carry the mode is a copy of a different file, except that a host too short of
+/// descriptors, processes or memory to read it is [`ProjectError::GitFailed`], a fault that
+/// passes.
 #[cfg(unix)]
 fn source_mode(file: &kr_transfer::AuthorisedFile) -> Result<Option<u32>> {
     use cap_std::fs::MetadataExt as _;
@@ -1111,7 +1127,9 @@ fn source_mode(_file: &kr_transfer::AuthorisedFile) -> Result<Option<u32>> {
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::Destination`] when the bits cannot be set.
+/// Returns [`ProjectError::Destination`] when the bits cannot be set, except that a host too short
+/// of descriptors, processes or memory to set them is [`ProjectError::GitFailed`], a fault that
+/// passes.
 #[cfg(unix)]
 fn apply_mode(file: &kr_transfer::AuthorisedFile, mode: Option<u32>) -> Result<()> {
     use cap_std::fs::PermissionsExt as _;
@@ -1173,6 +1191,14 @@ mod tests {
         /// that many calls of the step have passed.
         static COPY_FAILS: std::cell::Cell<Option<(&'static str, usize, rustix::io::Errno)>> =
             const { std::cell::Cell::new(None) };
+        /// Set by a case to make the removal of a temporary file fail on its own thread.
+        static REMOVAL_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Whether the case has the removal of a temporary file fail.
+    #[cfg(unix)]
+    pub(super) fn removal_fails() -> bool {
+        REMOVAL_FAILS.with(std::cell::Cell::get)
     }
 
     /// Returns the error the case set for this step of a copy, when this is the call it is set for.
@@ -1497,9 +1523,11 @@ mod tests {
     }
 
     /// An inclusion stopped by a shortage leaves what one stopped by the quota leaves: what was
-    /// carried before the stop is there, as the journal was told, and the path it stopped at has
-    /// left nothing in the destination. The service ends the workspace's creation the same way
-    /// for either, because it reads only that the copy failed.
+    /// carried before the stop is there, as the journal was told, and a path in the top level of
+    /// the tree that it stopped at has left nothing in the destination. (A nested path may leave
+    /// the directories made for it, and a temporary file that cannot be taken away is journalled
+    /// as left over; the next case holds that.) The service ends the workspace's creation the
+    /// same way for either, because it reads only that the copy failed.
     #[cfg(unix)]
     #[test]
     fn an_inclusion_stopped_by_a_shortage_leaves_what_one_stopped_by_the_quota_leaves() {
@@ -1528,5 +1556,37 @@ mod tests {
         assert_eq!(short_seen, over_seen);
         assert_eq!(names_in(&short.to), names_in(&over.to));
         assert_eq!(names_in(&short.to), ["first.txt"]);
+    }
+
+    /// A copy in progress that a stop leaves, because even its removal failed, is journalled before
+    /// the stop is returned, as a temporary file nobody accounts for is journalled for a copy that
+    /// goes on: the caller is told which file it is.
+    #[cfg(unix)]
+    #[test]
+    fn a_temporary_file_a_stopped_copy_cannot_take_away_is_journalled_as_left_over() {
+        let copying = two_files_to_copy();
+        let temporary = temporary_name(&RelativeName::parse("second.txt").expect("a name"));
+
+        COPY_FAILS.with(|fails| fails.set(Some(("write", 1, rustix::io::Errno::NOMEM))));
+        REMOVAL_FAILS.with(|fails| fails.set(true));
+        let (outcome, seen) = copied(&copying);
+        REMOVAL_FAILS.with(|fails| fails.set(false));
+        COPY_FAILS.with(|fails| fails.set(None));
+
+        let stopped = outcome.expect_err("a host short of memory stops the copy");
+        assert!(
+            stopped.code().retry_category().permits_automatic_retry(),
+            "{stopped}"
+        );
+        assert_eq!(
+            seen,
+            [
+                ("first.txt".to_owned(), PathOutcome::Carried),
+                (temporary.clone(), PathOutcome::Leftover)
+            ]
+        );
+        let mut left = vec!["first.txt".to_owned(), temporary];
+        left.sort();
+        assert_eq!(names_in(&copying.to), left);
     }
 }
