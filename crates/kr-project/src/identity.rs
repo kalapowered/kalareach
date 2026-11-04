@@ -1778,6 +1778,10 @@ pub(crate) mod tests {
         /// with this error, after that many have been made.
         pub(crate) static CLONE_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
             const { std::cell::Cell::new(None) };
+        /// Set by a case to make the listing of a directory that a repository is discovered through
+        /// fail on its own thread with this error, after that many have been made.
+        pub(crate) static LISTING_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
+            const { std::cell::Cell::new(None) };
         /// Set by a case to make the resolution of the path of a directory that was opened fail on
         /// its own thread with this error.
         pub(crate) static RESOLVE_FAILS: std::cell::Cell<Option<rustix::io::Errno>> =
@@ -2589,6 +2593,46 @@ pub(crate) mod tests {
         }
         take(find().expect("the repository is found"))
             .expect("without a failure the repository is taken");
+    }
+
+    /// Finding a repository through a location lists the directory its object directory keeps
+    /// alternates in, and listing a directory opens it again. A host out of descriptors,
+    /// processes or memory to do that has said nothing of the repository, so it is a fault that
+    /// passes; any other failure of the listing is still the caller's argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_descriptors_when_the_objects_of_a_repository_found_through_a_location_are_listed_is_a_fault_that_passes()
+     {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let base = std::fs::canonicalize(root.path()).expect("the directory resolves");
+        let plain = plain_repository(&base);
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([19; 16]));
+        let location = open_unrecorded_root(environment_id, &base)
+            .expect("the location opens")
+            .confined_to_one_mount()
+            .expect("it is on one mount");
+        let relative = RelativeName::parse("plain").expect("a name");
+        let shown = plain.display().to_string();
+        let find = || crate::discovery::discover_through(&location, &relative, &shown, None);
+
+        for (errno, passes) in OPEN_ERRORS {
+            LISTING_FAILS.with(|fails| fails.set(Some((0, errno))));
+            let found = find();
+            LISTING_FAILS.with(|fails| fails.set(None));
+
+            let Err(refused) = found else {
+                panic!("the objects could not be listed ({errno}), and the repository was found");
+            };
+            assert_answered(
+                &refused,
+                errno,
+                passes,
+                ErrorCode::InvalidArgument,
+                &plain,
+                &format!("{errno}"),
+            );
+        }
+        find().expect("without a failure the repository is found");
     }
 
     /// The rule that confines a directory to one mount goes with its copy: a copy of a confined

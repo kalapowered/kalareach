@@ -278,10 +278,16 @@ fn kind_of(base: &AuthorisedDirectory, entry: &str, shown: &str) -> Result<Optio
 
 /// Lists the names one directory holds, through its handle.
 fn entries_of(directory: &AuthorisedDirectory, shown: &str) -> Result<Vec<String>> {
-    let listing = directory
-        .handle()
-        .entries()
-        .map_err(|error| unreadable(shown, &error))?;
+    // A case that asks for it has the listing fail, after that many have been made, as it does for
+    // a host that is out of descriptors: listing a directory opens it again.
+    #[cfg(all(test, unix))]
+    let listing = match crate::identity::tests::due(&crate::identity::tests::LISTING_FAILS) {
+        Some(error) => Err(std::io::Error::from(error)),
+        None => directory.handle().entries(),
+    };
+    #[cfg(not(all(test, unix)))]
+    let listing = directory.handle().entries();
+    let listing = listing.map_err(|error| unreadable(shown, &error))?;
     let mut names = Vec::new();
     for entry in listing {
         let entry = entry.map_err(|error| unreadable(shown, &error))?;
