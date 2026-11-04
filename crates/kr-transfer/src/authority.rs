@@ -190,10 +190,11 @@ pub enum Escape {
     ///
     /// A full disk, a read failure, a permission the operating system refused, a host too short of
     /// descriptors, processes or memory, or a directory's identity, mount or flush that the
-    /// platform would not give. `component` is the name that failed, or the path the authority was
-    /// opened from where the authority itself could not be read. It is not
-    /// an authority refusal: `TransferError` reports it as a storage failure, and a caller that
-    /// opened the root from an argument of its own decides what it is for its own callers.
+    /// platform would not give. `component` is what failed: a name beneath the authorised
+    /// directory, the path the authority was opened from where the authority itself could not be
+    /// read, or the identity of a file that could not be examined again. It is not an authority
+    /// refusal: `TransferError` reports it as a storage failure, and a caller that opened the root
+    /// from an argument of its own decides what it is for its own callers.
     #[error("{component} could not be opened beneath the authorised directory: {detail}")]
     Unopenable {
         /// The component that failed.

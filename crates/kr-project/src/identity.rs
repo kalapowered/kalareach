@@ -300,7 +300,9 @@ impl OpenedRepository {
     ///
     /// Returns [`ProjectError::Destination`] when the directory cannot be opened,
     /// [`ProjectError::GitFailed`] when the repository cannot be read or when the host is too
-    /// short of descriptors, processes or memory to open a directory of it, or
+    /// short of descriptors, processes or memory to open a directory of it,
+    /// [`ProjectError::IdentityChanged`] when the directory is not the object that was opened
+    /// when Git runs or is confirmed after it, or
     /// [`ProjectError::ConfigurationRejected`] when its configuration names something no override
     /// removes.
     pub fn open(
