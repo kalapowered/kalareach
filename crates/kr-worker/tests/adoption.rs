@@ -175,7 +175,7 @@ impl Setup {
     }
 
     fn spawn_in_a_group(&self, mut command: Command) -> Started {
-        let mut child = command
+        let child = command
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -184,24 +184,8 @@ impl Setup {
             .expect("the program starts");
         let process = kr_ipc::identity::process_start_identity(child.id())
             .expect("the program is identified");
-        // The start is told to this process when the new program takes over, a little before the
-        // system has written the program's argument vector. A look taken in between reads an image
-        // with no arguments, cannot see what it was started with, and names the interpreter.
-        // Waited for by what the system says, the way a look reads it.
         #[cfg(target_os = "linux")]
-        {
-            let began = std::time::Instant::now();
-            while std::fs::read(format!("/proc/{}/cmdline", child.id()))
-                .is_ok_and(|arguments| arguments.is_empty())
-                && child.try_wait().is_ok_and(|ended| ended.is_none())
-            {
-                assert!(
-                    began.elapsed() < LIVENESS,
-                    "the program's arguments were still not readable after {LIVENESS:?}"
-                );
-                std::thread::yield_now();
-            }
-        }
+        let child = started_for_good(child);
         Started { child, process }
     }
 
@@ -1447,8 +1431,8 @@ async fn the_command_the_integration_answered_for_names_the_program_that_runs_it
     // A program that has the script among its arguments and is another program: `tail` reads the
     // script and runs nothing of it.
     let watcher = setup.host.root().join("watcher");
-    kr_ipc::testing::place_script(&watcher, "#!/bin/sh\nexec tail -f \"$0\"\n");
-    let started = setup.start_script(&watcher);
+    std::fs::write(&watcher, "#!/bin/sh\nexec tail -f \"$0\"\n").expect("the script tail reads");
+    let started = setup.spawn_in_a_group(Command::new("tail").arg("-f").arg(&watcher));
     let foreground = Setup::foreground(&started, vec![(watcher.display().to_string(), None)]);
     let named = look_until_named(&mut following, &producer, &foreground);
     assert_eq!(
@@ -1560,6 +1544,38 @@ fn look_until_named(
     foreground: &Foreground,
 ) -> String {
     look_until_name(following, producer, foreground, |_| true)
+}
+
+/// Waits until the system has finished starting `child`'s program, and says it has.
+///
+/// A start is told to this process before the program has taken over: for a moment the child still
+/// has this process's image and argument vector, then it has the new image and no argument vector
+/// until the system has written one. A look taken in either moment reads a program that is not the
+/// one started, and two looks that agree there name the interpreter, or this test binary. The new
+/// program's argument vector is what a look reads next, so it is what is waited for: not empty, and
+/// not this process's own.
+///
+/// # Panics
+///
+/// Panics when the child ends before that, or has not got there within the file's guard.
+#[cfg(target_os = "linux")]
+fn started_for_good(mut child: Child) -> Child {
+    let own = std::fs::read("/proc/self/cmdline").expect("this process's arguments");
+    let began = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().expect("the program can be waited for") {
+            panic!("the program ended as it started: {status}");
+        }
+        let arguments = std::fs::read(format!("/proc/{}/cmdline", child.id())).unwrap_or_default();
+        if !arguments.is_empty() && arguments != own {
+            return child;
+        }
+        assert!(
+            began.elapsed() < LIVENESS,
+            "the program's arguments were still not those it was started with after {LIVENESS:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Looks at `foreground` until the program is named and `wanted` accepts the name, and says it.
