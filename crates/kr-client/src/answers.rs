@@ -782,12 +782,14 @@ pub trait Keeper {
 ///
 /// A write or a removal reads the pair again under the store's lock and does nothing unless it is
 /// still this, so a command that decided from a stale reading changes nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Basis {
     draft: Option<Digest256>,
     record: Option<Digest256>,
     sends: Vec<ActionId>,
 }
+
+crate::debug_as_name!(Basis);
 
 impl Basis {
     /// The digest of the kept answer's bytes, when an answer is kept, which a settling names the
@@ -892,7 +894,7 @@ impl AnswerDrafts {
             fault: IoFault::from(error),
         };
         let _lock = self.hold()?;
-        self.expect(draft.question_id, basis)?;
+        self.unchanged(draft.question_id, basis)?;
         replaceable(&path)?;
         crate::sends::replaceable(&record_path)?;
         // One: the sends already made stay named while the answer they describe is replaced. The
@@ -943,7 +945,7 @@ impl AnswerDrafts {
             return Err(AnswerError::Full);
         }
         let _lock = self.hold()?;
-        self.expect(question_id, basis)?;
+        self.unchanged(question_id, basis)?;
         let Some(draft) = basis.draft else {
             return Err(AnswerError::Changed);
         };
@@ -1021,7 +1023,7 @@ impl AnswerDrafts {
     /// Returns [`AnswerError::Store`] when it cannot be removed.
     pub fn remove_if_unchanged(&self, question_id: QuestionId, basis: &Basis) -> Result<bool> {
         let _lock = self.hold()?;
-        if self.expect(question_id, basis).is_err() {
+        if self.unchanged(question_id, basis).is_err() {
             return Ok(false);
         }
         self.remove_pair(question_id)?;
@@ -1301,7 +1303,7 @@ impl AnswerDrafts {
     }
 
     /// Checks, under the lock, that the pair is still the one a caller decided from.
-    fn expect(&self, question_id: QuestionId, basis: &Basis) -> Result<()> {
+    fn unchanged(&self, question_id: QuestionId, basis: &Basis) -> Result<()> {
         let now = self.pair(question_id)?;
         if now.draft == basis.draft && now.record == basis.record {
             Ok(())

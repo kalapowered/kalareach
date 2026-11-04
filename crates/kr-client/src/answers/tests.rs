@@ -256,7 +256,6 @@ async fn a_record_that_names_no_answer_on_disk_is_ignored_and_swept() {
     let asked = question(5);
     begin(&drafts, &draft(&asked, true), &[], action(9)).expect("recorded");
     // The answer is replaced, as a release that lists the answers alone replaces it.
-    std::fs::remove_file(drafts.path(asked.question_id)).expect("removed");
     let other = AnswerDraft {
         answer: QuestionAnswer::Decision { decided: false },
         ..draft(&asked, true)

@@ -42,7 +42,7 @@ pub const MOST_SENDS: usize = 8;
 const RECORD_LIMIT: u64 = 16 * 1024;
 
 /// The sends of one kept answer.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendRecord {
     /// The format of the record: [`SEND_FORMAT`]. A record states it, so one that does not is
@@ -56,6 +56,8 @@ pub struct SendRecord {
     /// When the newest send was recorded, on this device's clock. Shown, never decided by.
     pub sent_at_ms: TimestampMs,
 }
+
+crate::debug_as_name!(SendRecord);
 
 impl SendRecord {
     /// Whether the record's contents are ones this build wrote.

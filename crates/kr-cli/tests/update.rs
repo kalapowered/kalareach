@@ -10027,6 +10027,7 @@ struct AcceptedLimit {
 
 /// Every record a command writes.
 const COMMAND_WRITTEN: &[&str] = &[
+    "answer-sends",
     "configuration",
     "controller-service",
     "kept-answers",
@@ -10044,11 +10045,12 @@ const COMMAND_WRITTEN: &[&str] = &[
 ///   command off. A `kr` of another store takes its own store's lock, which does not hold this one's
 ///   update off either.
 ///
-/// The records it leaves exposed are the six whose floor stays. The configuration document is not
+/// The records it leaves exposed are the seven whose floor stays. The configuration document is not
 /// among them: the limit is accepted for it ([`ACCEPTED_FOR_CONFIGURATION`]).
 const OPEN_GAPS: [OpenGap; 1] = [OpenGap {
     what: "a kr outside an installed release takes no lock, and a state root names no store",
     exposes: &[
+        "answer-sends",
         "controller-service",
         "kept-answers",
         "machine-merge-plan",

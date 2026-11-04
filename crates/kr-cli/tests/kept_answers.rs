@@ -29,14 +29,15 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{
-    ActorId, ApplicationInstanceId, ConnectionId, EnvironmentId, QuestionId, QuestionRevision,
-    SessionEpoch, SessionId,
+    ActionId, ActorId, ApplicationInstanceId, ConnectionId, EnvironmentId, QuestionId,
+    QuestionRevision, SessionEpoch, SessionId,
 };
 use kr_protocol::question::{
     AnswerRecord, Question, QuestionAnswerParams, QuestionChoice, QuestionKind, QuestionReadParams,
     QuestionReadResult, QuestionResolveResult, QuestionSource, QuestionState,
 };
-use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
+use kr_protocol::receipt::{ActionReadParams, ActionReadResult, Receipt, ReceiptState};
+use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64};
 use kr_protocol::session::DisplayNumber;
 use kr_protocol::worker::WorkerDescriptor;
 use serde_json::Value;
@@ -70,6 +71,8 @@ enum Behaviour {
     /// Is of an earlier build: it states no build in its answer to the hello, so what it replies
     /// to an answer is not a shape this command is sure to read.
     IsOfAnEarlierBuild,
+    /// Refuses every answer with `DRAFT_CONFLICT`, taking nothing and keeping no receipt.
+    RefusesAnswers,
 }
 
 /// Which environment the scripted session runs in.
@@ -105,6 +108,22 @@ struct State {
     spoils_store: bool,
     /// The file it left there.
     spoiled: Option<PathBuf>,
+    /// The receipts it keeps of the answers that reached it, in the order it wrote them.
+    receipts: Vec<(ActionId, ReceiptState)>,
+    /// The identifier and the quote of every answer that reached it.
+    arrivals: Vec<Arrival>,
+    /// The receipts a client was shown by a read.
+    shown: Vec<ActionId>,
+    /// Whether a record of sends was in the store when each answer reached the worker.
+    recorded_first: Vec<bool>,
+}
+
+/// One answer as it reached the worker.
+#[derive(Clone, Debug)]
+struct Arrival {
+    action_id: ActionId,
+    /// The uncertain send the answer named, when it named one.
+    quoted: Option<ActionId>,
 }
 
 /// A host tree with one scripted session in it, holding one question.
@@ -187,6 +206,10 @@ impl Host {
             store: temp.paths().state_root().join("kept-answers"),
             spoils_store: false,
             spoiled: None,
+            receipts: Vec::new(),
+            arrivals: Vec::new(),
+            shown: Vec::new(),
+            recorded_first: Vec::new(),
         }));
         let serving = tokio::spawn(serve(
             listener,
@@ -586,6 +609,7 @@ async fn serve_one(
                         .map_err(|error| refusal(&error.to_string()))
                     }
                     "question.read" => read(&state, &request.params),
+                    "action.read" => read_receipt(&state, &request.params),
                     other => Err(refusal(&format!("this worker answers no {other}"))),
                 };
                 (
@@ -600,9 +624,33 @@ async fn serve_one(
                     .behaviour;
                 if mutation.method.as_str() == "question.answer" {
                     spoil(&state);
+                    let arrival = arrive(&state, &mutation);
+                    // The worker's own rule: an uncertain outcome stands in the way of a new answer
+                    // unless the new one names it after it was shown.
+                    if let Err(error) = admit(&state, &arrival) {
+                        let _ = writer
+                            .write_message(&ControlFrame::Response(Response {
+                                request_id: mutation.request_id,
+                                outcome: Outcome::Error(error),
+                            }))
+                            .await;
+                        continue;
+                    }
                     match behaviour {
+                        Behaviour::RefusesAnswers => {
+                            let _ = writer
+                                .write_message(&ControlFrame::Response(Response {
+                                    request_id: mutation.request_id,
+                                    outcome: Outcome::Error(ProtocolError::new(
+                                        ErrorCode::DraftConflict,
+                                        "this worker refuses every answer",
+                                    )),
+                                }))
+                                .await;
+                            continue;
+                        }
                         Behaviour::TakesAnswersAndDropsTheReply => {
-                            let _ = take(&state, &mutation.params);
+                            let _ = take(&state, &mutation.params, mutation.action_id);
                             return;
                         }
                         Behaviour::RepliesWithGarbage => {
@@ -622,6 +670,11 @@ async fn serve_one(
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .answers_received += 1;
+                        state
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .receipts
+                            .push((mutation.action_id, ReceiptState::Unknown));
                         Err(ProtocolError::new(
                             ErrorCode::OutcomeUnknown,
                             "this worker cannot say what became of the answer",
@@ -630,7 +683,7 @@ async fn serve_one(
                     "question.answer"
                         if behaviour == Behaviour::TakesAnswersAndRepliesUnreadably =>
                     {
-                        take(&state, &mutation.params).and_then(|_| {
+                        take(&state, &mutation.params, mutation.action_id).and_then(|_| {
                             ParamsValue::from_typed(&QuestionReadResult {
                                 questions: Vec::new(),
                             })
@@ -638,7 +691,7 @@ async fn serve_one(
                         })
                     }
                     "question.answer" if behaviour == Behaviour::TakesAnswersAndLocksTheStore => {
-                        let taken = take(&state, &mutation.params);
+                        let taken = take(&state, &mutation.params, mutation.action_id);
                         let store = state
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
@@ -648,7 +701,7 @@ async fn serve_one(
                             .expect("the store is read-only");
                         taken
                     }
-                    "question.answer" => take(&state, &mutation.params),
+                    "question.answer" => take(&state, &mutation.params, mutation.action_id),
                     other => Err(refusal(&format!("this worker answers no {other}"))),
                 };
                 ((mutation.request_id, outcome), false)
@@ -719,8 +772,100 @@ fn read(state: &Mutex<State>, params: &ParamsValue) -> Result<ParamsValue, Proto
         .map_err(|error| refusal(&error.to_string()))
 }
 
+/// Notes an answer as it reaches the worker: its identifier, the send it names, and whether the
+/// store held a record of sends then.
+fn arrive(state: &Mutex<State>, mutation: &kr_protocol::action::MutationRequest) -> Arrival {
+    let quoted = match mutation.expected.clone().into_value() {
+        kr_cbor::CanonicalValue::Map(map) => map
+            .get(kr_protocol::action::SUPERSEDES_ACTION_KEY)
+            .and_then(|value| kr_cbor::from_canonical_value::<ActionId>(value).ok()),
+        _ => None,
+    };
+    let arrival = Arrival {
+        action_id: mutation.action_id,
+        quoted,
+    };
+    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+    let recorded = std::fs::read_dir(&state.store)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "send"))
+        })
+        .unwrap_or(false);
+    state.recorded_first.push(recorded);
+    state.arrivals.push(arrival.clone());
+    arrival
+}
+
+/// Refuses an answer while an uncertain send stands that it does not name after it was shown.
+fn admit(state: &Mutex<State>, arrival: &Arrival) -> Result<(), ProtocolError> {
+    let state = state.lock().unwrap_or_else(PoisonError::into_inner);
+    let uncertain = state
+        .receipts
+        .iter()
+        .rev()
+        .find(|(_, held)| *held == ReceiptState::Unknown)
+        .map(|(id, _)| *id);
+    match (uncertain, arrival.quoted) {
+        (None, _) => Ok(()),
+        (Some(uncertain), Some(named))
+            if named == uncertain && state.shown.contains(&uncertain) =>
+        {
+            Ok(())
+        }
+        _ => Err(ProtocolError::new(
+            ErrorCode::DraftConflict,
+            "an earlier action has an uncertain outcome that this one does not name",
+        )),
+    }
+}
+
+/// Answers `action.read` from the receipts the worker keeps.
+fn read_receipt(state: &Mutex<State>, params: &ParamsValue) -> Result<ParamsValue, ProtocolError> {
+    let params: ActionReadParams = params
+        .to_typed()
+        .map_err(|error| refusal(&error.to_string()))?;
+    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+    let held = state
+        .receipts
+        .iter()
+        .enumerate()
+        .find(|(_, (id, _))| *id == params.action_id)
+        .map(|(at, (_, held))| (at, *held));
+    let Some((at, held)) = held else {
+        return Err(refusal(&format!(
+            "no receipt for action {}",
+            params.action_id
+        )));
+    };
+    state.shown.push(params.action_id);
+    ParamsValue::from_typed(&ActionReadResult {
+        receipt: Receipt {
+            action_id: params.action_id,
+            actor_id: ActorId::new("local:test").expect("an actor"),
+            method: kr_protocol::method::Method::QuestionAnswer.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            revision: U64::new(3),
+            state: held,
+            reason: Nullable::null(),
+            payload_digest: Digest256::from_bytes([0; 32]),
+            accepted_deadline_ms: Nullable::null(),
+            error: Nullable::null(),
+            error_withheld: false,
+            updated_at_ms: TimestampMs::new(10 + u64::try_from(at).unwrap_or(0)),
+        },
+        result: Nullable::null(),
+    })
+    .map_err(|error| refusal(&error.to_string()))
+}
+
 /// Answers `question.answer`: takes an answer to the pending question at the revision it names.
-fn take(state: &Mutex<State>, params: &ParamsValue) -> Result<ParamsValue, ProtocolError> {
+fn take(
+    state: &Mutex<State>,
+    params: &ParamsValue,
+    action_id: ActionId,
+) -> Result<ParamsValue, ProtocolError> {
     let params: QuestionAnswerParams = params
         .to_typed()
         .map_err(|error| refusal(&error.to_string()))?;
@@ -750,8 +895,9 @@ fn take(state: &Mutex<State>, params: &ParamsValue) -> Result<ParamsValue, Proto
     question.state = QuestionState::Answered;
     question.revision = QuestionRevision::new(question.revision.get() + 1);
     question.resolved_at_ms = Nullable::some(now);
-    ParamsValue::from_typed(&QuestionResolveResult::whole(question.clone()))
-        .map_err(|error| refusal(&error.to_string()))
+    let whole = QuestionResolveResult::whole(question.clone());
+    state.receipts.push((action_id, ReceiptState::Applied));
+    ParamsValue::from_typed(&whole).map_err(|error| refusal(&error.to_string()))
 }
 
 /// KR-REQ-11.63: an answer the worker could not take is kept on this device, the person is told,
@@ -1786,4 +1932,301 @@ async fn a_malformed_reply_is_shown_and_not_kept() {
     assert_eq!(document["code"], "INVALID_ARGUMENT", "{document}");
     assert!(!host.kept().exists(), "a malformed reply keeps nothing");
     assert_eq!(host.answers_received(), 1);
+}
+
+/// The records of sends this build keeps beside the answers, as the tests below read them.
+impl Host {
+    /// Where the answers and their records are kept.
+    fn store_dir(&self) -> PathBuf {
+        self.temp.paths().state_root().join("kept-answers")
+    }
+
+    fn drafts(&self) -> kr_client::answers::AnswerDrafts {
+        kr_client::answers::AnswerDrafts::open(self.store_dir()).expect("the store opens")
+    }
+
+    /// The record of sends kept for the question.
+    fn record(&self) -> PathBuf {
+        self.store_dir().join(format!("{}.send", self.question_id))
+    }
+
+    /// The sends the record names, when there is one.
+    fn sends(&self) -> Vec<ActionId> {
+        match std::fs::read(self.record()) {
+            Ok(bytes) => {
+                let record: kr_client::sends::SendRecord =
+                    kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+                        .expect("a record of sends");
+                record.sends
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn arrivals(&self) -> Vec<Arrival> {
+        self.state().arrivals.clone()
+    }
+
+    fn receipt(&self, action_id: ActionId, held: ReceiptState) {
+        self.state().receipts.push((action_id, held));
+    }
+
+    /// Records the answer `yes` under the send `id` and nothing more, as an attempt does before it
+    /// sends: what a crash right after leaves.
+    fn record_pair(&self, id: ActionId) {
+        let draft = kr_client::answers::AnswerDraft {
+            version: kr_client::answers::ANSWER_FORMAT,
+            target: kr_protocol::envelope::ActionTarget {
+                environment_id: self.environment.environment_id(),
+                session_id: Nullable::some(self.state().question.session_id),
+                session_epoch: Nullable::some(SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            session_id: self.state().question.session_id,
+            question_id: self.question_id,
+            question_revision: self.state().question.revision,
+            answer: kr_protocol::question::QuestionAnswer::Choice {
+                choice_id: "left".to_owned(),
+            },
+            drafted_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+        };
+        let drafts = self.drafts();
+        let basis = drafts.basis(self.question_id).expect("the pair reads");
+        let carried = basis.sends().to_vec();
+        let writers = kr_ipc::install::hold_writers(
+            &kr_ipc::install::Writing::in_roots(
+                self.temp.paths().runtime_root(),
+                self.temp.paths().state_root(),
+            ),
+            &mut || {},
+        )
+        .expect("writers");
+        let leave = kr_client::answers::Leave {
+            answers: writers
+                .permit(&kr_client::answers::WRITTEN)
+                .expect("permitted"),
+            sends: writers
+                .permit(&kr_client::sends::WRITTEN)
+                .expect("permitted"),
+        };
+        drafts
+            .begin(&draft, &basis, &carried, id, &leave)
+            .expect("recorded");
+    }
+}
+
+fn action(byte: u8) -> ActionId {
+    ActionId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16]))
+}
+
+/// KR-REQ-11.63: the identifier an answer goes out under is recorded on this device before the
+/// answer reaches the worker, and it is the one the worker saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_identifier_of_an_answer_is_recorded_before_it_reaches_the_worker() {
+    let host = Host::start(Behaviour::TakesAnswersAndDropsTheReply).await;
+    let question = host.question();
+    let output = host.kr(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(output.status.code(), Some(3), "the reply was lost");
+    assert_eq!(host.state().recorded_first, vec![true]);
+    let arrivals = host.arrivals();
+    assert_eq!(arrivals.len(), 1);
+    assert_eq!(host.sends(), vec![arrivals[0].action_id]);
+    assert!(host.kept().is_file());
+}
+
+/// KR-REQ-11.63: a crash between the record and the send leaves a draft the worker has no record
+/// of. A reconnect offers it, reports that the host has no record of the earlier send, and sends
+/// nothing; sending it is one command that names the earlier outcome and then goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draft_whose_send_the_host_has_no_record_of_is_offered_and_not_sent() {
+    let host = Host::start(Behaviour::Serves).await;
+    host.record_pair(action(9));
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    let drafts = document["drafts"].as_array().expect("drafts");
+    assert_eq!(drafts.len(), 1, "{document}");
+    assert_eq!(drafts[0]["state"], "offered", "{document}");
+    assert_eq!(drafts[0]["earlier"][0]["state"], "no_record", "{document}");
+    assert_eq!(host.arrivals().len(), 0, "a reconnect sends nothing");
+
+    let question = host.question();
+    let (status, document) = host.json(&["question", "send", &question]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["earlier"][0]["state"], "no_record", "{document}");
+    assert_eq!(host.arrivals().len(), 1);
+    assert!(!host.kept().exists());
+    assert!(!host.record().exists());
+}
+
+/// KR-REQ-11.63: an answer whose reply was lost after the worker took it is found taken at the next
+/// reconnect: nothing is sent again, the copy is retired, and a new answer to the question says the
+/// host took an earlier send rather than that the question was already answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_whose_reply_was_lost_after_the_worker_took_it_is_found_taken() {
+    let host = Host::start(Behaviour::TakesAnswersAndDropsTheReply).await;
+    let question = host.question();
+    let output = host.kr(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(host.state().question.state, QuestionState::Answered);
+
+    host.behave(Behaviour::Serves);
+    // A new answer meets the question the earlier send answered, and is told so.
+    let (status, document) = host.json(&["question", "answer", &question, "--choice", "right"]);
+    assert_eq!(status, Some(1), "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(
+        message.contains("took an earlier send of this answer"),
+        "{message}"
+    );
+    assert!(!message.contains("already"), "{message}");
+    assert_eq!(host.arrivals().len(), 1, "nothing was sent again");
+
+    assert!(!host.kept().exists(), "the taken copy is no longer kept");
+    assert!(!host.record().exists());
+
+    // `drafts` finds the copy retired as taken, and sends nothing.
+    let host = Host::start(Behaviour::TakesAnswersAndDropsTheReply).await;
+    let question = host.question();
+    host.kr(&["question", "answer", &question, "--choice", "left"]);
+    let went = host.arrivals()[0].action_id;
+    host.behave(Behaviour::Serves);
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["drafts"][0]["state"], "taken", "{document}");
+    assert_eq!(
+        document["drafts"][0]["action_id"],
+        Value::String(went.to_string()),
+        "{document}"
+    );
+    assert_eq!(host.arrivals().len(), 1, "a reconnect sends nothing");
+    assert!(!host.kept().exists(), "the taken copy is no longer kept");
+    assert!(!host.record().exists());
+}
+
+/// KR-ACC-009, KR-REQ-11.63: an uncertain outcome is shown before a new send names it. `drafts`
+/// offers the answer with the uncertain send, and `send` names it in the one command: the output and
+/// the document name the earlier outcome, and the worker saw the quote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uncertain_send_is_named_by_the_next_send_and_shown_first() {
+    let host = Host::start(Behaviour::CannotSayWhatBecameOfAnswers).await;
+    let question = host.question();
+    let output = host.kr(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(output.status.code(), Some(3));
+    let uncertain = host.arrivals()[0].action_id;
+    assert_eq!(host.sends(), vec![uncertain]);
+
+    host.behave(Behaviour::Serves);
+    let (_, document) = host.json(&["question", "drafts"]);
+    assert_eq!(document["drafts"][0]["state"], "offered", "{document}");
+    assert_eq!(
+        document["drafts"][0]["earlier"][0]["state"], "unknown",
+        "{document}"
+    );
+    assert_eq!(host.arrivals().len(), 1, "a reconnect sends nothing");
+
+    // The human notice is issued before the send, on standard error.
+    let output = host.kr(&["question", "send", &question]);
+    assert_eq!(output.status.code(), Some(0));
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        said.contains("ended with an outcome the host could not establish"),
+        "{said}"
+    );
+    let arrivals = host.arrivals();
+    assert_eq!(arrivals.len(), 2);
+    assert_eq!(
+        arrivals[1].quoted,
+        Some(uncertain),
+        "the send names the uncertain one"
+    );
+    assert!(!host.kept().exists());
+}
+
+/// KR-REQ-11.63: the same, with `--json`: the document names the earlier outcome before the new
+/// result, and a failed send carries it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_earlier_outcome_is_named_in_the_document_of_a_send_and_of_a_failed_one() {
+    let host = Host::start(Behaviour::CannotSayWhatBecameOfAnswers).await;
+    let question = host.question();
+    host.kr(&["question", "answer", &question, "--choice", "left"]);
+    let uncertain = host.arrivals()[0].action_id;
+
+    host.behave(Behaviour::RefusesAnswers);
+    let (status, document) = host.json(&["question", "send", &question]);
+    assert_ne!(status, Some(0), "{document}");
+    assert_eq!(document["ok"], Value::Bool(false), "{document}");
+    assert_eq!(document["earlier"][0]["state"], "unknown", "{document}");
+    assert_eq!(
+        document["earlier"][0]["action_id"],
+        Value::String(uncertain.to_string()),
+        "{document}"
+    );
+
+    host.behave(Behaviour::Serves);
+    let (status, document) = host.json(&["question", "send", &question]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["ok"], Value::Bool(true), "{document}");
+    assert_eq!(document["earlier"][0]["state"], "unknown", "{document}");
+}
+
+/// KR-REQ-11.63: a replacement answer the worker refuses keeps the pair while an earlier send is
+/// unsettled, and the earlier send stays named; and sends the worker refuses in its own word leave
+/// the record at once, so eight of them leave none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_replacement_keeps_the_earlier_send_and_refused_sends_leave_the_record() {
+    let host = Host::start(Behaviour::CannotSayWhatBecameOfAnswers).await;
+    let question = host.question();
+    host.kr(&["question", "answer", &question, "--choice", "left"]);
+    let uncertain = host.arrivals()[0].action_id;
+
+    host.behave(Behaviour::RefusesAnswers);
+    let output = host.kr(&["question", "answer", &question, "--choice", "right"]);
+    assert_ne!(output.status.code(), Some(0));
+    // The replacement is what is kept, and the earlier send is still named; the refused one is not.
+    assert!(host.kept().is_file());
+    assert_eq!(host.sends(), vec![uncertain]);
+
+    // Settle the uncertain one as refused, and keep the answer offline-looking: sends the worker
+    // refuses leave nothing in the record.
+    host.state().receipts.clear();
+    for _ in 0..8 {
+        let output = host.kr(&["question", "send", &question]);
+        assert_ne!(output.status.code(), Some(0));
+    }
+    assert!(
+        host.sends().len() <= 1,
+        "refused sends do not fill the record: {:?}",
+        host.sends()
+    );
+    host.behave(Behaviour::Serves);
+    let output = host.kr(&["question", "send", &question]);
+    assert_eq!(output.status.code(), Some(0), "a ninth send is made");
+}
+
+/// KR-REQ-11.63: a record of sends that names no answer on disk is swept by `drafts`, and a record
+/// that cannot be read closes the answer it sits beside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_record_that_describes_no_answer_is_swept_and_one_that_cannot_be_read_closes_its_answer()
+{
+    let host = Host::start(Behaviour::Serves).await;
+    host.record_pair(action(9));
+    // The answer goes, as an older release removes one, and the record stays.
+    std::fs::remove_file(host.kept()).expect("the answer goes");
+    assert!(host.record().exists());
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["drafts"], Value::Array(Vec::new()), "{document}");
+    assert!(!host.record().exists(), "the orphan record was swept");
+
+    // A record that cannot be read closes its answer: it is neither listed nor sent.
+    host.record_pair(action(8));
+    std::fs::write(host.record(), b"not a record").expect("damaged");
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_ne!(status, Some(0), "{document}");
+    assert_eq!(host.arrivals().len(), 0);
+    let question = host.question();
+    let (status, document) = host.json(&["question", "send", &question]);
+    assert_ne!(status, Some(0), "{document}");
+    assert_eq!(host.arrivals().len(), 0, "nothing was sent");
 }
