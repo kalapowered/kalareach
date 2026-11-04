@@ -5821,12 +5821,37 @@ mod tests {
     /// asked whether the time is up, so a machine that was stopped past the bound while `ps` ran
     /// on finds its answer.
     #[cfg(unix)]
-    fn state_by(ps: impl AsRef<OsStr>, pid: &str, _bound: Duration) -> String {
-        let listed = Command::new(ps)
+    fn state_by(ps: impl AsRef<OsStr>, pid: &str, bound: Duration) -> String {
+        use std::io::Read as _;
+
+        let mut asked = Command::new(ps)
             .args(["-o", "stat=", "-p", pid])
-            .output()
-            .expect("ps lists the process");
-        String::from_utf8_lossy(&listed.stdout).trim().to_owned()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("ps starts");
+        let until = Instant::now() + bound;
+        loop {
+            match asked.try_wait().expect("ps can be waited on") {
+                Some(_) => break,
+                None if Instant::now() >= until => {
+                    // This case started it, so this case ends it, by the handle it holds.
+                    let _ = asked.kill();
+                    let _ = asked.wait();
+                    panic!("ps did not answer in {bound:?} for process {pid}");
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        let mut listed = String::new();
+        asked
+            .stdout
+            .take()
+            .expect("ps's output")
+            .read_to_string(&mut listed)
+            .expect("ps's answer reads");
+        listed.trim().to_owned()
     }
 
     /// Whether a process with this identifier is running, which one that has ended and not yet been
