@@ -645,6 +645,67 @@ fn a_process_whose_standard_error_is_held_still_ends_when_it_must() {
     assert_eq!(status.code(), Some(Exit::ControlStalled.code()));
 }
 
+/// A process whose standard error cannot be written to ends as it must when it has something to say
+/// as it ends, and does not wait to say it: its answer cannot be written because its daemon is
+/// gone, its model has failed, or a request it was sent is not a message. Each of the three ends has
+/// its own exit status, and none of them has a bound of the process's own to end it, since the work
+/// in hand is nowhere near its deadline and the control thread is not stuck on a request. The script
+/// holds the lock on standard error from before the process serves, as a write waiting on a pipe
+/// nobody reads does. The control is the process with its standard error free, which ends the same
+/// way.
+#[test]
+fn a_process_that_ends_with_something_to_say_does_not_wait_for_its_standard_error() {
+    let placed = Placed::stub();
+    for (form, hold_standard_error) in [("held", true), ("free", false)] {
+        // The daemon is gone: the answer to the load cannot be written.
+        let runtime = placed.directory(&format!("gone-{form}"));
+        let script = Script {
+            hold_standard_error,
+            fail_output_from: Some(2),
+            ..Script::default()
+        };
+        let mut process = Process::start(&placed, &script, &runtime);
+        process.hello();
+        process.send(&load(1, &default_profile(), 300_000));
+        let status = process
+            .exit_within(SOON * 3)
+            .expect("the process ends itself, though it cannot say why");
+        assert_eq!(status.code(), Some(Exit::DaemonGone.code()), "{form}");
+
+        // The model fails inside a job.
+        let runtime = placed.directory(&format!("failed-{form}"));
+        let script = Script {
+            hold_standard_error,
+            panic_in_generate: true,
+            ..Script::default()
+        };
+        let mut process = Process::start(&placed, &script, &runtime);
+        process.hello();
+        process.send(&load(1, &default_profile(), 300_000));
+        process.expect_answer(SOON, "the load");
+        process.send(&generate(2, 1, 300_000));
+        let status = process
+            .exit_within(SOON * 3)
+            .expect("the process ends itself, though it cannot say why");
+        assert_eq!(status.code(), Some(Exit::ModelFailed.code()), "{form}");
+
+        // A request that is not a message: a frame cut short by the end of the input.
+        let runtime = placed.directory(&format!("refused-{form}"));
+        let script = Script {
+            hold_standard_error,
+            ..Script::default()
+        };
+        let mut process = Process::start(&placed, &script, &runtime);
+        process.hello();
+        process.send_raw(&[0, 0]);
+        process.close_input();
+        let status = process
+            .exit_within(SOON * 3)
+            .expect("the process ends itself, though it cannot say why");
+        assert_eq!(status.code(), Some(Exit::WireBroken.code()), "{form}");
+    }
+}
+
 /// KR-REQ-22.11: a job that is past its deadline and has been told to stop, with the stop read by
 /// the control thread, is given until the stop bound to stop, and the process does not end itself
 /// for it at the usual grace after the deadline. The model here does not look at its token for

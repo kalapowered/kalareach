@@ -198,6 +198,13 @@ impl Process {
         input.flush().expect("the request is flushed");
     }
 
+    /// Sends bytes as they are, which need not be a frame.
+    pub fn send_raw(&mut self, bytes: &[u8]) {
+        let input = self.input.as_mut().expect("the input is open");
+        input.write_all(bytes).expect("the bytes are written");
+        input.flush().expect("the bytes are flushed");
+    }
+
     /// Returns the next answer, when one arrives in time. A process whose output ended is not a
     /// process that has not answered yet, and says how it ended.
     pub fn answer(&mut self, within: Duration) -> Option<Answer> {

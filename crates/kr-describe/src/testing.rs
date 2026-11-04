@@ -671,6 +671,9 @@ pub struct Script {
     pub wedge_input_after: Option<u64>,
     /// From this answer on, counting from one, writing blocks for good.
     pub wedge_output_from: Option<u64>,
+    /// From this answer on, counting from one, writing fails, as it does on a pipe that nothing
+    /// reads any longer.
+    pub fail_output_from: Option<u64>,
     /// A process that does not serve through [`crate::serve::run`] at all.
     pub raw: Option<Raw>,
     /// Whether the model looks at its token without pausing between looks, so that it sees a
@@ -875,6 +878,9 @@ impl Script {
         if let Some(count) = self.wedge_output_from {
             parts.push(format!("wedge-output-from={count}"));
         }
+        if let Some(count) = self.fail_output_from {
+            parts.push(format!("fail-output-from={count}"));
+        }
         let mut flag = |name: &str, set: bool| {
             if set {
                 parts.push(name.to_owned());
@@ -969,6 +975,7 @@ impl Script {
                 "peak-rss" => script.peak_rss_bytes = Some(number()?),
                 "wedge-input-after" => script.wedge_input_after = Some(number()?),
                 "wedge-output-from" => script.wedge_output_from = Some(number()?),
+                "fail-output-from" => script.fail_output_from = Some(number()?),
                 "load-until-cancelled" => script.load_until_cancelled = true,
                 "load-until-released" => script.load_until_released = true,
                 "generate-until-released" => script.generate_until_released = true,
@@ -1727,7 +1734,11 @@ pub fn stub_main() -> i32 {
         daemon,
     };
     let input = Wedging::reading(std::io::stdin(), script.wedge_input_after);
-    let output = Wedging::writing(std::io::stdout(), script.wedge_output_from);
+    let output = Closing {
+        inner: Wedging::writing(std::io::stdout(), script.wedge_output_from),
+        from: script.fail_output_from,
+        answers: 0,
+    };
     let model = StubModel::new(script).in_runtime_dir(options.runtime_dir.clone());
     crate::serve::run(options, model, input, output).code()
 }
@@ -1963,6 +1974,29 @@ impl<W: Write> Write for Wedging<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()?;
         self.frames += 1;
+        Ok(())
+    }
+}
+
+/// A stream whose writes fail from an answer on, as they do on a pipe that nothing reads any longer.
+struct Closing<W> {
+    inner: W,
+    from: Option<u64>,
+    /// The answers flushed so far.
+    answers: u64,
+}
+
+impl<W: Write> Write for Closing<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.from.is_some_and(|from| self.answers + 1 >= from) {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()?;
+        self.answers += 1;
         Ok(())
     }
 }

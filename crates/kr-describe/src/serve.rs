@@ -328,8 +328,7 @@ pub fn run<M: Model>(
                     );
                 }));
                 if served.is_err() {
-                    eprintln!("kr-describe: the model failed, so this process ends");
-                    std::process::exit(Exit::ModelFailed.code());
+                    end_process(Exit::ModelFailed, "the model failed, so this process ends");
                 }
             })
             .expect("the model thread starts");
@@ -484,7 +483,7 @@ pub fn run<M: Model>(
             // daemon is not going to send anything more.
             Ok(None) | Err(WireError::Io(_)) => return shared.end(Exit::Ended),
             Err(error) => {
-                eprintln!("kr-describe: a request from the daemon was refused: {error}");
+                say(&format!("a request from the daemon was refused: {error}"));
                 return shared.end(Exit::WireBroken);
             }
         }
@@ -546,10 +545,10 @@ impl Shared {
     fn answer(&self, answer: &Answer) {
         let mut output = self.output.lock().unwrap_or_else(PoisonError::into_inner);
         if let Err(error) = write_message(&mut *output, answer) {
-            eprintln!(
-                "kr-describe: an answer could not be written, so the daemon is gone: {error}"
+            end_process(
+                Exit::DaemonGone,
+                &format!("an answer could not be written, so the daemon is gone: {error}"),
             );
-            std::process::exit(Exit::DaemonGone.code());
         }
         // The bound held as the write ends, for a test to read back.
         #[cfg(feature = "testing")]
@@ -1049,17 +1048,16 @@ fn watchdog(shared: &Shared, daemon: Option<&ProcessStartIdentity>) {
     }
 }
 
-/// How long [`end_process`] waits for its message to reach standard error.
+/// How long [`say`] waits for its message to reach standard error.
 const NOTICE_WAIT: Duration = Duration::from_millis(250);
 
-/// Ends the process with `exit`, after saying why on standard error for as long as
-/// [`NOTICE_WAIT`] allows.
+/// Says why on standard error for as long as [`NOTICE_WAIT`] allows.
 ///
 /// The message is written on a thread of its own. Standard error is read by whoever started the
-/// process, and one that does not read it fills the pipe, after which a write waits for good: the
-/// end of a process that has decided to end must not wait behind it. A write that fails is of no
-/// concern to it either.
-fn end_process(exit: Exit, why: &str) -> ! {
+/// process, and one that does not read it fills the pipe, after which a write waits for good: a
+/// process that has something to say as it ends must not wait behind it. A write that fails is of
+/// no concern to it either.
+fn say(why: &str) {
     let (written, wrote) = std::sync::mpsc::channel();
     let message = format!("kr-describe: {why}\n");
     let spawned = std::thread::Builder::new()
@@ -1071,6 +1069,11 @@ fn end_process(exit: Exit, why: &str) -> ! {
     if spawned.is_ok() {
         let _ = wrote.recv_timeout(NOTICE_WAIT);
     }
+}
+
+/// Ends the process with `exit`, after saying why as [`say`] does.
+fn end_process(exit: Exit, why: &str) -> ! {
+    say(why);
     std::process::exit(exit.code())
 }
 
