@@ -384,7 +384,9 @@ async fn an_answer_the_worker_could_not_take_is_kept_and_only_the_person_sends_i
     );
     let call = link.expect(Method::QuestionAnswer).await;
     assert_eq!(call.kind, CallKind::Mutation);
-    let sent = call.action_id.expect("the answer goes out under an identifier");
+    let sent = call
+        .action_id
+        .expect("the answer goes out under an identifier");
     drop(link);
     let told = answered(asked).await.expect("the answer is kept");
     assert_eq!(told["outcome"], "kept");
@@ -478,7 +480,9 @@ async fn an_answer_whose_question_ended_is_kept_until_it_is_dismissed() {
         answer_params(&worker, 2, &choice("main")),
     );
     let call = link.expect(Method::QuestionAnswer).await;
-    let sent = call.action_id.expect("the answer goes out under an identifier");
+    let sent = call
+        .action_id
+        .expect("the answer goes out under an identifier");
     drop(link);
     let told = answered(asked).await.expect("kept");
     let drafted_at = told["draft"]["drafted_at_ms"].clone();
@@ -889,7 +893,9 @@ async fn an_answer_the_worker_took_is_reported_taken_when_its_kept_copy_cannot_b
         answer_params(&worker, 2, &choice("main")),
     );
     let call = link.expect(Method::QuestionAnswer).await;
-    let sent = call.action_id.expect("the answer goes out under an identifier");
+    let sent = call
+        .action_id
+        .expect("the answer goes out under an identifier");
     drop(link);
     let told = answered(asked).await.expect("kept");
     let drafted_at = told["draft"]["drafted_at_ms"].clone();
@@ -930,7 +936,10 @@ async fn an_answer_the_worker_took_is_reported_taken_when_its_kept_copy_cannot_b
 async fn has_no_receipt(link: &mut scripted_worker::Link, sent: kr_protocol::ids::ActionId) {
     let call = link.expect(Method::ActionRead).await;
     let params: kr_protocol::receipt::ActionReadParams = call.params();
-    assert_eq!(params.action_id, sent, "the read names the answer's identifier");
+    assert_eq!(
+        params.action_id, sent,
+        "the read names the answer's identifier"
+    );
     link.refuse(&call, &format!("no receipt for action {sent}"))
         .await;
 }
@@ -999,7 +1008,9 @@ async fn the_identifier_of_an_answer_is_recorded_before_it_reaches_the_worker() 
         answer_params(&worker, 2, &choice("release")),
     );
     let call = link.expect(Method::QuestionAnswer).await;
-    let sent = call.action_id.expect("the answer goes out under an identifier");
+    let sent = call
+        .action_id
+        .expect("the answer goes out under an identifier");
     assert_eq!(
         kept_files(&page, &worker, "send"),
         1,
@@ -1023,7 +1034,8 @@ async fn the_identifier_of_an_answer_is_recorded_before_it_reaches_the_worker() 
     let call = link.expect(Method::ActionRead).await;
     let params: kr_protocol::receipt::ActionReadParams = call.params();
     assert_eq!(params.action_id, sent);
-    link.refuse(&call, &format!("no receipt for action {sent}")).await;
+    link.refuse(&call, &format!("no receipt for action {sent}"))
+        .await;
     let settled = answered(settling).await.expect("the standing");
     assert_eq!(settled[0]["standing"], "offered", "{settled}");
     assert_eq!(settled[0]["earlier"][0]["state"], "no_record", "{settled}");

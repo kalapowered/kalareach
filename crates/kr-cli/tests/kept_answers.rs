@@ -1703,7 +1703,11 @@ async fn an_answer_to_a_question_that_ended_says_an_earlier_answer_is_still_kept
     assert!(message.contains("still kept"), "{message}");
     assert!(!message.contains("no longer kept"), "{message}");
     assert!(host.kept().is_file(), "the earlier answer is still kept");
-    assert_eq!(host.answers_received(), 0, "neither answer reached the worker");
+    assert_eq!(
+        host.answers_received(),
+        0,
+        "neither answer reached the worker"
+    );
 
     // With nothing kept before it, nothing is said of an earlier answer.
     let host = Host::start(Behaviour::Serves).await;
