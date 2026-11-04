@@ -1458,14 +1458,15 @@ mod tests {
         names
     }
 
-    /// A host short of descriptors, processes or memory to read or write one path has said nothing
-    /// of that path, so the inclusion stops there as a fault that passes, which a client sends the
-    /// request again after, and not as a path that could not be carried. What was carried before
-    /// stays, and nothing of the failed copy is left. Any other failure of a step is about that
-    /// one path: the inclusion goes on and reports the path as one that was not applied.
+    /// A failure of a step of the copy of one path, a host that is short of descriptors, processes
+    /// or memory included, is about that one path: the inclusion goes on, the workspace is made,
+    /// and the path is reported as one that was not applied. What was carried before stays, the
+    /// journal names the outcome of each path, and nothing of the failed copy is left in the
+    /// destination. Stopping the inclusion would leave the workspace marked for removal with its
+    /// tree, and a client that sent the creation again would be refused for the tree that is there.
     #[cfg(unix)]
     #[test]
-    fn a_host_short_of_memory_when_a_path_is_copied_stops_the_inclusion_as_a_fault_that_passes() {
+    fn a_failed_step_of_the_copy_of_a_path_leaves_the_path_unapplied_and_the_workspace_made() {
         use crate::identity::tests::OPEN_ERRORS;
 
         // Each step, and how many calls of it the first file takes.
@@ -1476,7 +1477,7 @@ mod tests {
             ("flush", 1),
             ("permissions", 1),
         ] {
-            for (errno, passes) in OPEN_ERRORS {
+            for (errno, _) in OPEN_ERRORS {
                 let copying = two_files_to_copy();
 
                 COPY_FAILS.with(|fails| fails.set(Some((step, passing, errno))));
@@ -1484,86 +1485,30 @@ mod tests {
                 COPY_FAILS.with(|fails| fails.set(None));
 
                 let row = format!("{step}, {errno}");
-                if passes {
-                    let Err(refused) = outcome else {
-                        panic!("{row}: the host was short, and the inclusion went on");
-                    };
-                    assert_eq!(
-                        refused.code(),
-                        kr_protocol::error::ErrorCode::UpstreamUnavailable,
-                        "{row}: {refused}"
-                    );
-                    assert!(
-                        refused
-                            .to_string()
-                            .contains(&std::io::Error::from(errno).to_string()),
-                        "it says the reason: {row}: {refused}"
-                    );
-                    assert_eq!(
-                        seen,
-                        [("first.txt".to_owned(), PathOutcome::Carried)],
-                        "{row}"
-                    );
-                } else {
-                    let report = outcome.expect("another failure is about the one path");
-                    assert_eq!(report.copied, ["first.txt"], "{row}");
-                    assert_eq!(report.skipped, ["second.txt"], "{row}");
-                    assert_eq!(
-                        seen,
-                        [
-                            ("first.txt".to_owned(), PathOutcome::Carried),
-                            ("second.txt".to_owned(), PathOutcome::Unapplied)
-                        ],
-                        "{row}"
-                    );
-                }
+                let report = outcome.unwrap_or_else(|refused| {
+                    panic!("{row}: a failed step stopped the inclusion: {refused}")
+                });
+                assert_eq!(report.copied, ["first.txt"], "{row}");
+                assert_eq!(report.skipped, ["second.txt"], "{row}");
+                assert!(report.leftover.is_empty(), "{row}");
+                assert_eq!(
+                    seen,
+                    [
+                        ("first.txt".to_owned(), PathOutcome::Carried),
+                        ("second.txt".to_owned(), PathOutcome::Unapplied)
+                    ],
+                    "{row}"
+                );
                 assert_eq!(names_in(&copying.to), ["first.txt"], "{row}");
             }
         }
     }
 
-    /// An inclusion stopped by a shortage leaves what one stopped by the quota leaves: what was
-    /// carried before the stop is there, as the journal was told, and a path in the top level of
-    /// the tree that it stopped at has left nothing in the destination. (A nested path may leave
-    /// the directories made for it, and a temporary file that cannot be taken away is journalled
-    /// as left over; the next case holds that.) The service ends the workspace's creation the
-    /// same way for either, because it reads only that the copy failed.
+    /// A temporary file that a failed copy cannot take away is not lost: the journal names it as
+    /// left over, before it names the path as not applied, and the report says so.
     #[cfg(unix)]
     #[test]
-    fn an_inclusion_stopped_by_a_shortage_leaves_what_one_stopped_by_the_quota_leaves() {
-        let over = two_files_to_copy();
-        std::fs::File::create(over.from.join("second.txt"))
-            .expect("the second file is made again")
-            .set_len(MAX_WORKSPACE_COPY_BYTES + 1)
-            .expect("it is larger than a workspace takes");
-        let (outcome, over_seen) = copied(&over);
-        let stopped = outcome.expect_err("more than the quota is not copied");
-        assert!(
-            matches!(stopped, ProjectError::QuotaExceeded { .. }),
-            "{stopped:?}"
-        );
-
-        let short = two_files_to_copy();
-        COPY_FAILS.with(|fails| fails.set(Some(("write", 1, rustix::io::Errno::NOMEM))));
-        let (outcome, short_seen) = copied(&short);
-        COPY_FAILS.with(|fails| fails.set(None));
-        let stopped = outcome.expect_err("a host short of memory stops the copy");
-        assert!(
-            stopped.code().retry_category().permits_automatic_retry(),
-            "{stopped}"
-        );
-
-        assert_eq!(short_seen, over_seen);
-        assert_eq!(names_in(&short.to), names_in(&over.to));
-        assert_eq!(names_in(&short.to), ["first.txt"]);
-    }
-
-    /// A copy in progress that a stop leaves, because even its removal failed, is journalled before
-    /// the stop is returned, as a temporary file nobody accounts for is journalled for a copy that
-    /// goes on: the caller is told which file it is.
-    #[cfg(unix)]
-    #[test]
-    fn a_temporary_file_a_stopped_copy_cannot_take_away_is_journalled_as_left_over() {
+    fn a_temporary_file_a_failed_copy_cannot_take_away_is_journalled_as_left_over() {
         let copying = two_files_to_copy();
         let temporary = temporary_name(&RelativeName::parse("second.txt").expect("a name"));
 
@@ -1573,16 +1518,15 @@ mod tests {
         REMOVAL_FAILS.with(|fails| fails.set(false));
         COPY_FAILS.with(|fails| fails.set(None));
 
-        let stopped = outcome.expect_err("a host short of memory stops the copy");
-        assert!(
-            stopped.code().retry_category().permits_automatic_retry(),
-            "{stopped}"
-        );
+        let report = outcome.expect("a failed step is about the one path");
+        assert_eq!(report.leftover, [temporary.clone()]);
+        assert_eq!(report.skipped, ["second.txt"]);
         assert_eq!(
             seen,
             [
                 ("first.txt".to_owned(), PathOutcome::Carried),
-                (temporary.clone(), PathOutcome::Leftover)
+                (temporary.clone(), PathOutcome::Leftover),
+                ("second.txt".to_owned(), PathOutcome::Unapplied)
             ]
         );
         let mut left = vec!["first.txt".to_owned(), temporary];
