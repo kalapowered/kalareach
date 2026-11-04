@@ -734,9 +734,11 @@ pub fn settle_handle(
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::Destination`] when the directory cannot be opened.
+/// Returns [`ProjectError::Destination`] when the directory cannot be opened, except that a host
+/// too short of descriptors, processes or memory to open it is [`ProjectError::GitFailed`], a
+/// fault that passes.
 pub fn identity_of(environment_id: EnvironmentId, path: &Path) -> Result<ObjectIdentity> {
-    Ok(AuthorisedDirectory::open_root(environment_id, path)?.identity())
+    Ok(crate::identity::open_unrecorded_root(environment_id, path)?.identity())
 }
 
 #[cfg(test)]

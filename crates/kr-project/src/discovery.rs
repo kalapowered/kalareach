@@ -100,7 +100,7 @@ pub fn discover(work_tree: AuthorisedDirectory, shown: &str) -> Result<Discovere
         }
     };
     let common_dir = match kind_of(&git_dir, "commondir", shown)? {
-        None => git_dir.try_clone()?,
+        None => crate::identity::duplicated(&git_dir)?,
         Some(ObjectKind::File) => {
             let text = read_small(&git_dir, "commondir", shown)?;
             git_dir.subdirectory(&beneath(
@@ -232,7 +232,7 @@ fn follow_objects(
         // there would hide the alternates it names from this check.
         Some(_) => return Err(refused(shown, "objects/info", "is not a directory")),
     }
-    let base = objects.try_clone()?;
+    let base = crate::identity::duplicated(&objects)?;
     found.push(objects);
     for alternate in alternates {
         if depth + 1 > MAX_ALTERNATE_DEPTH {

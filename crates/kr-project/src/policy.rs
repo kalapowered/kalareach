@@ -1252,8 +1252,8 @@ impl ProjectService {
         // Opened now, confined to the mount it is on, and kept: the confirmation is bound to this
         // object, and this object is what the location will hold. A platform that will not say
         // which mount a directory is on refuses the authorisation rather than approximating one.
-        let handle =
-            AuthorisedDirectory::open_root(self.environment_id, path)?.confined_to_one_mount()?;
+        let handle = crate::identity::open_unrecorded_root(self.environment_id, path)?
+            .confined_to_one_mount()?;
         let enlargement = Enlargement {
             action_digest: authorisation_digest(params, handle.identity())?,
             rights: location_rights(),

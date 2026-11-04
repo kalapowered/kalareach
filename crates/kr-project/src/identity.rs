@@ -300,7 +300,8 @@ impl OpenedRepository {
     ///
     /// Returns [`ProjectError::Destination`] when the directory cannot be opened,
     /// [`ProjectError::GitFailed`] when the repository cannot be read or when the host is too
-    /// short of descriptors, processes or memory to open a directory of it,
+    /// short of descriptors, processes or memory to open a directory of it or to copy the handle
+    /// of one,
     /// [`ProjectError::IdentityChanged`] when the directory is not the object that was opened
     /// when Git runs or is confirmed after it, or
     /// [`ProjectError::ConfigurationRejected`] when its configuration names something no override
@@ -383,7 +384,7 @@ impl OpenedRepository {
                 // tree.
                 let within = if recorded.git_dir.path_is_tree() {
                     decide_tree_before_git(&work_tree, recorded.tree)?;
-                    work_tree.try_clone()?
+                    duplicated(&work_tree)?
                 } else {
                     require_within(&work_tree, recorded.tree)?
                 };
@@ -565,7 +566,7 @@ impl OpenedRepository {
         }
         Ok((
             Self {
-                top: found.work_tree.try_clone()?,
+                top: duplicated(&found.work_tree)?,
                 work_tree: found.work_tree,
                 git_dir: found.common_dir,
                 own_dir: found.git_dir,
@@ -1104,25 +1105,34 @@ fn settled_update(reference: &str, outcome: Result<GitOutput>, started: bool) ->
 /// elsewhere the device). Another filesystem mounted over the path ends the climb at its own
 /// root, and so does the root of the filesystem, and either refuses. Where a platform does not
 /// open a directory's parent from its handle, only the recorded tree itself is accepted.
+///
+/// The climb copies handles, and a host too short of descriptors, processes or memory to make one
+/// has said nothing of the directory: that is [`ProjectError::GitFailed`], a fault that passes,
+/// and not a directory that is not the tree.
 fn require_within(
     named: &AuthorisedDirectory,
     tree: RecordedIdentity,
 ) -> Result<AuthorisedDirectory> {
     let refusal = match named.check_recorded(tree) {
-        Ok(_) => return Ok(named.try_clone()?),
+        Ok(_) => return duplicated(named),
         Err(refusal) => refusal,
     };
-    let mount_of = |directory: &AuthorisedDirectory| {
-        directory
-            .try_clone()
-            .and_then(AuthorisedDirectory::confined_to_one_mount)
+    // The mount a directory is on, asked of a copy of it that is confined to one. A directory that
+    // cannot say is on no mount the climb can follow, which ends it. A host too short of
+    // descriptors, processes or memory to make the copy has said nothing of the directory, which
+    // is not an answer to be climbed on or refused on.
+    let mount_of = |directory: &AuthorisedDirectory| match duplicated(directory) {
+        Ok(copy) => Ok(copy
+            .confined_to_one_mount()
             .ok()
-            .and_then(|held| held.mount())
+            .and_then(|held| held.mount())),
+        Err(shortage @ ProjectError::GitFailed { .. }) => Err(shortage),
+        Err(_) => Ok(None),
     };
-    if let Some(mount) = mount_of(named) {
-        let mut here = named.try_clone()?;
+    if let Some(mount) = mount_of(named)? {
+        let mut here = duplicated(named)?;
         while let Ok(above) = here.parent() {
-            if above.identity() == here.identity() || mount_of(&above) != Some(mount) {
+            if above.identity() == here.identity() || mount_of(&above)? != Some(mount) {
                 break;
             }
             if above.check_recorded(tree).is_ok() {
@@ -1182,13 +1192,20 @@ fn open_recorded_root(
     }
 }
 
-/// Returns a second authority over the same open directory, for a repository whose own data is in
-/// its Git directory. The handle is duplicated, which takes a descriptor as an open does, so a
-/// host too short of descriptors, processes or memory to do it has said nothing of the directory
-/// and the refusal is a fault that passes, worded as an open's is (`boundary::unopenable`).
+/// Returns a second authority over the same open directory: the copy every holder of an authority
+/// here takes of one it keeps while it gives another on. The handle is duplicated, which takes a
+/// descriptor as an open does, so a host too short of descriptors, processes or memory to do it
+/// has said nothing of the directory and the refusal is a fault that passes, worded as an open's
+/// is (`boundary::unopenable`).
 ///
-/// The directory carries no rule that confines it to one mount, as none opened here does, and the
-/// copy carries none either.
+/// The rule that confines a directory to one mount goes with its copy, as it does when the
+/// transfer crate copies one: a directory that carries none has a copy that carries none.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::GitFailed`], a fault that passes, when the host is too short of
+/// descriptors, processes or memory to duplicate the handle, and [`ProjectError::Destination`]
+/// when it cannot be duplicated for another reason or the copy cannot be read for what it is.
 pub(crate) fn duplicated(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
     let path = directory.display_path();
     // A case that asks for it has the duplication fail, after that many have been made, as it
@@ -1201,22 +1218,23 @@ pub(crate) fn duplicated(directory: &AuthorisedDirectory) -> Result<AuthorisedDi
     #[cfg(not(all(test, unix)))]
     let copy = directory.handle().try_clone();
     let copy = copy.map_err(|error| crate::boundary::unopenable(path, &error))?;
-    Ok(AuthorisedDirectory::from_handle(
-        directory.environment_id(),
-        copy,
-        path.to_path_buf(),
-    )?)
+    let held =
+        AuthorisedDirectory::from_handle(directory.environment_id(), copy, path.to_path_buf())?;
+    Ok(match directory.mount() {
+        Some(_) => held.confined_to_one_mount()?,
+        None => held,
+    })
 }
 
 /// Opens the directory at `path` as an authority for one environment: a checkout `project.adopt`
 /// is handed by path, the top level, the Git directory and a linked worktree's own directory Git
-/// reports for a repository, and a destination's parent the owner named by path. A record, where
-/// one names the directory, decides by identity afterwards.
+/// reports for a repository, a destination's parent the owner named by path, the parent of a tree
+/// to take away, the directory an owner authorises as a location, and a directory whose object a
+/// caller records. A record, where one names the directory, decides by identity afterwards.
 ///
 /// It is opened once, by the open that every directory here is opened by, and what the open
 /// finds is the answer, in the open's own words (`boundary::unopenable`). A link that leads round
-/// to itself reads as the system's reason for it. Other opens of a root, such as the parent of a
-/// tree to take away, are not made here.
+/// to itself reads as the system's reason for it.
 pub(crate) fn open_unrecorded_root(
     environment_id: EnvironmentId,
     path: &Path,

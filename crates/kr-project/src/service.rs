@@ -1338,7 +1338,10 @@ impl ProjectService {
         let (opened, git_dir) = OpenedRepository::discovered(
             &self.profile,
             found,
-            (location.handle().try_clone()?, relative.clone()),
+            (
+                crate::identity::duplicated(location.handle())?,
+                relative.clone(),
+            ),
             admission,
             recorded.map(|recorded| recorded.git_dir),
         )?;
@@ -3882,7 +3885,7 @@ impl ProjectService {
                 }
                 let (above, leaf) = split_last(relative)?;
                 let parent = match above {
-                    None => held.handle().try_clone()?,
+                    None => crate::identity::duplicated(held.handle())?,
                     Some(above) => match held.handle().subdirectory(&above) {
                         Ok(parent) => parent,
                         // The directory the tree was in is not there, so neither is the tree.
@@ -3893,7 +3896,7 @@ impl ProjectService {
                 (parent, leaf)
             }
             None => (
-                AuthorisedDirectory::open_root(self.environment_id, parent)?,
+                crate::identity::open_unrecorded_root(self.environment_id, parent)?,
                 RelativeName::parse(name)?,
             ),
         };

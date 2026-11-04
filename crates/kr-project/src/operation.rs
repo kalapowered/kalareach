@@ -160,7 +160,7 @@ impl Destination {
                 let held = policy.admit(*location_id, &wanted)?;
                 let admission =
                     crate::service::admission_for(policy, vec![(Arc::clone(&held), wanted)]);
-                let parent = held.handle().try_clone()?;
+                let parent = crate::identity::duplicated(held.handle())?;
                 let parent_path = parent.display_path().to_path_buf();
                 Ok(Self {
                     parent,
