@@ -141,7 +141,7 @@ impl EventOrder {
         Self::default()
     }
 
-    /// Takes the next place in the order.
+    /// Takes the next place in the order, the first being 1.
     #[must_use]
     pub fn next(&self) -> u64 {
         self.0.fetch_add(1, Ordering::SeqCst) + 1
@@ -179,9 +179,11 @@ impl EffectWait {
     }
 
     /// As this wait, taking a place in `order` each time the daemon is about to answer that the
-    /// outcome is unknown because the wait ended ([`Self::told_at`]). The daemon takes it before it
-    /// writes the answer, so the place says when the daemon decided to answer, and not when a
-    /// suite came to read the answer.
+    /// outcome is unknown because the wait ended ([`Self::told_at`]). The daemon takes it after the
+    /// wait has ended and before it writes the answer, so the place says when the daemon decided
+    /// to answer, and not when a suite came to read the answer. A suite that holds the wait with a
+    /// timer that numbers its ends in the same order ([`HeldTimer::held_in`]) can tell a daemon
+    /// that answered after the wait ended from one that stopped waiting without it.
     #[must_use]
     pub fn telling_in(mut self, order: EventOrder) -> Self {
         self.told = Some(Told {
@@ -191,8 +193,9 @@ impl EffectWait {
         self
     }
 
-    /// The places at which the daemon told a caller that the outcome is unknown because the wait
-    /// had ended, in the order it did.
+    /// The places at which the daemon was about to tell a caller that the outcome is unknown
+    /// because its wait had ended, in the order it was. The daemon takes each before it writes
+    /// the answer, so a place stays when the answer never reaches the caller.
     ///
     /// # Panics
     ///
@@ -545,6 +548,10 @@ pub struct HeldTimer {
     now: Mutex<std::time::Instant>,
     /// The time of day, which stands still until the test moves it.
     unix_ms: Mutex<u64>,
+    /// The order the waits that ended are placed in, when the test gave one.
+    order: Option<EventOrder>,
+    /// The places at which a wait ended because the test released it.
+    ended: Mutex<Vec<u64>>,
 }
 
 impl Default for HeldTimer {
@@ -555,6 +562,8 @@ impl Default for HeldTimer {
             asked: Notify::new(),
             now: Mutex::new(std::time::Instant::now()),
             unix_ms: Mutex::new(kr_ipc::now_ms().get()),
+            order: None,
+            ended: Mutex::default(),
         }
     }
 }
@@ -584,7 +593,10 @@ impl Timer for HeldTimer {
         });
         drop(waits);
         self.asked.notify_one();
-        Box::pin(async move { release.notified().await })
+        Box::pin(async move {
+            release.notified().await;
+            self.note_ended();
+        })
     }
 
     fn now(&self) -> std::time::Instant {
@@ -613,6 +625,37 @@ impl HeldTimer {
     /// A timer that holds every wait until the test releases it.
     pub fn held() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// As [`Self::held`], taking a place in `order` when a wait the test released ends
+    /// ([`Self::ended_at`]).
+    pub fn held_in(order: EventOrder) -> Arc<Self> {
+        Arc::new(Self {
+            order: Some(order),
+            ..Self::default()
+        })
+    }
+
+    /// The places at which a wait ended because the test released it, in the order they did. A
+    /// wait whose future was dropped before the release never ends, so it takes none: a daemon that
+    /// stops waiting without waiting for the timer leaves no place here.
+    ///
+    /// # Panics
+    ///
+    /// Panics when this timer was not given an order by [`Self::held_in`].
+    #[must_use]
+    pub fn ended_at(&self) -> Vec<u64> {
+        assert!(self.order.is_some(), "a timer that numbers its waits");
+        self.ended.lock().expect("the ended waits").clone()
+    }
+
+    fn note_ended(&self) {
+        if let Some(order) = &self.order {
+            self.ended
+                .lock()
+                .expect("the ended waits")
+                .push(order.next());
+        }
     }
 
     /// The next wait the daemon asked for that the test has not looked at, with the means to let

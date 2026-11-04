@@ -33,7 +33,7 @@ use net_support::{
     recipient,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Shares `session_id` with `recipient` as a viewer, as the owner at this machine does.
@@ -172,10 +172,11 @@ async fn kr_req_25_10_a_device_redeems_its_invitation_once_and_a_repeat_of_the_a
 /// answered that the outcome is unknown while the effect is still held. The wait is what ends the
 /// request and nothing else, and no clock decides which of the effect and the wait comes first, so
 /// nothing in the case depends on how long the host takes to write the action's route or to bring
-/// the redemption to the store. The answer's place in that order is the one the host took when it
-/// decided to answer, before it wrote the answer, and not the one the case came to read it at: an
-/// answer decided before the wait ended is told by its number from one decided after it, however
-/// late the case reads it or the raw device finds the frame.
+/// the redemption to the store. The held timer takes a place in the order of events when the wait
+/// it was asked for ends because the case released it, and the host takes one when it decides to
+/// answer, before it writes the answer: the wait ended, and then the host decided. A host that
+/// stopped waiting without the timer leaves no place for an ended wait, and one that decided before
+/// its wait ended has the earlier place, however late the case reads the answer.
 ///
 /// The limits that remain are the request's own. The raw device asks for two minutes from the
 /// moment the host receives the request, and the host refuses the redemption by name if it reaches
@@ -188,9 +189,9 @@ async fn kr_req_25_10_a_device_redeems_its_invitation_once_and_a_repeat_of_the_a
 async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repeat_is_answered_as_it_ended()
  {
     let owner = DeviceKeys::generate().expect("owner keys");
-    let wait = HeldTimer::held();
     let order = EventOrder::new();
-    let effect_wait = EffectWait::held_by(Arc::clone(&wait) as _).telling_in(order.clone());
+    let wait = HeldTimer::held_in(order.clone());
+    let effect_wait = EffectWait::held_by(Arc::clone(&wait) as _).telling_in(order);
     let host = Host::start_with_effect_wait(&owner, effect_wait.clone()).await;
     let (device, record) = recipient(&host, &owner).await;
     let issued = shared(
@@ -211,8 +212,6 @@ async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repea
     let window = connection.action_window_id();
     let (arrived, go) = host.controller().sharing().grants().pause_before_effect();
     let wait_ended = AtomicBool::new(false);
-    // The place in the order of events at which the case ended the wait.
-    let wait_ended_at = AtomicU64::new(0);
     let (told, ()) = tokio::join!(
         async {
             let told = connection
@@ -243,16 +242,15 @@ async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repea
                 "the effect has not happened: the request was told nothing of it"
             );
             wait_ended.store(true, Ordering::SeqCst);
-            wait_ended_at.store(order.next(), Ordering::SeqCst);
             end_the_wait.notify_one();
         }),
     );
-    let ended_at = wait_ended_at.load(Ordering::SeqCst);
+    let ended_at = wait.ended_at();
     let decided_at = effect_wait.told_at();
     assert!(
-        ended_at != 0 && decided_at.len() == 1 && decided_at[0] > ended_at,
-        "the host decided to answer at {decided_at:?}, not after the case ended its wait at \
-         {ended_at}: {told:?}"
+        ended_at.len() == 1 && decided_at.len() == 1 && ended_at[0] < decided_at[0],
+        "the host's wait ended at {ended_at:?} and the host decided to answer at {decided_at:?}, \
+         not once after the other: {told:?}"
     );
     let told = told.expect_err("an effect that has not ended is not an answer");
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
@@ -457,10 +455,11 @@ async fn kr_req_25_10_an_invitation_of_a_session_that_has_ended_activates_nothin
 /// been closed, so the connection is closed while the request is pending or it is not closed at
 /// all: the order of events decides the case, and no limit on how long the close takes. The share
 /// ends because the host's clocks are moved past its end, and not by the case waiting for it. The
-/// host looks at the grants a connection stands on again every 15 seconds at the least, so the
+/// host looks at the grants a connection stands on again at least once every 15 seconds, so the
 /// close can come that long after the move. [`RawDevice::answered_before_closing`] is given a
-/// guard for a case that went wrong and decides nothing for a run that closes the connection. (The end of the device's own pairing grant is a
-/// day away, so nothing but the share's end can end the connection here.)
+/// guard for a case that went wrong and decides nothing for a run that closes the connection.
+/// (The end of the device's own pairing grant is a day away, so nothing but the share's end can
+/// end the connection here.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_pending() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -500,8 +499,8 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
         )
         .await
         .expect("the short share is redeemed");
-    // That redemption was waited for by the held timer too, and the timer keeps the record of a wait
-    // after it has ended. It is taken here, so that the next wait taken is the held request's.
+    // That redemption was waited for by the held timer too, and the timer keeps the record of a
+    // wait after it has ended. It is taken here, so that the next wait taken is the held request's.
     let _ = within(
         "the wait for the short share's redemption",
         wait.next_wait(),
