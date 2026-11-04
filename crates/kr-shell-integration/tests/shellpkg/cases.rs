@@ -780,10 +780,10 @@ pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKin
     // One deadline covers every exchange and every wait between them.
     let deadline = session.deadline_for(REPLY);
     let mut acknowledgement = session.fence_exchange_before(&first, fence_id(1), deadline.0);
-    while !deadline.passed()
-        && (!acknowledgement.editor.buffer_empty
-            || acknowledgement.snapshot.queued_keys != U64::new(0)
-            || acknowledgement.snapshot.pending_bytes != U64::new(0))
+    while (!acknowledgement.editor.buffer_empty
+        || acknowledgement.snapshot.queued_keys != U64::new(0)
+        || acknowledgement.snapshot.pending_bytes != U64::new(0))
+        && !deadline.passed()
     {
         std::thread::sleep(deadline.left().min(Duration::from_millis(10)));
         if deadline.passed() {
@@ -906,6 +906,10 @@ pub fn an_eligible_gesture_under_a_fence_is_an_attributable_detach(kind: ShellKi
     // The detach and the repeated gesture's consumption are two; a third is a consumption of the
     // gesture that was submitted, which an attributable gesture is not.
     assert!(session.answered("kr-after-the-gestures"));
+    // The shell wrote both decisions before it ran the line, so they are on the endpoint when the
+    // marker is on the screen, whether or not it waited for the acceptance's answer: they are read
+    // here rather than assumed to have been read.
+    session.take_in_what_has_arrived();
     assert_eq!(
         session.events.managed_decisions(),
         decisions_before + 2,
