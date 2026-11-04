@@ -8,10 +8,6 @@
 //! Devices pair over the network and speak to the daemon on connections of their own, so what each
 //! test asserts is read from the daemon's answer to a device. A refusal is asserted by its kind,
 //! never by its words.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-19.08 | the `kr_req_19_08_` tests here |
 
 mod net_support;
 
@@ -178,6 +174,11 @@ fn target(adopted: &Adopted, worker: &Worker, instance: ApplicationInstanceId) -
 /// A daemon reaches a worker's agent: the device finds the instance in the session's snapshot,
 /// reads its capabilities and conversation, and its prompt reaches the upstream the broker
 /// dispatches on.
+///
+/// KR-REQ-19.08, the part about reading the conversation: a device paired with the rights to view
+/// and to prompt finds the agent in the session's snapshot and reads its capabilities and its
+/// conversation over its paired connection. Not shown here: an open of the session, a read refused
+/// for a missing right, or an answer to a question or an approval.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_device_reads_and_prompts_an_agent_on_a_worker_the_daemon_adopted() {
     let adopted = Adopted::start(1).await;

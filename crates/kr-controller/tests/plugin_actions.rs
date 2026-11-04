@@ -9,13 +9,6 @@
 //! product: the receipt journal, the dispatch barrier, the broker, the plugin service protocol and
 //! the engine that runs the component.
 //!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-23.30 | `plugin.action.invoke` runs the component registered for the binding, validates the plan it proposes against the action, the grant, the effect class and the arguments, transmits the plan that validates once, and rejects every other with a receipt that says it never dispatched |
-//! | KR-REQ-11.28, KR-REQ-23.30 | through a connector whose table spells a cancellation, the plan a component prepares for the cancellation it was invited to prepare is validated against the token the host issued and written from the table's template, naming the thread and the running turn; every plan that is not that one, and a component's prompt, which the table spells no source for, is refused before the marker and nothing is written |
-//! | KR-REQ-24.27 | the words a component declines an action with, and the names its plan chooses, are made of what it was handed, so they are withheld from what a person is told once privacy mode has stood on the connection, including when the reply is read after the connection was replaced, and the binding is marked as handed something made in privacy mode |
-//! | KR-REQ-11.31 | a component that faults when asked to prepare an action disables its binding's rich capability, and the native terminal's requests and answers go on before, during and after, on the transport the production gateway uses (not through `kr-hook launch`, whose leg needs a real managed shell) |
-//!
 //! The scripted peer stands in for a vendor's agent. A test that needs an action to wait for its
 //! component holds the worker's preparation before it asks, and one that needs a call outstanding
 //! in the component keeps the plugin host's replies back; every wait is for a condition the
@@ -605,6 +598,10 @@ async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is
 /// comes back from its component. The lease ends while the component prepares the action, the
 /// accepted deadline is still thirty seconds off, and the worker rejects the action as expired
 /// without a dispatch marker and writes nothing to the upstream.
+///
+/// KR-REQ-23.30, the part about the lease an action was accepted under: an action whose lease ended
+/// while its component prepared it is rejected with a receipt that says it never dispatched, and
+/// nothing is written to the upstream.
 ///
 /// The worker's deadlines are measured on a clock the test moves, so the lease ends because the
 /// test moved the clock past it and not because the test waited for it.
