@@ -412,6 +412,11 @@ that file for each question, answer and block, as long as the path is a plain fi
 device is never opened for writing in a way that could hold the shell up. Otherwise the integration
 writes no file of its own.
 
+The PSReadLine module waits five seconds for the worker's answer to its hello. A session whose
+environment names a positive whole number of milliseconds in `KR_SHELL_BRIDGE_HANDSHAKE_WAIT_MS`
+gets that wait instead; any other value leaves five seconds. The other packages wait two seconds
+and read no such variable.
+
 ## The reader-thread rules
 
 Three requests, each answered on the reader's own thread:

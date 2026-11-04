@@ -15,7 +15,12 @@ $script:KR_PROTOCOL = 'kr-shell-bridge/1'
 $script:KR_ENDPOINT_VARIABLE = 'KR_SHELL_BRIDGE'
 $script:KR_SECRET_VARIABLE = 'KR_SHELL_BRIDGE_SECRET'
 $script:KR_SESSION_VARIABLE = 'KR_SESSION'
+# The longest the module waits for the worker's answer to its hello. The environment may name a
+# longer one, in milliseconds, for a host that cannot promise a worker's answer inside five seconds
+# (a harness driving the module on a loaded machine); anything that is not a positive whole number
+# leaves this one.
 $script:KR_HANDSHAKE_WAIT_MS = 5000
+$script:KR_HANDSHAKE_WAIT_VARIABLE = 'KR_SHELL_BRIDGE_HANDSHAKE_WAIT_MS'
 $script:KR_MAX_FRAME = 1048576
 # The most one read of the endpoint takes before it gives the reader its thread back. A worker that
 # writes without pause would otherwise keep a drain loop going for as long as it kept writing, and a
@@ -658,8 +663,18 @@ function Read-KrAccept {
     }
 }
 
+function Get-KrHandshakeWaitMs {
+    $named = [uint32]0
+    if ([uint32]::TryParse([Environment]::GetEnvironmentVariable($script:KR_HANDSHAKE_WAIT_VARIABLE),
+            [System.Globalization.NumberStyles]::None, [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$named) -and $named -gt 0) {
+        return [uint64]$named
+    }
+    [uint64]$script:KR_HANDSHAKE_WAIT_MS
+}
+
 function Wait-KrHandshake {
-    $deadline = (Get-KrNowMs) + $script:KR_HANDSHAKE_WAIT_MS
+    $deadline = (Get-KrNowMs) + (Get-KrHandshakeWaitMs)
     while ($true) {
         $frame = Read-KrFrame
         if ($null -ne $frame) {
