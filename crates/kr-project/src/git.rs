@@ -5472,7 +5472,7 @@ mod tests {
             const { std::cell::Cell::new(None) };
         /// Set by a case to run something once on its own thread when a child's group is signalled,
         /// given the child's number.
-        pub(super) static AT_THE_END_OF_THE_GROUP: std::cell::Cell<Option<Box<dyn FnOnce(u32)>>> =
+        pub(super) static AT_THE_END_OF_THE_GROUP: std::cell::Cell<Option<Looks>> =
             const { std::cell::Cell::new(None) };
         /// Set by a case to replace the machine's clock on its own thread with one it moves by
         /// hand.
@@ -5568,6 +5568,10 @@ mod tests {
     /// What a case has its thread do between two polls of the wait for a probe's output.
     #[cfg(unix)]
     pub(super) type Stall = Box<dyn FnOnce(Limits)>;
+
+    /// What a case has its thread do when a child's group is signalled, given the child's number.
+    #[cfg(unix)]
+    pub(super) type Looks = Box<dyn FnOnce(u32)>;
 
     /// The two limits of a wait for a probe's output after the probe has ended: the second it is
     /// given, and the time the probe was given.
