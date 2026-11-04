@@ -194,12 +194,15 @@ struct Case {
             and window station; run it by name with --ignored (see the module documentation)"]
 fn the_boundary_accounts_run_only_git_and_the_person_runs_everything() {
     let mut case = Case::start();
-    case.system_programs_and_planted_images();
+    case.programs();
     case.git_and_its_helpers();
-    case.planted_helpers_and_hooks();
-    case.clone_that_checks_nothing_out();
+    case.helpers_a_repository_names();
+    case.clone_then_checkout();
     case.finish();
 }
+
+/// The three accounts a program is launched as, in the order the output is read.
+const ALL: [Who; 3] = [Who::Checkout, Who::Connect, Who::Person];
 
 impl Case {
     /// Checks what the case needs, makes the person's account and the fixtures, and reads the
@@ -512,140 +515,92 @@ impl Case {
         }
     }
 
-    /// A system program, signed programs and an unsigned one in places a repository could put them.
-    fn system_programs_and_planted_images(&mut self) {
+    /// Requires a program to be refused to a boundary account, by a rule the log names, and to run
+    /// for the person.
+    fn refused_or_ran(&mut self, who: Who, launch: &Launch, what: &str, blocked: &str) {
+        let role = self.account(who).role;
+        if who == Who::Person {
+            self.expect(launch.outcome == Outcome::Ran(0), || {
+                format!("{role}: {what} {}", launch.outcome)
+            });
+        } else {
+            self.expect(launch.outcome.refused(), || {
+                format!(
+                    "{role}: {what} {}, and was not refused by policy",
+                    launch.outcome
+                )
+            });
+            self.expect_blocked(who, blocked, what);
+        }
+    }
+
+    /// A system program, signed programs and an unsigned one, in the places a repository could put
+    /// them, and in a place the person owns.
+    fn programs(&mut self) {
+        println!("--- programs: system, signed and planted, unsigned and planted");
         let system = PathBuf::from(std::env::var_os("SystemRoot").expect("the system root"))
             .join("System32");
         let planted = self.root.join("planted");
         let directory = self.root.clone();
-        println!("--- programs: system, signed and planted, unsigned and planted");
-        for who in [Who::Checkout, Who::Connect, Who::Person] {
-            let _ = std::fs::remove_file(planted.join("recorder.exe.ran"));
-            let cmd = self.launch(
-                who,
+        let programs = [
+            (
                 "cmd.exe (signed, system)",
-                &system.join("cmd.exe"),
+                system.join("cmd.exe"),
                 "/c exit 0",
-                &directory,
-            );
-            let hostname = self.launch(
-                who,
+                r"%SYSTEM32%\CMD.EXE",
+            ),
+            (
                 "hostname.exe (signed, system)",
-                &system.join("hostname.exe"),
+                system.join("hostname.exe"),
                 "",
-                &directory,
-            );
-            let copy = self.launch(
-                who,
-                "hostname.exe (signed, copied beside a repository)",
-                &planted.join("hostname.exe"),
+                r"%SYSTEM32%\HOSTNAME.EXE",
+            ),
+            (
+                "hostname.exe (signed, beside a repository)",
+                planted.join("hostname.exe"),
                 "",
-                &directory,
-            );
-            let git_copy = self.launch(
-                who,
-                "git.exe (signed, copied beside a repository)",
-                &planted.join("git.exe"),
-                "--version",
-                &directory,
-            );
-            let recorder = self.launch(
-                who,
-                "recorder.exe (unsigned, beside a repository)",
-                &planted.join("recorder.exe"),
-                "",
-                &directory,
-            );
-            let recorded = planted.join("recorder.exe.ran").exists();
-            let _ = std::fs::remove_file(planted.join("recorder.exe.ran"));
-            let role = self.account(who).role;
-            if who == Who::Person {
-                self.expect(cmd.outcome == Outcome::Ran(0), || {
-                    format!("{role}: cmd.exe {}", cmd.outcome)
-                });
-                self.expect(hostname.outcome == Outcome::Ran(0), || {
-                    format!("{role}: hostname.exe {}", hostname.outcome)
-                });
-                self.expect(copy.outcome == Outcome::Ran(0), || {
-                    format!("{role}: the copied signed program {}", copy.outcome)
-                });
-                self.expect(git_copy.outcome.ran(), || {
-                    format!("{role}: the copied Git {}", git_copy.outcome)
-                });
-                self.expect(recorder.outcome == Outcome::Ran(0) && recorded, || {
-                    format!(
-                        "{role}: the unsigned program {} and recorded={recorded}",
-                        recorder.outcome
-                    )
-                });
-                continue;
-            }
-            self.expect(cmd.outcome.refused(), || {
-                format!(
-                    "{role}: cmd.exe {}, and was not refused by policy",
-                    cmd.outcome
-                )
-            });
-            self.expect(hostname.outcome.refused(), || {
-                format!("{role}: the system's hostname.exe {}", hostname.outcome)
-            });
-            self.expect(copy.outcome.refused(), || {
-                format!("{role}: the copied signed program {}", copy.outcome)
-            });
-            self.expect(git_copy.outcome.refused(), || {
-                format!(
-                    "{role}: the copy of Git outside its installation {}",
-                    git_copy.outcome
-                )
-            });
-            self.expect(recorder.outcome.refused() && !recorded, || {
-                format!(
-                    "{role}: the unsigned program {} and recorded={recorded}",
-                    recorder.outcome
-                )
-            });
-            self.expect_blocked(who, r"\SYSTEM32\CMD.EXE", "cmd.exe is named as blocked");
-            self.expect_blocked(
-                who,
-                r"\SYSTEM32\HOSTNAME.EXE",
-                "the system's hostname.exe is named as blocked",
-            );
-            self.expect_blocked(
-                who,
                 r"\PLANTED\HOSTNAME.EXE",
-                "the copied signed program is named as blocked",
-            );
-            self.expect_blocked(
-                who,
+            ),
+            (
+                "git.exe (signed, beside a repository)",
+                planted.join("git.exe"),
+                "--version",
                 r"\PLANTED\GIT.EXE",
-                "the copy of Git is named as blocked",
-            );
-            self.expect_blocked(
-                who,
+            ),
+            (
+                "recorder.exe (unsigned, beside a repository)",
+                planted.join("recorder.exe"),
+                "",
                 r"\PLANTED\RECORDER.EXE",
-                "the unsigned program is named as blocked",
-            );
+            ),
+        ];
+        for who in ALL {
+            let _ = std::fs::remove_file(planted.join("recorder.exe.ran"));
+            for (what, path, arguments, blocked) in &programs {
+                let launch = self.launch(who, what, path, arguments, &directory);
+                self.refused_or_ran(who, &launch, what, blocked);
+            }
+            let recorded = planted.join("recorder.exe.ran").exists();
+            let role = self.account(who).role;
+            self.expect(recorded == (who == Who::Person), || {
+                format!("{role}: the unsigned program recorded that it ran: {recorded}")
+            });
         }
 
         // The person's own place: a directory the ordinary account owns, where a program that
-        // account puts is the account's own doing and the policy has to allow it.
-        println!("--- the person's own place");
+        // account puts is the account's own doing and the policy has to let it run.
         let own = self.root.join("owned-by-the-person");
         std::fs::create_dir_all(&own).expect("the person's directory");
-        run_checked(
-            Command::new("icacls.exe")
-                .arg(&own)
-                .args(["/setowner", &self.person.name]),
-        );
         let owned = own.join("recorder.exe");
-        std::fs::copy(planted.join("recorder.exe"), &owned)
-            .expect("a copy in the person's directory");
-        run_checked(
-            Command::new("icacls.exe")
-                .arg(&owned)
-                .args(["/setowner", &self.person.name]),
-        );
-        let run = self.launch(
+        std::fs::copy(planted.join("recorder.exe"), &owned).expect("a program in the directory");
+        for path in [&own, &owned] {
+            run_checked(
+                Command::new("icacls.exe")
+                    .arg(path)
+                    .args(["/setowner", &self.person.name]),
+            );
+        }
+        let launch = self.launch(
             Who::Person,
             "recorder.exe (unsigned, in a directory the person owns)",
             &owned,
@@ -653,23 +608,23 @@ impl Case {
             &own,
         );
         let recorded = own.join("recorder.exe.ran").exists();
-        self.expect(run.outcome == Outcome::Ran(0) && recorded, || {
+        self.expect(launch.outcome == Outcome::Ran(0) && recorded, || {
             format!(
-                "person: the unsigned program in a directory the person owns {} and recorded={recorded}",
-                run.outcome
+                "person: the program in a directory the person owns {} and recorded={recorded}",
+                launch.outcome
             )
         });
     }
 
-    /// Git runs for both boundary accounts, and so do the programs it starts that are on the list.
+    /// Git runs for both boundary accounts, and so does a helper under its helper directory.
     fn git_and_its_helpers(&mut self) {
         println!("--- Git and the helpers on its list");
         let directory = self.root.clone();
         let git = self.git.clone();
         let helper = self.exec_path.join("git-remote-https.exe");
-        for who in [Who::Checkout, Who::Connect, Who::Person] {
+        for who in ALL {
             let version = self.launch(who, "git.exe --version", &git, "--version", &directory);
-            let status = self.launch(
+            let inside = self.launch(
                 who,
                 "git.exe rev-parse --git-dir (in a repository)",
                 &git,
@@ -688,15 +643,15 @@ impl Case {
                 version.outcome == Outcome::Ran(0) && version.output.contains("git version"),
                 || {
                     format!(
-                        "{role}: git --version {} with output {:?}",
+                        "{role}: git --version {} {:?}",
                         version.outcome, version.output
                     )
                 },
             );
-            self.expect(status.outcome == Outcome::Ran(0), || {
+            self.expect(inside.outcome == Outcome::Ran(0), || {
                 format!(
                     "{role}: git rev-parse {} {:?}",
-                    status.outcome, status.output
+                    inside.outcome, inside.output
                 )
             });
             self.expect(
@@ -720,15 +675,16 @@ impl Case {
     }
 
     /// A program the repository's configuration names as a helper, and a hook script.
-    fn planted_helpers_and_hooks(&mut self) {
+    fn helpers_a_repository_names(&mut self) {
         println!("--- helpers a repository names: a program (a clean filter) and a hook script");
         let directory = self.root.clone();
         let git = self.git.clone();
-        let planted = self.root.join("planted");
+        let ran_filter = self.root.join("planted").join("recorder.exe.ran");
         let filtered = self.root.join("filtered");
         let scripted = self.root.join("scripted");
-        for who in [Who::Checkout, Who::Connect, Who::Person] {
-            let _ = std::fs::remove_file(planted.join("recorder.exe.ran"));
+        let ran_hook = scripted.join(".git").join("hooks").join("post-commit.ran");
+        for who in ALL {
+            let _ = std::fs::remove_file(&ran_filter);
             let _ = std::fs::remove_file(filtered.join(".git").join("index"));
             std::fs::write(filtered.join("file.txt"), uuid::Uuid::new_v4().to_string())
                 .expect("a file to add");
@@ -739,11 +695,10 @@ impl Case {
                 "-C filtered add file.txt",
                 &directory,
             );
-            let filter_ran = planted.join("recorder.exe.ran").exists();
-            let _ = std::fs::remove_file(planted.join("recorder.exe.ran"));
+            let filter_ran = ran_filter.exists();
+            let _ = std::fs::remove_file(&ran_filter);
 
-            let _ =
-                std::fs::remove_file(scripted.join(".git").join("hooks").join("post-commit.ran"));
+            let _ = std::fs::remove_file(&ran_hook);
             let commit = self.launch(
                 who,
                 "git commit (the repository's hook is a shell script)",
@@ -751,74 +706,56 @@ impl Case {
                 "-C scripted -c user.name=case -c user.email=case@example.invalid commit -q --allow-empty -m hook",
                 &directory,
             );
-            let hook_ran = scripted
-                .join(".git")
-                .join("hooks")
-                .join("post-commit.ran")
-                .exists();
-            let _ =
-                std::fs::remove_file(scripted.join(".git").join("hooks").join("post-commit.ran"));
+            let hook_ran = ran_hook.exists();
+            let _ = std::fs::remove_file(&ran_hook);
 
             let role = self.account(who).role;
-            match who {
-                Who::Person => {
-                    self.expect(add.outcome == Outcome::Ran(0) && filter_ran, || {
-                        format!(
-                            "{role}: the planted filter {} and ran={filter_ran}",
-                            add.outcome
-                        )
-                    });
-                    self.expect(commit.outcome == Outcome::Ran(0) && hook_ran, || {
-                        format!(
-                            "{role}: the hook script {} and ran={hook_ran}",
-                            commit.outcome
-                        )
-                    });
-                }
-                Who::Checkout | Who::Connect => {
-                    self.expect(!filter_ran, || {
-                        format!("{role}: the program named as a clean filter ran")
-                    });
-                    self.expect(add.outcome != Outcome::Ran(0), || {
-                        format!(
-                            "{role}: git add succeeded although its required filter was refused"
-                        )
-                    });
-                    self.expect_blocked(
-                        who,
-                        r"\PLANTED\RECORDER.EXE",
-                        "the program named as a filter is named as blocked",
-                    );
-                    if who == Who::Checkout {
-                        self.expect(!hook_ran, || {
-                            format!("{role}: the hook script ran without a shell on its list")
-                        });
-                        self.expect_blocked(
-                            who,
-                            r"\USR\BIN\SH.EXE",
-                            "the shell is named as blocked",
-                        );
-                    } else {
-                        self.expect(hook_ran, || format!("{role}: the hook script did not run although the shell is on its list"));
-                        self.expect_allowed(
-                            who,
-                            r"\USR\BIN\SH.EXE",
-                            "the shell is named as allowed",
-                        );
-                    }
-                }
+            if who == Who::Person {
+                self.expect(add.outcome == Outcome::Ran(0) && filter_ran, || {
+                    format!(
+                        "{role}: the program named as a filter {} and ran={filter_ran}",
+                        add.outcome
+                    )
+                });
+                self.expect(commit.outcome == Outcome::Ran(0) && hook_ran, || {
+                    format!(
+                        "{role}: the hook script {} and ran={hook_ran}",
+                        commit.outcome
+                    )
+                });
+                continue;
+            }
+            self.expect(!filter_ran, || {
+                format!("{role}: the program named as a clean filter ran")
+            });
+            self.expect(add.outcome != Outcome::Ran(0), || {
+                format!("{role}: git add succeeded although its required filter was refused")
+            });
+            self.expect_blocked(
+                who,
+                r"\PLANTED\RECORDER.EXE",
+                "the program named as a filter is named as blocked",
+            );
+            // The hook script needs the shell: only the connection account's list holds it.
+            self.expect(hook_ran == (who == Who::Connect), || {
+                format!("{role}: the hook script ran={hook_ran}, which the shell on its list does not allow")
+            });
+            if who == Who::Connect {
+                self.expect_allowed(who, r"\USR\BIN\SH.EXE", "the shell is named as allowed");
+            } else {
+                self.expect_blocked(who, r"\USR\BIN\SH.EXE", "the shell is named as blocked");
             }
         }
     }
 
     /// The clone that checks nothing out needs the shell and the programs it starts, so only the
     /// connection account's list holds them; the checkout that follows is the other account's.
-    fn clone_that_checks_nothing_out(&mut self) {
+    fn clone_then_checkout(&mut self) {
         println!("--- a clone that checks nothing out, then the checkout of it");
         let directory = self.root.clone();
         let git = self.git.clone();
         let source = self.root.join("source.git");
-        for who in [Who::Checkout, Who::Connect, Who::Person] {
+        for who in ALL {
             let destination = self.root.join(format!("clone-{}", self.account(who).role));
             let clone = self.launch(
                 who,
@@ -842,30 +779,29 @@ impl Case {
                     r"\USR\BIN\SH.EXE",
                     "the shell the clone needs is named as blocked",
                 );
-            } else {
-                self.expect(clone.outcome == Outcome::Ran(0) && made, || {
-                    format!(
-                        "{role}: the clone {} and made={made} {:?}",
-                        clone.outcome, clone.output
-                    )
-                });
+                continue;
             }
+            self.expect(clone.outcome == Outcome::Ran(0) && made, || {
+                format!(
+                    "{role}: the clone {} and made={made} {:?}",
+                    clone.outcome, clone.output
+                )
+            });
             if who == Who::Connect {
                 self.expect_allowed(
                     who,
                     r"\BIN\GIT-UPLOAD-PACK.EXE",
                     "the program that serves the repository is named as allowed",
                 );
-                // The checkout is the other account's invocation, and it needs no shell.
                 let checkout = self.launch(
                     Who::Checkout,
-                    "git checkout of the clone (the checkout account)",
+                    "git checkout of that clone (the checkout account)",
                     &git,
                     &format!("-C \"{}\" checkout -q main", destination.display()),
                     &directory,
                 );
-                let checked = destination.join("seed.txt").exists();
-                self.expect(checkout.outcome == Outcome::Ran(0) && checked, || {
+                let landed = destination.join("seed.txt").exists();
+                self.expect(checkout.outcome == Outcome::Ran(0) && landed, || {
                     format!(
                         "checkout: the checkout of the clone {} {:?}",
                         checkout.outcome, checkout.output
@@ -1377,12 +1313,19 @@ fn events_after(watermark: u64) -> Vec<Event> {
         .collect()
 }
 
-/// Returns the text of the first element with this name.
+/// Returns the text of the first element with exactly this name.
 fn element<'a>(text: &'a str, name: &str) -> Option<&'a str> {
-    let start = text.find(&format!("<{name}"))?;
-    let open = text[start..].find('>')? + start + 1;
-    let close = text[open..].find(&format!("</{name}>"))? + open;
-    Some(&text[open..close])
+    let mut from = 0;
+    loop {
+        let start = from + text[from..].find(&format!("<{name}"))?;
+        let after = start + 1 + name.len();
+        if matches!(text[after..].chars().next()?, '>' | ' ') {
+            let open = text[after..].find('>')? + after + 1;
+            let close = text[open..].find(&format!("</{name}>"))? + open;
+            return Some(&text[open..close]);
+        }
+        from = after;
+    }
 }
 
 fn unescape(text: &str) -> String {
