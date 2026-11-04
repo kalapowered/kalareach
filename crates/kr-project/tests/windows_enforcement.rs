@@ -26,7 +26,7 @@
 //! and a program a repository's configuration names as a helper (a clean filter) never run, and Git
 //! reports that it could not start them; the shell is refused to the checkout account, so a hook
 //! script that needs it and a clone that needs it never run there, and they run for the connection
-//! account; the programs of Git's installation cannot be written to by either account; and Git, its
+//! account; neither account can make a directory in the directories its list names; and Git, its
 //! helpers and a clone that checks nothing out run where they are on the list. What the case
 //! requires of the ordinary account: every one of those programs runs.
 //!
@@ -912,9 +912,11 @@ impl Case {
     }
 
     /// A path rule on Git's installation holds only while neither boundary account can write there:
-    /// a program either account could put in a listed directory would be on the list.
+    /// a program either account could put in a listed directory would be on the list. This shows the
+    /// top of each listed directory and nothing below it: neither account can make a directory
+    /// there.
     fn git_installation_is_not_writable(&mut self) {
-        println!("--- the directories on the lists cannot be written by the boundary accounts");
+        println!("--- neither boundary account can make a directory in a directory on the lists");
         let directory = self.root.clone();
         let git = self.git.clone();
         let listed = [
@@ -1077,7 +1079,11 @@ fn elevated() -> bool {
     read != 0 && elevation.TokenIsElevated != 0
 }
 
-/// Runs a command, requires success and returns its standard output.
+/// Runs a command and returns its standard output and standard error, whatever its status.
+///
+/// A query that finds nothing, such as a registry value that is not there, ends with a status the
+/// case does not treat as a failure; a caller that needs the command to have worked checks what
+/// came back.
 fn output_of(command: &mut Command) -> String {
     let output = command.output().expect("the command starts");
     format!(
