@@ -914,6 +914,12 @@ fn kr_req_12_02_a_launcher_that_declines_leaves_its_reason_and_no_instance() {
 /// the reason on the launch attempt, and runs the typed command as typed, as the shell does without
 /// the integration. The control is the same invocation launched again under a job with no
 /// restriction, which is committed.
+///
+/// KR-REQ-12.02, the part about a launcher that declines: the backend keeps the reason on the launch
+/// attempt, nothing is registered, and the invocation can be launched again.
+///
+/// KR-REQ-12.07, the part about a launch that does not go through: the typed command runs as typed,
+/// in the person's own environment, and ends with its own exit code.
 #[test]
 fn kr_req_07_64_a_launcher_in_a_job_that_restricts_desktops_declines_and_the_typed_command_runs() {
     /// The restriction on a job's user interface that a vendor's own desktop cannot be made under.

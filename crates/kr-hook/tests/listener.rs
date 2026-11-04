@@ -101,6 +101,10 @@ async fn kr_req_12_14_a_hook_the_launched_application_starts_is_admitted() {
 /// presents a credential other than the launch's is refused, and so is the forwarder with the right
 /// files when the launched application did not start it. Each still answers `{}` and exits 0, so a
 /// refusal changes nothing about what the application does.
+///
+/// KR-REQ-12.14, the part about the per-launch credential: a hook that presents a credential other
+/// than the launch's is refused as a failure of the private exchange. Not shown here: the private
+/// endpoint, or a browser origin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_11_43_the_wrong_exchange_or_a_process_the_application_did_not_start_is_refused() {
     let placed = Placed::new();

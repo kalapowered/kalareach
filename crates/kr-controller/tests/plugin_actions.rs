@@ -173,6 +173,11 @@ async fn kr_req_11_28_a_components_cancellation_is_written_from_the_connectors_t
 /// KR-REQ-23.30: every plan a component proposes that is not the invocation's own is refused, each
 /// for its own reason, with a receipt that says the action never dispatched, and nothing is written
 /// to the upstream. A component that declines, and one that never returns, cost their own action.
+///
+/// KR-REQ-11.28, the part about what an effect plan may use: a plan that is not the invocation's
+/// own is refused and its action rejected with a receipt that says it never dispatched, so nothing
+/// outside the invocation reaches the upstream. Not shown here: the token the host issues, which
+/// the case does not read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_plan_that_is_not_the_invocations_own_is_rejected_and_nothing_is_written() {
     let Some(acting) = Acting::start().await else {
@@ -784,6 +789,10 @@ async fn kr_req_23_30_a_component_that_does_not_answer_costs_its_action_and_noth
 /// too late, and the action would be rejected and not carried out. A machine that stalls the case
 /// for as long as that bound allows fails it for the same reason, which is why the bound is the
 /// only thing this case cannot decide by a condition.
+///
+/// KR-REQ-23.30, the part about an action carried out after a call to its component that was
+/// outstanding: once the component answers, the action is transmitted once, as the frame after the
+/// terminal's own request. Not shown here: the refusals of a plan that does not validate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_11_31_the_native_terminal_goes_on_while_a_call_to_the_component_is_outstanding() {
     let Some(acting) =

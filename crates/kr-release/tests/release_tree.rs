@@ -599,12 +599,12 @@ fn a_relocated_tree_finds_its_modules_through_the_search_path_the_manifest_names
 /// A tree is signed by the threshold of keys the root names, and a host's check of
 /// what was signed refuses a tree that changed after it, or one that one key signed.
 ///
-/// KR-REQ-07.86, the part about signed artefacts: the manifest that lists every file of the tree
-/// with its length, mode and digest is signed with the keys of a root made for the run, and the
-/// host's check refuses the tree that one key of the two signed, and the tree whose program gained
-/// a byte after both did; the tree both signed is the control. Not shown here: a code signature on
-/// an executable or a module, the published release's signatures, or the production channel's root,
-/// which the root made for the run is not.
+/// KR-REQ-07.86, the part about signed artefacts: the tree's `release.json` is signed with the
+/// keys of a root made for the run, and `kr-release verify` refuses the tree that one key of the
+/// two signed and the tree whose `bin/kr` gained a byte after both did; the tree both signed is the
+/// control. Not shown here: a change to a module or to a file other than `bin/kr`, a code
+/// signature on an executable or a module, the published release's signatures, or the production
+/// channel's root, which the root made for the run is not.
 #[test]
 #[ignore = "builds a tree of this checkout's shell packages; it runs with --include-ignored where they are built"]
 fn a_signed_tree_verifies_and_a_changed_or_short_signed_one_does_not() {

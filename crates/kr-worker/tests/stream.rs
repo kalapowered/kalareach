@@ -2173,9 +2173,8 @@ async fn kr_req_11_35_a_committed_marker_followed_by_a_failed_transmission_leave
     );
 }
 
-/// KR-REQ-12.06: a prompt, a steer or a declared cancellation admitted before the terminal asked
-/// to change its conversation is stopped when its permit is taken: nothing is written and the
-/// refusal is proven.
+/// KR-REQ-12.06: a steer admitted before the terminal asked to change its conversation is stopped
+/// when its permit is taken: nothing is written and the refusal is proven.
 ///
 /// Not claimed: Windows, where no gateway runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2219,6 +2218,11 @@ async fn kr_req_12_06_a_mutation_and_an_action_admitted_before_a_selection_are_s
 
 /// KR-REQ-12.06 and KR-REQ-11.28: the same for the declared cancellation, whose token the
 /// admission spent.
+///
+/// KR-REQ-23.30, the part about the thread an action was admitted under: a declared cancellation
+/// whose conversation the server ended before its permit was taken is stopped there, proven unsent.
+/// Not shown here: a component's plan, since the host writes this action from the connector's
+/// template.
 ///
 /// Not claimed: Windows, where no gateway runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
