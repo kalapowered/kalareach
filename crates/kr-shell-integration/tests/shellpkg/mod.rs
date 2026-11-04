@@ -338,20 +338,36 @@ impl Package {
             .expect("the package's host runs")
     }
 
-    /// Runs `script` in the package's host on a terminal of its own, and once the script has
-    /// printed `marker`, types `typed` at that terminal. Returns what the terminal showed once the
-    /// host had ended.
+    /// Runs the script `script_for` writes in the package's host on a terminal of its own, and
+    /// once the script has printed `marker`, types `typed` at that terminal. Returns what the
+    /// terminal showed once the host had ended.
     ///
     /// What is typed stays in the terminal's queue until the script reads it, and a script that
     /// reads nothing leaves all of it there for as long as it runs. A terminal is read in lines
     /// until a program says otherwise, so `typed` is a line.
+    ///
+    /// `script_for` is given the path of a file that this makes once `typed` is in the terminal's
+    /// queue, so that a script which counts the queue can wait for the file rather than for a
+    /// length of time the harness would have to beat. The script is the one that bounds the wait,
+    /// and it is bounded by [`REPLY`], as the harness's own are.
     ///
     /// # Panics
     ///
     /// Panics when the host cannot be started, or has not printed `marker` or ended in time.
     #[cfg(unix)]
     #[must_use]
-    pub fn ask_with_input_typed_after(&self, script: &str, marker: &str, typed: &[u8]) -> String {
+    pub fn ask_with_input_typed_after(
+        &self,
+        script_for: impl FnOnce(&Path) -> String,
+        marker: &str,
+        typed: &[u8],
+    ) -> String {
+        let directory = tempfile::Builder::new()
+            .prefix("kr-shell-typed-")
+            .tempdir()
+            .expect("a directory for the file that says the input is typed");
+        let typed_flag = directory.path().join("typed");
+        let script = script_for(&typed_flag);
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -361,7 +377,7 @@ impl Package {
             })
             .expect("a pseudo-terminal");
         let mut command = CommandBuilder::new(&self.executable);
-        command.args(["-NoLogo", "-NoProfile", "-Command", script]);
+        command.args(["-NoLogo", "-NoProfile", "-Command", &script]);
         for (name, value) in self.launch() {
             command.env(name, value);
         }
@@ -391,19 +407,23 @@ impl Package {
             }
         });
         let text = || String::from_utf8_lossy(&shown.lock().expect("the output lock")).into_owned();
-        let deadline = Instant::now() + REPLY;
+        let window = after_any_give_up(REPLY);
+        let deadline = Instant::now() + window;
         while !text().contains(marker) {
-            assert!(
-                Instant::now() < deadline,
-                "the host did not print {marker:?}:\n{}",
-                text()
-            );
+            if Instant::now() >= deadline {
+                note_that_a_wait_gave_up();
+                let _ = child.kill();
+                panic!("the host did not print {marker:?}:\n{}", text());
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         writer.write_all(typed).expect("types at the terminal");
         writer.flush().expect("flushes the terminal");
+        // The input is in the terminal's queue: a script that waits for this file counts it.
+        std::fs::write(&typed_flag, b"").expect("the file that says the input is typed");
         while child.try_wait().expect("the host's state").is_none() {
-            if Instant::now() >= deadline + REPLY {
+            if Instant::now() >= deadline + window {
+                note_that_a_wait_gave_up();
                 let _ = child.kill();
                 panic!("the host did not end:\n{}", text());
             }
