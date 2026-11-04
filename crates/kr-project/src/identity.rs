@@ -456,7 +456,7 @@ impl OpenedRepository {
         // again and find whatever has since taken the name.
         let git_dir = open_unrecorded_root(environment_id, &git_dir_path)?;
         let own_dir = if own_dir_path == git_dir_path {
-            duplicated(&git_dir, environment_id)?
+            duplicated(&git_dir)?
         } else {
             open_unrecorded_root(environment_id, &own_dir_path)?
         };
@@ -782,7 +782,10 @@ impl OpenedRepository {
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::IdentityChanged`] when either identity or the configuration differs.
+    /// Returns [`ProjectError::IdentityChanged`] when either identity or the configuration
+    /// differs, [`ProjectError::GitFailed`] when the host is too short of descriptors, processes
+    /// or memory to open the top level or the Git directory again, and
+    /// [`ProjectError::Destination`] when either cannot be opened for another reason.
     pub fn confirm(&self, profile: &RestrictedProfile) -> Result<()> {
         // The repository is asked where its common directory and its top level are, rather than
         // reopened at the paths recorded earlier. A `.git` file rewritten to point elsewhere would
@@ -1180,10 +1183,10 @@ fn open_recorded_root(
 /// its Git directory. The handle is duplicated, which takes a descriptor as an open does, so a
 /// host too short of descriptors, processes or memory to do it has said nothing of the directory
 /// and the refusal is a fault that passes, worded as an open's is (`boundary::unopenable`).
-fn duplicated(
-    directory: &AuthorisedDirectory,
-    environment_id: EnvironmentId,
-) -> Result<AuthorisedDirectory> {
+///
+/// The directory carries no rule that confines it to one mount, as none opened here does, and the
+/// copy carries none either.
+fn duplicated(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
     let path = directory.display_path();
     // A case that asks for it has the duplication fail as it does for a host that is out of
     // descriptors.
@@ -1196,7 +1199,7 @@ fn duplicated(
     let copy = directory.handle().try_clone();
     let copy = copy.map_err(|error| crate::boundary::unopenable(path, &error))?;
     Ok(AuthorisedDirectory::from_handle(
-        environment_id,
+        directory.environment_id(),
         copy,
         path.to_path_buf(),
     )?)

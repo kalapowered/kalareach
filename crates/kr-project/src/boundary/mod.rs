@@ -52,12 +52,12 @@
 //! a moment before; the Git common directory by its own; the reserved destination by the identity
 //! the reservation returned; and the invocation's own temporary directory by the identity this host
 //! read when it made it. A directory the request holds no identity for is held to the object that
-//! was opened. After the run the directories it may write in (the working directory, those it
-//! reserved and its own temporary directory) are opened again and confirmed against the same
-//! identity. The child then does not start at a path either: it moves into the open working
-//! directory before the boundary is applied and before Git runs, with `-C .` as its only
-//! directory argument. A tree substituted at a name afterwards is therefore neither the tree Git
-//! works in nor a tree the boundary was built around.
+//! was opened. After the run the directories it may write in (the working directory, the Git
+//! common directory, a destination it reserved and its own temporary directory) are opened again
+//! and confirmed against the same identity. The child then does not start at a path either: it
+//! moves into the open working directory before the boundary is applied and before Git runs, with
+//! `-C .` as its only directory argument. A tree substituted at a name afterwards is therefore
+//! neither the tree Git works in nor a tree the boundary was built around.
 //!
 //! What the kernels enforce is narrower than the sentence above, and is stated as what it is:
 //! **opens for writing succeed only inside the granted root objects' subtrees as they stand at open
