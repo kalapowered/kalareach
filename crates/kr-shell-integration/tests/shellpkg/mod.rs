@@ -1777,6 +1777,25 @@ impl Session {
         }
     }
 
+    /// The worker's answer to the acceptance of a line: the capability a real worker mints for the
+    /// line it has just recorded. This harness stands in for the worker, so it mints one the same
+    /// way.
+    ///
+    /// A case that held an acceptance unanswered answers it with this when it is ready for the
+    /// answer to come.
+    pub fn acceptance_answer(
+        &mut self,
+        params: &kr_protocol::root::RootCommandAcceptedParams,
+    ) -> EventOutcome {
+        let token = (!self.commands.withhold_tokens).then(|| kr_ipc::new_uuid().to_string());
+        self.commands.tokens.push(token.clone());
+        EventOutcome::CommandRecorded(RootCommandAcceptedResult {
+            origin: params.origin.clone(),
+            detach_token: Nullable(token),
+            state: FenceState::Fenced,
+        })
+    }
+
     /// What the worker answers an event that needs no decision of its own.
     fn routine_answer(&mut self, event: &BridgeEvent) -> Option<EventOutcome> {
         if self.commands.stuck {
@@ -1810,16 +1829,7 @@ impl Session {
                 if self.commands.silent_acceptance {
                     return None;
                 }
-                // The capability a real worker mints for the line it has just recorded. This
-                // harness stands in for the worker, so it mints one the same way.
-                let token =
-                    (!self.commands.withhold_tokens).then(|| kr_ipc::new_uuid().to_string());
-                self.commands.tokens.push(token.clone());
-                Some(EventOutcome::CommandRecorded(RootCommandAcceptedResult {
-                    origin: params.origin.clone(),
-                    detach_token: Nullable(token),
-                    state: FenceState::Fenced,
-                }))
+                Some(self.acceptance_answer(params))
             }
             BridgeEvent::CommandResolve(params) => {
                 self.commands.resolves.push(params.clone());
