@@ -6449,7 +6449,9 @@ async fn each_request_a_setup_makes_for_a_token_is_one_the_gate_on_the_account_t
         (3, "the retention change", 1, 1, 1, 0),
     ];
     for (passing, request, bundle, enrolments, reads_made, changes) in rungs {
-        let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+        // The host's continuous clock stands still, so the call's deadline does not pass, whatever
+        // the pace of the case while it holds the call.
+        let (rig, _, _clock) = a_host_to_set_up_on_a_clock(&HeldTimer::held()).await;
         until_the_carriers_first_pass_has_ended(&rig).await;
         let web = Arc::clone(rig.served.web());
         let made = rig.prepared_setup(archive_id(), false);
