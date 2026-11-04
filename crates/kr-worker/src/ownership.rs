@@ -2768,11 +2768,11 @@ mod tests {
         }
         owned.take(Vec::new());
 
-        for number in &adopted {
+        for process in &left {
             assert!(
-                !std::path::Path::new(&format!("/proc/{number}")).exists(),
-                "process {number} was adopted, ended and recorded, and is still in the process \
-                 table"
+                !is_in_the_process_table(process),
+                "process {} was adopted, ended and recorded, and is still in the process table",
+                process.pid
             );
         }
         assert_eq!(root.wait().expect("the root's status").code(), Some(7));
