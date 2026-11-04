@@ -1265,10 +1265,12 @@ export type AnswerOutcome =
   /** The host did not confirm that it took it, so a copy is kept on this device. */
   | { readonly outcome: 'kept'; readonly draft: KeptAnswer }
   /**
-   * The host took an earlier send of an answer to this question while its reply was lost. Nothing
-   * was sent now, and the copy kept is retired.
+   * The host took an earlier send of an answer to this question while its reply was lost. When
+   * `refused` is null nothing was sent now; otherwise this press sent `refused`, which the host
+   * refused because the question was answered. The copy kept is retired by an answer, and stays
+   * until it is dismissed by a send of a kept answer.
    */
-  | { readonly outcome: 'landed'; readonly action_id: string }
+  | { readonly outcome: 'landed'; readonly action_id: string; readonly refused: string | null }
   /**
    * The host has an earlier send of an answer to this question and has not finished with it.
    * Nothing was sent now, and the copy stays kept.
@@ -1375,7 +1377,12 @@ export type Standing =
    * `earlier` is what the host said of the sends already made; an uncertain one is what a send
    * names.
    */
-  | { readonly standing: 'offered'; readonly earlier: readonly EarlierSend[] }
+  | {
+      readonly standing: 'offered'
+      readonly earlier: readonly EarlierSend[]
+      /** The uncertain send the next send names: the newest by the host's record of it, if any. */
+      readonly quote: string | null
+    }
   /** The host has an earlier send of the answer and has not finished with it. */
   | { readonly standing: 'waiting'; readonly action_id: string }
   /** The host took an earlier send of the answer while its reply was lost. */

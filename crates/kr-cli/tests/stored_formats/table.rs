@@ -1513,7 +1513,7 @@ pub fn named() -> Vec<Named> {
             children: &["answers.lock"],
             opaque: false,
             databases: false,
-            reason: "the lock a write of a kept answer holds from reading the answer it replaces until the new one is in place; empty",
+            reason: "the lock a write of a kept answer or of its record of sends holds from reading what it replaces until the new one is in place; empty",
         },
         leaf(
             StoreScope::StateRoot,

@@ -949,6 +949,15 @@ fn receipt_of(
     action_id: kr_protocol::ids::ActionId,
     state: kr_protocol::receipt::ReceiptState,
 ) -> kr_protocol::receipt::ActionReadResult {
+    receipt_at(action_id, state, 9_000)
+}
+
+/// The worker's receipt of a send, last written at `updated_at_ms` by the worker's clock.
+fn receipt_at(
+    action_id: kr_protocol::ids::ActionId,
+    state: kr_protocol::receipt::ReceiptState,
+    updated_at_ms: u64,
+) -> kr_protocol::receipt::ActionReadResult {
     kr_protocol::receipt::ActionReadResult {
         receipt: kr_protocol::receipt::Receipt {
             action_id,
@@ -962,7 +971,7 @@ fn receipt_of(
             accepted_deadline_ms: Nullable::null(),
             error: Nullable::null(),
             error_withheld: false,
-            updated_at_ms: TimestampMs::new(9_000),
+            updated_at_ms: TimestampMs::new(updated_at_ms),
         },
         result: Nullable::null(),
     }
@@ -1084,12 +1093,9 @@ async fn an_uncertain_send_is_held_back_until_the_press_that_names_it() {
     let held = answered(second).await.expect("held, not refused");
     assert_eq!(held["outcome"], "held", "{held}");
     assert_eq!(held["action_id"], uncertain.to_string());
-    assert!(
-        link.quiet_for(Duration::from_millis(300)).await,
-        "nothing was sent"
-    );
 
-    // The press that names the send it was shown goes out quoting it.
+    // The press that names the send it was shown goes out quoting it. It is the next call the
+    // worker sees, so the held press sent nothing.
     let third = page.call(
         "question_answer",
         json!({
@@ -1121,4 +1127,206 @@ async fn an_uncertain_send_is_held_back_until_the_press_that_names_it() {
     assert_eq!(told["outcome"], "taken", "{told}");
     assert_eq!(kept_files(&page, &worker, "answer"), 0);
     assert_eq!(kept_files(&page, &worker, "send"), 0);
+}
+
+/// KR-REQ-11.63: an earlier send that lands while a later one is on its way is reported as the one
+/// the host took, and the press says that its own send went out and was refused. The pair is
+/// retired with the answer the host took.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_the_host_refused_because_an_earlier_one_landed_names_both() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let read = page.call("question_read", read_params(&worker));
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    answered(read).await.expect("the questions");
+
+    // The first answer goes out and its reply is lost.
+    let asked = page.call(
+        "question_answer",
+        answer_params(&worker, 2, &choice("release")),
+    );
+    let call = link.expect(Method::QuestionAnswer).await;
+    let first = call.action_id.expect("an identifier");
+    drop(link);
+    answered(asked).await.expect("the answer is kept");
+
+    // A second answer finds no receipt of the first, and sends. The first lands before it, so the
+    // host refuses the second, and a second reading finds the first applied.
+    let second = page.call(
+        "question_answer",
+        answer_params(&worker, 2, &choice("main")),
+    );
+    let mut link = worker.link().await;
+    has_no_receipt(&mut link, first).await;
+    let call = link.expect(Method::QuestionAnswer).await;
+    let own = call.action_id.expect("an identifier");
+    link.refuse_with(
+        &call,
+        ErrorCode::QuestionResolved,
+        "the question was already answered",
+    )
+    .await;
+    let call = link.expect(Method::ActionRead).await;
+    link.answer(
+        &call,
+        &receipt_of(first, kr_protocol::receipt::ReceiptState::Applied),
+    )
+    .await;
+    let told = answered(second).await.expect("the earlier send was taken");
+    assert_eq!(told["outcome"], "landed", "{told}");
+    assert_eq!(told["action_id"], first.to_string(), "{told}");
+    assert_eq!(told["refused"], own.to_string(), "{told}");
+    assert_eq!(kept_files(&page, &worker, "answer"), 0);
+    assert_eq!(kept_files(&page, &worker, "send"), 0);
+}
+
+/// KR-REQ-11.63: when several earlier sends ended with an outcome the host could not establish, the
+/// send of a kept answer names the newest by the host's own record of it, which the standing says;
+/// naming another is refused and sends nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_send_of_a_kept_answer_names_the_newest_uncertain_send() {
+    use kr_protocol::receipt::ReceiptState;
+
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let read = page.call("question_read", read_params(&worker));
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    answered(read).await.expect("the questions");
+
+    // The first answer goes out and its reply is lost.
+    let asked = page.call(
+        "question_answer",
+        answer_params(&worker, 2, &choice("release")),
+    );
+    let call = link.expect(Method::QuestionAnswer).await;
+    let older = call.action_id.expect("an identifier");
+    drop(link);
+    answered(asked).await.expect("the answer is kept");
+
+    // A second answer is held until the first is shown, and then goes out quoting it, and its reply
+    // is lost too.
+    let held = page.call(
+        "question_answer",
+        answer_params(&worker, 2, &choice("main")),
+    );
+    let mut link = worker.link().await;
+    let call = link.expect(Method::ActionRead).await;
+    link.answer(&call, &receipt_at(older, ReceiptState::Unknown, 5_000))
+        .await;
+    answered(held).await.expect("held");
+    let again = page.call(
+        "question_answer",
+        json!({
+            "params": answer_params(&worker, 2, &choice("main"))["params"].clone(),
+            "acknowledged": older.to_string()
+        }),
+    );
+    let call = link.expect(Method::ActionRead).await;
+    link.answer(&call, &receipt_at(older, ReceiptState::Unknown, 5_000))
+        .await;
+    let call = link.expect(Method::QuestionAnswer).await;
+    let newer = call.action_id.expect("an identifier");
+    drop(link);
+    let kept = answered(again).await.expect("the answer is kept");
+    let drafted_at = kept["draft"]["drafted_at_ms"].clone();
+
+    // The host's record of the second send is the newer. Settling says which one a send names.
+    let settling = page.call(
+        "question_settle",
+        json!({ "params": { "sessionId": worker.session_id.to_string() } }),
+    );
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    for id in [older, newer] {
+        let call = link.expect(Method::ActionRead).await;
+        let at = if id == older { 5_000 } else { 9_000 };
+        link.answer(&call, &receipt_at(id, ReceiptState::Unknown, at))
+            .await;
+    }
+    let settled = answered(settling).await.expect("the standing");
+    assert_eq!(settled[0]["standing"], "offered", "{settled}");
+    assert_eq!(settled[0]["quote"], newer.to_string(), "{settled}");
+    assert_eq!(
+        settled[0]["earlier"].as_array().map(Vec::len),
+        Some(2),
+        "{settled}"
+    );
+
+    // A send that names the older one is refused, and the worker sees nothing of it.
+    let wrong = page.call(
+        "question_send_kept",
+        json!({ "params": {
+            "questionId": question_id().to_string(),
+            "draftedAtMs": drafted_at,
+            "acknowledged": older.to_string()
+        } }),
+    );
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    for id in [older, newer] {
+        let call = link.expect(Method::ActionRead).await;
+        let at = if id == older { 5_000 } else { 9_000 };
+        link.answer(&call, &receipt_at(id, ReceiptState::Unknown, at))
+            .await;
+    }
+    let refused = answered(wrong).await.expect_err("the wrong send is named");
+    assert_eq!(code_of(&refused), "DRAFT_CONFLICT", "{refused}");
+
+    // The newest goes out, quoting it.
+    let right = page.call(
+        "question_send_kept",
+        json!({ "params": {
+            "questionId": question_id().to_string(),
+            "draftedAtMs": drafted_at,
+            "acknowledged": newer.to_string()
+        } }),
+    );
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    for id in [older, newer] {
+        let call = link.expect(Method::ActionRead).await;
+        let at = if id == older { 5_000 } else { 9_000 };
+        link.answer(&call, &receipt_at(id, ReceiptState::Unknown, at))
+            .await;
+    }
+    let call = link.expect(Method::QuestionAnswer).await;
+    let quoted = call.expected.clone().expect("a mutation's preconditions");
+    let kr_cbor::CanonicalValue::Map(quoted) = quoted.into_value() else {
+        panic!("preconditions are a map");
+    };
+    assert!(
+        quoted
+            .get(kr_protocol::action::SUPERSEDES_ACTION_KEY)
+            .is_some(),
+        "the send names the newest uncertain one"
+    );
+    link.answer(&call, &resolution(&worker, QuestionState::Answered))
+        .await;
+    let told = answered(right).await.expect("the worker took it");
+    assert_eq!(told["outcome"], "taken", "{told}");
 }

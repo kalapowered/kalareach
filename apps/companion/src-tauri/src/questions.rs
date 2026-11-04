@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -360,6 +361,8 @@ struct Host<'a> {
     exchange: Duration,
     /// What the worker said of the answer it took, when it took one.
     taken: Mutex<Option<QuestionResolveResult>>,
+    /// Whether a send of this call reached the point where it may be on its way to the host.
+    sent: AtomicBool,
 }
 
 impl<'a> Host<'a> {
@@ -371,7 +374,13 @@ impl<'a> Host<'a> {
             opening,
             exchange: state.questions().exchange(),
             taken: Mutex::new(None),
+            sent: AtomicBool::new(false),
         }
+    }
+
+    /// Whether this call sent an answer, or may have: the host may hold it.
+    fn sent(&self) -> bool {
+        self.sent.load(Ordering::SeqCst)
     }
 
     fn taken(&self) -> Option<QuestionResolveResult> {
@@ -510,6 +519,7 @@ impl QuestionHost for Host<'_> {
         }
         // Counted in flight until the worker has answered, so that leaving the screen waits for it.
         let _flying = crate::standing::Flight::enter(link.link());
+        self.sent.store(true, Ordering::SeqCst);
         // Under the share the link acts under, which the host checks as it does an agent's
         // mutation. One that has not answered by the time has an outcome nobody knows.
         let answer = tokio::time::timeout(
@@ -633,11 +643,15 @@ pub enum Answer {
         /// The answer, as it is kept.
         draft: AnswerDraft,
     },
-    /// The host took an earlier send of an answer to this question while its reply was lost. This
-    /// press sent nothing, and the copy kept is retired.
+    /// The host took an earlier send of an answer to this question while its reply was lost. When
+    /// `refused` is empty this press sent nothing; otherwise this press sent `refused`, and the host
+    /// refused it because the question was answered. A press of the answer form retires the copy
+    /// kept; a press of a kept answer's send leaves it until the person dismisses it.
     Landed {
         /// The send the host took.
         action_id: ActionId,
+        /// This press's own send, when it went out and was refused for that reason.
+        refused: Option<ActionId>,
     },
     /// The host has an earlier send of an answer to this question and has not finished with it.
     /// This press sent nothing, and the copy stays kept.
@@ -762,6 +776,9 @@ pub enum Standing {
     Offered {
         /// What the host said of each earlier send.
         earlier: Vec<EarlierSend>,
+        /// The uncertain send a send of this answer names, which is the newest by the host's
+        /// record of it; the page acknowledges this one.
+        quote: Option<ActionId>,
     },
     /// The host has an earlier send of the answer and has not finished with it. The answer stays
     /// kept and cannot be sent.
@@ -943,7 +960,14 @@ pub async fn answer(
             leftover: false,
         }),
         (Ok(Answered::Kept(draft)), _) => Ok(Answer::Kept { draft }),
-        (Ok(Answered::Taken(action_id)), _) => Ok(Answer::Landed { action_id }),
+        (Ok(Answered::Taken(action_id)), _) => Ok(Answer::Landed {
+            action_id,
+            refused: None,
+        }),
+        (Ok(Answered::TakenAfterRefusal { taken, refused }), _) => Ok(Answer::Landed {
+            action_id: taken,
+            refused: Some(refused),
+        }),
         (Ok(Answered::Waiting(action_id)), _) => Ok(Answer::Waiting { action_id }),
         (Ok(Answered::Held(quote)), _) => Ok(Answer::Held {
             action_id: quote.action_id,
@@ -974,7 +998,15 @@ pub async fn answer(
             None,
         ) => Err(CommandError::new(
             error.code(),
-            format!("nothing was sent: {error}; it is still in the form"),
+            if host.sent() {
+                // The send reached the host and was refused, and settling it failed afterwards.
+                format!(
+                    "this press's send reached the host and was refused, and then: {error}; it is \
+                     still in the form"
+                )
+            } else {
+                format!("nothing was sent: {error}; it is still in the form")
+            },
         )),
         (Err(error), _) => Err(failure(error)),
     }
@@ -1060,6 +1092,7 @@ pub async fn settle(
                     Some(action_id) => Standing::Waiting { action_id },
                     None => Standing::Offered {
                         earlier: earlier_sends(&earlier),
+                        quote: earlier.quote().map(|quote| quote.action_id),
                     },
                 },
                 Err(Retired::Gone) => {
@@ -1150,7 +1183,10 @@ pub async fn send(
         Earlier::default()
     };
     if let Some(action_id) = earlier.taken() {
-        return Ok(Answer::Landed { action_id });
+        return Ok(Answer::Landed {
+            action_id,
+            refused: None,
+        });
     }
     let params = match draft.submission(current) {
         Ok(params) => params,
@@ -1227,7 +1263,10 @@ pub async fn send(
                     .await
                     .taken()
             {
-                return Ok(Answer::Landed { action_id });
+                return Ok(Answer::Landed {
+                    action_id,
+                    refused: Some(send),
+                });
             }
             return Err(CommandError::from(*failed.error));
         }

@@ -315,7 +315,10 @@ pub const SESSION_BOUND_COMMANDS: &[&str] = &[
 ///
 /// Every one is a `None` entry in [`NAMED_COMMANDS`]: the page supplies none of these methods'
 /// parameters. What reaches the host is built in native code from this computer's own state, its
-/// keys, its records and what the host listed, and none of it is handed back to the page.
+/// keys, its records and what the host listed, and none of it is handed back to the page. The one
+/// exception is a command that also takes a method's parameters from the page and then performs
+/// further methods beside it, such as `question_answer`: the methods listed for it are those
+/// further ones, never its own.
 /// `owner.confirmation.complete` appears only under `owner_confirmation_review`, and `pair.finish`
 /// and `pair.redeem` only under the two starts.
 pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
@@ -581,6 +584,10 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
             Method::QuestionAnswer,
         ],
     ),
+    // An answer is a page method, and before it goes this device asks the host what became of the
+    // sends the question's kept answer went out under, so that a send the host took is not made
+    // again. The page names the answer, never the action asked about.
+    ("question_answer", &[Method::ActionRead]),
 ];
 
 /// The command handlers, in the form Tauri registers.
@@ -4185,7 +4192,8 @@ mod tests {
     }
 
     /// KR-REQ-10.06: the commands that perform protocol methods from native state are named in
-    /// `NATIVE_METHODS`, each is a registered command the page supplies no method's parameters to,
+    /// `NATIVE_METHODS`, each is a registered command the page supplies no method's parameters to
+    /// (or, where the page names a method through it, it lists only further methods than that one),
     /// `owner.confirmation.complete` is performed only by the review, and `pair.finish` and
     /// `pair.redeem` only by the two starts. None of the pairing or confirmation methods is a page
     /// method.
@@ -4200,11 +4208,19 @@ mod tests {
             .iter()
             .filter_map(|(_, method)| *method)
             .collect();
-        for (command, _) in NATIVE_METHODS {
-            assert!(
-                local.contains(command),
-                "{command} is a registered command the page names no method through"
-            );
+        for (command, methods) in NATIVE_METHODS {
+            // A command the page names a method through lists only further methods than its own.
+            let named = NAMED_COMMANDS
+                .iter()
+                .find(|(name, _)| name == command)
+                .unwrap_or_else(|| panic!("{command} is not a registered command"));
+            match named.1 {
+                None => assert!(local.contains(command)),
+                Some(own) => assert!(
+                    !methods.contains(&own),
+                    "{command} lists its own page method as one native code performs"
+                ),
+            }
         }
         // What only this computer's own state may drive is no page method at all.
         for method in [

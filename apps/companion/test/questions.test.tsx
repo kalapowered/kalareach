@@ -16,6 +16,7 @@ import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
 import { QUESTION_CONFIRM, QUESTION_SELECT } from '../src/host/fake-questions'
+import { keptRefusalWords, landedWords, refusalWords } from '../src/model/questions'
 
 const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
 
@@ -284,6 +285,27 @@ describe('who may answer (KR-REQ-23.32)', () => {
   })
 })
 
+describe('what a refusal or an earlier send means for the person (KR-REQ-11.63)', () => {
+  it('keeps the explanation of a conflict on the send of a kept answer, which is not a changed question', () => {
+    const conflict = {
+      code: 'DRAFT_CONFLICT',
+      message: 'an earlier send of this answer ended with an outcome the host could not establish'
+    }
+    expect(keptRefusalWords(conflict, conflict.message)).toBe(conflict.message)
+    expect(refusalWords(conflict, conflict.message)).not.toBe(conflict.message)
+    // Any other refusal reads as it does for an answer.
+    const resolved = { code: 'QUESTION_RESOLVED', message: 'resolved' }
+    expect(keptRefusalWords(resolved, 'x')).toBe(refusalWords(resolved, 'x'))
+  })
+
+  it('says whether the press sent an answer of its own when the host took an earlier send', () => {
+    expect(landedWords(null)).toContain('Nothing was sent')
+    const refused = landedWords('c2000000-0000-4000-8000-000000000002')
+    expect(refused).toContain('refused')
+    expect(refused).not.toContain('Nothing was sent')
+  })
+})
+
 describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', () => {
   it('is kept and not sent, is sent by no reconnect, and goes only when the person sends it', async () => {
     const { controls } = start()
@@ -419,7 +441,7 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
     await person.click(within(question).getByRole('button', { name: 'Send answer' }))
     await screen.findByTestId('kept-answer')
     // An earlier send of this answer went out and its reply was lost: the worker cannot say.
-    const send = controls.questions.leaveUncertain(QUESTION_SELECT)
+    controls.questions.leaveUncertain(QUESTION_SELECT)
     act(() => {
       controls.questions.setReachable(true)
     })
@@ -435,7 +457,34 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
     await waitFor(() => {
       expect(controls.questions.sent).toHaveLength(1)
     })
-    expect(send).toMatch(/^c2000000-/)
+  })
+
+  it('names the newest of several uncertain earlier sends, which is not the oldest', async () => {
+    const { controls } = start()
+    const question = await questionAbout(WHICH_BRANCH)
+    const person = userEvent.setup()
+    await person.click(within(question).getByRole('radio', { name: 'main' }))
+    act(() => {
+      controls.questions.setReachable(false)
+    })
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    await screen.findByTestId('kept-answer')
+    // Two earlier sends went out and lost their replies. The host's record of the second is the
+    // newer, so a send that names the first is refused.
+    controls.questions.leaveUncertain(QUESTION_SELECT)
+    controls.questions.leaveUncertain(QUESTION_SELECT)
+    act(() => {
+      controls.questions.setReachable(true)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('kept-answer')).toHaveAttribute('data-standing', 'offered')
+    })
+    expect(controls.questions.sent).toHaveLength(0)
+
+    await person.click(screen.getByRole('button', { name: 'Send it now' }))
+    await waitFor(() => {
+      expect(controls.questions.sent).toHaveLength(1)
+    })
   })
 
   it('sends nothing for a new answer until the person has been shown an uncertain earlier send', async () => {
@@ -478,7 +527,7 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
     })
     const row = screen.getByTestId('kept-answer')
     expect(within(row).getByTestId('kept-answer-standing')).toHaveTextContent(
-      'The host took an earlier send of this answer while its reply was lost'
+      'The host took an earlier send of an answer to this question while its reply was lost'
     )
     expect(within(row).queryByRole('button', { name: 'Send it now' })).toBeNull()
     expect(controls.questions.sent).toHaveLength(0)

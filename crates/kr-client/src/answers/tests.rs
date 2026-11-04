@@ -496,12 +496,14 @@ fn a_replacement_stored_meanwhile_is_never_taken_by_a_command_that_read_before()
     drafts
         .remove_after_result(asked.question_id, digest)
         .expect("compared");
-    // Nor does a retirement, nor a settling of the first answer's send.
+    // Nor does a retirement.
     assert!(
         !drafts
             .remove_if_unchanged(asked.question_id, &read)
             .expect("compared")
     );
+    // Nor does a settling of the first answer's send: the replacement stays, and only the
+    // identifier the first command holds proof of leaves its record.
     let settled =
         with_leave(|leave| drafts.settle(asked.question_id, digest, &[action(1)], true, leave))
             .expect("compared");
@@ -511,7 +513,7 @@ fn a_replacement_stored_meanwhile_is_never_taken_by_a_command_that_read_before()
         .expect("reads")
         .expect("kept");
     assert_eq!(kept, second);
-    assert_eq!(basis.sends(), [action(1), action(2)]);
+    assert_eq!(basis.sends(), [action(2)]);
 }
 
 /// A second command that recorded a send of the same answer meanwhile keeps it: a settling drops
