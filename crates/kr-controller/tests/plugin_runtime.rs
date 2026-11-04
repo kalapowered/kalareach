@@ -333,9 +333,9 @@ where
 }
 
 /// [`until`] for a look that says what it found when it found nothing, so that a wait that runs
-/// out of patience says what its looks saw and when, and not only what it waited for: the first
-/// look, and each later look that differed from the one before, with the seconds since the wait
-/// began (the last eight of them when there are more).
+/// out of patience says what its looks saw and when, and not only what it waited for: each look
+/// that differed from the one before, with the seconds since the wait began when it was first seen
+/// (the first eight and the last eight when there are more, and how many are left out).
 async fn until_found<T, Fut>(what: &str, mut check: impl FnMut() -> Fut) -> T
 where
     Fut: std::future::Future<Output = Result<T, String>>,
@@ -354,28 +354,43 @@ where
         assert!(
             tokio::time::Instant::now() < deadline,
             "waited {PATIENCE:?} for {what}{}",
-            if looks.is_empty() {
-                String::new()
-            } else {
-                let skipped = looks.len().saturating_sub(9);
-                let shown: Vec<String> = looks
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| *index == 0 || *index > skipped)
-                    .map(|(_, (at, seen))| format!("after {:.1} s: {seen}", at.as_secs_f64()))
-                    .collect();
-                format!(
-                    "; the looks that differed, by the seconds since the wait began: {}",
-                    shown.join("; ")
-                )
-            }
+            looks_in_words(&looks)
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
+/// The looks of a wait that ran out, each with the seconds since the wait began.
+fn looks_in_words(looks: &[(Duration, String)]) -> String {
+    const KEPT: usize = 8;
+    if looks.is_empty() {
+        return String::new();
+    }
+    let show = |(at, seen): &(Duration, String)| format!("after {:.1} s: {seen}", at.as_secs_f64());
+    let shown = if looks.len() <= 2 * KEPT {
+        looks.iter().map(show).collect::<Vec<_>>().join("; ")
+    } else {
+        format!(
+            "{}; ({} looks left out); {}",
+            looks[..KEPT]
+                .iter()
+                .map(show)
+                .collect::<Vec<_>>()
+                .join("; "),
+            looks.len() - 2 * KEPT,
+            looks[looks.len() - KEPT..]
+                .iter()
+                .map(show)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    };
+    format!("; the looks that differed, by the seconds since the wait began: {shown}")
+}
+
 /// What the workers' reports of components say, one binding to a phrase, for a wait that ran out:
-/// whether the binding is `first`, its state and its reason.
+/// whether the binding is `first` (otherwise it is named by the end of its identifier), its state
+/// and its reason.
 fn reports_in_words(
     reports: &[(
         kr_protocol::ids::BrokerBindingId,
@@ -389,12 +404,19 @@ fn reports_in_words(
     reports
         .iter()
         .map(|(binding, report)| {
+            let digits: String = format!("{binding:?}")
+                .chars()
+                .filter(char::is_ascii_hexdigit)
+                .collect();
             format!(
                 "the {} binding is {:?} ({})",
                 if *binding == first {
-                    "first"
+                    "first".to_owned()
                 } else {
-                    "another"
+                    format!(
+                        "other (ending {})",
+                        &digits[digits.len().saturating_sub(6)..]
+                    )
                 },
                 report.state,
                 report.reason.0.as_deref().unwrap_or("no reason")
