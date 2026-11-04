@@ -281,7 +281,8 @@ export function tauriPort(): HostPort {
     reviewRead: (params) => read('review_read', params),
     reviewAcknowledge: (params) => mutate('review_acknowledge', params, {}),
     questionRead: (params, opening) => readIn('question_read', params, opening),
-    questionAnswer: (params, opening) => readIn('question_answer', params, opening),
+    questionAnswer: (params, opening, acknowledged) =>
+      call('question_answer', { params, opening, acknowledged }),
     questionKept: () => call('question_kept', {}),
     questionSettle: (sessionId, opening) => readIn('question_settle', { sessionId }, opening),
     questionSendKept: (which, opening) => readIn('question_send_kept', which, opening),

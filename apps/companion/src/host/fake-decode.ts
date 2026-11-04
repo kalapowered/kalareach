@@ -21,6 +21,7 @@ export type Shape =
   | { readonly kind: 'any' }
   | { readonly kind: 'prompt' }
   | { readonly kind: 'nullable'; readonly of: Shape }
+  | { readonly kind: 'optional'; readonly of: Shape }
   | { readonly kind: 'enum'; readonly values: readonly string[] }
   | { readonly kind: 'array'; readonly of: Shape }
   | { readonly kind: 'object'; readonly fields: Readonly<Record<string, Shape>> }
@@ -37,6 +38,8 @@ export const anything: Shape = { kind: 'any' }
 /** Prompt or steering text: one to 65,536 bytes of UTF-8. */
 export const prompt: Shape = { kind: 'prompt' }
 export const nullable = (of: Shape): Shape => ({ kind: 'nullable', of })
+/** A member that may be left out of a map, as a Rust `Option` with a default is. */
+export const optional = (of: Shape): Shape => ({ kind: 'optional', of })
 export const oneOf = (...values: string[]): Shape => ({ kind: 'enum', values })
 export const arrayOf = (of: Shape): Shape => ({ kind: 'array', of })
 export const object = (fields: Readonly<Record<string, Shape>>): Shape => ({
@@ -98,6 +101,8 @@ export function problemOf(value: unknown, shape: Shape, at: string): string | nu
         : `\`${at}\` is 1 to ${MAX_PROMPT_BYTES} bytes of text; longer content belongs in a draft`
     case 'nullable':
       return value === null ? null : problemOf(value, shape.of, at)
+    case 'optional':
+      return value === undefined ? null : problemOf(value, shape.of, at)
     case 'enum':
       return typeof value === 'string' && shape.values.includes(value)
         ? null
@@ -118,7 +123,10 @@ export function problemOf(value: unknown, shape: Shape, at: string): string | nu
       const unknown = Object.keys(fields).find((key) => !(key in shape.fields))
       if (unknown !== undefined) return `unknown field \`${unknown}\``
       for (const [key, each] of Object.entries(shape.fields)) {
-        if (!(key in fields)) return `missing field \`${key}\``
+        if (!(key in fields)) {
+          if (each.kind === 'optional') continue
+          return `missing field \`${key}\``
+        }
         const problem = problemOf(fields[key], each, at.length > 0 ? `${at}.${key}` : key)
         if (problem !== null) return problem
       }
@@ -251,7 +259,11 @@ export const QUESTION_ANSWER_PARAMS = object({
   answer: anything
 })
 /** One kept answer, named as native code reads it: by question and by when it was given. */
-export const KEPT_REF_PARAMS = object({ questionId: uuid, draftedAtMs: u64 })
+export const KEPT_REF_PARAMS = object({
+  questionId: uuid,
+  draftedAtMs: u64,
+  acknowledged: optional(uuid)
+})
 
 export const DRAFT_CREATE_PARAMS = object({
   environment_id: uuid,

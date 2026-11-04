@@ -12,7 +12,7 @@
 
 import type { Question, QuestionAnswer } from '@kalareach/protocol'
 
-import { failureCode, type Standing } from '../host/port'
+import { failureCode, type EarlierSend, type Standing } from '../host/port'
 
 /** The most bytes of text one answer carries. */
 export const MAX_ANSWER_BYTES = 16 * 1024
@@ -121,11 +121,42 @@ export function answerWords(answer: QuestionAnswer, question?: Question): string
   }
 }
 
+/**
+ * What the host said of the sends already made, one sentence each, with the leading space that joins
+ * them to the sentence before; none when there is nothing to say.
+ */
+export function earlierWords(earlier: readonly EarlierSend[]): string {
+  return earlier
+    .map((each) => {
+      switch (each.state) {
+        case 'unknown':
+          return ' An earlier send of this answer ended with an outcome the host could not establish; sending it now is a new send that names it.'
+        case 'refused':
+          return ' The host refused an earlier send of this answer.'
+        case 'no_record':
+          return ' The host has no record of an earlier send of this answer.'
+        case 'unreadable':
+          return ' The host could not be asked what became of an earlier send of this answer.'
+      }
+    })
+    .join('')
+}
+
+/** What the page says when an answer is held back because an earlier send's outcome is not yet shown. */
+export const HELD_WORDS =
+  'An earlier send of your answer ended with an outcome the host could not establish. Nothing was sent now. Press Send again to send this answer as a new send that names it.'
+
 /** Where a kept answer's question stands, in words that claim only what the worker said. */
 export function standingWords(standing: Standing): string {
   switch (standing.standing) {
     case 'offered':
-      return 'This question is still waiting, as it was when you answered. This device has sent nothing since.'
+      return `This question is still waiting, as it was when you answered. This device has sent nothing since.${earlierWords(standing.earlier)}`
+    case 'waiting':
+      return 'The host has an earlier send of this answer and has not finished with it. This device will not send it again until the host has.'
+    case 'taken':
+      return 'The host took an earlier send of this answer while its reply was lost. This device sent nothing again, and will not.'
+    case 'unsettled':
+      return 'This question ended, and the host could not be asked what became of an earlier send of this answer. This device will not send it.'
     case 'unlisted':
       return 'The session does not list this question, and nothing says the session ended. This device has sent nothing since.'
     case 'ended':

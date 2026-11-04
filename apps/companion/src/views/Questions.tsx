@@ -41,6 +41,7 @@ import {
   listedChoices,
   offersSomethingElse,
   refusalWords,
+  HELD_WORDS,
   standingWords,
   typedWords,
   type Form
@@ -131,6 +132,9 @@ export function QuestionRequests({
   const setForms = questionForms.update
   const [refusals, setRefusals] = useState<Readonly<Record<string, string>>>({})
   const [answering, setAnswering] = useState<string | null>(null)
+  // The earlier send of an answer, by question, whose outcome the host could not establish and which
+  // the person has been shown: the next press names it.
+  const [shownSends, setShownSends] = useState<Readonly<Record<string, string>>>({})
   // Questions that ended under a person's answer. Once the worker stops listing them, what they
   // chose and why it was not recorded would go with them, so they stay until dismissed.
   const [closed, setClosed] = useState<Readonly<Record<string, Closed>>>({})
@@ -244,21 +248,49 @@ export function QuestionRequests({
     if (!('answer' in made)) return
     setAnswering(question.question_id)
     ask(() =>
-      port.questionAnswer({
-        session_id: sessionId,
-        question_id: question.question_id,
-        expected_revision: question.revision,
-        answer: made.answer
-      })
+      port.questionAnswer(
+        {
+          session_id: sessionId,
+          question_id: question.question_id,
+          expected_revision: question.revision,
+          answer: made.answer
+        },
+        undefined,
+        shownSends[question.question_id]
+      )
     )
       .then((outcome) => {
+        // An uncertain earlier send is shown first, and the form keeps what was typed: nothing was
+        // sent or kept, and the next press names the send that was shown.
+        if (outcome.outcome === 'held') {
+          setShownSends((current) => ({ ...current, [question.question_id]: outcome.action_id }))
+          setRefusals((current) => ({ ...current, [question.question_id]: HELD_WORDS }))
+          keptChanged()
+          return
+        }
+        // The host has an earlier send and has not finished with it: nothing was sent, and the form
+        // keeps what was typed.
+        if (outcome.outcome === 'waiting') {
+          setRefusals((current) => ({
+            ...current,
+            [question.question_id]:
+              'The host has an earlier send of your answer and has not finished with it. Nothing was sent now.'
+          }))
+          keptChanged()
+          return
+        }
         answeredHere.current.add(question.question_id)
         setForms((current) => without(current, question.question_id))
+        setShownSends((current) => without(current, question.question_id))
         if (outcome.outcome === 'taken') {
           say(
             outcome.leftover
               ? 'Your answer was recorded. An older copy of it could not be removed from this device, and it will not be sent again.'
               : 'Your answer was recorded.'
+          )
+        } else if (outcome.outcome === 'landed') {
+          say(
+            'The host took an earlier send of your answer while its reply was lost. Nothing was sent again.'
           )
         } else {
           say(
@@ -672,15 +704,37 @@ export function KeptAnswers({ sessionId }: { readonly sessionId?: string }): Rea
           busy={busy === each.question_id}
           onSend={() => {
             setBusy(each.question_id)
+            // An uncertain earlier send the page has shown in the kept answer's standing is the one
+            // this press names.
+            const standing = settled.get(each.question_id)
+            const shown =
+              standing?.standing === 'offered'
+                ? standing.earlier.find((earlier) => earlier.state === 'unknown')?.action_id
+                : undefined
             ask(() =>
-              port.questionSendKept({ questionId: each.question_id, draftedAtMs: each.drafted_at_ms })
+              port.questionSendKept({
+                questionId: each.question_id,
+                draftedAtMs: each.drafted_at_ms,
+                ...(shown === undefined ? {} : { acknowledged: shown })
+              })
             )
               .then((outcome) => {
-                say(
-                  outcome.outcome === 'taken' && outcome.leftover
-                    ? 'Your answer was recorded. A copy of it could not be removed from this device, and it will not be sent again.'
-                    : 'Your answer was recorded.'
-                )
+                if (outcome.outcome === 'landed') {
+                  say(
+                    'The host took an earlier send of your answer while its reply was lost. Nothing was sent again.'
+                  )
+                } else if (outcome.outcome === 'waiting') {
+                  say(
+                    'The host has an earlier send of your answer and has not finished with it. Nothing was sent now.',
+                    'pending'
+                  )
+                } else {
+                  say(
+                    outcome.outcome === 'taken' && outcome.leftover
+                      ? 'Your answer was recorded. A copy of it could not be removed from this device, and it will not be sent again.'
+                      : 'Your answer was recorded.'
+                  )
+                }
               })
               .catch((error: unknown) => {
                 say(refusalWords(error, failureMessage(error)), 'danger')

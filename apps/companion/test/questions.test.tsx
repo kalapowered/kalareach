@@ -407,4 +407,93 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
       expect(screen.queryByTestId('kept-answer')).toBeNull()
     })
   })
+
+  it('shows an earlier send that ended uncertain, and the Send it now press names it', async () => {
+    const { controls } = start()
+    const question = await questionAbout(WHICH_BRANCH)
+    const person = userEvent.setup()
+    await person.click(within(question).getByRole('radio', { name: 'main' }))
+    act(() => {
+      controls.questions.setReachable(false)
+    })
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    await screen.findByTestId('kept-answer')
+    // An earlier send of this answer went out and its reply was lost: the worker cannot say.
+    const send = controls.questions.leaveUncertain(QUESTION_SELECT)
+    act(() => {
+      controls.questions.setReachable(true)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('kept-answer')).toHaveAttribute('data-standing', 'offered')
+    })
+    expect(screen.getByTestId('kept-answer-standing')).toHaveTextContent(
+      'ended with an outcome the host could not establish'
+    )
+    expect(controls.questions.sent).toHaveLength(0)
+
+    await person.click(screen.getByRole('button', { name: 'Send it now' }))
+    await waitFor(() => {
+      expect(controls.questions.sent).toHaveLength(1)
+    })
+    expect(send).toMatch(/^c2000000-/)
+  })
+
+  it('sends nothing for a new answer until the person has been shown an uncertain earlier send', async () => {
+    const { controls } = start()
+    const question = await questionAbout(WHICH_BRANCH)
+    const person = userEvent.setup()
+    await person.click(within(question).getByRole('radio', { name: 'main' }))
+    controls.questions.leaveUncertain(QUESTION_SELECT)
+
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    expect(await within(question).findByTestId('question-refusal')).toHaveTextContent(
+      'ended with an outcome the host could not establish'
+    )
+    expect(controls.questions.sent).toHaveLength(0)
+    // What was typed is still there.
+    expect(within(question).getByRole('radio', { name: 'main' })).toBeChecked()
+
+    // The next press names the send it was shown, and the answer goes.
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    expect(await screen.findByText('Your answer was recorded.')).toBeInTheDocument()
+    expect(controls.questions.sent).toHaveLength(1)
+  })
+
+  it('says the host took an earlier send, and sends nothing again, for a kept answer and for a new one', async () => {
+    const { controls } = start()
+    const question = await questionAbout(WHICH_BRANCH)
+    const person = userEvent.setup()
+    await person.click(within(question).getByRole('radio', { name: 'main' }))
+    act(() => {
+      controls.questions.setReachable(false)
+    })
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    await screen.findByTestId('kept-answer')
+    controls.questions.leaveTaken(QUESTION_SELECT)
+    act(() => {
+      controls.questions.setReachable(true)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('kept-answer')).toHaveAttribute('data-standing', 'taken')
+    })
+    const row = screen.getByTestId('kept-answer')
+    expect(within(row).getByTestId('kept-answer-standing')).toHaveTextContent(
+      'The host took an earlier send of this answer while its reply was lost'
+    )
+    expect(within(row).queryByRole('button', { name: 'Send it now' })).toBeNull()
+    expect(controls.questions.sent).toHaveLength(0)
+  })
+
+  it('waits when the host has an earlier send and has not finished with it', async () => {
+    const { controls } = start()
+    const question = await questionAbout(WHICH_BRANCH)
+    const person = userEvent.setup()
+    await person.click(within(question).getByRole('radio', { name: 'main' }))
+    controls.questions.leaveWaiting(QUESTION_SELECT)
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    expect(await within(question).findByTestId('question-refusal')).toHaveTextContent(
+      'has an earlier send of your answer and has not finished with it'
+    )
+    expect(controls.questions.sent).toHaveLength(0)
+  })
 })

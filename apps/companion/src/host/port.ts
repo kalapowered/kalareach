@@ -1264,6 +1264,22 @@ export type AnswerOutcome =
     }
   /** The host did not confirm that it took it, so a copy is kept on this device. */
   | { readonly outcome: 'kept'; readonly draft: KeptAnswer }
+  /**
+   * The host took an earlier send of an answer to this question while its reply was lost. Nothing
+   * was sent now, and the copy kept is retired.
+   */
+  | { readonly outcome: 'landed'; readonly action_id: string }
+  /**
+   * The host has an earlier send of an answer to this question and has not finished with it.
+   * Nothing was sent now, and the copy stays kept.
+   */
+  | { readonly outcome: 'waiting'; readonly action_id: string }
+  /**
+   * An earlier send of an answer to this question ended with an outcome the host could not
+   * establish, and nothing has shown it yet. Nothing was sent or kept; the next press names the
+   * send it carries.
+   */
+  | { readonly outcome: 'held'; readonly action_id: string }
 
 /** Whether a stored draft still goes where it was written for, or waits for a person's choice. */
 export type StoredMark = 'open' | 'conflicted' | 'orphaned'
@@ -1345,10 +1361,27 @@ export interface KeptAnswer {
   readonly drafted_at_ms: string
 }
 
+/** What the host said of one earlier send of a kept answer. */
+export interface EarlierSend {
+  readonly action_id: string
+  readonly state: 'unknown' | 'refused' | 'no_record' | 'unreadable'
+  readonly code: string | null
+}
+
 /** Where a kept answer stands against its question. */
 export type Standing =
-  /** The question is pending at the revision the person answered, so the answer can be sent. */
-  | { readonly standing: 'offered' }
+  /**
+   * The question is pending at the revision the person answered, so the answer can be sent.
+   * `earlier` is what the host said of the sends already made; an uncertain one is what a send
+   * names.
+   */
+  | { readonly standing: 'offered'; readonly earlier: readonly EarlierSend[] }
+  /** The host has an earlier send of the answer and has not finished with it. */
+  | { readonly standing: 'waiting'; readonly action_id: string }
+  /** The host took an earlier send of the answer while its reply was lost. */
+  | { readonly standing: 'taken'; readonly action_id: string }
+  /** The question ended, and the host could not be asked what became of an earlier send. */
+  | { readonly standing: 'unsettled' }
   /** The session lists no such question, and nothing says the session ended. */
   | { readonly standing: 'unlisted' }
   /** The question ended while the answer was kept. */
@@ -1374,6 +1407,8 @@ export interface KeptAnswerList {
 export interface KeptRef {
   readonly questionId: string
   readonly draftedAtMs: string
+  /** The send whose outcome the host could not establish that the page showed, when it showed one. */
+  readonly acknowledged?: string
 }
 
 /** The largest file the page may hand native code as bytes, as native code bounds it. */
@@ -1804,8 +1839,16 @@ export interface HostPort {
   /**
    * Answers a question, or keeps the answer on this device when the worker cannot be reached. A
    * kept answer has not been sent, and nothing sends it but {@link HostPort.questionSendKept}.
+   *
+   * When an earlier send of an answer to the question ended with an outcome the host could not
+   * establish, nothing is sent until the page names that send in `acknowledged`, which it does
+   * once it has shown the person the outcome ({@link AnswerOutcome} `held`).
    */
-  questionAnswer(params: QuestionAnswerParams, opening?: string): Promise<AnswerOutcome>
+  questionAnswer(
+    params: QuestionAnswerParams,
+    opening?: string,
+    acknowledged?: string
+  ): Promise<AnswerOutcome>
   /** Every answer kept on this device, oldest first, whatever host it was given to. */
   questionKept(): Promise<KeptAnswerList>
   /**
