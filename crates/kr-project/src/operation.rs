@@ -378,7 +378,9 @@ impl StagingSibling {
     /// # Errors
     ///
     /// Returns [`ProjectError::Destination`] when the directory cannot be made, or when it is not
-    /// one only this account can change, or the location's refusal.
+    /// one only this account can change, or the location's refusal. A host too short of
+    /// descriptors, processes or memory to make it is not told from another failure here, because
+    /// the transfer crate reports the failure of the make as text.
     pub fn create(destination: &Destination, name: &str) -> Result<Self> {
         let name = RelativeName::parse(name)?;
         let parent = destination.reach()?;
