@@ -46,10 +46,13 @@
 //!
 //! ## Directories, not names
 //!
-//! Every directory the boundary is built from is opened first and required to be the object the
-//! record names: the working tree by the identity the repository's record carries, the Git common
-//! directory by its own, the reserved destination by the identity the reservation returned. The
-//! child then does not start at a path either: it moves into the open working directory before the
+//! Every directory the boundary is built from is opened first, and required to be the object the
+//! caller holds an identity for: the working tree by the identity the repository's record carries
+//! where one does, the Git common directory by its own, the reserved destination by the identity
+//! the reservation returned, and the invocation's own temporary directory by the identity this host
+//! read when it made it. A directory the caller holds no identity for, as a checkout handed over
+//! by path is, is the object that was opened, and it is that object that is confirmed after the
+//! run. The child then does not start at a path either: it moves into the open working directory before the
 //! boundary is applied and before Git runs, with `-C .` as its only directory argument. A tree
 //! substituted at a name afterwards is therefore neither the tree Git works in nor a tree the
 //! boundary was built around.
@@ -241,9 +244,9 @@ impl Reach {
 }
 
 /// The refusal for a directory that could not be opened: the place, and the reason the system gave
-/// for it, in the open's own words. A directory an invocation runs in and a recorded tree are
-/// refused in these words alike. A link that cannot be followed reads as the system's reason for
-/// it, where `open_root` words it as a link for a root that no record names.
+/// for it, in the open's own words. A directory an invocation is enclosed around, a recorded tree
+/// and a root no record names are refused in these words alike. A link that cannot be followed
+/// reads as the system's reason for it, where the transfer crate's `open_root` words it as a link.
 ///
 /// A host too short of descriptors, processes or memory to open the place has said nothing of the
 /// place, so the refusal is a fault that passes, which a client sends the request again after.
@@ -298,7 +301,8 @@ impl OpenedDirectory {
     ///
     /// Returns [`ProjectError::Destination`] when the directory cannot be opened or its path
     /// cannot be resolved, except that a host too short of descriptors, processes or memory to
-    /// open it is [`ProjectError::GitFailed`], a fault that passes (`unopenable`), and
+    /// open it or to resolve its path is [`ProjectError::GitFailed`], a fault that passes
+    /// (`unopenable`), and
     /// [`ProjectError::IdentityChanged`] when the caller holds an identity
     /// and the object at the path is a different one, or the open or the resolution of the path
     /// finds nothing there: the object the identity names is gone, which is a source that changed
@@ -400,15 +404,22 @@ impl OpenedDirectory {
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::IdentityChanged`] when the object or its creation instant differs.
+    /// Returns [`ProjectError::IdentityChanged`] when the object or its creation instant differs,
+    /// or when the path no longer opens, and [`ProjectError::GitFailed`], a fault that passes,
+    /// when the host is too short of descriptors, processes or memory to open it again.
     pub fn confirm_path(&self) -> Result<()> {
+        // The directory is one this invocation was enclosed around: the one it ran in, one it
+        // reserved, or its own temporary directory, so the words name the place and no role.
+        let shown = crate::git::redact(&self.path.display().to_string());
         // A name that no longer opens at all is the same answer as a name that opens on something
         // else, and it is said the same way rather than as whatever the open failed with.
         let unconfirmed = || ProjectError::IdentityChanged {
-            detail: "the directory this invocation ran in could not be confirmed to be the \
-                     object it was started against, so what it produced is not served"
-                .to_owned()
-                .into(),
+            detail: format!(
+                "{shown}, a directory this invocation was enclosed around, could not be \
+                 confirmed to be the object it was started against, so what it produced is not \
+                 served"
+            )
+            .into(),
         };
         let now = match crate::identity::open_directory(&self.path) {
             Ok(handle) => {
@@ -424,10 +435,11 @@ impl OpenedDirectory {
         };
         if now.identity() != self.identity || created_at_ms(now.handle()) != self.created_at_ms {
             return Err(ProjectError::IdentityChanged {
-                detail: "the directory this invocation ran in is not the object it was started \
-                         against, so what it produced is not served"
-                    .to_owned()
-                    .into(),
+                detail: format!(
+                    "{shown}, a directory this invocation was enclosed around, is not the object \
+                     it was started against, so what it produced is not served"
+                )
+                .into(),
             });
         }
         Ok(())

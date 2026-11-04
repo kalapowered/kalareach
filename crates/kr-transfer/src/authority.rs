@@ -185,10 +185,15 @@ pub enum Escape {
         /// The component that was not there.
         component: String,
     },
-    /// The object could not be opened for a reason the storage decided.
+    /// The object could not be opened, or read to say what it is, for a reason the platform
+    /// reported.
     ///
-    /// A full disk, a read failure, a permission the operating system refused. This is a storage
-    /// failure rather than an authority refusal, and it is reported as one.
+    /// A full disk, a read failure, a permission the operating system refused, a host too short of
+    /// descriptors, processes or memory, or a directory's identity, mount or flush that the
+    /// platform would not give. `component` is the name beneath the authorised directory that
+    /// failed, or the whole path where [`AuthorisedDirectory::open_root`] opened a root. It is not
+    /// an authority refusal: `TransferError` reports it as a storage failure, and a caller that
+    /// opened the root from an argument of its own decides what it is for its own callers.
     #[error("{component} could not be opened beneath the authorised directory: {detail}")]
     Unopenable {
         /// The component that failed.
