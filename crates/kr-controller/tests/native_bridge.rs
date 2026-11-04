@@ -608,20 +608,16 @@ fn kr_req_11_42_a_forwarder_path_that_holds_syntax_is_written_whole() {
 #[cfg(unix)]
 #[test]
 fn kr_req_11_42_a_gemini_cli_hook_line_starts_exactly_the_forwarder_whatever_its_path_holds() {
-    use std::os::unix::fs::PermissionsExt as _;
     for directory in std::iter::once("plain").chain(AWKWARD.iter().copied()) {
         let site = GeminiSite::new();
         // A forwarder of this site's own, in a directory with the awkward name: a script that writes
         // the arguments it was started with beside itself.
         let program = site.root.join(directory).join("kr-hook");
         std::fs::create_dir_all(program.parent().expect("a parent")).expect("a directory");
-        std::fs::write(
+        kr_ipc::testing::place_script(
             &program,
             "#!/bin/sh\nfor argument in \"$@\"; do printf '%s\\n' \"$argument\"; done > \"$(dirname \"$0\")/arguments\"\n",
-        )
-        .expect("the forwarder");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-            .expect("runnable");
+        );
         let mut host = site.host();
         host.forwarder = Some(program.clone());
         let bridges = NativeBridges::new(host);

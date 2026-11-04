@@ -691,7 +691,7 @@ impl Updated {
             }
             // Named for the shell it stands for, because the worker recognises a shell by its name.
             let shell = directory.join("sh");
-            std::fs::write(
+            kr_ipc::testing::place_script(
                 &shell,
                 format!(
                     "#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\nKR_RUNTIME_DIR='{runtime}'\n\
@@ -705,13 +705,7 @@ impl Updated {
                     to = made.to_server.display(),
                     from = made.from_server.display(),
                 ),
-            )
-            .expect("the contact session's shell");
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
-                    .expect("executable");
-            }
+            );
             pipes = Some(made);
             host.new_session_as(&kr, &["--shell", &shell.display().to_string()])
         } else {

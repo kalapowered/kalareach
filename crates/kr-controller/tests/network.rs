@@ -4725,11 +4725,10 @@ async fn asked_in_a_new_session(host: &Host, local: &mut LocalClient) -> Asked {
     // The application is this test's own executable, copied into the host's tree and typed into
     // the session's shell, so the worker sees it as a process inside the session.
     let application = host.tree().root().join("kr-question-application");
-    std::fs::copy(
-        std::env::current_exe().expect("this test's own executable"),
+    kr_ipc::testing::place_program(
+        &std::env::current_exe().expect("this test's own executable"),
         &application,
-    )
-    .expect("copies the application half");
+    );
     let mut terminal = LocalClient::connect(&worker_endpoint, LocalClientKind::Cli, build())
         .await
         .expect("a local terminal reaches the worker");
@@ -7373,13 +7372,7 @@ async fn a_sessions_processes_are_read_from_the_system_and_a_console_uses_the_te
 
     // The console runs in the session's shell, and what is typed at it is printed by it.
     let console = host.tree().root().join("console.sh");
-    std::fs::write(&console, CONSOLE).expect("the console is written");
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        &console,
-        std::os::unix::fs::PermissionsExt::from_mode(0o755),
-    )
-    .expect("the console can run");
+    kr_ipc::testing::place_script(&console, CONSOLE);
     the_owner_types_until(
         &worker_endpoint,
         host.environment_id,

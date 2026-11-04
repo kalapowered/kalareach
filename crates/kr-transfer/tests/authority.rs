@@ -3604,8 +3604,6 @@ struct StandIn {
 #[cfg(target_os = "macos")]
 impl StandIn {
     fn new(root: &Path, behaviour: &Behaviour) -> Self {
-        use std::os::unix::fs::PermissionsExt;
-
         let directory = std::fs::canonicalize(root).expect("the directory resolves");
         let tool = directory.join("hdiutil");
         let Behaviour {
@@ -3640,7 +3638,7 @@ impl StandIn {
     printf '====\nimage-path      : %s\nimage-alias     : %s\nprocess ID      : 4242\n/dev/disk77\tGUID_partition_scheme\t\n/dev/disk77s1\tApple_HFS\t/Volumes/elsewhere\n' "$(cat "$d/attached")" "$(cat "$d/attached")"
   fi"#
         };
-        std::fs::write(
+        kr_ipc::testing::place_script(
             &tool,
             format!(
                 r#"#!/bin/sh
@@ -3671,10 +3669,7 @@ detach)
 esac
 "#
             ),
-        )
-        .expect("the stand-in is written");
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
-            .expect("the stand-in runs");
+        );
         Self { directory, tool }
     }
 

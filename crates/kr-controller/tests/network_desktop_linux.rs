@@ -36,21 +36,16 @@ fn typed<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> T {
 /// The session's leader is this test process, which is a process the reading can anchor a
 /// generation on.
 fn login_manager(directory: &std::path::Path, session: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let answers = directory.join("session");
     std::fs::write(&answers, session).expect("the session's properties");
     let program = directory.join("loginctl");
-    std::fs::write(
+    kr_ipc::testing::place_script(
         &program,
         format!(
             "#!/bin/sh\ncase \"$1\" in\n  show-user) echo 'Display=c1' ;;\n  show-session) cat '{}' ;;\nesac\n",
             answers.display()
         ),
-    )
-    .expect("the login manager");
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-        .expect("it can be run");
+    );
     program
 }
 

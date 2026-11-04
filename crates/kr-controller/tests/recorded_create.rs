@@ -169,7 +169,7 @@ impl Host {
             );
             let opening = tree.root().join("gate");
             let cancelling = tree.root().join("cancel");
-            std::fs::write(
+            kr_ipc::testing::place_script(
                 &worker,
                 format!(
                     "#!/bin/sh\nwhile [ ! -e '{}' ]; do\n  if [ -e '{}' ]; then exit 0; fi\n  \
@@ -178,11 +178,7 @@ impl Host {
                     cancelling.display(),
                     real.display()
                 ),
-            )
-            .expect("writes the held worker");
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755))
-                .expect("makes it runnable");
+            );
             gate = Some((opening, cancelling));
         } else {
             kr_ipc::testing::place_and_start_once(

@@ -31,7 +31,6 @@
 #![cfg(unix)]
 
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -227,9 +226,7 @@ impl Host {
             worker.display()
         );
         let root_program = tree.root().join("kr-kill-root");
-        std::fs::write(&root_program, ROOT_PROGRAM).expect("writes the root program");
-        std::fs::set_permissions(&root_program, std::fs::Permissions::from_mode(0o700))
-            .expect("the root program runs");
+        kr_ipc::testing::place_script(&root_program, ROOT_PROGRAM);
         let secrets = environment.secrets_dir();
         let controller = Controller::start(ControllerSetup {
             paths: environment.clone(),

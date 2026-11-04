@@ -2121,18 +2121,13 @@ async fn a_worker_that_withholds_its_attachments(host: &Standalone, session_id: 
 /// of the output is in it.
 #[test]
 fn doctor_reports_the_faults_a_running_sessions_terminal_met() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let host = Standalone::create();
     host.select_standalone();
     let shell = host.tree.root().join("faulty-shell.sh");
-    std::fs::write(
+    kr_ipc::testing::place_script(
         &shell,
         "#!/bin/sh\nprintf 'ok\\355\\240\\200more'\nexec cat\n",
-    )
-    .expect("writes the shell");
-    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
-        .expect("makes it executable");
+    );
     let cwd = host.tree.root().display().to_string();
     let output = start(host.kr(&[
         "--json",

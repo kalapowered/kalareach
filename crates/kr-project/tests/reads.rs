@@ -615,7 +615,7 @@ mod linux {
         let planted = location.join("planted-program");
         // Placed rather than written here, so no child another test starts can hold it open for
         // writing and have the kernel refuse it as busy, which is not the refusal under test.
-        support::place_script(&planted, "#!/bin/sh\necho planted-program-ran\n");
+        kr_ipc::testing::place_script(&planted, "#!/bin/sh\necho planted-program-ran\n");
         let shell = Path::new("/bin/sh");
         let run = |helpers: Vec<PathBuf>| {
             run_enclosed(

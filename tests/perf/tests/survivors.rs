@@ -13,7 +13,6 @@
 
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -78,9 +77,7 @@ fn performance(directory: &Path, plant: Option<&Path>) -> Output {
     let bin = directory.join("bin");
     std::fs::create_dir_all(&bin).expect("a directory for the stand-in");
     let cargo = bin.join("cargo");
-    std::fs::write(&cargo, CARGO).expect("the stand-in");
-    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700))
-        .expect("the stand-in runs");
+    kr_ipc::testing::place_script(&cargo, CARGO);
     let physical = directory.join("physical");
     std::fs::create_dir_all(&physical).expect("a temporary directory");
     let temporary = directory.join("tmp");

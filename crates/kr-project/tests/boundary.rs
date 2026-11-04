@@ -70,9 +70,9 @@ const SENTINELS: &str = ".git/kr-boundary-sentinels";
 fn recorder(path: &Path, repository: &Path, name: &str) {
     let sentinels = repository.join(SENTINELS);
     std::fs::create_dir_all(&sentinels).expect("the sentinel directory");
-    support::place_script(
+    kr_ipc::testing::place_script(
         path,
-        &format!(
+        format!(
             "#!/bin/sh\necho ran >> \"{}/{name}\"\nexit 0\n",
             sentinels.display()
         ),

@@ -15,7 +15,6 @@
 
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -61,10 +60,7 @@ fn repository() -> PathBuf {
 }
 
 fn stand_in(bin: &Path, name: &str, body: &str) {
-    let path = bin.join(name);
-    std::fs::write(&path, body).expect("the stand-in");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-        .expect("the stand-in runs");
+    kr_ipc::testing::place_script(&bin.join(name), body);
 }
 
 /// What one run of the script did.

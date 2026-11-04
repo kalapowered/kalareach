@@ -915,15 +915,7 @@ impl Assembled {
             }
         }
         for (name, contents) in &self.written {
-            let file = directory.join("bin").join(exe(name));
-            std::fs::write(&file, contents).expect("a program written for the release");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-
-                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
-                    .expect("executable");
-            }
+            kr_ipc::testing::place_script(&directory.join("bin").join(exe(name)), contents);
         }
         let write = |path: &str, contents: &[u8]| {
             let file = directory.join(path);
@@ -2251,7 +2243,7 @@ impl Host {
             .expect("the pipe is held");
         // Named for the shell it goes on as, because the worker recognises a shell by its name.
         let shell = directory.join("sh");
-        std::fs::write(
+        kr_ipc::testing::place_script(
             &shell,
             format!(
                 "#!/bin/sh\n/bin/cat < '{life}' > /dev/null &\n\
@@ -2260,13 +2252,7 @@ impl Host {
                 life = life.display(),
                 pid = pid_file.display()
             ),
-        )
-        .expect("the stand-in agent's shell");
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
-                .expect("executable");
-        }
+        );
         let cwd = self.tree.root().display().to_string();
         let output = self.run(
             kr,

@@ -1002,13 +1002,11 @@ impl Daemon {
         scratch: &Path,
         named_directory: bool,
     ) -> Result<Started, kr_protocol::error::ProtocolError> {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let report = scratch.join("env-report.txt");
         let pending = scratch.join("env-report.partial");
         let _ = std::fs::remove_file(&report);
         let script = scratch.join("report-then-shell.sh");
-        std::fs::write(
+        kr_ipc::testing::place_script(
             &script,
             format!(
                 "#!/bin/sh\n/usr/bin/env > '{}'\n/bin/mv '{}' '{}'\nexec /bin/sh -i\n",
@@ -1016,10 +1014,7 @@ impl Daemon {
                 pending.display(),
                 report.display()
             ),
-        )
-        .expect("a shell that reports its environment");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("an executable");
+        );
         let mut client = LocalClient::connect(&self.endpoint, kind, build())
             .await
             .expect("connects");

@@ -753,37 +753,9 @@ pub fn plant_marker(parent: &Path, name: &str, sentinels: &Path) -> PathBuf {
         "{name}-marker{}",
         if cfg!(windows) { ".cmd" } else { ".sh" }
     ));
-    place_script(&marker, &body);
+    kr_ipc::testing::place_script(&marker, &body);
     prove_the_marker_records(&marker, sentinels);
     marker
-}
-
-/// Puts a program whose text is `text` at `destination`, runnable, without this process ever
-/// holding it open for writing.
-///
-/// This binary's tests run on threads of one process, and a child another test starts is handed a
-/// copy of every descriptor open at that moment, a descriptor this process is writing a program
-/// through included. The child holds its copy until it starts its own program, and until then
-/// Linux refuses to start the program that is still open for writing. The programs these tests
-/// plant are started by Git, or by a program Git started, so no retry of this process's own can
-/// cover them, and a refused start is exactly what an assertion that nothing ran would miss. So
-/// the text goes to a file nothing starts, and a separate process copies it into place: no
-/// descriptor of this process is ever open on the program for writing, and no child can inherit
-/// one.
-///
-/// # Panics
-///
-/// Panics when the text cannot be written or the program cannot be placed.
-pub fn place_script(destination: &Path, text: &str) {
-    let mut name = destination
-        .file_name()
-        .expect("a program has a name")
-        .to_owned();
-    name.push(".text");
-    let text_file = destination.with_file_name(name);
-    std::fs::write(&text_file, text).expect("the program's text is written");
-    kr_ipc::testing::place_program(&text_file, destination);
-    std::fs::remove_file(&text_file).expect("the program's text goes once it is in place");
 }
 
 /// Runs the planted marker once and requires it to leave its evidence.
@@ -805,7 +777,8 @@ fn prove_the_marker_records(marker: &Path, sentinels: &Path) {
     std::fs::create_dir_all(sentinels).expect("the sentinel directory");
     // With nothing in its environment, which is at least as bare as the one the restricted profile
     // gives a Git child: a marker that records under this records under that. It was placed by
-    // `place_script`, so nothing holds it open for writing and it starts the first time.
+    // `kr_ipc::testing::place_script`, so nothing holds it open for writing and it starts the first
+    // time.
     let status = Command::new(marker)
         .arg(CONTROL)
         .env_clear()
@@ -843,7 +816,7 @@ fn copy_marker(marker: &Path, destination: &Path, sentinel: &str) {
     } else {
         format!("#!/bin/sh\nexec \"{}\" {sentinel}\n", marker.display())
     };
-    place_script(destination, &body);
+    kr_ipc::testing::place_script(destination, &body);
 }
 
 /// A destination request for one name inside a directory.

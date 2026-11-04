@@ -1425,8 +1425,6 @@ async fn the_default_context_is_the_hosts_own_and_the_receipt_records_what_was_u
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_created_sessions_shell_reads_the_private_database_and_the_worker_says_so() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let host = Host::create();
     let daemon = host.start().await;
     let mut client = host.client().await;
@@ -1434,7 +1432,7 @@ async fn a_created_sessions_shell_reads_the_private_database_and_the_worker_says
     // A shell that says what its terminfo library reads, once, and then waits.
     let seen = host.temp.root().join("terminfo-seen.txt");
     let shell = host.temp.root().join("terminfo-shell.sh");
-    std::fs::write(
+    kr_ipc::testing::place_script(
         &shell,
         format!(
             "#!/bin/sh\n\
@@ -1447,10 +1445,7 @@ async fn a_created_sessions_shell_reads_the_private_database_and_the_worker_says
              exec cat\n",
             seen = kr_worker::testing::shell_quoted(&seen)
         ),
-    )
-    .expect("a shell script");
-    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700))
-        .expect("an executable shell");
+    );
 
     let mut params = create_params(
         host.environment_id,

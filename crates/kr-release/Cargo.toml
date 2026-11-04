@@ -43,6 +43,8 @@ tokio = { workspace = true, features = ["rt"] }
 tough.workspace = true
 
 [dev-dependencies]
+# Places the stand-in programs the sealing tests run, as a separate process writes them.
+kr-ipc = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
 [lints]
