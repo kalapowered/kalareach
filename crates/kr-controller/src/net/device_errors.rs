@@ -17,9 +17,10 @@
 //! the sentence is kept. Anything else that names the host (a path of any kind, the number
 //! of an account, the name of a program that changes who may use a file) has no end this module
 //! can find, so the device is given the part of the message that comes before the first such name,
-//! if that is a clause of its own and the whole message and the reason after it fit in an error,
-//! and otherwise a sentence composed here from the code. A message that is longer than an error may
-//! be once its quotations are replaced is given that sentence too.
+//! if that is a clause of its own and the whole message, once its quotations are replaced, and the
+//! reason after it fit in an error, and otherwise a sentence composed here from the code. A message
+//! that names nothing and is longer than an error may be once its quotations are replaced is given
+//! that sentence too.
 //!
 //! The same rule reaches an error wherever it is, because the text of an error that has already
 //! been made (a worker's, one a store kept, one a catalogue receipt holds) cannot be made again:
@@ -547,10 +548,10 @@ fn told_in_place(text: &str, fixed: impl Fn() -> String) -> Option<String> {
         None => match first {
             None => without_commands?,
             // A clause is kept only when the whole text is short enough to carry it and its
-            // reason, whichever name comes first. Finding a name earlier cannot make a long text
-            // tell a clause that finding it later would have refused, and the rule cannot read
-            // the clause of a long text as clean: a bare account name, `uid: 501` or a program it
-            // does not know stands in it where the rule finds nothing.
+            // reason, whichever name comes first, so finding a name earlier cannot make a long
+            // text tell a clause that finding it later would have refused. The clause of a long
+            // text is held back whatever it holds: a bare account name, `uid: 501` or a known
+            // program behind a joining mark can stand in it where the rule finds nothing.
             Some(_) if text.len() + "; ".len() + WHY_NOT_SHOWN.len() > LONGEST_MESSAGE => fixed(),
             Some(at) => match clause_before(text, at) {
                 Some(clause) => format!("{clause}; {WHY_NOT_SHOWN}"),
@@ -1400,9 +1401,10 @@ fn account_number(text: &str, outside: &impl Fn(usize) -> bool) -> Option<usize>
 
 /// Whether `character`, beside a quotation that is replaced, is parted from the words `a command`
 /// by a space in the second reading: anything but white space and the marks that end a clause or
-/// close a bracket, so an opening bracket is parted too. Such a mark stays against its neighbour,
-/// as it does in a text with no quotation, where white space alone parts words, so a program that
-/// one of them joins to the word beside it (`sudo,x`, `` `a b`,sudo x ``) is not found.
+/// close a bracket, so an opening bracket is parted too. A mark that ends a clause or closes a
+/// bracket stays against its neighbour, as it does in a text with no quotation, where white space
+/// alone parts words, so a program that one of them joins to the word beside it (`sudo,x`,
+/// `` `a b`,sudo x ``) is not found.
 fn joins_a_word(character: char) -> bool {
     !character.is_whitespace()
         && !matches!(
@@ -1599,10 +1601,10 @@ mod tests {
     }
 
     /// A text that names the host and is too long to carry a clause and its reason is given the
-    /// sentence made from the code, whatever stands before the name. The rule cannot read a long
-    /// clause as clean: a bare account name, `uid: 501`, `~name/work`, `.config/kalareach/x` and a
-    /// program it does not know stand in it as they do after a replaced quotation, and none of
-    /// them is found.
+    /// sentence made from the code, whatever stands before the name. The clause of a long text is
+    /// held back whatever it holds: a bare account name, `uid: 501`, `~name/work`,
+    /// `.config/kalareach/x` and a known program behind a joining mark (`,sudo x`) can stand in it,
+    /// after a replaced quotation or not, and the rule finds none of them.
     #[test]
     fn a_long_text_that_names_the_host_gets_the_fixed_sentence_whatever_its_clause_is() {
         let fixed = sentence_for(ErrorCode::InvalidArgument, WHY_NOT_SHOWN);
@@ -1625,15 +1627,25 @@ mod tests {
                 "{said}"
             );
         }
-        // A clause that is clean is held back too, when the path after it makes the text long.
+        // A clause that is clean is held back too, when the path after it makes the text long:
+        // the text is kept up to the length at which the clause and its reason fit in an error,
+        // and one byte more gives the sentence made from the code.
         let clause = "the host could not make the session's directory";
         let head = format!("{clause}: create /Users/marguerite/");
-        let said = format!("{head}{}", "p".repeat(LONGEST_MESSAGE - head.len()));
-        assert_eq!(
-            message_for_a_device(ErrorCode::ResourceUnavailable, &said),
-            Some(sentence_for(ErrorCode::ResourceUnavailable, WHY_NOT_SHOWN)),
-            "{said}"
-        );
+        let limit = LONGEST_MESSAGE - "; ".len() - WHY_NOT_SHOWN.len();
+        for (length, kept) in [(limit, true), (limit + 1, false), (LONGEST_MESSAGE, false)] {
+            let said = format!("{head}{}", "p".repeat(length - head.len()));
+            assert_eq!(said.len(), length);
+            assert_eq!(
+                message_for_a_device(ErrorCode::ResourceUnavailable, &said),
+                Some(if kept {
+                    format!("{clause}; {WHY_NOT_SHOWN}")
+                } else {
+                    sentence_for(ErrorCode::ResourceUnavailable, WHY_NOT_SHOWN)
+                }),
+                "{length} bytes"
+            );
+        }
     }
 
     #[test]
@@ -4355,7 +4367,8 @@ mod tests {
                 ",sudo x failed: /x",
                 " failed: /Users/m",
             ] {
-                for before in ["", "x "] {
+                // The last has a program against the bracket, which is found when they are parted.
+                for before in ["", "x ", "sudo"] {
                     let said = format!("{before}{opening}`a b`{closing}{beside}");
                     assert_eq!(
                         message_for_a_device(ErrorCode::InvalidArgument, &said).as_deref(),
