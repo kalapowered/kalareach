@@ -655,7 +655,7 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
     // Enter an integrated shell: `kr new` on a terminal of its own makes a managed session and
     // attaches it.
     let work = run.work();
-    let mut local = Window::open(
+    let (mut local, queries) = Window::open_answering(
         &run,
         "kr new",
         &run.binary("kr"),
@@ -675,7 +675,7 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
         run.root(),
         &variables,
     );
-    answered(&local, local.answer_capability_queries(0));
+    answered(&local, queries);
     let _ = local.wait_for_screen(PROMPT.trim_end(), "the managed shell reads at the terminal");
     let sessions = host.live_sessions();
     assert_eq!(sessions.len(), 1, "one live session: {sessions:?}");
@@ -990,7 +990,7 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
         .unwrap_or_else(|why| panic!("{why}"));
 
     // `kr attach` from the command line draws the screen the device holds.
-    let mut attached = Window::open(
+    let (mut attached, queries) = Window::open_answering(
         &run,
         "kr attach",
         &run.binary("kr"),
@@ -998,7 +998,7 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
         run.root(),
         &host.variables(),
     );
-    answered(&attached, attached.answer_capability_queries(0));
+    answered(&attached, queries);
     let started = std::time::Instant::now();
     let (drawn, held) = loop {
         runtime

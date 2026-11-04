@@ -7824,7 +7824,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
         // The control: the local terminal attaches again and holds the lease; a second approval,
         // the local terminal denies and the device's allow is refused; the same check fails.
         let display = logged.agent.session.display.clone();
-        let local = Window::open(
+        let (local, queries) = Window::open_answering(
             stage.run,
             "the local terminal, attached again",
             &stage.run.binary("kr"),
@@ -7832,7 +7832,7 @@ fn a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
             stage.run.root(),
             &setup,
         );
-        answered(&local, local.answer_capability_queries(0));
+        answered(&local, queries);
         std::thread::sleep(Duration::from_millis(500));
         let second_command = format!("echo {second} >> {logs_at}");
         assert!(

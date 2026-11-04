@@ -719,7 +719,7 @@ impl Person {
                 String::from_utf8_lossy(&installed.stderr)
             );
         }
-        let window = Window::open(
+        let (window, queries) = Window::open_answering(
             &ctx.run,
             "kr new",
             &ctx.run.binary("kr"),
@@ -739,7 +739,7 @@ impl Person {
             ctx.run.root(),
             &variables,
         );
-        answered(&window, window.answer_capability_queries(0));
+        answered(&window, queries);
         let _ =
             window.wait_for_screen(PROMPT.trim_end(), "the managed shell reads at the terminal");
         let sessions: Vec<_> = host

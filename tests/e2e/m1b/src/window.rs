@@ -94,10 +94,19 @@ pub struct Collected {
 }
 
 impl Collected {
+    /// Starts the thread that collects what `reader` produces, and returns once that thread is
+    /// running.
+    ///
+    /// A program started after the call asks a terminal that is already being read. A program
+    /// started first can ask its question, and give up on the answer a second later, before the
+    /// thread that would give it has been scheduled.
     fn collect(mut reader: Box<dyn Read + Send>, keys: Keys) -> Self {
         let collected = Self::default();
         let seen = Arc::clone(&collected.seen);
+        let (running, started) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
+            // Said before the first read, and `collect` does not return until it is heard.
+            let _ = running.send(());
             let mut buffer = [0_u8; 8192];
             while let Ok(read) = reader.read(&mut buffer) {
                 if read == 0 {
@@ -118,6 +127,9 @@ impl Collected {
             transcript.ended = true;
             transcript.owed.clear();
         });
+        started
+            .recv()
+            .expect("the thread that collects the window's output started");
         collected
     }
 
@@ -193,7 +205,7 @@ impl std::fmt::Debug for Window {
 
 impl Window {
     /// Opens a window running `program` with `arguments`, in `directory`, with exactly
-    /// `variables` in its environment.
+    /// `variables` in its environment. The program asks the terminal nothing.
     ///
     /// The process is recorded with the run, so the closing check knows it.
     ///
@@ -209,6 +221,59 @@ impl Window {
         directory: &Path,
         variables: &[(String, String)],
     ) -> Self {
+        Self::start(
+            run,
+            what,
+            program,
+            arguments,
+            directory,
+            variables,
+            |_, _| (),
+        )
+        .0
+    }
+
+    /// As [`Self::open`], for a program that asks the terminal what it is, and returns what waits
+    /// for the answer, which [`answered`] waits for.
+    ///
+    /// The answer is owed before the program starts, so that it is typed the moment the question
+    /// that ends the capability exchange arrives: the exchange has one second in all, and a thread
+    /// that sleeps between looks is woken late on a machine under load.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the terminal cannot be opened or the program cannot start.
+    #[must_use]
+    pub fn open_answering(
+        run: &Run,
+        what: &str,
+        program: &Path,
+        arguments: &[&str],
+        directory: &Path,
+        variables: &[(String, String)],
+    ) -> (Self, Answering) {
+        Self::start(
+            run,
+            what,
+            program,
+            arguments,
+            directory,
+            variables,
+            |collected, keys| collected.reply_to(0, b"\x1b[c", PROBE_ANSWER, keys),
+        )
+    }
+
+    /// Opens the window's terminal and starts reading it, calls `owing` with what it reads and
+    /// types through to register the replies the terminal owes, and only then starts the program.
+    fn start<T>(
+        run: &Run,
+        what: &str,
+        program: &Path,
+        arguments: &[&str],
+        directory: &Path,
+        variables: &[(String, String)],
+        owing: impl FnOnce(&Collected, &Keys) -> T,
+    ) -> (Self, T) {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: ROWS,
@@ -217,6 +282,12 @@ impl Window {
                 pixel_height: 0,
             })
             .expect("opens a terminal");
+        let keys: Keys = Arc::new(Mutex::new(pair.master.take_writer().expect("a writer")));
+        let collected = Collected::collect(
+            pair.master.try_clone_reader().expect("a reader"),
+            Arc::clone(&keys),
+        );
+        let owed = owing(&collected, &keys);
         let mut command = CommandBuilder::new(program);
         command.args(arguments);
         command.env_clear();
@@ -231,19 +302,17 @@ impl Window {
         if let Some(pid) = child.process_id() {
             run.record_child(pid, what);
         }
-        let keys: Keys = Arc::new(Mutex::new(pair.master.take_writer().expect("a writer")));
-        let collected = Collected::collect(
-            pair.master.try_clone_reader().expect("a reader"),
-            Arc::clone(&keys),
-        );
-        Self {
-            what: what.to_owned(),
-            withheld: false,
-            pair,
-            child,
-            collected,
-            keys,
-        }
+        (
+            Self {
+                what: what.to_owned(),
+                withheld: false,
+                pair,
+                child,
+                collected,
+                keys,
+            },
+            owed,
+        )
     }
 
     /// Keeps what this window is sent out of every failure message, for a window that shows an
@@ -354,15 +423,6 @@ impl Window {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-    }
-
-    /// Answers the next capability exchange `kr` starts on this terminal after `mark`: the
-    /// exchange has one second in all, so the answer is typed by the thread that collects what the
-    /// terminal is sent, the moment the question that ends the exchange arrives.
-    #[must_use]
-    pub fn answer_capability_queries(&self, mark: usize) -> Answering {
-        self.collected
-            .reply_to(mark, b"\x1b[c", PROBE_ANSWER, &self.keys)
     }
 
     /// Waits for the program to exit, and returns its status.

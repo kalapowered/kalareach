@@ -599,7 +599,7 @@ pub fn default_keychain_of_a_session(
         .iter()
         .map(|session| session["session_id"].to_string())
         .collect();
-    let mut window = Window::open(
+    let (mut window, queries) = Window::open_answering(
         run,
         "a session with the person's own home",
         &run.binary("kr"),
@@ -618,7 +618,7 @@ pub fn default_keychain_of_a_session(
         run.root(),
         &variables,
     );
-    answered(&window, window.answer_capability_queries(0));
+    answered(&window, queries);
     let _ = window.wait_for_screen(PROMPT.trim_end(), "the managed shell reads at its terminal");
     let created: Vec<serde_json::Value> = host
         .live_sessions()
@@ -684,7 +684,7 @@ pub fn names_a_session_exports(
     crate::provenance::forget_names(&file).unwrap_or_else(|why| panic!("{why}"));
     let work = run.work().display().to_string();
     let executable = shell.executable.display().to_string();
-    let mut window = Window::open(
+    let (mut window, queries) = Window::open_answering(
         run,
         "a session that exports names",
         &run.binary("kr"),
@@ -704,7 +704,7 @@ pub fn names_a_session_exports(
         run.root(),
         variables,
     );
-    answered(&window, window.answer_capability_queries(0));
+    answered(&window, queries);
     let _ = window.wait_for_screen(PROMPT.trim_end(), "the managed shell reads at its terminal");
     let deadline = Instant::now() + LIVENESS;
     let names = loop {
@@ -807,7 +807,7 @@ pub fn open_session(
         .collect();
     let work = run.work().display().to_string();
     let executable = shell.executable.display().to_string();
-    let window = Window::open(
+    let (window, queries) = Window::open_answering(
         run,
         what,
         &run.binary("kr"),
@@ -830,7 +830,7 @@ pub fn open_session(
         run.root(),
         variables,
     );
-    answered(&window, window.answer_capability_queries(0));
+    answered(&window, queries);
     let _ = window.wait_for_screen(PROMPT.trim_end(), "the managed shell reads at its terminal");
     let created: Vec<serde_json::Value> = host
         .live_sessions()
