@@ -894,14 +894,12 @@ async fn an_answer_the_worker_took_is_reported_taken_when_its_kept_copy_cannot_b
     let told = answered(asked).await.expect("kept");
     let drafted_at = told["draft"]["drafted_at_ms"].clone();
 
-    // Its directory can be listed and read but nothing in it can be removed.
     let directory = std::fs::read_dir(&kept_in)
         .expect("the kept answers")
         .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
         .find(|path| path.is_dir())
         .expect("the worker's environment");
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).expect("locked");
 
     let sending = page.call(
         "question_send_kept",
@@ -916,6 +914,9 @@ async fn an_answer_the_worker_took_is_reported_taken_when_its_kept_copy_cannot_b
     .await;
     has_no_receipt(&mut link, sent).await;
     let call = link.expect(Method::QuestionAnswer).await;
+    // The send is recorded and has reached the worker. From now on the directory can be listed and
+    // read but nothing in it can be removed, so the copy cannot be removed once the worker took it.
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).expect("locked");
     link.answer(&call, &resolution(&worker, QuestionState::Answered))
         .await;
     let result = answered(sending).await;

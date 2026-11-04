@@ -231,10 +231,12 @@ pub async fn answer(
             (_, AnswerError::Retired(reason)) => {
                 ended_first(question_id, reason, &kept_copy(&drafts, question_id))
             }
-            (Delivery::Unknown, error) => unkept(&workers, question_id, error),
-            (Delivery::NotSent | Delivery::NotTaken, error) => {
+            (delivery @ (Delivery::NotSent | Delivery::NotTaken | Delivery::Unknown), error) => {
                 match kept_copy(&drafts, question_id) {
                     KeptCopy::Kept => still_kept_failure(&workers, question_id, error),
+                    KeptCopy::None if delivery == Delivery::Unknown => {
+                        unkept(&workers, question_id, error)
+                    }
                     KeptCopy::None => answer_failure(error),
                     KeptCopy::Unreadable(why) => unknown_copy(&workers, question_id, error, &why),
                 }
@@ -566,7 +568,8 @@ fn kept(workers: &Workers, question_id: QuestionId, which: &'static str) -> CliE
 /// not be read, or the copy kept on this device could not be removed.
 ///
 /// The answer is never called unsent, and it is not offered for sending again: the next
-/// `kr question drafts` finds its question answered and retires any copy still kept.
+/// `kr question drafts` finds from the worker's record that it took the answer and retires any copy
+/// still kept.
 fn taken(
     workers: &Workers,
     session_id: SessionId,
@@ -580,7 +583,7 @@ fn taken(
     let copy = match copy {
         KeptCopy::Kept => shown!(
             "an answer to question {} is still kept on this device, and \
-             `kr question drafts` retires it once its question reads as answered",
+             `kr question drafts` retires it once it reads the worker's record of the answer",
             question_id
         ),
         KeptCopy::None => Shown::said("nothing is kept for it"),
@@ -656,8 +659,8 @@ fn ended_first(question_id: QuestionId, reason: Retired, copy: &KeptCopy) -> Cli
     ))
 }
 
-/// The failure reported for an answer that went out, whose fate is not known, and that the rules
-/// do not keep: a reply that is not a message is its worker's own answer, not a lost connection.
+/// The failure reported for an answer that went out, whose fate is not known, and of which no copy
+/// is kept on this device, so nothing remains to ask the worker about.
 fn unkept(workers: &Workers, question_id: QuestionId, error: AnswerError) -> CliError {
     let why = workers
         .failure()
@@ -695,7 +698,7 @@ fn kept_message(
             question_id
         ),
         Delivery::Taken => {
-            Shown::said("`kr question drafts` retires it once its question reads as answered")
+            Shown::said("`kr question drafts` retires it once it reads the worker's record of it")
         }
     };
     shown!("{}: {}. {}", retained(delivery, retention), why, next)

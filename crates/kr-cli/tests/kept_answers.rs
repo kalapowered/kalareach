@@ -478,6 +478,10 @@ fn pending_question(session_id: SessionId) -> Question {
                 choice_id: "left".to_owned(),
                 label: "Left".to_owned(),
             },
+            QuestionChoice {
+                choice_id: "right".to_owned(),
+                label: "Right".to_owned(),
+            },
             QuestionChoice::something_else(),
         ],
         source: QuestionSource {
@@ -990,11 +994,10 @@ async fn kr_req_10_49_nothing_is_sent_to_a_worker_whose_reply_this_command_may_n
     assert_eq!(host.answers_received(), 1);
 }
 
-/// KR-REQ-11.63: an answer its worker could not take that cannot be kept on this device either is
-/// reported as both, so the person knows it is in neither place, and it is never called unsent
-/// when it may have arrived.
+/// KR-REQ-11.63: an answer that cannot be recorded on this device is not sent, since a reconnect
+/// could not ask the host what became of it; the command says so, and keeps nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_answer_that_can_be_neither_taken_nor_kept_says_so() {
+async fn an_answer_that_cannot_be_recorded_is_not_sent_and_says_so() {
     let host = Host::start(Behaviour::EndsAfterTheRead).await;
     let question = host.question();
     host.lock_store();
@@ -1003,17 +1006,10 @@ async fn an_answer_that_can_be_neither_taken_nor_kept_says_so() {
     assert_eq!(status, Some(1), "{document}");
     assert!(document.get("kept").is_none(), "{document}");
     let message = document["message"].as_str().expect("a message");
-    assert!(
-        message.contains("could not be kept on this device"),
-        "{message}"
-    );
-    assert!(
-        message.contains("this command did not send it") || message.contains("is not known"),
-        "{message}"
-    );
+    assert!(message.contains("this command sent no answer"), "{message}");
     assert!(!message.contains("was not sent"), "{message}");
     assert!(!host.kept().exists(), "nothing is kept");
-    assert_eq!(host.answers_received(), 0, "nothing was taken");
+    assert_eq!(host.answers_received(), 0, "nothing was sent");
 }
 
 /// KR-REQ-11.63: a kept answer whose question is still pending at the revision it answered is
@@ -1161,13 +1157,14 @@ async fn an_answer_whose_reply_was_lost_is_kept_as_unknown_and_never_sent_twice(
     host.behave(Behaviour::Serves);
     let (status, document) = host.json(&["question", "drafts"]);
     assert_eq!(status, Some(0), "{document}");
-    assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
-    assert_eq!(document["drafts"][0]["reason_code"], "QUESTION_RESOLVED");
-    assert!(!host.kept().exists(), "a retired answer is no longer kept");
+    assert_eq!(document["drafts"][0]["state"], "taken", "{document}");
+    assert!(document["drafts"][0]["action_id"].is_string(), "{document}");
+    assert!(!host.kept().exists(), "a taken answer is no longer kept");
     assert_eq!(host.answers_received(), 1, "and it was not sent again");
 
-    // Retired by `kr question drafts` for a person, or by `kr question send`, an answer that may
-    // well have arrived is never called unsent: what is said is that this command did not send it.
+    // Found taken by `kr question drafts` for a person, or by `kr question send`, an answer that
+    // arrived is never called unsent: what is said is that the host took it and that this command
+    // did not send it.
     for sends in [false, true] {
         let host = Host::start(Behaviour::TakesAnswersAndDropsTheReply).await;
         let question = host.question();
@@ -1185,15 +1182,19 @@ async fn an_answer_whose_reply_was_lost_is_kept_as_unknown_and_never_sent_twice(
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(said.contains("was answered"), "{line:?}: {said}");
+        assert!(said.contains("took an earlier send"), "{line:?}: {said}");
         assert!(
-            said.contains("this command did not send"),
+            said.contains(if sends {
+                "this command sent nothing"
+            } else {
+                "this command did not send"
+            }),
             "{line:?}: {said}"
         );
         assert!(!said.contains("was not sent"), "{line:?}: {said}");
         assert!(
             !host.kept().exists(),
-            "{line:?}: a retired answer is no longer kept"
+            "{line:?}: a taken answer is no longer kept"
         );
         assert_eq!(
             host.answers_received(),
@@ -1592,12 +1593,12 @@ async fn an_answer_a_worker_took_is_never_called_unsent_when_its_reply_cannot_be
     assert_eq!(document["code"], "INVALID_ARGUMENT", "{document}");
     let message = document["message"].as_str().expect("a message");
     assert!(message.contains("worker took the answer"), "{message}");
-    assert!(message.contains("nothing is kept"), "{message}");
+    assert!(message.contains("still kept"), "{message}");
     assert!(!message.contains("did not send"), "{message}");
     assert!(!message.contains("not known"), "{message}");
     assert!(
-        !host.kept().exists(),
-        "an answer the worker took is not kept"
+        host.kept().is_file(),
+        "the pair stays, for the next reading to find taken"
     );
     assert_eq!(host.answers_received(), 1);
 
@@ -1617,8 +1618,7 @@ async fn an_answer_a_worker_took_is_never_called_unsent_when_its_reply_cannot_be
     host.behave(Behaviour::Serves);
     let (status, document) = host.json(&["question", "drafts"]);
     assert_eq!(status, Some(0), "{document}");
-    assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
-    assert_eq!(document["drafts"][0]["reason_code"], "QUESTION_RESOLVED");
+    assert_eq!(document["drafts"][0]["state"], "taken", "{document}");
     assert!(!host.kept().exists(), "the copy is retired");
     assert_eq!(host.answers_received(), 1, "and it was not sent again");
 }
@@ -1641,7 +1641,7 @@ async fn what_an_attempt_established_is_reported_when_the_store_cannot_be_read_a
     assert!(message.contains("worker took the answer"), "{message}");
     assert!(message.contains("cannot be read"), "{message}");
     assert!(!message.contains("did not send"), "{message}");
-    assert!(!host.kept().exists(), "nothing is kept");
+    assert!(host.kept().is_file(), "the pair stays");
     assert_eq!(host.answers_received(), 1);
 
     let host = kept_answer().await;
@@ -1659,8 +1659,7 @@ async fn what_an_attempt_established_is_reported_when_the_store_cannot_be_read_a
     host.behave(Behaviour::Serves);
     let (status, document) = host.json(&["question", "drafts"]);
     assert_eq!(status, Some(0), "{document}");
-    assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
-    assert_eq!(document["drafts"][0]["reason_code"], "QUESTION_RESOLVED");
+    assert_eq!(document["drafts"][0]["state"], "taken", "{document}");
     assert_eq!(host.answers_received(), 1, "and it was not sent again");
 
     let host = kept_answer().await;
@@ -1680,16 +1679,21 @@ async fn what_an_attempt_established_is_reported_when_the_store_cannot_be_read_a
 }
 
 /// KR-REQ-11.63: an answer to a question that ended before it reached the worker is not sent, and
-/// an answer kept earlier for the same question is reported as still kept, never as removed. The
-/// control is the same answer with nothing kept before it.
+/// an answer kept earlier for the same question, which the host never took, is reported as still
+/// kept, never as removed. The control is the same answer with nothing kept before it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_answer_to_a_question_that_ended_says_an_earlier_answer_is_still_kept() {
-    let host = Host::start(Behaviour::TakesAnswersAndDropsTheReply).await;
+    let host = Host::start(Behaviour::EndsAfterTheRead).await;
     let question = host.question();
     let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
     assert_eq!(status, Some(3), "{document}");
     assert!(host.kept().is_file());
-    host.behave(Behaviour::Serves);
+    {
+        // Somebody else answered it, so the host has no send of this device's.
+        let mut state = host.state();
+        state.behaviour = Behaviour::Serves;
+        state.question.state = QuestionState::Answered;
+    }
 
     let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
     assert_eq!(status, Some(8), "{document}");
@@ -1699,7 +1703,7 @@ async fn an_answer_to_a_question_that_ended_says_an_earlier_answer_is_still_kept
     assert!(message.contains("still kept"), "{message}");
     assert!(!message.contains("no longer kept"), "{message}");
     assert!(host.kept().is_file(), "the earlier answer is still kept");
-    assert_eq!(host.answers_received(), 1, "the second answer went nowhere");
+    assert_eq!(host.answers_received(), 0, "neither answer reached the worker");
 
     // With nothing kept before it, nothing is said of an earlier answer.
     let host = Host::start(Behaviour::Serves).await;
@@ -1737,8 +1741,7 @@ async fn a_sent_answer_whose_kept_copy_cannot_be_removed_is_never_called_unsent(
     host.behave(Behaviour::Serves);
     let (status, document) = host.json(&["question", "drafts"]);
     assert_eq!(status, Some(0), "{document}");
-    assert_eq!(document["drafts"][0]["state"], "retired", "{document}");
-    assert_eq!(document["drafts"][0]["reason_code"], "QUESTION_RESOLVED");
+    assert_eq!(document["drafts"][0]["state"], "taken", "{document}");
     assert!(!host.kept().exists(), "the copy is retired");
     assert_eq!(host.answers_received(), 1, "and it was not sent again");
 }
@@ -1919,18 +1922,24 @@ async fn a_descriptor_that_cannot_be_read_is_not_taken_for_a_session_without_the
     assert_eq!(host.answers_received(), 0);
 }
 
-/// KR-REQ-11.63: a reply that is not a message is the worker's own answer, not a lost connection,
-/// so the answer is shown as refused and not kept, as the drafts library rules.
+/// KR-REQ-11.63: a reply that is not a message came after the answer went out, so the answer is
+/// recorded and stays kept with its fate unknown, and is never called unsent. The next reading asks
+/// the host what became of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_malformed_reply_is_shown_and_not_kept() {
+async fn a_malformed_reply_leaves_the_answer_kept_with_its_fate_unknown() {
     let host = Host::start(Behaviour::RepliesWithGarbage).await;
     let question = host.question();
     let (status, document) = host.json(&["question", "answer", &question, "--choice", "left"]);
-    assert_eq!(status, Some(8), "{document}");
+    assert_eq!(status, Some(3), "{document}");
     assert_eq!(document["ok"], Value::Bool(false), "{document}");
-    assert!(document.get("kept").is_none(), "{document}");
+    assert_eq!(document["kept"], Value::Bool(true), "{document}");
     assert_eq!(document["code"], "INVALID_ARGUMENT", "{document}");
-    assert!(!host.kept().exists(), "a malformed reply keeps nothing");
+    let message = document["message"].as_str().expect("a message");
+    assert!(message.contains("is not known"), "{message}");
+    assert!(!message.contains("did not send"), "{message}");
+    assert!(!message.contains("was not kept"), "{message}");
+    assert!(host.kept().is_file(), "the pair stays");
+    assert_eq!(host.sends().len(), 1, "and names the send");
     assert_eq!(host.answers_received(), 1);
 }
 

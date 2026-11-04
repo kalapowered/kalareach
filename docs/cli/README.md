@@ -1207,9 +1207,9 @@ carries `"kept": true` beside the failure:
 `OUTCOME_UNKNOWN` when whether it arrived is not known, and otherwise the code of what stopped it.
 What the command says of the answer is what its attempt established, step by step: that it did not
 send it, that the worker did not take it, or that whether the worker took it is not known, which it
-never calls unsent. A reply that is not a message is the worker's own answer rather than a lost
-connection, so it is shown as a refusal that says the answer's fate is not known, and nothing is
-kept. When the answer cannot be written to this device, nothing is sent: the command says so, and
+never calls unsent. A reply that is not a message came after the answer
+went out, so the answer stays kept and the command says that whether the worker took it is not
+known. When the answer cannot be written to this device, nothing is sent: the command says so, and
 says whether an answer kept earlier for the question is still kept. It exits with 1, or with 9 when
 an update of this host is switching releases and held the writers' lock for the whole wait of 30
 seconds; run the command again once the update has finished. A worker
