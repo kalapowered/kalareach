@@ -195,17 +195,23 @@ impl Session {
     /// three it holds for any key. The PowerShell editor reads it after a key's operation has
     /// run, so there it holds only for the end-of-file gesture, whose decision reads the mailbox
     /// first.
+    ///
+    /// A reader that reports the terminal's or the macro queue as still holding input may not have
+    /// taken it yet: it is asked again about the same prompt until it reports them taken or the
+    /// reply window ends. A reader that reports a partial key sequence is not asked again, since no
+    /// key typed here leaves one: that report is the one that counts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reader still reports a queue holding input at the empty prompt, as its last
+    /// report or after the window for asking again.
     pub fn fenced_prompt(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
         let mut entry = self.next_prompt();
         // One deadline covers the exchanges and the waits between them, so asking the reader again
         // never buys it another reply window.
         let deadline = self.deadline_for(REPLY).0;
         let mut acknowledgement = self.fence_exchange_before(&entry, fence_id(index), deadline);
-        while !(acknowledgement.queues.tty_typeahead_drained
-            && acknowledgement.queues.macro_input_drained
-            && acknowledgement.queues.partial_key_drained)
-            && Instant::now() < deadline
-        {
+        while Self::input_not_yet_taken(acknowledgement.queues) && Instant::now() < deadline {
             std::thread::sleep(
                 deadline
                     .saturating_duration_since(Instant::now())

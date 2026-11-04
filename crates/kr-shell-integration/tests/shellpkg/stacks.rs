@@ -2281,16 +2281,16 @@ impl Session {
     /// first fence is written under a reply window of its own, whatever the wait for the entry
     /// took. The reply window of the prompt starts once that fence is written: its answer, and
     /// every fence asked again, answer to it and buy no other. A reader that never takes its keys,
-    /// or stays slower than the harness types them, reports them for that long and fails on it. A
-    /// reader that reports a partial key sequence is not asked again, since no key typed here
-    /// leaves one, and neither is a reader that is given no keys: their report is the one that
-    /// counts.
+    /// or stays slower than the harness types them, reports them for that long and fails on it,
+    /// with the last report it made, wherever in the window it ends. A reader that reports a
+    /// partial key sequence is not asked again, since no key typed here leaves one, and neither is
+    /// a reader that is given no keys: their report is the one that counts.
     ///
     /// # Panics
     ///
     /// Panics when that reader reports a queue still holding input at an empty prompt, and keeps
-    /// reporting it until the window ends where it is asked again, and when it does not answer a
-    /// fence inside the window.
+    /// reporting it until the window ends where it is asked again, and when it does not answer the
+    /// first fence of a prompt inside the window.
     pub fn fenced_latest(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
         // A reader can leave between reporting itself and being asked — a prompt redrawn, a
         // nested read returning — and the reader's answer to that is honest: this is not the
@@ -2300,14 +2300,14 @@ impl Session {
         let deadline = self.deadline_for(FENCE);
         let may_ask_again = dialect(self.package_kind).answers_at_the_next_step;
         // The prompt a fence was asked about whose answer found input unread, with the end of the
-        // reply window of that prompt: the reader is the one that is running still, so it is asked
-        // about again and no new entry is waited for.
+        // reply window of that prompt and what the answer reported: the reader is the one that is
+        // running still, so it is asked about again and no new entry is waited for.
         let mut asked_about = None;
         let mut attempts = 0;
         loop {
             attempts += 1;
             let (enter, window) = match asked_about.take() {
-                Some((enter, until)) => (enter, Some(until)),
+                Some((enter, until, reported)) => (enter, Some((until, reported))),
                 None => (self.latest_prompt(), None),
             };
             let fence = fence_for(&enter, fence_id(index), attachment_id(1), epoch(4));
@@ -2322,17 +2322,31 @@ impl Session {
             // The first fence for a prompt is written under a reply window of its own, and the
             // window the answers answer to starts once it is written: the write is not taken from
             // the reader's time to answer.
-            let (asked, until) = match window {
-                Some(until) => (self.ask_before(request, until), until),
+            let (asked, until) = match &window {
+                Some((until, _)) => (self.ask_before(request, *until), *until),
                 None => (self.ask(request), self.deadline_for(REPLY).0),
             };
-            match self.answer_before(asked, until) {
+            let answer = match window {
+                // A fence asked again answers to the window of its prompt. A window that ends
+                // before it is answered ends the case with the last report the reader made, which
+                // is what failed: the little time left for an answer is not.
+                Some((_, reported)) => {
+                    self.answer_by(asked, Deadline(until)).unwrap_or_else(|| {
+                        panic!(
+                            "an idle reader reported a queue still holding input in {} fences, and \
+                         the window ended before it answered the next: {reported:?}\nterminal \
+                         output:\n{}",
+                            attempts - 1,
+                            self.terminal_output()
+                        )
+                    })
+                }
+                None => self.answer_before(asked, until),
+            };
+            match answer {
                 BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement)) => {
                     let queues = acknowledgement.queues;
-                    if may_ask_again
-                        && queues.partial_key_drained
-                        && !(queues.tty_typeahead_drained && queues.macro_input_drained)
-                        && Instant::now() < until
+                    if may_ask_again && Self::input_not_yet_taken(queues) && Instant::now() < until
                     {
                         eprintln!(
                             "a fence found input the reader had not taken; asking again \
@@ -2340,7 +2354,7 @@ impl Session {
                         );
                         self.pump_before(self.bounded(Duration::from_millis(50)), until);
                         if Instant::now() < until {
-                            asked_about = Some((enter, until));
+                            asked_about = Some((enter, until, queues));
                             continue;
                         }
                     }

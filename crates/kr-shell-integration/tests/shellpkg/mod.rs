@@ -1765,6 +1765,15 @@ impl Session {
         self.ask_before(request, deadline.0)
     }
 
+    /// Whether a fence's answer reports the terminal's or the macro queue as holding input the
+    /// reader has not taken yet: such a fence is asked again about the same prompt, since keys
+    /// typed first go first and the reader may judge the fence before it has taken them. A reader
+    /// that reports a partial key sequence is not asked again, since no key typed here leaves one:
+    /// that report is the one that counts.
+    fn input_not_yet_taken(queues: kr_protocol::root::QueueDrainReport) -> bool {
+        queues.partial_key_drained && !(queues.tty_typeahead_drained && queues.macro_input_drained)
+    }
+
     /// Asks the reader for the launch `request` and returns what it decided.
     ///
     /// A reader that answers at its next step is given a key behind every frame the harness
