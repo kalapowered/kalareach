@@ -371,7 +371,7 @@ fn looks_in_words(looks: &[(Duration, String)]) -> String {
         looks.iter().map(show).collect::<Vec<_>>().join("; ")
     } else {
         format!(
-            "{}; ({} looks left out); {}",
+            "{}; ({} left out); {}",
             looks[..KEPT]
                 .iter()
                 .map(show)
@@ -404,18 +404,15 @@ fn reports_in_words(
     reports
         .iter()
         .map(|(binding, report)| {
-            let digits: String = format!("{binding:?}")
-                .chars()
-                .filter(char::is_ascii_hexdigit)
-                .collect();
+            let identifier = binding.to_string();
             format!(
-                "the {} binding is {:?} ({})",
+                "{} is {:?} ({})",
                 if *binding == first {
-                    "first".to_owned()
+                    "the first binding".to_owned()
                 } else {
                     format!(
-                        "other (ending {})",
-                        &digits[digits.len().saturating_sub(6)..]
+                        "the other binding (ending {})",
+                        &identifier[identifier.len().saturating_sub(6)..]
                     )
                 },
                 report.state,
