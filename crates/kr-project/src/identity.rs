@@ -1212,22 +1212,26 @@ fn open_recorded_root(
 /// when it cannot be duplicated for another reason or the copy cannot be read for what it is.
 pub(crate) fn duplicated(directory: &AuthorisedDirectory) -> Result<AuthorisedDirectory> {
     let path = directory.display_path();
-    // A case that asks for it has the duplication fail, after that many have been made, as it
-    // does for a host that is out of descriptors.
-    #[cfg(all(test, unix))]
-    let copy = match tests::due(&tests::CLONE_FAILS) {
-        Some(error) => Err(std::io::Error::from(error)),
-        None => directory.handle().try_clone(),
-    };
-    #[cfg(not(all(test, unix)))]
-    let copy = directory.handle().try_clone();
-    let copy = copy.map_err(|error| crate::boundary::unopenable(path, &error))?;
+    let copy =
+        copy_of(directory.handle()).map_err(|error| crate::boundary::unopenable(path, &error))?;
     let held =
         AuthorisedDirectory::from_handle(directory.environment_id(), copy, path.to_path_buf())?;
     Ok(match directory.mount() {
         Some(_) => held.confined_to_one_mount()?,
         None => held,
     })
+}
+
+/// Duplicates the handle of an open directory, which takes a descriptor as an open does, so that a
+/// host too short of descriptors, processes or memory fails it. The caller words the failure.
+pub(crate) fn copy_of(directory: &cap_std::fs::Dir) -> std::io::Result<cap_std::fs::Dir> {
+    // A case that asks for it has the duplication fail, after that many have been made, as it
+    // does for a host that is out of descriptors.
+    #[cfg(all(test, unix))]
+    if let Some(error) = tests::due(&tests::CLONE_FAILS) {
+        return Err(std::io::Error::from(error));
+    }
+    directory.try_clone()
 }
 
 /// Opens the directory at `path` as an authority for one environment: a checkout `project.adopt`
@@ -2263,6 +2267,65 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// Every Git invocation is given a temporary directory of its own, and this host holds it to
+    /// the object it made by copying its handle: the mark inside it, the directory itself twice,
+    /// and the directory again for the record. A host out of descriptors, processes or memory to
+    /// make a copy has said nothing of the directory, so where the copy decides the invocation's
+    /// answer that answer is a fault that passes, which a client sends the request again after,
+    /// and not the caller's argument; any other failure of the copy is still the argument. Where
+    /// the invocation words the failure as its own temporary directory's (the mark, and the record
+    /// of the directory) it keeps doing so, with the reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_descriptors_when_the_temporary_directory_of_a_git_invocation_is_identified_is_a_fault_that_passes()
+     {
+        let made = repositories();
+        let opened = OpenedRepository::open(&made.profile, made.environment_id, &made.main)
+            .expect("the repository opens");
+
+        for (what, passing, wrapped) in [
+            ("the mark inside the directory", 0, true),
+            ("the directory, when it is opened again", 1, false),
+            ("the directory, to compare it with that", 2, false),
+            ("the directory, for the record", 3, true),
+        ] {
+            for (errno, passes) in OPEN_ERRORS {
+                CLONE_FAILS.with(|fails| fails.set(Some((passing, errno))));
+                let head = opened.head(&made.profile);
+                CLONE_FAILS.with(|fails| fails.set(None));
+
+                let Err(refused) = head else {
+                    panic!("{what} could not be copied ({errno}), and the invocation ran");
+                };
+                if wrapped {
+                    assert_eq!(
+                        refused.code(),
+                        ErrorCode::StorageUnavailable,
+                        "{what}, {errno}: {refused}"
+                    );
+                    assert!(
+                        refused
+                            .to_string()
+                            .contains(&std::io::Error::from(errno).to_string()),
+                        "it says the reason: {what}, {errno}: {refused}"
+                    );
+                } else {
+                    assert_answered(
+                        &refused,
+                        errno,
+                        passes,
+                        ErrorCode::InvalidArgument,
+                        Path::new("a directory this host made"),
+                        &format!("{what}, {errno}"),
+                    );
+                }
+            }
+        }
+        opened
+            .head(&made.profile)
+            .expect("without a failure the invocation runs");
     }
 
     /// The same holds for the parent a destination is named by path under: it is opened once, when

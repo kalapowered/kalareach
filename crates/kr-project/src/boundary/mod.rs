@@ -684,9 +684,8 @@ pub fn identity_of_handle(
     environment_id: EnvironmentId,
     directory: &cap_std::fs::Dir,
 ) -> Result<ObjectIdentity> {
-    let handle = directory
-        .try_clone()
-        .map_err(|error| ProjectError::Destination {
+    let handle =
+        crate::identity::copy_of(directory).map_err(|error| ProjectError::Destination {
             detail: format!("a directory this host made could not be identified: {error}").into(),
         })?;
     Ok(AuthorisedDirectory::from_handle(environment_id, handle, PathBuf::new())?.identity())
@@ -702,9 +701,8 @@ pub fn recorded_of_handle(
     environment_id: EnvironmentId,
     directory: &cap_std::fs::Dir,
 ) -> Result<RecordedIdentity> {
-    let handle = directory
-        .try_clone()
-        .map_err(|error| ProjectError::Destination {
+    let handle =
+        crate::identity::copy_of(directory).map_err(|error| ProjectError::Destination {
             detail: format!("a directory this host made could not be identified: {error}").into(),
         })?;
     Ok(AuthorisedDirectory::from_handle(environment_id, handle, PathBuf::new())?.recorded()?)
@@ -722,9 +720,8 @@ pub fn settle_handle(
     directory: &cap_std::fs::Dir,
     expected: RecordedIdentity,
 ) -> Result<Settled> {
-    let handle = directory
-        .try_clone()
-        .map_err(|error| ProjectError::Destination {
+    let handle =
+        crate::identity::copy_of(directory).map_err(|error| ProjectError::Destination {
             detail: format!("a directory this host made could not be identified: {error}").into(),
         })?;
     AuthorisedDirectory::from_handle(environment_id, handle, PathBuf::new())?
@@ -986,5 +983,60 @@ mod tests {
         for shell in connection_shell(Path::new("/usr/libexec/git-core")) {
             assert!(shell.is_file(), "{} is a program", shell.display());
         }
+    }
+
+    /// The copy of the handle of a directory this host made takes a descriptor as an open does,
+    /// and the three answers that rest on it are the same: the directory's identity, its identity
+    /// as the journal records it, and whether it is the directory a record names. A host out of
+    /// descriptors, processes or memory has said nothing of the directory, so each is a fault that
+    /// passes, which a client sends the request again after; any other failure of the copy is
+    /// still the caller's argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_descriptors_when_the_handle_of_a_directory_this_host_made_is_copied_is_a_fault_that_passes()
+     {
+        use crate::identity::tests::{CLONE_FAILS, OPEN_ERRORS, assert_answered};
+
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([14; 16]));
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(root.path(), cap_std::ambient_authority())
+                .expect("the directory opens");
+        let recorded = recorded_of_handle(environment_id, &directory)
+            .expect("a directory this host made has an identity");
+
+        for (errno, passes) in OPEN_ERRORS {
+            CLONE_FAILS.with(|fails| fails.set(Some((0, errno))));
+            let answers = [
+                (
+                    "its identity",
+                    identity_of_handle(environment_id, &directory).map(drop),
+                ),
+                (
+                    "its identity as the journal records it",
+                    recorded_of_handle(environment_id, &directory).map(drop),
+                ),
+                (
+                    "whether it is the directory a record names",
+                    settle_handle(environment_id, &directory, recorded).map(drop),
+                ),
+            ];
+            CLONE_FAILS.with(|fails| fails.set(None));
+
+            for (what, answer) in answers {
+                let Err(refused) = answer else {
+                    panic!("the copy failed ({errno}), and {what} was given");
+                };
+                assert_answered(
+                    &refused,
+                    errno,
+                    passes,
+                    kr_protocol::error::ErrorCode::InvalidArgument,
+                    Path::new("a directory this host made"),
+                    &format!("{what}, {errno}"),
+                );
+            }
+        }
+        identity_of_handle(environment_id, &directory).expect("without a failure it is identified");
     }
 }
