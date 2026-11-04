@@ -18,6 +18,7 @@
 //! | Module | What it holds |
 //! | --- | --- |
 //! | [`answers`] | Answers kept on this device while the host cannot be reached, and what a reconnect makes of them |
+//! | [`sends`] | The action identifiers a kept answer went out under, so a reconnect can ask the host what became of each |
 //! | [`chunks`] | Where one transfer's chunks travel: the attachment-chunk lane, which never shares the control connection |
 //! | [`transport`] | The shape both transports share, and the iroh connection |
 //! | [`tunnel`] | An HTTP `CONNECT` tunnel through the host's proxy, for a connection that is not HTTP itself |
@@ -64,6 +65,7 @@ pub mod projection;
 pub mod reconnect;
 pub mod recovery;
 pub mod retry;
+pub mod sends;
 pub mod services;
 pub mod session;
 #[cfg(feature = "terminal")]

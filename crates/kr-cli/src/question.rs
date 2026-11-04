@@ -35,7 +35,8 @@ use kr_client::shown::{Said as _, Shown};
 use std::collections::BTreeMap;
 
 use kr_client::answers::{
-    self, AnswerDraft, AnswerDrafts, AnswerError, Answered, QuestionHost, Reconciled, Retired,
+    self, AnswerDraft, AnswerDrafts, AnswerError, AnswerFailure, Answered, Dispatch, Earlier,
+    Keeper, Leave, QuestionHost, Quoting, Reconciled, Retired, SendState, Unread,
 };
 use kr_client::error::ClientError;
 use kr_ipc::client::LocalClient;
@@ -48,6 +49,7 @@ use kr_protocol::question::{
     Question, QuestionAnswer, QuestionAnswerParams, QuestionCancelParams, QuestionReadParams,
     QuestionReadResult, QuestionResolveResult, QuestionState, SOMETHING_ELSE_CHOICE,
 };
+use kr_protocol::receipt::{ActionReadParams, ActionReadResult, Receipt};
 use kr_protocol::scalars::Nullable;
 use kr_protocol::worker::WorkerDescriptor;
 
@@ -141,50 +143,74 @@ pub async fn show(
         .map(|(descriptor, question, _)| (descriptor, question))
 }
 
+/// How `kr question answer` or `kr question send` ended, and what the host said of the earlier
+/// sends of the answer, which is named before the new result whether the call succeeded or not.
+pub struct Reported {
+    /// What the host said of each earlier send of the answer; empty when there were none.
+    pub earlier: Earlier,
+    /// The question as the host now has it, or why the call did not end in that.
+    pub outcome: Result<Question>,
+}
+
+impl Reported {
+    fn failed(error: CliError) -> Self {
+        Self {
+            earlier: Earlier::default(),
+            outcome: Err(error),
+        }
+    }
+}
+
 /// Answers one question, or keeps the answer on this device when its worker cannot take it.
 ///
 /// The revision this command read is the revision the answer names, so a question that moved while
-/// the person was reading it is refused rather than answered as though it had not.
+/// the person was reading it is refused rather than answered as though it had not. The identifier
+/// the answer goes out under is kept on this device with the answer before anything is written to
+/// the worker, so a later `kr question drafts` can ask the host what became of it. When the host
+/// has an earlier send of the answer, each is named before this one goes, and an uncertain one is
+/// named by it.
 ///
 /// # Errors
 ///
-/// Returns [`CliError::AnswerKept`] when the answer was kept rather than sent, [`CliError::Usage`]
-/// for an answer that does not fit the question's form, [`CliError::Refused`] when the question
-/// has already been resolved, has expired, or has moved to a revision this command did not read,
-/// [`CliError::Unfinished`] when the worker took the answer and its reply cannot be read, and
-/// [`CliError::UpdateDeferred`] when it could neither be sent nor kept because an update of this
-/// host held one of its locks for the whole wait.
+/// The outcome is [`CliError::AnswerKept`] when the answer was kept rather than sent,
+/// [`CliError::Usage`] for an answer that does not fit the question's form, [`CliError::Refused`]
+/// when the question has already been resolved, has expired, or has moved to a revision this
+/// command did not read, [`CliError::Unfinished`] when the worker took the answer and its reply
+/// cannot be read, or took an earlier send of it, and [`CliError::UpdateDeferred`] when nothing
+/// could be sent because an update of this host held one of its locks for the whole wait.
 pub async fn answer(
     paths: &HostPaths,
     question_id: QuestionId,
     answer: QuestionAnswer,
     build_id: BuildId,
-) -> Result<Question> {
-    let (descriptor, question, client) = locate(paths, question_id, build_id.clone()).await?;
-    let drafts = kept_answers(paths)?;
+) -> Reported {
+    let (descriptor, question, client) = match locate(paths, question_id, build_id.clone()).await {
+        Ok(found) => found,
+        Err(error) => return Reported::failed(error),
+    };
+    let drafts = match kept_answers(paths) {
+        Ok(drafts) => drafts,
+        Err(error) => return Reported::failed(error),
+    };
     let workers = Workers::new(paths, build_id).holding(&descriptor, client);
-    let answered = answers::answer(
-        Some(&workers),
+    let keeper = Hold::new(paths);
+    let attempt = answers::answer(
+        &workers,
+        &keeper,
         &drafts,
         crate::attach::target(&descriptor),
         &question,
         answer,
         kr_ipc::now_ms(),
+        Quoting::Sending,
     )
     .await;
-    match answered {
-        Ok(Answered::Sent(resolved)) => shown(*resolved),
-        // The answer is a stored record: keeping it holds the writers' lock and asks for the leave to
-        // write it, which no send does.
-        Ok(Answered::Unconfirmed(draft)) => {
-            match keep_answer(&drafts, &draft, crate::barrier::hold(paths)) {
-                Ok(()) => Err(kept(&workers, draft.question_id, "was kept")),
-                Err(refused) => Err(lost_when_not_kept(&workers, draft.question_id, refused)),
-            }
-        }
+    let outcome = match attempt.outcome {
+        Ok(answered) => settled(&workers, answered),
         // What the failure says of the answer is what the attempt established, not what the
         // failure's kind suggests.
         Err(error) => Err(match (workers.delivery(), error) {
+            (_, AnswerError::Keeping(_)) => keeping_failure(&keeper, question_id, &drafts),
             (Delivery::Taken, error) => taken(
                 &workers,
                 descriptor.session_id,
@@ -198,8 +224,87 @@ pub async fn answer(
                 ended_first(question_id, reason, &kept_copy(&drafts, question_id))
             }
             (Delivery::Unknown, error) => unkept(&workers, question_id, error),
-            (Delivery::NotSent | Delivery::NotTaken, error) => answer_failure(error),
+            (Delivery::NotSent | Delivery::NotTaken, error) => {
+                match kept_copy(&drafts, question_id) {
+                    KeptCopy::Kept => still_kept_failure(&workers, question_id, error),
+                    KeptCopy::None => answer_failure(error),
+                    KeptCopy::Unreadable(why) => unknown_copy(&workers, question_id, error, &why),
+                }
+            }
         }),
+    };
+    Reported {
+        earlier: attempt.earlier,
+        outcome,
+    }
+}
+
+/// What a call that went through says: the question when the worker took the answer, and otherwise
+/// the failure that tells the person what became of it.
+fn settled(workers: &Workers, answered: Answered) -> Result<Question> {
+    match answered {
+        Answered::Sent(resolved) => shown(*resolved),
+        Answered::Kept(draft) => Err(kept(workers, draft.question_id, "was kept")),
+        Answered::Taken(action_id) => Err(CliError::Unfinished {
+            code: ErrorCode::QuestionResolved,
+            message: shown!(
+                "the host took an earlier send of this answer (action {}) while its reply was \
+                 lost, so this command sent nothing",
+                action_id
+            ),
+        }),
+        Answered::Waiting(action_id) => Err(CliError::AnswerKept {
+            code: ErrorCode::ResourceUnavailable,
+            message: shown!(
+                "the host has an earlier send of this answer (action {}) and has not finished with \
+                 it, so this command sent nothing; the answer is still kept on this device",
+                action_id
+            ),
+        }),
+        Answered::Held(quote) => Err(CliError::AnswerKept {
+            code: ErrorCode::OutcomeUnknown,
+            message: shown!(
+                "an earlier send of this answer (action {}) ended with an outcome the host could \
+                 not establish, so this command sent nothing",
+                quote.action_id
+            ),
+        }),
+    }
+}
+
+/// The failure reported when the answer could not be recorded on this device, so nothing was sent:
+/// an update that held one of its locks for the whole wait is exit 9 here as it is for every
+/// command. An answer kept earlier for the question is reported as the store has it.
+fn keeping_failure(keeper: &Hold<'_>, question_id: QuestionId, drafts: &AnswerDrafts) -> CliError {
+    let earlier = match kept_copy(drafts, question_id) {
+        KeptCopy::Kept => shown!(
+            "; an earlier answer to question {} is still kept on this device",
+            question_id
+        ),
+        KeptCopy::None => Shown::said(""),
+        KeptCopy::Unreadable(why) => shown!(
+            "; whether an earlier answer to question {} is still kept on this device cannot be read ({})",
+            question_id,
+            why
+        ),
+    };
+    match keeper.refusal() {
+        Some(CliError::UpdateDeferred(_)) => CliError::UpdateDeferred(shown!(
+            "this command sent no answer and kept no new answer; an update of this host is \
+             switching releases and it waited {} seconds; run it again once the update has \
+             finished{}",
+            kr_ipc::install::WRITERS_WAIT_SECONDS,
+            earlier
+        )),
+        Some(refused) => CliError::Other(shown!(
+            "this command sent no answer and kept no new answer: {}{}",
+            refused.said(),
+            earlier
+        )),
+        None => CliError::Other(shown!(
+            "this command sent no answer and kept no new answer{}",
+            earlier
+        )),
     }
 }
 
@@ -239,28 +344,37 @@ fn unreconciled(workers: &Workers, error: AnswerError) -> CliError {
 /// Sends one kept answer, which is the one way a kept answer is ever sent.
 ///
 /// The question is read again first, and an answer whose question ended or moved is retired rather
-/// than sent.
+/// than sent. The host is asked about every earlier send of the answer first: one it took is
+/// reported and nothing is sent, and one whose outcome it could not establish is named, before
+/// the new send goes and by it.
 ///
 /// # Errors
 ///
-/// Returns [`CliError::Usage`] when no answer to the question is kept, [`CliError::AnswerKept`]
-/// when the worker could not take it and it stays kept, [`CliError::Refused`] when the question
-/// ended or moved, and [`CliError::Unfinished`] when the worker took it and what came after failed.
-pub async fn send(
-    paths: &HostPaths,
-    question_id: QuestionId,
-    build_id: BuildId,
-) -> Result<Question> {
-    let drafts = kept_answers(paths)?;
-    let draft = kept_draft(&drafts, question_id)?.ok_or_else(|| {
-        CliError::Usage(shown!(
-            "no answer to question {} is kept on this device",
-            question_id
-        ))
-    })?;
+/// The outcome is [`CliError::Usage`] when no answer to the question is kept,
+/// [`CliError::AnswerKept`] when the worker could not take it and it stays kept,
+/// [`CliError::Refused`] when the question ended or moved, and [`CliError::Unfinished`] when the
+/// worker took it, or an earlier send of it, and what came after failed.
+pub async fn send(paths: &HostPaths, question_id: QuestionId, build_id: BuildId) -> Reported {
+    let drafts = match kept_answers(paths) {
+        Ok(drafts) => drafts,
+        Err(error) => return Reported::failed(error),
+    };
+    let (draft, basis) = match drafts.entry(question_id) {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return Reported::failed(CliError::Usage(shown!(
+                "no answer to question {} is kept on this device",
+                question_id
+            )));
+        }
+        Err(error) => return Reported::failed(answer_failure(error)),
+    };
     let workers = Workers::new(paths, build_id).knowing(std::slice::from_ref(&draft));
-    match answers::send(&workers, &drafts, &draft).await {
-        Ok(resolved) => shown(resolved),
+    let keeper = Hold::new(paths);
+    let attempt = answers::send(&workers, &keeper, &drafts, &draft, &basis, Quoting::Sending).await;
+    let outcome = match attempt.outcome {
+        Ok(answered) => settled(&workers, answered),
+        Err(AnswerError::Keeping(_)) => Err(keeping_failure(&keeper, question_id, &drafts)),
         // The library keeps a draft it could not send for any reason but its question's end, so
         // what is still in the store says whether it stayed kept. The failure is reported as
         // itself, with what the store says beside it, and a store that cannot be read replaces
@@ -281,6 +395,10 @@ pub async fn send(
                 }
             })
         }
+    };
+    Reported {
+        earlier: attempt.earlier,
+        outcome,
     }
 }
 
@@ -326,28 +444,48 @@ fn still_kept_failure(workers: &Workers, question_id: QuestionId, error: AnswerE
     }
 }
 
-/// Keeps an answer on this device, under the writers' lock `writers` (or the reason it could not be
-/// held) and the leave to write a kept answer, and says why it could not be.
-fn keep_answer(
-    drafts: &AnswerDrafts,
-    draft: &AnswerDraft,
-    writers: Result<kr_ipc::install::Writers>,
-) -> Result<()> {
-    let writers = writers?;
-    let permit = crate::barrier::permit(&writers, &answers::WRITTEN)?;
-    drafts
-        .keep(draft, &permit)
-        .map_err(|error| CliError::Other(shown!("{}", error)))
+/// The leave to write a kept answer and its record of sends, taken for a write and let go of when
+/// it is done: the writers' lock this program's store holds, and a permit for each of the two
+/// records. When an update holds the lock for the whole wait the leave is refused, and the refusal
+/// is kept here so the exit status follows it.
+struct Hold<'a> {
+    paths: &'a HostPaths,
+    refusal: std::sync::Mutex<Option<CliError>>,
 }
 
-/// The failure reported for an answer that was not sent and was not kept because `refused`, with
-/// the exit status of the refusal: an update that held one of its locks for the whole wait is exit 9
-/// here as it is for every command.
-fn lost_when_not_kept(workers: &Workers, question_id: QuestionId, refused: CliError) -> CliError {
-    let lost = lost(workers, question_id, &refused.said());
-    match refused {
-        CliError::UpdateDeferred(_) => CliError::UpdateDeferred(lost.said()),
-        _ => lost,
+impl<'a> Hold<'a> {
+    fn new(paths: &'a HostPaths) -> Self {
+        Self {
+            paths,
+            refusal: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Why the leave was last refused.
+    fn refusal(&self) -> Option<CliError> {
+        self.refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl Keeper for Hold<'_> {
+    fn keep<R>(&self, work: impl FnOnce(&Leave<'_>) -> R) -> std::result::Result<R, Shown> {
+        let taken = (|| {
+            let writers = crate::barrier::hold(self.paths)?;
+            let answers = crate::barrier::permit(&writers, &answers::WRITTEN)?;
+            let sends = crate::barrier::permit(&writers, &kr_client::sends::WRITTEN)?;
+            Ok::<R, CliError>(work(&Leave { answers, sends }))
+        })();
+        taken.map_err(|refused| {
+            let said = refused.said();
+            *self
+                .refusal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(refused);
+            said
+        })
     }
 }
 
@@ -520,25 +658,6 @@ fn unkept(workers: &Workers, question_id: QuestionId, error: AnswerError) -> Cli
     ))
 }
 
-/// The failure reported for an answer its worker did not take, or may not have taken, that could
-/// not be kept on this device either, so the person knows it is in neither place.
-fn lost(workers: &Workers, question_id: QuestionId, why_not_kept: &Shown) -> CliError {
-    let retention = shown!(
-        "the answer to question {} could not be kept on this device ({})",
-        question_id,
-        why_not_kept.clone()
-    );
-    let why = workers.failure().map_or_else(
-        || Shown::said("its session's worker could not take it"),
-        |failure| failure.why,
-    );
-    CliError::Other(shown!(
-        "{}: {}",
-        retained(workers.delivery(), retention),
-        why
-    ))
-}
-
 /// Says what became of a kept answer, claiming no more about its delivery than was established.
 ///
 /// An answer that may have reached its worker is never said to be unsent; the next
@@ -633,9 +752,15 @@ fn answer_failure(error: AnswerError) -> CliError {
             code,
             Shown::said(UNLISTED_BECAUSE),
         )),
-        AnswerError::Store { .. } | AnswerError::Unreadable { .. } | AnswerError::NotPermitted => {
-            CliError::Other(shown!("{}", error))
+        AnswerError::Changed => {
+            CliError::Refused(kr_client::error::refusal(code, shown!("{}", error)))
         }
+        AnswerError::Store { .. }
+        | AnswerError::Unreadable { .. }
+        | AnswerError::NotPermitted
+        | AnswerError::Keeping(_)
+        | AnswerError::Full
+        | AnswerError::Unsettled => CliError::Other(shown!("{}", error)),
     }
 }
 
@@ -658,20 +783,47 @@ fn retired_because(reason: Retired) -> Shown {
 /// Renders one kept answer, as `kr question drafts` found it, for a script.
 #[must_use]
 pub fn kept_rendered(reconciled: &Reconciled) -> Document {
-    let (draft, state, reason, reason_code) = match reconciled {
-        Reconciled::Offered(draft) => (draft, "offered", None, None),
+    let (draft, state, reason, reason_code, action) = match reconciled {
+        Reconciled::Offered { draft, .. } => (draft, "offered", None, None, None),
         Reconciled::Unlisted(draft) => (
             draft,
             "unlisted",
             Some(Shown::said(UNLISTED_BECAUSE)),
             Some(AnswerError::Unlisted.code()),
+            None,
+        ),
+        Reconciled::Waiting { draft, action_id } => (
+            draft,
+            "waiting",
+            Some(Shown::said(WAITING_BECAUSE)),
+            None,
+            Some(*action_id),
+        ),
+        Reconciled::Unsettled(draft) => (
+            draft,
+            "unsettled",
+            Some(Shown::said(UNSETTLED_BECAUSE)),
+            Some(AnswerError::Unsettled.code()),
+            None,
+        ),
+        Reconciled::Taken { draft, action_id } => (
+            draft,
+            "taken",
+            Some(Shown::said(TAKEN_BECAUSE)),
+            None,
+            Some(*action_id),
         ),
         Reconciled::Retired { draft, reason } => (
             draft,
             "retired",
             Some(retired_because(*reason)),
             Some(AnswerError::Retired(*reason).code()),
+            None,
         ),
+    };
+    let earlier = match reconciled {
+        Reconciled::Offered { earlier, .. } => earlier_documents(earlier),
+        _ => Vec::new(),
     };
     Document::new()
         .with("question_id", output::said(&draft.question_id))
@@ -679,6 +831,8 @@ pub fn kept_rendered(reconciled: &Reconciled) -> Document {
         .with("state", state)
         .with("reason", reason)
         .with("reason_code", reason_code.map(ErrorCode::as_str))
+        .with("action_id", action.map(|action| output::said(&action)))
+        .with("earlier", earlier)
         .with("question_revision", draft.question_revision.get())
         .with("answer", answer_document(&draft.answer))
         .with("drafted_at_ms", draft.drafted_at_ms.get())
@@ -688,17 +842,35 @@ pub fn kept_rendered(reconciled: &Reconciled) -> Document {
 #[must_use]
 pub fn kept_line(reconciled: &Reconciled) -> Line {
     match reconciled {
-        Reconciled::Offered(draft) => stdout_line!(
-            "{}  offered  {} at revision {}; send it with kr question send {}",
+        Reconciled::Offered { draft, earlier } => stdout_line!(
+            "{}  offered  {} at revision {}; send it with kr question send {}{}",
             draft.question_id,
             answer_words(&draft.answer),
             draft.question_revision.get(),
-            draft.question_id
+            draft.question_id,
+            earlier_words(earlier)
         ),
         Reconciled::Unlisted(draft) => stdout_line!(
             "{}  unlisted  {}; it is still kept, and this command did not send it",
             draft.question_id,
             UNLISTED_BECAUSE
+        ),
+        Reconciled::Waiting { draft, action_id } => stdout_line!(
+            "{}  waiting  {} (action {}); it is still kept, and this command did not send it",
+            draft.question_id,
+            WAITING_BECAUSE,
+            action_id
+        ),
+        Reconciled::Unsettled(draft) => stdout_line!(
+            "{}  unsettled  {}; it is still kept, and this command did not send it",
+            draft.question_id,
+            UNSETTLED_BECAUSE
+        ),
+        Reconciled::Taken { draft, action_id } => stdout_line!(
+            "{}  taken  {} (action {}); this command did not send it, and it is no longer kept",
+            draft.question_id,
+            TAKEN_BECAUSE,
+            action_id
         ),
         Reconciled::Retired { draft, reason } => stdout_line!(
             "{}  retired  {}; this command did not send it, and it is no longer kept",
@@ -706,6 +878,80 @@ pub fn kept_line(reconciled: &Reconciled) -> Line {
             retired_because(*reason)
         ),
     }
+}
+
+/// Why a kept answer is waiting, in the words a person is shown.
+const WAITING_BECAUSE: &str = "the host has an earlier send of it and has not finished with it";
+
+/// Why a kept answer is unsettled, in the words a person is shown.
+const UNSETTLED_BECAUSE: &str = "its question ended, and the host could not be asked what became \
+                                 of an earlier send of it";
+
+/// What the host did with a kept answer that was taken, in the words a person is shown.
+const TAKEN_BECAUSE: &str = "the host took an earlier send of it while its reply was lost";
+
+/// What the host said of each earlier send, for a script.
+#[must_use]
+pub fn earlier_documents(earlier: &Earlier) -> Vec<Document> {
+    earlier
+        .sends()
+        .map(|(action_id, state)| {
+            let (word, code) = match state {
+                SendState::Applied => ("applied", None),
+                SendState::Pending => ("pending", None),
+                SendState::Unknown { .. } => ("unknown", None),
+                SendState::Refused(code) => ("refused", *code),
+                SendState::NoRecord => ("no_record", None),
+                SendState::Unreadable(Unread::Failed) => ("unreadable", None),
+                SendState::Unreadable(Unread::Refused(code)) => ("unreadable", Some(*code)),
+            };
+            Document::new()
+                .with("action_id", output::said(action_id))
+                .with("state", word)
+                .with("code", code.map(ErrorCode::as_str))
+        })
+        .collect()
+}
+
+/// What the host said of each earlier send worth showing, as one sentence each.
+fn earlier_sentences(earlier: &Earlier) -> Vec<Shown> {
+    earlier
+        .sends()
+        .filter_map(|(action_id, state)| match state {
+            SendState::Unknown { .. } => Some(shown!(
+                "an earlier send of this answer (action {}) ended with an outcome the host could \
+                 not establish; sending now is a new action that names it",
+                action_id
+            )),
+            SendState::NoRecord => Some(shown!(
+                "the host has no record of the earlier send (action {})",
+                action_id
+            )),
+            SendState::Refused(Some(code)) => Some(shown!(
+                "the host refused the earlier send (action {}): {}",
+                action_id,
+                code
+            )),
+            SendState::Refused(None) => Some(shown!(
+                "the host refused the earlier send (action {})",
+                action_id
+            )),
+            SendState::Unreadable(_) => Some(shown!(
+                "the host could not be asked what became of the earlier send (action {})",
+                action_id
+            )),
+            SendState::Applied | SendState::Pending => None,
+        })
+        .collect()
+}
+
+/// What the host said of each earlier send, appended to a line for a person.
+fn earlier_words(earlier: &Earlier) -> Shown {
+    earlier_sentences(earlier)
+        .into_iter()
+        .fold(Shown::said(""), |line, sentence| {
+            shown!("{}; {}", line, sentence)
+        })
 }
 
 /// An answer, for a script: its text and its choice are the person's own.
@@ -1055,19 +1301,29 @@ impl QuestionHost for Workers {
         &self,
         target: ActionTarget,
         params: QuestionAnswerParams,
-    ) -> std::result::Result<QuestionResolveResult, ClientError> {
+        dispatch: Dispatch,
+    ) -> std::result::Result<QuestionResolveResult, AnswerFailure> {
         let session_id = params.session_id;
-        // Nothing is written until the mutation goes out, whatever an earlier attempt recorded.
+        // Nothing is written until the mutation goes out, and nothing an earlier read or attempt
+        // recorded is this answer's.
         self.delivered(Delivery::NotSent);
+        *self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let mut connections = self.connections.lock().await;
-        let client = self.connection(&mut connections, session_id).await?;
+        let client = self
+            .connection(&mut connections, session_id)
+            .await
+            .map_err(AnswerFailure::unwritten)?;
         // Nothing is sent to a worker whose reply this build cannot be sure to read.
         check_worker(client.acknowledgement().build.as_ref(), session_id)
-            .map_err(ClientError::Host)?;
-        let action_id = ActionId::new(kr_ipc::new_uuid());
+            .map_err(|refusal| AnswerFailure::unwritten(ClientError::Host(refusal)))?;
+        let action_id = dispatch.action_id;
+        let expected = answers::supersession(dispatch.quote).map_err(AnswerFailure::unwritten)?;
         // Composing reads whatever the worker already sent and writes nothing, so a failure here
         // sent nothing.
-        let mutation = match client
+        let mut mutation = match client
             .compose(Method::QuestionAnswer, action_id, target, &params)
             .await
         {
@@ -1083,9 +1339,11 @@ impl QuestionHost for Workers {
                         Shown::ipc(&failure)
                     ),
                 );
-                return Err(ClientError::Ipc(failure));
+                return Err(AnswerFailure::unwritten(ClientError::Ipc(failure)));
             }
         };
+        // A send that follows an uncertain one names it, and shows the worker that it was read.
+        mutation.expected = expected;
         // From here the answer may be on its way, and only the worker's word says more.
         self.delivered(Delivery::Unknown);
         match client.repeat(&mutation).await {
@@ -1096,7 +1354,7 @@ impl QuestionHost for Workers {
                     Err(unreadable) => {
                         let error = ClientError::from(unreadable);
                         self.failed(error.code(), shown!("its reply cannot be read ({})", error));
-                        Err(error)
+                        Err(AnswerFailure::from(error))
                     }
                 }
             }
@@ -1125,7 +1383,7 @@ impl QuestionHost for Workers {
                         ),
                     );
                 }
-                Err(ClientError::from(refusal))
+                Err(AnswerFailure::from(ClientError::from(refusal)))
             }
             // Sending reads what is pending, writes the answer and waits for the reply, and a
             // connection that goes at any of those points may have carried the answer or not.
@@ -1140,7 +1398,9 @@ impl QuestionHost for Workers {
                         Shown::ipc(&failure)
                     ),
                 );
-                Err(ClientError::SubmissionUncertain { action_id })
+                Err(AnswerFailure::from(ClientError::SubmissionUncertain {
+                    action_id,
+                }))
             }
             // A reply this command cannot read came after the answer went out, so the answer may
             // have been taken.
@@ -1155,8 +1415,43 @@ impl QuestionHost for Workers {
                         Shown::ipc(&failure)
                     ),
                 );
-                Err(ClientError::Ipc(failure))
+                Err(AnswerFailure::from(ClientError::Ipc(failure)))
             }
+        }
+    }
+
+    async fn receipt(
+        &self,
+        session_id: SessionId,
+        action_id: ActionId,
+    ) -> std::result::Result<Receipt, ClientError> {
+        let mut connections = self.connections.lock().await;
+        let client = self.connection(&mut connections, session_id).await?;
+        let outcome = client
+            .request(
+                Method::ActionRead,
+                &ActionReadParams {
+                    action_id,
+                    session_id: Some(session_id),
+                },
+            )
+            .await;
+        let value = match outcome {
+            Ok(Ok(value)) => value,
+            Ok(Err(refusal)) => return Err(ClientError::from(refusal)),
+            Err(error) => {
+                connections.remove(&session_id);
+                return Err(ClientError::Ipc(error));
+            }
+        };
+        let read: ActionReadResult = value.to_typed()?;
+        Ok(read.receipt)
+    }
+
+    /// Says what the host said of the earlier sends, before the new one goes.
+    fn learned(&self, earlier: &Earlier) {
+        for sentence in earlier_sentences(earlier) {
+            crate::report::say(&sentence);
         }
     }
 
@@ -1706,7 +2001,8 @@ mod tests {
     /// lock keeps its exit status 9, and says the answer was neither sent nor kept.
     #[cfg(unix)]
     #[test]
-    fn an_answer_is_kept_only_where_the_current_release_allows_and_the_exit_follows_the_refusal() {
+    fn an_answer_is_recorded_only_where_the_current_release_allows_and_the_exit_follows_the_refusal()
+     {
         use crate::barrier::testing::Listing;
 
         let directory = tempfile::tempdir().expect("a directory");
@@ -1724,12 +2020,41 @@ mod tests {
             .path()
             .join("answers")
             .join(format!("{}.answer", draft.question_id));
+        let record = |writers: kr_ipc::install::Writers| -> Result<()> {
+            let leave = Leave {
+                answers: crate::barrier::permit(&writers, &answers::WRITTEN)?,
+                sends: crate::barrier::permit(&writers, &kr_client::sends::WRITTEN)?,
+            };
+            let basis = drafts.basis(draft.question_id).map_err(answer_failure)?;
+            drafts
+                .begin(
+                    &draft,
+                    &basis,
+                    &[],
+                    ActionId::new(kr_ipc::new_uuid()),
+                    &leave,
+                )
+                .map(|_| ())
+                .map_err(answer_failure)
+        };
 
         let elsewhere = Listing::of(&[(answers::WRITTEN.store, answers::WRITTEN.version + 1)]);
-        assert!(keep_answer(&drafts, &draft, Ok(elsewhere.writers)).is_err());
+        assert!(record(elsewhere.writers).is_err());
         assert!(
             !kept.exists(),
             "nothing is kept in a format the release does not list"
+        );
+        let sends_elsewhere = Listing::of(&[
+            (answers::WRITTEN.store, answers::WRITTEN.version),
+            (
+                kr_client::sends::WRITTEN.store,
+                kr_client::sends::WRITTEN.version + 1,
+            ),
+        ]);
+        assert!(record(sends_elsewhere.writers).is_err());
+        assert!(
+            !kept.exists(),
+            "nothing is kept beside a record of sends in a format the release does not list"
         );
 
         for (what, listing) in [
@@ -1739,7 +2064,7 @@ mod tests {
             ),
             ("no kept answers", Listing::of(&[("registry", 7)])),
         ] {
-            keep_answer(&drafts, &draft, Ok(listing.writers))
+            record(listing.writers)
                 .unwrap_or_else(|error| panic!("kept where the release lists {what}: {error}"));
             assert_eq!(drafts.drafts().expect("reads"), vec![draft.clone()]);
         }
@@ -1756,33 +2081,27 @@ mod tests {
             Listing::of(&[(answers::WRITTEN.store, answers::WRITTEN.version)]),
             Listing::of(&[("registry", 7)]),
         ] {
-            assert!(keep_answer(&drafts, &draft, Ok(listing.writers)).is_err());
+            assert!(record(listing.writers).is_err());
             assert_eq!(std::fs::read(&kept).expect("reads"), later);
         }
 
-        // The exit status follows the refusal.
-        let host = kr_ipc::testing::TempHost::create();
-        let workers = Workers::new(
-            host.paths(),
-            BuildId::new("kr/0").expect("a build identifier"),
-        );
-        let deferred = keep_answer(
-            &drafts,
-            &draft,
-            Err(CliError::UpdateDeferred(Shown::said("an update waits"))),
-        )
-        .expect_err("refused");
-        let reported = lost_when_not_kept(&workers, draft.question_id, deferred);
+        // The exit status follows the refusal, and the report says nothing was sent.
+        let paths = kr_ipc::testing::TempHost::create();
+        let keeper = Hold::new(paths.paths());
+        *keeper.refusal.lock().expect("the lock") =
+            Some(CliError::UpdateDeferred(Shown::said("an update waits")));
+        let reported = keeping_failure(&keeper, draft.question_id, &drafts);
         assert_eq!(reported.exit_code(), 9, "{reported}");
         assert!(
-            reported.said().as_str().contains("could not be kept"),
-            "it says the answer is not kept: {reported}"
+            reported
+                .said()
+                .as_str()
+                .contains("sent no answer and kept no new answer"),
+            "it says nothing was sent or kept: {reported}"
         );
-        let other = lost_when_not_kept(
-            &workers,
-            draft.question_id,
-            CliError::Other(Shown::said("the lock could not be used")),
-        );
+        *keeper.refusal.lock().expect("the lock") =
+            Some(CliError::Other(Shown::said("the lock could not be used")));
+        let other = keeping_failure(&keeper, draft.question_id, &drafts);
         assert_eq!(other.exit_code(), 1);
     }
 

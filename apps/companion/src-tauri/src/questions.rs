@@ -27,19 +27,21 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kr_client::answers::{
-    self, AnswerDraft, AnswerDrafts, AnswerError, Answered, QuestionHost, Retired,
+    self, AnswerDraft, AnswerDrafts, AnswerError, AnswerFailure, Answered, Dispatch, Earlier,
+    Keeper, Leave, QuestionHost, Quoting, Retired, SendState, Unread,
 };
 use kr_client::{ClientError, Session};
 use kr_ipc::install::Writing;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{EnvironmentId, QuestionId, QuestionRevision, SessionId};
+use kr_protocol::ids::{ActionId, EnvironmentId, QuestionId, QuestionRevision, SessionId};
 use kr_protocol::local::LocalBuild;
 use kr_protocol::method::Method;
 use kr_protocol::question::{
     Question, QuestionAnswerParams, QuestionReadParams, QuestionReadResult, QuestionResolveResult,
     QuestionState,
 };
+use kr_protocol::receipt::Receipt;
 use kr_protocol::scalars::{Nullable, TimestampMs};
 use kr_protocol::session::{SessionReadParams, SessionReadResult, SessionState};
 use serde::{Deserialize, Serialize};
@@ -489,41 +491,58 @@ impl QuestionHost for Host<'_> {
         &self,
         target: ActionTarget,
         params: QuestionAnswerParams,
-    ) -> std::result::Result<QuestionResolveResult, ClientError> {
+        dispatch: Dispatch,
+    ) -> std::result::Result<QuestionResolveResult, AnswerFailure> {
         let session_id = params.session_id;
-        let link = self.link(session_id).await?;
+        let link = self
+            .link(session_id)
+            .await
+            .map_err(AnswerFailure::unwritten)?;
         // An answer goes only to the host it was given to.
         if target.environment_id != link.ids.environment_id {
-            return Err(ClientError::ConnectionEnded);
+            return Err(AnswerFailure::unwritten(ClientError::ConnectionEnded));
         }
         // On this machine, only to a worker whose reply this build can be sure to read. A paired
         // host's daemon forwards the answer and states no worker build.
         if matches!(self.route, Route::Local) {
-            readable_by_this_build(link.build.as_ref(), session_id)?;
+            readable_by_this_build(link.build.as_ref(), session_id)
+                .map_err(AnswerFailure::unwritten)?;
         }
         // Counted in flight until the worker has answered, so that leaving the screen waits for it.
         let _flying = crate::standing::Flight::enter(link.link());
-        // Under the share the link acts under, which the host checks as it does an agent's mutation.
-        let answer = self
-            .within(async {
-                link.session
-                    .mutate(
-                        Method::QuestionAnswer,
-                        target,
-                        link.grant_id,
-                        &kr_protocol::envelope::ParamsValue::empty(),
-                        &params,
-                        answers::ANSWER_TTL,
-                    )
-                    .await?
-                    .to_typed::<QuestionResolveResult>()
-            })
-            .await;
-        let answer = self.settle(session_id, link.link(), answer);
+        // Under the share the link acts under, which the host checks as it does an agent's
+        // mutation. One that has not answered by the time has an outcome nobody knows.
+        let answer = tokio::time::timeout(
+            self.exchange,
+            answers::answer_over(&link.session, link.grant_id, target, params, dispatch),
+        )
+        .await
+        .unwrap_or_else(|_| Err(AnswerFailure::from(ClientError::ConnectionEnded)));
+        if let Err(failure) = &answer
+            && ends_the_link(&failure.error)
+        {
+            self.links.forget(self.state, session_id, link.link());
+        }
         if let Ok(resolved) = &answer {
             *self.taken.lock().unwrap_or_else(PoisonError::into_inner) = Some(resolved.clone());
         }
         answer
+    }
+
+    async fn receipt(
+        &self,
+        session_id: SessionId,
+        action_id: ActionId,
+    ) -> std::result::Result<Receipt, ClientError> {
+        let link = self.link(session_id).await?;
+        let answer = self
+            .within(<Session as QuestionHost>::receipt(
+                &link.session,
+                session_id,
+                action_id,
+            ))
+            .await;
+        self.settle(session_id, link.link(), answer)
     }
 
     /// Whether the host's record of the session says it ended.
@@ -614,6 +633,112 @@ pub enum Answer {
         /// The answer, as it is kept.
         draft: AnswerDraft,
     },
+    /// The host took an earlier send of an answer to this question while its reply was lost. This
+    /// press sent nothing, and the copy kept is retired.
+    Landed {
+        /// The send the host took.
+        action_id: ActionId,
+    },
+    /// The host has an earlier send of an answer to this question and has not finished with it.
+    /// This press sent nothing, and the copy stays kept.
+    Waiting {
+        /// The send the host has.
+        action_id: ActionId,
+    },
+    /// An earlier send of an answer to this question ended with an outcome the host could not
+    /// establish, and the page has not been shown it. This press sent nothing and kept nothing: the
+    /// page shows the outcome, and the next press carries the send it was shown.
+    Held {
+        /// The send whose outcome the host could not establish.
+        action_id: ActionId,
+    },
+}
+
+/// What the host said of one earlier send of a kept answer, for the page.
+#[derive(Debug, Serialize)]
+pub struct EarlierSend {
+    /// The send.
+    pub action_id: ActionId,
+    /// What the host said: `unknown`, `refused`, `no_record` or `unreadable`.
+    pub state: &'static str,
+    /// The code the host gave, when it gave one.
+    pub code: Option<ErrorCode>,
+}
+
+/// What the host said of each earlier send worth showing; a send the host took or has is a standing
+/// of its own.
+fn earlier_sends(earlier: &Earlier) -> Vec<EarlierSend> {
+    earlier
+        .sends()
+        .filter_map(|(action_id, state)| {
+            let (state, code) = match state {
+                SendState::Unknown { .. } => ("unknown", None),
+                SendState::Refused(code) => ("refused", *code),
+                SendState::NoRecord => ("no_record", None),
+                SendState::Unreadable(Unread::Failed) => ("unreadable", None),
+                SendState::Unreadable(Unread::Refused(code)) => ("unreadable", Some(*code)),
+                SendState::Applied | SendState::Pending => return None,
+            };
+            Some(EarlierSend {
+                action_id: *action_id,
+                state,
+                code,
+            })
+        })
+        .collect()
+}
+
+/// The leave to write the answers kept on this device and the record of their sends.
+///
+/// No release of the host ships this application, so it runs outside every store: the hold registers
+/// nothing, holds nothing and permits every record, and the roots it is given are never read. They
+/// are `root`, the directory the answers are kept in. An update would not find the answers by them
+/// if it did: it looks for `kept-answers/*.answer` directly under a state root, and the answers here
+/// are kept as `kept-answers/<environment>/*.answer`.
+struct Holding {
+    root: PathBuf,
+    /// Why the leave was last refused.
+    refusal: Mutex<String>,
+}
+
+impl Holding {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            refusal: Mutex::new(String::new()),
+        }
+    }
+
+    fn refusal(&self) -> String {
+        self.refusal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Keeper for Holding {
+    fn keep<R>(
+        &self,
+        work: impl FnOnce(&Leave<'_>) -> R,
+    ) -> std::result::Result<R, kr_client::shown::Shown> {
+        let taken = (|| {
+            let writing = Writing::in_roots(&self.root, &self.root);
+            let writers = kr_ipc::install::hold_writers(&writing, &mut || {})
+                .map_err(|refused| refused.to_string())?;
+            let answers = writers
+                .permit(&answers::WRITTEN)
+                .map_err(|refused| refused.to_string())?;
+            let sends = writers
+                .permit(&kr_client::sends::WRITTEN)
+                .map_err(|refused| refused.to_string())?;
+            Ok::<R, String>(work(&Leave { answers, sends }))
+        })();
+        taken.map_err(|why| {
+            *self.refusal.lock().unwrap_or_else(PoisonError::into_inner) = why;
+            kr_client::shown::Shown::said("the leave to write a kept answer was refused")
+        })
+    }
 }
 
 /// One kept answer and where its question stands now.
@@ -632,8 +757,27 @@ pub struct Settled {
 #[derive(Debug, Serialize)]
 #[serde(tag = "standing", rename_all = "snake_case")]
 pub enum Standing {
-    /// The question is pending at the revision the person answered. It can be sent.
-    Offered,
+    /// The question is pending at the revision the person answered. It can be sent. `earlier` is
+    /// what the host said of the sends already made, and an uncertain one is what a send names.
+    Offered {
+        /// What the host said of each earlier send.
+        earlier: Vec<EarlierSend>,
+    },
+    /// The host has an earlier send of the answer and has not finished with it. The answer stays
+    /// kept and cannot be sent.
+    Waiting {
+        /// The send the host has.
+        action_id: ActionId,
+    },
+    /// The host took an earlier send of the answer while its reply was lost. It is not sent again,
+    /// and stays shown until the person dismisses it.
+    Taken {
+        /// The send the host took.
+        action_id: ActionId,
+    },
+    /// The question ended and the host could not be asked what became of an earlier send. The
+    /// answer stays kept and cannot be sent.
+    Unsettled,
     /// The session does not list the question, and the host's record does not say the session
     /// ended. The answer stays kept and cannot be sent.
     Unlisted,
@@ -671,6 +815,10 @@ pub struct KeptRef {
     /// When the answer was given, as the page was shown it. An answer kept again for the same
     /// question since carries another time, and the command that names the old one does nothing.
     pub drafted_at_ms: TimestampMs,
+    /// The send whose outcome the host could not establish that the page showed, when it showed
+    /// one. A send that finds another sends nothing.
+    #[serde(default)]
+    pub acknowledged: Option<ActionId>,
 }
 
 /// The parameters of the command that settles the kept answers of one session.
@@ -731,17 +879,23 @@ pub async fn read(
 }
 
 /// Answers a question, or keeps the answer on this device when the host did not confirm that it
-/// took it.
+/// took it. The identifier the answer goes out under is kept with it before anything is sent, so a
+/// later settling asks the host what became of it.
+///
+/// An earlier send of an answer to the question that ended with an outcome the host could not
+/// establish is shown to the person first: a press that finds one `acknowledged` does not name sends
+/// nothing and says [`Answer::Held`], and the next press names it.
 ///
 /// # Errors
 ///
 /// Returns the worker's refusal, a form the question does not take, or a store that failed while
-/// the answer had to be kept.
+/// the answer had to be kept, in which case nothing was sent.
 pub async fn answer(
     state: &AppState,
     links: &WorkerLinks,
     opening: Option<&str>,
     params: QuestionAnswerParams,
+    acknowledged: Option<ActionId>,
 ) -> Result<Answer> {
     let desk = state.questions();
     let _turn = desk.turn().await?;
@@ -761,6 +915,7 @@ pub async fn answer(
     }
     let store = desk.store(shown.target.environment_id).map_err(failure)?;
     let host = Host::new(links, state, opening);
+    let keeper = Holding::new(desk.root()?);
     // An answer is named by its question and the time it was kept at, and that name is what a send
     // or a dismissal is held to. So a new answer to a question that already has one kept is kept
     // later than that one, whatever the clock says, and an older name never names a newer answer.
@@ -771,21 +926,28 @@ pub async fn answer(
         }
         _ => now,
     };
-    let answered = answers::answer(
-        Some(&host),
+    let attempt = answers::answer(
+        &host,
+        &keeper,
         &store,
         shown.target.clone(),
         &shown.question,
         params.answer,
         drafted_at,
+        Quoting::AfterShown(acknowledged),
     )
     .await;
-    match (answered, host.taken()) {
+    match (attempt.outcome, host.taken()) {
         (Ok(Answered::Sent(resolution)), _) => Ok(Answer::Taken {
             resolution,
             leftover: false,
         }),
-        (Ok(Answered::Unconfirmed(draft)), _) => keep(store, draft, desk.root()?).await,
+        (Ok(Answered::Kept(draft)), _) => Ok(Answer::Kept { draft }),
+        (Ok(Answered::Taken(action_id)), _) => Ok(Answer::Landed { action_id }),
+        (Ok(Answered::Waiting(action_id)), _) => Ok(Answer::Waiting { action_id }),
+        (Ok(Answered::Held(quote)), _) => Ok(Answer::Held {
+            action_id: quote.action_id,
+        }),
         // The worker took it and removing the copy kept earlier failed: the answer was taken, and
         // the page is told so.
         (Err(AnswerError::Store { .. } | AnswerError::Unreadable { .. }), Some(resolution)) => {
@@ -794,42 +956,28 @@ pub async fn answer(
                 leftover: true,
             })
         }
+        // The answer could not be recorded, so nothing was sent; what the person wrote stays in
+        // the form.
+        (Err(AnswerError::Keeping(_)), _) => Err(CommandError::unavailable(format!(
+            "nothing was sent, and no copy of your answer could be kept on this device: {}; it \
+             is still in the form",
+            keeper.refusal()
+        ))),
+        (
+            Err(
+                error @ (AnswerError::Store { .. }
+                | AnswerError::Unreadable { .. }
+                | AnswerError::Changed
+                | AnswerError::Full
+                | AnswerError::NotPermitted),
+            ),
+            None,
+        ) => Err(CommandError::new(
+            error.code(),
+            format!("nothing was sent: {error}; it is still in the form"),
+        )),
         (Err(error), _) => Err(failure(error)),
     }
-}
-
-/// Keeps an answer the host did not confirm, under the writers' lock and the leave to write a kept
-/// answer, the way the command line does.
-///
-/// In a program of a host's store, an update that is switching releases holds the lock, and a write
-/// waits for it for up to [`kr_ipc::install::WRITERS_WAIT_SECONDS`] seconds. When it still cannot
-/// write, no copy of the answer is kept, and the page is told that; what the person wrote stays in
-/// the form.
-///
-/// No release of the host ships this application, so it runs outside every store: the hold
-/// registers nothing, holds nothing and permits every record, and the roots it is given are never
-/// read. They are `root`, the directory the answers are kept in. An update would not find the
-/// answers by them if it did: it looks for `kept-answers/*.answer` directly under a state root,
-/// and the answers here are kept as `kept-answers/<environment>/*.answer`.
-async fn keep(store: AnswerDrafts, draft: AnswerDraft, root: PathBuf) -> Result<Answer> {
-    tokio::task::spawn_blocking(move || {
-        let not_kept = |why: String| {
-            CommandError::unavailable(format!(
-                "the host did not confirm your answer, and no copy of it could be kept on this \
-                 device: {why}; it is still in the form"
-            ))
-        };
-        let writing = Writing::in_roots(&root, &root);
-        let writers = kr_ipc::install::hold_writers(&writing, &mut || {})
-            .map_err(|refused| not_kept(refused.to_string()))?;
-        let permit = writers
-            .permit(&answers::WRITTEN)
-            .map_err(|refused| not_kept(refused.to_string()))?;
-        store.keep(&draft, &permit).map_err(failure)?;
-        Ok(Answer::Kept { draft })
-    })
-    .await
-    .map_err(|error| CommandError::local_failure(format!("keeping the answer stopped: {error}")))?
 }
 
 /// Every answer kept on this device, in every environment.
@@ -888,20 +1036,46 @@ pub async fn settle(
             .iter()
             .find(|question| question.question_id == draft.question_id)
             .cloned();
-        let standing = match draft.submission(question.as_ref()) {
-            Ok(_) => Standing::Offered,
-            Err(Retired::Gone) => {
-                if host
-                    .session_ended(draft.session_id)
-                    .await
-                    .map_err(CommandError::from)?
-                {
-                    Standing::Gone
-                } else {
-                    Standing::Unlisted
+        // What the host says of the sends already made, asked after the question was read.
+        let (_, basis) = desk
+            .store(draft.target.environment_id)
+            .and_then(|store| store.entry(draft.question_id))
+            .map_err(failure)?
+            .ok_or_else(|| {
+                CommandError::new(
+                    ErrorCode::DraftConflict,
+                    "the answer kept for that question has changed: read the kept answers again",
+                )
+            })?;
+        let earlier = if question.is_some() && !basis.sends().is_empty() {
+            answers::learn(&host, draft.session_id, basis.sends()).await
+        } else {
+            Earlier::default()
+        };
+        let standing = if let Some(action_id) = earlier.taken() {
+            Standing::Taken { action_id }
+        } else {
+            match draft.submission(question.as_ref()) {
+                Ok(_) => match earlier.waiting() {
+                    Some(action_id) => Standing::Waiting { action_id },
+                    None => Standing::Offered {
+                        earlier: earlier_sends(&earlier),
+                    },
+                },
+                Err(Retired::Gone) => {
+                    if host
+                        .session_ended(draft.session_id)
+                        .await
+                        .map_err(CommandError::from)?
+                    {
+                        Standing::Gone
+                    } else {
+                        Standing::Unlisted
+                    }
                 }
+                Err(_) if earlier.failed() => Standing::Unsettled,
+                Err(reason) => reason.into(),
             }
-            Err(reason) => reason.into(),
         };
         settled.push(Settled {
             draft,
@@ -958,6 +1132,26 @@ pub async fn send(
     let current = questions
         .iter()
         .find(|question| question.question_id == draft.question_id);
+    let store = desk.store(draft.target.environment_id).map_err(failure)?;
+    let (_, basis) = store
+        .entry(draft.question_id)
+        .map_err(failure)?
+        .ok_or_else(|| {
+            CommandError::new(
+                ErrorCode::DraftConflict,
+                "the answer kept for that question has changed: read the kept answers again",
+            )
+        })?;
+    // The host is asked what became of every send already made, after the question was read. One it
+    // took ends the matter, and nothing is sent.
+    let earlier = if current.is_some() && !basis.sends().is_empty() {
+        answers::learn(&host, draft.session_id, basis.sends()).await
+    } else {
+        Earlier::default()
+    };
+    if let Some(action_id) = earlier.taken() {
+        return Ok(Answer::Landed { action_id });
+    }
     let params = match draft.submission(current) {
         Ok(params) => params,
         Err(Retired::Gone)
@@ -968,18 +1162,79 @@ pub async fn send(
         {
             return Err(failure(AnswerError::Unlisted));
         }
+        Err(_) if earlier.failed() => return Err(failure(AnswerError::Unsettled)),
         Err(reason) => return Err(failure(AnswerError::Retired(reason))),
     };
-    let resolution = host
-        .answer(draft.target.clone(), params)
-        .await
-        .map_err(CommandError::from)?;
+    if let Some(action_id) = earlier.waiting() {
+        return Ok(Answer::Waiting { action_id });
+    }
+    // An uncertain earlier send is shown to the person before a send names it.
+    let quote = earlier.quote();
+    if let Some(quote) = quote
+        && which.acknowledged != Some(quote.action_id)
+    {
+        return Err(CommandError::new(
+            ErrorCode::DraftConflict,
+            "an earlier send of this answer ended with an outcome the host could not establish: \
+             read the kept answers again",
+        ));
+    }
+    let keeper = Holding::new(desk.root()?);
+    let send = ActionId::new(kr_ipc::new_uuid());
+    let carried = earlier.carried(basis.sends());
+    let digest = basis.draft().ok_or_else(|| {
+        CommandError::new(
+            ErrorCode::DraftConflict,
+            "the answer kept for that question has changed: read the kept answers again",
+        )
+    })?;
+    keeper
+        .keep(|leave| store.record_send(draft.question_id, &basis, &carried, send, leave))
+        .map_err(|_| {
+            CommandError::unavailable(format!(
+                "nothing was sent, and the send could not be recorded on this device: {}",
+                keeper.refusal()
+            ))
+        })?
+        .map_err(|error| CommandError::new(error.code(), format!("nothing was sent: {error}")))?;
+    let sent = host
+        .answer(
+            draft.target.clone(),
+            params,
+            Dispatch {
+                action_id: send,
+                quote,
+            },
+        )
+        .await;
+    let resolution = match sent {
+        Ok(resolution) => resolution,
+        Err(failed) => {
+            if failed.settled() {
+                let _ = keeper
+                    .keep(|leave| store.settle(draft.question_id, digest, &[send], false, leave));
+            }
+            // The question ended: an earlier send may be the reason, and a send the host took is
+            // told rather than hidden. The answer stays kept either way, until it is dismissed.
+            if let ClientError::Host(refused) = &failed.error
+                && matches!(
+                    refused.code,
+                    ErrorCode::QuestionResolved | ErrorCode::QuestionExpired
+                )
+                && !carried.is_empty()
+                && let Ok(basis) = store.basis(draft.question_id)
+                && let Some(action_id) = answers::learn(&host, draft.session_id, basis.sends())
+                    .await
+                    .taken()
+            {
+                return Ok(Answer::Landed { action_id });
+            }
+            return Err(CommandError::from(failed.error));
+        }
+    };
     // The worker has the answer. Taking the copy away is the last step, and a failure of it is
     // told rather than hidden: a copy left behind is retired by the next settling.
-    let leftover = desk
-        .store(draft.target.environment_id)
-        .and_then(|store| store.discard(draft.question_id))
-        .is_err();
+    let leftover = store.discard(draft.question_id).is_err();
     Ok(Answer::Taken {
         resolution: Box::new(resolution),
         leftover,

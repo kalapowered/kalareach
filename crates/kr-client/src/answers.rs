@@ -3,18 +3,20 @@
 //! Section 11: offline answers remain drafts, and a reconnect never submits them automatically. Two
 //! rules make that hold here.
 //!
-//! * **An answer the host could not take is kept, not queued.** [`answer`] sends an answer when the
-//!   host can be reached. When it cannot, including when the connection ended with the answer's
-//!   outcome unknown, it hands the answer back ([`Answered::Unconfirmed`]) to be kept on this device
-//!   as an [`AnswerDraft`]: the answer, the question and the revision of it the person was shown.
-//!   Keeping it is the caller's step ([`AnswerDrafts::keep`]), which is a write of a stored record.
-//!   Nothing retries it.
+//! * **An answer the host could not take is kept, not queued.** [`answer`] records the answer, the
+//!   question and the revision of it the person was shown ([`AnswerDraft`]), and the identifier the
+//!   answer goes out under ([`crate::sends`]), on this device, and only then sends it. When the
+//!   host cannot be reached, including when the connection ended with the answer's outcome
+//!   unknown, the answer stays kept ([`Answered::Kept`]). Writing it is a write of stored records,
+//!   which the caller's [`Keeper`] gives the leave for. Nothing retries it.
 //! * **A reconnect offers; only a person sends.** [`reconcile`] reads the questions as the host now
 //!   reports them and decides what each draft is: offered again when its question is still pending
 //!   at the revision the person answered, and retired unsent when the question ended or moved while
-//!   this client was away. It reads and nothing else. The one way a kept draft reaches the host is
-//!   [`send`], the caller's own step for a person who chose to send it, and it checks the question
-//!   once more before it does.
+//!   this client was away. Before it decides, it asks the host what became of each send of the
+//!   answer, so an answer whose reply was lost is retired as taken, and an uncertain outcome is
+//!   shown before a new send names it. It reads and nothing else. The one way a kept draft reaches
+//!   the host is [`send`], the caller's own step for a person who chose to send it, and it checks
+//!   the question once more before it does.
 //!
 //! A session's worker says what became of its questions, and nothing else does. Whether the session
 //! itself ended is the host's own record to say, so a draft whose question its session does not list
@@ -40,13 +42,14 @@ use std::time::{Duration, Instant};
 use kr_ipc::install::{Permit, Written};
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, RetryCategory};
-use kr_protocol::ids::{QuestionId, QuestionRevision, SessionId};
+use kr_protocol::ids::{ActionId, QuestionId, QuestionRevision, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::question::{
     MAX_ANSWER_BYTES, Question, QuestionAnswer, QuestionAnswerParams, QuestionReadParams,
     QuestionReadResult, QuestionResolveResult, QuestionState, check_answer,
 };
-use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs};
+use kr_protocol::receipt::{ActionReadParams, Receipt, ReceiptState};
+use kr_protocol::scalars::{Digest256, DurationMs, Nullable, TimestampMs};
 use kr_protocol::session::{SessionReadParams, SessionReadResult, SessionState};
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +58,7 @@ use crate::session::Session;
 use crate::shown::{IoFault, Said, Shown};
 
 /// The extension every kept answer carries.
-const EXTENSION: &str = "answer";
+pub(crate) const EXTENSION: &str = "answer";
 
 /// The format of a kept answer this build writes, recorded in it as `version`. A kept answer an
 /// earlier build wrote states none and is read as format 0, which differs from this format in the
@@ -70,7 +73,7 @@ pub const WRITTEN: Written = Written::new("kept-answers", ANSWER_FORMAT as u64);
 
 /// The file in the store's directory whose lock a write holds from its look at the answer it
 /// replaces until the answer is in place.
-const LOCK_NAME: &str = "answers.lock";
+pub(crate) const LOCK_NAME: &str = "answers.lock";
 
 /// How long a write waits for another that is under way.
 const LOCK_PATIENCE: Duration = Duration::from_secs(2);
@@ -188,16 +191,160 @@ impl Said for Retired {
 
 crate::display_as_said!(Retired);
 
+/// What the host said when asked about one send of a kept answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendState {
+    /// The host took it.
+    Applied,
+    /// The host has it and has not finished with it: received, accepted or dispatching.
+    Pending,
+    /// The host dispatched it and cannot say whether it took effect. A later send may name it.
+    Unknown {
+        /// The revision of the host's record of it, which a later send shows it was read at.
+        revision: u64,
+        /// When the host last wrote that record, as the host's clock had it.
+        updated_at_ms: TimestampMs,
+    },
+    /// The host refused it, or rejected it before it was dispatched. Nothing took effect.
+    Refused(Option<ErrorCode>),
+    /// The host has no record of it. That is a report, never "not sent": the send may arrive late.
+    NoRecord,
+    /// The host could not be asked.
+    Unreadable(Unread),
+}
+
+/// Why a send's record could not be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unread {
+    /// The read was lost or failed in a way that may pass. It decides nothing.
+    Failed,
+    /// The host refused the read in its own word, which no retry changes, such as a device that may
+    /// not view the session.
+    Refused(ErrorCode),
+}
+
+/// The uncertain send a later send names, and the revision of it that was read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quote {
+    /// The send whose outcome the host could not establish.
+    pub action_id: ActionId,
+    /// The revision of the host's record of it.
+    pub revision: u64,
+}
+
+/// What the host said of every earlier send of a kept answer, oldest first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Earlier {
+    sends: Vec<(ActionId, SendState)>,
+}
+
+impl Earlier {
+    /// Every send asked about, with what the host said.
+    pub fn sends(&self) -> impl Iterator<Item = &(ActionId, SendState)> {
+        self.sends.iter()
+    }
+
+    /// Whether no send was asked about.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sends.is_empty()
+    }
+
+    /// The first send the host took.
+    #[must_use]
+    pub fn taken(&self) -> Option<ActionId> {
+        self.sends
+            .iter()
+            .find_map(|(id, state)| (*state == SendState::Applied).then_some(*id))
+    }
+
+    /// The first send the host has and has not finished with.
+    #[must_use]
+    pub fn waiting(&self) -> Option<ActionId> {
+        self.sends
+            .iter()
+            .find_map(|(id, state)| (*state == SendState::Pending).then_some(*id))
+    }
+
+    /// The newest send whose outcome the host could not establish, by the host's record of it and
+    /// then its identifier, as the worker orders them.
+    #[must_use]
+    pub fn quote(&self) -> Option<Quote> {
+        self.sends
+            .iter()
+            .filter_map(|(id, state)| match state {
+                SendState::Unknown {
+                    revision,
+                    updated_at_ms,
+                } => Some((updated_at_ms.get(), *id, *revision)),
+                _ => None,
+            })
+            .max_by_key(|(updated, id, _)| (*updated, *id))
+            .map(|(_, action_id, revision)| Quote {
+                action_id,
+                revision,
+            })
+    }
+
+    /// Whether a read failed in a way that may pass, so what became of a send is not established.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.sends
+            .iter()
+            .any(|(_, state)| *state == SendState::Unreadable(Unread::Failed))
+    }
+
+    /// The sends a record keeps after these reads: every one the host did not settle by refusing
+    /// it. A send not asked about is kept.
+    #[must_use]
+    pub fn carried(&self, recorded: &[ActionId]) -> Vec<ActionId> {
+        recorded
+            .iter()
+            .copied()
+            .filter(|id| {
+                !self
+                    .sends
+                    .iter()
+                    .any(|(read, state)| read == id && matches!(state, SendState::Refused(_)))
+            })
+            .collect()
+    }
+}
+
 /// What a reconnect made of one kept answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reconciled {
     /// Its question is still pending at the revision the person answered. It is offered again, and
-    /// nothing has been sent.
-    Offered(AnswerDraft),
+    /// nothing has been sent. `earlier` is what the host said of the sends already made.
+    Offered {
+        /// The kept answer.
+        draft: AnswerDraft,
+        /// What the host said of its earlier sends; empty when there were none.
+        earlier: Earlier,
+    },
     /// Its question is not among those its session lists, and the host's record of the session
     /// does not say the session ended. It is still kept, it is not offered, and nothing has been
     /// sent.
     Unlisted(AnswerDraft),
+    /// The host has a send of it and has not finished with it. It is kept, it is not offered, and
+    /// nothing has been sent.
+    Waiting {
+        /// The kept answer.
+        draft: AnswerDraft,
+        /// The send the host has.
+        action_id: ActionId,
+    },
+    /// The host could not be asked what became of an earlier send, and its question has ended. It is
+    /// kept, it is not offered, and nothing has been sent.
+    Unsettled(AnswerDraft),
+    /// The host took an earlier send of it while the reply was lost. It was not sent again, and it
+    /// is no longer kept.
+    Taken {
+        /// The kept answer.
+        draft: AnswerDraft,
+        /// The send the host took.
+        action_id: ActionId,
+    },
     /// Its question ended or moved while this client was away. It was not sent, and it is no longer
     /// kept.
     Retired {
@@ -216,10 +363,17 @@ pub enum Answered {
     /// grant does not reach it ([`QuestionResolveResult::question`]).
     Sent(Box<QuestionResolveResult>),
     /// The host did not confirm that it took the answer: it could not be reached, or the connection
-    /// ended with the outcome unknown. The caller keeps the answer on this device
-    /// ([`AnswerDrafts::keep`]), which is a write of a stored record made under the leave to write
-    /// it and can be refused, so the answer is not kept until that returns.
-    Unconfirmed(AnswerDraft),
+    /// ended with the outcome unknown. The answer and the identifier it went out under are kept on
+    /// this device, so a reconnect asks the host what became of it.
+    Kept(AnswerDraft),
+    /// The host took an earlier send of this question's answer while its reply was lost. Nothing
+    /// was sent.
+    Taken(ActionId),
+    /// The host has an earlier send and has not finished with it. Nothing was sent.
+    Waiting(ActionId),
+    /// An earlier send ended with an outcome the host could not establish, and the caller asked to
+    /// have it shown first. Nothing was sent; the quote is what the next send names.
+    Held(Quote),
 }
 
 impl std::fmt::Debug for Answered {
@@ -232,14 +386,38 @@ impl std::fmt::Debug for Answered {
                 .field("revision", &resolved.revision)
                 .field("state", &resolved.state)
                 .finish_non_exhaustive(),
-            Self::Unconfirmed(draft) => formatter.debug_tuple("Unconfirmed").field(draft).finish(),
+            Self::Kept(draft) => formatter.debug_tuple("Kept").field(draft).finish(),
+            Self::Taken(action) => formatter.debug_tuple("Taken").field(action).finish(),
+            Self::Waiting(action) => formatter.debug_tuple("Waiting").field(action).finish(),
+            Self::Held(quote) => formatter.debug_tuple("Held").field(quote).finish(),
         }
     }
 }
 
+/// What a call that sends says, besides its outcome: what the host said of the earlier sends.
+#[derive(Debug)]
+pub struct Attempt<T> {
+    /// What the host said of every earlier send of the answer; empty when there were none or the
+    /// call ended before it asked.
+    pub earlier: Earlier,
+    /// How the call ended.
+    pub outcome: Result<T>,
+}
+
+/// Whether a send that finds an earlier uncertain one goes at once, or waits to be shown it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quoting {
+    /// The send names the earlier uncertain one and goes. The caller shows it, through
+    /// [`QuestionHost::learned`], before it goes.
+    Sending,
+    /// The send goes only if the newest uncertain one is the one the person has been shown, which
+    /// this names; otherwise nothing is sent and the call ends with [`Answered::Held`].
+    AfterShown(Option<ActionId>),
+}
+
 /// A kept answer's file as a failure may name it: whole when this store wrote its name.
 fn stored(path: &std::path::Path) -> Shown {
-    Shown::stored(path, &[LOCK_NAME], &[EXTENSION, "partial"])
+    crate::sends::stored(path)
 }
 
 /// A failure of this module.
@@ -283,6 +461,28 @@ pub enum AnswerError {
     /// The leave to write a kept answer was given for another record.
     #[error("the leave to write was not for a kept answer")]
     NotPermitted,
+    /// The leave to write a kept answer could not be had, and why.
+    #[error("{0}")]
+    Keeping(Shown),
+    /// The kept answer or its record of sends changed while this command ran, so nothing was
+    /// written and nothing was sent.
+    #[error(
+        "the answer kept for that question changed while this command ran, so nothing was sent: \
+         read the kept answers again"
+    )]
+    Changed,
+    /// Eight earlier sends of this answer are not settled, so a ninth was not made.
+    #[error(
+        "eight earlier sends of this answer are not settled by the host, so nothing was sent; the \
+         kept answer is retired once its question ends"
+    )]
+    Full,
+    /// The host could not be asked what became of an earlier send, so the kept answer stays.
+    #[error(
+        "the host could not be asked what became of an earlier send of this answer, so the kept \
+         answer stays"
+    )]
+    Unsettled,
 }
 
 impl AnswerError {
@@ -295,23 +495,87 @@ impl AnswerError {
             Self::Retired(Retired::Ended(_)) => ErrorCode::QuestionResolved,
             Self::Retired(Retired::Moved { .. }) => ErrorCode::StaleSession,
             Self::Retired(Retired::Gone) => ErrorCode::UnknownSession,
-            Self::Unlisted => ErrorCode::ResourceUnavailable,
-            Self::Store { .. } | Self::Unreadable { .. } => ErrorCode::StorageUnavailable,
-            Self::NotPermitted => ErrorCode::InvalidArgument,
+            Self::Unlisted | Self::Full | Self::Unsettled => ErrorCode::ResourceUnavailable,
+            Self::Store { .. } | Self::Unreadable { .. } | Self::Keeping(_) => {
+                ErrorCode::StorageUnavailable
+            }
             Self::Host(error) => error.code(),
+            Self::NotPermitted => ErrorCode::PermissionDenied,
+            Self::Changed => ErrorCode::DraftConflict,
         }
     }
 }
 
-crate::debug_as_display!(AnswerError);
-
-/// The result of this module's operations.
+/// The result of this module's calls.
 pub type Result<T> = std::result::Result<T, AnswerError>;
+
+/// How an attempt to send an answer failed, and whether the request was written.
+///
+/// An implementation says that nothing was written only when it is sure. A failure it cannot place
+/// is written: the host may have the answer, and the identifier stays in the record until the host
+/// says what became of it.
+#[derive(Debug)]
+pub struct AnswerFailure {
+    /// What failed.
+    pub error: ClientError,
+    /// Whether the request may have reached the host.
+    pub written: bool,
+}
+
+impl AnswerFailure {
+    /// A failure before the request was written.
+    #[must_use]
+    pub fn unwritten(error: ClientError) -> Self {
+        Self {
+            error,
+            written: false,
+        }
+    }
+
+    /// Whether the client holds proof of what became of the send: the host's own definite word, or
+    /// that nothing was written. A send so settled leaves the record at once.
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        if !self.written {
+            return true;
+        }
+        match &self.error {
+            ClientError::Host(_) | ClientError::Refused { .. } => !keeps_the_answer(&self.error),
+            ClientError::NoActionWindow
+            | ClientError::Misdirected { .. }
+            | ClientError::OtherHost
+            | ClientError::StillAccounting
+            | ClientError::TooManyOutstandingMutations { .. }
+            | ClientError::TooManyUnresolvedActions { .. }
+            | ClientError::WrongEffect { .. }
+            | ClientError::UnsupportedVersion { .. } => true,
+            _ => false,
+        }
+    }
+}
+
+impl From<ClientError> for AnswerFailure {
+    fn from(error: ClientError) -> Self {
+        Self {
+            error,
+            written: true,
+        }
+    }
+}
+
+/// The send an answer goes out under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dispatch {
+    /// The identifier, minted and recorded before the request is written.
+    pub action_id: ActionId,
+    /// The earlier uncertain send this one names, when the host holds one.
+    pub quote: Option<Quote>,
+}
 
 /// What this module needs from a connection to the host.
 ///
-/// [`Session`] is the connection a client has. The two calls are the answering surface's own
-/// `question.read` and `question.answer`, and nothing else is reached.
+/// [`Session`] is the connection a client has. The calls are the answering surface's own
+/// `question.read` and `question.answer`, and the read of a send's receipt.
 pub trait QuestionHost {
     /// Reads every question of one session, the resolved ones included.
     fn questions(
@@ -319,12 +583,20 @@ pub trait QuestionHost {
         session_id: SessionId,
     ) -> impl Future<Output = std::result::Result<Vec<Question>, ClientError>> + Send;
 
-    /// Answers one question.
+    /// Answers one question, under the identifier and the quote in `dispatch`.
     fn answer(
         &self,
         target: ActionTarget,
         params: QuestionAnswerParams,
-    ) -> impl Future<Output = std::result::Result<QuestionResolveResult, ClientError>> + Send;
+        dispatch: Dispatch,
+    ) -> impl Future<Output = std::result::Result<QuestionResolveResult, AnswerFailure>> + Send;
+
+    /// Reads the host's receipt of one send.
+    fn receipt(
+        &self,
+        session_id: SessionId,
+        action_id: ActionId,
+    ) -> impl Future<Output = std::result::Result<Receipt, ClientError>> + Send;
 
     /// Whether the host's own record of a session says the session ended.
     ///
@@ -335,6 +607,87 @@ pub trait QuestionHost {
         &self,
         session_id: SessionId,
     ) -> impl Future<Output = std::result::Result<bool, ClientError>> + Send;
+
+    /// Called once, after the record of the send is written and before it goes, with what the host
+    /// said of the earlier sends, when there were any. A caller that shows the person an earlier
+    /// outcome before a new send shows it here.
+    fn learned(&self, earlier: &Earlier) {
+        let _ = earlier;
+    }
+}
+
+/// The preconditions of a request that names an uncertain send it supersedes, which is how the
+/// request shows the earlier outcome: none when there is nothing to name.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Cbor`] when the map does not encode.
+pub fn supersession(quote: Option<Quote>) -> std::result::Result<ParamsValue, ClientError> {
+    let Some(quote) = quote else {
+        return Ok(ParamsValue::empty());
+    };
+    let mut expected = kr_cbor::CanonicalMap::new();
+    expected
+        .insert(
+            kr_protocol::action::SUPERSEDES_ACTION_KEY.to_owned(),
+            kr_cbor::to_canonical_value(&quote.action_id)?,
+        )
+        .map_err(|error| ClientError::Cbor(Shown::cbor(&error)))?;
+    expected
+        .insert(
+            kr_protocol::action::SUPERSEDES_REVISION_KEY.to_owned(),
+            kr_cbor::CanonicalValue::integer(i128::from(quote.revision))
+                .map_err(|error| ClientError::Cbor(Shown::cbor(&error)))?,
+        )
+        .map_err(|error| ClientError::Cbor(Shown::cbor(&error)))?;
+    Ok(ParamsValue::new(kr_cbor::CanonicalValue::Map(expected)))
+}
+
+/// Sends an answer over a connection under the identifier and the quote in `dispatch`, as the
+/// share `grant_id` names when there is one.
+///
+/// The request is composed first, which records nothing and writes nothing, so a failure there sent
+/// nothing; the action is recorded in the connection's book when it goes, and stays there until the
+/// host's own word settles it.
+///
+/// # Errors
+///
+/// The failure, with whether the request was written.
+pub async fn answer_over(
+    session: &Session,
+    grant_id: Option<kr_protocol::ids::GrantId>,
+    target: ActionTarget,
+    params: QuestionAnswerParams,
+    dispatch: Dispatch,
+) -> std::result::Result<QuestionResolveResult, AnswerFailure> {
+    let expected = supersession(dispatch.quote).map_err(AnswerFailure::unwritten)?;
+    let composed = session
+        .compose(
+            Method::QuestionAnswer,
+            dispatch.action_id,
+            target,
+            grant_id,
+            &expected,
+            &params,
+            ANSWER_TTL,
+        )
+        .await
+        .map_err(AnswerFailure::unwritten)?;
+    match session.send(&composed).await {
+        Ok(settled) => {
+            session.settle(dispatch.action_id).await;
+            Ok(settled.to_typed()?)
+        }
+        Err(error) => {
+            let failure = AnswerFailure::from(error);
+            // The host's own word settles the action here; an outcome it could not give, and a
+            // connection that ended, leave it for the receipt read to settle.
+            if failure.settled() {
+                session.settle(dispatch.action_id).await;
+            }
+            Err(failure)
+        }
+    }
 }
 
 impl QuestionHost for Session {
@@ -359,17 +712,23 @@ impl QuestionHost for Session {
         &self,
         target: ActionTarget,
         params: QuestionAnswerParams,
-    ) -> std::result::Result<QuestionResolveResult, ClientError> {
-        self.mutate(
-            Method::QuestionAnswer,
-            target,
-            None,
-            &ParamsValue::empty(),
-            &params,
-            ANSWER_TTL,
-        )
-        .await?
-        .to_typed()
+        dispatch: Dispatch,
+    ) -> std::result::Result<QuestionResolveResult, AnswerFailure> {
+        answer_over(self, None, target, params, dispatch).await
+    }
+
+    async fn receipt(
+        &self,
+        session_id: SessionId,
+        action_id: ActionId,
+    ) -> std::result::Result<Receipt, ClientError> {
+        Ok(self
+            .read_receipt(&ActionReadParams {
+                action_id,
+                session_id: Some(session_id),
+            })
+            .await?
+            .receipt)
     }
 
     async fn session_ended(&self, session_id: SessionId) -> std::result::Result<bool, ClientError> {
@@ -395,6 +754,65 @@ impl QuestionHost for Session {
     }
 }
 
+/// The leave to write the two records of a kept answer: the answer, and the record of its sends.
+#[derive(Debug)]
+pub struct Leave<'a> {
+    /// The leave to write a kept answer ([`WRITTEN`]).
+    pub answers: Permit<'a>,
+    /// The leave to write a record of sends ([`crate::sends::WRITTEN`]).
+    pub sends: Permit<'a>,
+}
+
+/// How a caller takes the leave to write kept answers, which it asks for under the writers' lock
+/// and lets go of when the write is done.
+pub trait Keeper {
+    /// Takes the lock, hands `work` the leave, and lets the lock go when `work` returns. When the
+    /// lock cannot be taken or the leave is refused, `work` does not run, and the failure is said
+    /// in the words the person is shown; the caller keeps the refusal itself.
+    ///
+    /// # Errors
+    ///
+    /// The reason the leave could not be had.
+    fn keep<R>(&self, work: impl FnOnce(&Leave<'_>) -> R) -> std::result::Result<R, Shown>;
+}
+
+/// The pair of files kept for one question as a caller read them, which is what it decided from.
+///
+/// A write or a removal reads the pair again under the store's lock and does nothing unless it is
+/// still this, so a command that decided from a stale reading changes nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Basis {
+    draft: Option<Digest256>,
+    record: Option<Digest256>,
+    sends: Vec<ActionId>,
+}
+
+impl Basis {
+    /// The digest of the kept answer's bytes, when an answer is kept, which a settling names the
+    /// answer by.
+    #[must_use]
+    pub fn draft(&self) -> Option<Digest256> {
+        self.draft
+    }
+
+    /// The sends the record names for the answer on disk, oldest first.
+    #[must_use]
+    pub fn sends(&self) -> &[ActionId] {
+        &self.sends
+    }
+}
+
+/// What a settling left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Settled {
+    /// The kept answer stays, with the record as it now is.
+    Kept,
+    /// The kept answer and its record were removed.
+    Removed,
+    /// The pair was no longer what the caller read, so nothing was changed.
+    Changed,
+}
+
 /// The answers this device keeps, in a directory the caller names.
 #[derive(Clone)]
 pub struct AnswerDrafts {
@@ -417,23 +835,43 @@ impl AnswerDrafts {
         Ok(Self { directory })
     }
 
-    /// Keeps one answer, in place of any answer kept earlier for the same question, in the format
-    /// this build writes whatever `draft` states.
+    /// Keeps one answer, in place of any answer kept earlier for the same question, and records
+    /// the send it is about to go out under, in the format this build writes them.
     ///
-    /// `permit` is the leave to write a kept answer at that format ([`WRITTEN`]), asked for under
-    /// the writers' lock. The answer kept earlier is read first, under the store's own lock: one of a
-    /// later format, or one that cannot be read, is left as it is and the new answer is not kept. A
-    /// link or a pipe at the answer's name holds no answer this build wrote, and is replaced.
+    /// `basis` is the pair as the caller's reading of the host was made from, and `carried` the
+    /// sends of the answer being replaced that the record keeps. The pair is read again under the
+    /// store's lock and nothing is written unless it is still `basis`. The answer replaced is read
+    /// first: one of a later format, or one that cannot be read, is left as it is and the new
+    /// answer is not kept. A link or a pipe at the answer's name holds no answer this build wrote,
+    /// and is replaced.
+    ///
+    /// The writes are in an order no crash leaves a send forgotten in: when the record carries
+    /// sends, it is first written for the answer on disk and the one being written; then the answer
+    /// is renamed into place; then the record is written for the new answer alone, with the new
+    /// send. A failure or a crash at any step leaves a record that matches the answer on disk and
+    /// names no send that was not about to go out. Nothing is sent by this call.
+    ///
+    /// Returns the digest of the answer now kept, which a later settling names.
     ///
     /// # Errors
     ///
-    /// Returns [`AnswerError::Store`] when it cannot be written, [`AnswerError::Unreadable`] when the
-    /// answer it would replace is of a later format or cannot be read, and
-    /// [`AnswerError::NotPermitted`] when the permit is for another record.
-    pub fn keep(&self, draft: &AnswerDraft, permit: &Permit<'_>) -> Result<()> {
-        permit
-            .require(&WRITTEN)
-            .map_err(|_| AnswerError::NotPermitted)?;
+    /// Returns [`AnswerError::Changed`] when the pair is not `basis`, [`AnswerError::Full`] when
+    /// `carried` already holds [`crate::sends::MOST_SENDS`], [`AnswerError::Store`] when it cannot be
+    /// written, [`AnswerError::Unreadable`] when the answer or the record it would replace is of a
+    /// later format or cannot be read, and [`AnswerError::NotPermitted`] when a permit is for
+    /// another record.
+    pub fn begin(
+        &self,
+        draft: &AnswerDraft,
+        basis: &Basis,
+        carried: &[ActionId],
+        send: ActionId,
+        leave: &Leave<'_>,
+    ) -> Result<Digest256> {
+        self.permitted(leave)?;
+        if carried.len() >= crate::sends::MOST_SENDS {
+            return Err(AnswerError::Full);
+        }
         let kept = AnswerDraft {
             version: ANSWER_FORMAT,
             ..draft.clone()
@@ -444,21 +882,27 @@ impl AnswerDrafts {
                 Shown::cbor(&error)
             ))
         })?;
+        let new = crate::sends::digest(&bytes);
         let path = self.path(draft.question_id);
+        let record_path = self.record_path(draft.question_id);
         let store = |error| AnswerError::Store {
             path: stored(&path),
             fault: IoFault::from(error),
         };
-        let lock_path = self.directory.join(LOCK_NAME);
-        let _lock = Self::lock(&lock_path).map_err(|error| AnswerError::Store {
-            path: stored(&lock_path),
-            fault: IoFault::from(error),
-        })?;
+        let _lock = self.hold()?;
+        self.expect(draft.question_id, basis)?;
         replaceable(&path)?;
-        // A name of this write's own, so a second writer of the same question writes a file of its
-        // own too, and the last rename is the answer that stays.
-        let unique = crate::drafts::fresh_uuid()
-            .map_err(|error| store(std::io::Error::other(crate::shown!("{}", error))))?;
+        crate::sends::replaceable(&record_path)?;
+        // One: the sends already made stay named while the answer they describe is replaced. The
+        // new send is not named yet, so a failure from here on records none that never went out.
+        if !carried.is_empty()
+            && let Some(on_disk) = basis.draft
+        {
+            self.write_record(draft.question_id, vec![on_disk, new], carried)?;
+            crate::sends::reached(crate::sends::Stop::AfterCarry, &self.directory)?;
+        }
+        // Two: the answer, in a file of its own, renamed over its name.
+        let unique = self.unique(&path)?;
         let partial = self
             .directory
             .join(format!(".{}.{unique}.partial", draft.question_id));
@@ -467,7 +911,162 @@ impl AnswerDrafts {
             let _ = std::fs::remove_file(&partial);
             return Err(store(error));
         }
-        kr_flush::flush_directory(&self.directory, kr_flush::NameKind::File).map_err(store)
+        kr_flush::flush_directory(&self.directory, kr_flush::NameKind::File).map_err(store)?;
+        crate::sends::reached(crate::sends::Stop::AfterDraft, &self.directory)?;
+        // Three: the record names the new answer alone, with every send it carries and this one.
+        let mut sends = carried.to_vec();
+        sends.push(send);
+        self.write_record(draft.question_id, vec![new], &sends)?;
+        Ok(new)
+    }
+
+    /// Records one more send of the answer kept for a question, which is unchanged.
+    ///
+    /// The pair is read again under the store's lock, and nothing is written unless it is still
+    /// `basis`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::begin`].
+    pub fn record_send(
+        &self,
+        question_id: QuestionId,
+        basis: &Basis,
+        carried: &[ActionId],
+        send: ActionId,
+        leave: &Leave<'_>,
+    ) -> Result<()> {
+        self.permitted(leave)?;
+        if carried.len() >= crate::sends::MOST_SENDS {
+            return Err(AnswerError::Full);
+        }
+        let _lock = self.hold()?;
+        self.expect(question_id, basis)?;
+        let Some(draft) = basis.draft else {
+            return Err(AnswerError::Changed);
+        };
+        crate::sends::replaceable(&self.record_path(question_id))?;
+        let mut sends = carried.to_vec();
+        sends.push(send);
+        self.write_record(question_id, vec![draft], &sends)
+    }
+
+    /// Drops sends the caller holds proof of from the record of the answer kept for a question,
+    /// and removes the pair too when `remove_when_empty` and the record, read under the store's
+    /// lock, then names no other send. A send another command recorded meanwhile stays, and so does
+    /// an answer stored meanwhile, which is not the one `draft` names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnswerError::Store`] when it cannot be written or removed,
+    /// [`AnswerError::Unreadable`] when the record cannot be read, and
+    /// [`AnswerError::NotPermitted`] when a permit is for another record.
+    pub fn settle(
+        &self,
+        question_id: QuestionId,
+        draft: Digest256,
+        settled: &[ActionId],
+        remove_when_empty: bool,
+        leave: &Leave<'_>,
+    ) -> Result<Settled> {
+        leave
+            .sends
+            .require(&crate::sends::WRITTEN)
+            .map_err(|_| AnswerError::NotPermitted)?;
+        let _lock = self.hold()?;
+        let now = self.pair(question_id)?;
+        if now.draft != Some(draft) {
+            return Ok(Settled::Changed);
+        }
+        let remaining: Vec<ActionId> = now
+            .sends
+            .iter()
+            .copied()
+            .filter(|send| !settled.contains(send))
+            .collect();
+        if remaining.is_empty() {
+            if remove_when_empty {
+                self.remove_pair(question_id)?;
+                return Ok(Settled::Removed);
+            }
+            self.remove_record(question_id)?;
+        } else if remaining.len() != now.sends.len() {
+            self.write_record(question_id, vec![draft], &remaining)?;
+        }
+        Ok(Settled::Kept)
+    }
+
+    /// Removes the pair kept for a question after a send of the answer was taken: the answer and its
+    /// record. Only the answer is compared, for the send that resolved the question makes every
+    /// other send of it moot; an answer stored meanwhile is not the one `draft` names, and stays.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnswerError::Store`] when it cannot be removed.
+    pub fn remove_after_result(&self, question_id: QuestionId, draft: Digest256) -> Result<()> {
+        let _lock = self.hold()?;
+        if self.answer_digest(&self.path(question_id))? == Some(draft) {
+            self.remove_pair(question_id)?;
+        }
+        Ok(())
+    }
+
+    /// Removes the pair kept for a question when it is still `basis`, which is what a retirement
+    /// after a read of the host decided from. Returns whether it was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnswerError::Store`] when it cannot be removed.
+    pub fn remove_if_unchanged(&self, question_id: QuestionId, basis: &Basis) -> Result<bool> {
+        let _lock = self.hold()?;
+        if self.expect(question_id, basis).is_err() {
+            return Ok(false);
+        }
+        self.remove_pair(question_id)?;
+        Ok(true)
+    }
+
+    /// Reads one kept answer with the pair it was read from, when one is kept.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::entries`].
+    pub fn entry(&self, question_id: QuestionId) -> Result<Option<(AnswerDraft, Basis)>> {
+        let path = self.path(question_id);
+        let Some((draft, digest)) = read_draft_with_digest(&path)? else {
+            return Ok(None);
+        };
+        let basis = self.pair_of(question_id, Some(digest))?;
+        Ok(Some((draft, basis)))
+    }
+
+    /// Reads the pair kept for a question, whether or not an answer is kept.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::entries`].
+    pub fn basis(&self, question_id: QuestionId) -> Result<Basis> {
+        self.pair(question_id)
+    }
+
+    /// Returns every answer kept on this device with the pair it was read from, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnswerError::Store`] when the directory cannot be read, and
+    /// [`AnswerError::Unreadable`] when a kept answer or the record of its sends is not one this
+    /// build wrote: the answer it describes is closed, and the failure names the file.
+    pub fn entries(&self) -> Result<Vec<(AnswerDraft, Basis)>> {
+        let mut entries = Vec::new();
+        for path in self.answer_files()? {
+            let Some((draft, digest)) = read_draft_with_digest(&path)? else {
+                continue;
+            };
+            let basis = self.pair_of(draft.question_id, Some(digest))?;
+            entries.push((draft, basis));
+        }
+        entries.sort_by_key(|(draft, _)| (draft.drafted_at_ms.get(), draft.question_id));
+        Ok(entries)
     }
 
     /// Returns every answer kept on this device, oldest first.
@@ -477,35 +1076,169 @@ impl AnswerDrafts {
     /// Returns [`AnswerError::Store`] when the directory cannot be read, and
     /// [`AnswerError::Unreadable`] when a kept answer is not one this build wrote.
     pub fn drafts(&self) -> Result<Vec<AnswerDraft>> {
+        let mut drafts = Vec::new();
+        for path in self.answer_files()? {
+            if let Some((draft, _)) = read_draft_with_digest(&path)? {
+                drafts.push(draft);
+            }
+        }
+        drafts.sort_by_key(|draft| (draft.drafted_at_ms.get(), draft.question_id));
+        Ok(drafts)
+    }
+
+    /// Removes every record of sends that names no answer on disk, which describes no row. A record
+    /// that cannot be read is left: nothing says what it described.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnswerError::Store`] when the directory or a record cannot be removed.
+    pub fn sweep(&self) -> Result<()> {
         let entries = std::fs::read_dir(&self.directory).map_err(|error| AnswerError::Store {
             path: Shown::root(&self.directory),
             fault: IoFault::from(error),
         })?;
-        let mut drafts = Vec::new();
+        let mut records = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|error| AnswerError::Store {
                 path: Shown::root(&self.directory),
                 fault: IoFault::from(error),
             })?;
             let path = entry.path();
-            // A partial write whose process did not live to rename it is not an answer.
-            if path.extension().and_then(|extension| extension.to_str()) != Some(EXTENSION) {
+            if path.extension().and_then(|extension| extension.to_str())
+                == Some(crate::sends::EXTENSION)
+            {
+                records.push(path);
+            }
+        }
+        if records.is_empty() {
+            return Ok(());
+        }
+        let _lock = self.hold()?;
+        for record in records {
+            let Ok(Some(found)) = crate::sends::read(&record) else {
+                continue;
+            };
+            let answer = record.with_extension(EXTENSION);
+            let on_disk = self.answer_digest(&answer)?;
+            if on_disk.is_some_and(|digest| found.record.draft.contains(&digest)) {
                 continue;
             }
-            drafts.push(read_draft(&path)?);
+            std::fs::remove_file(&record).map_err(|error| AnswerError::Store {
+                path: stored(&record),
+                fault: IoFault::from(error),
+            })?;
+            kr_flush::flush_directory(&self.directory, kr_flush::NameKind::File).map_err(
+                |error| AnswerError::Store {
+                    path: Shown::root(&self.directory),
+                    fault: IoFault::from(error),
+                },
+            )?;
         }
-        drafts.sort_by_key(|draft| (draft.drafted_at_ms.get(), draft.question_id));
-        Ok(drafts)
+        Ok(())
     }
 
-    /// Forgets the answer kept for one question, when there is one.
+    /// Forgets the answer kept for one question, and its record of sends, when there is one: the
+    /// person's own word that nothing more is wanted of them.
     ///
     /// # Errors
     ///
     /// Returns [`AnswerError::Store`] when it cannot be removed.
     pub fn discard(&self, question_id: QuestionId) -> Result<()> {
+        let _lock = self.hold()?;
+        self.remove_pair(question_id)
+    }
+
+    fn path(&self, question_id: QuestionId) -> PathBuf {
+        self.directory.join(format!("{question_id}.{EXTENSION}"))
+    }
+
+    fn record_path(&self, question_id: QuestionId) -> PathBuf {
+        self.directory
+            .join(format!("{question_id}.{}", crate::sends::EXTENSION))
+    }
+
+    /// Checks the two permits are for the two records a begin or a recording writes.
+    fn permitted(&self, leave: &Leave<'_>) -> Result<()> {
+        leave
+            .answers
+            .require(&WRITTEN)
+            .map_err(|_| AnswerError::NotPermitted)?;
+        leave
+            .sends
+            .require(&crate::sends::WRITTEN)
+            .map_err(|_| AnswerError::NotPermitted)
+    }
+
+    /// Takes the store's lock for a write.
+    fn hold(&self) -> Result<std::fs::File> {
+        let lock_path = self.directory.join(LOCK_NAME);
+        Self::lock(&lock_path).map_err(|error| AnswerError::Store {
+            path: stored(&lock_path),
+            fault: IoFault::from(error),
+        })
+    }
+
+    /// A name for a file this call writes, of its own.
+    fn unique(&self, path: &Path) -> Result<String> {
+        crate::drafts::fresh_uuid()
+            .map(|unique| unique.to_string())
+            .map_err(|error| AnswerError::Store {
+                path: stored(path),
+                fault: IoFault::from(std::io::Error::other(crate::shown!("{}", error))),
+            })
+    }
+
+    /// Writes the record of a question's sends.
+    fn write_record(
+        &self,
+        question_id: QuestionId,
+        draft: Vec<Digest256>,
+        sends: &[ActionId],
+    ) -> Result<()> {
+        let record_path = self.record_path(question_id);
+        let unique = self.unique(&record_path)?;
+        crate::sends::write(
+            &self.directory,
+            &record_path,
+            &format!("{question_id}.{unique}"),
+            &crate::sends::SendRecord {
+                version: crate::sends::SEND_FORMAT,
+                draft,
+                sends: sends.to_vec(),
+                sent_at_ms: kr_ipc::now_ms(),
+            },
+        )
+    }
+
+    /// Removes the answer, flushes, then removes its record. The caller holds the store's lock.
+    fn remove_pair(&self, question_id: QuestionId) -> Result<()> {
         let path = self.path(question_id);
+        let flush = || {
+            kr_flush::flush_directory(&self.directory, kr_flush::NameKind::File).map_err(|error| {
+                AnswerError::Store {
+                    path: Shown::root(&self.directory),
+                    fault: IoFault::from(error),
+                }
+            })
+        };
         match std::fs::remove_file(&path) {
+            Ok(()) => flush()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AnswerError::Store {
+                    path: stored(&path),
+                    fault: IoFault::from(error),
+                });
+            }
+        }
+        crate::sends::reached(crate::sends::Stop::AfterDraftRemoved, &self.directory)?;
+        self.remove_record(question_id)
+    }
+
+    /// Removes the record of a question's sends, when there is one. The caller holds the lock.
+    fn remove_record(&self, question_id: QuestionId) -> Result<()> {
+        let record_path = self.record_path(question_id);
+        match std::fs::remove_file(&record_path) {
             Ok(()) => kr_flush::flush_directory(&self.directory, kr_flush::NameKind::File).map_err(
                 |error| AnswerError::Store {
                     path: Shown::root(&self.directory),
@@ -514,14 +1247,86 @@ impl AnswerDrafts {
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(AnswerError::Store {
-                path: stored(&path),
+                path: stored(&record_path),
                 fault: IoFault::from(error),
             }),
         }
     }
 
-    fn path(&self, question_id: QuestionId) -> PathBuf {
-        self.directory.join(format!("{question_id}.{EXTENSION}"))
+    /// The digest of the kept answer's bytes at `path`, when a regular file is there. A link or a
+    /// pipe holds no answer this build wrote.
+    fn answer_digest(&self, path: &Path) -> Result<Option<Digest256>> {
+        match std::fs::symlink_metadata(path) {
+            Ok(about) if about.file_type().is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(AnswerError::Store {
+                    path: stored(path),
+                    fault: IoFault::from(error),
+                });
+            }
+        }
+        let bytes = kr_ipc::paths::read_owner_only_file(path, KEPT_LIMIT).map_err(|error| {
+            AnswerError::Unreadable {
+                path: stored(path),
+                detail: Shown::ipc(&error),
+            }
+        })?;
+        Ok(bytes.map(|bytes| crate::sends::digest(&bytes)))
+    }
+
+    /// The pair kept for a question as it is on disk now.
+    fn pair(&self, question_id: QuestionId) -> Result<Basis> {
+        let draft = self.answer_digest(&self.path(question_id))?;
+        self.pair_of(question_id, draft)
+    }
+
+    /// The pair for an answer whose bytes have the digest `draft`: the record's digest, and the
+    /// sends it names for that answer.
+    fn pair_of(&self, question_id: QuestionId, draft: Option<Digest256>) -> Result<Basis> {
+        let found = crate::sends::read(&self.record_path(question_id))?;
+        let record = found.as_ref().map(|found| found.digest);
+        let sends = match (draft, found) {
+            (Some(draft), Some(found)) if found.record.draft.contains(&draft) => found.record.sends,
+            _ => Vec::new(),
+        };
+        Ok(Basis {
+            draft,
+            record,
+            sends,
+        })
+    }
+
+    /// Checks, under the lock, that the pair is still the one a caller decided from.
+    fn expect(&self, question_id: QuestionId, basis: &Basis) -> Result<()> {
+        let now = self.pair(question_id)?;
+        if now.draft == basis.draft && now.record == basis.record {
+            Ok(())
+        } else {
+            Err(AnswerError::Changed)
+        }
+    }
+
+    /// The kept answers' files in the directory.
+    fn answer_files(&self) -> Result<Vec<PathBuf>> {
+        let entries = std::fs::read_dir(&self.directory).map_err(|error| AnswerError::Store {
+            path: Shown::root(&self.directory),
+            fault: IoFault::from(error),
+        })?;
+        let mut files = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| AnswerError::Store {
+                path: Shown::root(&self.directory),
+                fault: IoFault::from(error),
+            })?;
+            let path = entry.path();
+            // A partial write whose process did not live to rename it is not an answer.
+            if path.extension().and_then(|extension| extension.to_str()) == Some(EXTENSION) {
+                files.push(path);
+            }
+        }
+        Ok(files)
     }
 
     /// Takes the store's lock for a write, at `path`, waiting [`LOCK_PATIENCE`] for another that is
@@ -591,22 +1396,22 @@ fn replaceable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Reads one kept answer.
+/// Reads one kept answer and the digest of its bytes, when one is there.
 ///
 /// The path is one a listing found, so a failure names it whole only when its name is one this
 /// store writes: whatever else is in the directory was put there by something else.
-fn read_draft(path: &Path) -> Result<AnswerDraft> {
+fn read_draft_with_digest(path: &Path) -> Result<Option<(AnswerDraft, Digest256)>> {
     // One handle, opened without following a link or waiting for a writer, and owner-only: a pipe
     // or a link under an answer's name is refused here and does not hold a listing open.
-    let bytes = kr_ipc::paths::read_owner_only_file(path, KEPT_LIMIT)
-        .map_err(|error| AnswerError::Unreadable {
+    let Some(bytes) = kr_ipc::paths::read_owner_only_file(path, KEPT_LIMIT).map_err(|error| {
+        AnswerError::Unreadable {
             path: stored(path),
             detail: Shown::ipc(&error),
-        })?
-        .ok_or_else(|| AnswerError::Store {
-            path: stored(path),
-            fault: IoFault::from(std::io::Error::from(std::io::ErrorKind::NotFound)),
-        })?;
+        }
+    })?
+    else {
+        return Ok(None);
+    };
     let draft: AnswerDraft = kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
         .map_err(|error| AnswerError::Unreadable {
             path: stored(path),
@@ -620,7 +1425,7 @@ fn read_draft(path: &Path) -> Result<AnswerDraft> {
             detail: Shown::said("it was kept by a later release of this client"),
         });
     }
-    Ok(draft)
+    Ok(Some((draft, crate::sends::digest(&bytes))))
 }
 
 /// What an answer that does not fit its question's form breaks, in words that carry none of it.
@@ -648,7 +1453,7 @@ fn form_failure(question: &Question, answer: &QuestionAnswer) -> Shown {
 /// busy or without storage for a moment, which the protocol classifies as transient. And the answer
 /// went and what became of it is not known, whether the connection ended before the host's word
 /// came back or the host itself said the outcome is unknown; the answer may have been taken, and
-/// the next reconcile reads the question and retires the draft if it was, so it is never sent twice.
+/// the next reconcile reads the host's record of the send, so it is never sent twice.
 ///
 /// Every other failure is the host's own answer and is shown rather than kept: a refused proof, a
 /// schema or version this build does not share, a malformed message, an answer to a question that
@@ -669,26 +1474,139 @@ fn keeps_the_answer(error: &ClientError) -> bool {
     }
 }
 
-/// Sends a person's answer, or hands it back to be kept on this device when the host cannot be
-/// reached or did not confirm that it took it.
+/// What the host said of one send, from its receipt.
+fn state_of(receipt: &Receipt) -> SendState {
+    match receipt.state {
+        ReceiptState::Applied => SendState::Applied,
+        ReceiptState::Received | ReceiptState::Accepted | ReceiptState::Dispatching => {
+            SendState::Pending
+        }
+        ReceiptState::Unknown => SendState::Unknown {
+            revision: receipt.revision.get(),
+            updated_at_ms: receipt.updated_at_ms,
+        },
+        ReceiptState::Refused | ReceiptState::Rejected => {
+            SendState::Refused(receipt.error.0.as_ref().map(|error| error.code))
+        }
+    }
+}
+
+/// What a failed read of a send's receipt says of the send.
+fn unread(error: &ClientError) -> SendState {
+    match error {
+        // The worker answers an identifier it has no receipt for with this text, and so does a
+        // request it cannot place, so the text tells them apart.
+        ClientError::Host(refused)
+            if refused.code == ErrorCode::InvalidArgument
+                && refused.message.starts_with("no receipt for action") =>
+        {
+            SendState::NoRecord
+        }
+        ClientError::Host(refused) | ClientError::Refused { error: refused, .. }
+            if !keeps_the_answer(error) =>
+        {
+            SendState::Unreadable(Unread::Refused(refused.code))
+        }
+        _ => SendState::Unreadable(Unread::Failed),
+    }
+}
+
+/// Asks the host about every send the record names, and returns what it said of each.
 ///
-/// `host` is the connection this client has, or none while it has none. `question` is the question
-/// as the person was shown it, and the answer is checked against its form before anything else
-/// happens, so what is kept is an answer the host could take.
+/// It decides nothing and removes nothing. It is asked after the question has been read, never
+/// before: a worker holds the session from admitting an answer to recording its outcome, so a
+/// question read as answered by a send has that send's receipt.
+pub async fn learn<H: QuestionHost>(
+    host: &H,
+    session_id: SessionId,
+    recorded: &[ActionId],
+) -> Earlier {
+    let mut sends = Vec::with_capacity(recorded.len());
+    for action_id in recorded {
+        let state = match host.receipt(session_id, *action_id).await {
+            Ok(receipt) => state_of(&receipt),
+            Err(error) => unread(&error),
+        };
+        sends.push((*action_id, state));
+    }
+    Earlier { sends }
+}
+
+/// Settles the send an attempt just made, from its own failure, when the client holds proof of
+/// what became of it. It is a write, so it asks the caller for the leave again; when that is
+/// refused the identifier stays, and the next reading of the host settles it.
+fn settle_own<K: Keeper>(
+    keeper: &K,
+    drafts: &AnswerDrafts,
+    question_id: QuestionId,
+    draft: Digest256,
+    send: ActionId,
+    remove_when_empty: bool,
+) {
+    let _ =
+        keeper.keep(|leave| drafts.settle(question_id, draft, &[send], remove_when_empty, leave));
+}
+
+/// Sends a person's answer. The identifier it goes out under is recorded, with the answer, before
+/// anything is written to the host, so a reconnect can ask the host what became of it.
+///
+/// `question` is the question as the person was shown it, and the answer is checked against its
+/// form before anything else happens, so what is kept is an answer the host could take. When the
+/// record holds sends already, the host is asked about each first ([`Attempt::earlier`]): one it
+/// took is reported and nothing is sent; one it has and has not finished with waits; one whose
+/// outcome it could not establish is named by this send, or, for a caller that asked
+/// [`Quoting::AfterShown`], shown first.
+///
+/// A host that cannot be reached, and a lost, uncertain or transient failure, keep the answer and
+/// its record on this device ([`Answered::Kept`]); the host's own word that it did not take the
+/// answer settles the send, and removes the pair unless an earlier send is still unsettled.
 ///
 /// # Errors
 ///
 /// Returns [`AnswerError::Form`] for an answer that does not fit the question,
+/// [`AnswerError::Keeping`] when the leave to write could not be had,
+/// [`AnswerError::Changed`] and [`AnswerError::Full`] when nothing could be recorded,
 /// [`AnswerError::Host`] when the host refused it (the question already ended, or this device may
-/// not answer it), and [`AnswerError::Store`] when an answer kept earlier for the question, which
-/// this one supersedes, cannot be removed.
-pub async fn answer<H: QuestionHost>(
-    host: Option<&H>,
+/// not answer it), and [`AnswerError::Store`] when the pair cannot be removed after the host took
+/// the answer.
+#[allow(clippy::too_many_arguments)]
+pub async fn answer<H: QuestionHost + Sync, K: Keeper + Sync>(
+    host: &H,
+    keeper: &K,
     drafts: &AnswerDrafts,
     target: ActionTarget,
     question: &Question,
     answer: QuestionAnswer,
     now: TimestampMs,
+    quoting: Quoting,
+) -> Attempt<Answered> {
+    let mut earlier = Earlier::default();
+    let outcome = answered(
+        host,
+        keeper,
+        drafts,
+        target,
+        question,
+        answer,
+        now,
+        quoting,
+        &mut earlier,
+    )
+    .await;
+    Attempt { earlier, outcome }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn answered<H: QuestionHost + Sync, K: Keeper + Sync>(
+    host: &H,
+    keeper: &K,
+    drafts: &AnswerDrafts,
+    target: ActionTarget,
+    question: &Question,
+    answer: QuestionAnswer,
+    now: TimestampMs,
+    quoting: Quoting,
+    earlier: &mut Earlier,
 ) -> Result<Answered> {
     check_answer(question, &answer)
         .map_err(|_| AnswerError::Form(form_failure(question, &answer)))?;
@@ -701,31 +1619,112 @@ pub async fn answer<H: QuestionHost>(
         answer,
         drafted_at_ms: now,
     };
-    let Some(host) = host else {
-        return Ok(Answered::Unconfirmed(draft));
-    };
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let basis = drafts.basis(draft.question_id)?;
+    // What the host says of an earlier send comes before the question's state: a question the
+    // person's own send answered is never read as answered by somebody else. A read that failed
+    // decides nothing here: the attempt goes on, and the host refuses a send that lacks a quote it
+    // needs.
+    if !basis.sends().is_empty() {
+        *earlier = learn(host, draft.session_id, basis.sends()).await;
+        if let Some(taken) = earlier.taken() {
+            let _ = drafts.remove_if_unchanged(draft.question_id, &basis)?;
+            return Ok(Answered::Taken(taken));
+        }
+        if let Some(waiting) = earlier.waiting() {
+            return Ok(Answered::Waiting(waiting));
+        }
+        if let (Quoting::AfterShown(shown), Some(quote)) = (quoting, earlier.quote())
+            && shown != Some(quote.action_id)
+        {
+            return Ok(Answered::Held(quote));
+        }
+    }
     let params = draft
         .submission(Some(question))
         .map_err(AnswerError::Retired)?;
-    match host.answer(draft.target.clone(), params).await {
+    let carried = earlier.carried(basis.sends());
+    let quote = earlier.quote();
+    let kept = keeper
+        .keep(|leave| drafts.begin(&draft, &basis, &carried, action_id, leave))
+        .map_err(AnswerError::Keeping)??;
+    if !earlier.is_empty() {
+        host.learned(earlier);
+    }
+    let dispatch = Dispatch { action_id, quote };
+    match host.answer(draft.target.clone(), params, dispatch).await {
         Ok(resolved) => {
             // An answer kept earlier for this question has been superseded by this one.
-            drafts.discard(draft.question_id)?;
+            drafts.remove_after_result(draft.question_id, kept)?;
             Ok(Answered::Sent(Box::new(resolved)))
         }
-        Err(error) if keeps_the_answer(&error) => Ok(Answered::Unconfirmed(draft)),
-        Err(error) => Err(AnswerError::Host(error)),
+        Err(failure) => {
+            let keeps = keeps_the_answer(&failure.error);
+            if failure.settled() {
+                settle_own(keeper, drafts, draft.question_id, kept, action_id, !keeps);
+            }
+            if keeps {
+                return Ok(Answered::Kept(draft));
+            }
+            if ended(&failure.error) && !carried.is_empty() {
+                if let Some(taken) = ended_after_send(host, drafts, &draft).await? {
+                    return Ok(Answered::Taken(taken));
+                }
+            }
+            Err(AnswerError::Host(failure.error))
+        }
     }
+}
+
+/// Whether the host refused a send because its question ended.
+fn ended(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Host(refused)
+            if matches!(
+                refused.code,
+                ErrorCode::QuestionResolved | ErrorCode::QuestionExpired
+            )
+    )
+}
+
+/// The host refused a send because its question ended. An earlier send of the answer may be the
+/// reason, so every send still in the record is read again: one the host took is reported and the
+/// pair removed, and otherwise the pair is removed only when no read failed.
+async fn ended_after_send<H: QuestionHost>(
+    host: &H,
+    drafts: &AnswerDrafts,
+    draft: &AnswerDraft,
+) -> Result<Option<ActionId>> {
+    let basis = drafts.basis(draft.question_id)?;
+    let again = if basis.sends().is_empty() {
+        Earlier::default()
+    } else {
+        learn(host, draft.session_id, basis.sends()).await
+    };
+    if let Some(taken) = again.taken() {
+        let _ = drafts.remove_if_unchanged(draft.question_id, &basis)?;
+        return Ok(Some(taken));
+    }
+    if !again.failed() {
+        let _ = drafts.remove_if_unchanged(draft.question_id, &basis)?;
+    }
+    Ok(None)
 }
 
 /// Decides, after a reconnect, what every kept answer is, and sends none of them.
 ///
-/// Each session a kept answer names is read once, resolved questions included. A draft whose
-/// question is still pending at the revision the person answered is offered again and stays kept.
-/// A draft whose question ended or moved is retired: it is not sent and it is no longer kept, and
-/// the result says why, so the person can be told that their answer did not go and what happened
-/// instead. A draft whose question its session does not list is retired as gone only when the
-/// host's record says the session ended, and is otherwise kept and reported as unlisted.
+/// A record of sends that names no kept answer is removed first, before any worker is read. Each
+/// session a kept answer names is read once, resolved questions included. For a kept answer whose
+/// question its session lists, the host is asked about every send its record names, after the
+/// question was read: a send the host took retires the answer as taken; a send the host has and
+/// has not finished with keeps it, waiting; and the question decides the rest. A draft whose
+/// question is still pending at the revision the person answered is offered again and stays kept,
+/// with what the host said of its earlier sends. A draft whose question ended or moved is retired:
+/// it is not sent and it is no longer kept, unless a read of the host failed, in which case it
+/// stays and is reported as unsettled. A draft whose question its session does not list is retired
+/// as gone only when the host's record says the session ended, and is otherwise kept and reported
+/// as unlisted.
 ///
 /// # Errors
 ///
@@ -736,8 +1735,9 @@ pub async fn reconcile<H: QuestionHost>(
     host: &H,
     drafts: &AnswerDrafts,
 ) -> Result<Vec<Reconciled>> {
-    let kept = drafts.drafts()?;
-    let mut sessions: Vec<SessionId> = kept.iter().map(|draft| draft.session_id).collect();
+    drafts.sweep()?;
+    let kept = drafts.entries()?;
+    let mut sessions: Vec<SessionId> = kept.iter().map(|(draft, _)| draft.session_id).collect();
     sessions.sort_unstable();
     sessions.dedup();
     let mut current: Vec<Question> = Vec::new();
@@ -753,7 +1753,7 @@ pub async fn reconcile<H: QuestionHost>(
     // The record of every session with a draft whose question it does not list, read once each
     // and before anything is retired, so a record that cannot be read retires nothing.
     let mut ended: Vec<(SessionId, bool)> = Vec::new();
-    for draft in &kept {
+    for (draft, _) in &kept {
         let listed = current
             .iter()
             .any(|question| question.question_id == draft.question_id);
@@ -775,18 +1775,40 @@ pub async fn reconcile<H: QuestionHost>(
             .any(|(ended_id, record)| *ended_id == session_id && *record)
     };
     let mut reconciled = Vec::with_capacity(kept.len());
-    for draft in kept {
+    for (draft, basis) in kept {
         let question = current
             .iter()
             .find(|question| question.question_id == draft.question_id);
+        let earlier = if question.is_some() && !basis.sends().is_empty() {
+            learn(host, draft.session_id, basis.sends()).await
+        } else {
+            Earlier::default()
+        };
+        if let Some(action_id) = earlier.taken() {
+            if drafts.remove_if_unchanged(draft.question_id, &basis)? {
+                reconciled.push(Reconciled::Taken { draft, action_id });
+            } else {
+                reconciled.push(Reconciled::Unsettled(draft));
+            }
+            continue;
+        }
         match draft.submission(question) {
-            Ok(_) => reconciled.push(Reconciled::Offered(draft)),
+            Ok(_) => match earlier.waiting() {
+                Some(action_id) => reconciled.push(Reconciled::Waiting { draft, action_id }),
+                None => reconciled.push(Reconciled::Offered { draft, earlier }),
+            },
             Err(Retired::Gone) if !session_ended(draft.session_id) => {
                 reconciled.push(Reconciled::Unlisted(draft));
             }
+            // A read that failed leaves what became of an earlier send open, so the answer is not
+            // retired on the question alone.
+            Err(_) if earlier.failed() => reconciled.push(Reconciled::Unsettled(draft)),
             Err(reason) => {
-                drafts.discard(draft.question_id)?;
-                reconciled.push(Reconciled::Retired { draft, reason });
+                if drafts.remove_if_unchanged(draft.question_id, &basis)? {
+                    reconciled.push(Reconciled::Retired { draft, reason });
+                } else {
+                    reconciled.push(Reconciled::Unsettled(draft));
+                }
             }
         }
     }
@@ -795,25 +1817,56 @@ pub async fn reconcile<H: QuestionHost>(
 
 /// Sends one kept answer, for a person who chose to send it.
 ///
-/// The question is read again first, so a draft whose question ended or moved since it was offered
-/// is retired rather than sent. A draft that is sent, or that the host refuses because its question
-/// ended, is no longer kept.
+/// `draft` and `basis` are the answer and the pair as the caller read them from the store
+/// ([`AnswerDrafts::entry`]). The question is read again first, and the host is asked about every
+/// send the record names: one it took is reported and nothing is sent; one it has and has not
+/// finished with waits; a draft whose question ended or moved is retired rather than sent, unless a
+/// read of the host failed; and an uncertain outcome is named by the send, or shown first for a
+/// caller that asked [`Quoting::AfterShown`]. The send is recorded before it goes. A draft that is
+/// sent, or that the host refuses because its question ended once every send was read, is no longer
+/// kept; any other refusal settles this send and keeps the draft.
 ///
 /// # Errors
 ///
 /// Returns [`AnswerError::Retired`] when the question ended or moved, [`AnswerError::Unlisted`] when
 /// its session does not list the question and the host's record does not say the session ended,
+/// [`AnswerError::Unsettled`] when the question ended and an earlier send could not be asked about,
+/// [`AnswerError::Changed`] and [`AnswerError::Full`] when nothing could be recorded,
 /// [`AnswerError::Host`] when the host refused or could not be reached, and [`AnswerError::Store`]
 /// when the store cannot be updated.
-pub async fn send<H: QuestionHost>(
+pub async fn send<H: QuestionHost + Sync, K: Keeper + Sync>(
     host: &H,
+    keeper: &K,
     drafts: &AnswerDrafts,
     draft: &AnswerDraft,
-) -> Result<QuestionResolveResult> {
+    basis: &Basis,
+    quoting: Quoting,
+) -> Attempt<Answered> {
+    let mut earlier = Earlier::default();
+    let outcome = sent(host, keeper, drafts, draft, basis, quoting, &mut earlier).await;
+    Attempt { earlier, outcome }
+}
+
+async fn sent<H: QuestionHost + Sync, K: Keeper + Sync>(
+    host: &H,
+    keeper: &K,
+    drafts: &AnswerDrafts,
+    draft: &AnswerDraft,
+    basis: &Basis,
+    quoting: Quoting,
+    earlier: &mut Earlier,
+) -> Result<Answered> {
     let questions = host.questions(draft.session_id).await?;
     let current = questions
         .iter()
         .find(|question| question.question_id == draft.question_id);
+    if current.is_some() && !basis.sends().is_empty() {
+        *earlier = learn(host, draft.session_id, basis.sends()).await;
+        if let Some(taken) = earlier.taken() {
+            let _ = drafts.remove_if_unchanged(draft.question_id, basis)?;
+            return Ok(Answered::Taken(taken));
+        }
+    }
     let params = match draft.submission(current) {
         Ok(params) => params,
         // A question its session does not list is gone only when the host's record of the
@@ -821,25 +1874,51 @@ pub async fn send<H: QuestionHost>(
         Err(Retired::Gone) if !host.session_ended(draft.session_id).await? => {
             return Err(AnswerError::Unlisted);
         }
+        Err(_) if earlier.failed() => return Err(AnswerError::Unsettled),
         Err(reason) => {
-            drafts.discard(draft.question_id)?;
+            let _ = drafts.remove_if_unchanged(draft.question_id, basis)?;
             return Err(AnswerError::Retired(reason));
         }
     };
-    match host.answer(draft.target.clone(), params).await {
+    if let Some(waiting) = earlier.waiting() {
+        return Ok(Answered::Waiting(waiting));
+    }
+    if let (Quoting::AfterShown(shown), Some(quote)) = (quoting, earlier.quote())
+        && shown != Some(quote.action_id)
+    {
+        return Ok(Answered::Held(quote));
+    }
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let carried = earlier.carried(basis.sends());
+    let quote = earlier.quote();
+    let Some(digest) = basis.draft else {
+        return Err(AnswerError::Changed);
+    };
+    keeper
+        .keep(|leave| drafts.record_send(draft.question_id, basis, &carried, action_id, leave))
+        .map_err(AnswerError::Keeping)??;
+    if !earlier.is_empty() {
+        host.learned(earlier);
+    }
+    let dispatch = Dispatch { action_id, quote };
+    match host.answer(draft.target.clone(), params, dispatch).await {
         Ok(resolved) => {
-            drafts.discard(draft.question_id)?;
-            Ok(resolved)
+            drafts.remove_after_result(draft.question_id, digest)?;
+            Ok(Answered::Sent(Box::new(resolved)))
         }
-        Err(ClientError::Host(refused))
-            if matches!(
-                refused.code,
-                ErrorCode::QuestionResolved | ErrorCode::QuestionExpired
-            ) =>
-        {
-            drafts.discard(draft.question_id)?;
-            Err(AnswerError::Host(ClientError::Host(refused)))
+        Err(failure) => {
+            if failure.settled() {
+                settle_own(keeper, drafts, draft.question_id, digest, action_id, false);
+            }
+            if ended(&failure.error) {
+                if let Some(taken) = ended_after_send(host, drafts, draft).await? {
+                    return Ok(Answered::Taken(taken));
+                }
+            }
+            Err(AnswerError::Host(failure.error))
         }
-        Err(error) => Err(AnswerError::Host(error)),
     }
 }
+
+#[cfg(test)]
+mod tests;
