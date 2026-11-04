@@ -1631,12 +1631,12 @@ impl DescriptionService {
     /// Takes the news that the description process ended without this service asking.
     ///
     /// The model goes with it and nothing else. The work in flight ends: a job the process was
-    /// cancelling ends cancelled, or back in the queue for a pause, a job whose process the daemon
-    /// ended for passing its deadline
-    /// ends so, one whose process the daemon ended for its memory ceiling fails unless it was being
-    /// stopped or its session was gone, which it ends as, and any other job is queued again once
-    /// with its aging position (a process that ended itself for passing its deadline reads as one
-    /// that exited). The next load waits out the restart delay.
+    /// cancelling ends cancelled, or back in the queue for a pause, except that a job whose process
+    /// the daemon ended for passing its deadline ends so unless a caller cancelled it; one whose
+    /// process the daemon ended for its memory ceiling fails unless it was being stopped or its
+    /// session was gone, which it ends as; and any other job is queued again once with its aging
+    /// position (a process that ended itself for passing its deadline reads as one that exited).
+    /// The next load waits out the restart delay.
     ///
     /// # Errors
     ///
@@ -2444,8 +2444,8 @@ impl DescriptionService {
             }
             // A job that was being stopped, or whose session is gone, ends as that made it when
             // the daemon ended the process for its ceiling. The job runs again after a pause, and
-            // fails if it passes the ceiling again with nothing stopping it. Any other job is the
-            // one that held the process past it.
+            // fails if the ceiling ends it again with nothing stopping it. Any other job is the one
+            // that held the process past it.
             ProcessEnd::MemoryCeiling => self.ended_as_stopped_or(dispatched, |service, job| {
                 if service.session_gone(&job) {
                     service.counts.cancelled = service.counts.cancelled.saturating_add(1);

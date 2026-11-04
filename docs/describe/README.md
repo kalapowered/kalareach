@@ -174,7 +174,7 @@ happen. A job that held its process past the ceiling without ever finishing is e
 reading alone, publishes nothing, is not queued again, and pauses inference the same way. A job that
 was already being stopped when the daemon ended its process for the ceiling, or whose session had
 gone, ends as that made it instead: cancelled, or back in the queue with its place for a pause, to
-run again once inference resumes and to fail if it passes the ceiling again with nothing stopping
+run again once inference resumes and to fail if the ceiling ends it again with nothing stopping
 it. A job the process itself ended at the ceiling between tokens fails whatever was stopping it. The
 process's end pauses inference the same way in every case.
 
@@ -214,7 +214,8 @@ one that catches the failed allocation answers that its load or job failed and g
 asks the job when the process closes its end, when its frames stop short, and when it answers that a
 load or a job failed. If the job recorded a refused commit, the daemon takes it that the process
 ended for memory: the process is ended, inference pauses with `memory_pressure` as it does for a
-reading past the ceiling, and the job is not retried. The answer of the load or the job in hand,
+reading past the ceiling, and the job is not retried, unless it was being stopped, which it ends
+as. The answer of the load or the job in hand,
 when it does not say that the load or the job failed, clears what the job recorded, so a refusal the
 runtime got over does not count against a later end. The system posts the job's message inside the
 refused call, so an answer written after that call finds it. But the message and the process's
@@ -665,8 +666,8 @@ the wire while the system had refused it memory, which the daemon reads as the c
 the job past its deadline or failed (a process that ends itself for passing its deadline reads as
 one that exited or broke the wire, and the job is queued again), and if the next process fails it
 as well it is not retried, however many pauses come between. A job already being stopped when the
-daemon ended the process for its memory ceiling, or whose session had gone, ends as the stop or the
-session made it and not failed. A job a caller or
+daemon ended the process for its memory ceiling or read its end as the ceiling, or whose session had
+gone, ends as the stop or the session made it and not failed. A job a caller or
 privacy mode cancelled is never queued again, even when its process ends before the cancellation is
 answered, and even when a pause had already stopped it: a retry would run it under a new token that
 nobody had cancelled. The service's handle on the running job is the one way to cancel it from
