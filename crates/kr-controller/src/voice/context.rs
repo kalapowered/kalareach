@@ -664,8 +664,9 @@ mod tests {
 
     /// KR-REQ-15.20 and KR-REQ-10.49: a closed session's retained summary keeps its own creation
     /// time, so a grant whose history begins after that session ended sees none of it. For 10.49
-    /// this is the dating half of the summary clause: a summary read now is dated by its source
-    /// and not by the moment it is read. That the filter keeps back what is dated before a bound is
+    /// this is the later-snapshot half of the history clause: a snapshot made now from a closed
+    /// session's record is dated by its source and not by the moment it is read. It says nothing of
+    /// generated text. That the filter keeps back what is dated before a bound is
     /// `content_older_than_the_requesting_devices_bound_is_kept_back`'s.
     #[test]
     fn a_retained_summary_of_a_closed_session_stays_behind_a_later_history_bound() {

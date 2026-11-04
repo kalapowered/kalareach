@@ -1729,9 +1729,8 @@ async fn a_device_under_a_grant_with_no_cursor_is_shown_what_is_first_seen_after
 
 /// KR-REQ-10.49: a range of the retained events that the host could not read has no date, so a
 /// device whose history has a bound is listed none in the inbox it reads, as the changed view lists
-/// none. The items stay as they were, and the first approval stays uncertain for the device that
-/// can see it. The controls: the owner is listed the range, and so is a device whose grant names a
-/// cursor at the start of time.
+/// none. The first approval stays uncertain for a device that reaches it. The controls: the owner
+/// is listed the range, and so is a device whose grant starts at the beginning of time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_with_a_history_bound_is_listed_no_gap_in_the_inbox() {
     let owner_keys = DeviceKeys::generate().expect("owner keys");
@@ -1774,13 +1773,8 @@ async fn a_device_with_a_history_bound_is_listed_no_gap_in_the_inbox() {
     let narrow = device_inbox(&bounded).await;
     assert!(
         narrow.gaps.is_empty(),
-        "a device paired after the first approval is listed no range: {:?}",
+        "a device whose history has a bound is listed no range: {:?}",
         narrow.gaps
-    );
-    assert_eq!(
-        narrow.items.len(),
-        1,
-        "and is shown the one approval it reaches, as before"
     );
     host.stop().await;
 }

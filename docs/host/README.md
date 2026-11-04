@@ -6555,8 +6555,8 @@ The `gaps` of `attention.read` are ranges, not numbers. A range of the retained 
 could not read has no date, so a device whose history does not reach every moment is listed none,
 whether the range is in a session's records or in the workflow journal, just as `visit.changed`
 shows it no `omitted` range. An item such a range could have settled stays uncertain, so the device
-still learns that the host cannot say how it ended. The owner, and a device whose grant starts at
-the beginning of time, are listed every range.
+still learns that the host cannot say how it ended. The owner is listed every range. A device whose
+grant starts at the beginning of time is listed the ranges its grant admits, as before.
 
 A log view's source offset and its filter travel with the visit. They come back after a reconnect,
 each view keeps its own position when a client switches between two, and a view whose range
@@ -6692,8 +6692,9 @@ Showing earlier history is opt-in. An item will be shown on a device only if it 
 earlier than the history cursor on the grant with which the device was given access to it, or (if
 the grant has no history cursor) no earlier than when the grant itself began, which for a pairing
 grant is when the host committed the pairing. A reminder's date is that of the question it reminds
-about, not when it fires. A gap or a review does not have a date; it is displayed by session
-only.
+about, not when it fires. A review subject is dated by its current version, as described below. A
+gap has no date, so a caller whose history has a bound is listed none, and any other caller is
+listed the gaps of the sessions its grant admits.
 
 An item's text and a change's text come from retained content: a question's wording, what an
 application printed, the fixed words of a turn that ended or a command that failed. The store

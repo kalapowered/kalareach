@@ -2307,8 +2307,16 @@ fn a_viewer_with_a_bound_is_shown_no_gap_in_the_inbox() {
         "a range has no date, so a bounded viewer is told of none: {:?}",
         bounded.gaps
     );
+    let first = key(
+        &attention,
+        AttentionRule::PendingApproval,
+        &approval_subject("req-1"),
+    );
     assert!(
-        bounded.items.iter().any(|item| item.uncertain),
+        bounded
+            .items
+            .iter()
+            .any(|item| item.key == first && item.uncertain),
         "the host still cannot say whether the missing range settled the first approval: {:?}",
         bounded.items
     );
