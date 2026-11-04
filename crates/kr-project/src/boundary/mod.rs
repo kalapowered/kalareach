@@ -47,15 +47,16 @@
 //! ## Directories, not names
 //!
 //! Every directory the boundary is built from is opened first, and required to be the object the
-//! caller holds an identity for: the working tree by the identity the repository's record carries
-//! where one does, the Git common directory by its own, the reserved destination by the identity
-//! the reservation returned, and the invocation's own temporary directory by the identity this host
-//! read when it made it. A directory the caller holds no identity for, as a checkout handed over
-//! by path is, is the object that was opened, and it is that object that is confirmed after the
-//! run. The child then does not start at a path either: it moves into the open working directory
-//! before the boundary is applied and before Git runs, with `-C .` as its only directory argument.
-//! A tree substituted at a name afterwards is therefore neither the tree Git works in nor a tree
-//! the boundary was built around.
+//! caller holds an identity for: the working tree by the identity the repository's record carries,
+//! or, for a checkout handed over by path, by the one this host read from the directory it opened
+//! a moment before; the Git common directory by its own; the reserved destination by the identity
+//! the reservation returned; and the invocation's own temporary directory by the identity this host
+//! read when it made it. A directory the request holds no identity for is held to the object that
+//! was opened. After the run each is opened again and confirmed against the same identity. The
+//! child then does not start at a path either: it moves into the open working directory before
+//! the boundary is applied and before Git runs, with `-C .` as its only directory argument. A tree
+//! substituted at a name afterwards is therefore neither the tree Git works in nor a tree the
+//! boundary was built around.
 //!
 //! What the kernels enforce is narrower than the sentence above, and is stated as what it is:
 //! **opens for writing succeed only inside the granted root objects' subtrees as they stand at open
@@ -301,18 +302,17 @@ impl OpenedDirectory {
     ///
     /// Returns [`ProjectError::Destination`] when the directory cannot be opened or its path
     /// cannot be resolved, except that a host too short of descriptors, processes or memory to
-    /// open it or to resolve its path is [`ProjectError::GitFailed`], a fault that passes
-    /// (`unopenable`), and
-    /// [`ProjectError::IdentityChanged`] when the caller holds an identity
-    /// and the object at the path is a different one, or the open or the resolution of the path
-    /// finds nothing there: the object the identity names is gone, which is a source that changed
-    /// and not an argument the caller got wrong. With no identity, a directory that is gone is the
-    /// caller's argument. Each step answers for what it found itself, as it does where a recorded
-    /// tree is first opened, and nothing looks at the path again to decide. A failure to open is
-    /// worded by the open's own error (`unopenable`), so a link that leads round to itself reads
-    /// as the system's reason for it and not as a link, as `open_root` words it for a root that no
-    /// record names. A platform that reports a parent that is a file as not found, as Windows
-    /// may, reads it as nothing there too; that platform runs no Git, so no request reaches it.
+    /// open it or to resolve its path is [`ProjectError::GitFailed`], a fault that passes, and
+    /// [`ProjectError::IdentityChanged`] when the caller holds an identity and the object at the
+    /// path is a different one, or the open or the resolution of the path finds nothing there:
+    /// the object the identity names is gone, which is a source that changed and not an argument
+    /// the caller got wrong. With no identity, a directory that is gone is the caller's argument.
+    /// Each step answers for what it found itself, as it does where a recorded tree is first
+    /// opened, and nothing looks at the path again to decide. A failure to open is worded by the
+    /// open's own error (`unopenable`), so a link that leads round to itself reads as the
+    /// system's reason for it and not as a link, as the transfer crate's `open_root` words it. A
+    /// platform that reports a parent that is a file as not found, as Windows may, reads it as
+    /// nothing there too; that platform runs no Git, so no request reaches it.
     pub fn open(
         environment_id: EnvironmentId,
         path: &Path,
@@ -478,7 +478,7 @@ pub struct Confinement {
     /// The directory the child starts in, as the object this host opened.
     pub working: OpenedDirectory,
     /// The other directories this operation owns: a repository's Git common directory, a
-    /// destination the operation reserved. Each is the object its record names.
+    /// destination the operation reserved. Each is the object the identity held for it names.
     pub reserved: Vec<OpenedDirectory>,
     /// The private temporary directory this invocation owns for its own length.
     pub temporary: OpenedDirectory,
@@ -598,7 +598,9 @@ impl Confinement {
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::IdentityChanged`] when any of them differs.
+    /// Returns [`ProjectError::IdentityChanged`] when any of them differs or no longer opens, and
+    /// [`ProjectError::GitFailed`], a fault that passes, when the host is too short of
+    /// descriptors, processes or memory to open one again.
     pub fn confirm(&self) -> Result<()> {
         for directory in self.written() {
             directory.confirm_path()?;

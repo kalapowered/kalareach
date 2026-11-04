@@ -84,9 +84,10 @@ impl Destination {
     /// # Errors
     ///
     /// Returns [`ProjectError::Destination`] when the parent cannot be opened or the name is not
-    /// one component, [`ProjectError::WrongEnvironment`] when the request names another
-    /// environment, or [`ProjectError::PermissionDenied`] when the caller may not name that
-    /// parent.
+    /// one component, [`ProjectError::GitFailed`] when the host is too short of descriptors,
+    /// processes or memory to open the parent, [`ProjectError::WrongEnvironment`] when the
+    /// request names another environment, or [`ProjectError::PermissionDenied`] when the caller
+    /// may not name that parent.
     pub fn resolve(
         request: &DestinationRequest,
         environment_id: EnvironmentId,

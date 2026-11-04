@@ -299,7 +299,8 @@ impl OpenedRepository {
     /// # Errors
     ///
     /// Returns [`ProjectError::Destination`] when the directory cannot be opened,
-    /// [`ProjectError::GitFailed`] when the repository cannot be read, or
+    /// [`ProjectError::GitFailed`] when the repository cannot be read or when the host is too
+    /// short of descriptors, processes or memory to open a directory of it, or
     /// [`ProjectError::ConfigurationRejected`] when its configuration names something no override
     /// removes.
     pub fn open(
@@ -1173,13 +1174,15 @@ fn open_recorded_root(
     }
 }
 
-/// Opens the directory at `path` as an authority for one environment, where no record names it:
-/// a checkout `project.adopt` is handed by path, the top level and the Git directories Git reports
-/// for it, a destination's parent the owner named by path, and the parent of a tree to take away.
+/// Opens the directory at `path` as an authority for one environment: a checkout `project.adopt`
+/// is handed by path, the top level, the Git directory and a linked worktree's own directory Git
+/// reports for a repository, and a destination's parent the owner named by path. A record, where
+/// one names the directory, decides by identity afterwards.
 ///
 /// It is opened once, by the open that every directory here is opened by, and what the open
-/// finds is the answer, in the open's own words. A link that leads round to itself reads as the
-/// system's reason for it.
+/// finds is the answer, in the open's own words (`boundary::unopenable`). A link that leads round
+/// to itself reads as the system's reason for it. Other opens of a root, such as the parent of a
+/// tree to take away, are not made here.
 pub(crate) fn open_unrecorded_root(
     environment_id: EnvironmentId,
     path: &Path,
@@ -1986,9 +1989,11 @@ mod tests {
                 "{row}: {refused}"
             );
             let said = refused.to_string();
+            // The place is followed by what was done to it, so that a place that is the start of
+            // another (a top level and the Git directory inside it) is not taken for it.
             assert!(
                 said.contains(&std::io::Error::from(errno).to_string())
-                    && said.contains(&place.display().to_string()),
+                    && said.contains(&format!("{} could", place.display())),
                 "it says the place and the reason: {row}: {said}"
             );
         } else if let Some(code) = otherwise {
