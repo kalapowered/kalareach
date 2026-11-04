@@ -365,8 +365,11 @@ impl Session {
     ///
     /// Panics when it does not hold inside the reply window.
     pub fn until(&mut self, what: &str, ready: impl Fn(&Commands) -> bool) {
-        let deadline = Deadline::after(REPLY);
+        let deadline = self.deadline_for(REPLY);
         while !ready(&self.commands) {
+            if deadline.passed() {
+                note_that_a_wait_gave_up();
+            }
             assert!(
                 !deadline.passed(),
                 "{what} did not arrive; the terminal showed:\n{}",
@@ -1058,12 +1061,17 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
         "the bridge does not start a case holding the long wait for answers:\n{}",
         session.terminal_output()
     );
-    let entries = session.commands.entries.len();
     session.lets_the_bridge_give_up_on_a_question();
     session.commands.policy = ResolvePolicy::Silent;
     let asked = session.run_asking("kr-probe unanswered", "probe-ran");
     assert_eq!(asked.len(), 1, "the command asked: {asked:?}");
     assert_eq!(last_run(&probes).arguments, ["unanswered"]);
+    let unanswered_at = session
+        .commands
+        .accepted
+        .last()
+        .expect("the unanswered line was accepted")
+        .prompt_generation;
 
     // A worker that answers what came after the unanswered question has caught up, so the next
     // command asks again. A shell looks at its mailbox once before it asks, and does not wait for
@@ -1072,7 +1080,10 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
     // answers in the order it reads proves it has read those answers.
     session.commands.policy = ResolvePolicy::default();
     session.until("the prompt after the unanswered line", |commands| {
-        commands.entries.len() > entries
+        commands.entries.iter().any(|entry| {
+            entry.reader_context == ReaderContext::Primary
+                && entry.prompt_generation > unanswered_at
+        })
     });
     session.barrier();
     session.lets_the_bridge_wait_for_answers();
