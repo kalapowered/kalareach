@@ -5,12 +5,6 @@
 //! channel` over its own standard input and output, as Claude Code starts a channel server. This
 //! test speaks MCP to it as Claude Code does, and speaks the private exchange to it as the worker
 //! does, through the connection the worker admitted.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-11.42 | every case: the channel registration's own invocation, admitted by the worker |
-//! | KR-REQ-12.18 | `kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_nothing_else` |
-//! | KR-REQ-11.34 | `kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_nothing_else`: core code alone carries the frames, beside the unchanged terminal |
 
 mod common;
 

@@ -9,12 +9,6 @@
 //! The last case stands in for the worker's listener, on the private endpoint the platform gives a
 //! launch: a socket on Unix, a named pipe on Windows. The application it launches is a shell of its
 //! own, `/bin/sh` or a copy of `cmd.exe`.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-11.43 | every case: the registration file and the private exchange, never a session identifier alone |
-//! | KR-REQ-12.14 | `kr_req_12_14_*`: the private endpoint, and the per-launch credential |
-//! | KR-REQ-05.09 | `kr_req_05_09_*`: the installation is validated before anything is accepted |
 
 mod common;
 

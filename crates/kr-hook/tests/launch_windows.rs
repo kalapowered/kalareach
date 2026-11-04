@@ -11,13 +11,6 @@
 //! has committed, so what is checked here is the order as much as the outcome: the backend names the
 //! program and not the launcher, in a job of its own, and a launch that goes wrong leaves a program
 //! that never ran.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-12.02 | a launch records and commits the program the launcher created, never the launcher; the program's exit code is the launcher's, whole, whether the launch was committed or the program ran as typed; a launch the backend refuses or does not commit, one a launcher declines, one whose launcher goes before the program is shown and one before it is confirmed, and one that is never started leave nothing running; a program that was started outlives the launcher |
-//! | KR-REQ-12.07 | a refused invocation runs as typed |
-//! | KR-REQ-05.09 | a program the kernel shows was not made from the hashed file, or was not started by the launcher, is not committed; the hold on the hashed file ends with the commit; a launcher the root shell did not start, or one started before the backend was established, is not admitted |
-//! | KR-REQ-07.61 | the committed program is held by a job of its own, which lists what it starts |
 
 #![cfg(windows)]
 

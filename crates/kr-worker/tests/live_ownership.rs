@@ -12,10 +12,6 @@
 //! death is a real one: this test binary is run again as a child process that writes its journal
 //! and its question ledger as the worker does and is killed with `SIGKILL`, and the archive then
 //! takes the journal over and recovers it.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-24.06 | every `kr_req_24_06_` test here |
 
 #![cfg(unix)]
 

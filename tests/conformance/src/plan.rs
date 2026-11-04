@@ -2125,14 +2125,6 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
-        package: "kr-attention",
-        target: "--test consumer",
-        cases: &["the_consumer_half_of_the_crash_test"],
-        runs: Runs::Helper {
-            file: "crates/kr-attention/tests/consumer.rs",
-        },
-    },
-    IgnoredRun {
         package: "kr-worker",
         target: "--test host",
         cases: &["a_survivor_of_a_crashed_session_tries_to_act_as_it"],
@@ -2152,26 +2144,10 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
     },
     IgnoredRun {
         package: "kr-worker",
-        target: "--test live_ownership",
-        cases: &["the_worker_half_of_the_death_test"],
-        runs: Runs::Helper {
-            file: "crates/kr-worker/tests/live_ownership.rs",
-        },
-    },
-    IgnoredRun {
-        package: "kr-worker",
         target: "--test windows_endpoint",
         cases: &["a_bridge_helper", "agent_runs_a_helper"],
         runs: Runs::Helper {
             file: "crates/kr-worker/tests/windows_endpoint.rs",
-        },
-    },
-    IgnoredRun {
-        package: "kr-hook",
-        target: "--test launch_windows",
-        cases: &["scripted_launcher_helper"],
-        runs: Runs::Helper {
-            file: "crates/kr-hook/tests/launch_windows.rs",
         },
     },
     IgnoredRun {
@@ -2196,22 +2172,6 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &["a_store_on_a_volume_that_is_not_ntfs_is_refused"],
         runs: Runs::ByHand {
             why: "it needs a volume that is not NTFS, a virtual disk formatted FAT32 that a person attaches and names in the environment",
-        },
-    },
-    IgnoredRun {
-        package: "kr-hook",
-        target: "--test channel",
-        cases: &["record_the_approval_the_channel_relays"],
-        runs: Runs::ByHand {
-            why: "it records a release's channel frame for its cut, and is run by hand in that release's tree",
-        },
-    },
-    IgnoredRun {
-        package: "kr-hook",
-        target: "--test listener",
-        cases: &["record_the_hello_the_forwarder_presents"],
-        runs: Runs::ByHand {
-            why: "it records a release's hello for its cut, and is run by hand in that release's tree",
         },
     },
     IgnoredRun {

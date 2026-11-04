@@ -7,10 +7,6 @@
 //! after the transaction commits, and the transaction fails part way. The first is a real death:
 //! this test binary is run again as a child process that applies an event and ends at once, by
 //! `SIGKILL` where there is one, with no release and nothing flushed on the way out.
-//!
-//! | Row | What proves it |
-//! | --- | --- |
-//! | KR-REQ-24.20 | every `kr_req_24_20_` test here |
 
 use std::path::Path;
 use std::process::Command;
