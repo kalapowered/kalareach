@@ -542,6 +542,10 @@ async fn a_device_that_repeats_a_step_is_answered_from_the_receipt_and_a_changed
     .await;
     let connection = RawDevice::connect(&host, &device, &record).await;
 
+    // The window is part of what an action is, and the host renews the one a connection holds, so
+    // every presentation of the action goes under the one it was first presented under: under a
+    // renewed one a repeat would be another action.
+    let window = connection.action_window_id();
     let a = action();
     let first = MachineJoinParams {
         machine_id: some_group(0x71),
@@ -549,7 +553,13 @@ async fn a_device_that_repeats_a_step_is_answered_from_the_receipt_and_a_changed
     };
     let a_result: MachineStepResult = typed(
         &connection
-            .mutate(Method::MachineJoin, a, target(&host), &first)
+            .mutate_in(
+                window.clone(),
+                Method::MachineJoin,
+                a,
+                target(&host),
+                &first,
+            )
             .await
             .expect("joins"),
     );
@@ -570,7 +580,13 @@ async fn a_device_that_repeats_a_step_is_answered_from_the_receipt_and_a_changed
     // A again: the same action, the same payload, the same window.
     let again: MachineStepResult = typed(
         &connection
-            .mutate(Method::MachineJoin, a, target(&host), &first)
+            .mutate_in(
+                window.clone(),
+                Method::MachineJoin,
+                a,
+                target(&host),
+                &first,
+            )
             .await
             .expect("is answered from its receipt"),
     );
@@ -578,7 +594,8 @@ async fn a_device_that_repeats_a_step_is_answered_from_the_receipt_and_a_changed
     assert_eq!(group_of(&mut local).await, b_result.machine);
     // A with a changed payload.
     let conflict = connection
-        .mutate(
+        .mutate_in(
+            window,
             Method::MachineJoin,
             a,
             target(&host),

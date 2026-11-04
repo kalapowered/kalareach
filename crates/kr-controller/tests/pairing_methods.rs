@@ -1512,8 +1512,13 @@ async fn an_owner_devices_completion_is_answered_again_only_under_its_own_action
         ActionId::new(kr_ipc::new_uuid()),
         ActionId::new(kr_ipc::new_uuid()),
     );
+    // The window is part of what an action is, and the host renews the one a connection holds, so
+    // every presentation of an action goes under the one it was first presented under: under a
+    // renewed one a swapped proof or a repeat would be another action.
+    let window = raw.action_window_id();
     let answered_p = raw
-        .mutate(
+        .mutate_in(
+            window.clone(),
             Method::OwnerConfirmationComplete,
             a,
             target.clone(),
@@ -1522,7 +1527,8 @@ async fn an_owner_devices_completion_is_answered_again_only_under_its_own_action
         .await
         .expect("the owner device answers the first under its action");
     let answered_q = raw
-        .mutate(
+        .mutate_in(
+            window.clone(),
             Method::OwnerConfirmationComplete,
             b,
             target.clone(),
@@ -1535,7 +1541,8 @@ async fn an_owner_devices_completion_is_answered_again_only_under_its_own_action
     // spent.
     for (action, proof) in [(a, q.clone()), (b, p.clone())] {
         let swapped = raw
-            .mutate(
+            .mutate_in(
+                window.clone(),
                 Method::OwnerConfirmationComplete,
                 action,
                 target.clone(),
@@ -1546,7 +1553,8 @@ async fn an_owner_devices_completion_is_answered_again_only_under_its_own_action
     }
     // The exact repeats are answered from their own records.
     assert_eq!(
-        raw.mutate(
+        raw.mutate_in(
+            window.clone(),
             Method::OwnerConfirmationComplete,
             a,
             target.clone(),
@@ -1557,9 +1565,15 @@ async fn an_owner_devices_completion_is_answered_again_only_under_its_own_action
         answered_p
     );
     assert_eq!(
-        raw.mutate(Method::OwnerConfirmationComplete, b, target, &completing(q))
-            .await
-            .expect("the second's own repeat"),
+        raw.mutate_in(
+            window,
+            Method::OwnerConfirmationComplete,
+            b,
+            target,
+            &completing(q),
+        )
+        .await
+        .expect("the second's own repeat"),
         answered_q
     );
     host.stop().await;

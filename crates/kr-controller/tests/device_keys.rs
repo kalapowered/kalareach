@@ -269,11 +269,20 @@ async fn an_exact_retry_of_a_completion_is_answered_from_its_record_after_a_reco
 
     let first_connection = RawDevice::connect(&host, &device, &record).await;
     first_connection.claim();
+    // The window the action is first presented under, taken before the first request: the host
+    // renews the one a connection holds, and an action presented again under a renewed window
+    // would be another action.
+    let window = first_connection.action_window_id();
     let first = first_connection
-        .mutate(Method::DeviceKeysComplete, action, target.clone(), &params)
+        .mutate_in(
+            window.clone(),
+            Method::DeviceKeysComplete,
+            action,
+            target.clone(),
+            &params,
+        )
         .await
         .expect("the declaration completes the record");
-    let window = first_connection.action_window_id();
     first_connection.close();
 
     // The reply is taken to be lost. On a later connection, with a window of its own, the device
@@ -317,12 +326,21 @@ async fn an_exact_retry_of_a_refused_declaration_is_given_the_same_refusal_after
 
     let first_connection = RawDevice::connect(&host, &device, &record).await;
     first_connection.claim();
+    // The window the action is first presented under, taken before the first request: the host
+    // renews the one a connection holds, and an action presented again under a renewed window
+    // would be another action.
+    let window = first_connection.action_window_id();
     let first = first_connection
-        .mutate(Method::DeviceKeysComplete, action, target.clone(), &forged)
+        .mutate_in(
+            window.clone(),
+            Method::DeviceKeysComplete,
+            action,
+            target.clone(),
+            &forged,
+        )
         .await
         .expect_err("a declaration another key signed");
     assert_eq!(first.code, ErrorCode::PermissionDenied);
-    let window = first_connection.action_window_id();
     first_connection.close();
 
     // The refusal was this action's answer, and it is given again: the exact retry, presented on

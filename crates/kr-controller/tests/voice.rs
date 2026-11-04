@@ -2103,14 +2103,31 @@ async fn a_retry_is_not_answered_from_its_record_while_a_fence_is_owed() {
         actions: Nullable::null(),
     };
 
+    // The window is part of what an action is, and the host renews the one a connection holds, so
+    // every presentation of the action goes under the one it was first presented under: under a
+    // renewed one a retry would be another action, and no record would be found for it.
+    let window = raw.action_window_id();
+
     let first: kr_protocol::voice::VoiceGrantResult = raw
-        .mutate(Method::VoiceGrant, action_id, target.clone(), &params)
+        .mutate_in(
+            window.clone(),
+            Method::VoiceGrant,
+            action_id,
+            target.clone(),
+            &params,
+        )
         .await
         .expect("the voice grant is written")
         .to_typed()
         .expect("a voice grant result");
     let again: kr_protocol::voice::VoiceGrantResult = raw
-        .mutate(Method::VoiceGrant, action_id, target.clone(), &params)
+        .mutate_in(
+            window.clone(),
+            Method::VoiceGrant,
+            action_id,
+            target.clone(),
+            &params,
+        )
         .await
         .expect("the same action is answered from its record")
         .to_typed()
@@ -2119,7 +2136,7 @@ async fn a_retry_is_not_answered_from_its_record_while_a_fence_is_owed() {
 
     let registry = owe_a_fence(host.controller(), &host.tree().environment()).await;
     let refused = raw
-        .mutate(Method::VoiceGrant, action_id, target, &params)
+        .mutate_in(window, Method::VoiceGrant, action_id, target, &params)
         .await
         .expect_err("a fence owed stops the retained answer");
     assert_eq!(
@@ -2161,13 +2178,22 @@ async fn a_retry_is_not_answered_when_a_fence_is_owed_while_its_record_is_found(
         session_ids: [SessionId::new(kr_ipc::new_uuid())].into_iter().collect(),
         actions: Nullable::null(),
     };
-    raw.mutate(Method::VoiceGrant, action_id, target.clone(), &params)
-        .await
-        .expect("the voice grant is written");
+    // The window is part of what an action is, and the host renews the one a connection holds, so
+    // the retry goes under the window the action was first presented under.
+    let window = raw.action_window_id();
+    raw.mutate_in(
+        window.clone(),
+        Method::VoiceGrant,
+        action_id,
+        target.clone(),
+        &params,
+    )
+    .await
+    .expect("the voice grant is written");
 
     let (arrived, release) = host.controller().pause_retained_lookup();
     let (retried, registry) = tokio::join!(
-        raw.mutate(Method::VoiceGrant, action_id, target, &params),
+        raw.mutate_in(window, Method::VoiceGrant, action_id, target, &params),
         async {
             tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
                 .await

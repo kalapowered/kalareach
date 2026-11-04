@@ -723,9 +723,14 @@ async fn a_resubmitted_catalogue_action_is_answered_from_its_own_record() {
 
     let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
     let params = add_params(&host, &owner, &published);
+    // The window is part of what an action is, and the host renews the one a connection holds, so
+    // the action is presented the second time under the window it was first presented under: under
+    // a renewed one the resubmission would be another action.
+    let window = raw.action_window_id();
     let submitted_at = kr_ipc::now_ms().get();
     let first: wire::CatalogueAddResult = typed(
-        &raw.mutate(
+        &raw.mutate_in(
+            window.clone(),
             Method::CatalogueAdd,
             action_id,
             ActionTarget::environment(environment_id),
@@ -764,7 +769,8 @@ async fn a_resubmitted_catalogue_action_is_answered_from_its_own_record() {
     // The same identity and the same payload. A second enrolment of one root is refused, so an
     // answer that repeats the first can only have come from the record the first settled.
     let again: wire::CatalogueAddResult = typed(
-        &raw.mutate(
+        &raw.mutate_in(
+            window,
             Method::CatalogueAdd,
             action_id,
             ActionTarget::environment(environment_id),
