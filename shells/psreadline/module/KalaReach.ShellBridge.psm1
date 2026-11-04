@@ -625,7 +625,9 @@ function Initialize-KalaReachBridge {
     Clear-KrSecret
     Remove-Item -Path ('Env:' + $script:KR_ENDPOINT_VARIABLE) -ErrorAction SilentlyContinue
     Remove-Item -Path ('Env:' + $script:KR_SECRET_VARIABLE) -ErrorAction SilentlyContinue
-    Remove-Item -Path ('Env:' + $script:KR_HANDSHAKE_WAIT_VARIABLE) -ErrorAction SilentlyContinue
+    # Not `Remove-Item`: a session whose environment never named the wait has nothing to remove,
+    # and removing an absent item of the `Env:` drive adds an `$Error` record (see `Set-KrToken`).
+    [Environment]::SetEnvironmentVariable($script:KR_HANDSHAKE_WAIT_VARIABLE, [NullString]::Value)
 
     Install-KrReadLineWrapper
 }
