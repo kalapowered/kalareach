@@ -1752,6 +1752,9 @@ pub struct RawDevice {
     /// The frames the reading task has found, in the order they arrived.
     heard: tokio::sync::Mutex<Heard>,
     reading: tokio::task::JoinHandle<()>,
+    /// How long a mutation this connection sends asks to stand, from the moment the host receives it,
+    /// and how long [`Self::mutate_in`] waits for its answer.
+    request_life: Duration,
 }
 
 /// The frames a task reading a control stream passes on, in the order they arrived.
@@ -1848,7 +1851,18 @@ impl RawDevice {
             next_request: std::sync::atomic::AtomicU64::new(1),
             heard: tokio::sync::Mutex::new(heard),
             reading,
+            request_life: Duration::from_secs(120),
         })
+    }
+
+    /// Has the mutations this connection sends ask to stand for `life` from the moment the host
+    /// receives them, and [`Self::mutate_in`] wait that long for an answer. A case that holds a
+    /// request at the host for as long as the case takes has the host's own limit on the request
+    /// stand at the longest the protocol allows.
+    #[must_use]
+    pub fn lasting(mut self, life: Duration) -> Self {
+        self.request_life = life;
+        self
     }
 
     /// The next frame the host sent that nothing has read, or `None` when the control stream has
@@ -1948,7 +1962,9 @@ impl RawDevice {
             target,
             expected: ParamsValue::empty(),
             action_window_id,
-            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(120_000),
+            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(
+                u64::try_from(self.request_life.as_millis()).expect("a life in milliseconds"),
+            ),
             params: ParamsValue::from_typed(params).expect("the parameters encode"),
         }));
         (request_id, frame)
@@ -2030,7 +2046,7 @@ impl RawDevice {
         if self.transport.send(&frame).await.is_err() {
             return None;
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let deadline = tokio::time::Instant::now() + self.request_life;
         loop {
             let frame = tokio::time::timeout_at(deadline, self.heard_next())
                 .await

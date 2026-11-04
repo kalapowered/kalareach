@@ -17,6 +17,7 @@ use kr_crypto::keys::DeviceKeys;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::GrantExpiry;
 use kr_protocol::ids::{ActionId, DeviceId, GrantId, InvitationId, SessionId};
+use kr_protocol::limits::MAX_MUTATION_TTL;
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
@@ -178,13 +179,13 @@ async fn kr_req_25_10_a_device_redeems_its_invitation_once_and_a_repeat_of_the_a
 /// stopped waiting without the timer leaves no place for an ended wait, and one that decided before
 /// its wait ended has the earlier place, however late the case reads the answer.
 ///
-/// The limits that remain are the request's own. The raw device asks for two minutes from the
-/// moment the host receives the request, and the host refuses the redemption by name if it reaches
-/// its commit after that, which leaves the grant inactive and the case waiting for an effect that
-/// ended. The raw device also stops waiting for an answer two minutes after it sent the request.
-/// The route's write, the redemption's way to the store, the hold and the case's letting go of it
-/// have to take under two minutes together. [`within`] ends a case that went wrong and decides
-/// nothing for a run that stays inside them.
+/// The limits that remain are the request's own. The raw device asks for the longest life the
+/// protocol allows, five minutes from the moment the host receives the request, and the host
+/// refuses the redemption by name if it reaches its commit after that, which leaves the grant
+/// inactive and the case waiting for an effect that ended. The raw device also stops waiting for an
+/// answer that long after it sent the request. The route's write, the redemption's way to the
+/// store, the hold and the case's letting go of it have to take under five minutes together.
+/// [`within`] ends a case that went wrong and decides nothing for a run that stays inside them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repeat_is_answered_as_it_ended()
  {
@@ -204,7 +205,9 @@ async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repea
         invitation_id: issued.preview.invitation_id,
     };
     let action = ActionId::new(kr_ipc::new_uuid());
-    let connection = RawDevice::connect(&host, &device, &record).await;
+    let connection = RawDevice::connect(&host, &device, &record)
+        .await
+        .lasting(Duration::from_millis(MAX_MUTATION_TTL.get()));
 
     // The window is part of what an action is, so both presentations go under the one the
     // connection holds now: a window the host renews to between them would make the second a

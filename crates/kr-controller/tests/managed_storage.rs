@@ -25,7 +25,7 @@ use kr_client::services::{
     ServiceSigner, managed_response_limits,
 };
 use kr_controller::account::{HostAccount, Service};
-use kr_controller::backup::runtime::{OPERATOR_CEILING, STORAGE_DEADLINES, TOKEN_CHECK};
+use kr_controller::backup::runtime::{OPERATOR_CEILING, TOKEN_CHECK};
 use kr_controller::backup::store::{AttemptStatus, MadeFrom, Production, Remote};
 use kr_controller::quiet::{LONGEST_DELAY, Timer};
 use kr_controller::service::{Clocks, Controller, ControllerSetup, WallClock};
@@ -6090,8 +6090,10 @@ async fn a_deadline_that_passes_while_the_bundle_write_waits_for_its_own_token_s
 /// passes, says nothing was read and owes nothing: a runner that stops for that long cuts the first
 /// look and not the second. So the look is made again, with the fault armed before each one, until
 /// the host owes a delay. A look that meets the fault and is not cut owes it, so this ends at the
-/// first look that does. The guard is shorter than the time a request the case holds has to be
-/// answered in: after that the call goes on without the case, and what fails is another step.
+/// first look that does. The guard is a failure guard of minutes, as [`within`] is: it only keeps
+/// a case whose host never owes the delay from hanging, and decides nothing for a run that owes
+/// it. The request the case holds beside the looks is bounded by the transport's read deadline, and
+/// a stall longer than that ends it whatever this waits for.
 ///
 /// A look that the service answered with the refusal and that left nothing owed lost the delay, and
 /// the case fails there. The host counts the refusals it was given, so a look is told from one a
@@ -6100,6 +6102,9 @@ async fn a_deadline_that_passes_while_the_bundle_write_waits_for_its_own_token_s
 /// it read is made again: the request of a look that was cut can take the fault late. The delay
 /// owed is the one the service named.
 async fn the_service_names_a_delay_to_a_look_at_its_storage_state(rig: &Rig, delay: Moment) {
+    /// The longest the looks are made again for, as long as a wait on any other condition here.
+    const LOOKS_GUARD: Duration = Duration::from_secs(180);
+
     let Moment::Refuse {
         retry_after_seconds: Some(named),
         ..
@@ -6109,8 +6114,7 @@ async fn the_service_names_a_delay_to_a_look_at_its_storage_state(rig: &Rig, del
     };
     let quiet = rig.controller.backup_runtime().expect("a carrier").quiet();
     let mut said = None;
-    let guard = STORAGE_DEADLINES.read - Duration::from_secs(10);
-    let owed = tokio::time::timeout(guard, async {
+    let owed = tokio::time::timeout(LOOKS_GUARD, async {
         while quiet.left().is_none() {
             rig.served.web().fail(STATUS, 1, delay);
             let refused = rig.controller.backup_status_reads_refused();
