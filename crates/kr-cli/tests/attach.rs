@@ -639,6 +639,11 @@ struct TerminalOutput {
 }
 
 impl TerminalOutput {
+    /// Starts reading the terminal, and returns once the thread that reads it is running.
+    ///
+    /// It is called, and the replies the terminal owes are registered, before the command that
+    /// writes to the terminal is started: the command asks the terminal what it is and gives up on
+    /// an answer after one second, and a thread started after it can be scheduled later than that.
     fn collect(reader: Box<dyn Read + Send>) -> Self {
         Self {
             seen: terminal::collect(reader),
@@ -1000,6 +1005,8 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
     let before = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
 
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let queries = answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
     let mut shell = pty
         .slave
         // The trailing command keeps the shell from replacing itself with `kr`: the shell has to
@@ -1013,8 +1020,6 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let queries = answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
     output.expect_within(
         b"ready",
         LIVENESS_DEADLINE,
@@ -1111,6 +1116,9 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
         })
         .expect("opens a terminal");
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let queries =
+        answer_keyboard_and_mode_queries(&output, pty.master.take_writer().expect("a writer"));
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -1121,9 +1129,6 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let queries =
-        answer_keyboard_and_mode_queries(&output, pty.master.take_writer().expect("a writer"));
     output.expect_within(
         b"ready",
         LIVENESS_DEADLINE,
@@ -1234,6 +1239,9 @@ async fn an_attach_that_fails_after_the_handshake_leaves_the_terminal_the_modes_
         })
         .expect("opens a terminal");
     let display = unreachable.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let queries =
+        answer_keyboard_and_mode_queries(&output, pty.master.take_writer().expect("a writer"));
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -1244,9 +1252,6 @@ async fn an_attach_that_fails_after_the_handshake_leaves_the_terminal_the_modes_
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let queries =
-        answer_keyboard_and_mode_queries(&output, pty.master.take_writer().expect("a writer"));
 
     // The status is read once its line is whole: the digit can arrive after the rest of the marker.
     let status = exit_status(&output, "attach-finished-");
@@ -1299,6 +1304,8 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
     let before = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
 
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let queries = answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -1309,8 +1316,6 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let queries = answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
     output.expect_within(
         b"ready",
         LIVENESS_DEADLINE,
@@ -1426,6 +1431,8 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
         .expect("opens a terminal");
 
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let queries = answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -1436,8 +1443,6 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let queries = answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
     output.expect_within(
         b"kr-up.",
         LIVENESS_DEADLINE,
@@ -1533,6 +1538,7 @@ async fn a_terminal_that_does_not_finish_the_handshake_fails_the_attach_and_keep
     let before = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
 
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -1543,7 +1549,6 @@ async fn a_terminal_that_does_not_finish_the_handshake_fails_the_attach_and_keep
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     // Nothing answers. The handshake's own deadline ends it.
     output.expect_within(
         b"attach-finished-6",
@@ -1597,6 +1602,12 @@ async fn what_was_typed_during_the_handshake_reaches_the_application() {
         })
         .expect("opens a terminal");
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let queries = answer_and_type(
+        &output,
+        pty.master.take_writer().expect("a writer"),
+        b"kr-typed-early\n",
+    );
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -1607,12 +1618,6 @@ async fn what_was_typed_during_the_handshake_reaches_the_application() {
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let queries = answer_and_type(
-        &output,
-        pty.master.take_writer().expect("a writer"),
-        b"kr-typed-early\n",
-    );
     // The session is what is asked, because the outer terminal would show these bytes back whether
     // they were forwarded or not: a handshake that failed restores echo, and echo alone would
     // satisfy a terminal-side assertion while the application had never been given anything.
@@ -1657,6 +1662,8 @@ async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_a
         })
         .expect("opens a terminal");
     let before = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let queries = answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -1668,8 +1675,6 @@ async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_a
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let queries = answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
 
     // The code, not merely "not zero": 3 is a host this command could not reach, and 6 is a
     // terminal that never answered. Accepting any failure would let a handshake that timed out
@@ -1724,6 +1729,7 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
         })
         .expect("opens a terminal");
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -1734,7 +1740,6 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     output.expect_within(
         b"ready",
         LIVENESS_DEADLINE,
@@ -1865,6 +1870,11 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
         })
         .expect("opens a terminal");
     let display = outer.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    // A pseudo-terminal hands out its writer once, and two things need it here: the answer to the
+    // outer command's handshake, and this test typing afterwards.
+    let keyboard = terminal::keys(pty.master.take_writer().expect("a writer"));
+    let _queries = output.reply_to(b"\x1b[c", b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c", &keyboard);
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -1875,11 +1885,6 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    // A pseudo-terminal hands out its writer once, and two things need it here: the answer to the
-    // outer command's handshake, and this test typing afterwards.
-    let keyboard = terminal::keys(pty.master.take_writer().expect("a writer"));
-    let _queries = output.reply_to(b"\x1b[c", b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c", &keyboard);
     let types = |bytes: &[u8]| {
         let mut writer = keyboard.lock().expect("the writer is not poisoned");
         writer.write_all(bytes).expect("types");
@@ -2135,6 +2140,7 @@ async fn a_descriptor_its_worker_cannot_answer_for_is_not_attached_through() {
         })
         .expect("opens a terminal");
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -2145,7 +2151,6 @@ async fn a_descriptor_its_worker_cannot_answer_for_is_not_attached_through() {
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     assert_ne!(
         exit_status(&output, "attach-finished-"),
         0,
@@ -2390,6 +2395,9 @@ async fn a_connection_lost_after_a_refusal_ends_the_attachment_as_a_lost_connect
         })
         .expect("opens a terminal");
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let (queries, keys) =
+        answer_keyboard_queries_then_type(&output, pty.master.take_writer().expect("a writer"));
     let shell = pty
         .slave
         .spawn_command(shell_running(
@@ -2404,9 +2412,6 @@ async fn a_connection_lost_after_a_refusal_ends_the_attachment_as_a_lost_connect
         hosted: &hosted,
         shell,
     };
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let (queries, keys) =
-        answer_keyboard_queries_then_type(&output, pty.master.take_writer().expect("a writer"));
     output.expect_within(
         b"kr-ready",
         LIVENESS_DEADLINE,

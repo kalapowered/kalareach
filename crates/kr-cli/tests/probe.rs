@@ -208,6 +208,11 @@ struct TerminalOutput {
 }
 
 impl TerminalOutput {
+    /// Starts reading the terminal, and returns once the thread that reads it is running.
+    ///
+    /// It is called, and the replies the terminal owes are registered, before the command that
+    /// writes to the terminal is started: the command asks the terminal what it is and gives up on
+    /// an answer after one second, and a thread started after it can be scheduled later than that.
     fn collect(reader: Box<dyn Read + Send>) -> Self {
         Self {
             seen: terminal::collect(reader),
@@ -327,6 +332,8 @@ async fn the_exchange_ends_with_the_terminator_and_no_reply_reaches_the_applicat
         })
         .expect("opens a terminal");
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let keys = terminal::keys(pty.master.take_writer().expect("a writer"));
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -337,8 +344,6 @@ async fn the_exchange_ends_with_the_terminator_and_no_reply_reaches_the_applicat
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let keys = terminal::keys(pty.master.take_writer().expect("a writer"));
 
     // The terminal answers every question, and the person types through the middle of it. The
     // answer is typed the moment the question that ends the exchange has arrived: the exchange has
@@ -438,6 +443,7 @@ async fn a_terminal_that_never_finishes_the_exchange_fails_the_attempt() {
         .expect("opens a terminal");
     let before = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -448,7 +454,6 @@ async fn a_terminal_that_never_finishes_the_exchange_fails_the_attempt() {
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     // Nothing answers. The exchange has one second, and the attempt fails rather than beginning to
     // forward on a stream that may still receive a late reply.
     let started = Instant::now();
@@ -553,6 +558,14 @@ async fn the_exchange_ends_when_the_terminal_answers_in_a_process_whose_timers_w
         })
         .expect("opens a terminal");
     let display = hosted.display.get().to_string();
+    // Collected, and answered, by threads that are made with this thread's own slack, before the
+    // slack is raised and before the shell that asks is started.
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    let keys = terminal::keys(Box::new(Late {
+        inner: pty.master.take_writer().expect("a writer"),
+        by: Duration::from_millis(100),
+    }));
+    let answering = output.reply_to(b"\x1b[c", b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c", &keys);
     let mut shell = started_with_timers_woken_late(Duration::from_millis(1500), || {
         pty.slave
             .spawn_command(shell_running(
@@ -564,13 +577,6 @@ async fn the_exchange_ends_when_the_terminal_answers_in_a_process_whose_timers_w
             ))
             .expect("starts the shell")
     });
-    // Collected, and answered, by threads that were made with this thread's own slack.
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
-    let keys = terminal::keys(Box::new(Late {
-        inner: pty.master.take_writer().expect("a writer"),
-        by: Duration::from_millis(100),
-    }));
-    let answering = output.reply_to(b"\x1b[c", b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c", &keys);
     assert!(
         answering.typed_within(Duration::from_secs(30)),
         "the command asked the terminal what it is: {}",
@@ -605,6 +611,7 @@ async fn no_probe_asks_the_terminal_nothing() {
         })
         .expect("opens a terminal");
     let display = hosted.display.get().to_string();
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -615,7 +622,6 @@ async fn no_probe_asks_the_terminal_nothing() {
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     // The screen arrives: the choice is made before anything is written, so there is no handshake
     // to wait for and the attachment simply begins.
     assert!(
@@ -653,6 +659,7 @@ async fn a_create_whose_terminal_exchange_fails_asks_for_no_session() {
             pixel_height: 0,
         })
         .expect("opens a terminal");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -663,7 +670,6 @@ async fn a_create_whose_terminal_exchange_fails_asks_for_no_session() {
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     assert!(
         output.wait_for(b"create-finished-", Duration::from_secs(40)),
         "the command finished: {}",
@@ -701,6 +707,7 @@ async fn unanswered_probe(runtime: &Path, state: &Path) {
             pixel_height: 0,
         })
         .expect("opens a terminal");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let mut shell = pty
         .slave
         .spawn_command(shell_over(
@@ -712,7 +719,6 @@ async fn unanswered_probe(runtime: &Path, state: &Path) {
             ),
         ))
         .expect("starts the shell");
-    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     assert!(
         output.wait_for(b"create-finished-", Duration::from_secs(40)),
         "the command finished: {}",

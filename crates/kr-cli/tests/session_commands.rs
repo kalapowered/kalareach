@@ -224,6 +224,11 @@ struct TerminalOutput {
 }
 
 impl TerminalOutput {
+    /// Starts reading the terminal, and returns once the thread that reads it is running.
+    ///
+    /// It is called, and the replies the terminal owes are registered, before the command that
+    /// writes to the terminal is started: the command asks the terminal what it is and gives up on
+    /// an answer after one second, and a thread started after it can be scheduled later than that.
     fn collect(reader: Box<dyn Read + Send>) -> Self {
         Self {
             seen: terminal::collect(reader),
@@ -290,15 +295,16 @@ impl Attached {
             host.temp.paths().state_root().display().to_string(),
         );
         builder.cwd("/");
-        let shell = pty.slave.spawn_command(builder).expect("starts the shell");
         let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
         let writer = terminal::keys(pty.master.take_writer().expect("a writer"));
         // The command asks the terminal what it is before it changes anything, and a terminal
         // answers. Without the answer the bounded handshake fails and there is nothing to attach.
+        // The answer is owed before the command starts, so that it is typed the moment the
+        // question arrives.
+        let answering = output.reply_to(b"\x1b[c", b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c", &writer);
+        let shell = pty.slave.spawn_command(builder).expect("starts the shell");
         assert!(
-            output
-                .reply_to(b"\x1b[c", b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c", &writer)
-                .typed_within(LIVENESS_DEADLINE),
+            answering.typed_within(LIVENESS_DEADLINE),
             "the command asked this terminal what it is: the answer was not typed within \
              {LIVENESS_DEADLINE:?}; the terminal was sent: {}",
             output.text().escape_debug()
