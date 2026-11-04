@@ -334,6 +334,23 @@ fn what_the_host_reads_from_current_once_is_of_one_release_though_a_switch_falls
 fn a_program_started_from_the_release_current_names_runs_that_release_during_switches() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// Tells the switching thread to stop however the starts end, a failed assertion included.
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Ends the program a start made if the case leaves before the program has ended.
+    struct Started(std::process::Child);
+    impl Drop for Started {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     const STARTS: u32 = 40;
     let test = TestStore::create();
     let one = release("0.1.0+aaaaaaaaaaaa");
@@ -350,6 +367,7 @@ fn a_program_started_from_the_release_current_names_runs_that_release_during_swi
                 round += 1;
             }
         });
+        let _stop = Stop(&finished);
         for start in 0..STARTS {
             let program = test
                 .store
@@ -371,14 +389,16 @@ fn a_program_started_from_the_release_current_names_runs_that_release_during_swi
             );
             let talk = test.root.join(format!("talk-{start}"));
             std::fs::create_dir(&talk).expect("a directory to talk through");
-            let mut child = std::process::Command::new(&program)
-                .args(["--exact", "helper", "--nocapture", "--test-threads", "1"])
-                .env(HELPER, &talk)
-                .current_dir(&test.root)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("the program starts");
+            let mut child = Started(
+                std::process::Command::new(&program)
+                    .args(["--exact", "helper", "--nocapture", "--test-threads", "1"])
+                    .env(HELPER, &talk)
+                    .current_dir(&test.root)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("the program starts"),
+            );
             wait_for(&talk.join("started"));
             std::fs::write(talk.join("go"), b"").expect("go");
             wait_for(&talk.join("said"));
@@ -393,9 +413,8 @@ fn a_program_started_from_the_release_current_names_runs_that_release_during_swi
                 "the kernel names the program the read named"
             );
             std::fs::write(talk.join("end"), b"").expect("end");
-            assert!(child.wait().expect("the program ends").success());
+            assert!(child.0.wait().expect("the program ends").success());
         }
-        finished.store(true, Ordering::SeqCst);
     });
 }
 
