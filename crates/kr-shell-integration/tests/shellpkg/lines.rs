@@ -819,14 +819,15 @@ pub fn a_prompt_a_line_opens_keeps_the_lines_block_and_capability(kind: ShellKin
 /// block and a prompt that works.
 ///
 /// The key has to arrive while the module waits for the answer, and nothing about the harness's
-/// pace may decide that. So the module keeps the long wait every case gives it, the worker holds
-/// the answer back, and it is answered only once the key is in the terminal: what ends the wait is
-/// the answer, which comes after the key by construction. A line that had run before the key was
-/// typed would be a key that missed the wait, and fails the case.
+/// pace may decide that. So the module waits for longer than the harness waits for anything, the
+/// worker holds the answer back, and it is answered only once the key is in the terminal: what
+/// ends the wait is the answer, which comes after the key by construction. A line that had run
+/// before the key was typed would be a module that did not wait, and fails the case.
 pub fn a_cancellation_during_an_unanswered_acceptance_leaves_the_prompt_working(kind: ShellKind) {
     let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
+    session.lets_the_bridge_wait_beyond_any_reply();
     session.commands.silent_acceptance = true;
     let line = "kr-probe cancelled-in-the-acceptance";
     session.forget_events();
@@ -839,8 +840,8 @@ pub fn a_cancellation_during_an_unanswered_acceptance_leaves_the_prompt_working(
     };
     assert!(
         probes.runs().is_empty(),
-        "the line ran before the key was typed, so the key did not arrive while the module waited \
-         for the answer: {:?}",
+        "the line ran before its acceptance was answered, so the module did not wait for the answer: \
+         {:?}",
         probes.runs()
     );
     session.type_bytes(CTRL_C);

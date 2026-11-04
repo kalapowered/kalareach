@@ -132,6 +132,13 @@ pub const STEP: Duration = Duration::from_millis(60);
 /// [`Session::lets_the_bridge_give_up_on_a_question`].
 const PATIENT_ANSWER_WAIT_MS: u32 = 120_000;
 
+/// How long the bridge waits for an answer in a case that holds one back until the harness has done
+/// something that no pace of the harness's can delay past the wait.
+///
+/// The harness gives up on any of its own waits at [`REPLY`] and fails its case, so a bridge that
+/// waits for longer than that is still waiting at every moment at which the harness is still going.
+const WAIT_BEYOND_ANY_REPLY_MS: u32 = 600_000;
+
 /// How long the PowerShell package's module waits for the worker's answer to its hello.
 ///
 /// The module ships with five seconds, which is long beside a worker that answers in under a
@@ -2545,6 +2552,21 @@ impl Session {
             "the shell does not take the line that sets the wait for the next question:\n{}",
             self.terminal_output()
         );
+    }
+
+    /// Makes the bridge wait for the worker's answers longer than the harness waits for anything,
+    /// for a case that holds an answer back until it has typed a key.
+    ///
+    /// Nothing the harness does at any pace puts the key after the wait: the harness has failed its
+    /// own case by [`REPLY`], which is less. Nothing is done for a shell whose bridge has no such
+    /// wait.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shell does not take the line or the bridge does not hold the wait after it.
+    pub fn lets_the_bridge_wait_beyond_any_reply(&mut self) {
+        const _: () = assert!(WAIT_BEYOND_ANY_REPLY_MS as u64 > REPLY.as_millis() as u64);
+        self.sets_the_bridge_answer_wait(WAIT_BEYOND_ANY_REPLY_MS);
     }
 
     /// Whether the bridge holds the short wait for answers that the lookup it was armed for set.
