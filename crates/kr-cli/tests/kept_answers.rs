@@ -116,6 +116,9 @@ struct State {
     shown: Vec<ActionId>,
     /// Whether a record of sends was in the store when each answer reached the worker.
     recorded_first: Vec<bool>,
+    /// An earlier send that lands just before the next answer is looked at, and answers the
+    /// question.
+    late: Option<ActionId>,
 }
 
 /// One answer as it reached the worker.
@@ -210,6 +213,7 @@ impl Host {
             arrivals: Vec::new(),
             shown: Vec::new(),
             recorded_first: Vec::new(),
+            late: None,
         }));
         let serving = tokio::spawn(serve(
             listener,
@@ -628,6 +632,7 @@ async fn serve_one(
                     .behaviour;
                 if mutation.method.as_str() == "question.answer" {
                     spoil(&state);
+                    land_late(&state);
                     let arrival = arrive(&state, &mutation);
                     // The worker's own rule: an uncertain outcome stands in the way of a new answer
                     // unless the new one names it after it was shown.
@@ -724,6 +729,18 @@ async fn serve_one(
             return;
         }
     }
+}
+
+/// Lands an earlier send that was in flight, when the worker is set to: its receipt is applied and
+/// the question is answered, as though that send had reached the worker first.
+fn land_late(state: &Mutex<State>) {
+    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(landed) = state.late.take() else {
+        return;
+    };
+    state.receipts.push((landed, ReceiptState::Applied));
+    state.question.state = QuestionState::Answered;
+    state.question.revision = QuestionRevision::new(state.question.revision.get() + 1);
 }
 
 /// Leaves a file in the store that no kept answer reads as, when the worker is set to.
@@ -2184,6 +2201,42 @@ async fn the_earlier_outcome_is_named_in_the_document_of_a_send_and_of_a_failed_
     assert_eq!(document["earlier"][0]["state"], "unknown", "{document}");
 }
 
+/// KR-REQ-11.63: an earlier send that lands while a later one is on its way is reported as the one
+/// the host took, and the report says that this command's own send went out and was refused. It
+/// does not say that nothing was sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_the_host_refused_because_an_earlier_one_landed_is_not_called_unsent() {
+    let host = Host::start(Behaviour::EndsAfterTheRead).await;
+    let question = host.question();
+    let (status, _) = host.json(&["question", "answer", &question, "--choice", "left"]);
+    assert_eq!(status, Some(3));
+    let earlier = host.sends()[0];
+    host.state().late = Some(earlier);
+    host.behave(Behaviour::Serves);
+
+    let (status, document) = host.json(&["question", "answer", &question, "--choice", "right"]);
+    assert_eq!(status, Some(1), "{document}");
+    assert_eq!(document["code"], "QUESTION_RESOLVED", "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(
+        message.contains(&format!(
+            "took an earlier send of this answer (action {earlier})"
+        )),
+        "{message}"
+    );
+    assert!(message.contains("this command's own send"), "{message}");
+    assert!(!message.contains("sent nothing"), "{message}");
+    assert_eq!(
+        host.arrivals().len(),
+        1,
+        "the second send reached the worker"
+    );
+    assert!(
+        !host.kept().exists(),
+        "the answer the host took is no longer kept"
+    );
+}
+
 /// KR-REQ-11.63: a replacement answer the worker refuses keeps the pair while an earlier send is
 /// unsettled, and the earlier send stays named; and sends the worker refuses in its own word leave
 /// the record at once, so eight of them leave none.
@@ -2208,10 +2261,10 @@ async fn a_refused_replacement_keeps_the_earlier_send_and_refused_sends_leave_th
         let output = host.kr(&["question", "send", &question]);
         assert_ne!(output.status.code(), Some(0));
     }
-    assert!(
-        host.sends().len() <= 1,
-        "refused sends do not fill the record: {:?}",
-        host.sends()
+    assert_eq!(
+        host.sends(),
+        vec![uncertain],
+        "refused sends do not fill the record"
     );
     host.behave(Behaviour::Serves);
     let output = host.kr(&["question", "send", &question]);

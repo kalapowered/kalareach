@@ -334,8 +334,9 @@ pub enum Reconciled {
         /// The send the host has.
         action_id: ActionId,
     },
-    /// The host could not be asked what became of an earlier send, and its question has ended. It is
-    /// kept, it is not offered, and nothing has been sent.
+    /// The host could not be asked what became of an earlier send and the question has ended or
+    /// moved, or the kept answer changed while it was read. It is kept, it is not offered, and
+    /// nothing has been sent.
     Unsettled(AnswerDraft),
     /// The host took an earlier send of it while the reply was lost. It was not sent again, and it
     /// is no longer kept.
@@ -366,9 +367,17 @@ pub enum Answered {
     /// ended with the outcome unknown. The answer and the identifier it went out under are kept on
     /// this device, so a reconnect asks the host what became of it.
     Kept(AnswerDraft),
-    /// The host took an earlier send of this question's answer while its reply was lost. Nothing
-    /// was sent.
+    /// The host took an earlier send of this question's answer while its reply was lost. This call
+    /// stopped before it sent anything.
     Taken(ActionId),
+    /// The host took an earlier send of this question's answer while its reply was lost, after this
+    /// call had already sent its own, which the host refused because the question was answered.
+    TakenAfterRefusal {
+        /// The earlier send the host took.
+        taken: ActionId,
+        /// This call's own send, which the host refused.
+        refused: ActionId,
+    },
     /// The host has an earlier send and has not finished with it. Nothing was sent.
     Waiting(ActionId),
     /// An earlier send ended with an outcome the host could not establish, and the caller asked to
@@ -388,6 +397,11 @@ impl std::fmt::Debug for Answered {
                 .finish_non_exhaustive(),
             Self::Kept(draft) => formatter.debug_tuple("Kept").field(draft).finish(),
             Self::Taken(action) => formatter.debug_tuple("Taken").field(action).finish(),
+            Self::TakenAfterRefusal { taken, refused } => formatter
+                .debug_struct("TakenAfterRefusal")
+                .field("taken", taken)
+                .field("refused", refused)
+                .finish(),
             Self::Waiting(action) => formatter.debug_tuple("Waiting").field(action).finish(),
             Self::Held(quote) => formatter.debug_tuple("Held").field(quote).finish(),
         }
@@ -472,10 +486,7 @@ pub enum AnswerError {
     )]
     Changed,
     /// Eight earlier sends of this answer are not settled, so a ninth was not made.
-    #[error(
-        "eight earlier sends of this answer are not settled by the host, so nothing was sent; the \
-         kept answer is retired once its question ends"
-    )]
+    #[error("eight earlier sends of this answer are not settled by the host, so nothing was sent")]
     Full,
     /// The host could not be asked what became of an earlier send, so the kept answer stays.
     #[error(
@@ -813,7 +824,8 @@ pub enum Settled {
     Kept,
     /// The kept answer and its record were removed.
     Removed,
-    /// The pair was no longer what the caller read, so nothing was changed.
+    /// The answer kept now is not the one the caller named, so it stays; the identifiers the caller
+    /// held proof of were dropped from its record.
     Changed,
 }
 
@@ -958,7 +970,8 @@ impl AnswerDrafts {
     /// Drops sends the caller holds proof of from the record of the answer kept for a question,
     /// and removes the pair too when `remove_when_empty` and the record, read under the store's
     /// lock, then names no other send. A send another command recorded meanwhile stays, and so does
-    /// an answer stored meanwhile, which is not the one `draft` names.
+    /// an answer stored meanwhile, which is not the one `draft` names: only the identifiers leave
+    /// its record.
     ///
     /// # Errors
     ///
@@ -979,9 +992,13 @@ impl AnswerDrafts {
             .map_err(|_| AnswerError::NotPermitted)?;
         let _lock = self.hold()?;
         let now = self.pair(question_id)?;
-        if now.draft != Some(draft) {
+        let Some(on_disk) = now.draft else {
             return Ok(Settled::Changed);
-        }
+        };
+        // An answer stored meanwhile is not the one `draft` names and stays, but the identifiers
+        // this call holds proof of leave the record all the same: a send that is settled and stays
+        // recorded would take a place for ever, since the host has no record of it to say so.
+        let same = on_disk == draft;
         let remaining: Vec<ActionId> = now
             .sends
             .iter()
@@ -989,15 +1006,19 @@ impl AnswerDrafts {
             .filter(|send| !settled.contains(send))
             .collect();
         if remaining.is_empty() {
-            if remove_when_empty {
+            if remove_when_empty && same {
                 self.remove_pair(question_id)?;
                 return Ok(Settled::Removed);
             }
             self.remove_record(question_id)?;
         } else if remaining.len() != now.sends.len() {
-            self.write_record(question_id, vec![draft], &remaining)?;
+            self.write_record(question_id, vec![on_disk], &remaining)?;
         }
-        Ok(Settled::Kept)
+        Ok(if same {
+            Settled::Kept
+        } else {
+            Settled::Changed
+        })
     }
 
     /// Removes the pair kept for a question after a send of the answer was taken: the answer and its
@@ -1538,7 +1559,8 @@ pub async fn learn<H: QuestionHost>(
 
 /// Settles the send an attempt just made, from its own failure, when the client holds proof of
 /// what became of it. It is a write, so it asks the caller for the leave again; when that is
-/// refused the identifier stays, and the next reading of the host settles it.
+/// refused the identifier stays. A send the host refused before it was admitted has no receipt for
+/// a later reading to settle it by, so it stays until the answer is removed.
 fn settle_own<K: Keeper>(
     keeper: &K,
     drafts: &AnswerDrafts,
@@ -1673,9 +1695,12 @@ async fn answered<H: QuestionHost + Sync, K: Keeper + Sync>(
             }
             if ended(&failure.error)
                 && !carried.is_empty()
-                && let Some(taken) = ended_after_send(host, drafts, &draft).await?
+                && let Some(taken) = ended_after_send(host, drafts, &draft, kept).await?
             {
-                return Ok(Answered::Taken(taken));
+                return Ok(Answered::TakenAfterRefusal {
+                    taken,
+                    refused: action_id,
+                });
             }
             Err(AnswerError::Host(*failure.error))
         }
@@ -1696,23 +1721,29 @@ fn ended(error: &ClientError) -> bool {
 
 /// The host refused a send because its question ended. An earlier send of the answer may be the
 /// reason, so every send still in the record is read again: one the host took is reported and the
-/// pair removed, and otherwise the pair is removed only when no read failed.
+/// pair removed, and otherwise the pair is removed only when no read failed. `sent` is the digest
+/// of the answer this call sent: an answer another command stored meanwhile is not this one, and
+/// stays.
 async fn ended_after_send<H: QuestionHost>(
     host: &H,
     drafts: &AnswerDrafts,
     draft: &AnswerDraft,
+    sent: Digest256,
 ) -> Result<Option<ActionId>> {
     let basis = drafts.basis(draft.question_id)?;
+    let ours = basis.draft() == Some(sent);
     let again = if basis.sends().is_empty() {
         Earlier::default()
     } else {
         learn(host, draft.session_id, basis.sends()).await
     };
     if let Some(taken) = again.taken() {
-        let _ = drafts.remove_if_unchanged(draft.question_id, &basis);
+        if ours {
+            let _ = drafts.remove_if_unchanged(draft.question_id, &basis);
+        }
         return Ok(Some(taken));
     }
-    if !again.failed() {
+    if ours && !again.failed() {
         let _ = drafts.remove_if_unchanged(draft.question_id, &basis)?;
     }
     Ok(None)
@@ -1882,7 +1913,10 @@ async fn sent<H: QuestionHost + Sync, K: Keeper + Sync>(
         }
         Err(_) if earlier.failed() => return Err(AnswerError::Unsettled),
         Err(reason) => {
-            let _ = drafts.remove_if_unchanged(draft.question_id, basis)?;
+            // An answer another command stored meanwhile is not the one this retires.
+            if !drafts.remove_if_unchanged(draft.question_id, basis)? {
+                return Err(AnswerError::Changed);
+            }
             return Err(AnswerError::Retired(reason));
         }
     };
@@ -1917,9 +1951,12 @@ async fn sent<H: QuestionHost + Sync, K: Keeper + Sync>(
                 settle_own(keeper, drafts, draft.question_id, digest, action_id, false);
             }
             if ended(&failure.error)
-                && let Some(taken) = ended_after_send(host, drafts, draft).await?
+                && let Some(taken) = ended_after_send(host, drafts, draft, digest).await?
             {
-                return Ok(Answered::Taken(taken));
+                return Ok(Answered::TakenAfterRefusal {
+                    taken,
+                    refused: action_id,
+                });
             }
             Err(AnswerError::Host(*failure.error))
         }

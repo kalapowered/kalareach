@@ -142,6 +142,17 @@ export function earlierWords(earlier: readonly EarlierSend[]): string {
     .join('')
 }
 
+/**
+ * What the page says when the host took an earlier send of an answer to a question while its reply
+ * was lost: that nothing was sent now, or that this press's own send was refused because of it. It
+ * names no text of the answer, since the answer kept may differ from the one the host took.
+ */
+export function landedWords(refused: string | null): string {
+  return refused === null
+    ? 'The host took an earlier send of an answer to this question while its reply was lost. Nothing was sent again.'
+    : 'The host took an earlier send of an answer to this question while its reply was lost. This press sent an answer too, and the host refused it because the question was answered.'
+}
+
 /** What the page says when an answer is held back because an earlier send's outcome is not yet shown. */
 export const HELD_WORDS =
   'An earlier send of your answer ended with an outcome the host could not establish. Nothing was sent now. Press Send again to send this answer as a new send that names it.'
@@ -154,9 +165,9 @@ export function standingWords(standing: Standing): string {
     case 'waiting':
       return 'The host has an earlier send of this answer and has not finished with it. This device will not send it again until the host has.'
     case 'taken':
-      return 'The host took an earlier send of this answer while its reply was lost. This device sent nothing again, and will not.'
+      return `The host took an earlier send of an answer to this question while its reply was lost (action ${standing.action_id}). This device sent nothing again, and will not.`
     case 'unsettled':
-      return 'This question ended, and the host could not be asked what became of an earlier send of this answer. This device will not send it.'
+      return 'This answer is not settled: the host could not be asked what became of an earlier send of it, or it changed while it was read. This device will not send it now.'
     case 'unlisted':
       return 'The session does not list this question, and nothing says the session ended. This device has sent nothing since.'
     case 'ended':
@@ -182,6 +193,14 @@ export function refusalWords(failure: unknown, fallback: string): string {
     default:
       return fallback
   }
+}
+
+/**
+ * What a refusal of the send of a kept answer means for the person. A conflict there is the native
+ * code's own explanation, which says what to do, and not the question having changed.
+ */
+export function keptRefusalWords(failure: unknown, fallback: string): string {
+  return failureCode(failure) === 'DRAFT_CONFLICT' ? fallback : refusalWords(failure, fallback)
 }
 
 /** How long until a question expires, in words, or that it has. */

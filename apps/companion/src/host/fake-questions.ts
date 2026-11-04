@@ -99,6 +99,8 @@ export class ScriptedQuestions implements FakeQuestions {
   #ended = new Set<string>()
   #reachable = true
   readonly #earlier = new Map<string, { readonly id: string; readonly state: EarlierState }>()
+  /** The older uncertain sends of a question, oldest first; the newest is in `#earlier`. */
+  readonly #older = new Map<string, string[]>()
   readonly sent: QuestionAnswerParams[] = []
 
   constructor(ids: QuestionIds) {
@@ -164,7 +166,13 @@ export class ScriptedQuestions implements FakeQuestions {
   }
 
   #leave(questionId: string, state: EarlierState): string {
-    const id = sendId(this.#earlier.size + 1)
+    const id = sendId(this.#earlier.size + (this.#older.get(questionId)?.length ?? 0) + 1)
+    const before = this.#earlier.get(questionId)
+    // An uncertain send left after another is the newest by the host's record, which is the one a
+    // send names.
+    if (before?.state === 'unknown' && state === 'unknown') {
+      this.#older.set(questionId, [...(this.#older.get(questionId) ?? []), before.id])
+    }
     this.#earlier.set(questionId, { id, state })
     return id
   }
@@ -276,7 +284,8 @@ export class ScriptedQuestions implements FakeQuestions {
     if (earlier?.state === 'taken') {
       this.#earlier.delete(shown.question_id)
       this.#kept = this.#kept.filter((each) => each.question_id !== shown.question_id)
-      return { outcome: 'landed', action_id: earlier.id }
+      this.#older.delete(shown.question_id)
+      return { outcome: 'landed', action_id: earlier.id, refused: null }
     }
     if (earlier?.state === 'waiting') return { outcome: 'waiting', action_id: earlier.id }
     if (earlier?.state === 'unknown' && acknowledged !== earlier.id) {
@@ -318,6 +327,7 @@ export class ScriptedQuestions implements FakeQuestions {
       )
     }
     this.#earlier.delete(shown.question_id)
+    this.#older.delete(shown.question_id)
     this.sent.push({
       session_id: shown.session_id,
       question_id: shown.question_id,
@@ -368,12 +378,17 @@ export class ScriptedQuestions implements FakeQuestions {
     const earlier = this.#earlier.get(draft.question_id)
     if (earlier?.state === 'taken') return { standing: 'taken', action_id: earlier.id }
     if (earlier?.state === 'waiting') return { standing: 'waiting', action_id: earlier.id }
+    const unknown = earlier?.state === 'unknown'
     return {
       standing: 'offered',
-      earlier:
-        earlier?.state === 'unknown'
-          ? [{ action_id: earlier.id, state: 'unknown', code: null }]
-          : []
+      earlier: unknown
+        ? [...(this.#older.get(draft.question_id) ?? []), earlier.id].map((id) => ({
+            action_id: id,
+            state: 'unknown' as const,
+            code: null
+          }))
+        : [],
+      quote: unknown ? earlier.id : null
     }
   }
 
@@ -390,7 +405,9 @@ export class ScriptedQuestions implements FakeQuestions {
     const held = this.#questions.find((each) => each.question_id === draft.question_id)
     if (held === undefined) refuse('RESOURCE_UNAVAILABLE', 'The session does not list that question.')
     const earlier = this.#earlier.get(draft.question_id)
-    if (earlier?.state === 'taken') return { outcome: 'landed', action_id: earlier.id }
+    if (earlier?.state === 'taken') {
+      return { outcome: 'landed', action_id: earlier.id, refused: null }
+    }
     if (earlier?.state === 'waiting') return { outcome: 'waiting', action_id: earlier.id }
     if (earlier?.state === 'unknown' && which.acknowledged !== earlier.id) {
       refuse(

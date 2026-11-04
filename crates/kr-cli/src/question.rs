@@ -263,6 +263,16 @@ fn settled(workers: &Workers, answered: Answered) -> Result<Question> {
                 action_id
             ),
         }),
+        Answered::TakenAfterRefusal { taken, refused } => Err(CliError::Unfinished {
+            code: ErrorCode::QuestionResolved,
+            message: shown!(
+                "the host took an earlier send of this answer (action {}) while its reply was \
+                 lost; this command's own send (action {}) went out after it and was refused \
+                 because the question was answered",
+                taken,
+                refused
+            ),
+        }),
         Answered::Waiting(action_id) => Err(CliError::AnswerKept {
             code: ErrorCode::ResourceUnavailable,
             message: shown!(
@@ -902,8 +912,8 @@ pub fn kept_line(reconciled: &Reconciled) -> Line {
 const WAITING_BECAUSE: &str = "the host has an earlier send of it and has not finished with it";
 
 /// Why a kept answer is unsettled, in the words a person is shown.
-const UNSETTLED_BECAUSE: &str = "its question ended, and the host could not be asked what became \
-                                 of an earlier send of it";
+const UNSETTLED_BECAUSE: &str = "it is not settled: the host could not be asked what became of an \
+                                 earlier send of it, or the answer changed while it was read";
 
 /// What the host did with a kept answer that was taken, in the words a person is shown.
 const TAKEN_BECAUSE: &str = "the host took an earlier send of it while its reply was lost";

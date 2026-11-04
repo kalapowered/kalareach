@@ -145,6 +145,10 @@ struct Host {
     shown: Mutex<Vec<ActionId>>,
     /// An earlier send that arrives late, just before the next answer is looked at.
     late: Mutex<Option<(ActionId, QuestionAnswerParams)>>,
+    /// What another command does to the store while the host is reading the questions, once.
+    on_questions: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// What another command does to the store while an answer is on its way to the host, once.
+    on_answer: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// What the store held when each answer reached the host: whether its identifier was recorded.
     recorded_first: Mutex<Vec<bool>>,
     watching: Mutex<Option<AnswerDrafts>>,
@@ -168,6 +172,8 @@ impl Host {
             journal: Mutex::new(Vec::new()),
             shown: Mutex::new(Vec::new()),
             late: Mutex::new(None),
+            on_questions: Mutex::new(None),
+            on_answer: Mutex::new(None),
             recorded_first: Mutex::new(Vec::new()),
             watching: Mutex::new(None),
             learned: Mutex::new(Vec::new()),
@@ -276,6 +282,9 @@ impl QuestionHost for Host {
         session_id: SessionId,
     ) -> impl Future<Output = Result<Vec<Question>, ClientError>> + Send {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        if let Some(meanwhile) = self.on_questions.lock().expect("the lock").take() {
+            meanwhile();
+        }
         let found: Vec<Question> = self
             .questions
             .lock()
@@ -310,6 +319,9 @@ impl QuestionHost for Host {
         if let Some((id, late)) = self.late.lock().expect("the lock").take() {
             let _ = self.take(&late);
             self.holds(id, ReceiptState::Applied);
+        }
+        if let Some(meanwhile) = self.on_answer.lock().expect("the lock").take() {
+            meanwhile();
         }
         let outcome = self.admits(dispatch).and_then(|()| match line {
             Line::Refuses(code) => Err(AnswerFailure::from(ClientError::Host(ProtocolError::new(
@@ -1538,8 +1550,11 @@ async fn a_send_that_lands_late_is_reported_as_the_one_the_host_took() {
         .await
         .outcome
         .expect("the earlier send was taken");
+    // The second send went out and was refused, which the outcome says: this call did not send
+    // nothing.
+    let b = host.dispatches()[1].action_id;
     assert!(
-        matches!(second, Answered::Taken(id) if id == a),
+        matches!(second, Answered::TakenAfterRefusal { taken, refused } if taken == a && refused == b),
         "{second:?}"
     );
     assert!(
@@ -1550,6 +1565,105 @@ async fn a_send_that_lands_late_is_reported_as_the_one_the_host_took() {
         host.questions.lock().expect("the lock")[0].state,
         QuestionState::Answered
     );
+}
+
+/// KR-REQ-11.63: the cleanup after a send the host refused because an earlier one landed removes
+/// only the answer this call sent. An answer another command stored while the send was on its way
+/// stays, and so does every send it carries; the identifier this call settled leaves the record.
+#[tokio::test]
+async fn a_cleanup_after_a_late_arrival_leaves_an_answer_stored_meanwhile() {
+    let (_directory, drafts) = store();
+    let asked = question(70);
+    let host = Host::with(vec![asked.clone()]);
+    host.line(Line::Lost);
+    answer_via(&host, &drafts, &asked, yes(), 5_000)
+        .await
+        .outcome
+        .expect("kept");
+    let a = host.dispatches()[0].action_id;
+    let lost = host.answers()[0].clone();
+    *host.late.lock().expect("the lock") = Some((a, lost));
+    host.line(Line::Up);
+
+    // Another command stores its own answer while the second send is on its way.
+    let replacement = AnswerDraft {
+        version: ANSWER_FORMAT,
+        target: target(),
+        session_id: asked.session_id,
+        question_id: asked.question_id,
+        question_revision: asked.revision,
+        answer: no(),
+        drafted_at_ms: TimestampMs::new(7_000),
+    };
+    let other = drafts.clone();
+    let stored = replacement.clone();
+    *host.on_answer.lock().expect("the lock") = Some(Box::new(move || {
+        begin(&other, &stored).expect("stored by the other command");
+    }));
+
+    let second = answer_via(&host, &drafts, &asked, no(), 6_000)
+        .await
+        .outcome
+        .expect("the earlier send was taken");
+    let b = host.dispatches()[1].action_id;
+    assert!(
+        matches!(second, Answered::TakenAfterRefusal { taken, refused } if taken == a && refused == b),
+        "{second:?}"
+    );
+    let (kept, basis) = drafts
+        .entry(asked.question_id)
+        .expect("reads")
+        .expect("the other command's answer is still kept");
+    assert_eq!(kept, replacement);
+    assert!(
+        !basis.sends().contains(&b),
+        "the send the host refused leaves the record"
+    );
+    assert!(
+        basis.sends().contains(&a),
+        "the send the host took stays named"
+    );
+}
+
+/// KR-REQ-11.63: a retirement decided from a reading of the pair that another command has since
+/// replaced removes nothing, and the report says the pair changed rather than that the answer is
+/// gone.
+#[tokio::test]
+async fn a_retirement_from_a_stale_reading_is_reported_as_a_change() {
+    let (_directory, drafts) = store();
+    let asked = question(71);
+    let kept = answer_offline(&drafts, &asked).await;
+    let (draft, basis) = drafts
+        .entry(asked.question_id)
+        .expect("reads")
+        .expect("kept");
+    assert_eq!(draft, kept);
+
+    // The question ends, and another command stores a replacement while this one reads it.
+    let host = Host::with(vec![asked.clone()]);
+    host.resolve(asked.question_id, QuestionState::Answered);
+    let replacement = AnswerDraft {
+        drafted_at_ms: TimestampMs::new(9_000),
+        answer: no(),
+        ..kept
+    };
+    let other = drafts.clone();
+    let stored = replacement.clone();
+    *host.on_questions.lock().expect("the lock") = Some(Box::new(move || {
+        begin(&other, &stored).expect("stored by the other command");
+    }));
+
+    let attempt = send(&host, &Hold, &drafts, &draft, &basis, Quoting::Sending).await;
+    assert!(
+        matches!(attempt.outcome, Err(AnswerError::Changed)),
+        "{:?}",
+        attempt.outcome
+    );
+    let (now, _) = drafts
+        .entry(asked.question_id)
+        .expect("reads")
+        .expect("the replacement is still kept");
+    assert_eq!(now, replacement);
 }
 
 /// KR-REQ-11.63: a read of the host that fails retires nothing. A kept answer whose question ended

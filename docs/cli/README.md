@@ -1208,7 +1208,10 @@ stopped it. What the command says of the answer is what its attempt established,
 it did not send it, that the worker did not take it, or that whether the worker took it is not
 known. It never calls an answer unsent when it may have arrived. A reply that is not a message came
 after the answer went out, so the answer stays kept and the command says that whether the worker
-took it is not known.
+took it is not known; its code is that of the reply that could not be read. A new answer replaces
+the answer kept earlier for its question as soon as it is recorded. If the worker then refuses the
+new answer in its own word, no answer is kept for the question, unless an earlier send of it is
+still unsettled, and then the new answer is the one kept.
 
 When the answer cannot be written to this device, the command sends nothing, says so, and says
 whether an answer kept earlier for the question is still kept. It exits with 1, or with 9 when an
@@ -1232,8 +1235,9 @@ answer as offered, waiting, unlisted, unsettled, taken or retired.
   The document's `earlier` member says what the worker said of each earlier send: that its outcome
   could not be established, that it refused the send, that it has no record of it, or that it could
   not be asked. No record proves nothing about whether the send arrived late.
-- An answer whose question ended is unsettled, and stays kept, when the worker could not be asked
-  about a send. A read that fails retires no answer.
+- An answer whose question ended or moved is unsettled, and stays kept, when the worker could not
+  be asked about a send, and so is an answer that changed while it was read. A read that fails
+  retires no answer.
 - An answer whose question its session no longer lists, while the session's daemon does not record
   the session ended, is unlisted. It stays kept and is not offered, and `kr question send` neither
   sends nor retires it.

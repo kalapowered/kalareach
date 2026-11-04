@@ -38,6 +38,8 @@ import {
   endedWords,
   expiryWords,
   holdsSomething,
+  keptRefusalWords,
+  landedWords,
   listedChoices,
   offersSomethingElse,
   refusalWords,
@@ -289,9 +291,7 @@ export function QuestionRequests({
               : 'Your answer was recorded.'
           )
         } else if (outcome.outcome === 'landed') {
-          say(
-            'The host took an earlier send of your answer while its reply was lost. Nothing was sent again.'
-          )
+          say(landedWords(outcome.refused))
         } else {
           say(
             'The host did not confirm that. A copy of your answer is kept on this device, and it is sent again only if you send it.',
@@ -313,6 +313,9 @@ export function QuestionRequests({
           return
         }
         setRefusals((current) => ({ ...current, [question.question_id]: words }))
+        // A new answer replaces the one kept before it when it is recorded, and a refusal of it
+        // removes the new one: the kept answers are read again to show what is left.
+        keptChanged()
       })
       .finally(() => {
         setAnswering(null)
@@ -707,22 +710,17 @@ export function KeptAnswers({ sessionId }: { readonly sessionId?: string }): Rea
             // An uncertain earlier send the page has shown in the kept answer's standing is the one
             // this press names.
             const standing = settled.get(each.question_id)
-            const shown =
-              standing?.standing === 'offered'
-                ? standing.earlier.find((earlier) => earlier.state === 'unknown')?.action_id
-                : undefined
+            const shown = standing?.standing === 'offered' ? standing.quote : null
             ask(() =>
               port.questionSendKept({
                 questionId: each.question_id,
                 draftedAtMs: each.drafted_at_ms,
-                ...(shown === undefined ? {} : { acknowledged: shown })
+                ...(shown === null ? {} : { acknowledged: shown })
               })
             )
               .then((outcome) => {
                 if (outcome.outcome === 'landed') {
-                  say(
-                    'The host took an earlier send of your answer while its reply was lost. Nothing was sent again.'
-                  )
+                  say(landedWords(outcome.refused))
                 } else if (outcome.outcome === 'waiting') {
                   say(
                     'The host has an earlier send of your answer and has not finished with it. Nothing was sent now.',
@@ -737,7 +735,7 @@ export function KeptAnswers({ sessionId }: { readonly sessionId?: string }): Rea
                 }
               })
               .catch((error: unknown) => {
-                say(refusalWords(error, failureMessage(error)), 'danger')
+                say(keptRefusalWords(error, failureMessage(error)), 'danger')
               })
               .finally(() => {
                 setBusy(null)
