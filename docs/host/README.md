@@ -3328,36 +3328,35 @@ only a device that holds `host.manage`; the command block reaches only a device 
 history from the moment the command started or earlier, and the `session_description` and
 `working_directory` of `voice.context` only where the grant's history bound admits the moment each
 was produced. The `disabled_reason` of a capability record in `plugin.capabilities` is a sentence of
-the host's. For a signed qualification that the host
-accepted and whose state is not usable, it is followed by the statement of that qualification, which
-is the publisher's published text and not this host's, and is sent as it is. A qualification the
-host refused is reported as not tested, with the host's own sentence of the refusal and no
-statement. The
-`suspension_reason` of an agent instance's binding, which says why rich mutations wait, and the
-refusal of a rich mutation that repeats it, are sent as the host wrote them when the reason is one
-of the host's own sentences. A reason that quotes the method of a request that the connector's table
-does not classify, or what stopped the worker taking a conversation, is replaced by the kind of wait
-it was, and the quoted words are not sent. For a reason the host does not know, the device is told
-only that mutations wait. What a closure records of a resource it left is held to the same rule
-and is replaced by the kind of resource. What the agent of a session says in refusing a prompt, a
-steer, a cancellation, an approval or a plugin's action is the agent's own words, and they quote
-what it was working on. The worker gives them as `INVALID_ARGUMENT`, `UPSTREAM_UNAVAILABLE` or
-`OUTCOME_UNKNOWN`, so on these methods a worker's message with one of those codes is replaced by a
-sentence made from its code. The daemon's own refusals of the same call are made before a worker is
-asked, and a device is told them as they are written. A plugin's action also meets the plugin
-runtime, whose words come as `RESOURCE_UNAVAILABLE` or `UNSUPPORTED_CAPABILITY`: the device is told
-which state the runtime or the component was in, and not what the runtime said, and the answer to an
-approval is told the same way when its component was disabled for a fault. The exception is the
-host's own reasons for refusing the device's argument, which the device needs to correct what it
-sent, and which are told apart by their wording and not by their code: a prompt that names neither a
-draft nor inline text or names both, a parameter an action does not declare, requires, supplies
-twice or does not accept, a value outside its bound, an action that names no attachment, and an
-attachment over the size a package accepts or of a type it does not accept. A reason that has no
-word of the argument in it is sent as the host wrote it. The others quote a word or a number of the
-argument, which the upstream could have written in its place, so the device is told which reason it
-was and not the word or the number. The code and the retry category stay. A candidate that has not
-paired is never given what the pairing store or the rendezvous service reported. The owner at this
-machine is given the whole text, on the local socket.
+the host's. For a signed qualification that the host accepted and whose state is not usable, it is
+followed by the statement of that qualification, which is the publisher's published text and not
+this host's, and is sent as it is. A qualification the host refused is reported as not tested, with
+the host's own sentence of the refusal and no statement. The `suspension_reason` of an agent
+instance's binding, which says why rich mutations wait, and the refusal of a rich mutation that
+repeats it, are sent as the host wrote them when the reason is one of the host's own sentences. A
+reason that quotes the method of a request that the connector's table does not classify, or what
+stopped the worker taking a conversation, is replaced by the kind of wait it was, and the quoted
+words are not sent. For a reason the host does not know, the device is told only that mutations
+wait. What a closure records of a resource it left is held to the same rule and is replaced by the
+kind of resource. What the agent of a session says in refusing a prompt, a steer, a cancellation, an
+approval or a plugin's action is the agent's own words, and they quote what it was working on. The
+worker gives them as `INVALID_ARGUMENT`, `UPSTREAM_UNAVAILABLE` or `OUTCOME_UNKNOWN`, so on these
+methods a worker's message with one of those codes is replaced by a sentence made from its code. The
+daemon's own refusals of the same call are made before a worker is asked, and a device is told them
+as they are written. A plugin's action also meets the plugin runtime, whose words come as
+`RESOURCE_UNAVAILABLE` or `UNSUPPORTED_CAPABILITY`: the device is told which state the runtime or
+the component was in, and not what the runtime said, and the answer to an approval is told the same
+way when its component was disabled for a fault. The exception is the host's own reasons for
+refusing the device's argument, which the device needs to correct what it sent, and which are told
+apart by their wording and not by their code: a prompt that names neither a draft nor inline text or
+names both, a parameter an action does not declare, requires, supplies twice or does not accept, a
+value outside its bound, an action that names no attachment, and an attachment over the size a
+package accepts or of a type it does not accept. A reason that has no word of the argument in it is
+sent as the host wrote it. The others quote a word or a number of the argument, which the upstream
+could have written in its place, so the device is told which reason it was and not the word or the
+number. The code and the retry category stay. A candidate that has not paired is never given what
+the pairing store or the rendezvous service reported. The owner at this machine is given the whole
+text, on the local socket.
 
 What the grant decides, for every request:
 

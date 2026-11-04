@@ -4277,8 +4277,8 @@ mod tests {
     /// The replacement of a quotation gives the words beside it a boundary, which lets the rule
     /// read more, and can complete a pointer's refusal or turn a glued word into a web address.
     /// The rule tells no more of a text than it tells of the text with the words run together, so
-    /// where the two readings differ it tells nothing of the text. A long text is judged by its
-    /// length and not by where the first name is.
+    /// where the two readings differ it tells nothing of the text. A text that holds a pointer's
+    /// place is judged by its length and not by where the first name is.
     #[test]
     fn a_replaced_quotation_never_lets_the_rule_tell_more_than_the_text_without_it_would() {
         let fixed = sentence_for(ErrorCode::InvalidArgument, WHY_NOT_SHOWN);
@@ -4302,9 +4302,10 @@ mod tests {
             // Both readings find a name, in different places: the run-together text finds the path
             // and keeps a clause that holds the program, which only the readings apart find.
             "x: `a b`(chmod 700 q) y: /Users/m".to_owned(),
-            // A name found earlier makes the kept clause short, and a short clause passes the
-            // limit that a long one did not.
+            // The readings differ in a long text, so nothing of it is told.
             long.clone(),
+            // An account found beyond a pointer's place makes the kept clause short, and a short
+            // clause passes the limit that a long one did not.
             beyond,
         ] {
             assert_eq!(
