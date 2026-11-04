@@ -877,7 +877,65 @@ async fn an_attach_to_a_closed_session_in_a_stopped_environment_says_how_it_ende
     );
 }
 
-/// A terminal, with `kr attach` running on it through a shell that reports how it ended.
+/// A terminal whose output is being read, with no command on it yet.
+///
+/// The replies it owes are registered here, before [`World::terminal_running`] starts the command
+/// that asks for them: the command gives up on an answer to a question about what the terminal is
+/// one second after it asks, and a terminal that is read, and has its reply owed, only after the
+/// command starts can be too late to give it.
+struct OpenTerminal {
+    pty: portable_pty::PtyPair,
+    /// The modes the terminal was in before anything ran on it, which a command has to leave it in.
+    before: rustix::termios::Termios,
+    seen: Collected,
+    writer: Keys,
+}
+
+impl OpenTerminal {
+    /// Opens a terminal and starts reading it, returning once the thread that reads it is running.
+    fn new() -> Self {
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("opens a terminal");
+        let before = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the modes");
+        let seen = terminal::collect(pty.master.try_clone_reader().expect("a reader"));
+        let writer = terminal::keys(pty.master.take_writer().expect("a writer"));
+        Self {
+            pty,
+            before,
+            seen,
+            writer,
+        }
+    }
+
+    /// Types `reply` the moment the terminal has been asked what it is `nth` times, by the command
+    /// or by a command it started.
+    fn replies_to_question(&self, nth: usize, reply: &[u8]) -> Answering {
+        terminal::reply_to(&self.seen, 0, b"\x1b[c", nth, reply, &self.writer)
+    }
+
+    /// Owes the replies to the first question the command asks this terminal and, when there is
+    /// one, to the second that the attachment it starts asks, and returns what waits for each.
+    ///
+    /// The second is owed first: the first reply lets the command go on, and the attachment's
+    /// exchange has one second in all from the moment it asks, so the reply to its question has to
+    /// be owed before the reply that lets it ask can be typed.
+    fn replies_to_the_questions(
+        &self,
+        first: &[u8],
+        second: Option<&[u8]>,
+    ) -> (Answering, Option<Answering>) {
+        let second = second.map(|reply| self.replies_to_question(2, reply));
+        (self.replies_to_question(1, first), second)
+    }
+}
+
+/// A terminal, with a command running on it through a shell that reports how it ended.
 struct Terminal {
     pty: portable_pty::PtyPair,
     /// The modes the terminal was in before anything ran on it, which a command has to leave it in.
@@ -912,35 +970,6 @@ impl Terminal {
 
     fn text(&self) -> String {
         String::from_utf8_lossy(&terminal::bytes(&self.seen)).into_owned()
-    }
-
-    /// Answers the command's questions about what this terminal is. The answer is typed by the
-    /// thread that collects what the terminal is sent, the moment the question that ends the
-    /// exchange has arrived: the exchange has one second in all.
-    fn answers_what_it_is(&self) {
-        let answering = self.replies_to_question(1, b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
-        self.typed(answering, "the command asked this terminal what it is");
-    }
-
-    /// Types `reply` the moment the terminal has been asked what it is `nth` times, by the command
-    /// or by a command it started.
-    fn replies_to_question(&self, nth: usize, reply: &[u8]) -> Answering {
-        terminal::reply_to(&self.seen, 0, b"\x1b[c", nth, reply, &self.writer)
-    }
-
-    /// Owes the replies to the first question the command asks this terminal and, when there is
-    /// one, to the second that the attachment it starts asks, and returns what waits for each.
-    ///
-    /// The second is owed first: the first reply lets the command go on, and the attachment's
-    /// exchange has one second in all from the moment it asks, so the reply to its question has to
-    /// be owed before the reply that lets it ask can be typed.
-    fn replies_to_the_questions(
-        &self,
-        first: &[u8],
-        second: Option<&[u8]>,
-    ) -> (Answering, Option<Answering>) {
-        let second = second.map(|reply| self.replies_to_question(2, reply));
-        (self.replies_to_question(1, first), second)
     }
 
     /// Requires that `answering` was typed, and names `what` was asked when it was not.
@@ -1016,29 +1045,28 @@ impl Terminal {
 }
 
 impl World {
-    /// Runs a shell command on a terminal of its own, in the source host's environment, and
-    /// returns that terminal. The command asks it nothing yet: answering is the test's.
-    fn terminal_running(&self, command: &str) -> Terminal {
-        self.terminal_running_in(Path::new("/"), command, &[])
+    /// Runs a shell command on `terminal`, in the source host's environment, and returns the
+    /// terminal with the command on it. The replies the command is owed are registered on
+    /// `terminal` before this is called.
+    fn terminal_running(&self, terminal: OpenTerminal, command: &str) -> Terminal {
+        self.terminal_running_in(terminal, Path::new("/"), command, &[])
     }
 
     /// As [`Self::terminal_running`], in `directory` and with `variables` added to the terminal's
     /// environment.
     fn terminal_running_in(
         &self,
+        terminal: OpenTerminal,
         directory: &Path,
         command: &str,
         variables: &[(&str, &std::ffi::OsStr)],
     ) -> Terminal {
-        let pty = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("opens a terminal");
-        let before = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the modes");
+        let OpenTerminal {
+            pty,
+            before,
+            seen,
+            writer,
+        } = terminal;
         let mut builder = CommandBuilder::new("/bin/sh");
         builder.arg("-c");
         builder.arg(command);
@@ -1061,8 +1089,6 @@ impl World {
         }
         builder.cwd(directory);
         let shell = pty.slave.spawn_command(builder).expect("starts the shell");
-        let seen = terminal::collect(pty.master.try_clone_reader().expect("a reader"));
-        let writer = terminal::keys(pty.master.take_writer().expect("a writer"));
         Terminal {
             before,
             pty,
@@ -1072,28 +1098,35 @@ impl World {
         }
     }
 
+    /// Runs `command` on a terminal that answers the command's questions about what it is. The
+    /// answer is typed by the thread that collects what the terminal is sent, the moment the
+    /// question that ends the exchange has arrived: the exchange has one second in all.
+    fn terminal_answering(&self, command: &str) -> Terminal {
+        let terminal = OpenTerminal::new();
+        let answering = terminal.replies_to_question(1, b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
+        let terminal = self.terminal_running(terminal, command);
+        terminal.typed(answering, "the command asked this terminal what it is");
+        terminal
+    }
+
     /// Runs `kr attach` for a display number in the destination, on a terminal that answers the
     /// command's questions about what it is.
     fn attach_on_a_terminal(&self, display: &str) -> Terminal {
-        let terminal = self.terminal_running(&format!(
-            "{} attach {display} --environment dest; printf 'attach-finished-%s\\n' \"$?\"",
-            support::kr().display()
-        ));
         // The command asks the terminal what it is before it changes anything, and a terminal
         // answers. Without the answer the bounded handshake fails and there is nothing to attach.
-        terminal.answers_what_it_is();
-        terminal
+        self.terminal_answering(&format!(
+            "{} attach {display} --environment dest; printf 'attach-finished-%s\\n' \"$?\"",
+            support::kr().display()
+        ))
     }
 
     /// Runs `kr attach` for a display number of the source host's own environment, on a terminal
     /// that answers the command's questions about what it is.
     fn attach_here_on_a_terminal(&self, display: &str) -> Terminal {
-        let terminal = self.terminal_running(&format!(
+        self.terminal_answering(&format!(
             "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
             support::kr().display()
-        ));
-        terminal.answers_what_it_is();
-        terminal
+        ))
     }
 }
 
@@ -1191,7 +1224,13 @@ fn a_created_session_attached_on_a_terminal(
     arguments: &str,
     variables: &[(&str, &std::ffi::OsStr)],
 ) -> Terminal {
+    let terminal = OpenTerminal::new();
+    let (colours, what_it_is) = terminal.replies_to_the_questions(
+        b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c",
+        Some(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c"),
+    );
     let terminal = world.terminal_running_in(
+        terminal,
         directory,
         &format!(
             "{} new --attach --palette probe {arguments} --shell /bin/sh --shell-mode native_compat \
@@ -1200,10 +1239,6 @@ fn a_created_session_attached_on_a_terminal(
             support::kr().display()
         ),
         variables,
-    );
-    let (colours, what_it_is) = terminal.replies_to_the_questions(
-        b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c",
-        Some(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c"),
     );
     terminal.typed(colours, "the command asked this terminal what it is");
     if let Some(what_it_is) = what_it_is {
@@ -1325,16 +1360,20 @@ async fn a_create_that_is_not_attached(answer_the_attachment: bool) -> String {
     )
     .expect("says from which run the destination is unreachable");
 
-    let terminal = world.terminal_running(&format!(
-        "{} new --attach --palette probe --environment dest --shell /bin/sh --shell-mode native_compat \
-         --startup interactive \
-         --headless; printf 'create-finished-%s\\n' \"$?\"",
-        support::kr().display()
-    ));
     // The command asks this terminal for its colours, and the person types while it does.
+    let terminal = OpenTerminal::new();
     let (colours, what_it_is) = terminal.replies_to_the_questions(
         b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\typed\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c",
         answer_the_attachment.then_some(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c".as_slice()),
+    );
+    let terminal = world.terminal_running(
+        terminal,
+        &format!(
+            "{} new --attach --palette probe --environment dest --shell /bin/sh --shell-mode native_compat \
+             --startup interactive \
+             --headless; printf 'create-finished-%s\\n' \"$?\"",
+            support::kr().display()
+        ),
     );
     terminal.typed(colours, "the command asked this terminal what it is");
     if let Some(what_it_is) = what_it_is {
@@ -1491,16 +1530,20 @@ async fn a_create_whose_bridged_attachment_cannot_ask_the_terminal_says_what_typ
 async fn what_was_typed_while_a_create_asked_for_colours_reaches_the_bridged_shell() {
     let world = World::start().await;
     world.enrol_destination();
-    let terminal = world.terminal_running(&format!(
-        "{} new --attach --palette probe --environment dest --shell /bin/sh --shell-mode native_compat \
-         --startup interactive \
-         --headless; printf 'create-finished-%s\\n' \"$?\"",
-        support::kr().display()
-    ));
     // The five bytes begin a command, which the person finishes once the shell is theirs.
+    let terminal = OpenTerminal::new();
     let (colours, what_it_is) = terminal.replies_to_the_questions(
         b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\echo \x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c",
         Some(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c"),
+    );
+    let terminal = world.terminal_running(
+        terminal,
+        &format!(
+            "{} new --attach --palette probe --environment dest --shell /bin/sh --shell-mode native_compat \
+             --startup interactive \
+             --headless; printf 'create-finished-%s\\n' \"$?\"",
+            support::kr().display()
+        ),
     );
     terminal.typed(colours, "the command asked this terminal what it is");
     if let Some(what_it_is) = what_it_is {

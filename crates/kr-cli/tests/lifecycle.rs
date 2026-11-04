@@ -477,7 +477,7 @@ impl Host {
 
     /// [`Self::create_in_window`] with more options for `kr new`.
     fn create_in_window_with(&self, options: &str, then: &str) -> (Window, Created) {
-        let window = Window::open(
+        let (window, queries) = Window::open_answering(
             self,
             &format!(
                 "env 'PS1={PROMPT}' {} new --attach {options} --headless --shell /bin/sh \
@@ -486,7 +486,7 @@ impl Host {
                 quoted(&self.work)
             ),
         );
-        window.answered(0, window.answer_capability_queries(0));
+        window.answered(0, queries);
         window.wait_for(0, PROMPT.as_bytes(), "the new session's shell is reading");
         let listed = self.only_live_session();
         let session_id: SessionId = listed["session_id"]
@@ -1493,6 +1493,11 @@ struct Screen {
 }
 
 impl Screen {
+    /// Starts reading the terminal, and returns once the thread that reads it is running.
+    ///
+    /// It is called, and the replies the terminal owes are registered, before the command that
+    /// writes to the terminal is started: the command asks the terminal what it is and gives up on
+    /// an answer after one second, and a thread started after it can be scheduled later than that.
     fn collect(reader: Box<dyn Read + Send>) -> Self {
         Self {
             seen: terminal::collect(reader),
@@ -1539,6 +1544,12 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Owes the answer to the next capability exchange `kr` starts on `screen`'s terminal after `mark`,
+/// typed through `keys` the moment the question that ends the exchange has arrived.
+fn answer_capability_exchange(screen: &Screen, keys: &terminal::Keys, mark: usize) -> Answering {
+    terminal::reply_to(&screen.seen, mark, b"\x1b[c", 1, PROBE_ANSWER, keys)
+}
+
 /// A terminal window: a pseudo-terminal with a shell on it, as a person's own terminal has.
 ///
 /// The shell is the session leader and `kr` runs inside it, which is how a person's terminal is
@@ -1552,8 +1563,31 @@ struct Window {
 }
 
 impl Window {
-    /// Opens a window whose shell runs `script`.
+    /// Opens a window whose shell runs `script`, which asks the terminal nothing.
     fn open(host: &Host, script: &str) -> Self {
+        Self::start(host, script, |_, _| ()).0
+    }
+
+    /// Opens a window whose shell runs `script`, a command of which asks the terminal what it is,
+    /// and returns what waits for the answer.
+    ///
+    /// The answer is owed before the shell starts, so that it is typed the moment the question
+    /// arrives: the exchange has one second in all.
+    fn open_answering(host: &Host, script: &str) -> (Self, Answering) {
+        Self::start(host, script, |screen, keys| {
+            answer_capability_exchange(screen, keys, 0)
+        })
+    }
+
+    /// Opens the window's terminal and starts reading it, calls `owing` with what it reads and
+    /// types through to register the replies the terminal owes, and only then starts the shell
+    /// that runs `script`: a command the shell starts asks a terminal that is already read, and
+    /// whose answer is already owed.
+    fn start<T>(
+        host: &Host,
+        script: &str,
+        owing: impl FnOnce(&Screen, &terminal::Keys) -> T,
+    ) -> (Self, T) {
         let terminal = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -1562,6 +1596,9 @@ impl Window {
                 pixel_height: 0,
             })
             .expect("opens a terminal");
+        let screen = Screen::collect(terminal.master.try_clone_reader().expect("a reader"));
+        let keys = terminal::keys(terminal.master.take_writer().expect("a writer"));
+        let owed = owing(&screen, &keys);
         let mut command = CommandBuilder::new("/bin/sh");
         command.arg("-c");
         command.arg(script);
@@ -1574,14 +1611,15 @@ impl Window {
             .slave
             .spawn_command(command)
             .expect("starts the window's shell");
-        let screen = Screen::collect(terminal.master.try_clone_reader().expect("a reader"));
-        let keys = terminal::keys(terminal.master.take_writer().expect("a writer"));
-        Self {
-            _terminal: terminal,
-            shell,
-            screen,
-            keys,
-        }
+        (
+            Self {
+                _terminal: terminal,
+                shell,
+                screen,
+                keys,
+            },
+            owed,
+        )
     }
 
     fn mark(&self) -> usize {
@@ -1640,14 +1678,7 @@ impl Window {
     /// The reply is typed by the thread that collects what the terminal is sent, the moment the
     /// question that ends the exchange has arrived: the exchange has one second in all.
     fn answer_capability_queries(&self, mark: usize) -> Answering {
-        terminal::reply_to(
-            &self.screen.seen,
-            mark,
-            b"\x1b[c",
-            1,
-            PROBE_ANSWER,
-            &self.keys,
-        )
+        answer_capability_exchange(&self.screen, &self.keys, mark)
     }
 
     /// Requires that `queries`, started at `mark`, were answered.
@@ -4881,11 +4912,11 @@ fn a_new_window_through_the_konsole_profile_creates_a_session_each_time() {
             .expect("the profile holds a command"),
     );
     let open = || {
-        let window = Window::open(
+        let (window, queries) = Window::open_answering(
             &host,
             &format!("{stored}; printf '\\nnew-%s-%s\\n' finished \"$?\"; IFS= read -r _"),
         );
-        window.answered(0, window.answer_capability_queries(0));
+        window.answered(0, queries);
         window
     };
     let sessions_attached = |wanted: usize| -> Vec<Value> {
