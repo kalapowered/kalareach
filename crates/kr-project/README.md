@@ -91,14 +91,16 @@ mark; what is not is left where it is, with a line saying so. The paragraph on i
 that does and does not establish.
 
 **Directories, not names.** Every directory the boundary lets an invocation write in is opened first
-and required to be the object its record names: the working tree by the identity the repository's
-record carries, the Git common directory by its own, the reserved destination by the identity the
-reservation returned. A directory substituted at one of those names is refused before anything
-starts. Git's own program and helper directory are executed and never written in, and no record
-names them: Linux opens each by its path when it makes its rules, and the profile on macOS names
-each by its path. The child then does not start at a path either: it moves into the open working
-directory before the boundary is applied and before Git runs, with `-C .` as its only directory
-argument.
+and required to be the object the caller holds an identity for: the working tree by the identity the
+repository's record carries, or, for a checkout handed over by path, by the one read from the
+directory opened a moment before; the Git common directory by its own; the reserved destination by
+the identity the reservation returned; the invocation's own temporary directory by the identity read
+when it was made. A directory substituted at one of those names is refused before anything starts.
+The programs an invocation may execute (Git's, the approved ssh program and the connection shell)
+and Git's helper directory are not written in, and nobody holds an identity for them: Linux opens
+each by its path when it makes its rules, and the profile on macOS names each by its path. The
+child then does not start at a path either: it moves into the open working directory before the
+boundary is applied and before Git runs, with `-C .` as its only directory argument.
 
 What the kernels then enforce is this: **opens for writing succeed only inside the granted root
 objects' subtrees as they stand at open time; execution stays confined; the granted roots are

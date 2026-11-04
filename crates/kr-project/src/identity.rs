@@ -524,8 +524,10 @@ impl OpenedRepository {
     ///
     /// Returns [`ProjectError::IdentityChanged`] for a Git directory that is not the recorded one,
     /// [`ProjectError::PermissionDenied`] for a repository that sets `core.worktree`,
-    /// [`ProjectError::ConfigurationRejected`] for one whose drivers cannot be overridden, or the
-    /// refusal the admission gives.
+    /// [`ProjectError::ConfigurationRejected`] for one whose drivers cannot be overridden,
+    /// [`ProjectError::GitFailed`], a fault that passes, when the host is too short of
+    /// descriptors, processes or memory to copy the working tree's handle or to read the
+    /// repository, or the refusal the admission gives.
     pub fn discovered(
         profile: &RestrictedProfile,
         found: Discovered,
@@ -1108,7 +1110,9 @@ fn settled_update(reference: &str, outcome: Result<GitOutput>, started: bool) ->
 ///
 /// The climb copies handles, and a host too short of descriptors, processes or memory to make one
 /// has said nothing of the directory: that is [`ProjectError::GitFailed`], a fault that passes,
-/// and not a directory that is not the tree.
+/// and not a directory that is not the tree. The climb also opens each parent from the handle
+/// below it, and a failure of that, a shortage included, ends the climb: the directory is then
+/// not the recorded tree.
 fn require_within(
     named: &AuthorisedDirectory,
     tree: RecordedIdentity,
@@ -1192,8 +1196,8 @@ fn open_recorded_root(
     }
 }
 
-/// Returns a second authority over the same open directory: the copy every holder of an authority
-/// here takes of one it keeps while it gives another on. The handle is duplicated, which takes a
+/// Returns a second authority over the same open directory, as the transfer crate's `try_clone`
+/// does, for a holder that keeps one and gives another on. The handle is duplicated, which takes a
 /// descriptor as an open does, so a host too short of descriptors, processes or memory to do it
 /// has said nothing of the directory and the refusal is a fault that passes, worded as an open's
 /// is (`boundary::unopenable`).
