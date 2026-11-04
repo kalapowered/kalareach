@@ -36,6 +36,10 @@ use kr_protocol::session::{
 };
 
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the shared teardown says its progress on the test's own error output"
+)]
 mod teardown;
 
 /// Starts the worker through this host's own supervisor, and names its package root.

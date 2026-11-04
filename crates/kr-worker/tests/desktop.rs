@@ -49,6 +49,10 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::session::{Session, SessionConfig};
 
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the shared teardown says its progress on the test's own error output"
+)]
 mod teardown;
 
 /// Moves this test process out of the checkout, once.

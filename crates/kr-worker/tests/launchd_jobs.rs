@@ -41,6 +41,10 @@ use kr_protocol::session::{
 use kr_protocol::worker::ReservationId;
 
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the shared teardown says its progress on the test's own error output"
+)]
 mod teardown;
 
 /// How long something that has to happen is given. A liveness bound rather than a measurement,
