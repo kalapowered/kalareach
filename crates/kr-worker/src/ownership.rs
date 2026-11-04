@@ -51,9 +51,10 @@
 //! status, and neither is a process that only the control group or the terminal lists: the account
 //! can write any of its processes into the group, the worker's own among them, so a listing cannot
 //! tell them apart. A process that was never read that way, one that left the session, one the
-//! record had no room for, and one that had ended and was waiting for its parent when a full set
-//! gave its place to a newer process, stay in the process table until the worker exits; so does
-//! every one on a kernel that gives no process descriptor to wait on (before Linux 5.4).
+//! record had no room for that had not ended when it was refused, and one that had ended and was
+//! waiting for its parent when a full set gave its place to a newer process, stay in the process
+//! table until the worker exits; so does every one on a kernel that gives no process descriptor
+//! to wait on (before Linux 5.4).
 //!
 //! A process that leaves the session for a control daemon's own scope is not the session's: a
 //! control daemon of another environment that a command of the session started moves into a scope
@@ -215,9 +216,9 @@ pub struct OwnedProcesses {
     /// The processes a reading of the worker's tree found while the root's session was shown to be
     /// the recorded one, by identifier and start value. One of them that is still in that session
     /// shows it still is, however long after the root shell's last wait it began. Shared with
-    /// every copy, and kept to about twice the record's bound.
+    /// every copy; what has ended is dropped once it passes twice the record's bound.
     #[cfg(target_os = "linux")]
-    proved: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<(u64, u64)>>>,
+    proved: std::sync::Arc<std::sync::Mutex<BTreeMap<(u64, u64), ProcessStartIdentity>>>,
     /// The most processes `seen` holds.
     cap: usize,
     /// Whether a process was refused for want of room, and said so.
@@ -407,7 +408,7 @@ impl OwnedProcesses {
             #[cfg(target_os = "linux")]
             root_held: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(target_os = "linux")]
-            proved: std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
+            proved: std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             cap: MAX_RECORDED_PROCESSES,
             refused_for_room: false,
             #[cfg(test)]
@@ -2021,9 +2022,16 @@ impl OwnedProcesses {
             .proved
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        proved.extend(members.iter().map(key));
+        proved.extend(members.iter().map(|member| (key(member), member.clone())));
+        // By what the kernel says, not by this record's `live`: a member of this very reading is
+        // not in it yet, and another copy's `live` differs.
         if proved.len() > self.cap.saturating_mul(2) {
-            proved.retain(|this| self.live.contains_key(this));
+            proved.retain(|_, member| {
+                !matches!(
+                    kr_ipc::identity::process_state(member),
+                    kr_ipc::identity::ProcessState::Ended
+                )
+            });
         }
     }
 
@@ -2088,7 +2096,7 @@ impl OwnedProcesses {
                 .chain(self.live.values())
                 .filter(|member| {
                     member.pid.get() != u64::from(root)
-                        && (began_before(member) || proved.contains(&key(member)))
+                        && (began_before(member) || proved.contains_key(&key(member)))
                 })
                 .any(|member| {
                     u32::try_from(member.pid.get())
@@ -3760,7 +3768,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_process_the_walk_found_in_the_session_shows_it_to_the_walks_after_it() {
-        let session = a_session_whose_leader_was_collected(2);
+        let session = a_session_whose_leader_was_collected(3);
         let mut owned = OwnedProcesses::establish(
             OwnershipBoundary::TerminalGroup {
                 group: 1,
@@ -3768,6 +3776,9 @@ mod tests {
             },
             session.leader.clone(),
         );
+        // The three processes pass twice the bound, so the first walk prunes what it kept, before
+        // the record has taken any of them.
+        owned.cap = 1;
         owned
             .root_held
             .store(session.held, std::sync::atomic::Ordering::Release);
@@ -3779,7 +3790,6 @@ mod tests {
                 process.pid
             );
         }
-        owned.take(found);
         owned
             .root_held
             .store(0, std::sync::atomic::Ordering::Release);
