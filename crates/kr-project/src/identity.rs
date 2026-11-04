@@ -456,7 +456,7 @@ impl OpenedRepository {
         // again and find whatever has since taken the name.
         let git_dir = open_unrecorded_root(environment_id, &git_dir_path)?;
         let own_dir = if own_dir_path == git_dir_path {
-            git_dir.try_clone()?
+            duplicated(&git_dir, environment_id)?
         } else {
             open_unrecorded_root(environment_id, &own_dir_path)?
         };
@@ -1176,6 +1176,32 @@ fn open_recorded_root(
     }
 }
 
+/// Returns a second authority over the same open directory, for a repository whose own data is in
+/// its Git directory. The handle is duplicated, which takes a descriptor as an open does, so a
+/// host too short of descriptors, processes or memory to do it has said nothing of the directory
+/// and the refusal is a fault that passes, worded as an open's is (`boundary::unopenable`).
+fn duplicated(
+    directory: &AuthorisedDirectory,
+    environment_id: EnvironmentId,
+) -> Result<AuthorisedDirectory> {
+    let path = directory.display_path();
+    // A case that asks for it has the duplication fail as it does for a host that is out of
+    // descriptors.
+    #[cfg(all(test, unix))]
+    let copy = match tests::CLONE_FAILS.with(std::cell::Cell::get) {
+        Some(error) => Err(std::io::Error::from(error)),
+        None => directory.handle().try_clone(),
+    };
+    #[cfg(not(all(test, unix)))]
+    let copy = directory.handle().try_clone();
+    let copy = copy.map_err(|error| crate::boundary::unopenable(path, &error))?;
+    Ok(AuthorisedDirectory::from_handle(
+        environment_id,
+        copy,
+        path.to_path_buf(),
+    )?)
+}
+
 /// Opens the directory at `path` as an authority for one environment: a checkout `project.adopt`
 /// is handed by path, the top level, the Git directory and a linked worktree's own directory Git
 /// reports for a repository, and a destination's parent the owner named by path. A record, where
@@ -1728,6 +1754,10 @@ mod tests {
         /// that many roots have been opened.
         pub(super) static ROOT_OPEN_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
             const { std::cell::Cell::new(None) };
+        /// Set by a case to make the duplication of a directory's handle fail on its own thread
+        /// with this error.
+        pub(super) static CLONE_FAILS: std::cell::Cell<Option<rustix::io::Errno>> =
+            const { std::cell::Cell::new(None) };
         /// Set by a case to make the resolution of the path of a directory that was opened fail on
         /// its own thread with this error.
         pub(super) static RESOLVE_FAILS: std::cell::Cell<Option<rustix::io::Errno>> =
@@ -1969,13 +1999,13 @@ mod tests {
 
     /// Holds a refusal to the answer its error is given. A host's shortage is a fault that passes,
     /// which a client sends the request again after, and it says the place and the reason. Any
-    /// other failure is not one a client sends again, and is `otherwise` where a case names that.
+    /// other failure is not one a client sends again, and keeps the code `otherwise`.
     #[cfg(unix)]
     fn assert_answered(
         refused: &ProjectError,
         errno: rustix::io::Errno,
         passes: bool,
-        otherwise: Option<ErrorCode>,
+        otherwise: ErrorCode,
         place: &Path,
         row: &str,
     ) {
@@ -1998,8 +2028,8 @@ mod tests {
                     && said.contains(&format!("{} could", place.display())),
                 "it says the place and the reason: {row}: {said}"
             );
-        } else if let Some(code) = otherwise {
-            assert_eq!(refused.code(), code, "{row}: {refused}");
+        } else {
+            assert_eq!(refused.code(), otherwise, "{row}: {refused}");
         }
     }
 
@@ -2108,13 +2138,48 @@ mod tests {
                     &refused,
                     errno,
                     passes,
-                    Some(ErrorCode::InvalidArgument),
+                    ErrorCode::InvalidArgument,
                     place,
                     &format!("{what}, {errno}"),
                 );
             }
         }
         OpenedRepository::open(&made.profile, made.environment_id, &made.via)
+            .expect("without a failure the repository opens");
+    }
+
+    /// A repository keeps its own data in its Git directory unless it is a linked worktree, and
+    /// then the handle to that directory is duplicated. A host out of descriptors, processes or
+    /// memory to do that has said nothing of the directory, so that is a fault that passes, which
+    /// a client sends the request again after, and not the caller's argument; any other failure
+    /// of the duplication is still the argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_descriptors_when_a_repositorys_git_directory_is_duplicated_is_a_fault_that_passes()
+     {
+        let made = repositories();
+        let common = made.main.join(".git");
+
+        for (errno, passes) in OPEN_ERRORS {
+            CLONE_FAILS.with(|fails| fails.set(Some(errno)));
+            let opened = OpenedRepository::open(&made.profile, made.environment_id, &made.main);
+            CLONE_FAILS.with(|fails| fails.set(None));
+
+            let Err(refused) = opened else {
+                panic!(
+                    "the Git directory could not be duplicated ({errno}), and the repository opened"
+                );
+            };
+            assert_answered(
+                &refused,
+                errno,
+                passes,
+                ErrorCode::InvalidArgument,
+                &common,
+                &format!("{errno}"),
+            );
+        }
+        OpenedRepository::open(&made.profile, made.environment_id, &made.main)
             .expect("without a failure the repository opens");
     }
 
@@ -2150,7 +2215,7 @@ mod tests {
                     &refused,
                     errno,
                     passes,
-                    None,
+                    ErrorCode::InvalidArgument,
                     place,
                     &format!("{what}, {errno}"),
                 );
@@ -2191,7 +2256,7 @@ mod tests {
                 &refused,
                 errno,
                 passes,
-                Some(ErrorCode::InvalidArgument),
+                ErrorCode::InvalidArgument,
                 root.path(),
                 &format!("{errno}"),
             );
@@ -2225,7 +2290,7 @@ mod tests {
                     &refused,
                     errno,
                     passes,
-                    Some(ErrorCode::InvalidArgument),
+                    ErrorCode::InvalidArgument,
                     &tree,
                     &format!("{errno}, identity held: {}", expected.is_some()),
                 );
@@ -2280,7 +2345,7 @@ mod tests {
                     &refused,
                     errno,
                     passes,
-                    Some(ErrorCode::SourceChanged),
+                    ErrorCode::SourceChanged,
                     directory.path(),
                     &format!("{}, {errno}", directory.path().display()),
                 );
