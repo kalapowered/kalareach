@@ -163,20 +163,33 @@ fn battery_pauses_by_default_and_runs_when_an_owner_enables_it() {
 /// mid-read does.
 type Files<'a> = &'a [(&'a str, Option<&'a str>)];
 
-/// What a power-supply class laid out as the kernel lays it out says of the host's power.
-fn power_of_tree(supplies: &[(&str, Files)]) -> Signal<PowerSource> {
-    let root = tempfile::tempdir().expect("a power-supply class");
-    for (name, files) in supplies {
+/// A class directory of the kernel laid out as `entries` say: one directory for each entry, holding
+/// its files.
+fn class_tree(entries: &[(&str, Files)]) -> tempfile::TempDir {
+    let root = tempfile::tempdir().expect("a class directory");
+    for (name, files) in entries {
         let directory = root.path().join(name);
-        std::fs::create_dir_all(&directory).expect("a supply directory");
+        std::fs::create_dir_all(&directory).expect("an entry's directory");
         for (file, content) in *files {
             match content {
-                Some(text) => std::fs::write(directory.join(file), text).expect("a supply file"),
+                Some(text) => std::fs::write(directory.join(file), text).expect("an entry's file"),
                 None => std::fs::create_dir(directory.join(file)).expect("an unreadable file"),
             }
         }
     }
+    root
+}
+
+/// What a power-supply class laid out as the kernel lays it out says of the host's power.
+fn power_of_tree(supplies: &[(&str, Files)]) -> Signal<PowerSource> {
+    let root = class_tree(supplies);
     kr_describe::resource::platform::power_of_supplies(root.path())
+}
+
+/// What a thermal class laid out as the kernel lays it out says of the host's heat.
+fn heat_of_tree(zones: &[(&str, Files)]) -> Signal<ThermalState> {
+    let root = class_tree(zones);
+    kr_describe::resource::platform::thermal_of_zone_class(root.path())
 }
 
 /// KR-REQ-22.13: what a power-supply class says of the host's power, read from trees laid out as
@@ -841,6 +854,122 @@ fn the_thermal_zones_a_platform_lists_say_how_hot_the_host_is() {
         read(&[None, Some(60)]),
         Signal::Qualified(ThermalState::Elevated)
     );
+}
+
+/// KR-REQ-22.13: what a Linux thermal class says of the heat, read from trees laid out as the
+/// kernel lays them out: each zone's temperature against the lowest trip point above zero among its
+/// first eight. A zone the host listed and gave no usable reading of, whose temperature cannot be
+/// read or that declares no trip point to read it against, cannot be taken for one that holds
+/// nothing back: with no zone showing heat the host's heat is not known, and a zone that does show
+/// heat still does. The scheduler does not pause for heat it does not know, as it does not for
+/// heat a host cannot read at all.
+#[test]
+fn a_thermal_zone_the_host_gave_no_reading_of_is_not_taken_for_one_that_is_cool() {
+    use kr_describe::resource::platform::thermal_of_zone_class;
+
+    let cool: Files = &[
+        ("temp", Some("45000\n")),
+        ("trip_point_0_temp", Some("100000\n")),
+    ];
+    let warm: Files = &[
+        ("temp", Some("95000\n")),
+        ("trip_point_0_temp", Some("100000\n")),
+    ];
+    let hot: Files = &[
+        ("temp", Some("100000\n")),
+        ("trip_point_0_temp", Some("100000\n")),
+    ];
+    // A device that is down, whose driver fails the read.
+    let unreadable: Files = &[("temp", None), ("trip_point_0_temp", Some("100000\n"))];
+    let no_trip_point: Files = &[("temp", Some("30000\n"))];
+    let trip_point_of_nought: Files = &[
+        ("temp", Some("30000\n")),
+        ("trip_point_0_temp", Some("0\n")),
+    ];
+    let unknown = |signal: Signal<ThermalState>| matches!(signal, Signal::Unqualified { .. });
+
+    // The cases the reader always answered.
+    assert_eq!(
+        heat_of_tree(&[("thermal_zone0", cool)]),
+        Signal::Qualified(ThermalState::Nominal)
+    );
+    assert_eq!(
+        heat_of_tree(&[("thermal_zone0", cool), ("thermal_zone1", warm)]),
+        Signal::Qualified(ThermalState::Elevated)
+    );
+    assert_eq!(
+        heat_of_tree(&[("thermal_zone0", cool), ("thermal_zone1", hot)]),
+        Signal::Qualified(ThermalState::Critical),
+        "the worst zone decides"
+    );
+    assert!(unknown(heat_of_tree(&[])));
+    let absent = tempfile::tempdir().expect("a directory");
+    assert!(unknown(thermal_of_zone_class(
+        &absent.path().join("no-such-class")
+    )));
+
+    // What is not a zone is not read: a cooling device has a temperature file of its own sometimes.
+    assert_eq!(
+        heat_of_tree(&[("thermal_zone0", cool), ("cooling_device0", hot)]),
+        Signal::Qualified(ThermalState::Nominal)
+    );
+    assert!(unknown(heat_of_tree(&[("cooling_device0", hot)])));
+
+    // The lowest trip point decides, among the first eight and above zero.
+    let two_trip_points: Files = &[
+        ("temp", Some("75000\n")),
+        ("trip_point_0_temp", Some("100000\n")),
+        ("trip_point_1_temp", Some("80000\n")),
+    ];
+    assert_eq!(
+        heat_of_tree(&[("thermal_zone0", two_trip_points)]),
+        Signal::Qualified(ThermalState::Elevated)
+    );
+    let beyond_the_first_eight: Files = &[
+        ("temp", Some("75000\n")),
+        ("trip_point_0_temp", Some("100000\n")),
+        ("trip_point_8_temp", Some("80000\n")),
+    ];
+    assert_eq!(
+        heat_of_tree(&[("thermal_zone0", beyond_the_first_eight)]),
+        Signal::Qualified(ThermalState::Nominal)
+    );
+
+    // A zone with no reading beside one that is cool is not a host with nothing held back.
+    for (name, zone) in [
+        ("a temperature that cannot be read", unreadable),
+        ("no trip point", no_trip_point),
+        ("no trip point above zero", trip_point_of_nought),
+    ] {
+        assert!(
+            unknown(heat_of_tree(&[
+                ("thermal_zone0", cool),
+                ("thermal_zone1", zone)
+            ])),
+            "a zone with {name} beside a cool one"
+        );
+        assert!(
+            unknown(heat_of_tree(&[("thermal_zone1", zone)])),
+            "a zone with {name} alone"
+        );
+        // Heat that was read is still heat.
+        assert_eq!(
+            heat_of_tree(&[("thermal_zone0", warm), ("thermal_zone1", zone)]),
+            Signal::Qualified(ThermalState::Elevated),
+            "a zone with {name} beside a warm one"
+        );
+    }
+
+    // What the scheduler does with heat it does not know: it does not pause for it.
+    let cost = default_profile().execution().resident_estimate;
+    let conditions = HostConditions {
+        thermal: heat_of_tree(&[("thermal_zone0", cool), ("thermal_zone1", unreadable)]),
+        ..roomy()
+    };
+    assert!(unknown(conditions.thermal));
+    let mut policy = ResourcePolicy::new(ResourceSettings::default(), Budgets::DEFAULTS);
+    policy.evaluate(&conditions, &cost, false);
+    assert_eq!(policy.state(), ResourceState::Admitted);
 }
 
 /// KR-REQ-22.13: what a Mac's thermal pressure level says of the heat. The levels are the ones the

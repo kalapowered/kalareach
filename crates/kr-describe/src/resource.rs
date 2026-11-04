@@ -451,6 +451,16 @@ pub mod platform {
         let unread = zones
             .iter()
             .any(|zone| zone.passive_limit_percent.is_none());
+        heat_of_zones(worst, unread)
+    }
+
+    /// What the zones of one host say of the heat, given the worst state among those that were read
+    /// and whether the host listed a zone it gave no reading of.
+    ///
+    /// A zone that was read as limited is heat, whatever the others did. Without one, the host is
+    /// nominal only when every zone it listed was read, and its heat is not known when it listed one
+    /// it gave no reading of or listed none. The policy does not pause for heat it does not know.
+    const fn heat_of_zones(worst: Option<ThermalState>, unread: bool) -> Signal<ThermalState> {
         match (worst, unread) {
             (Some(heat @ (ThermalState::Elevated | ThermalState::Critical)), _) => {
                 Signal::Qualified(heat)
@@ -463,6 +473,59 @@ pub mod platform {
                 why: "this host reported no thermal zone",
             },
         }
+    }
+
+    /// What a Linux thermal class says of the heat, read from the directory that holds one entry
+    /// per zone.
+    ///
+    /// Each zone's temperature is compared with the lowest trip point above zero among the first
+    /// eight it declares. Comparing a temperature with a fixed number would be meaningless across
+    /// machines; comparing it with the trip point the platform itself declared is the platform's
+    /// own judgement. The lowest is the one that matters: on an ACPI zone the first is often the
+    /// critical point, well above one the platform acts on earlier. The type of a trip point is not
+    /// read, so a zone that declares only a critical point is read against it, and a zone whose
+    /// lowest trip point is a fan's step reads that step as its limit.
+    ///
+    /// A zone whose temperature the host will not give (a device that is down, whose driver fails
+    /// the read) or that declares no trip point to read it against is a zone it listed and gave no
+    /// usable reading of, and [`thermal_of_zones`] puts it the same way: it keeps the host from
+    /// reading as nominal, and a zone that was read as limited is still heat.
+    #[must_use]
+    pub fn thermal_of_zone_class(root: &std::path::Path) -> Signal<ThermalState> {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Signal::Unqualified {
+                why: "this host has no thermal class",
+            };
+        };
+        let mut worst: Option<ThermalState> = None;
+        let mut unread = false;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("thermal_zone"))
+            {
+                continue;
+            }
+            let trip = (0..8)
+                .filter_map(|index| read_number(&path.join(format!("trip_point_{index}_temp"))))
+                .filter(|trip| *trip > 0)
+                .min();
+            let (Some(temperature), Some(trip)) = (read_number(&path.join("temp")), trip) else {
+                unread = true;
+                continue;
+            };
+            let state = if temperature >= trip {
+                ThermalState::Critical
+            } else if temperature * 100 >= trip * 90 {
+                ThermalState::Elevated
+            } else {
+                ThermalState::Nominal
+            };
+            worst = Some(worst.map_or(state, |held| held.max(state)));
+        }
+        heat_of_zones(worst, unread)
     }
 
     fn memory() -> (Signal<u64>, Signal<u64>) {
@@ -619,53 +682,7 @@ pub mod platform {
 
     #[cfg(target_os = "linux")]
     fn thermal() -> Signal<ThermalState> {
-        // The kernel's thermal zones, against the lowest trip point each zone declares among its
-        // first eight. Comparing a temperature with a fixed number would be meaningless across
-        // machines; comparing it with the trip point the platform itself declared is the
-        // platform's own judgement. The lowest is the one that matters: on an ACPI zone the first
-        // is often the critical point, well above one the platform acts on earlier. The type of a
-        // trip point is not read, so a zone that declares only a critical point is read against
-        // it, and a zone whose lowest trip point is a fan's step reads that step as its limit.
-        let Ok(entries) = std::fs::read_dir("/sys/class/thermal") else {
-            return Signal::Unqualified {
-                why: "this host has no thermal class",
-            };
-        };
-        let mut worst: Option<ThermalState> = None;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("thermal_zone"))
-            {
-                continue;
-            }
-            let Some(temperature) = read_number(&path.join("temp")) else {
-                continue;
-            };
-            let Some(trip) = (0..8)
-                .filter_map(|index| read_number(&path.join(format!("trip_point_{index}_temp"))))
-                .filter(|trip| *trip > 0)
-                .min()
-            else {
-                continue;
-            };
-            let state = if temperature >= trip {
-                ThermalState::Critical
-            } else if temperature * 100 >= trip * 90 {
-                ThermalState::Elevated
-            } else {
-                ThermalState::Nominal
-            };
-            worst = Some(worst.map_or(state, |held| held.max(state)));
-        }
-        worst.map_or(
-            Signal::Unqualified {
-                why: "this host reported no thermal zone with a trip point",
-            },
-            Signal::Qualified,
-        )
+        thermal_of_zone_class(std::path::Path::new("/sys/class/thermal"))
     }
 
     #[cfg(windows)]
@@ -686,7 +703,7 @@ pub mod platform {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    /// Reads the whole number a kernel file holds, when it holds one.
     fn read_number(path: &std::path::Path) -> Option<i64> {
         std::fs::read_to_string(path)
             .ok()?
