@@ -307,6 +307,12 @@ async fn without_the_private_database_the_hosts_own_answers() {
 /// A creator's own database directory is not dropped and does not win: the private database still
 /// answers `xterm-256color`, the creator's directory still answers the terminal names only it has,
 /// and the diagnostics report what the creator had.
+///
+/// KR-REQ-08.41, the part about a user override: a creator's `TERMINFO` and `TERMINFO_DIRS` neither
+/// win nor are dropped, since the private database answers `xterm-256color` while the creator's
+/// directory still answers a terminal only it has, and the selection the launch environment records
+/// says the override was made and holds both of the creator's values. Not shown here: that the
+/// record reaches the worker's log or any surface a person reads.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_creators_database_is_kept_behind_the_private_one_and_reported() {
     let state = Scratch::new();
@@ -486,6 +492,17 @@ fn tmux_unescape(text: &str) -> Vec<u8> {
 /// `tmux` is asked what it read: it lists every capability of the terminal it is attached to, and
 /// each one the private database also has must be the value that database holds. The exception is
 /// the cursor-style reset, which `tmux` sets by terminal name whatever the database says.
+///
+/// KR-REQ-08.41, the part about nested multiplexer behaviour: with `tmux` run inside a managed
+/// session, its own list of what it read for the outer terminal holds the private database's
+/// truecolour flags and the database's value for every string capability but the five `tmux` sets
+/// by rule; a program in a pane still reads the private directory; the outer session's `TERM`,
+/// `TERMINFO` and database file are what they were before `tmux` ran; and each sequence `tmux`
+/// wrote that the terminal engine does not classify is a mode `tmux` sets for any terminal whose
+/// name begins with `xterm` or one the database's own output capabilities expand to. Not shown
+/// here: another multiplexer, or a host with no `tmux`: the case then prints that it skipped and
+/// returns passing, and no workflow or script sets `KR_REQUIRE_MULTIPLEXERS` to make that a
+/// failure.
 #[tokio::test(flavor = "multi_thread")]
 async fn tmux_inside_a_managed_session_reads_the_private_database() {
     let Some(tmux) = program("tmux", "KR_REQUIRE_MULTIPLEXERS") else {
