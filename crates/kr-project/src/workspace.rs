@@ -819,15 +819,13 @@ pub const fn outcome_text(outcome: PathOutcome) -> &'static str {
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::QuotaExceeded`] when the total passes [`MAX_WORKSPACE_COPY_BYTES`], or
-/// [`ProjectError::GitFailed`], a fault that passes, when the host is too short of descriptors,
-/// processes or memory to read the mode of a path it has opened, or to read or write that path:
-/// the paths carried before stay, and none after it is tried. A host that is short at the open of
-/// the source, at the making of a directory or of the temporary file, or at the rename is not told
-/// from any other failure there, and the path is reported as not applied. A path that cannot be
-/// carried for another reason is reported in the copy's report, not refused. It returns
+/// Returns [`ProjectError::QuotaExceeded`] when the total passes [`MAX_WORKSPACE_COPY_BYTES`],
 /// [`ProjectError::Destination`] when the directory cannot be flushed after a rename, and the
-/// refusal of the admission or of the journal of progress.
+/// refusal of the admission or of the journal of progress. A path that cannot be carried, a host
+/// too short of descriptors, processes or memory to read or write it included, is reported in the
+/// copy's report and not refused: stopping there would leave the workspace marked for removal
+/// with its tree, and a client that sent the creation again would be refused for the tree that is
+/// there.
 pub fn copy_included(
     source: &AuthorisedDirectory,
     destination: &AuthorisedDirectory,
@@ -875,13 +873,12 @@ pub fn copy_included(
         // way through an inclusion leaves a record of which paths it had applied, which is what a
         // reader of an unfinished workspace needs and what recovery reports.
         let left = report.leftover.len();
-        let copied = copy_one(source, destination, &name, &mut report);
+        let carried = copy_one(source, destination, &name, &mut report)?;
         // A copy in progress this host could not take away again is journalled like any other
-        // path, so nothing it wrote is left unaccounted for, whether or not the copy went on.
+        // path, so nothing it wrote is left unaccounted for.
         for stray in &report.leftover[left..] {
             progress(stray, PathOutcome::Leftover)?;
         }
-        let carried = copied?;
         if carried {
             report.copied.push(entry.path.clone());
             progress(&entry.path, PathOutcome::Carried)?;
@@ -940,17 +937,6 @@ fn took_away(target: &AuthorisedDirectory, temporary: &RelativeName) -> bool {
     target.remove(temporary).is_ok()
 }
 
-/// Whether a failure of the copy of one path stops the whole inclusion: the quota, and a host
-/// too short of descriptors, processes or memory to read or write the path, which has said nothing
-/// of the path and so is a fault that passes (`boundary::refused_by`) and not a path that could
-/// not be carried.
-const fn stops_the_inclusion(error: &ProjectError) -> bool {
-    matches!(
-        error,
-        ProjectError::QuotaExceeded { .. } | ProjectError::GitFailed { .. }
-    )
-}
-
 fn copy_one(
     source: &AuthorisedDirectory,
     destination: &AuthorisedDirectory,
@@ -963,12 +949,9 @@ fn copy_one(
     // The source's permission bits are read before anything is written, because a copy that
     // cannot carry them is a copy of a different file: an executable script that arrives without
     // its executable bit does not run. A path whose mode this host could not read is reported as
-    // unapplied and the destination keeps what the base put there, unless the host was too short
-    // of descriptors, processes or memory to read it: that says nothing of the path.
-    let mode = match source_mode(&file) {
-        Ok(mode) => mode,
-        Err(error) if stops_the_inclusion(&error) => return Err(error),
-        Err(_) => return Ok(false),
+    // unapplied and the destination keeps what the base put there.
+    let Ok(mode) = source_mode(&file) else {
+        return Ok(false);
     };
     let byte_len = file.byte_len();
     let total = &mut report.byte_len;
@@ -1036,14 +1019,15 @@ fn copy_one(
                 Ok(count) => count,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => {
-                    return Err(crate::boundary::refused_by(
-                        &error,
-                        format!("{leaf} could not be read: {error}"),
-                    ));
+                    return Err(ProjectError::Destination {
+                        detail: format!("{leaf} could not be read: {error}").into(),
+                    });
                 }
             };
             at("write", || written.handle_mut().write_all(&buffer[..read])).map_err(|error| {
-                crate::boundary::refused_by(&error, format!("{leaf} could not be written: {error}"))
+                ProjectError::Destination {
+                    detail: format!("{leaf} could not be written: {error}").into(),
+                }
             })?;
         }
         // An executable script that arrives without its executable bit is not the file the user
@@ -1053,7 +1037,9 @@ fn copy_one(
         // The bytes are durable before the name changes, so a power loss cannot leave the
         // destination naming a file whose content never reached the disk.
         at("flush", || written.handle_mut().sync_all()).map_err(|error| {
-            crate::boundary::refused_by(&error, format!("{leaf} could not be flushed: {error}"))
+            ProjectError::Destination {
+                detail: format!("{leaf} could not be flushed: {error}").into(),
+            }
         })?;
         Ok(())
     })();
@@ -1064,10 +1050,11 @@ fn copy_one(
         if !took_away(target, &temporary) {
             report.leftover.push(temporary_path);
         }
-        // A quota, and a host too short of descriptors, processes or memory to read or write
-        // the path, stop the whole inclusion; anything else about this one path is reported as a
-        // path that was not applied.
-        if stops_the_inclusion(&error) {
+        // A quota is the one failure that stops the whole inclusion; anything about this one path
+        // is reported as a path that was not applied, a host that is short of descriptors,
+        // processes or memory included: it says nothing of the path, but stopping would leave a
+        // workspace marked for removal that a resend of the creation could not replace.
+        if matches!(error, ProjectError::QuotaExceeded { .. }) {
             return Err(error);
         }
         return Ok(false);
@@ -1097,19 +1084,15 @@ fn copy_one(
 /// # Errors
 ///
 /// Returns [`ProjectError::Destination`] when the source's own metadata cannot be read, because a
-/// copy that cannot carry the mode is a copy of a different file, except that a host too short of
-/// descriptors, processes or memory to read it is [`ProjectError::GitFailed`], a fault that
-/// passes.
+/// copy that cannot carry the mode is a copy of a different file.
 #[cfg(unix)]
 fn source_mode(file: &kr_transfer::AuthorisedFile) -> Result<Option<u32>> {
     use cap_std::fs::MetadataExt as _;
 
-    let metadata = at("mode", || file.handle().metadata()).map_err(|error| {
-        crate::boundary::refused_by(
-            &error,
-            format!("a file's own permissions could not be read: {error}"),
-        )
-    })?;
+    let metadata =
+        at("mode", || file.handle().metadata()).map_err(|error| ProjectError::Destination {
+            detail: format!("a file's own permissions could not be read: {error}").into(),
+        })?;
     Ok(Some(metadata.mode()))
 }
 
@@ -1127,9 +1110,7 @@ fn source_mode(_file: &kr_transfer::AuthorisedFile) -> Result<Option<u32>> {
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::Destination`] when the bits cannot be set, except that a host too short
-/// of descriptors, processes or memory to set them is [`ProjectError::GitFailed`], a fault that
-/// passes.
+/// Returns [`ProjectError::Destination`] when the bits cannot be set.
 #[cfg(unix)]
 fn apply_mode(file: &kr_transfer::AuthorisedFile, mode: Option<u32>) -> Result<()> {
     use cap_std::fs::PermissionsExt as _;
@@ -1139,11 +1120,8 @@ fn apply_mode(file: &kr_transfer::AuthorisedFile, mode: Option<u32>) -> Result<(
             file.handle()
                 .set_permissions(cap_std::fs::Permissions::from_mode(mode))
         })
-        .map_err(|error| {
-            crate::boundary::refused_by(
-                &error,
-                format!("a copy's permissions could not be set: {error}"),
-            )
+        .map_err(|error| ProjectError::Destination {
+            detail: format!("a copy's permissions could not be set: {error}").into(),
         })?;
     }
     Ok(())
