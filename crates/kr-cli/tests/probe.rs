@@ -334,6 +334,14 @@ async fn the_exchange_ends_with_the_terminator_and_no_reply_reaches_the_applicat
     let display = hosted.display.get().to_string();
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let keys = terminal::keys(pty.master.take_writer().expect("a writer"));
+    // The terminal answers every question, and the person types through the middle of it. The
+    // answer is typed the moment the question that ends the exchange has arrived: the exchange has
+    // one second in all, and the questions asked are read from what was sent by then.
+    let answering = output.reply_to(
+        b"\x1b[c",
+        b"\x1b[?5u\x1b]10;rgb:ff/ff/ff\x1b\\typed-during\x1b[>4;2m\x1b[?62;22c",
+        &keys,
+    );
     let mut shell = pty
         .slave
         .spawn_command(shell_running(
@@ -344,15 +352,6 @@ async fn the_exchange_ends_with_the_terminator_and_no_reply_reaches_the_applicat
             ),
         ))
         .expect("starts the shell");
-
-    // The terminal answers every question, and the person types through the middle of it. The
-    // answer is typed the moment the question that ends the exchange has arrived: the exchange has
-    // one second in all, and the questions asked are read from what was sent by then.
-    let answering = output.reply_to(
-        b"\x1b[c",
-        b"\x1b[?5u\x1b]10;rgb:ff/ff/ff\x1b\\typed-during\x1b[>4;2m\x1b[?62;22c",
-        &keys,
-    );
     assert!(
         answering.typed_within(Duration::from_secs(30)),
         "the command asked the terminal what it is: {}",
