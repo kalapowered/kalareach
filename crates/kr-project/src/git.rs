@@ -5991,8 +5991,9 @@ mod tests {
 
     /// A stand-in that writes its number to `own` and then waits, placed as the program a case
     /// asks. It ends when a case lets it go with [`let_go`], or when `directory` is gone, as it is
-    /// when the case ends and the directory is removed with it; a guard of two minutes ends one
-    /// that neither reached.
+    /// when the case ends and the directory is removed with it, or when the test program has
+    /// ended: it is never ended by a count of waits, which a machine that is loaded or stopped
+    /// would make an elapsed time.
     #[cfg(unix)]
     fn waiting_stand_in(directory: &Path, own: &Path) -> PathBuf {
         writing_stand_in(directory, own, "")
@@ -6006,12 +6007,13 @@ mod tests {
         std::fs::write(
             &text,
             format!(
-                "#!/bin/sh\necho $$ > '{own}'\n{output}\ni=0\n\
-                 while [ -d '{directory}' ] && [ ! -e '{release}' ] && [ $i -lt 2400 ]; \
-                 do sleep 0.05; i=$((i+1)); done\n",
+                "#!/bin/sh\necho $$ > '{own}'\n{output}\n\
+                 while [ -d '{directory}' ] && [ ! -e '{release}' ] && kill -0 {tester} 2>/dev/null; \
+                 do sleep 0.05; done\n",
                 own = own.display(),
                 directory = directory.display(),
                 release = directory.join("release").display(),
+                tester = std::process::id(),
             ),
         )
         .expect("the stand-in's text");
@@ -6444,7 +6446,8 @@ mod tests {
             &text,
             format!(
                 "#!/bin/sh\n/usr/bin/perl '{holder}' '{own}' '{release}' '{directory}' '{tester}' &\n\
-                 i=0\nwhile [ ! -s '{own}' ] && [ $i -lt 2400 ]; do sleep 0.02; i=$((i+1)); done\n",
+                 while [ ! -s '{own}' ] && [ -d '{directory}' ] && kill -0 {tester} 2>/dev/null; \
+                 do sleep 0.02; done\n",
                 holder = holder.display(),
                 own = own.display(),
                 release = release.display(),
@@ -6580,12 +6583,13 @@ mod tests {
         std::fs::write(
             &text,
             format!(
-                "#!/bin/sh\necho $$ > '{own}'\ni=0\n\
-                 while [ ! -e '{release}' ] && [ -d '{directory}' ] && [ $i -lt 2400 ]; \
-                 do sleep 0.02; i=$((i+1)); done\n{body}\n",
+                "#!/bin/sh\necho $$ > '{own}'\n\
+                 while [ ! -e '{release}' ] && [ -d '{directory}' ] && kill -0 {tester} 2>/dev/null; \
+                 do sleep 0.02; done\n{body}\n",
                 own = own.display(),
                 release = release.display(),
                 directory = directory.path().display(),
+                tester = std::process::id(),
             ),
         )
         .expect("the stand-in's text");
