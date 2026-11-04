@@ -150,7 +150,60 @@ static STANDARD_ERROR: OnceLock<Writer> = OnceLock::new();
 
 /// Returns the writer of this process's standard error, making it if no line has been said.
 pub(crate) fn standard_error() -> &'static Writer {
-    STANDARD_ERROR.get_or_init(|| Writer::new(std::io::stderr()))
+    STANDARD_ERROR.get_or_init(|| Writer::new(destination()))
+}
+
+/// Where the writer of this process's standard error writes.
+#[cfg(not(feature = "testing"))]
+fn destination() -> std::io::Stderr {
+    std::io::stderr()
+}
+
+/// Names a variable in the environment of a process a test starts; the writer of that process's
+/// standard error writes nothing until the process calls [`drain`].
+#[cfg(feature = "testing")]
+const HOLD_VARIABLE: &str = "KR_TEST_HOLD_DIAGNOSTICS_UNTIL_DRAIN";
+
+/// Whether [`drain`] has been called in this process, and what a held write waits on.
+#[cfg(feature = "testing")]
+static DRAIN_CALLED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+/// Where the writer of this process's standard error writes: its standard error, which a test can
+/// make late. A line said just before a program ends is lost to the exit unless the program waits
+/// for the thread that writes it, and a test cannot catch the moment the thread has not yet reached
+/// it. A test that is to prove that a program waits sets [`HOLD_VARIABLE`], and no write is made
+/// until the program calls [`drain`]. Without the variable nothing waits, and the feature that
+/// compiles this in is one no shipped build enables.
+#[cfg(feature = "testing")]
+fn destination() -> impl Write + Send + 'static {
+    struct HeldForATest {
+        inner: std::io::Stderr,
+        held: bool,
+    }
+
+    impl Write for HeldForATest {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.held {
+                let (called, drain_called) = &DRAIN_CALLED;
+                let mut called = locked(called);
+                while !*called {
+                    called = drain_called
+                        .wait(called)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+            self.inner.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    HeldForATest {
+        inner: std::io::stderr(),
+        held: std::env::var_os(HOLD_VARIABLE).is_some(),
+    }
 }
 
 /// Says one line to this process's standard error, and lets it go if it cannot be written or the
@@ -170,6 +223,12 @@ pub fn tell(line: std::fmt::Arguments<'_>) {
 /// thread has not reached can be lost to the exit. A standard error that has stopped draining holds
 /// this for `within` and no longer, and the lines still waiting are lost when the process ends.
 pub fn drain(within: Duration) -> bool {
+    #[cfg(feature = "testing")]
+    {
+        let (called, drain_called) = &DRAIN_CALLED;
+        *locked(called) = true;
+        drain_called.notify_all();
+    }
     STANDARD_ERROR
         .get()
         .is_none_or(|writer| writer.drain(within))

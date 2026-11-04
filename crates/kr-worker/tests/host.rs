@@ -1669,6 +1669,11 @@ async fn a_worker_whose_standard_error_refuses_every_write_starts_and_ends_with_
 ///
 /// The worker program is started with a rendezvous no controller listens on. It says that it has
 /// no clock floor to prove authority by, then that it could not connect.
+///
+/// The writer of the worker's diagnostics is held until the program asks it to finish, so the
+/// lines are there to read only if the program waits for them before it ends. A program that ends
+/// without waiting is caught on every run, and not on the runs where its thread happens to be
+/// quick.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_its_standard_error_does()
@@ -1701,6 +1706,7 @@ async fn a_worker_that_cannot_reach_its_controller_says_why_and_ends_whatever_it
             .arg("--state-dir")
             .arg(paths.state_root())
             .current_dir(host.temp.root())
+            .env("KR_TEST_HOLD_DIAGNOSTICS_UNTIL_DRAIN", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(writer)
