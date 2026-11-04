@@ -333,36 +333,55 @@ where
 }
 
 /// [`until`] for a look that says what it found when it found nothing, so that a wait that runs
-/// out of patience says what the last look saw and not only what it waited for.
+/// out of patience says what its looks saw and when, and not only what it waited for: the first
+/// look, and each later look that differed from the one before, with the seconds since the wait
+/// began (the last eight of them when there are more).
 async fn until_found<T, Fut>(what: &str, mut check: impl FnMut() -> Fut) -> T
 where
     Fut: std::future::Future<Output = Result<T, String>>,
 {
-    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let began = tokio::time::Instant::now();
+    let deadline = began + PATIENCE;
+    let mut looks: Vec<(Duration, String)> = Vec::new();
     loop {
         let seen = match check().await {
             Ok(found) => return found,
             Err(seen) => seen,
         };
+        if !seen.is_empty() && looks.last().is_none_or(|(_, last)| *last != seen) {
+            looks.push((began.elapsed(), seen));
+        }
         assert!(
             tokio::time::Instant::now() < deadline,
             "waited {PATIENCE:?} for {what}{}",
-            if seen.is_empty() {
+            if looks.is_empty() {
                 String::new()
             } else {
-                format!("; the last look found {seen}")
+                let skipped = looks.len().saturating_sub(9);
+                let shown: Vec<String> = looks
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index == 0 || *index > skipped)
+                    .map(|(_, (at, seen))| format!("after {:.1} s: {seen}", at.as_secs_f64()))
+                    .collect();
+                format!(
+                    "; the looks that differed, by the seconds since the wait began: {}",
+                    shown.join("; ")
+                )
             }
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-/// What the workers' reports of components say, one binding to a phrase, for a wait that ran out.
+/// What the workers' reports of components say, one binding to a phrase, for a wait that ran out:
+/// whether the binding is `first`, its state and its reason.
 fn reports_in_words(
     reports: &[(
         kr_protocol::ids::BrokerBindingId,
         kr_protocol::admission::ComponentReport,
     )],
+    first: kr_protocol::ids::BrokerBindingId,
 ) -> String {
     if reports.is_empty() {
         return "no binding".to_owned();
@@ -371,7 +390,12 @@ fn reports_in_words(
         .iter()
         .map(|(binding, report)| {
             format!(
-                "{binding:?} {:?} ({})",
+                "the {} binding is {:?} ({})",
+                if *binding == first {
+                    "first"
+                } else {
+                    "another"
+                },
                 report.state,
                 report.reason.0.as_deref().unwrap_or("no reason")
             )
@@ -1426,7 +1450,7 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
                 .iter()
                 .find(|(binding, report)| *binding != first_binding && registering(report))
                 .map(|(binding, _)| *binding)
-                .ok_or_else(|| reports_in_words(&reports))
+                .ok_or_else(|| reports_in_words(&reports, first_binding))
         },
     )
     .await;
