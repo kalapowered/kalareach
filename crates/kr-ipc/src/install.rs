@@ -24,6 +24,12 @@
 //! old one stays beside `current` as `.current-<uuid>`, naming no more than a release's directory
 //! and holding nothing, until the next switch takes it away.
 //!
+//! A path through `current` is for what is written down for something else to start later. A
+//! program the host starts itself, now, from the release `current` names reads the link once
+//! ([`Store::current_program`], [`Store::current_shells`]) and uses the path of the release it
+//! read, which has no link in it: a path walk through a link that a rename replaces rarely answers
+//! that the path is missing, on Linux, and two walks through it can name two releases.
+//!
 //! # Which release a process runs
 //!
 //! The kernel's record of the process's own image says, never the path the process was started
@@ -320,8 +326,7 @@ pub fn registered_forwarder() -> Option<PathBuf> {
 
 /// Returns the forwarder a package registers for `running`, where the file is there.
 fn registered_forwarder_of(running: &Running) -> Option<PathBuf> {
-    let stable = running.stable(Program::Hook);
-    stable.is_file().then_some(stable)
+    running.stable_if_present(Program::Hook)
 }
 
 /// What a process runs.
@@ -431,11 +436,9 @@ impl Running {
     #[must_use]
     pub fn own(&self, program: Program) -> PathBuf {
         match self {
-            Self::Installed(installed) => installed
-                .store
-                .release_directory(&installed.release)
-                .join("bin")
-                .join(program.file_name()),
+            Self::Installed(installed) => {
+                installed.store.release_program(&installed.release, program)
+            }
             Self::Loose { directory } => directory.join(program.file_name()),
         }
     }
@@ -443,12 +446,26 @@ impl Running {
     /// The program an update replaces: the path through `current` that whatever this host
     /// records for later names, such as the service definition that starts the control daemon.
     ///
-    /// Outside a store it is the program beside this one, as before.
+    /// Outside a store it is the program beside this one, as before. A start the host makes itself,
+    /// now, does not use it: see [`Store::current_program`].
     #[must_use]
     pub fn stable(&self, program: Program) -> PathBuf {
         match self {
             Self::Installed(installed) => installed.store.stable(program),
             Self::Loose { directory } => directory.join(program.file_name()),
+        }
+    }
+
+    /// [`Running::stable`], where the program is there, asked as [`Store::stable_if_present`]
+    /// asks it.
+    #[must_use]
+    pub fn stable_if_present(&self, program: Program) -> Option<PathBuf> {
+        match self {
+            Self::Installed(installed) => installed.store.stable_if_present(program),
+            Self::Loose { directory } => {
+                let path = directory.join(program.file_name());
+                path.is_file().then_some(path)
+            }
         }
     }
 
@@ -989,15 +1006,70 @@ impl Store {
     }
 
     /// The program an update replaces, through `current`.
+    ///
+    /// This is the path to write down for a program that will be started later, by something that
+    /// is not this host: it follows every update. A start the host makes itself, now, uses
+    /// [`Store::current_program`] instead.
     #[must_use]
     pub fn stable(&self, program: Program) -> PathBuf {
         self.current_link().join("bin").join(program.file_name())
     }
 
     /// The current release's qualified shell packages, through `current`.
+    ///
+    /// Like [`Store::stable`], this is a path to write down. Reading the packages now uses
+    /// [`Store::current_shells`].
     #[must_use]
     pub fn stable_shells(&self) -> PathBuf {
         self.current_link().join("shells")
+    }
+
+    /// One release's own copy of a program: a path with no link in it.
+    #[must_use]
+    pub fn release_program(&self, release: &ReleaseName, program: Program) -> PathBuf {
+        self.release_directory(release)
+            .join("bin")
+            .join(program.file_name())
+    }
+
+    /// The program of the release `current` names, for a start the host makes itself.
+    ///
+    /// The link is read once and the path returned has none in it, so the start walks a path that
+    /// no switch replaces and runs the one release the read named. A path through `current`
+    /// (`stable`) is resolved again at every step of a walk: on Linux a walk through a link that a
+    /// rename replaces rarely answers that a path is missing, and two walks through it, such as
+    /// the programs of one start, can name two releases. `None` when no release is current.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Store::current`] returns.
+    pub fn current_program(&self, program: Program) -> Result<Option<PathBuf>> {
+        Ok(self
+            .current()?
+            .map(|release| self.release_program(&release, program)))
+    }
+
+    /// The qualified shell packages of the release `current` names, read once like
+    /// [`Store::current_program`]: every file of one package set is then in one release.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Store::current`] returns.
+    pub fn current_shells(&self) -> Result<Option<PathBuf>> {
+        Ok(self
+            .current()?
+            .map(|release| self.release_directory(&release).join("shells")))
+    }
+
+    /// The path [`Store::stable`] names, where the program is there.
+    ///
+    /// Whether it is there is asked of the release `current` names, read once, so a switch under
+    /// way never makes a program every release carries look absent. What is written down stays the
+    /// stable path.
+    #[must_use]
+    pub fn stable_if_present(&self, program: Program) -> Option<PathBuf> {
+        let there = self.current_program(program).ok().flatten()?.is_file();
+        there.then(|| self.stable(program))
     }
 
     /// Creates the store's directories, owner-only, where they are missing. The store record is

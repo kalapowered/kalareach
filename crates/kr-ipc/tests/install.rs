@@ -260,6 +260,145 @@ fn a_program_started_through_current_keeps_its_release_after_the_switch() {
     assert!(test.store.release_directory(&two).exists());
 }
 
+/// KR-REQ-26.09: what the host reads from the release `current` names comes from one release
+/// whichever way a switch falls between its looks. Through the link a second look names the other
+/// release (the control); a path read once keeps naming the release it was read in.
+#[test]
+fn what_the_host_reads_from_current_once_is_of_one_release_though_a_switch_falls_between_looks() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let two = release("0.2.0+bbbbbbbbbbbb");
+    for name in [&one, &two] {
+        test.install(name);
+        // A release's package files say which release they are in.
+        for shell in ["zsh", "bash"] {
+            let package = test
+                .store
+                .release_directory(name)
+                .join("shells")
+                .join(shell);
+            std::fs::create_dir_all(&package).expect("a package's directory");
+            std::fs::write(package.join("marker"), name.as_str()).expect("names its release");
+        }
+    }
+    test.switch(&one);
+    let marker = |shells: &Path, shell: &str| {
+        std::fs::read_to_string(shells.join(shell).join("marker")).expect("a package's marker")
+    };
+
+    // The control: the host's two looks through the link, with a switch between them.
+    let first = marker(&test.store.stable_shells(), "zsh");
+    let program = test
+        .store
+        .current_program(Program::Kr)
+        .expect("current is readable")
+        .expect("a release is current");
+    let shells = test
+        .store
+        .current_shells()
+        .expect("current is readable")
+        .expect("a release is current");
+    test.switch(&two);
+    let second = marker(&test.store.stable_shells(), "bash");
+    assert_eq!(
+        (first.as_str(), second.as_str()),
+        (one.as_str(), two.as_str()),
+        "through the link the two looks name two releases"
+    );
+
+    // Read once: both packages, and the program, are the first release's still.
+    assert_eq!(marker(&shells, "zsh"), one.as_str());
+    assert_eq!(marker(&shells, "bash"), one.as_str());
+    assert_eq!(program, test.store.release_program(&one, Program::Kr));
+    assert!(
+        program.is_file(),
+        "the program is there: {}",
+        program.display()
+    );
+    assert!(
+        !program.starts_with(test.store.current_link())
+            && !shells.starts_with(test.store.current_link()),
+        "neither path has the link in it"
+    );
+    // A read after the switch names the other release.
+    assert_eq!(
+        test.store.current_program(Program::Kr).expect("reads"),
+        Some(test.store.release_program(&two, Program::Kr))
+    );
+}
+
+/// KR-REQ-26.09: a program the host starts from the release `current` names runs that release,
+/// whole, while `current` is being switched over and over: the one its start read, held, from the
+/// image the read named. Judged by a count of starts, not by how long they take.
+#[test]
+fn a_program_started_from_the_release_current_names_runs_that_release_during_switches() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const STARTS: u32 = 40;
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let two = release("0.2.0+bbbbbbbbbbbb");
+    test.install(&one);
+    test.install(&two);
+    test.switch(&one);
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut round = 0_u32;
+            while !finished.load(Ordering::SeqCst) {
+                test.switch(if round % 2 == 0 { &two } else { &one });
+                round += 1;
+            }
+        });
+        for start in 0..STARTS {
+            let program = test
+                .store
+                .current_program(Program::Kr)
+                .expect("current is readable")
+                .expect("a release is current");
+            // The release the read named, from the path it returned.
+            let named = program
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(std::ffi::OsStr::to_str)
+                .map(str::to_owned)
+                .expect("the path is a release's program");
+            assert!(
+                [one.as_str(), two.as_str()].contains(&named.as_str()),
+                "the path names a release of the store, not the link: {}",
+                program.display()
+            );
+            let talk = test.root.join(format!("talk-{start}"));
+            std::fs::create_dir(&talk).expect("a directory to talk through");
+            let mut child = std::process::Command::new(&program)
+                .args(["--exact", "helper", "--nocapture", "--test-threads", "1"])
+                .env(HELPER, &talk)
+                .current_dir(&test.root)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("the program starts");
+            wait_for(&talk.join("started"));
+            std::fs::write(talk.join("go"), b"").expect("go");
+            wait_for(&talk.join("said"));
+            let said = std::fs::read_to_string(talk.join("said")).expect("what it found");
+            let mut lines = said.lines();
+            let image = PathBuf::from(lines.next().expect("its image"));
+            let held = lines.next().expect("its release");
+            assert_eq!(held, named, "it runs and holds the release the read named");
+            assert_eq!(
+                std::fs::canonicalize(&image).expect("its image resolves"),
+                std::fs::canonicalize(&program).expect("the program resolves"),
+                "the kernel names the program the read named"
+            );
+            std::fs::write(talk.join("end"), b"").expect("end");
+            assert!(child.wait().expect("the program ends").success());
+        }
+        finished.store(true, Ordering::SeqCst);
+    });
+}
+
 /// A build outside a store is what it always was: its programs are the ones beside it, and it
 /// holds nothing.
 #[test]
