@@ -811,7 +811,10 @@ fn model_thread<M: Model>(
                     let in_hand = shared.job_in_hand.load(Ordering::Acquire) == id;
                     let cancelled = token.is_cancelled();
                     #[cfg(feature = "testing")]
-                    crate::testing::job_token_read(id, in_hand);
+                    crate::testing::job_token_read(
+                        id,
+                        crate::testing::TokenRead { in_hand, cancelled },
+                    );
                     cancelled
                 };
                 let bound = if cancelled { stop_due } else { grace_due };
@@ -872,6 +875,10 @@ fn model_thread<M: Model>(
                         detail: Nullable(detail),
                     },
                 });
+                // The bound is cleared after the answer is written, so the write is held to it. The
+                // bound held as the write ends, for a test to read back.
+                #[cfg(feature = "testing")]
+                crate::testing::job_answered(id, shared.work_due.load(Ordering::Acquire));
                 shared.work_due.store(0, Ordering::Release);
                 // The bound held now that the job is answered, for a test to read back.
                 #[cfg(feature = "testing")]

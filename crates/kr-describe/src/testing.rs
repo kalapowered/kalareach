@@ -76,8 +76,8 @@ pub const JOB_BOUNDS_PREFIX: &str = "stub-job-bounds-";
 
 /// The start of the name of the file a stub whose script marks work leaves in its runtime
 /// directory when its model thread reads the token of the job with an identifier, followed by that
-/// identifier. It holds whether the job was in hand when the token was read, in the form
-/// [`job_in_hand_at_the_read`] reads.
+/// identifier. It holds whether the job was in hand when the token was read and whether the token
+/// read was cancelled, in the form [`job_token_as_read`] reads.
 pub const JOB_BOUND_CHOSEN_PREFIX: &str = "stub-job-bound-chosen-";
 
 /// The name of the file a stub whose script marks work leaves in its runtime directory each time
@@ -264,13 +264,53 @@ pub fn bound_held_after_the_answer(runtime_dir: &Path, id: u64) -> Option<u64> {
         .ok()
 }
 
-/// Records whether the job with this identifier was in hand as the model thread read its token,
-/// when the process is a stub whose script marks work.
-pub(crate) fn job_token_read(id: u64, in_hand: bool) {
+/// The start of the name of the file a stub whose script marks work leaves in its runtime
+/// directory when its model thread has written the answer to the job with an identifier, followed
+/// by that identifier. It holds the bound the process held as the answer was written, in the
+/// process's stamps, which is the bound of the job and not nought: the bound is cleared after the
+/// answer, and a clear that came before it would leave the write of the answer with no limit.
+pub const JOB_ANSWERED_PREFIX: &str = "stub-job-answered-";
+
+/// Records the bound the process holds as the answer to the job with this identifier has been
+/// written, when the process is a stub whose script marks work.
+pub(crate) fn job_answered(id: u64, held: u64) {
+    if let Some(directory) = RECORDS_DIRECTORY.get() {
+        let _ = std::fs::write(
+            directory.join(format!("{JOB_ANSWERED_PREFIX}{id}")),
+            held.to_string(),
+        );
+    }
+}
+
+/// Returns the bound, in the process's stamps, that the stub process with `runtime_dir` as its
+/// runtime directory held as the answer to the job with this identifier was written, once it has
+/// been.
+#[must_use]
+pub fn bound_held_at_the_answer(runtime_dir: &Path, id: u64) -> Option<u64> {
+    std::fs::read_to_string(runtime_dir.join(format!("{JOB_ANSWERED_PREFIX}{id}")))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// What the model thread of a stub process found as it read a job's token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenRead {
+    /// Whether the job was in hand as the token was read.
+    pub in_hand: bool,
+    /// Whether the token read was cancelled.
+    pub cancelled: bool,
+}
+
+/// Records what the model thread found as it read the token of the job with this identifier, when
+/// the process is a stub whose script marks work. The record takes the value the read returned, so
+/// it cannot be written before the read.
+pub(crate) fn job_token_read(id: u64, found: TokenRead) {
     if let Some(directory) = RECORDS_DIRECTORY.get() {
         let _ = std::fs::write(
             directory.join(format!("{JOB_BOUND_CHOSEN_PREFIX}{id}")),
-            if in_hand { "1" } else { "0" },
+            format!("{} {}", u8::from(found.in_hand), u8::from(found.cancelled)),
         );
     }
 }
@@ -285,17 +325,22 @@ pub(crate) fn job_bound_chosen(_id: u64) {
     }
 }
 
-/// Returns whether the job with this identifier was in hand when the model thread of the stub
-/// process with `runtime_dir` as its runtime directory read the job's token, once it has read it.
+/// Returns what the model thread of the stub process with `runtime_dir` as its runtime directory
+/// found as it read the token of the job with this identifier, once it has read it.
 #[must_use]
-pub fn job_in_hand_at_the_read(runtime_dir: &Path, id: u64) -> Option<bool> {
+pub fn job_token_as_read(runtime_dir: &Path, id: u64) -> Option<TokenRead> {
     let text =
         std::fs::read_to_string(runtime_dir.join(format!("{JOB_BOUND_CHOSEN_PREFIX}{id}"))).ok()?;
-    match text.trim() {
+    let flag = |part: &str| match part {
         "1" => Some(true),
         "0" => Some(false),
         _ => None,
-    }
+    };
+    let (in_hand, cancelled) = text.trim().split_once(' ')?;
+    Some(TokenRead {
+        in_hand: flag(in_hand)?,
+        cancelled: flag(cancelled)?,
+    })
 }
 
 /// Returns what the watchdog of the stub process with `runtime_dir` as its runtime directory found

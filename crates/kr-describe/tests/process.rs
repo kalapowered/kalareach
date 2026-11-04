@@ -21,9 +21,9 @@ use kr_describe::serve::{
 };
 use kr_describe::supervise::STOP_BOUND_MS;
 use kr_describe::testing::{
-    Script, acknowledging_state, bound_held_after_the_answer, job_bounds, job_in_hand_at_the_read,
-    release_held_watchdog, release_held_work, token_cancelled_at_the_look, watchdog_found,
-    watchdog_has_spared,
+    Script, TokenRead, acknowledging_state, bound_held_after_the_answer, bound_held_at_the_answer,
+    job_bounds, job_token_as_read, release_held_watchdog, release_held_work,
+    token_cancelled_at_the_look, watchdog_found, watchdog_has_spared,
 };
 use kr_describe::wire::{Answer, JobEnd, LoadEnd, Request, WIRE_VERSION, frame_of};
 use kr_protocol::ids::SessionEpoch;
@@ -841,7 +841,9 @@ fn a_stop_applied_after_the_watchdog_found_the_job_overdue_is_not_missed() {
 /// and only then releases the watchdog and reads its record that it left the process alone. No
 /// delay decides it. A watchdog that ends the process unless the bound has moved later, or a model
 /// thread that does not clear the bound when the job is answered, ends or keeps an idle process
-/// as overdue.
+/// as overdue. The process also records the bound it holds as the answer is written, which the
+/// case reads as not nought: a clear before the write leaves the write with no limit, and a stop
+/// that comes between the clear and the forgetting of the job gives an idle process the stop bound.
 #[test]
 fn a_job_that_ends_after_the_watchdog_found_it_overdue_does_not_end_the_process() {
     let placed = Placed::stub();
@@ -872,6 +874,10 @@ fn a_job_that_ends_after_the_watchdog_found_it_overdue_does_not_end_the_process(
     wait_for("the model thread to clear the job's bound", || {
         bound_held_after_the_answer(&runtime, 2).is_some()
     });
+    assert!(
+        bound_held_at_the_answer(&runtime, 2).is_some_and(|held| held != 0),
+        "the bound the job was held to is still held as its answer is written"
+    );
     assert_eq!(
         bound_held_after_the_answer(&runtime, 2),
         Some(0),
@@ -937,11 +943,12 @@ fn a_job_cancelled_before_it_is_in_hand_is_held_to_the_stop_bound_from_the_start
 /// the job's token and before it has set the job's bound, is not lost: the cancellation finds the job
 /// in hand and extends it, and the model thread's bound does not take the extension back. The script
 /// holds the model thread between the two; the case sends the stop once the process says it has read
-/// the token (the record is left after the read, so the token is always read as not cancelled and
-/// the model thread always has the grace to set), reads the acknowledgement, which is written after
-/// the extension, and lets the model thread go. The bound the process holds the job to is then read
-/// back from the process: the stop bound. No delay decides it. A bound set in place of the extension, or a job put in hand after its bound,
-/// leaves the grace.
+/// the token (the record holds what the read returned, so it is left after the read, and the case
+/// asserts that the read found the token not cancelled, so that the model thread always has the
+/// grace to set), reads the acknowledgement, which is written after the extension, and lets the
+/// model thread go. The bound the process holds the job to is then read back from the process: the
+/// stop bound. No delay decides it. A bound set in place of the extension, or a job put in hand
+/// after its bound, leaves the grace.
 #[test]
 fn a_stop_read_while_a_job_comes_into_hand_is_not_lost() {
     let placed = Placed::stub();
@@ -957,7 +964,7 @@ fn a_stop_read_while_a_job_comes_into_hand_is_not_lost() {
     process.expect_answer(SOON, "the load");
     process.send(&generate(2, 1, 60_000));
     wait_for("the model thread to read the job's token", || {
-        job_in_hand_at_the_read(&runtime, 2).is_some()
+        job_token_as_read(&runtime, 2).is_some()
     });
     process.send(&Request::Cancel { id: U64::new(2) });
     assert_eq!(
@@ -970,9 +977,12 @@ fn a_stop_read_while_a_job_comes_into_hand_is_not_lost() {
         Answer::Ended { id, why: JobEnd::Cancelled, .. } if id.get() == 2
     ));
     assert_eq!(
-        job_in_hand_at_the_read(&runtime, 2),
-        Some(true),
-        "the job is in hand before its token is read"
+        job_token_as_read(&runtime, 2),
+        Some(TokenRead {
+            in_hand: true,
+            cancelled: false
+        }),
+        "the job is in hand before its token is read, and the read finds the token not cancelled"
     );
     assert!(
         !began(&runtime, "job"),
