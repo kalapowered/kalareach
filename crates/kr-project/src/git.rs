@@ -5832,9 +5832,12 @@ mod tests {
 
     /// The state the program `ps` gives for a process within `bound`, which is nothing for one
     /// that is gone. A `ps` that has not answered by then is ended, and the case that asked fails:
-    /// the question cannot hold a case without end. It is asked whether `ps` has ended before it is
-    /// asked whether the time is up, so a machine that was stopped past the bound while `ps` ran
-    /// on finds its answer.
+    /// the question cannot hold a case without end. The time is read before it is asked whether
+    /// `ps` has ended, so a stop between the two cannot turn an answer that came meanwhile into a
+    /// failure: the case fails only for a `ps` that is still running at a look made after the
+    /// bound. Nothing after that waits without end either. A `ps` that does not end for the signal
+    /// is left, and what an ended `ps` wrote is read from the pipe as it stands, so a process that
+    /// kept the pipe open does not hold the case.
     #[cfg(unix)]
     fn state_by(ps: impl AsRef<OsStr>, pid: &str, bound: Duration) -> String {
         use std::io::Read as _;
@@ -5848,25 +5851,54 @@ mod tests {
             .expect("ps starts");
         let until = Instant::now() + bound;
         loop {
+            let late = Instant::now() >= until;
             match asked.try_wait().expect("ps can be waited on") {
                 Some(_) => break,
-                None if Instant::now() >= until => {
+                None if late => {
                     // This case started it, so this case ends it, by the handle it holds.
                     let _ = asked.kill();
-                    let _ = asked.wait();
+                    let reaped = Instant::now() + Duration::from_secs(30);
+                    while asked.try_wait().is_ok_and(|ended| ended.is_none())
+                        && Instant::now() < reaped
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
                     panic!("ps did not answer in {bound:?} for process {pid}");
                 }
                 None => std::thread::sleep(Duration::from_millis(5)),
             }
         }
-        let mut listed = String::new();
-        asked
-            .stdout
-            .take()
-            .expect("ps's output")
-            .read_to_string(&mut listed)
-            .expect("ps's answer reads");
-        listed.trim().to_owned()
+        let mut output = asked.stdout.take().expect("ps's output");
+        rustix::fs::fcntl_setfl(&output, rustix::fs::OFlags::NONBLOCK)
+            .expect("ps's output is read without blocking");
+        let mut listed = Vec::new();
+        let mut buffer = [0_u8; 256];
+        loop {
+            match output.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => listed.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("ps's answer could not be read: {error}"),
+            }
+        }
+        String::from_utf8_lossy(&listed).trim().to_owned()
+    }
+
+    /// Waits until no process with this identifier is running. The time is read before the
+    /// question, so a stop between the two cannot fail a case for a process that ended meanwhile:
+    /// it fails, with `what`, only when a look made after the guard still finds the process.
+    #[cfg(unix)]
+    fn wait_until_gone(pid: &str, what: &str) {
+        let guard = Instant::now() + Duration::from_secs(30);
+        loop {
+            let late = Instant::now() >= guard;
+            if !running(pid) {
+                return;
+            }
+            assert!(!late, "{what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Whether a process with this identifier is running, which one that has ended and not yet been
@@ -6332,9 +6364,9 @@ mod tests {
     }
 
     /// Places a `git` in `directory` that starts a process in a session of its own, which holds the
-    /// pipe the stand-in was started with until a case lets it go with [`let_go`] or `directory` is
-    /// gone, and ends. The stand-in ends once the holder has left the group, so that ending the
-    /// group cannot reach it.
+    /// pipe the stand-in was started with until a case lets it go with [`let_go`], `directory` is
+    /// gone or the test program has ended, and ends. The stand-in ends once the holder has left
+    /// the group, so that ending the group cannot reach it.
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     fn stand_in_whose_output_a_process_outside_its_group_holds(directory: &Path) -> PathBuf {
         let (own, release) = (directory.join("own"), directory.join("release"));
@@ -6342,8 +6374,8 @@ mod tests {
         std::fs::write(
             &holder,
             "use POSIX ();\nPOSIX::setsid();\nopen(my $out, '>', $ARGV[0]) or die;\n\
-             print $out $$;\nclose($out);\nmy $i = 0;\n\
-             while (-d $ARGV[2] && !-e $ARGV[1] && $i++ < 2400) {\n\
+             print $out $$;\nclose($out);\n\
+             while (-d $ARGV[2] && !-e $ARGV[1] && kill(0, $ARGV[3])) {\n\
              select(undef, undef, undef, 0.05); }\n",
         )
         .expect("the holder's text");
@@ -6351,12 +6383,13 @@ mod tests {
         std::fs::write(
             &text,
             format!(
-                "#!/bin/sh\n/usr/bin/perl '{holder}' '{own}' '{release}' '{directory}' &\ni=0\n\
-                 while [ ! -s '{own}' ] && [ $i -lt 2400 ]; do sleep 0.02; i=$((i+1)); done\n",
+                "#!/bin/sh\n/usr/bin/perl '{holder}' '{own}' '{release}' '{directory}' '{tester}' &\n\
+                 i=0\nwhile [ ! -s '{own}' ] && [ $i -lt 2400 ]; do sleep 0.02; i=$((i+1)); done\n",
                 holder = holder.display(),
                 own = own.display(),
                 release = release.display(),
                 directory = directory.display(),
+                tester = std::process::id(),
             ),
         )
         .expect("the stand-in's text");
@@ -7567,14 +7600,21 @@ mod tests {
     }
 
     /// A `ps` that does not answer fails the case that asked it, and is ended, within the bound it
-    /// was given: it cannot hold a case without end. The stand-in never answers on its own, so
-    /// nothing here depends on how fast the machine runs.
+    /// was given: it cannot hold a case without end. The stand-in never answers on its own: it
+    /// lives for as long as the test program and the case's directory do, and no longer, so
+    /// nothing here depends on how fast the machine runs or on how long it is stopped.
     #[cfg(unix)]
     #[test]
     #[should_panic(expected = "ps did not answer")]
     fn a_ps_that_does_not_answer_fails_the_case_that_asked_it() {
         let directory = tempfile::tempdir().expect("a directory for this test");
-        place_stand_in(directory.path(), "exec sleep 120");
+        place_stand_in(
+            directory.path(),
+            &format!(
+                "while kill -0 $PPID 2>/dev/null && [ -d '{}' ]; do sleep 0.05; done",
+                directory.path().display()
+            ),
+        );
 
         state_by(
             directory.path().join("git"),
@@ -7785,13 +7825,9 @@ mod tests {
             .expect("the stand-in recorded the process it left in its group")
             .trim()
             .to_owned();
-        let guard = Instant::now() + Duration::from_secs(30);
-        while running(&sleeper) {
-            assert!(
-                Instant::now() < guard,
-                "the process the stand-in left in its group is still running"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_until_gone(
+            &sleeper,
+            "the process the stand-in left in its group is still running",
+        );
     }
 }
