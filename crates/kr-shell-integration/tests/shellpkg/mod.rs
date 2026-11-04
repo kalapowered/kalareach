@@ -51,12 +51,13 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 /// How long a wait for the shell, or for a reader's answer, goes on before a test gives up on it.
 ///
 /// The waits it bounds end when the thing they wait for happens, or sooner when it cannot: a shell
-/// that has ended without connecting is found within half a second, and a wait on an endpoint
-/// whose stream has ended, with nothing whole left in it, ends at once. So the bound is reached
-/// only by a shell that is running and says nothing, and a runner that is slow to start a shell
-/// only makes the wait longer. It is far beyond what a loaded machine has taken: a shell started
-/// at background priority on a machine with its processors busy took more than twenty seconds to
-/// connect, where an idle machine takes a second or two, and no case has taken a tenth of it.
+/// that has ended without connecting is found within half a second, and the waits for an event
+/// or an answer end at once when the endpoint's stream has ended with nothing whole left in it.
+/// So the bound is reached only by a shell that is running and says nothing, and a runner that is
+/// slow to start a shell only makes the wait longer. It is far beyond what a loaded machine has
+/// taken: a shell started at background priority on a machine with its processors busy took more
+/// than twenty seconds to connect, where an idle machine takes a second or two, and the longest
+/// whole case of a loaded run took 83 seconds.
 pub const REPLY: Duration = Duration::from_secs(240);
 
 /// What a wait goes on for once an earlier wait in this run has given up on a shell that was
@@ -64,8 +65,9 @@ pub const REPLY: Duration = Duration::from_secs(240);
 ///
 /// A package that fails in the same way for every case would otherwise cost [`REPLY`] in each of
 /// them, which is longer than the job that runs them, and the failure text libtest prints at the
-/// end of a run would be lost with the job. The run is already a failure when this applies, so it
-/// can fail no correct code.
+/// end of a run would be lost with the job. The run is already a failure when this applies, so the
+/// cap cannot turn a passing run into a failing one; it can fail a later case that a loaded runner
+/// would have let through, and the messages of the waits it cuts say so.
 const REPLY_AFTER_A_GIVE_UP: Duration = Duration::from_secs(20);
 
 /// Whether a wait has given up on a silent shell in this run.
@@ -1210,8 +1212,9 @@ impl Session {
         // A shell that is not managed connects to nothing. The stream a session reads is then one
         // whose other end this session holds and never writes to, so a read finds nothing.
         let (stream, bridge_peer) = if managed {
-            let connected =
-                accept_unless(&listener, REPLY, || matches!(child.try_wait(), Ok(Some(_))));
+            let connected = accept_unless(&listener, after_any_give_up(REPLY), || {
+                matches!(child.try_wait(), Ok(Some(_)))
+            });
             let Some(stream) = connected else {
                 let state = match child.try_wait() {
                     Ok(Some(status)) => format!("it ended with {status:?}"),
@@ -1274,7 +1277,14 @@ impl Session {
         if !managed {
             return session;
         }
-        let hello = match session.read_frame(REPLY).expect("the opening frame") {
+        let Some(opening) = session.read_frame(after_any_give_up(REPLY)) else {
+            note_that_a_wait_gave_up();
+            panic!(
+                "the bridge sent no opening frame; the terminal showed:\n{}",
+                session.terminal_output()
+            );
+        };
+        let hello = match opening {
             BridgeFrame::Hello(hello) => hello,
             other => panic!("the bridge opened with {other:?}"),
         };
@@ -1871,16 +1881,19 @@ impl Session {
                 return (received.id, received.event);
             }
             let gave_up = deadline.passed();
+            let cut_short = A_WAIT_GAVE_UP.load(Ordering::Relaxed);
             if gave_up {
                 note_that_a_wait_gave_up();
             }
             assert!(
                 !gave_up && !self.read_to_the_end(),
                 "no {what} arrived{}; the events were {:?}\nterminal output:\n{}",
-                if gave_up {
-                    ""
-                } else {
+                if !gave_up {
                     " and the stream has ended"
+                } else if cut_short {
+                    " (cut short, because an earlier wait in this run gave up)"
+                } else {
+                    ""
                 },
                 self.events.waiting(),
                 self.terminal_output()
@@ -2116,9 +2129,17 @@ impl Session {
                 return answer;
             }
             let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                note_that_a_wait_gave_up();
+            }
             assert!(
-                !left.is_zero(),
-                "the reader did not answer request {id:?} before the deadline of this wait\nterminal output:\n{}",
+                !left.is_zero() && !self.read_to_the_end(),
+                "the reader did not answer request {id:?} {}\nterminal output:\n{}",
+                if left.is_zero() {
+                    "before the deadline of this wait"
+                } else {
+                    "and the stream has ended"
+                },
                 self.terminal_output()
             );
             self.pump_before(left.min(Duration::from_millis(50)), deadline);
@@ -2231,8 +2252,12 @@ impl Session {
             // the line, and it sends a line feed where the return was.
             let start = self.output.lock().expect("the output lock").len();
             self.type_bytes(line.as_bytes());
+            let drawn = self.wait_for_editor(start);
+            if !drawn {
+                note_that_a_wait_gave_up();
+            }
             assert!(
-                self.wait_for_editor(start),
+                drawn,
                 "the editor drew nothing for {line:?}:\n{}",
                 self.terminal_output()
             );
