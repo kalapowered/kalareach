@@ -210,12 +210,12 @@ pub enum SendState {
     /// The host has no record of it. That is a report, never "not sent": the send may arrive late.
     NoRecord,
     /// The host could not be asked.
-    Unreadable(Unread),
+    Unreadable(ReadFailure),
 }
 
 /// Why a send's record could not be read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Unread {
+pub enum ReadFailure {
     /// The read was lost or failed in a way that may pass. It decides nothing.
     Failed,
     /// The host refused the read in its own word, which no retry changes, such as a device that may
@@ -291,7 +291,7 @@ impl Earlier {
     pub fn failed(&self) -> bool {
         self.sends
             .iter()
-            .any(|(_, state)| *state == SendState::Unreadable(Unread::Failed))
+            .any(|(_, state)| *state == SendState::Unreadable(ReadFailure::Failed))
     }
 
     /// The sends a record keeps after these reads: every one the host did not settle by refusing
@@ -1509,9 +1509,9 @@ fn unread(error: &ClientError) -> SendState {
         ClientError::Host(refused) | ClientError::Refused { error: refused, .. }
             if !keeps_the_answer(error) =>
         {
-            SendState::Unreadable(Unread::Refused(refused.code))
+            SendState::Unreadable(ReadFailure::Refused(refused.code))
         }
-        _ => SendState::Unreadable(Unread::Failed),
+        _ => SendState::Unreadable(ReadFailure::Failed),
     }
 }
 

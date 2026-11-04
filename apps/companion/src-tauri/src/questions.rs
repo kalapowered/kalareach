@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use kr_client::answers::{
     self, AnswerDraft, AnswerDrafts, AnswerError, AnswerFailure, Answered, Dispatch, Earlier,
-    Keeper, Leave, QuestionHost, Quoting, Retired, SendState, Unread,
+    Keeper, Leave, QuestionHost, Quoting, ReadFailure, Retired, SendState,
 };
 use kr_client::{ClientError, Session};
 use kr_ipc::install::Writing;
@@ -675,8 +675,8 @@ fn earlier_sends(earlier: &Earlier) -> Vec<EarlierSend> {
                 SendState::Unknown { .. } => ("unknown", None),
                 SendState::Refused(code) => ("refused", *code),
                 SendState::NoRecord => ("no_record", None),
-                SendState::Unreadable(Unread::Failed) => ("unreadable", None),
-                SendState::Unreadable(Unread::Refused(code)) => ("unreadable", Some(*code)),
+                SendState::Unreadable(ReadFailure::Failed) => ("unreadable", None),
+                SendState::Unreadable(ReadFailure::Refused(code)) => ("unreadable", Some(*code)),
                 SendState::Applied | SendState::Pending => return None,
             };
             Some(EarlierSend {

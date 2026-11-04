@@ -22,12 +22,11 @@ use kr_protocol::receipt::{Receipt, ReceiptState};
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 
 use super::{
-    AnswerDraft, AnswerDrafts, AnswerError, AnswerFailure, Dispatch, Keeper, Leave, QuestionHost,
+    AnswerDraft, AnswerDrafts, AnswerError, AnswerFailure, Dispatch, Leave, QuestionHost,
     Reconciled, Settled, reconcile,
 };
 use crate::error::ClientError;
 use crate::sends::{self, Stop};
-use crate::shown::Shown;
 
 fn session() -> SessionId {
     SessionId::new(Uuid::from_bytes([1; 16]))
@@ -100,14 +99,6 @@ fn with_leave<R>(work: impl FnOnce(&Leave<'_>) -> R) -> R {
         sends: writers.permit(&sends::WRITTEN).expect("permitted"),
     };
     work(&leave)
-}
-
-struct Hold;
-
-impl Keeper for Hold {
-    fn keep<R>(&self, work: impl FnOnce(&Leave<'_>) -> R) -> Result<R, Shown> {
-        Ok(with_leave(work))
-    }
 }
 
 fn store() -> (tempfile::TempDir, AnswerDrafts) {

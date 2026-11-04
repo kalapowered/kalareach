@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 
 use kr_client::answers::{
     self, AnswerDraft, AnswerDrafts, AnswerError, AnswerFailure, Answered, Dispatch, Earlier,
-    Keeper, Leave, QuestionHost, Quoting, Reconciled, Retired, SendState, Unread,
+    Keeper, Leave, QuestionHost, Quoting, ReadFailure, Reconciled, Retired, SendState,
 };
 use kr_client::error::ClientError;
 use kr_ipc::client::LocalClient;
@@ -859,7 +859,7 @@ pub fn kept_line(reconciled: &Reconciled) -> Line {
             "{}  waiting  {} (action {}); it is still kept, and this command did not send it",
             draft.question_id,
             WAITING_BECAUSE,
-            action_id
+            *action_id
         ),
         Reconciled::Unsettled(draft) => stdout_line!(
             "{}  unsettled  {}; it is still kept, and this command did not send it",
@@ -870,7 +870,7 @@ pub fn kept_line(reconciled: &Reconciled) -> Line {
             "{}  taken  {} (action {}); this command did not send it, and it is no longer kept",
             draft.question_id,
             TAKEN_BECAUSE,
-            action_id
+            *action_id
         ),
         Reconciled::Retired { draft, reason } => stdout_line!(
             "{}  retired  {}; this command did not send it, and it is no longer kept",
@@ -902,8 +902,8 @@ pub fn earlier_documents(earlier: &Earlier) -> Vec<Document> {
                 SendState::Unknown { .. } => ("unknown", None),
                 SendState::Refused(code) => ("refused", *code),
                 SendState::NoRecord => ("no_record", None),
-                SendState::Unreadable(Unread::Failed) => ("unreadable", None),
-                SendState::Unreadable(Unread::Refused(code)) => ("unreadable", Some(*code)),
+                SendState::Unreadable(ReadFailure::Failed) => ("unreadable", None),
+                SendState::Unreadable(ReadFailure::Refused(code)) => ("unreadable", Some(*code)),
             };
             Document::new()
                 .with("action_id", output::said(action_id))
@@ -921,24 +921,24 @@ fn earlier_sentences(earlier: &Earlier) -> Vec<Shown> {
             SendState::Unknown { .. } => Some(shown!(
                 "an earlier send of this answer (action {}) ended with an outcome the host could \
                  not establish; sending now is a new action that names it",
-                action_id
+                *action_id
             )),
             SendState::NoRecord => Some(shown!(
                 "the host has no record of the earlier send (action {})",
-                action_id
+                *action_id
             )),
             SendState::Refused(Some(code)) => Some(shown!(
                 "the host refused the earlier send (action {}): {}",
-                action_id,
-                code
+                *action_id,
+                *code
             )),
             SendState::Refused(None) => Some(shown!(
                 "the host refused the earlier send (action {})",
-                action_id
+                *action_id
             )),
             SendState::Unreadable(_) => Some(shown!(
                 "the host could not be asked what became of the earlier send (action {})",
-                action_id
+                *action_id
             )),
             SendState::Applied | SendState::Pending => None,
         })

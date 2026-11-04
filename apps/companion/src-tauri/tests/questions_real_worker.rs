@@ -346,3 +346,315 @@ async fn an_answer_to_a_question_that_expired_while_it_was_read_is_refused() {
         .expect("the question is held");
     assert!(held.answer.0.is_none(), "no answer was recorded");
 }
+
+/// The kept answers' place for one environment, as the application keeps them.
+fn kept_store(page: &Page, worker: &Worker) -> kr_client::answers::AnswerDrafts {
+    kr_client::answers::AnswerDrafts::open(
+        page.kept
+            .path()
+            .join("kept-answers")
+            .join(worker.temp.environment_id().to_string()),
+    )
+    .expect("a store")
+}
+
+/// Records an answer to `question` under the send `id` and nothing more, as an attempt does before
+/// it sends: what a crash right after leaves.
+fn record_pair(
+    page: &Page,
+    worker: &Worker,
+    question: QuestionId,
+    revision: &str,
+    id: kr_protocol::ids::ActionId,
+) {
+    let draft = kr_client::answers::AnswerDraft {
+        version: kr_client::answers::ANSWER_FORMAT,
+        target: session_target(worker),
+        session_id: worker.session_id,
+        question_id: question,
+        question_revision: QuestionRevision::new(revision.parse().expect("a revision")),
+        answer: QuestionAnswer::Decision { decided: true },
+        drafted_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+    };
+    let store = kept_store(page, worker);
+    let root = page.kept.path().join("kept-answers");
+    let writers = kr_ipc::install::hold_writers(
+        &kr_ipc::install::Writing::in_roots(&root, &root),
+        &mut || {},
+    )
+    .expect("the writers lock");
+    let leave = kr_client::answers::Leave {
+        answers: writers
+            .permit(&kr_client::answers::WRITTEN)
+            .expect("permitted"),
+        sends: writers
+            .permit(&kr_client::sends::WRITTEN)
+            .expect("permitted"),
+    };
+    let basis = store.basis(question).expect("the pair reads");
+    let carried = basis.sends().to_vec();
+    store
+        .begin(&draft, &basis, &carried, id, &leave)
+        .expect("recorded");
+}
+
+/// The target the application sends an answer on: the session at its first epoch.
+fn session_target(worker: &Worker) -> kr_protocol::envelope::ActionTarget {
+    kr_protocol::envelope::ActionTarget {
+        environment_id: worker.temp.environment_id(),
+        session_id: Nullable::some(worker.session_id),
+        session_epoch: Nullable::some(SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    }
+}
+
+/// A local owner's connection to the worker, as `kr` has one.
+async fn owner(worker: &Worker) -> kr_ipc::client::LocalClient {
+    let endpoint = worker
+        .temp
+        .environment()
+        .worker_endpoint(DisplayNumber::new(1))
+        .expect("an endpoint");
+    kr_ipc::client::LocalClient::connect(
+        &endpoint,
+        kr_protocol::local::LocalClientKind::Cli,
+        BuildId::new("kr-test/0").expect("a build identifier"),
+    )
+    .await
+    .expect("connects")
+}
+
+/// Sends the answer under the identifier `id` over `client`, as an application's send would.
+async fn send_as(
+    client: &mut kr_ipc::client::LocalClient,
+    worker: &Worker,
+    question: QuestionId,
+    revision: &str,
+    id: kr_protocol::ids::ActionId,
+) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
+    client
+        .mutate(
+            kr_protocol::method::Method::QuestionAnswer,
+            id,
+            session_target(worker),
+            &QuestionAnswerParams {
+                session_id: worker.session_id,
+                question_id: question,
+                expected_revision: QuestionRevision::new(revision.parse().expect("a revision")),
+                answer: QuestionAnswer::Decision { decided: true },
+            },
+        )
+        .await
+        .expect("the connection holds")
+}
+
+/// Puts an action of the local owner with an uncertain outcome on the subject of a question answer
+/// into the worker's journal, as a send whose outcome the worker could not establish leaves it.
+async fn an_uncertain_answer(
+    worker: &Worker,
+    client: &mut kr_ipc::client::LocalClient,
+    question: QuestionId,
+    revision: &str,
+    id: kr_protocol::ids::ActionId,
+) {
+    let composed = client
+        .compose(
+            kr_protocol::method::Method::QuestionAnswer,
+            id,
+            session_target(worker),
+            &QuestionAnswerParams {
+                session_id: worker.session_id,
+                question_id: question,
+                expected_revision: QuestionRevision::new(revision.parse().expect("a revision")),
+                answer: QuestionAnswer::Decision { decided: true },
+            },
+        )
+        .await
+        .expect("composes");
+    let subject = kr_protocol::action::subject_digest(&composed).expect("a subject digest");
+    let actor = ActorId::new(format!("local:{}", kr_ipc::paths::current_uid())).expect("an actor");
+    let mut session = worker.service.runtime().session();
+    let journal = session.journal_mut().expect("a journal");
+    journal
+        .accept(&kr_worker::journal::Submission {
+            actor_id: actor.clone(),
+            action_id: id,
+            method: composed.method.clone(),
+            method_version: composed.method_version,
+            payload_digest: kr_protocol::scalars::Digest256::from_bytes([7; 32]),
+            subject_digest: subject,
+            intent: vec![0xa0],
+            accepted_deadline_ms: Some(TimestampMs::new(kr_ipc::now_ms().get() + 120_000)),
+            now_ms: kr_ipc::now_ms(),
+        })
+        .expect("the earlier intent");
+    journal
+        .mark_dispatching(actor.clone(), id, kr_ipc::now_ms())
+        .expect("a marker");
+    journal
+        .settle(
+            actor,
+            id,
+            kr_protocol::receipt::ReceiptState::Unknown,
+            None,
+            None,
+            kr_ipc::now_ms(),
+        )
+        .expect("an uncertain outcome");
+}
+
+/// The page's settling of the answers kept for the session.
+fn settle(worker: &Worker) -> Value {
+    json!({ "params": { "sessionId": worker.session_id.to_string() } })
+}
+
+/// KR-REQ-11.63: an answer sent under a recorded identifier whose reply was lost, with the pair left
+/// in place as a lost reply leaves it, is found taken from the worker's own receipt; a pair that was
+/// recorded and never sent is found unrecorded, from the worker's own "no receipt".
+#[tokio::test(flavor = "multi_thread")]
+async fn the_worker_says_whether_an_answer_the_application_lost_the_reply_to_was_taken() {
+    let worker = worker().await;
+    let page = Page::new(worker.temp.environment());
+    let asked = ask(&worker, "lost-reply", kr_ipc::now_ms().get(), 600_000);
+    let listed = answered(page.call("question_read", read(&worker)))
+        .await
+        .expect("the questions");
+    let revision = listed["questions"][0]["revision"]
+        .as_str()
+        .expect("a revision")
+        .to_owned();
+    let sent = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+
+    // Recorded and never sent: the worker has no receipt of it.
+    record_pair(&page, &worker, asked, &revision, sent);
+    let standing = answered(page.call("question_settle", settle(&worker)))
+        .await
+        .expect("the standing");
+    assert_eq!(standing[0]["standing"], "offered", "{standing}");
+    assert_eq!(
+        standing[0]["earlier"][0]["state"], "no_record",
+        "{standing}"
+    );
+    assert_eq!(standing[0]["earlier"][0]["action_id"], sent.to_string());
+
+    // Sent, and the reply lost: the worker took it, and its receipt says so.
+    let mut client = owner(&worker).await;
+    send_as(&mut client, &worker, asked, &revision, sent)
+        .await
+        .expect("the worker takes it");
+    let standing = answered(page.call("question_settle", settle(&worker)))
+        .await
+        .expect("the standing");
+    assert_eq!(standing[0]["standing"], "taken", "{standing}");
+    assert_eq!(standing[0]["action_id"], sent.to_string());
+    // Nothing is sent again, and dismissing removes both files.
+    let again = answered(page.call(
+        "question_send_kept",
+        json!({ "params": {
+            "questionId": asked.to_string(),
+            "draftedAtMs": standing[0]["draft"]["drafted_at_ms"].clone()
+        } }),
+    ))
+    .await
+    .expect("nothing is sent");
+    assert_eq!(again["outcome"], "landed", "{again}");
+    let kept = kept_store(&page, &worker);
+    assert!(
+        kept.drafts().expect("reads").len() == 1,
+        "the copy stays shown until dismissed"
+    );
+    let which = json!({ "params": {
+        "questionId": asked.to_string(),
+        "draftedAtMs": standing[0]["draft"]["drafted_at_ms"].clone()
+    } });
+    assert_eq!(
+        answered(page.call("question_dismiss_kept", which))
+            .await
+            .expect("dismissed"),
+        json!(true)
+    );
+    assert!(kept.drafts().expect("reads").is_empty());
+}
+
+/// KR-ACC-009: after an answer whose outcome the worker could not establish, the worker refuses the
+/// next answer of that actor until it names the uncertain send after being shown it. The application
+/// shows the outcome first, on both its commands: an answer or a send that finds an uncertain send
+/// the page was not shown sends nothing, and the press that names it is admitted by the worker.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uncertain_send_is_shown_before_the_application_names_it_to_the_worker() {
+    let worker = worker().await;
+    let page = Page::new(worker.temp.environment());
+    let asked = ask(&worker, "uncertain", kr_ipc::now_ms().get(), 600_000);
+    let listed = answered(page.call("question_read", read(&worker)))
+        .await
+        .expect("the questions");
+    let revision = listed["questions"][0]["revision"]
+        .as_str()
+        .expect("a revision")
+        .to_owned();
+    let uncertain = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let mut client = owner(&worker).await;
+    an_uncertain_answer(&worker, &mut client, asked, &revision, uncertain).await;
+    record_pair(&page, &worker, asked, &revision, uncertain);
+
+    // The worker refuses a send that does not name the uncertain one: a plain answer from another
+    // actor path is the control.
+    let refused = send_as(
+        &mut client,
+        &worker,
+        asked,
+        &revision,
+        kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+    )
+    .await
+    .expect_err("an unquoted send is refused");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::DraftConflict);
+
+    // Settling shows the uncertain send, and a send of the kept answer that was not shown it
+    // sends nothing.
+    let standing = answered(page.call("question_settle", settle(&worker)))
+        .await
+        .expect("the standing");
+    assert_eq!(standing[0]["standing"], "offered", "{standing}");
+    assert_eq!(standing[0]["earlier"][0]["state"], "unknown", "{standing}");
+    let drafted = standing[0]["draft"]["drafted_at_ms"].clone();
+    let unshown = answered(page.call(
+        "question_send_kept",
+        json!({ "params": { "questionId": asked.to_string(), "draftedAtMs": drafted } }),
+    ))
+    .await
+    .expect_err("an unshown uncertain send stops the send");
+    assert_eq!(code_of(&unshown), "DRAFT_CONFLICT", "{unshown}");
+    assert_eq!(
+        worker
+            .service
+            .questions()
+            .question(asked)
+            .expect("held")
+            .state,
+        kr_protocol::question::QuestionState::Pending,
+        "nothing was sent"
+    );
+
+    // A new answer meets the same: it says so and sends nothing, and the press that carries the
+    // identifier is admitted.
+    let held = answered(page.call(
+        "question_answer",
+        json!({ "params": answer(&worker, asked, &revision, true)["params"].clone() }),
+    ))
+    .await
+    .expect("held");
+    assert_eq!(held["outcome"], "held", "{held}");
+    assert_eq!(held["action_id"], uncertain.to_string());
+    let taken = answered(page.call(
+        "question_answer",
+        json!({
+            "params": answer(&worker, asked, &revision, true)["params"].clone(),
+            "acknowledged": uncertain.to_string()
+        }),
+    ))
+    .await
+    .expect("the worker admits the quoted answer");
+    assert_eq!(taken["outcome"], "taken", "{taken}");
+}
