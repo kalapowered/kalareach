@@ -1362,7 +1362,6 @@ mod tests {
     #[cfg(unix)]
     struct Copying {
         _root: kr_ipc::testing::PrivateTempDir,
-        from: std::path::PathBuf,
         to: std::path::PathBuf,
         source: AuthorisedDirectory,
         destination: AuthorisedDirectory,
@@ -1394,7 +1393,6 @@ mod tests {
             AuthorisedDirectory::open_root(environment_id, &to).expect("the destination");
         Copying {
             _root: root,
-            from,
             to,
             source,
             destination,
@@ -1497,7 +1495,7 @@ mod tests {
         COPY_FAILS.with(|fails| fails.set(None));
 
         let report = outcome.expect("a failed step is about the one path");
-        assert_eq!(report.leftover, [temporary.clone()]);
+        assert_eq!(report.leftover, std::slice::from_ref(&temporary));
         assert_eq!(report.skipped, ["second.txt"]);
         assert_eq!(
             seen,
