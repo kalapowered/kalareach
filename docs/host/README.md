@@ -4330,9 +4330,12 @@ the pass that did, so the age bound waits for the next pass. The holder gives up
 output, so when that is less than the excess the workers that look again give up the rest, one at a
 time; where no worker lost the lock, the rest stays until the pass of a worker that has output to
 give up finds the host over the cap. A worker that cannot open or take the lock file at all gives up
-nothing for the cap and keeps the reason with the others its pass left output behind for. A pass
-writes such a reason to the worker's standard error once while it stands, and again if it changes
-or comes back, with one exception: a pass that applies no age bound, as a look at the cap does not
+nothing for the cap and keeps the reason beside any other its pass left output behind for, so that
+neither hides the other. A pass writes such a reason to the worker's standard error unless the log
+already ends on it, or will once the lines handed over before it are written. So it says a reason
+once while it stands, and again if it changes or comes back, and also when the log came to end on
+another reason since: a line of another reason that was written after the first, or a line that was
+refused or dropped. One exception: a pass that applies no age bound, as a look at the cap does not
 and as a pass on a wall clock the host cannot prove does not, keeps the reason it said last when it
 finds none, since it cannot tell that a reason the age bound left has gone. While the host cannot
 prove its wall clock, a reason of the byte caps that goes and comes back is therefore not said
@@ -4342,24 +4345,31 @@ journal. A Windows worker's is a console with no window, so nothing keeps the re
 pass hands the line to a thread of the worker's own, which writes the worker's diagnostics one at a
 time, and waits for nothing: it is called with neither the session's lock nor the dispatch barrier
 held, and the reason counts as said only once the thread has written it. A write that fails, as
-one does on a full volume, costs nothing; the reason is offered again at the next pass. A standard
-error that has stopped draining, a pipe nobody reads, holds that thread and nothing else while the
-worker runs: the passes go on, a stop of the session is answered, and the process ends with the
-thread still in its write, after a wait of two seconds at most. At most eight lines wait for the
-thread, and a line beyond that is dropped. The other lines the worker writes there, such as the one
-that says a command was not integrated for its launch, go the same way, and so do the lines of the
-worker's program, such as why it could not start, that the controller did not receive its ready
-report, and that an attachment had not been sent the closure when the worker ended. A line said just
+one does on a full volume, costs nothing, and neither does a line the thread drops: the reason is
+offered again at the next pass. A standard error that has stopped draining, a pipe nobody reads,
+holds that thread and nothing else while the worker runs: the passes go on, a stop of the session is
+answered, and the process ends with the thread still in its write, after a wait of two seconds at
+most. At most eight lines wait for the thread, and a line beyond that is dropped. The other lines
+the worker writes there, such as the one that says a command was not integrated for its launch, go
+the same way, and so do the lines of the worker's program, such as why it could not start, that the
+controller did not receive its ready report, and that an attachment had not been sent the closure
+when the worker ended. A line said just
 before the process ends can be lost to the exit, so the program waits up to two seconds for the
-thread to write what it has been handed before it ends. Three writes happen where they are said: the
-line every worker says at its start, which terminfo database its session reads; the argument
-parser's message for a command line it refuses; and the standard library's message for a panic, or
-for another fatal error such as a failed allocation. A standard error that has stopped draining
-before a worker's first line holds the worker there, so that it never reports itself ready and never
-ends, as it always could. One that stops later holds neither, nor the worker's final error or the
-line about a closure. A panic's or a fatal error's message waits for a stalled standard error where
-it happens, at any time, and the process may then not end. A line is handed over whole and written
-with `write_all`, so a volume that is nearly full can take part of it. Nothing bounds how long the
+thread to write what it has been handed before it ends. Three writes happen where they are said, and
+no other write of the worker to its standard error does: a lint refuses a direct write in the
+worker's library and in its program. The first is the line every worker says at its start, which
+terminfo database its session reads. It is written where it is said because the thread would be
+started for that line alone in every worker, and a thread that starts and ends, or one that stays,
+costs resident memory that the idle measurement counts. The second is the argument parser's message
+for a command line it refuses, which the parser writes itself before it ends the process, so the
+program never holds that line to hand over. The third is the standard library's message for a panic,
+or for another fatal error such as a failed allocation, which it writes where the fault happens, at
+any time. A standard error that has stopped draining before a worker's first line holds the worker
+there, so that it never reports itself ready and never ends, as it always could. One that stops
+later holds neither, nor the worker's final error or the line about a closure. The parser's message,
+a panic's and a fatal error's wait for a stalled standard error where they happen, and the process
+may then not end. A line is handed over whole and written with `write_all`, so a volume that is
+nearly full can take part of it. Nothing bounds how long the
 host stays over the cap: the delays are random, and a holder that stops without ending keeps the
 lock while the others go on looking. The host also stays over the cap when the session that grew
 cannot give up the excess, as when its worker has ended, it holds less than the excess while the

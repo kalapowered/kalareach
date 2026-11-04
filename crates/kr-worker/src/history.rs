@@ -1034,10 +1034,10 @@ impl OutputHistory {
     /// than the excess, the rest goes to the sessions that did not get the lock and look again;
     /// where none lost it, the rest stays until the pass of a session that has output to give up
     /// finds the host over its cap. A lock that cannot be opened or taken at all is not another
-    /// session holding it: the pass says why in
-    /// [`Self::left_behind`]. A worker of an earlier release takes no lock, so the exclusion is
-    /// among the workers of this one. The control daemon applies the same cap to the sessions that
-    /// have closed, from a reading of its own.
+    /// session holding it: the pass says why in [`Self::left_behind`], beside any other reason its
+    /// own bounds left output behind for. A worker of an earlier release takes no lock, so the
+    /// exclusion is among the workers of this one. The control daemon applies the same cap to the
+    /// sessions that have closed, from a reading of its own.
     pub fn apply_retention_to_host(
         &mut self,
         spools: &Path,
