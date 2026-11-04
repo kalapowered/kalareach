@@ -11,7 +11,6 @@
 mod net_support;
 
 use kr_controller::service::net::devices::DeviceRecord;
-use kr_controller::service::net::dispatch::EFFECT_WAIT;
 use kr_controller::sharing::ShareRequest;
 use kr_controller::testing::{EffectWait, HeldTimer};
 use kr_crypto::keys::DeviceKeys;
@@ -30,10 +29,11 @@ use kr_protocol::sharing::{
     DeviceListParams, DeviceListResult, DeviceRevokeParams, GrantListParams, GrantListResult,
 };
 use net_support::{
-    Device, Host, MovedWall, RawDevice, on_the_host, owned_by, pair_with, proposal, recipient,
+    Device, Host, Moved, MovedWall, RawDevice, on_the_host, owned_by, pair_with, proposal,
+    recipient,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Shares `session_id` with `recipient` as a viewer, as the owner at this machine does.
@@ -172,7 +172,10 @@ async fn kr_req_25_10_a_device_redeems_its_invitation_once_and_a_repeat_of_the_a
 /// answered that the outcome is unknown while the effect is still held. The wait is what ends the
 /// request and nothing else, and no clock decides which of the effect and the wait comes first, so
 /// nothing in the case depends on how long the host takes to write the action's route or to bring
-/// the redemption to the store.
+/// the redemption to the store. The answer's place in that order is the one it arrived at, which
+/// the raw device numbers as it finds the frame, and not the one the case came to read it at: an
+/// answer sent before the wait ended is told by its number from one sent after it, however soon
+/// the case reads it.
 ///
 /// The limits that remain are the request's own. The raw device asks for two minutes from the
 /// moment the host receives the request, and the host refuses the redemption by name if it reaches
@@ -207,10 +210,12 @@ async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repea
     let window = connection.action_window_id();
     let (arrived, go) = host.controller().sharing().grants().pause_before_effect();
     let wait_ended = AtomicBool::new(false);
-    let (told, ()) = tokio::join!(
+    // The place in the connection's order of events at which the case ended the wait.
+    let wait_ended_at = AtomicU64::new(0);
+    let ((told, answered_at), ()) = tokio::join!(
         async {
-            let told = connection
-                .mutate_in(
+            let (told, answered_at) = connection
+                .mutate_in_numbered(
                     window.clone(),
                     Method::GrantRedeem,
                     action,
@@ -222,7 +227,7 @@ async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repea
                 wait_ended.load(Ordering::SeqCst),
                 "the host answered before its wait was ended: {told:?}"
             );
-            told
+            (told, answered_at)
         },
         within("the host's wait and the held redemption", async {
             // The host has started its wait once the timer has been asked for it, and the wait
@@ -237,8 +242,15 @@ async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repea
                 "the effect has not happened: the request was told nothing of it"
             );
             wait_ended.store(true, Ordering::SeqCst);
+            wait_ended_at.store(connection.mark(), Ordering::SeqCst);
             end_the_wait.notify_one();
         }),
+    );
+    let ended_at = wait_ended_at.load(Ordering::SeqCst);
+    assert!(
+        ended_at != 0 && answered_at > ended_at,
+        "the answer arrived at {answered_at}, before the case ended the host's wait at {ended_at}: \
+         {told:?}"
     );
     let told = told.expect_err("an effect that has not ended is not an answer");
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
@@ -268,6 +280,14 @@ async fn a_request_whose_effect_outlasts_the_hosts_wait_is_told_so_and_the_repea
     connection.close();
     host.stop().await;
 }
+
+/// How long the share a connection is ended with lasts, on the clocks the case moves.
+const SHARE_LIFETIME: Duration = Duration::from_secs(10 * 60);
+
+/// The longest [`RawDevice::answered_before_closing`] waits for the close, which only a host that
+/// does not close the connection at the share's end reaches: the case decides on what the host
+/// did, and this only keeps a case that went wrong from hanging.
+const CLOSE_GUARD: Duration = Duration::from_secs(180);
 
 /// A failure guard for a wait on a condition: the case decides on what the host did, and this only
 /// keeps a case that went wrong from hanging.
@@ -429,13 +449,26 @@ async fn kr_req_25_10_an_invitation_of_a_session_that_has_ended_activates_nothin
 /// its is still waiting to be served. The device read under a share, and then sent a redemption
 /// that is held at the store; the share ends, and the host closes the connection without waiting
 /// for the request. What a connection that was looked at only between requests would do is wait
-/// for the request, which the host gives up on after [`EFFECT_WAIT`], so the connection has to be
-/// closed well inside that wait. (The end of the device's own pairing grant is a day away, so
-/// nothing but the share's end can end the connection here.)
+/// for the request, which the host gives up on once its wait for the effect has ended.
+///
+/// The host's wait is counted by a timer the case holds and does not end until the connection has
+/// been closed, so the connection is closed while the request is pending or it is not closed at
+/// all: the order of events decides the case, and no limit on how long the close takes. The share
+/// ends because the host's clocks are moved past its end, and not by the case waiting for it.
+/// [`RawDevice::answered_before_closing`] is given a guard for a case that went wrong and decides
+/// nothing for a run that closes the connection. (The end of the device's own pairing grant is a
+/// day away, so nothing but the share's end can end the connection here.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_pending() {
     let owner = DeviceKeys::generate().expect("owner keys");
-    let host = Host::start(&owner).await;
+    let (moved, clocks) = Moved::new();
+    let wait = HeldTimer::held();
+    let host = Host::start_with_effect_wait_on_clocks(
+        &owner,
+        EffectWait::held_by(Arc::clone(&wait) as _),
+        clocks,
+    )
+    .await;
     let (device, record) = recipient(&host, &owner).await;
     let session_id = net_support::an_open_session(&host).0;
     let other = shared(
@@ -445,13 +478,11 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
     )
     .await;
     let connection = RawDevice::connect(&host, &device, &record).await;
-    // Written once the connection is up, so the share's life is spent on the exchange below and
-    // not on setting the connection up. It lasts a third of the host's wait for an effect.
     let short = shared_for(
         &host,
         session_id,
         record.device_id,
-        Some(u64::try_from(EFFECT_WAIT.as_millis() / 3).expect("a lifetime in milliseconds")),
+        Some(SHARE_LIFETIME.as_millis().try_into().expect("milliseconds")),
     )
     .await;
 
@@ -487,10 +518,16 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
             },
         )
         .await;
-    tokio::task::spawn_blocking(move || arrived.recv_timeout(std::time::Duration::from_secs(60)))
-        .await
-        .expect("the wait for the request ran")
-        .expect("the redemption reached the store and is held there");
+    // The host has started its wait for the request once the timer has been asked for it, and the
+    // wait goes on until the case lets it end.
+    let (_, end_the_wait) = within("the host's wait for the request", wait.next_wait()).await;
+    within(
+        "the redemption to reach the store",
+        tokio::task::spawn_blocking(move || arrived.recv()),
+    )
+    .await
+    .expect("the wait for the request ran")
+    .expect("the redemption reached the store and is held there");
     assert!(
         !is_active(&host, other.grant.grant_id),
         "the request is pending: nothing was written"
@@ -498,18 +535,19 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
 
     // The share ends while the request is held. The connection is closed then, and the request
     // is never answered. A connection that is only looked at between requests is closed after the
-    // host gives up on the request, which is no earlier than the whole of its wait, so two thirds
-    // of that wait is the longest this one is given.
+    // host gives up on the request, which does not happen while the case holds the wait.
+    moved.advance(SHARE_LIFETIME + Duration::from_secs(60));
     let answered = connection
-        .answered_before_closing(held, EFFECT_WAIT / 3 * 2)
+        .answered_before_closing(held, CLOSE_GUARD)
         .await
-        .expect("the connection was closed inside the host's wait for the request");
+        .expect("the connection was closed with its share while the host's wait was held");
     assert!(
         !answered,
         "the connection was ended with its share while a request of its was still pending, and \
          the request was not answered first"
     );
     go.send(()).expect("the held redemption is let go");
+    end_the_wait.notify_one();
     host.stop().await;
 }
 
