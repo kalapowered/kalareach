@@ -521,15 +521,6 @@ fn kept_copy(drafts: &AnswerDrafts, question_id: QuestionId) -> KeptCopy {
     }
 }
 
-/// The answer kept for one question, when there is one.
-fn kept_draft(drafts: &AnswerDrafts, question_id: QuestionId) -> Result<Option<AnswerDraft>> {
-    Ok(drafts
-        .drafts()
-        .map_err(answer_failure)?
-        .into_iter()
-        .find(|draft| draft.question_id == question_id))
-}
-
 /// The failure an answer kept rather than delivered is reported as, with why and what to do next.
 fn kept(workers: &Workers, question_id: QuestionId, which: &'static str) -> CliError {
     let failure = workers.failure().unwrap_or_else(|| Failure {
@@ -2212,7 +2203,10 @@ mod tests {
     #[test]
     fn a_kept_answer_says_whether_it_can_be_sent_and_why_not() {
         let draft = kept_draft_for(&question(QuestionState::Pending));
-        let offered = Reconciled::Offered(draft.clone());
+        let offered = Reconciled::Offered {
+            draft: draft.clone(),
+            earlier: Earlier::default(),
+        };
         assert!(
             kept_line(&offered)
                 .text()

@@ -2320,10 +2320,10 @@ async fn question(
 /// refused.
 fn report_answered(
     question_id: kr_protocol::ids::QuestionId,
-    reported: question::Reported,
+    reported: kr_cli::question::Reported,
     json: bool,
 ) -> Result<Completion> {
-    let earlier = question::earlier_documents(&reported.earlier);
+    let earlier = kr_cli::question::earlier_documents(&reported.earlier);
     match reported.outcome {
         Ok(item) => {
             if json {

@@ -1197,36 +1197,54 @@ The `kr question list`, `show`, `answer` and `cancel` commands read a worker's b
 
 `show`, `answer` and `cancel` ask each worker for the question by its identifier, which fits a frame however long the session's history is. A worker that does not hold the question refuses that read, so the command then asks for the worker's pending questions, and a worker that shows them was asked and lacks the question. A worker that cannot be asked is not taken for one that lacks the question: it cannot be reached (a descriptor an ended worker left behind is such a worker), a session descriptor on this host cannot be read, it refuses to show its questions, or its read fails some other way. When no worker holds the question and one could not be asked, the command reports that failure, sends nothing and keeps nothing. With a worker that cannot be reached, or a descriptor that cannot be read, it exits with code 3 and, with `--json`, has no `kept` member; with one that refuses to show its questions it exits with code 8 and the worker's own code; with a reply it cannot read, with code 1. When a worker of another release was not read either, the exit code 8 report above names the session that could not be asked as well.
 
-An answer the worker could not take is kept rather than lost. When the connection to the worker
-fails before the answer is sent, or ends while it is being sent so that nobody can say whether it
-arrived, or the worker refuses it for the moment, `kr question answer` keeps the answer in this
-user's state directory, readable only by its owner, with the question and the revision it answered.
-It says so and exits with 3, and its `--json` document carries `"kept": true` beside the failure:
+An answer is kept on this device before it is sent, and stays kept when the worker could not take
+it. `kr question answer` writes the answer to this user's state directory, readable only by its
+owner, with the question, the revision it answered and the identifier the answer goes out under,
+and then sends it. When the connection to the worker fails before the answer is sent, or ends while
+it is being sent so that nobody can say whether it arrived, or the worker refuses it for the
+moment, the answer stays kept. The command says so and exits with 3, and its `--json` document
+carries `"kept": true` beside the failure:
 `OUTCOME_UNKNOWN` when whether it arrived is not known, and otherwise the code of what stopped it.
 What the command says of the answer is what its attempt established, step by step: that it did not
 send it, that the worker did not take it, or that whether the worker took it is not known, which it
 never calls unsent. A reply that is not a message is the worker's own answer rather than a lost
 connection, so it is shown as a refusal that says the answer's fate is not known, and nothing is
-kept. An answer that can be neither taken nor kept is reported as both, with exit status 1, or 9 when an
-update of this host held the writers' lock for the whole wait. A worker
+kept. When the answer cannot be written to this device, nothing is sent: the command says so, and
+says whether an answer kept earlier for the question is still kept. It exits with 1, or with 9 when
+an update of this host is switching releases and held the writers' lock for the whole wait of 30
+seconds; run the command again once the update has finished. A worker
 that replied that it took the answer took it: when that reply cannot be read, or the copy kept on
 this device cannot be removed afterwards, the command says the worker took the answer and exits with
 1, and the next `kr question drafts` retires any copy still kept. When the store on this device
 cannot be read after an attempt, the command says so beside what the attempt established, never in
 place of it, and exits with 1.
 
-`kr question drafts` reads each kept answer's question again and finds the answer offered, unlisted
-or retired. An answer whose question is still pending at the revision it answered is offered, and
-stays kept. An answer whose question its session no longer lists, while the session's daemon does
+`kr question drafts` reads each kept answer's question again, and asks the worker what became of
+every send the answer went out under, so an answer whose reply was lost is found out. It finds the
+answer offered, waiting, unlisted, unsettled, taken or retired. An answer is taken when the worker
+took one of its sends while the reply was lost: it is not sent again, and it is no longer kept. An
+answer is waiting when the worker has a send and has not finished with it: it stays kept and is not
+offered. An answer whose question is still pending at the revision it answered is offered, and
+stays kept; the document's `earlier` member says what the worker said of each earlier send: that
+its outcome could not be established, that it refused the send, that it has no record of it, which
+proves nothing about whether the send arrived late, or that it could not be asked. An answer whose
+question ended is unsettled, and stays kept, when the worker could not be asked about a send; no
+read that fails retires an answer. An answer whose question its session no longer lists, while the session's daemon does
 not record the session ended, is unlisted: it stays kept and is not offered, and `kr question send`
 neither sends nor retires it. Every other answer is retired: its question was answered, cancelled or
 expired, or moved to another revision, or its session no longer lists it and the daemon records the
 session ended. The command does not send a retired answer, and it is no longer kept. The command
 sends nothing, however often it runs. `kr question send` is the one way a kept answer is sent: it reads the question once
-more and sends the answer only while that question is still what the person answered. An answer
-whose outcome was not known is retired by the next `kr question drafts` if it did arrive, so it is
-never sent twice. When `kr question send` cannot send it, the failure keeps its own code and says
-the answer is still kept. An answer `kr question answer` gives to a question that ended or moved
+more, asks the worker about every send already made, and sends the answer only while that question
+is still what the person answered. An answer whose outcome was not known is found taken by the
+next reading if it did arrive, so it is never sent twice. A send whose outcome the worker could not
+establish is named by the next send, because the worker refuses a later answer from the same
+caller until it does: `kr question send` and `kr question answer` print the earlier outcome on
+standard error before they send, and name it in the `earlier` member of the `--json` document, which
+a failed send carries too. A host never holds more than eight sends of one answer whose outcome is
+not settled; a ninth is not sent, and the answer is retired once its question ends. A send the
+worker refused in its own word is not kept. When `kr question send` cannot send it, the failure
+keeps its own code and says the answer is still kept. An answer `kr question answer` gives to a question that ended or moved
 before the answer reached it is not sent, and the command says whether an answer kept for that
 question earlier is still kept.
 
