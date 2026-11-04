@@ -98,7 +98,12 @@ impl Session {
         deadline: Instant,
     ) -> kr_protocol::root::FenceAcknowledgement {
         let settled = self.settled_fence_exchange(enter, fence, deadline);
-        settled.unwrap_or_else(|why| panic!("{why}:\n{}", self.terminal_output()))
+        settled.unwrap_or_else(|why| {
+            if Instant::now() >= deadline {
+                note_that_a_wait_gave_up();
+            }
+            panic!("{why}:\n{}", self.terminal_output())
+        })
     }
 
     /// Runs the exchange against the reader `enter` names, and against the reader its own next
@@ -123,7 +128,7 @@ impl Session {
         // The deadline is put in force for the whole exchange rather than handed to the waits
         // this names, so the ones below them answer to it too: the pumps that read a moved
         // reader's next report, and the acknowledgements and steps those pumps write.
-        self.within_budget(Deadline(deadline), |session| {
+        self.within_budget(Deadline::at(deadline), |session| {
             session.settle_the_exchange(enter, fence)
         })
     }
@@ -471,7 +476,7 @@ fn signal_the_shell(session: &Session, signal: &str) {
             .ok()
             .and_then(Pid::from_raw)
             .expect("the shell's process identifier is a process");
-        let deadline = Instant::now() + REPLY;
+        let deadline = session.deadline_for(REPLY);
         loop {
             match waitpid(Some(shell), WaitOptions::UNTRACED | WaitOptions::NOHANG) {
                 Ok(Some((_, status))) if status.stopped() => break,
@@ -482,7 +487,7 @@ fn signal_the_shell(session: &Session, signal: &str) {
                 Err(error) => panic!("waiting for the shell {pid} to stop: {error}"),
             }
             assert!(
-                Instant::now() < deadline,
+                !deadline.passed(),
                 "the shell {pid} was sent the stop and is not stopped"
             );
             std::thread::sleep(Duration::from_millis(10));
@@ -715,14 +720,14 @@ fn unread_input_is_not_drained(kind: ShellKind, unread: &[u8], completion: &[u8]
 
     // Taken, the answer is no longer typeahead: the reader that reported it unread reports the
     // queues drained once it has read it.
-    let deadline = Instant::now() + REPLY;
+    let deadline = session.deadline_for(REPLY);
     let mut entry = first;
     let mut latest = asked;
-    while !latest.queues.tty_typeahead_drained && Instant::now() < deadline {
+    while !latest.queues.tty_typeahead_drained && !deadline.passed() {
         std::thread::sleep(Duration::from_millis(20));
         entry.prompt_generation = latest.prompt_generation;
         entry.reader_revision = latest.reader_revision;
-        latest = session.fence_exchange_before(&entry, fence_id(32), deadline);
+        latest = session.fence_exchange_before(&entry, fence_id(32), deadline.0);
     }
     assert!(
         latest.queues.tty_typeahead_drained,
@@ -772,7 +777,7 @@ pub fn the_reader_reports_its_boundaries_and_proves_its_own_state(kind: ShellKin
     // sequence together, at one instant. The reader reaches that instant once the bytes its own
     // startup left behind have drained, so this asks again until the state it reports has settled.
     // One deadline covers every exchange and every wait between them.
-    let deadline = Instant::now() + REPLY;
+    let deadline = session.deadline_for(REPLY).0;
     let mut acknowledgement = session.fence_exchange_before(&first, fence_id(1), deadline);
     while Instant::now() < deadline
         && (!acknowledgement.editor.buffer_empty

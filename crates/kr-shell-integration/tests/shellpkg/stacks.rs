@@ -1493,7 +1493,7 @@ impl Session {
     /// than assumed from the keys that were typed. The report says which reader wrote it, so a
     /// drive can ask later whether the key it offered went to that same one.
     pub fn reader_said(&mut self, within: Duration) -> Option<ReaderReport> {
-        let deadline = Deadline::after(self.bounded(within));
+        let deadline = self.window(within);
         self.next_reader_report(deadline, |_| true)
     }
 
@@ -1593,7 +1593,7 @@ impl Session {
     where
         F: Fn(&ReaderMark) -> bool,
     {
-        let deadline = Instant::now() + REPLY;
+        let deadline = self.deadline_for(REPLY);
         let mut last;
         loop {
             match self.reader_state_now(enter, fence) {
@@ -1602,7 +1602,7 @@ impl Session {
                 Err(why) => last = why,
             }
             assert!(
-                Instant::now() < deadline,
+                !deadline.passed(),
                 "the reader never showed {what}; the last it said was {last}:\n{}",
                 self.terminal_output()
             );
@@ -1729,7 +1729,7 @@ impl Session {
         known: Option<ReaderMark>,
         within: Duration,
     ) -> Result<ReaderMark, String> {
-        let deadline = Deadline::after(self.bounded(within));
+        let deadline = self.window(within);
         // What the reader has already said about itself, waiting for nothing: the keys that ended
         // the drive's state are reports of their own, and a reader that never left the keymap it
         // types text in has nothing here to do. `known` is what a caller already has of it, from
@@ -1848,7 +1848,7 @@ impl Session {
     /// The bridge goes with the shell, so a write that finds it gone is a result here rather than
     /// a fault, and whatever the bridge sent before it went is still read and kept.
     pub fn ended_within(&mut self, within: Duration) -> bool {
-        let deadline = Deadline::after(self.bounded(within));
+        let deadline = self.window(within);
         self.expecting_the_bridge_to_go(|session| {
             loop {
                 if !session.alive() {
@@ -2098,7 +2098,7 @@ impl Session {
         needle: &str,
         within: Duration,
     ) -> bool {
-        let deadline = Deadline::after(self.bounded(within));
+        let deadline = self.window(within);
         self.wait_for_output_after_by(start, needle, deadline)
     }
 
@@ -2330,8 +2330,8 @@ impl Session {
                 // A fence asked again answers to the window of its prompt. A window that ends
                 // before it is answered ends the case with the last report the reader made, which
                 // is what failed: the little time left for an answer is not.
-                Some((_, reported)) => {
-                    self.answer_by(asked, Deadline(until)).unwrap_or_else(|| {
+                Some((_, reported)) => self.answer_by(asked, Deadline(until, true)).unwrap_or_else(
+                    || {
                         panic!(
                             "an idle reader reported a queue still holding input in {} fences, and \
                          the window ended before it answered the next: {reported:?}\nterminal \
@@ -2339,8 +2339,8 @@ impl Session {
                             attempts - 1,
                             self.terminal_output()
                         )
-                    })
-                }
+                    },
+                ),
                 None => self.answer_before(asked, until),
             };
             match answer {

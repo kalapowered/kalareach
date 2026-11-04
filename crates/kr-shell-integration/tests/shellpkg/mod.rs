@@ -67,13 +67,17 @@ pub const REPLY: Duration = Duration::from_secs(240);
 /// them, which is longer than the job that runs them, and the failure text libtest prints at the
 /// end of a run would be lost with the job. The run is already a failure when this applies, so the
 /// cap cannot turn a passing run into a failing one; it can fail a later case that a loaded runner
-/// would have let through, and the messages of the waits it cuts say so.
+/// would have let through. A failure of [`Session::expect_event`] after the cap says so.
 const REPLY_AFTER_A_GIVE_UP: Duration = Duration::from_secs(20);
 
 /// Whether a wait has given up on a silent shell in this run.
 static A_WAIT_GAVE_UP: AtomicBool = AtomicBool::new(false);
 
 /// Notes that a wait gave up on a silent shell, for the waits after it.
+///
+/// A wait with a [`REPLY`] window notes it itself when the window runs out (see
+/// [`Deadline::passed`]), whoever asked and whatever the caller makes of the answer. A wait that
+/// reports its own end some other way notes it where it does.
 fn note_that_a_wait_gave_up() {
     A_WAIT_GAVE_UP.store(true, Ordering::Relaxed);
 }
@@ -219,20 +223,37 @@ pub fn endpoint_break(shut: bool, write_gone: bool, read_gone: bool) -> Option<&
 /// the outer budget early or run past it, and both are a caller having asked for one thing and
 /// waited for another. So a step that owns a budget makes one of these and hands it down, and
 /// every wait below it reads the clock against that one moment.
+///
+/// The second member says whether the moment ends a whole [`REPLY`] window, the wait for a shell
+/// that is expected to answer. Such a deadline notes it when it passes, so the waits after it are
+/// held to [`REPLY_AFTER_A_GIVE_UP`] however the caller reports the failure; the deadline of a
+/// probe for something that must not happen, which is a few hundred milliseconds, does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Deadline(Instant);
+pub struct Deadline(Instant, bool);
 
 impl Deadline {
     /// The moment `budget` from now.
     #[must_use]
     pub fn after(budget: Duration) -> Self {
-        Self(Instant::now() + budget)
+        Self(Instant::now() + budget, false)
+    }
+
+    /// The moment a caller fixed itself.
+    #[must_use]
+    pub fn at(moment: Instant) -> Self {
+        Self(moment, false)
     }
 
     /// Whether that moment has arrived.
+    ///
+    /// A [`REPLY`] window that has run out is noted here.
     #[must_use]
     pub fn passed(self) -> bool {
-        Instant::now() >= self.0
+        let over = Instant::now() >= self.0;
+        if over && self.1 {
+            note_that_a_wait_gave_up();
+        }
+        over
     }
 
     /// How much of the budget is left, which is nothing once it has passed.
@@ -244,7 +265,15 @@ impl Deadline {
     /// The earlier of two moments, which is the one a nested wait answers to.
     #[must_use]
     pub fn earlier(self, other: Self) -> Self {
-        Self(self.0.min(other.0))
+        if other.0 < self.0 { other } else { self }
+    }
+
+    /// The end of a wait of `within` for a shell that is expected to answer.
+    ///
+    /// It is a [`REPLY`] window when `within` is that long, and one that ran out is a shell that
+    /// said nothing for that long. A shorter wait is a probe, which a deliberate silence ends.
+    fn reply_window(within: Duration) -> Self {
+        Self(Instant::now() + after_any_give_up(within), within >= REPLY)
     }
 
     /// `within`, or the rest of this budget where that ends sooner.
@@ -1268,7 +1297,8 @@ impl Session {
         // A shell that is not managed connects to nothing. The stream a session reads is then one
         // whose other end this session holds and never writes to, so a read finds nothing.
         let (stream, bridge_peer) = if managed {
-            let connected = accept_unless(&listener, after_any_give_up(REPLY), || {
+            let connect_window = after_any_give_up(REPLY);
+            let connected = accept_unless(&listener, connect_window, || {
                 matches!(child.try_wait(), Ok(Some(_)))
             });
             let Some(stream) = connected else {
@@ -1276,7 +1306,7 @@ impl Session {
                     Ok(Some(status)) => format!("it ended with {status:?}"),
                     _ => {
                         note_that_a_wait_gave_up();
-                        format!("it was still running after {REPLY:?}")
+                        format!("it was still running after {connect_window:?}")
                     }
                 };
                 panic!(
@@ -1486,7 +1516,18 @@ impl Session {
     fn deadline_for(&self, default: Duration) -> Deadline {
         match self.budget {
             Some(deadline) => deadline,
-            None => Deadline::after(after_any_give_up(default)),
+            None => Deadline::reply_window(default),
+        }
+    }
+
+    /// The moment a wait for `within` ends at, cut to what is left of the budget in force.
+    ///
+    /// This is [`Session::bounded`] as a deadline. Where no budget is in force and `within` is a
+    /// whole [`REPLY`], the deadline notes that the wait gave up when it passes.
+    fn window(&self, within: Duration) -> Deadline {
+        match self.budget {
+            Some(deadline) => Deadline::after(deadline.at_most(within)),
+            None => Deadline::reply_window(within),
         }
     }
 
@@ -2291,7 +2332,8 @@ impl Session {
     ///
     /// Panics when the terminal has not taken them inside [`REPLY`].
     pub fn type_bytes(&mut self, bytes: &[u8]) {
-        self.type_bytes_before(bytes, Instant::now() + REPLY);
+        let deadline = self.deadline_for(REPLY);
+        self.type_bytes_before(bytes, deadline.0);
     }
 
     /// Types bytes into the terminal, no later than `deadline`.
@@ -2304,6 +2346,9 @@ impl Session {
     /// as long as the shell stays wedged.
     fn type_bytes_before(&mut self, bytes: &[u8], deadline: Instant) {
         if let Err(reason) = self.terminal.write_before(bytes, deadline) {
+            if Instant::now() >= deadline {
+                note_that_a_wait_gave_up();
+            }
             panic!("{reason}\nterminal output:\n{}", self.terminal_output());
         }
     }
@@ -2632,7 +2677,7 @@ impl Session {
     /// cannot be made to carry one — there is no method on [`DisplayObservation`] that says a
     /// command ran.
     pub fn drew_after(&mut self, start: usize, text: &str, within: Duration) -> DisplayObservation {
-        let deadline = Deadline::after(self.bounded(within));
+        let deadline = self.window(within);
         DisplayObservation {
             drawn: self.wait_for_output_after_by(start, text, deadline),
         }
