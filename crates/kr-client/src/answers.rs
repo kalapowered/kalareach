@@ -500,13 +500,15 @@ impl AnswerError {
                 ErrorCode::StorageUnavailable
             }
             Self::Host(error) => error.code(),
-            Self::NotPermitted => ErrorCode::PermissionDenied,
+            Self::NotPermitted => ErrorCode::InvalidArgument,
             Self::Changed => ErrorCode::DraftConflict,
         }
     }
 }
 
-/// The result of this module's calls.
+crate::debug_as_display!(AnswerError);
+
+/// The result of this module's operations.
 pub type Result<T> = std::result::Result<T, AnswerError>;
 
 /// How an attempt to send an answer failed, and whether the request was written.

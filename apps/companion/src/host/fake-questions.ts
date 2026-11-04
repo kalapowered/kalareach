@@ -72,6 +72,23 @@ export interface FakeQuestions {
   readonly sent: readonly QuestionAnswerParams[]
   /** Makes the worker unreachable, so an answer is kept, or reachable again. */
   setReachable(reachable: boolean): void
+  /**
+   * An earlier send of an answer to the question ended with an outcome the worker could not
+   * establish. Returns that send's identifier. A later answer sends nothing until the page names it.
+   */
+  leaveUncertain(questionId: string): string
+  /** An earlier send of an answer to the question was taken by the worker while its reply was lost. */
+  leaveTaken(questionId: string): string
+  /** The worker has an earlier send of an answer to the question and has not finished with it. */
+  leaveWaiting(questionId: string): string
+}
+
+/** What the worker says of an earlier send of an answer to one question. */
+type EarlierState = 'unknown' | 'taken' | 'waiting'
+
+/** The identifier of the n-th scripted earlier send. */
+function sendId(index: number): string {
+  return `c2000000-0000-4000-8000-${String(index).padStart(12, '0')}`
 }
 
 /** The questions and kept answers of the scripted host. */
@@ -81,6 +98,7 @@ export class ScriptedQuestions implements FakeQuestions {
   #kept: KeptAnswer[] = []
   #ended = new Set<string>()
   #reachable = true
+  readonly #earlier = new Map<string, { readonly id: string; readonly state: EarlierState }>()
   readonly sent: QuestionAnswerParams[] = []
 
   constructor(ids: QuestionIds) {
@@ -143,6 +161,24 @@ export class ScriptedQuestions implements FakeQuestions {
 
   setReachable(reachable: boolean): void {
     this.#reachable = reachable
+  }
+
+  #leave(questionId: string, state: EarlierState): string {
+    const id = sendId(this.#earlier.size + 1)
+    this.#earlier.set(questionId, { id, state })
+    return id
+  }
+
+  leaveUncertain(questionId: string): string {
+    return this.#leave(questionId, 'unknown')
+  }
+
+  leaveTaken(questionId: string): string {
+    return this.#leave(questionId, 'taken')
+  }
+
+  leaveWaiting(questionId: string): string {
+    return this.#leave(questionId, 'waiting')
   }
 
   #find(questionId: string): Question {
@@ -228,13 +264,24 @@ export class ScriptedQuestions implements FakeQuestions {
     }
   }
 
-  answer(params: unknown): AnswerOutcome {
+  answer(params: unknown, acknowledged?: string): AnswerOutcome {
     const asked = decodeParams<QuestionAnswerParams>(params, QUESTION_ANSWER_PARAMS)
     const shown = this.#questions.find((each) => each.question_id === asked.question_id)
     if (shown === undefined || shown.session_id !== asked.session_id) {
       refuse('DRAFT_CONFLICT', 'That question has not been read here: read it again.')
     }
     problemWith(shown, asked.answer)
+    // What the worker says of an earlier send comes before anything is sent or kept.
+    const earlier = this.#earlier.get(shown.question_id)
+    if (earlier?.state === 'taken') {
+      this.#earlier.delete(shown.question_id)
+      this.#kept = this.#kept.filter((each) => each.question_id !== shown.question_id)
+      return { outcome: 'landed', action_id: earlier.id }
+    }
+    if (earlier?.state === 'waiting') return { outcome: 'waiting', action_id: earlier.id }
+    if (earlier?.state === 'unknown' && acknowledged !== earlier.id) {
+      return { outcome: 'held', action_id: earlier.id }
+    }
     if (!this.#reachable) {
       const draft: KeptAnswer = {
         target: {
@@ -270,6 +317,7 @@ export class ScriptedQuestions implements FakeQuestions {
         `This question is at revision ${shown.revision}, and the answer named ${revision}.`
       )
     }
+    this.#earlier.delete(shown.question_id)
     this.sent.push({
       session_id: shown.session_id,
       question_id: shown.question_id,
@@ -317,7 +365,16 @@ export class ScriptedQuestions implements FakeQuestions {
     if (held.revision !== draft.question_revision) {
       return { standing: 'moved', revision: held.revision }
     }
-    return { standing: 'offered' }
+    const earlier = this.#earlier.get(draft.question_id)
+    if (earlier?.state === 'taken') return { standing: 'taken', action_id: earlier.id }
+    if (earlier?.state === 'waiting') return { standing: 'waiting', action_id: earlier.id }
+    return {
+      standing: 'offered',
+      earlier:
+        earlier?.state === 'unknown'
+          ? [{ action_id: earlier.id, state: 'unknown', code: null }]
+          : []
+    }
   }
 
   sendKept(params: unknown): AnswerOutcome {
@@ -332,6 +389,15 @@ export class ScriptedQuestions implements FakeQuestions {
     this.#requireReachable()
     const held = this.#questions.find((each) => each.question_id === draft.question_id)
     if (held === undefined) refuse('RESOURCE_UNAVAILABLE', 'The session does not list that question.')
+    const earlier = this.#earlier.get(draft.question_id)
+    if (earlier?.state === 'taken') return { outcome: 'landed', action_id: earlier.id }
+    if (earlier?.state === 'waiting') return { outcome: 'waiting', action_id: earlier.id }
+    if (earlier?.state === 'unknown' && which.acknowledged !== earlier.id) {
+      refuse(
+        'DRAFT_CONFLICT',
+        'An earlier send of this answer ended with an outcome the host could not establish: read the kept answers again.'
+      )
+    }
     return this.#take(held, draft.question_revision, draft.answer)
   }
 

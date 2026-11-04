@@ -2194,9 +2194,9 @@ export function fakeHost(
         checkOpening('questionRead', params.session_id, opening)
         return questions.read(params)
       }),
-    questionAnswer: (params, opening) => {
+    questionAnswer: (params, opening, acknowledged) => {
       checkOpening('questionAnswer', params.session_id, opening)
-      return Promise.resolve(questions.answer(params))
+      return Promise.resolve(questions.answer(params, acknowledged))
     },
     questionKept: () => Promise.resolve(questions.kept()),
     questionSettle: (sessionId, opening) => {
