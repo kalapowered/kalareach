@@ -1965,6 +1965,9 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
     let package = Package::built(kind);
     let probes = Probes::new();
     let mut session = a_session_with_probes(&package, &probes);
+    // The line that gives the bridge its second back is a line of its own, accepted and answered
+    // like any other, so it comes before the frames this case queues for the lines after it.
+    session.lets_the_bridge_give_up_on_a_question();
 
     // A gesture at a fenced prompt leaves a detach waiting for the worker's answer, which comes
     // only after the next line has been typed. The fence stays held until the answer arrives.
@@ -2026,7 +2029,6 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
     ];
     // Nothing is answered after the resolve, so what the next reader does with those frames
     // depends on nothing more arriving.
-    session.lets_the_bridge_give_up_on_a_question();
     session.commands.silent_after_resolve = true;
 
     let asked = session.run_asking("kr-probe amid-traffic", "probe-ran");
