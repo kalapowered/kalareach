@@ -931,10 +931,14 @@ impl Case {
         ];
         for who in [Who::Checkout, Who::Connect] {
             for place in &listed {
-                // A name of this launch alone. A directory of that name that was there already is
-                // not this launch's to find or to remove, and one that is there afterwards was made
-                // by it.
+                // A name of this launch alone, required to be free before the launch: a directory
+                // found there afterwards was made by the launch, and only that one is removed.
                 let probe = place.join(format!("kr-write-check-{}", uuid::Uuid::new_v4().simple()));
+                assert!(
+                    !probe.exists(),
+                    "{} exists before the launch that would make it",
+                    probe.display()
+                );
                 let launch = self.launch(
                     who,
                     "git init inside a directory on the lists",
