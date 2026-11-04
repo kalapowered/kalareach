@@ -705,7 +705,9 @@ pub struct Script {
     /// lock, for good.
     pub hold_standard_error: bool,
     /// Whether the process fills its standard error before it serves, as a pipe nobody reads is
-    /// filled: every write to it, the panic hook's included, waits for good. It is read on Unix only.
+    /// filled: every write to it, the panic hook's included, waits for good. It is read on Unix
+    /// only, and the process ends at once, with status 74, when its standard error is not a pipe
+    /// or cannot be filled.
     pub fill_standard_error: bool,
 }
 
@@ -1732,9 +1734,11 @@ pub fn stub_main() -> i32 {
         });
         let _ = locked.recv();
     }
+    // A pipe that could not be filled leaves the process to end here, without a word, since a
+    // case that went on would be one whose standard error was never full.
     #[cfg(unix)]
-    if script.fill_standard_error {
-        fill_standard_error();
+    if script.fill_standard_error && fill_standard_error().is_err() {
+        return 74;
     }
     crate::serve::say_panics_without_waiting();
     let options = Options {
@@ -1989,23 +1993,40 @@ impl<W: Write> Write for Wedging<W> {
 }
 
 /// Writes to the process's standard error until the system says it is full, and leaves it blocking
-/// again: what a pipe nobody reads comes to, after which any write to it waits for good.
+/// again: what a pipe nobody reads comes to, after which any write to it waits for good. Only a pipe
+/// can be filled, since a file would take writes without end and a terminal is shared.
 #[cfg(unix)]
-fn fill_standard_error() {
-    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+fn fill_standard_error() -> Result<(), rustix::io::Errno> {
+    use rustix::fs::{FileType, OFlags, fcntl_getfl, fcntl_setfl, fstat};
 
     let standard_error = std::io::stderr();
-    let Ok(flags) = fcntl_getfl(&standard_error) else {
-        return;
-    };
-    if fcntl_setfl(&standard_error, flags | OFlags::NONBLOCK).is_err() {
-        return;
+    if FileType::from_raw_mode(fstat(&standard_error)?.st_mode) != FileType::Fifo {
+        return Err(rustix::io::Errno::INVAL);
     }
-    // A write that would wait is the pipe being full: whole blocks first, then single bytes, so that
-    // no room is left for a short message. Any other failure ends the filling too.
-    while rustix::io::write(&standard_error, &[b' '; 4096]).is_ok() {}
-    while rustix::io::write(&standard_error, b" ").is_ok() {}
-    let _ = fcntl_setfl(&standard_error, flags);
+    let flags = fcntl_getfl(&standard_error)?;
+    fcntl_setfl(&standard_error, flags | OFlags::NONBLOCK)?;
+    // Whole blocks first, then single bytes, so that no room is left for a short message.
+    let filled = write_until_full(&standard_error, &[b' '; 4096])
+        .and_then(|()| write_until_full(&standard_error, b" "));
+    fcntl_setfl(&standard_error, flags)?;
+    filled
+}
+
+/// Writes `bytes` to a non-blocking descriptor until the system says the write would wait.
+#[cfg(unix)]
+fn write_until_full(
+    descriptor: impl std::os::fd::AsFd,
+    bytes: &[u8],
+) -> Result<(), rustix::io::Errno> {
+    use rustix::io::Errno;
+
+    loop {
+        match rustix::io::write(&descriptor, bytes) {
+            Ok(_) | Err(Errno::INTR) => {}
+            Err(Errno::AGAIN) => return Ok(()),
+            Err(other) => return Err(other),
+        }
+    }
 }
 
 /// A stream whose writes fail from an answer on, as they do on a pipe that nothing reads any longer.
