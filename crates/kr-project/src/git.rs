@@ -4218,22 +4218,22 @@ fn without_blocking(pipe: &std::process::ChildStdout) -> std::io::Result<()> {
     // program writes last holds something.
     #[cfg(test)]
     if let Some(started) = tests::STARTS_FIRST.with(|started| started.borrow().clone()) {
-        let guard = Instant::now() + Duration::from_secs(30);
-        let written = || std::fs::metadata(&started).is_ok_and(|file| file.len() > 0);
-        while !written() && Instant::now() < guard {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        tests::written_within(
+            &started,
+            tests::WAIT_BOUND,
+            "the program the case waits for never started",
+        );
     }
     #[cfg(test)]
     if let Some(after) = tests::SWITCH_FAILS.with(|fails| fails.borrow().clone()) {
         // The case that asks for the failure has its stand-in write its number to a file first, so
         // that what is done to the stand-in afterwards can be told from what is done before it has
         // run. The file is made before the number is written to it, so it is the number waited for.
-        let guard = Instant::now() + Duration::from_secs(30);
-        let written = || std::fs::metadata(&after).is_ok_and(|file| file.len() > 0);
-        while !written() && Instant::now() < guard {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        tests::written_within(
+            &after,
+            tests::WAIT_BOUND,
+            "the stand-in never wrote its number",
+        );
         return Err(std::io::Error::other("the pipe cannot be switched"));
     }
     rustix::fs::fcntl_setfl(pipe, rustix::fs::OFlags::NONBLOCK).map_err(std::io::Error::from)
@@ -5580,6 +5580,37 @@ mod tests {
     pub(super) struct Limits {
         pub(super) second: Instant,
         pub(super) deadline: Instant,
+    }
+
+    /// How long a case waits for a process or a file when it does not control the clock: minutes,
+    /// so that a machine that is loaded or stopped does not fail the case, and a case that will
+    /// never be answered still ends.
+    #[cfg(unix)]
+    pub(super) const WAIT_BOUND: Duration = Duration::from_secs(300);
+
+    /// Waits until `file` holds something.
+    #[cfg(unix)]
+    pub(super) fn written_within(file: &Path, bound: Duration, _what: &str) {
+        let guard = Instant::now() + bound;
+        let written = || std::fs::metadata(file).is_ok_and(|file| file.len() > 0);
+        while !written() && Instant::now() < guard {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A wait for the file a stand-in writes fails the case when a look made after its bound still
+    /// finds the file empty, and does not go on without it.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "the stand-in never wrote its number")]
+    fn a_wait_for_the_file_a_stand_in_writes_fails_the_case_at_its_bound() {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+
+        written_within(
+            &directory.path().join("own"),
+            Duration::from_millis(300),
+            "the stand-in never wrote its number",
+        );
     }
 
     /// Waits until the clock has reached `moment`.
