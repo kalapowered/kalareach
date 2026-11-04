@@ -234,25 +234,30 @@ impl Destination {
     /// created.
     pub fn reserve(&self) -> Result<AuthorisedDirectory> {
         let parent = self.reach()?;
-        parent
-            .handle()
-            .create_dir(self.name.as_str())
-            .map_err(|error| ProjectError::Destination {
-                detail: if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    format!(
-                        "{} is taken, and an isolated workspace is created rather than merged into \
+        // A case that asks for it has the make fail, as it does for a host that is short of memory.
+        #[cfg(all(test, unix))]
+        let made = match crate::identity::tests::due(&tests::MAKE_FAILS) {
+            Some(error) => Err(std::io::Error::from(error)),
+            None => parent.handle().create_dir(self.name.as_str()),
+        };
+        #[cfg(not(all(test, unix)))]
+        let made = parent.handle().create_dir(self.name.as_str());
+        made.map_err(|error| ProjectError::Destination {
+            detail: if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "{} is taken, and an isolated workspace is created rather than merged into \
                          something",
-                        crate::git::redact(&self.path().display().to_string())
-                    )
-                    .into()
-                } else {
-                    format!(
-                        "{} could not be created: {error}",
-                        crate::git::redact(&self.path().display().to_string())
-                    )
-                    .into()
-                },
-            })?;
+                    crate::git::redact(&self.path().display().to_string())
+                )
+                .into()
+            } else {
+                format!(
+                    "{} could not be created: {error}",
+                    crate::git::redact(&self.path().display().to_string())
+                )
+                .into()
+            },
+        })?;
         parent.sync(kr_flush::NameKind::Directory)?;
         Ok(parent.subdirectory(&self.name)?)
     }
@@ -841,14 +846,27 @@ fn rename_no_replace(
     use std::os::fd::AsFd as _;
 
     unchanged()?;
-    rustix::fs::renameat_with(
+    // A case that asks for it has the rename fail, as it does for a host that is short of memory.
+    #[cfg(test)]
+    let renamed = match crate::identity::tests::due(&tests::RENAME_FAILS) {
+        Some(error) => Err(error),
+        None => rustix::fs::renameat_with(
+            from.handle().as_fd(),
+            from_name.as_str(),
+            to.handle().as_fd(),
+            to_name.as_str(),
+            rustix::fs::RenameFlags::NOREPLACE,
+        ),
+    };
+    #[cfg(not(test))]
+    let renamed = rustix::fs::renameat_with(
         from.handle().as_fd(),
         from_name.as_str(),
         to.handle().as_fd(),
         to_name.as_str(),
         rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(|error| match error {
+    );
+    renamed.map_err(|error| match error {
         rustix::io::Errno::EXIST | rustix::io::Errno::NOTEMPTY => ProjectError::Destination {
             detail: format!(
                 "{} was taken between this operation's check and its publication, so nothing was \
@@ -1155,6 +1173,18 @@ fn random_suffix() -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    std::thread_local! {
+        /// Set by a case to make the making of a directory fail on its own thread with this
+        /// error, after that many have been made.
+        pub(super) static MAKE_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
+            const { std::cell::Cell::new(None) };
+        /// Set by a case to make the rename that publishes a tree fail on its own thread with this
+        /// error, after that many have been made.
+        pub(super) static RENAME_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
     /// What a test does between the check before an attempt at a publication's rename and the
     /// attempt.
     #[cfg(not(unix))]
@@ -1454,6 +1484,83 @@ mod tests {
         )
         .expect("the destination resolves");
         (parent, destination)
+    }
+
+    /// A host short of descriptors, processes or memory to make the directory a worktree is
+    /// created in has said nothing of the destination, so that is a fault that passes, which a
+    /// client sends the request again after. Any other failure of the make is still the caller's
+    /// argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_short_of_memory_when_a_destination_is_reserved_is_a_fault_that_passes() {
+        use crate::identity::tests::{OPEN_ERRORS, assert_answered};
+
+        let (_parent, destination) = a_destination();
+
+        for (errno, passes) in OPEN_ERRORS {
+            MAKE_FAILS.with(|fails| fails.set(Some((0, errno))));
+            let reserved = destination.reserve();
+            MAKE_FAILS.with(|fails| fails.set(None));
+
+            let Err(refused) = reserved else {
+                panic!("the directory could not be made ({errno}), and it was reserved");
+            };
+            assert_answered(
+                &refused,
+                errno,
+                passes,
+                kr_protocol::error::ErrorCode::InvalidArgument,
+                &destination.path(),
+                &format!("{errno}"),
+            );
+            assert!(!destination.path().exists(), "{errno}: nothing was made");
+        }
+        destination
+            .reserve()
+            .expect("without a failure the destination is reserved");
+    }
+
+    /// A host short of descriptors, processes or memory to rename a staged tree into place has
+    /// said nothing of the name, so that is a fault that passes, which a client sends the request
+    /// again after: nothing was published and the tree is still staged. Any other failure of the
+    /// rename is still the caller's argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_short_of_memory_when_a_staged_tree_is_published_is_a_fault_that_passes() {
+        use crate::identity::tests::{OPEN_ERRORS, assert_answered};
+
+        let (_parent, destination, sibling) = staged_by_plain_means();
+        let witness = sibling
+            .staged_witness()
+            .expect("the staged repository is read");
+
+        for (errno, passes) in OPEN_ERRORS {
+            RENAME_FAILS.with(|fails| fails.set(Some((0, errno))));
+            let published = publish(&sibling, &destination, witness);
+            RENAME_FAILS.with(|fails| fails.set(None));
+
+            let Err(refused) = published else {
+                panic!("the rename failed ({errno}), and the tree was published");
+            };
+            assert_answered(
+                &refused,
+                errno,
+                passes,
+                kr_protocol::error::ErrorCode::InvalidArgument,
+                Path::new(destination.name().as_str()),
+                &format!("{errno}"),
+            );
+            assert!(
+                !destination.path().exists(),
+                "{errno}: nothing was published"
+            );
+            assert!(
+                sibling.tree_path().is_dir(),
+                "{errno}: the tree is still staged"
+            );
+        }
+        publish(&sibling, &destination, witness)
+            .expect("without a failure the staged tree is published");
     }
 
     /// A staging directory with something staged in it, beside a destination in a directory of
