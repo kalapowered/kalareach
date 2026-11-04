@@ -2192,8 +2192,8 @@ async fn start_one(
             environment: variables,
         } => {
             // The daemon of `current`, the release `start_recorded` read once: a path with no
-            // link in it, so a switch another command makes cannot find it missing or start a
-            // release the daemon is not waited for as.
+            // link in it, so a switch another command makes cannot find it missing, and the
+            // daemon started is the one this start waits for.
             let mut child = crate::startup::start_as_before(
                 &environment.paths,
                 &store.release_program(current, kr_ipc::install::Program::Controller),
