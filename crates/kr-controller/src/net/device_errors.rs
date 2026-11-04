@@ -539,13 +539,6 @@ fn told_in_place(text: &str, fixed: impl Fn() -> String) -> Option<String> {
     let text = without_commands.as_deref().unwrap_or(text);
     let apart = read_apart.as_deref().unwrap_or(text);
     let (first, first_apart) = (first_naming(text), first_naming(apart));
-    // A pointer's place is set aside, and an account's number inside it does not hide one beyond
-    // it. That number can come before the name that would have come first, which leaves a shorter
-    // clause that fits where the longer one did not. So a text that holds a pointer's place is
-    // kept only when the whole of it is short enough to carry a clause, whichever name comes
-    // first. A text with no place has nothing set aside, and the limit below holds its clause.
-    let too_long_for_a_clause = pointer_place(text).is_some()
-        && text.len() + "; ".len() + WHY_NOT_SHOWN.len() > LONGEST_MESSAGE;
     // A refusal that is known by its wording, in either reading, is told by its reason whether or
     // not the rule finds a name in it: it can name an account that has no form the rule can find.
     let told = match known_reason(text).or_else(|| known_reason(apart)) {
@@ -553,15 +546,20 @@ fn told_in_place(text: &str, fixed: impl Fn() -> String) -> Option<String> {
         None if first.map(|at| &text[..at]) != first_apart.map(|at| &apart[..at]) => fixed(),
         None => match first {
             None => without_commands?,
-            Some(_) if too_long_for_a_clause => fixed(),
+            // A clause is kept only when the whole text is short enough to carry it and its
+            // reason, whichever name comes first. Finding a name earlier cannot make a long text
+            // tell a clause that finding it later would have refused, and the rule cannot read
+            // the clause of a long text as clean: a bare account name, `uid: 501` or a program it
+            // does not know stands in it where the rule finds nothing.
+            Some(_) if text.len() + "; ".len() + WHY_NOT_SHOWN.len() > LONGEST_MESSAGE => fixed(),
             Some(at) => match clause_before(text, at) {
                 Some(clause) => format!("{clause}; {WHY_NOT_SHOWN}"),
                 None => fixed(),
             },
         },
     };
-    // A text never carries more than an error's limit: a clause that cannot take its reason after
-    // it, and a text whose quotations are longer once replaced, give way to what stands for them.
+    // A text never carries more than an error's limit: a text that names nothing and is longer
+    // once its quotations are replaced gives way to what stands for it.
     Some(if told.len() > LONGEST_MESSAGE {
         fixed()
     } else {
@@ -1616,19 +1614,40 @@ mod tests {
         );
     }
 
-    /// A path that makes a text long takes nothing from the clause in front of it: the clause is
-    /// told as it is for a short text, while the clause and its reason fit in an error.
+    /// A text that names the host and is too long to carry a clause and its reason is given the
+    /// sentence made from the code, whatever stands before the name. The rule cannot read a long
+    /// clause as clean: a bare account name, `uid: 501`, `~name/work`, `.config/kalareach/x` and a
+    /// program it does not know stand in it as they do after a replaced quotation, and none of
+    /// them is found.
     #[test]
-    fn a_long_path_does_not_withhold_the_short_clause_before_it() {
+    fn a_long_text_that_names_the_host_gets_the_fixed_sentence_whatever_its_clause_is() {
+        let fixed = sentence_for(ErrorCode::InvalidArgument, WHY_NOT_SHOWN);
+        let tail = format!(": /{}", "x".repeat(960));
+        for head in [
+            "`a b` .config/kalareach/x failed",
+            "`a b` ~marguerite/work failed",
+            "`a b` marguerite said no",
+            "`a b` uid: 501 failed",
+            "`a b`,sudo x failed",
+            // The same forms with no quotation to replace.
+            "marguerite said no",
+            "uid: 501 failed",
+        ] {
+            let said = format!("{head}{tail}");
+            assert!(said.len() < LONGEST_MESSAGE, "{} bytes", said.len());
+            assert_eq!(
+                message_for_a_device(ErrorCode::InvalidArgument, &said).as_deref(),
+                Some(fixed.as_str()),
+                "{said}"
+            );
+        }
+        // A clause that is clean is held back too, when the path after it makes the text long.
         let clause = "the host could not make the session's directory";
         let head = format!("{clause}: create /Users/marguerite/");
         let said = format!("{head}{}", "p".repeat(LONGEST_MESSAGE - head.len()));
-        let told = error(ErrorCode::ResourceUnavailable, &said);
-        assert!(told.is_consistent(), "{}", said.len());
-        let shown = error_for_a_device(&told).into_owned();
         assert_eq!(
-            shown.message,
-            format!("{clause}; {WHY_NOT_SHOWN}"),
+            message_for_a_device(ErrorCode::ResourceUnavailable, &said),
+            Some(sentence_for(ErrorCode::ResourceUnavailable, WHY_NOT_SHOWN)),
             "{said}"
         );
     }
@@ -4278,13 +4297,13 @@ mod tests {
     /// The replacement of a quotation gives the words beside it a boundary, which lets the rule
     /// read more, and can complete a pointer's refusal or turn a glued word into a web address.
     /// The rule tells no more of a text than it tells of the text with the words run together, so
-    /// where the two readings differ it tells nothing of the text. A text that holds a pointer's
-    /// place is judged by its length and not by where the first name is.
+    /// where the two readings differ it tells nothing of the text. A long text is judged by its
+    /// length and not by where the first name is.
     #[test]
     fn a_replaced_quotation_never_lets_the_rule_tell_more_than_the_text_without_it_would() {
         let fixed = sentence_for(ErrorCode::InvalidArgument, WHY_NOT_SHOWN);
         let nothing = format!("why the admissions leave the installation out; {WHY_NOT_SHOWN}");
-        let long = format!("uid: 501; `a b`(chmod 700 q) {}; user 502", "x".repeat(929));
+        let long = format!("uid: 501; `a b`(chmod 700 q) {}; user 502", "x".repeat(930));
         let beyond = format!(
             "uid: 509; Params at /field uid 501 carries a field it does not declare; user 502; \
              {}; /Users/alice/private",
@@ -4303,8 +4322,7 @@ mod tests {
             // Both readings find a name, in different places: the run-together text finds the path
             // and keeps a clause that holds the program, which only the readings apart find.
             "x: `a b`(chmod 700 q) y: /Users/m".to_owned(),
-            // The readings differ, and the text is as long as an error may be with the clause
-            // the run-together reading keeps: only the comparison withholds it.
+            // The readings differ in a long text, so nothing of it is told.
             long.clone(),
             // An account found beyond a pointer's place makes the kept clause short, and a short
             // clause passes the limit that a long one did not.
