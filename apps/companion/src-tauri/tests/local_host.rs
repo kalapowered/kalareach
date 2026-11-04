@@ -683,8 +683,21 @@ async fn an_answer_kept_for_a_session_whose_worker_has_gone_is_settled_as_gone()
         &mut || {},
     )
     .expect("the writers lock");
-    let permit = writers.permit(&WRITTEN).expect("the leave to write");
-    store.keep(&draft, &permit).expect("kept");
+    let leave = kr_client::answers::Leave {
+        answers: writers.permit(&WRITTEN).expect("the leave to write"),
+        sends: writers
+            .permit(&kr_client::sends::WRITTEN)
+            .expect("the leave to write"),
+    };
+    // Kept the way an earlier run left it, with no send recorded beside it.
+    let basis = store.basis(question_id).expect("the pair reads");
+    let sent = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let digest = store
+        .begin(&draft, &basis, &[], sent, &leave)
+        .expect("kept");
+    store
+        .settle(question_id, digest, &[sent], false, &leave)
+        .expect("the record goes");
 
     // No worker is serving the session, and the daemon has no such session either.
     let settled = host

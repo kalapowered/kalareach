@@ -1974,18 +1974,23 @@ impl Host {
     /// Records the answer `yes` under the send `id` and nothing more, as an attempt does before it
     /// sends: what a crash right after leaves.
     fn record_pair(&self, id: ActionId) {
+        // Read once: the guard of the worker's state is not held while another is asked for.
+        let (session_id, revision) = {
+            let state = self.state();
+            (state.question.session_id, state.question.revision)
+        };
         let draft = kr_client::answers::AnswerDraft {
             version: kr_client::answers::ANSWER_FORMAT,
             target: kr_protocol::envelope::ActionTarget {
                 environment_id: self.environment.environment_id(),
-                session_id: Nullable::some(self.state().question.session_id),
+                session_id: Nullable::some(session_id),
                 session_epoch: Nullable::some(SessionEpoch::V1),
                 application_instance_id: Nullable::null(),
                 agent_binding_revision: Nullable::null(),
             },
-            session_id: self.state().question.session_id,
+            session_id,
             question_id: self.question_id,
-            question_revision: self.state().question.revision,
+            question_revision: revision,
             answer: kr_protocol::question::QuestionAnswer::Choice {
                 choice_id: "left".to_owned(),
             },
