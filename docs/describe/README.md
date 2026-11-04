@@ -701,20 +701,23 @@ contention figure would be of a terminal at background priority beside a model a
 priority. Start the benchmark outside the class: a process started under `taskpolicy -b` is in it,
 and so is everything that process starts.
 
-Each figure of the model is of the description process alone, which holds the runtime and the model
-and none of the harness, and each line says so. The benchmark reads the process's resident set and
-processor use from outside it, no oftener than `sysinfo` computes processor use over. A first job
+Each figure of the model's memory and processor use is of the description process alone, which
+holds the runtime and the model and none of the harness, and each line says so. The benchmark reads
+them from outside the process, no oftener than `sysinfo` computes processor use over. A first job
 loads the model and is not recorded, so the passes run against a loaded model and the cold start is
 reported apart; the load runs while the workload runs. After a job that misses its deadline the
 service holds the next one back, and the benchmark waits for it as the daemon does, up to six
 minutes, so one miss does not end a pass. The latencies are the service's own account of each job.
-The workload's own processor use is read before the process starts. Whole-product RSS and CPU are not measured here at all, because the
-controller, the workers and the shared services are not running beside the two processes; the
-release matrix measures them.
+The workload's own processor use is read before the process starts. Whole-product RSS and CPU are
+not measured here at all, because the controller, the workers and the shared services are not
+running beside the two processes; the release matrix measures them.
 
 A budget the run misses is named as a qualification target that was not met and the run exits
 non-zero, after it has measured everything else it can still measure: a benchmark that stopped at
-the first breach would answer one question by withholding the rest.
+the first breach would answer one question by withholding the rest. A process the service ended for
+its memory ceiling, or a model it unloaded for memory pressure, is named the same way, so a breach
+the samples missed still counts. A host whose resource policy pauses inference before the model
+loads ends the run at once with that reason, since nothing can be measured there.
 
 `cargo test -p kr-describe` never downloads weights. It starts a stub description process, the same
 serving code over a model that answers from the prompt, and drives it over real pipes, so the rules
