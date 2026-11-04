@@ -874,6 +874,9 @@ pub fn an_eligible_gesture_under_a_fence_is_an_attributable_detach(kind: ShellKi
     assert!(session.answered("kr-ready"));
 
     let (enter, fence) = session.fenced_prompt(1);
+    // The decisions the reader reports from here are the gesture's and the repeated gesture's, and
+    // no other: they are counted as they arrive, whatever the waits below take off the queue.
+    let decisions_before = session.events.managed_decisions();
     session.type_bytes(CTRL_D);
 
     let (id, event) = session.expect_event("eof_detach", |event| {
@@ -886,7 +889,6 @@ pub fn an_eligible_gesture_under_a_fence_is_an_attributable_detach(kind: ShellKi
     assert_eq!(detach.prompt_generation, enter.prompt_generation);
     assert_eq!(detach.input_epoch, fence.input_epoch);
     session.answer_event(id, detached(attachment_id(1)));
-    let decided = session.events.managed_decisions();
     assert!(
         session.alive(),
         "the gesture ended the shell instead of detaching an attachment"
@@ -902,12 +904,14 @@ pub fn an_eligible_gesture_under_a_fence_is_an_attributable_detach(kind: ShellKi
         unreachable!()
     };
     assert_eq!(repeated.reason, ConsumeReason::FenceMissing);
-    // The reader reports in the order it acts. The repeated gesture's decision is the only one
-    // after the detach, so the first gesture, which was submitted, was not also consumed: a
-    // consumption of it would have come ahead of the repeated gesture's and been counted.
+    // The reader reports in the order it acts, and a line it runs next is accepted after both
+    // gestures were decided, so the harness has read every decision by the time the line has run.
+    // The detach and the repeated gesture's consumption are two; a third is a consumption of the
+    // gesture that was submitted, which an attributable gesture is not.
+    assert!(session.answered("kr-after-the-gestures"));
     assert_eq!(
         session.events.managed_decisions(),
-        decided + 1,
+        decisions_before + 2,
         "an attributable gesture is submitted, not consumed"
     );
     assert!(session.alive());
