@@ -5887,20 +5887,50 @@ mod tests {
         String::from_utf8_lossy(&listed).trim().to_owned()
     }
 
-    /// Waits until no process with this identifier is running. The time is read before the
-    /// question, so a stop between the two cannot fail a case for a process that ended meanwhile:
-    /// it fails, with `what`, only when a look made after the guard still finds the process.
+    /// Looks until `look` finds something, and fails with `what` only when a look made after
+    /// `guard` has passed still finds nothing. The time is read before the look, so a stop between
+    /// the look and the time, however long, cannot fail a case for what came meanwhile.
     #[cfg(unix)]
-    fn wait_until_gone(pid: &str, what: &str) {
-        let guard = Instant::now() + Duration::from_secs(30);
+    fn look_until<T>(guard: Duration, what: &str, mut look: impl FnMut() -> Option<T>) -> T {
+        let until = Instant::now() + guard;
         loop {
-            let late = Instant::now() >= guard;
-            if !running(pid) {
-                return;
+            let late = Instant::now() >= until;
+            if let Some(found) = look() {
+                return found;
             }
             assert!(!late, "{what}");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Waits until no process with this identifier is running, as [`look_until`] does.
+    #[cfg(unix)]
+    fn wait_until_gone(pid: &str, what: &str) {
+        look_until(Duration::from_secs(30), what, || {
+            (!running(pid)).then_some(())
+        });
+    }
+
+    /// A wait that is stopped after a look is not failed for what the next look finds. The first
+    /// look finds nothing, and the stop is inside it, longer than the time the wait is given and
+    /// taken after the time was read; the next look finds it. A wait that reads the time after
+    /// the look fails here.
+    #[cfg(unix)]
+    #[test]
+    fn a_wait_that_is_stopped_after_a_look_still_finds_what_came_meanwhile() {
+        let mut looks = 0;
+
+        let found = look_until(Duration::from_millis(300), "it was never found", || {
+            looks += 1;
+            if looks == 1 {
+                std::thread::sleep(Duration::from_millis(700));
+                None
+            } else {
+                Some(looks)
+            }
+        });
+
+        assert_eq!(found, 2);
     }
 
     /// Whether a process with this identifier is running, which one that has ended and not yet been
@@ -5959,19 +5989,16 @@ mod tests {
     /// The number a stand-in wrote, which it does when it starts, and so may be after a refusal.
     #[cfg(unix)]
     fn number_of(own: &Path) -> String {
-        let guard = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Ok(pid) = std::fs::read_to_string(own)
-                && !pid.trim().is_empty()
-            {
-                return pid.trim().to_owned();
-            }
-            assert!(
-                Instant::now() < guard,
-                "the stand-in never ran: it was ended before it could start"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        look_until(
+            Duration::from_secs(30),
+            "the stand-in never ran: it was ended before it could start",
+            || {
+                std::fs::read_to_string(own)
+                    .ok()
+                    .map(|pid| pid.trim().to_owned())
+                    .filter(|pid| !pid.is_empty())
+            },
+        )
     }
 
     #[cfg(unix)]
@@ -6167,14 +6194,10 @@ mod tests {
                 .expect("the program had started")
                 .trim()
                 .to_owned();
-            let guard = Instant::now() + Duration::from_secs(30);
-            while running(&pid) {
-                assert!(
-                    Instant::now() < guard,
-                    "process {pid} of the stand-in still runs after it was refused"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            wait_until_gone(
+                &pid,
+                &format!("process {pid} of the stand-in still runs after it was refused"),
+            );
         }
         assert!(
             !finished.exists(),
@@ -6354,14 +6377,10 @@ mod tests {
 
         end_if_own(child);
 
-        let guard = Instant::now() + Duration::from_secs(30);
-        while running(&sleeper) {
-            assert!(
-                Instant::now() < guard,
-                "the process the child left in its group is still running"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_until_gone(
+            &sleeper,
+            "the process the child left in its group is still running",
+        );
         assert_eq!(state(&pid), "", "the child was collected");
     }
 
@@ -6546,11 +6565,7 @@ mod tests {
                     moves.advance_to(deadline);
                 }
                 std::fs::write(&release, "").expect("the stand-in is released");
-                let guard = Instant::now() + Duration::from_secs(30);
-                while running(&pid) {
-                    assert!(Instant::now() < guard, "the stand-in never ended");
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                wait_until_gone(&pid, "the stand-in never ended");
                 std::fs::write(&gate, "ended").expect("the first poll is let go");
             });
             ask(&program, &["--version"], deadline)
@@ -6674,14 +6689,10 @@ mod tests {
                         .to_owned();
                     // The signal is asynchronous: the process may be found a moment after it was
                     // sent, so it is waited for.
-                    let guard = Instant::now() + Duration::from_secs(30);
-                    while running(&sleeper) {
-                        assert!(
-                            Instant::now() < guard,
-                            "{row}: the group the stand-in led was not ended"
-                        );
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
+                    wait_until_gone(
+                        &sleeper,
+                        &format!("{row}: the group the stand-in led was not ended"),
+                    );
                     assert!(
                         collected(&number_of(&directory.path().join("own"))),
                         "{row}: the stand-in was collected"
@@ -7640,13 +7651,20 @@ mod tests {
     fn an_exit_seen_after_the_time_ran_out_is_the_clocks_though_the_output_passed_the_limit_in_time()
      {
         TIME_IS_UP.with(|up| up.set(true));
-        let (outcome, _directory) = ask_with_the_first_poll_after_the_stand_in_ended(
+        let (outcome, directory) = ask_with_the_first_poll_after_the_stand_in_ended(
             "/usr/bin/perl -e 'fcntl(STDOUT, 1031, 1048576) or die; \
-             syswrite(STDOUT, \"x\" x 200000) == 200000 or die;'",
+             syswrite(STDOUT, \"x\" x 200000) == 200000 or die;' \
+             && echo wrote > \"$(dirname \"$0\")/wrote\"",
             Duration::from_secs(60),
             false,
         );
         TIME_IS_UP.with(|up| up.set(false));
+        // The clock's refusal would be the same if Linux had refused the pipe its size and the
+        // fixture had written nothing, so that it wrote all of it is a condition of its own.
+        assert!(
+            directory.path().join("wrote").exists(),
+            "the stand-in wrote more than the limit before it ended"
+        );
 
         let refusal = match outcome {
             Err(Asked::Overran(refusal)) => refusal,
