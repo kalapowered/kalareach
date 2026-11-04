@@ -75,9 +75,10 @@ static A_WAIT_GAVE_UP: AtomicBool = AtomicBool::new(false);
 
 /// Notes that a wait gave up on a silent shell, for the waits after it.
 ///
-/// A wait with a [`REPLY`] window notes it itself when the window runs out (see
-/// [`Deadline::passed`]), whoever asked and whatever the caller makes of the answer. A wait that
-/// reports its own end some other way notes it where it does.
+/// A wait whose running out fails the case notes it itself when its [`REPLY`] window runs out (see
+/// [`Deadline::passed`]), whoever asked. A wait whose running out is an answer, not a failure, is
+/// made with [`Session::probe_window`] and does not. A wait that reports its own end some other way
+/// notes it where it does.
 fn note_that_a_wait_gave_up() {
     A_WAIT_GAVE_UP.store(true, Ordering::Relaxed);
 }
@@ -231,10 +232,12 @@ pub fn endpoint_break(shut: bool, write_gone: bool, read_gone: bool) -> Option<&
 /// waited for another. So a step that owns a budget makes one of these and hands it down, and
 /// every wait below it reads the clock against that one moment.
 ///
-/// The second member says whether the moment ends a whole [`REPLY`] window, the wait for a shell
-/// that is expected to answer. Such a deadline notes it when it passes, so the waits after it are
-/// held to [`REPLY_AFTER_A_GIVE_UP`] however the caller reports the failure; the deadline of a
-/// probe for something that must not happen, which is a few hundred milliseconds, does not.
+/// The second member says whether the moment ends a whole [`REPLY`] window whose running out fails
+/// the case, the wait for a shell that is expected to answer. Such a deadline notes it when it
+/// passes, so the waits after it are held to [`REPLY_AFTER_A_GIVE_UP`] however the caller reports
+/// the failure. The deadline of a probe for something that must not happen, which is a few hundred
+/// milliseconds, does not, and neither does a [`Session::probe_window`], whose length is a whole
+/// [`REPLY`] but whose running out is an answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadline(Instant, bool);
 
@@ -1519,7 +1522,9 @@ impl Session {
         outcome
     }
 
-    /// The moment a wait inside this session ends at, given what its caller asked for.
+    /// The moment a wait inside this session ends at, given what its caller asked for: the budget
+    /// in force, or a window of `default`. A window of a whole [`REPLY`] notes that the wait gave up
+    /// when it passes, so use it for a wait whose running out fails the case.
     fn deadline_for(&self, default: Duration) -> Deadline {
         match self.budget {
             Some(deadline) => deadline,
@@ -2092,7 +2097,7 @@ impl Session {
     /// Panics when the reader answers a launch with something other than a decision, answers
     /// after the window, or accepts a transaction other than the one it was asked.
     pub fn launched(&mut self, request: LaunchMailboxRequest) -> LaunchDecision {
-        let until = self.deadline_for(REPLY).0;
+        let until = self.deadline_for(REPLY);
         let may_ask_again = dialect(self.package_kind).answers_at_the_next_step;
         let mut asked = 0_u8;
         loop {
@@ -2101,8 +2106,8 @@ impl Session {
             identifier[0] = identifier[0].wrapping_add(asked);
             again.transaction = LaunchTransactionId::new(Uuid::from_bytes(identifier));
             let transaction = again.transaction;
-            let id = self.ask_before(WorkerRequest::Launch(again), until);
-            let BridgeAnswer::Launch(decision) = self.answer_before(id, until) else {
+            let id = self.ask_before(WorkerRequest::Launch(again), until.0);
+            let BridgeAnswer::Launch(decision) = self.answer_before(id, until.0) else {
                 panic!("the reader answered a launch with something else")
             };
             if let LaunchDecision::Accepted(accepted) = &decision {
@@ -2113,7 +2118,7 @@ impl Session {
             }
             if !may_ask_again
                 || decision.rejection() != Some(LaunchRejectionReason::QueuedPriorInput)
-                || Instant::now() >= until
+                || until.passed()
                 || asked == u8::MAX
             {
                 return decision;
@@ -2122,8 +2127,8 @@ impl Session {
             eprintln!(
                 "a launch was refused for input the reader had not taken; asking again ({asked})"
             );
-            self.pump_before(self.bounded(Duration::from_millis(50)), until);
-            if Instant::now() >= until {
+            self.pump_before(self.bounded(Duration::from_millis(50)), until.0);
+            if until.passed() {
                 return decision;
             }
         }
