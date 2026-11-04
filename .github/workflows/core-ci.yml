@@ -106,6 +106,20 @@ jobs:
           ssh -V
           test -x /usr/sbin/sshd
 
+      # The worker's terminfo suite runs tmux inside a managed session and reads back what tmux took
+      # from the private database. The runner image lists no tmux, so it is installed when the
+      # runner does not have one, and the step fails if there is still none, so the Test step below
+      # can require it.
+      - name: Install tmux
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          if ! command -v tmux > /dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends --yes tmux
+          fi
+          tmux -V
+
       # Five checks mount a user-space filesystem on a directory and look at it from the code under
       # test: three removals and a daemon start that meet a mount whose server never answers, and a
       # daemon start that meets one whose server has stopped. The mount is made through the setuid
@@ -198,6 +212,10 @@ jobs:
           # printed reason where there is none to start one in, and pass. Here a runner without
           # one fails them.
           KR_REQUIRE_SERVICE_MANAGER: "1"
+          # The terminfo checks that run tmux and tic stand down with a printed reason where the
+          # host has none, which would let a runner without them pass the checks without running
+          # them. Here a missing tmux or tic fails them.
+          KR_REQUIRE_MULTIPLEXERS: "1"
         run: cargo test --locked --workspace
 
       # Documentation is built with warnings refused, so a link that resolves to nothing, or to an
@@ -2442,18 +2460,21 @@ jobs:
 
       # The worker's pseudo-terminal suite starts each shell section 3 names as a session's root
       # shell. The runner has Bash and Zsh; Fish is installed here, and the test step names all
-      # three as required, so a shell that is missing fails rather than being skipped.
+      # three as required, so a shell that is missing fails rather than being skipped. The worker's
+      # terminfo suite also runs tmux inside a managed session, and the runner image lists none, so
+      # tmux is installed in the same step, and the Test step below requires it.
       - name: Install the shells the worker's suite drives
         timeout-minutes: 5
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: |
-          brew install fish
+          brew install fish tmux
           for shell in bash zsh fish; do
             echo "$shell: $(command -v "$shell")"
           done
           fish --version
+          tmux -V
 
       - name: Restore the cargo cache
         id: cargo-cache
@@ -2593,6 +2614,10 @@ jobs:
       - name: Test
         if: ${{ !cancelled() && matrix.part == 'tests' }}
         timeout-minutes: 197
+        env:
+          # The terminfo checks that run tmux and tic stand down with a printed reason where the
+          # host has none. Here a missing tmux or tic fails them.
+          KR_REQUIRE_MULTIPLEXERS: "1"
         run: >-
           cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --
           --skip the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor
