@@ -46,13 +46,16 @@
 //!
 //! ## Directories, not names
 //!
-//! Every directory the boundary is built from is opened first, and required to be the object the
-//! caller holds an identity for: the working tree by the identity the repository's record carries,
-//! or, for a checkout handed over by path, by the one this host read from the directory it opened
-//! a moment before; the Git common directory by its own; the reserved destination by the identity
-//! the reservation returned; and the invocation's own temporary directory by the identity this host
-//! read when it made it. A directory the request holds no identity for is held to the object that
-//! was opened. After the run the directories it may write in (the working directory, the Git
+//! Every directory the boundary lets an invocation write in is opened first, and required to be
+//! the object the caller holds an identity for: the working tree by the identity the repository's
+//! record carries, or, for a checkout handed over by path, by the one this host read from the
+//! directory it opened a moment before; the Git common directory by its own; the reserved
+//! destination by the identity the reservation returned; and the invocation's own temporary
+//! directory by the identity this host read when it made it. A directory the request holds no
+//! identity for is held to the object that was opened. Git's own program and helper directory are
+//! what an invocation executes and does not write in, and nobody holds an identity for them: Linux
+//! opens each by its path when it makes its rules, and the profile on macOS names each by its
+//! path. After the run the directories it may write in (the working directory, the Git
 //! common directory, a destination it reserved and its own temporary directory) are opened again
 //! and confirmed against the same identity. The child then does not start at a path either: it
 //! moves into the open working directory before the boundary is applied and before Git runs, with
