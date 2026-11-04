@@ -1,11 +1,10 @@
 //! Recovery, through the commands the page calls, against the sync service as a local Worker
 //! answered it.
 //!
-//! KR-REQ-20.15 and 20.18: the recovery bundle is committed before the host's writer is declared
-//! recovery-enabled and before the host is set up under this computer's recovery, and bundle
-//! updates use the stable locator and compare-and-swap without
-//! reprinting the seed. The sync service is a choice of its own, and the account's token goes
-//! only to the service the account is signed in to.
+//! The recovery bundle is committed before the host's writer is declared recovery-enabled and
+//! before the host is set up under this computer's recovery, and bundle updates use the stable
+//! locator and compare-and-swap without reprinting the seed. The sync service is a choice of its
+//! own, and the account's token goes only to the service the account is signed in to.
 //!
 //! The companion runs on the mock runtime, its commands are called the way the page calls them,
 //! and its transport is the real one, talking over loopback to the stand-in `kr_service_stand_in`
@@ -1561,6 +1560,10 @@ async fn the_bundle_exports_alone_as_a_private_file_of_ciphertext() {
 
 /// The first write of all can be lost too. Whether it landed or not, settling it leaves recovery
 /// either on or ready to be turned on again, and the locator the kit names does not change.
+///
+/// KR-REQ-20.18, the part about the stable locator: after a first write whose answer was lost, the
+/// kit names the locator that write used, and a device holding only the kit reads the bundle there.
+/// Not shown here: an update by compare-and-swap, or any other field of the kit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turning_recovery_on_after_a_lost_first_write_keeps_the_locator() {
     for (moment, landed) in [(Moment::After, true), (Moment::Before, false)] {
@@ -1667,6 +1670,10 @@ async fn left_by_an_earlier_run_at(
 
 /// A record in the first format, written before the bundle landed, is read: turning recovery on
 /// again finds the bundle this device put there, adopts it and writes nothing over it.
+///
+/// KR-REQ-20.18, the part about the stable locator: the kit of a computer whose earlier run stopped
+/// after the bundle landed names the locator that bundle is at, and nothing is written over it. Not
+/// shown here: an update by compare-and-swap, or any other field of the kit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_start_that_stopped_after_the_bundle_landed_adopts_it() {
     let computer = Computer::new().await;

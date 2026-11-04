@@ -7,18 +7,14 @@
 //! here ([`ScriptedHosts`]): the connection to a real host that answers `host.info` is the
 //! companion's own and is not under test.
 //!
-//! KR-REQ-24.28: a host in privacy mode stops what leaves for the sync service at its recorded
-//! generation: `a_draft_of_a_host_in_privacy_mode_stays_here_until_the_host_lets_it_go`,
-//! `an_edit_made_while_the_host_is_private_is_not_sent` and
-//! `the_drafts_of_a_host_this_computer_cannot_read_stay_here_and_the_view_says_why` (a host that
-//! cannot be read is treated as private); the colour mode, which holds no session content, keeps
-//! going. KR-REQ-20.13: a draft is a draft, never an execution request:
-//! `a_draft_another_device_wrote_arrives_as_a_kept_copy_and_nothing_is_sent_for_it`.
+//! A host in privacy mode stops what leaves for the sync service at its recorded generation, and a
+//! host that cannot be read is treated as private; the colour mode, which holds no session
+//! content, keeps going. A draft is a draft, never an execution request.
 //!
-//! KR-REQ-20.13: settings sync uses per-object revisions and compare-and-swap writes, keeps the
-//! content a refused write lost for the person to choose from instead of choosing by the clock, and
-//! never overwrites a host's grants. KR-REQ-18.05: encrypted settings sync. The sync service is a
-//! client the application fills with the service it is set to use.
+//! Settings sync uses per-object revisions and compare-and-swap writes, keeps the content a
+//! refused write lost for the person to choose from instead of choosing by the clock, and never
+//! overwrites a host's grants. Settings sync is encrypted. The sync service is a client the
+//! application fills with the service it is set to use.
 //!
 //! The companion runs on the mock runtime, its commands are called the way the page calls them,
 //! and its transport is the real one, talking over loopback to the stand-in `kr_service_stand_in`
@@ -1309,6 +1305,11 @@ async fn the_colour_mode_is_kept_here_and_the_window_is_opened_in_it_and_nothing
 /// Turning sync on starts a collection of this computer's own, claims it with its first key record,
 /// and puts the settings in it sealed: another device with the collection's key reads the mode, and
 /// no request carries an account.
+///
+/// KR-REQ-18.05, the part about encrypted settings sync: turning sync on starts a collection and
+/// puts the settings in it so that a second store opened with the collection's keys reads the mode,
+/// and every request is proven by this device's signature with no account token. Not shown here:
+/// what the service holds (the case does not read it), history backups or recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turning_sync_on_starts_a_collection_and_puts_the_settings_in_it_sealed() {
     let computer = Computer::new().await;
@@ -2504,6 +2505,10 @@ async fn a_second_companion_on_this_computer_does_not_write_over_the_first_ones_
 /// A choice made while the first read of the service is out is not replaced by what that read
 /// brings: this computer held nothing when the read left, so there is no version kept beside, and
 /// the next publication is refused and keeps what the other device wrote for the person to choose.
+///
+/// KR-REQ-20.13, the part about conflicting copies: a choice made while the first read of the
+/// service is out is not replaced by what the read brings; the choice stands, and the other
+/// device's write waits as a conflict and stays at the service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_choice_made_while_the_first_read_is_out_does_not_replace_what_the_other_device_wrote() {
     use companion_tauri::settings::ColourMode;
@@ -2558,6 +2563,10 @@ async fn a_choice_made_while_the_first_read_is_out_does_not_replace_what_the_oth
 /// A step that stops after it read what another device wrote, and before it took it, leaves a note
 /// of where that write stands and nothing that holds it. The person's choice made after that is
 /// not published against the note: the other device's write is kept beside it for them to choose.
+///
+/// KR-REQ-20.13, the part about conflicting copies: after a step that stopped before it took what
+/// it read, the person's next choice is not published over the other device's write; the choice
+/// stands, and the write waits as a conflict and stays at the service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_step_that_stopped_before_taking_what_was_read_does_not_let_the_next_choice_replace_it() {
     use companion_tauri::settings::ColourMode;
@@ -2681,6 +2690,11 @@ fn a_replacement_that_expected_an_earlier_choice_leaves_the_later_one() {
 /// A change made here while another device changed the same setting is kept for the person: the
 /// mode this computer is in stays what the person chose, what the other device wrote is kept
 /// beside it, and neither this step nor any later one picks between them.
+///
+/// KR-REQ-20.13, the part about conflicting copies: a change made here over a write another device
+/// made is kept for the person; the person's own choice stands, what the other device wrote is
+/// still at the service and counted as a conflict, and later steps pick neither. Not shown here:
+/// per-object revision identifiers, the service's refusal of the write, or a host's grants.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_change_on_both_sides_is_kept_for_the_person_and_nothing_picks_between_them() {
     let computer = Computer::new().await;
@@ -2758,6 +2772,10 @@ async fn waiting_for_a_choice(computer: &Computer) -> (Page, Elsewhere) {
 
 /// The versions are shown as they are, this computer's own and each the other devices wrote, and
 /// the times that are shown decide nothing.
+///
+/// KR-REQ-20.13, the part about choosing by the clock: the versions are listed, this computer's own
+/// and each other device's, and neither the listing nor a later step picks one. Not shown here:
+/// that a time shown decides nothing (the case compares no times), or the choice itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_versions_are_listed_and_none_is_picked_for_the_person() {
     let computer = Computer::new().await;
@@ -3291,6 +3309,12 @@ async fn a_draft_is_published_sealed_once_drafts_sync_is_on_and_again_only_when_
 
 /// Privacy mode at a host keeps that host's drafts on this device, and the view says so. A host
 /// with it off lets them go; the colour mode, which carries no session content, goes either way.
+///
+/// KR-REQ-24.28, the part about what leaves while a host is in privacy mode: a draft written for a
+/// host whose privacy mode is on stays on this computer and the view says which and why, a host
+/// with it off lets its draft go, the colour mode goes either way, and the held draft goes once the
+/// host reports privacy off at a later generation. Not shown here: work already in flight when a
+/// host turns private, or any cleanup before privacy mode reports complete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_draft_of_a_host_in_privacy_mode_stays_here_until_the_host_lets_it_go() {
     let computer = Computer::new().await;
@@ -3337,6 +3361,10 @@ async fn a_draft_of_a_host_in_privacy_mode_stays_here_until_the_host_lets_it_go(
 
 /// A host in privacy mode stops what was already published too: a draft edited while the host is
 /// private is not sent, and goes once the host lets it.
+///
+/// KR-REQ-24.28, the part about what was already published: an edit made while the host is private
+/// is not sent and the view says the draft is kept, and the edit goes once the host reports privacy
+/// off at a later generation. Not shown here: work already in flight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_edit_made_while_the_host_is_private_is_not_sent() {
     let computer = Computer::new().await;
@@ -3377,6 +3405,10 @@ async fn an_edit_made_while_the_host_is_private_is_not_sent() {
 /// A host this computer cannot read is treated as private: its drafts stay here, and the view says
 /// that this computer could not read it and why. So are the drafts of a host no connection was up
 /// to name when they were written.
+///
+/// KR-REQ-24.28, the part about a host that cannot be read: its drafts, and those of a host no
+/// connection was up to name, stay on this computer as a private host's do, and the view says that
+/// and why. Not shown here: work already in flight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_drafts_of_a_host_this_computer_cannot_read_stay_here_and_the_view_says_why() {
     let computer = Computer::new().await;
@@ -3413,6 +3445,12 @@ async fn the_drafts_of_a_host_this_computer_cannot_read_stay_here_and_the_view_s
 /// A draft another device wrote arrives as a copy kept beside this computer's own: it is never one
 /// of this computer's drafts, a version of it that was brought down is not brought down again, and
 /// a later version is another copy.
+///
+/// KR-REQ-20.13, the part about draft prompts: a draft another device wrote arrives as a copy kept
+/// beside this computer's own, never as one of its own drafts; a version already brought down is
+/// not brought down again, a later version is another copy, and this computer writes nothing of it.
+/// Not shown here: that a draft is never run (no case here runs one), or the person's choice
+/// between a copy and a draft.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_draft_another_device_wrote_arrives_as_a_kept_copy_and_nothing_is_sent_for_it() {
     let computer = Computer::new().await;
@@ -3756,6 +3794,11 @@ async fn host_says_while_a_publication_is_out(
 /// arrives, before the answer is settled: the answer is discarded and nothing is noted of the
 /// draft, whatever the pass had read of the host before, and the view says the draft is kept for
 /// the host's privacy mode.
+///
+/// KR-REQ-24.28, the part about no late result of an older generation: when a host goes private
+/// while a publication of its draft is out at the service, the answer is discarded when it arrives
+/// and nothing is noted of the draft, and the view says the draft is kept for the host's privacy
+/// mode. Not shown here: upload, notification or inference work other than a draft's publication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_host_that_goes_private_while_a_publication_is_out_has_the_answer_discarded() {
     let computer = Computer::new().await;
@@ -3775,6 +3818,10 @@ async fn a_host_that_goes_private_while_a_publication_is_out_has_the_answer_disc
 /// A publication of a draft another device wrote first is refused, and the service answers with the
 /// other device's draft. When the host cannot be read as the answer arrives, nothing of it is kept
 /// beside this computer's own: the draft is fenced, as the host's privacy mode asks.
+///
+/// KR-REQ-24.28, the part about no late result of an older generation: a refusal whose answer
+/// carries another device's draft brings nothing down when the host cannot be read as the answer
+/// arrives; no copy is kept and the view says why the draft waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refusal_that_arrives_while_the_host_cannot_be_read_brings_nothing_down() {
     let computer = Computer::new().await;
@@ -3822,6 +3869,10 @@ async fn a_refusal_that_arrives_while_the_host_cannot_be_read_brings_nothing_dow
 /// word that privacy mode is off is believed, and a store cannot follow it down when it turns on
 /// again: it is fenced at the generation it holds, so what an answer brings down is withheld. A
 /// write the service applied before then is noted all the same.
+///
+/// KR-REQ-24.28, the part about a host whose state was reset: the store stays fenced at the
+/// generation it holds, so what an answer brings down is withheld, and the view says the store is
+/// ahead of the host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_host_that_goes_private_below_the_generation_held_has_what_the_answer_brings_withheld() {
     let computer = Computer::new().await;
@@ -3895,6 +3946,10 @@ async fn a_host_that_cannot_be_read_when_the_answer_arrives_is_treated_as_privat
 
 /// A host that goes private while a pass is out at the service is read again just before each draft
 /// of it leaves: the first draft goes under the mode the host was in, and the second does not.
+///
+/// KR-REQ-24.28, the part about a host that turns private during a pass: the host is read again
+/// before each draft leaves, so of two drafts exactly one leaves and the other is kept for the
+/// host's privacy mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_host_that_goes_private_during_a_pass_keeps_the_drafts_that_had_not_left_yet() {
     let computer = Computer::new().await;
@@ -4002,6 +4057,10 @@ async fn with_a_publication_whose_answer_was_lost(
 /// notes nothing of where the draft landed. A draft sent meanwhile is still owed a removal: it is
 /// made against the place the publication left it, when the host lets it, and the draft does not
 /// come back as another device's.
+///
+/// KR-REQ-24.28, the part about a removal owed to a host in privacy mode: it waits while the host
+/// is private and is made once the host lets it, and the draft does not return as another device's
+/// copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_privacy_change_that_settles_a_lost_answer_leaves_the_removal_owed() {
     let computer = Computer::new().await;
@@ -4439,6 +4498,9 @@ fn from_other_devices(drafts: &[Value]) -> usize {
 /// A host that reports an older privacy generation than this computer holds for it (its state was
 /// reset) is not believed: the store keeps the generation it has, so a host that says privacy mode
 /// is on would otherwise leave the store open. Nothing of that host is sent, and the others go on.
+///
+/// KR-REQ-24.28, the part about a host that reports an older generation than the store holds: it is
+/// not believed, nothing of that host is sent, and the other host's draft goes on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_host_that_reports_an_older_generation_than_this_computer_holds_is_not_believed() {
     let computer = Computer::new().await;
@@ -4506,6 +4568,12 @@ async fn two_computers() -> (Computer, Computer) {
 /// second finds the offer and joins when the person confirms there, and the settings the first
 /// wrote follow it: the key moved on when the device was added, and the first sealed the settings
 /// under the new one.
+///
+/// KR-REQ-18.05, the part about encrypted settings sync across devices: a second device is offered
+/// the settings when a host lists it, is given the collection's key when the person confirms on the
+/// first computer, joins when the person confirms there, and reads the settings the first wrote
+/// after the key moved on; its own change reaches the first. Not shown here: what the service
+/// holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_device_is_given_the_key_joins_and_reads_what_the_first_wrote() {
     let (this, other) = two_computers().await;
@@ -4598,6 +4666,9 @@ async fn a_device_is_not_given_the_key_unless_the_person_confirms() {
 }
 
 /// A device taken out is given no key for what is written afterwards.
+///
+/// KR-REQ-18.05, the part about encrypted settings sync across devices: a device taken out is given
+/// no key for what is written afterwards and keeps the setting it last read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_taken_out_does_not_read_what_is_written_afterwards() {
     let (this, other) = two_computers().await;
