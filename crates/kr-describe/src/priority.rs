@@ -148,8 +148,10 @@ impl Applied {
 /// Puts the calling thread, and on the platforms that hold the class for a process (macOS and
 /// Windows) the calling process, into the background class this platform offers.
 ///
-/// It is called by the inference thread of the description process and by the benchmark, before the
-/// model starts a thread of its own. On Linux the threads it starts inherit the class; on macOS and Windows every thread of the
+/// It is called by the inference thread of the description process and by the benchmark's output
+/// check, before the model starts a thread of its own. The benchmark that measures contention does
+/// not call it: it runs the description process, and keeps the terminal workload in a process of its
+/// own. On Linux the threads it starts inherit the class; on macOS and Windows every thread of the
 /// process is in it. A failure is reported rather than propagated: a host whose scheduler refuses
 /// the change still runs descriptions, at ordinary priority, and says so.
 #[must_use]

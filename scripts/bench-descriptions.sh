@@ -7,8 +7,12 @@
 # and digest before anything is loaded. A file that does not match stops the run rather than
 # producing a figure about weights nobody qualified.
 #
+# The benchmark runs the product's own description process (`kr-describe-inference`) the way the
+# control daemon does, as a process of its own, and keeps the terminal workload in the benchmark's
+# process. So the model is in the background class and the workload is not.
+#
 # Everything the run touches lives on local storage: the assets, the store the benchmark writes and
-# the binary itself. The workspace may be on a removable volume, and a measurement that waited on a
+# both binaries. The workspace may be on a removable volume, and a measurement that waited on a
 # volume is not a measurement of this product.
 #
 # Usage:
@@ -67,16 +71,19 @@ echo "threads pinned to: $threads"
 
 echo "=== build ==="
 profile_args=(--profile "$profile")
-CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build --release -p kr-describe-model --bin kr-describe-bench
+CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build --release -p kr-describe-model \
+  --bin kr-describe-bench --bin kr-describe-inference
 
-# The built binary is copied to local storage and run from there, with its working directory there
-# too. A process started from a removable volume is a separate privacy identity on macOS, and the
-# first path it opened would block on a dialog nobody is watching for.
+# The built binaries are copied to local storage and run from there, with their working directory
+# there too. A process started from a removable volume is a separate privacy identity on macOS, and
+# the first path it opened would block on a dialog nobody is watching for.
 run_dir="$cache/run"
 mkdir -p "$run_dir"
 binary="$run_dir/kr-describe-bench"
+inference="$run_dir/kr-describe-inference"
 cp "${CARGO_TARGET_DIR:-$root/target}/release/kr-describe-bench" "$binary"
-chmod +x "$binary"
+cp "${CARGO_TARGET_DIR:-$root/target}/release/kr-describe-inference" "$inference"
+chmod +x "$binary" "$inference"
 
 echo "=== assets ==="
 manifest="$run_dir/manifest.tsv"
@@ -109,7 +116,7 @@ echo "=== KR-PERF-009 ==="
 # the profile. A run that used every core would measure a machine this product never promises.
 # One command array, never an empty one: an empty array under `set -u` is an unbound variable on
 # the bash macOS ships, whatever it is expanded beside.
-run_command=("$binary" --run "${profile_args[@]}" --cache "$cache")
+run_command=("$binary" --run "${profile_args[@]}" --cache "$cache" --inference "$inference")
 if command -v taskset >/dev/null 2>&1; then
   run_command=(taskset -c "0-$((threads - 1))" "${run_command[@]}")
   echo "pinned with: taskset -c 0-$((threads - 1))"

@@ -674,13 +674,14 @@ does, has no inference library anywhere in its dependency graph.
 
 ## Measuring it
 
-`scripts/bench-descriptions.sh` runs the real model against real weights. It downloads the selected
-profile's assets once into a cache on local storage, and `kr-describe-bench` verifies every size and
-digest before it loads anything. The run is pinned to four processors, states the hardware beside
-every figure, and reports:
+`scripts/bench-descriptions.sh` runs the real model against real weights, in the description process
+the product ships. It downloads the selected profile's assets once into a cache on local storage,
+and `kr-describe-bench` verifies every size and digest before it starts that process. The run is
+pinned to four processors, states the hardware beside every figure, and reports:
 
-- cold-start load time;
-- the declared itemised resident cost beside the measured resident set, whole process and model;
+- cold-start load time, as the description process reports it, with its own check of the weights'
+  digest in it;
+- the declared itemised resident cost beside the description process's measured resident set;
 - queue-wait and execution latency at 1, 5, 20 and 50 sessions, separately;
 - how many descriptions were produced, how many passed the deadline and how many were refused;
 - the resource-paused case, driven on the same host that has just been publishing.
@@ -689,16 +690,24 @@ The last one is measured that way because section 22 forbids passing the active-
 keeping inference switched off, so the pause is measured beside real production rather than instead
 of it.
 
-Every figure is of one process, which holds the runtime, the harness and the terminal workload the
-contention case needs, and each line says so. On macOS and Windows the model's background class is
-the whole process's, so in this process the terminal workload runs in the class with the model: the
-contention figure there is of two threads in one class, and not of a terminal beside a model in the
-background. On Linux the class is the model thread's, which the workload does not share. What that process grew by over a baseline is reported
-as an estimate of the model and its runtime rather than as a measurement of them: the baselines are
-real (the process before the model was loaded, and the terminal workload running with no job
-admitted), but subtracting one peak from another does not separate threads that share a process.
-Whole-product RSS and CPU are not measured here at all, because the controller, the workers and the
-shared services are not running beside this one process; the release matrix measures them.
+The benchmark drives that process the way the control daemon does. It starts `kr-describe-inference`
+(the script passes the one it built, as `--inference`), links the verified weights where the daemon
+places them, and runs the service through the daemon's own driver. The process puts itself in the
+background class, as it does under the daemon, and the benchmark never does. The terminal workload
+for the contention case runs in the benchmark's own process. On macOS and Windows the class is the
+whole process's, so a workload in the model's process would run in the class with the model, and the
+contention figure would be of a terminal at background priority beside a model at the same
+priority. Start the benchmark outside the class: a process started under `taskpolicy -b` is in it,
+and so is everything that process starts.
+
+Each figure of the model is of the description process alone, which holds the runtime and the model
+and none of the harness, and each line says so. The benchmark reads the process's resident set and
+processor use from outside it, no oftener than `sysinfo` computes processor use over. A first job
+loads the model and is not recorded, so the passes run against a loaded model and the cold start is
+reported apart; the load runs while the workload runs. The workload's own processor use is read
+before the process starts. Whole-product RSS and CPU are not measured here at all, because the
+controller, the workers and the shared services are not running beside the two processes; the
+release matrix measures them.
 
 A budget the run misses is named as a qualification target that was not met and the run exits
 non-zero, after it has measured everything else it can still measure: a benchmark that stopped at
@@ -709,7 +718,9 @@ serving code over a model that answers from the prompt, and drives it over real 
 (fairness, rejection, unloading, privacy) and the process's bounds are tested in seconds. `cargo
 test -p kr-describe-model` runs the real process with the real weights where the benchmark's cache
 holds them, including a job it is told to cancel, which the model has to stop itself, and says so
-where it does not. Neither can answer whether the text is any good, and
+where it does not. On macOS it also starts the benchmark and reads from outside the kernel's
+priority of every thread of the benchmark's process, where the terminal workload runs, and of the
+description process it started. Neither can answer whether the text is any good, and
 that is what the benchmark is for.
 
 ## The qualification matrix
