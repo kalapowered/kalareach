@@ -18,7 +18,9 @@
 //!
 //! Earlier history is opt-in. Beside what its grant admits, a device is shown an item only when the
 //! condition it stands for was first seen at or after the moment its grant's history reaches back
-//! to ([`Viewer::reaches`]): its history cursor, or its own start when it has none.
+//! to ([`Viewer::reaches`]): its history cursor, or its own start when it has none. A range the
+//! host could not read has no date, so a device whose history does not reach every moment is told
+//! of none ([`Viewer::sees_gap`]).
 
 use kr_protocol::attention::{AttentionGap, AttentionSource};
 use kr_protocol::ids::{GrantId, SessionId};
@@ -144,15 +146,24 @@ impl Viewer<'_> {
     /// session, so it is shown to whoever may see the session. A gap in the environment's own
     /// workflow journal is shown to whoever may manage automation here; any other environment gap
     /// is the host's own, and needs `host.manage`.
+    ///
+    /// A gap has no date, so nothing says it lies within a history that starts at a moment: a
+    /// caller whose history does not reach every moment is told of none, as it is shown no range
+    /// that went missing from a session's change log.
     #[must_use]
     pub fn sees_gap(&self, gap: &AttentionGap) -> bool {
         match self {
             Self::Owner => true,
-            Self::Device(scope) => match gap.session_id.0 {
-                Some(session_id) => self.sees_session(session_id),
-                None if gap.source == AttentionSource::Automation => scope.automation_manage,
-                None => scope.host_manage,
-            },
+            Self::Device(scope) => {
+                self.reaches_every_moment()
+                    && match gap.session_id.0 {
+                        Some(session_id) => self.sees_session(session_id),
+                        None if gap.source == AttentionSource::Automation => {
+                            scope.automation_manage
+                        }
+                        None => scope.host_manage,
+                    }
+            }
         }
     }
 }

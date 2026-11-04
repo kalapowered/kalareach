@@ -6547,10 +6547,16 @@ how many came before it. This holds for an invitation because the host refuses o
 would start after the moment it is issued: a bound still ahead would count each change recorded
 before it, and a device clock far ahead of the host's can name one. An invitation that an earlier
 build issued with such a bound shows that count until it expires. The second is what the numbering
-does not reach: a
-review's versions, an attention item's revision, the `gaps` and `dropped` count of
+does not reach: a review's versions, an attention item's revision, the `dropped` count of
 `attention.read`, and a log view's output offsets. They stay the host's own numbers, and the bound
 does not cut them.
+
+The `gaps` of `attention.read` are ranges, not numbers. A range of the retained events that the host
+could not read has no date, so a device whose history does not reach every moment is listed none,
+whether the range is in a session's records or in the workflow journal, just as `visit.changed`
+shows it no `omitted` range. An item such a range could have settled stays uncertain, so the device
+still learns that the host cannot say how it ended. The owner, and a device whose grant starts at
+the beginning of time, are listed every range.
 
 A log view's source offset and its filter travel with the visit. They come back after a reconnect,
 each view keeps its own position when a client switches between two, and a view whose range
@@ -6676,7 +6682,8 @@ carries `session.view`; a paused workflow revision's or causal chain's item when
 how `workflow.read` decides what a device is shown; and the environment's other items when it
 carries `host.manage`. An automation item whose grant the journal could not name is shown to no
 device. The same scope bounds a read's items, the gaps it reports and where it may continue from; a
-gap in the workflow journal's records is shown to a grant that carries `automation.manage`.
+gap in the workflow journal's records is shown to a grant that carries `automation.manage`, and no
+gap is shown to a grant whose history does not reach every moment, since a gap has no date.
 `attention.read` and `attention.acknowledge` are reads of the caller's current view rather than
 rights of their own, so a device holding only `host.manage` reads the environment's own items and
 none of any session or workflow. A read may name one session to narrow the inbox to it.
