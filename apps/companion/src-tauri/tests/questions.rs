@@ -384,6 +384,7 @@ async fn an_answer_the_worker_could_not_take_is_kept_and_only_the_person_sends_i
     );
     let call = link.expect(Method::QuestionAnswer).await;
     assert_eq!(call.kind, CallKind::Mutation);
+    let sent = call.action_id.expect("the answer goes out under an identifier");
     drop(link);
     let told = answered(asked).await.expect("the answer is kept");
     assert_eq!(told["outcome"], "kept");
@@ -415,6 +416,7 @@ async fn an_answer_the_worker_could_not_take_is_kept_and_only_the_person_sends_i
         &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
     )
     .await;
+    has_no_receipt(&mut link, sent).await;
     let settled = answered(settling)
         .await
         .expect("the standing of the answers");
@@ -435,6 +437,7 @@ async fn an_answer_the_worker_could_not_take_is_kept_and_only_the_person_sends_i
         &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
     )
     .await;
+    has_no_receipt(&mut link, sent).await;
     let call = link.expect(Method::QuestionAnswer).await;
     let params: QuestionAnswerParams = call.params();
     assert_eq!(params.expected_revision, QuestionRevision::new(2));
@@ -474,7 +477,8 @@ async fn an_answer_whose_question_ended_is_kept_until_it_is_dismissed() {
         "question_answer",
         answer_params(&worker, 2, &choice("main")),
     );
-    link.expect(Method::QuestionAnswer).await;
+    let call = link.expect(Method::QuestionAnswer).await;
+    let sent = call.action_id.expect("the answer goes out under an identifier");
     drop(link);
     let told = answered(asked).await.expect("kept");
     let drafted_at = told["draft"]["drafted_at_ms"].clone();
@@ -491,6 +495,7 @@ async fn an_answer_whose_question_ended_is_kept_until_it_is_dismissed() {
         &reads(&worker, vec![question(&worker, 3, QuestionState::Answered)]),
     )
     .await;
+    has_no_receipt(&mut link, sent).await;
     let settled = answered(settling).await.expect("the standing");
     assert_eq!(settled[0]["standing"], "ended");
     assert_eq!(settled[0]["state"], "answered");
@@ -506,6 +511,7 @@ async fn an_answer_whose_question_ended_is_kept_until_it_is_dismissed() {
         &reads(&worker, vec![question(&worker, 3, QuestionState::Answered)]),
     )
     .await;
+    has_no_receipt(&mut link, sent).await;
     let refused = answered(sending).await.expect_err("the question ended");
     assert_eq!(code_of(&refused), "QUESTION_RESOLVED");
     assert!(link.quiet_for(Duration::from_millis(300)).await);
@@ -882,7 +888,8 @@ async fn an_answer_the_worker_took_is_reported_taken_when_its_kept_copy_cannot_b
         "question_answer",
         answer_params(&worker, 2, &choice("main")),
     );
-    link.expect(Method::QuestionAnswer).await;
+    let call = link.expect(Method::QuestionAnswer).await;
+    let sent = call.action_id.expect("the answer goes out under an identifier");
     drop(link);
     let told = answered(asked).await.expect("kept");
     let drafted_at = told["draft"]["drafted_at_ms"].clone();
@@ -907,6 +914,7 @@ async fn an_answer_the_worker_took_is_reported_taken_when_its_kept_copy_cannot_b
         &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
     )
     .await;
+    has_no_receipt(&mut link, sent).await;
     let call = link.expect(Method::QuestionAnswer).await;
     link.answer(&call, &resolution(&worker, QuestionState::Answered))
         .await;
@@ -915,6 +923,15 @@ async fn an_answer_the_worker_took_is_reported_taken_when_its_kept_copy_cannot_b
     let told = result.expect("the worker took it");
     assert_eq!(told["outcome"], "taken");
     assert_eq!(told["leftover"], true);
+}
+
+/// The worker has no receipt of `sent`, as it answers an identifier it never saw.
+async fn has_no_receipt(link: &mut scripted_worker::Link, sent: kr_protocol::ids::ActionId) {
+    let call = link.expect(Method::ActionRead).await;
+    let params: kr_protocol::receipt::ActionReadParams = call.params();
+    assert_eq!(params.action_id, sent, "the read names the answer's identifier");
+    link.refuse(&call, &format!("no receipt for action {sent}"))
+        .await;
 }
 
 /// The worker's receipt of a send, as `action.read` answers it.

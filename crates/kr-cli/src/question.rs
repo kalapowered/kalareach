@@ -292,7 +292,7 @@ fn older_copy(question_id: QuestionId, copy: &KeptCopy) -> Shown {
         KeptCopy::Unreadable(why) => shown!(
             "; whether an earlier answer to question {} is still kept on this device cannot be read ({})",
             question_id,
-            why
+            *why
         ),
     }
 }
@@ -302,7 +302,7 @@ fn older_copy(question_id: QuestionId, copy: &KeptCopy) -> Shown {
 fn not_recorded(question_id: QuestionId, error: &AnswerError, copy: &KeptCopy) -> CliError {
     CliError::Other(shown!(
         "this command sent no answer: {}{}",
-        error,
+        *error,
         older_copy(question_id, copy)
     ))
 }

@@ -498,6 +498,8 @@ impl Link {
                         params: request.params,
                         kind: CallKind::Request,
                         target: None,
+                        action_id: None,
+                        expected: None,
                     }),
                     Ok(ControlFrame::Mutation(mutation)) => sent.push(Call {
                         request_id: mutation.request_id,
@@ -505,6 +507,8 @@ impl Link {
                         params: mutation.params,
                         kind: CallKind::Mutation,
                         target: Some(mutation.target),
+                        action_id: Some(mutation.action_id),
+                        expected: Some(mutation.expected),
                     }),
                     Ok(_) => {}
                     Err(_) => return,
