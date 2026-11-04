@@ -194,6 +194,11 @@ pub struct OwnedProcesses {
     /// finds ended and cannot yet collect is tried again by the next one.
     #[cfg(target_os = "linux")]
     elsewhere: std::sync::Arc<std::sync::Mutex<BTreeMap<(u64, u64), Elsewhere>>>,
+    /// The processes a reading has tied to the session as ones the worker did not start, until
+    /// the next [`Self::take`] puts them in `elsewhere`: only a process that call has recorded
+    /// as running is put there. Not shared with a copy, which makes its own readings.
+    #[cfg(target_os = "linux")]
+    noted_elsewhere: Vec<ProcessStartIdentity>,
     /// The most processes `seen` holds.
     cap: usize,
     /// Whether a process was refused for want of room, and said so.
@@ -378,6 +383,8 @@ impl OwnedProcesses {
             under_backends: BTreeMap::new(),
             #[cfg(target_os = "linux")]
             elsewhere: std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            #[cfg(target_os = "linux")]
+            noted_elsewhere: Vec::new(),
             cap: MAX_RECORDED_PROCESSES,
             refused_for_room: false,
             #[cfg(test)]
@@ -443,6 +450,8 @@ impl OwnedProcesses {
                 under_backends: self.under_backends.clone(),
                 #[cfg(target_os = "linux")]
                 elsewhere: std::sync::Arc::clone(&self.elsewhere),
+                #[cfg(target_os = "linux")]
+                noted_elsewhere: Vec::new(),
                 cap: self.cap,
                 refused_for_room: self.refused_for_room,
                 #[cfg(test)]
@@ -845,7 +854,14 @@ impl OwnedProcesses {
             .collect();
         for this in flagged {
             self.live.remove(&this);
+            // It left the session, so it is nobody's to collect from here.
+            #[cfg(target_os = "linux")]
+            self.forget_elsewhere(&this);
         }
+        // What the readings noted is noted after this call has recorded it, and only if it is
+        // recorded as running, so that no entry is ever one that nothing will read as ended.
+        #[cfg(target_os = "linux")]
+        self.admit_elsewhere();
         // One recorded earlier and not found this time is read again: it may have moved.
         let moved: Vec<ProcessStartIdentity> = self
             .live
@@ -899,11 +915,10 @@ impl OwnedProcesses {
     /// status. A record rooted at the worker itself notes nothing: from that root the reading
     /// cannot tell the worker's own children from any other process.
     ///
-    /// The set is bounded by the record's cap. When it is full, room is made from the entries that
-    /// can no longer be read as ended (the process left, or the record had no room for it), and
-    /// then from the ones that ended and are somebody else's to collect for now.
+    /// The process is put in the set by the next [`Self::take`], which records it first: see
+    /// [`Self::admit_elsewhere`].
     #[cfg(target_os = "linux")]
-    fn started_elsewhere(&self, identity: &ProcessStartIdentity) {
+    fn started_elsewhere(&mut self, identity: &ProcessStartIdentity) {
         let this = key(identity);
         if self.root.pid.get() == u64::from(std::process::id())
             || this == key(&self.root)
@@ -911,43 +926,73 @@ impl OwnedProcesses {
         {
             return;
         }
+        self.noted_elsewhere.push(identity.clone());
+    }
+
+    /// Puts the processes the readings noted as started elsewhere in the set, each one that this
+    /// record holds as running.
+    ///
+    /// The set is bounded by the record's cap. An entry is put there only for a process this
+    /// record holds as running, and leaves it when its status is taken, when nothing holds the
+    /// process, when the process leaves the session ([`Self::forget_elsewhere`]) or when the record
+    /// has no room for it ([`Self::forget_unended_elsewhere`]). So an entry is always one a reading
+    /// can still find ended, or one that has ended and waits for its status to be taken, and none
+    /// is left over from a reading that never reached this call. When the set is full, room is
+    /// made from the second kind, because a process that ended under a live parent is that
+    /// parent's to collect for now and one that runs can still be collected when it ends.
+    #[cfg(target_os = "linux")]
+    fn admit_elsewhere(&mut self) {
+        let noted = std::mem::take(&mut self.noted_elsewhere);
         let mut elsewhere = self
             .elsewhere
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if elsewhere.contains_key(&this) {
-            return;
-        }
-        if elsewhere.len() >= self.cap
-            && let Some(room) = elsewhere
-                .iter()
-                .find_map(|(this, entry)| {
-                    (!entry.ended && !self.live.contains_key(this)).then_some(*this)
-                })
-                .or_else(|| {
-                    elsewhere
-                        .iter()
-                        .find_map(|(this, entry)| entry.ended.then_some(*this))
-                })
-        {
-            elsewhere.remove(&room);
-        }
-        if elsewhere.len() < self.cap {
-            elsewhere.entry(this).or_insert(Elsewhere {
-                identity: identity.clone(),
-                ended: false,
-            });
+        for identity in noted {
+            let this = key(&identity);
+            if !self.live.contains_key(&this) || elsewhere.contains_key(&this) {
+                continue;
+            }
+            if elsewhere.len() >= self.cap
+                && let Some(room) = elsewhere
+                    .iter()
+                    .find_map(|(this, entry)| entry.ended.then_some(*this))
+            {
+                elsewhere.remove(&room);
+            }
+            if elsewhere.len() < self.cap {
+                elsewhere.insert(
+                    this,
+                    Elsewhere {
+                        identity,
+                        ended: false,
+                    },
+                );
+            }
         }
     }
 
-    /// Forgets that a process was noted as started elsewhere: it has left the session, or the
-    /// record had no room for it, so a reading will not find it ended.
+    /// Forgets that a process was noted as started elsewhere: it has left the session, so it is
+    /// nobody's to collect from here.
     #[cfg(target_os = "linux")]
     fn forget_elsewhere(&self, this: &(u64, u64)) {
         self.elsewhere
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(this);
+    }
+
+    /// Forgets an entry of the set that has not been read as ended: the record had no room for
+    /// the process, so no reading will find it ended. One that has ended stays, because its status
+    /// is still to be taken whether or not the record holds the process.
+    #[cfg(target_os = "linux")]
+    fn forget_unended_elsewhere(&self, this: &(u64, u64)) {
+        let mut elsewhere = self
+            .elsewhere
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if elsewhere.get(this).is_some_and(|entry| !entry.ended) {
+            elsewhere.remove(this);
+        }
     }
 
     /// Takes the status of every process noted as started elsewhere that has been read as ended,
@@ -1258,7 +1303,7 @@ impl OwnedProcesses {
     /// Says once that the record was full, and which process it had no room for.
     fn refuse_for_room(&mut self, identity: &ProcessStartIdentity) {
         #[cfg(target_os = "linux")]
-        self.forget_elsewhere(&key(identity));
+        self.forget_unended_elsewhere(&key(identity));
         if !self.refused_for_room {
             self.refused_for_room = true;
             self.note_unestablished(format!(
@@ -2742,18 +2787,17 @@ mod tests {
         assert_eq!(helper.wait().expect("the helper's status").code(), Some(6));
     }
 
-    /// KR-REQ-07.14 and KR-REQ-07.60: a recorded process that ends while its own parent is still
-    /// there is the parent's to collect, so it is left, and it is collected once the parent ends
-    /// and the worker adopts it: the record tries again at each reading until the process is
-    /// taken or nothing holds it.
+    /// Starts a server that starts a command and never collects it, and names the command.
     ///
-    /// The server here is a child of the test and a backend root, and never collects what it
-    /// started: it is `cat`, which the shell it begins as turns itself into. Its command ends
-    /// first, as the server's child, and the server ends after, when its input does.
+    /// The server is a child of the test and `cat`, which the shell it begins as turns itself into
+    /// once it has named the command: a shell could collect the command itself before that, so the
+    /// server is returned only when it is `cat`. It ends when its input does.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn a_process_that_ended_under_a_parent_is_collected_once_the_worker_adopts_it() {
-        use rustix::process::{Pid, Signal, kill_process};
+    fn a_command_under_a_server_that_never_collects_it() -> (
+        std::process::Child,
+        std::process::ChildStdin,
+        ProcessStartIdentity,
+    ) {
         use std::io::BufRead as _;
 
         adopt_orphans();
@@ -2775,29 +2819,36 @@ mod tests {
             .trim()
             .parse()
             .expect("a process number");
-        let identity = |number: u32| {
-            kr_ipc::identity::process_start_identity(number).expect("the process's identity")
-        };
-        let command_identity = identity(command);
-        let mut owned = session_with(&identity(server.id()));
-        owned.observe_backends();
-        assert!(
-            owned
-                .below_backend(&identity(server.id()))
-                .contains(&command_identity),
-            "the walk below the server reads its command"
-        );
+        let waited = std::time::Instant::now();
+        while std::fs::read_to_string(format!("/proc/{}/comm", server.id()))
+            .map_or(true, |name| name.trim() != "cat")
+        {
+            assert!(
+                waited.elapsed() < std::time::Duration::from_secs(60),
+                "the server did not become cat"
+            );
+            std::thread::yield_now();
+        }
+        let command =
+            kr_ipc::identity::process_start_identity(command).expect("the command's identity");
+        (server, told, command)
+    }
 
-        // The command ends under the server, which does not collect it: it is read as ended, and
-        // is not the worker's child to collect.
+    /// Ends `command` and returns once the kernel says it has ended, without collecting it: its
+    /// parent is not this test.
+    #[cfg(target_os = "linux")]
+    fn end_a_command(command: &ProcessStartIdentity) {
+        use rustix::process::{Pid, Signal, kill_process};
+
         kill_process(
-            Pid::from_raw(i32::try_from(command).expect("a number")).expect("a process"),
+            Pid::from_raw(i32::try_from(command.pid.get()).expect("a number"))
+                .expect("a process"),
             Signal::KILL,
         )
         .expect("ends the command");
         let waited = std::time::Instant::now();
         while !matches!(
-            kr_ipc::identity::process_state(&command_identity),
+            kr_ipc::identity::process_state(command),
             kr_ipc::identity::ProcessState::Ended
         ) {
             assert!(
@@ -2806,9 +2857,38 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    /// KR-REQ-07.14 and KR-REQ-07.60: a recorded process that ends while its own parent is still
+    /// there is the parent's to collect, so it is left, and it is collected once the parent ends
+    /// and the worker adopts it: the record tries again at each reading until the process is
+    /// taken or nothing holds it.
+    ///
+    /// The server here is a child of the test and a backend root, and never collects what it
+    /// started. Its command ends first, as the server's child, and the server ends after, when its
+    /// input does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_that_ended_under_a_parent_is_collected_once_the_worker_adopts_it() {
+        let (mut server, told, command) = a_command_under_a_server_that_never_collects_it();
+        let identity = |number: u32| {
+            kr_ipc::identity::process_start_identity(number).expect("the process's identity")
+        };
+        let mut owned = session_with(&identity(server.id()));
+        owned.observe_backends();
+        assert!(
+            owned
+                .below_backend(&identity(server.id()))
+                .contains(&command),
+            "the walk below the server reads its command"
+        );
+
+        // The command ends under the server, which does not collect it: it is read as ended, and
+        // is not the worker's child to collect.
+        end_a_command(&command);
         owned.take(Vec::new());
         assert!(
-            std::path::Path::new(&format!("/proc/{command}")).exists(),
+            is_in_the_process_table(&command),
             "the command waits for the server to collect it"
         );
 
@@ -2817,9 +2897,52 @@ mod tests {
         assert_eq!(server.wait().expect("the server's status").code(), Some(0));
         owned.take(Vec::new());
         assert!(
-            !std::path::Path::new(&format!("/proc/{command}")).exists(),
+            !is_in_the_process_table(&command),
             "the command ended under the server, was adopted when the server ended, and is still in \
              the process table"
+        );
+    }
+
+    /// KR-REQ-07.14 and KR-REQ-07.60: a process that ended under a parent and is waiting to be
+    /// collected stays so when the record is full and a reading finds the process again: the
+    /// record has no room for it, which is no reason to leave it in the process table for good.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_waiting_to_be_collected_stays_so_when_the_record_has_no_room_to_read_it_again() {
+        let (mut server, told, command) = a_command_under_a_server_that_never_collects_it();
+        let identity = |number: u32| {
+            kr_ipc::identity::process_start_identity(number).expect("the process's identity")
+        };
+        let mut owned = session_with(&identity(server.id()));
+        owned.observe_backends();
+        end_a_command(&command);
+        owned.take(Vec::new());
+        assert!(
+            is_in_the_process_table(&command),
+            "the command waits for the server to collect it"
+        );
+
+        // The record trims what ended, and is then as full as it can be when a reading finds the
+        // command again.
+        owned.forget_ended();
+        assert!(
+            !owned.seen.contains_key(&key(&command)),
+            "the trim forgot the command"
+        );
+        owned.cap = owned.seen.len();
+        owned.take([command.clone()]);
+        assert!(
+            !owned.seen.contains_key(&key(&command)) && owned.refused_for_room,
+            "the record had no room for the command"
+        );
+
+        drop(told);
+        assert_eq!(server.wait().expect("the server's status").code(), Some(0));
+        owned.take(Vec::new());
+        assert!(
+            !is_in_the_process_table(&command),
+            "the command waited to be collected, was refused for room, and is still in the process \
+             table"
         );
     }
 
@@ -2860,11 +2983,10 @@ mod tests {
 
     /// KR-REQ-07.14: a reading that finds again a process already noted as started elsewhere makes
     /// no room and changes nothing about it, so a status that waits for its parent to end is still
-    /// tried; and when the set is full, room is made from what can no longer be read as ended
-    /// before what waits.
+    /// tried; and when the set is full, room is made from what has ended.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_full_set_of_processes_started_elsewhere_keeps_what_waits_for_a_parent_to_end() {
+    fn a_process_found_again_makes_no_room_in_a_full_set_of_processes_started_elsewhere() {
         let mut owned = OwnedProcesses::establish(
             OwnershipBoundary::TerminalGroup {
                 group: 1,
@@ -2873,10 +2995,9 @@ mod tests {
             kr_ipc::identity::ended_process_identity(4_000_010),
         );
         owned.cap = 2;
-        let (waiting, other, stale, newcomer) = (
+        let (waiting, other, newcomer) = (
             identity(5_000_001),
             identity(5_000_002),
-            identity(5_000_003),
             identity(5_000_004),
         );
         let state = |owned: &OwnedProcesses| {
@@ -2888,37 +3009,136 @@ mod tests {
                 .map(|(this, entry)| (*this, entry.ended))
                 .collect::<Vec<_>>()
         };
-        owned.started_elsewhere(&waiting);
-        owned.started_elsewhere(&other);
+        // The record holds each process as running when a reading notes it, as `take` leaves it.
+        let noted = |owned: &mut OwnedProcesses, process: &ProcessStartIdentity| {
+            owned.live.insert(key(process), process.clone());
+            owned.started_elsewhere(process);
+            owned.admit_elsewhere();
+        };
+        noted(&mut owned, &waiting);
+        noted(&mut owned, &other);
         for entry in owned.elsewhere.lock().expect("the set").values_mut() {
             entry.ended = true;
         }
-        owned.started_elsewhere(&waiting);
+        noted(&mut owned, &waiting);
         assert_eq!(
             state(&owned),
             vec![(key(&waiting), true), (key(&other), true)],
             "finding a process again changes nothing"
         );
-        owned.started_elsewhere(&newcomer);
+        noted(&mut owned, &newcomer);
         assert_eq!(
             state(&owned),
             vec![(key(&other), true), (key(&newcomer), false)],
-            "a full set makes room from what has ended when nothing else can go"
+            "a full set makes room from what has ended"
         );
-        owned.elsewhere.lock().expect("the set").clear();
-        owned.started_elsewhere(&waiting);
-        owned
-            .elsewhere
-            .lock()
-            .expect("the set")
-            .values_mut()
-            .for_each(|entry| entry.ended = true);
-        owned.started_elsewhere(&stale);
-        owned.started_elsewhere(&newcomer);
-        assert_eq!(
-            state(&owned),
-            vec![(key(&waiting), true), (key(&newcomer), false)],
-            "and from a process that can no longer be read as ended before one that waits"
+    }
+
+    /// KR-REQ-07.14: a set full of processes that ended under a live parent and wait for it makes
+    /// room for a walk's new processes, and keeps each of them: what one walk noted is not read as
+    /// stale because the record has not taken the rest of the walk yet.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_walk_that_notes_many_processes_keeps_each_in_a_set_full_of_what_waits_for_a_parent() {
+        let mut owned = OwnedProcesses::establish(
+            OwnershipBoundary::TerminalGroup {
+                group: 1,
+                terminal: None,
+            },
+            kr_ipc::identity::ended_process_identity(4_000_010),
+        );
+        owned.cap = 4;
+        {
+            let mut elsewhere = owned.elsewhere.lock().expect("the set");
+            for pid in 5_000_001..=5_000_004 {
+                elsewhere.insert(
+                    key(&identity(pid)),
+                    Elsewhere {
+                        identity: identity(pid),
+                        ended: true,
+                    },
+                );
+            }
+        }
+        let sleepers = Sleepers(
+            (0..3)
+                .map(|_| {
+                    std::process::Command::new("sleep")
+                        .arg("600")
+                        .spawn()
+                        .expect("starts a process that runs")
+                })
+                .collect(),
+        );
+        let walked: Vec<ProcessStartIdentity> = sleepers
+            .0
+            .iter()
+            .map(|sleeper| {
+                kr_ipc::identity::process_start_identity(sleeper.id())
+                    .expect("the process's identity")
+            })
+            .collect();
+        for process in &walked {
+            owned.started_elsewhere(process);
+        }
+        owned.take(walked.clone());
+        let elsewhere = owned.elsewhere.lock().expect("the set");
+        for process in &walked {
+            assert!(
+                elsewhere
+                    .get(&key(process))
+                    .is_some_and(|entry| !entry.ended),
+                "process {} was noted by the walk and is not in the set",
+                process.pid
+            );
+        }
+    }
+
+    /// KR-REQ-07.14: a process read as having left the session through a shared reference, which
+    /// the next call drops from the ones that run, is not kept in the set either: nothing would
+    /// read it as ended, so the entry would take room for good.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_read_as_having_left_through_a_shared_reference_is_not_kept_to_be_collected() {
+        let sleepers = Sleepers(vec![
+            std::process::Command::new("sleep")
+                .arg("600")
+                .spawn()
+                .expect("starts a process that runs"),
+        ]);
+        let process = kr_ipc::identity::process_start_identity(sleepers.0[0].id())
+            .expect("the process's identity");
+        let mut owned = OwnedProcesses::establish(
+            OwnershipBoundary::TerminalGroup {
+                group: 1,
+                terminal: None,
+            },
+            kr_ipc::identity::ended_process_identity(4_000_010),
+        );
+        owned.started_elsewhere(&process);
+        owned.take([process.clone()]);
+        assert!(
+            owned
+                .elsewhere
+                .lock()
+                .expect("the set")
+                .contains_key(&key(&process)),
+            "the set holds a process the record holds as running"
+        );
+        owned.in_a_scope.insert(key(&process));
+        let recorded = owned.seen.get(&key(&process)).expect("the process is recorded");
+        assert!(
+            owned.has_left(recorded, &Scopes::default()),
+            "the process is read as having left"
+        );
+        owned.take(Vec::new());
+        assert!(
+            !owned
+                .elsewhere
+                .lock()
+                .expect("the set")
+                .contains_key(&key(&process)),
+            "a process that left the session is still in the set"
         );
     }
 
