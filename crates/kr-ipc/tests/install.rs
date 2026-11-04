@@ -1197,9 +1197,10 @@ fn a_program_that_asks_what_it_runs_after_its_release_was_removed_is_refused() {
 /// A reader reads the link once and then the named release's own program, a path with no link in
 /// it. It does not walk a path through the link: on the build machine (Linux 7.0, ext4) a walk
 /// through a link that is being replaced sometimes meets a missing path, about once in some tens
-/// of millions of walks, whether the link is replaced by a rename or by exchanging two names, and
-/// a program that does nothing but replace a link shows it. None of the switch's own steps causes
-/// it. What the switch decides is what the link names, and that is read whole.
+/// of millions of walks, whether the link is replaced by a rename or by exchanging two names. A
+/// program that only replaces a link and flushes the directory after each replace, as the switch
+/// does, shows it, so the store and its locks are not needed for it. What the switch decides is
+/// what the link names, and that is read whole.
 #[test]
 fn current_names_a_whole_release_at_every_moment_of_a_switch() {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
