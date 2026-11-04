@@ -339,7 +339,7 @@ impl OpenedDirectory {
         }
         // Every mechanism's rules are written against a path with no link left in it, so the path
         // is resolved once, here, beside the handle rather than at each rule.
-        let resolved = std::fs::canonicalize(path).map_err(|error| {
+        let resolved = crate::identity::resolve_directory(path).map_err(|error| {
             if nothing(&error) {
                 return gone();
             }
@@ -394,7 +394,11 @@ impl OpenedDirectory {
     pub fn confirm_path(&self) -> Result<()> {
         // A name that no longer opens at all is the same answer as a name that opens on something
         // else, and it is said the same way rather than as whatever the open failed with.
-        let Ok(now) = AuthorisedDirectory::open_root(self.environment_id, &self.path) else {
+        let opened = crate::identity::open_directory(&self.path).map_err(|_| ());
+        let Ok(now) = opened.and_then(|handle| {
+            AuthorisedDirectory::from_handle(self.environment_id, handle, self.path.clone())
+                .map_err(|_| ())
+        }) else {
             return Err(ProjectError::IdentityChanged {
                 detail: "the directory this invocation ran in could not be confirmed to be the \
                          object it was started against, so what it produced is not served"

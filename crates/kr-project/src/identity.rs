@@ -366,7 +366,7 @@ impl OpenedRepository {
     ) -> Result<(Self, Decided)> {
         let work_tree = match recorded {
             Some(recorded) => open_recorded_root(environment_id, path, recorded.tree)?,
-            None => AuthorisedDirectory::open_root(environment_id, path)?,
+            None => open_unrecorded_root(environment_id, path)?,
         };
         let ceiling = match recorded {
             Some(recorded) => {
@@ -439,7 +439,7 @@ impl OpenedRepository {
         }
         // The top level is opened and decided before its configuration is audited, and before
         // anything else is run in the repository Git found.
-        let tree = AuthorisedDirectory::open_root(environment_id, &top_level)?;
+        let tree = open_unrecorded_root(environment_id, &top_level)?;
         let settled_tree = match recorded {
             Some(recorded) => tree.check_recorded(recorded.tree).map_err(|refusal| {
                 not_the_recorded_tree(recorded.tree, tree.display_path(), &refusal)
@@ -451,11 +451,11 @@ impl OpenedRepository {
         // Git has just said where they are, and kept: every later question about this
         // repository's own data is asked of these handles, so nothing has to resolve those paths
         // again and find whatever has since taken the name.
-        let git_dir = AuthorisedDirectory::open_root(environment_id, &git_dir_path)?;
+        let git_dir = open_unrecorded_root(environment_id, &git_dir_path)?;
         let own_dir = if own_dir_path == git_dir_path {
             git_dir.try_clone()?
         } else {
-            AuthorisedDirectory::open_root(environment_id, &own_dir_path)?
+            open_unrecorded_root(environment_id, &own_dir_path)?
         };
         // And the Git directory is decided before the configuration is audited too: a repository
         // that is not the recorded one is not read, whatever top level it reports.
@@ -842,10 +842,8 @@ impl OpenedRepository {
                 }
             }
             None => {
-                let tree =
-                    AuthorisedDirectory::open_root(self.work_tree.environment_id(), &top_level)?;
-                let git_dir =
-                    AuthorisedDirectory::open_root(self.work_tree.environment_id(), &git_dir_path)?;
+                let tree = open_unrecorded_root(self.work_tree.environment_id(), &top_level)?;
+                let git_dir = open_unrecorded_root(self.work_tree.environment_id(), &git_dir_path)?;
                 RepositoryIdentity {
                     git_dir: git_dir.identity(),
                     work_tree: tree.identity(),
@@ -1173,6 +1171,54 @@ fn open_recorded_root(
         // change them.
         Err(error) => Err(crate::boundary::unopenable(path, &error)),
     }
+}
+
+/// Opens the directory at `path` as an authority for one environment, where no record names it:
+/// a checkout `project.adopt` is handed by path, the top level and the Git directories Git reports
+/// for it, a destination's parent the owner named by path, and the parent of a tree to take away.
+///
+/// It is opened once, by the open that every directory here is opened by, and what the open
+/// finds is the answer, in the open's own words. A link that leads round to itself reads as the
+/// system's reason for it.
+pub(crate) fn open_unrecorded_root(
+    environment_id: EnvironmentId,
+    path: &Path,
+) -> Result<AuthorisedDirectory> {
+    // A case that asks for it has the open fail, after that many roots have been opened, as it does
+    // for a host that is out of descriptors.
+    #[cfg(all(test, unix))]
+    let opened = match tests::ROOT_OPEN_FAILS.with(std::cell::Cell::get) {
+        Some((0, error)) => Err(std::io::Error::from(error)),
+        Some((passing, error)) => {
+            tests::ROOT_OPEN_FAILS.with(|fails| fails.set(Some((passing - 1, error))));
+            open_directory(path)
+        }
+        None => open_directory(path),
+    };
+    #[cfg(not(all(test, unix)))]
+    let opened = open_directory(path);
+    let handle = opened.map_err(|error| ProjectError::Destination {
+        detail: format!(
+            "{} could not be opened: {error}",
+            crate::git::redact(&path.display().to_string())
+        )
+        .into(),
+    })?;
+    Ok(AuthorisedDirectory::from_handle(
+        environment_id,
+        handle,
+        path.to_path_buf(),
+    )?)
+}
+
+/// Resolves the path of a directory that was opened, to the path with no link left in it.
+pub(crate) fn resolve_directory(path: &Path) -> std::io::Result<PathBuf> {
+    // A case that asks for it has the resolution fail, as it does for a host that is out of memory.
+    #[cfg(all(test, unix))]
+    if let Some(error) = tests::RESOLVE_FAILS.with(std::cell::Cell::get) {
+        return Err(std::io::Error::from(error));
+    }
+    std::fs::canonicalize(path)
 }
 
 /// Opens the directory at `path` with this process's own authority, which is how the place a
@@ -1679,6 +1725,14 @@ mod tests {
         /// answered, whether it opened the place or not.
         pub(super) static AFTER_THE_OPEN: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::Cell::new(None) };
+        /// Set by a case to make the open of a root on its own thread fail with this error, after
+        /// that many roots have been opened.
+        pub(super) static ROOT_OPEN_FAILS: std::cell::Cell<Option<(usize, rustix::io::Errno)>> =
+            const { std::cell::Cell::new(None) };
+        /// Set by a case to make the resolution of the path of a directory that was opened fail on
+        /// its own thread with this error.
+        pub(super) static RESOLVE_FAILS: std::cell::Cell<Option<rustix::io::Errno>> =
+            const { std::cell::Cell::new(None) };
     }
 
     /// The tree is there until the open and gone when the open is made, as it is for a tree that
@@ -1769,7 +1823,7 @@ mod tests {
 
     /// Opens the place `route` stands for, and returns what it was refused with: 0 is the place a
     /// record names for its tree, 1 the directory an invocation runs in with no identity held for
-    /// it, and 2 the same with the identity of `held`.
+    /// it, 2 the same with the identity of `held`, and 3 a directory that no record names.
     #[cfg(unix)]
     fn refused_open(
         route: usize,
@@ -1781,17 +1835,19 @@ mod tests {
         match route {
             0 => open_recorded_root(environment_id, path, recorded).map(|_| ()),
             1 => crate::boundary::OpenedDirectory::open(environment_id, path, None).map(|_| ()),
-            _ => {
+            2 => {
                 crate::boundary::OpenedDirectory::open(environment_id, path, Some(held)).map(|_| ())
             }
+            _ => open_unrecorded_root(environment_id, path).map(|_| ()),
         }
         .expect_err("the open was refused")
     }
 
     /// A host out of descriptors, processes or memory says nothing of the place it was asked to
     /// open, so the open is a fault that passes, which a client sends the request again after, on
-    /// each route that opens a place: a recorded tree's, and an invocation's with and without an
-    /// identity held for it. Any other failure of the open is still the caller's argument.
+    /// each route that opens a place: a recorded tree's, an invocation's with and without an
+    /// identity held for it, and a directory that no record names. Any other failure of the open is
+    /// still the caller's argument.
     #[cfg(unix)]
     #[test]
     fn a_host_out_of_descriptors_at_the_open_of_a_place_is_a_fault_that_passes() {
@@ -1807,7 +1863,7 @@ mod tests {
             (rustix::io::Errno::NOMEM, true),
             (rustix::io::Errno::IO, false),
         ] {
-            for route in 0..3 {
+            for route in 0..4 {
                 OPEN_FAILS.with(|fails| fails.set(Some(errno)));
                 let refused = refused_open(route, environment_id, &tree, recorded, held);
                 OPEN_FAILS.with(|fails| fails.set(None));
@@ -1852,7 +1908,7 @@ mod tests {
             .identity();
         let (first, second) = (root.path().join("first"), root.path().join("second"));
 
-        for route in 0..3 {
+        for route in 0..4 {
             std::os::unix::fs::symlink(&second, &first).expect("a link");
             std::os::unix::fs::symlink(&first, &second).expect("and a link back");
             let reason = std::fs::File::open(&first)
@@ -1900,5 +1956,334 @@ mod tests {
         let other = open_recorded_root(environment_id, &tree, recorded)
             .expect("a directory at the place opens");
         assert!(other.check_recorded(recorded).is_err());
+    }
+
+    /// The errors a place is opened with when the host is short of descriptors, processes or
+    /// memory, and one it is not: for each, whether it is the host's shortage.
+    #[cfg(unix)]
+    const OPEN_ERRORS: [(rustix::io::Errno, bool); 4] = [
+        (rustix::io::Errno::MFILE, true),
+        (rustix::io::Errno::NFILE, true),
+        (rustix::io::Errno::NOMEM, true),
+        (rustix::io::Errno::IO, false),
+    ];
+
+    /// Holds a refusal to the answer its error is given. A host's shortage is a fault that passes,
+    /// which a client sends the request again after, and it says the place and the reason. Any
+    /// other failure is not one a client sends again, and is `otherwise` where a case names that.
+    #[cfg(unix)]
+    fn assert_answered(
+        refused: &ProjectError,
+        errno: rustix::io::Errno,
+        passes: bool,
+        otherwise: Option<ErrorCode>,
+        place: &Path,
+        row: &str,
+    ) {
+        assert_eq!(
+            refused.code().retry_category().permits_automatic_retry(),
+            passes,
+            "{row}: {refused}"
+        );
+        if passes {
+            assert_eq!(
+                refused.code(),
+                ErrorCode::UpstreamUnavailable,
+                "{row}: {refused}"
+            );
+            let said = refused.to_string();
+            assert!(
+                said.contains(&std::io::Error::from(errno).to_string())
+                    && said.contains(&place.display().to_string()),
+                "it says the place and the reason: {row}: {said}"
+            );
+        } else if let Some(code) = otherwise {
+            assert_eq!(refused.code(), code, "{row}: {refused}");
+        }
+    }
+
+    /// A repository Git made, a linked worktree of it, a link to the repository, and a profile to
+    /// open them with, in a directory of their own. Their paths are resolved, as Git reports its
+    /// own, so that the path a case expects is the one Git reports.
+    #[cfg(unix)]
+    struct Repositories {
+        _root: tempfile::TempDir,
+        profile: RestrictedProfile,
+        environment_id: EnvironmentId,
+        main: PathBuf,
+        linked: PathBuf,
+        via: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn repositories() -> Repositories {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let base = std::fs::canonicalize(root.path()).expect("the directory resolves");
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([10; 16]));
+        let (main, linked, via) = (base.join("main"), base.join("linked"), base.join("via"));
+        std::fs::create_dir(&main).expect("a directory for the repository");
+        let git = |arguments: &[&str]| {
+            let made = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&main)
+                .args(arguments)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &base)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git runs");
+            assert!(
+                made.status.success(),
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&made.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&[
+            "-c",
+            "user.name=a",
+            "-c",
+            "user.email=a@b.c",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "a commit",
+        ]);
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "linked",
+            &linked.display().to_string(),
+        ]);
+        std::os::unix::fs::symlink(&main, &via).expect("a link to the repository");
+        let profile = RestrictedProfile::prepare(&base.join("profile"), environment_id)
+            .expect("the profile is prepared");
+        profile
+            .git()
+            .expect("this case runs Git, and this host has none");
+        Repositories {
+            _root: root,
+            profile,
+            environment_id,
+            main,
+            linked,
+            via,
+        }
+    }
+
+    /// A host out of descriptors, processes or memory says nothing of a directory it was asked to
+    /// open for a repository, so that is a fault that passes, which a client sends the request
+    /// again after, wherever the open is: the directory the caller handed over by path, as
+    /// `project.adopt` does, the top level and the Git directory Git then reports, and a linked
+    /// worktree's own directory. The handed path is a link to the repository, so the rows can be
+    /// told apart by the place each names. Any other failure of the open is still the caller's
+    /// argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_descriptors_at_the_open_of_a_repositorys_directories_is_a_fault_that_passes() {
+        let made = repositories();
+        let common = made.main.join(".git");
+        let own = common.join("worktrees").join("linked");
+
+        for (what, handed, passing, place) in [
+            ("the directory it was handed", &made.via, 0, &made.via),
+            ("the top level Git reports", &made.via, 1, &made.main),
+            ("the Git directory Git reports", &made.via, 2, &common),
+            ("a linked worktree's own directory", &made.linked, 3, &own),
+        ] {
+            for (errno, passes) in OPEN_ERRORS {
+                ROOT_OPEN_FAILS.with(|fails| fails.set(Some((passing, errno))));
+                let opened = OpenedRepository::open(&made.profile, made.environment_id, handed);
+                ROOT_OPEN_FAILS.with(|fails| fails.set(None));
+
+                let Err(refused) = opened else {
+                    panic!("{what} could not be opened ({errno}), and the repository opened");
+                };
+                assert_answered(
+                    &refused,
+                    errno,
+                    passes,
+                    Some(ErrorCode::InvalidArgument),
+                    place,
+                    &format!("{what}, {errno}"),
+                );
+            }
+        }
+        OpenedRepository::open(&made.profile, made.environment_id, &made.via)
+            .expect("without a failure the repository opens");
+    }
+
+    /// The same holds where an opened repository is confirmed after an invocation: it is opened
+    /// again at the top level and the Git directory Git reports, and a host that is short of
+    /// descriptors, processes or memory to do that has not said that the repository changed.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_descriptors_when_a_repository_is_confirmed_is_a_fault_that_passes() {
+        let made = repositories();
+        let common = made.main.join(".git");
+        let opened = OpenedRepository::open(&made.profile, made.environment_id, &made.main)
+            .expect("the repository opens");
+        opened
+            .confirm(&made.profile)
+            .expect("a repository that has not changed is confirmed");
+
+        for (what, passing, place) in [
+            ("the top level", 0, &made.main),
+            ("the Git directory", 1, &common),
+        ] {
+            for (errno, passes) in OPEN_ERRORS {
+                ROOT_OPEN_FAILS.with(|fails| fails.set(Some((passing, errno))));
+                let confirmed = opened.confirm(&made.profile);
+                ROOT_OPEN_FAILS.with(|fails| fails.set(None));
+
+                let Err(refused) = confirmed else {
+                    panic!(
+                        "{what} could not be opened ({errno}), and the repository was confirmed"
+                    );
+                };
+                assert_answered(
+                    &refused,
+                    errno,
+                    passes,
+                    None,
+                    place,
+                    &format!("{what}, {errno}"),
+                );
+            }
+        }
+    }
+
+    /// The same holds for the parent a destination is named by path under: it is opened once, when
+    /// the destination is resolved, and a host that is short of descriptors, processes or memory
+    /// to open it has said nothing of the parent.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_descriptors_at_the_open_of_a_destinations_parent_is_a_fault_that_passes() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([12; 16]));
+        let request = kr_protocol::project::DestinationRequest {
+            environment_id,
+            parent: kr_protocol::project::DestinationParent::Host {
+                path: root.path().display().to_string(),
+            },
+            name: "published".to_owned(),
+        };
+
+        for (errno, passes) in OPEN_ERRORS {
+            ROOT_OPEN_FAILS.with(|fails| fails.set(Some((0, errno))));
+            let resolved = crate::operation::Destination::resolve(
+                &request,
+                environment_id,
+                &crate::policy::LocationPolicy::default(),
+                crate::policy::Admitting::Caller(None),
+            );
+            ROOT_OPEN_FAILS.with(|fails| fails.set(None));
+
+            let Err(refused) = resolved else {
+                panic!("the parent could not be opened ({errno}), and the destination resolved");
+            };
+            assert_answered(
+                &refused,
+                errno,
+                passes,
+                Some(ErrorCode::InvalidArgument),
+                root.path(),
+                &format!("{errno}"),
+            );
+        }
+    }
+
+    /// A directory that opened and whose path cannot then be resolved, because the host is short
+    /// of memory, is no more the caller's argument than one that could not be opened: the open
+    /// said nothing of the place, so that is a fault that passes, with an identity held for the
+    /// directory and with none. Any other failure of the resolution is still the caller's argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_memory_to_resolve_the_path_of_an_opened_directory_is_a_fault_that_passes() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let (environment_id, tree, _) = recorded_tree_in(root.path());
+        let held = AuthorisedDirectory::open_root(environment_id, &tree)
+            .expect("the tree opens")
+            .identity();
+
+        for (errno, passes) in OPEN_ERRORS {
+            for expected in [None, Some(held)] {
+                RESOLVE_FAILS.with(|fails| fails.set(Some(errno)));
+                let opened =
+                    crate::boundary::OpenedDirectory::open(environment_id, &tree, expected);
+                RESOLVE_FAILS.with(|fails| fails.set(None));
+
+                let Err(refused) = opened else {
+                    panic!("the path could not be resolved ({errno}), and the directory opened");
+                };
+                assert_answered(
+                    &refused,
+                    errno,
+                    passes,
+                    Some(ErrorCode::InvalidArgument),
+                    &tree,
+                    &format!("{errno}, identity held: {}", expected.is_some()),
+                );
+            }
+        }
+    }
+
+    /// An invocation's directories are opened again once it has ended, to be confirmed to be the
+    /// objects they were opened as: the directory it ran in, the ones it reserved and its own
+    /// temporary directory. A host out of descriptors, processes or memory to open one has not
+    /// said that it changed, so that is a fault that passes, and what the invocation produced is
+    /// not served under a code that says the source changed. A directory that cannot be opened for
+    /// another reason is the changed source it always was.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_out_of_descriptors_when_the_directories_of_an_invocation_are_confirmed_is_a_fault_that_passes()
+     {
+        use crate::boundary::{Confinement, OpenedDirectory, Reach, Reads};
+
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([17; 16]));
+        let open = |name: &str| {
+            let place = root.path().join(name);
+            std::fs::create_dir(&place).expect("a directory for the invocation");
+            OpenedDirectory::open(environment_id, &place, None).expect("the directory opens")
+        };
+        let confinement = Confinement {
+            program: PathBuf::from("/git"),
+            exec_path: PathBuf::from("/git-core"),
+            helpers: Vec::new(),
+            working: open("working"),
+            reserved: vec![open("reserved")],
+            temporary: open("temporary"),
+            readable: Vec::new(),
+            reach: Reach::Nothing,
+            reads: Reads::Everywhere,
+        };
+        confinement
+            .confirm()
+            .expect("directories that are as they were opened are confirmed");
+
+        for directory in confinement.written() {
+            for (errno, passes) in OPEN_ERRORS {
+                OPEN_FAILS.with(|fails| fails.set(Some(errno)));
+                let confirmed = directory.confirm_path();
+                OPEN_FAILS.with(|fails| fails.set(None));
+
+                let Err(refused) = confirmed else {
+                    panic!("the directory could not be opened ({errno}), and it was confirmed");
+                };
+                assert_answered(
+                    &refused,
+                    errno,
+                    passes,
+                    Some(ErrorCode::SourceChanged),
+                    directory.path(),
+                    &format!("{}, {errno}", directory.path().display()),
+                );
+            }
+        }
     }
 }

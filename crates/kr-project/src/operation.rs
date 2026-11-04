@@ -141,7 +141,7 @@ impl Destination {
                         .into(),
                     });
                 }
-                let parent = AuthorisedDirectory::open_root(environment_id, &parent_path)?;
+                let parent = crate::identity::open_unrecorded_root(environment_id, &parent_path)?;
                 Ok(Self {
                     parent,
                     parent_path,

@@ -5809,27 +5809,39 @@ mod tests {
         );
     }
 
+    /// The state `ps` gives for a process, which is nothing for one that is gone.
+    #[cfg(unix)]
+    fn state_of(pid: &str) -> String {
+        state_by("ps", pid, Duration::from_secs(60))
+    }
+
+    /// The state the program `ps` gives for a process within `bound`, which is nothing for one
+    /// that is gone. A `ps` that has not answered by then is ended, and the case that asked fails:
+    /// the question cannot hold a case without end. It is asked whether `ps` has ended before it is
+    /// asked whether the time is up, so a machine that was stopped past the bound while `ps` ran
+    /// on finds its answer.
+    #[cfg(unix)]
+    fn state_by(ps: impl AsRef<OsStr>, pid: &str, _bound: Duration) -> String {
+        let listed = Command::new(ps)
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .expect("ps lists the process");
+        String::from_utf8_lossy(&listed.stdout).trim().to_owned()
+    }
+
     /// Whether a process with this identifier is running, which one that has ended and not yet been
     /// collected is not.
     #[cfg(unix)]
     fn running(pid: &str) -> bool {
-        let listed = std::process::Command::new("ps")
-            .args(["-o", "stat=", "-p", pid])
-            .output()
-            .expect("ps lists the process");
-        let state = String::from_utf8_lossy(&listed.stdout);
-        !state.trim().is_empty() && !state.trim().starts_with('Z')
+        let state = state_of(pid);
+        !state.is_empty() && !state.starts_with('Z')
     }
 
     /// Whether a process with this identifier is gone altogether, which one that has ended and not
     /// yet been collected is not.
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     fn collected(pid: &str) -> bool {
-        let listed = std::process::Command::new("ps")
-            .args(["-o", "stat=", "-p", pid])
-            .output()
-            .expect("ps lists the process");
-        String::from_utf8_lossy(&listed.stdout).trim().is_empty()
+        state_of(pid).is_empty()
     }
 
     /// A stand-in that writes its number to `own` and then waits, placed as the program a case
@@ -6241,13 +6253,7 @@ mod tests {
     fn a_probe_cut_short_after_its_child_ended_has_its_group_ended_and_is_collected() {
         use std::os::unix::process::CommandExt as _;
 
-        let state = |pid: &str| {
-            let listed = std::process::Command::new("ps")
-                .args(["-o", "stat=", "-p", pid])
-                .output()
-                .expect("ps lists the process");
-            String::from_utf8_lossy(&listed.stdout).trim().to_owned()
-        };
+        let state = state_of;
         let directory = tempfile::tempdir().expect("a directory for this test");
         let sleeper = directory.path().join("sleeper");
         let child = std::process::Command::new("/bin/sh")
@@ -7518,5 +7524,22 @@ mod tests {
         assert!(!vcs.matches("remote..vcs"));
         assert!(!vcs.matches("vcs"));
         assert!(!vcs.matches("other.origin.vcs"));
+    }
+
+    /// A `ps` that does not answer fails the case that asked it, and is ended, within the bound it
+    /// was given: it cannot hold a case without end. The stand-in never answers on its own, so
+    /// nothing here depends on how fast the machine runs.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "ps did not answer")]
+    fn a_ps_that_does_not_answer_fails_the_case_that_asked_it() {
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        place_stand_in(directory.path(), "exec sleep 120");
+
+        state_by(
+            directory.path().join("git"),
+            "1",
+            Duration::from_millis(300),
+        );
     }
 }
