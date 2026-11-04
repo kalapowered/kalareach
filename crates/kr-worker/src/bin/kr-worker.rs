@@ -25,8 +25,8 @@
 // argument parser writes its message for a command line it refuses itself, and ends the process
 // before this program can hand the message over. The standard library writes the message for a
 // panic or another fatal error, such as a failed allocation, where the fault happens, at any time,
-// and it may keep the process from ending. `eprintln!`, `dbg!` and `std::io::stderr()` are refused
-// everywhere else in this package.
+// and it may keep the process from ending. `std::io::stderr()` is refused everywhere else in this
+// package, and `eprintln!` and `dbg!` in its library and in this program.
 #![deny(clippy::print_stderr, clippy::dbg_macro)]
 
 use std::process::ExitCode;

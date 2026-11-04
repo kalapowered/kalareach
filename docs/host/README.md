@@ -4353,29 +4353,28 @@ most. At most eight lines wait for the thread, and a line beyond that is dropped
 the worker writes there, such as the one that says a command was not integrated for its launch, go
 the same way, and so do the lines of the worker's program, such as why it could not start, that the
 controller did not receive its ready report, and that an attachment had not been sent the closure
-when the worker ended. A line said just
-before the process ends can be lost to the exit, so the program waits up to two seconds for the
-thread to write what it has been handed before it ends. Three writes happen where they are said, and
-no other write of the worker to its standard error does: a lint refuses a direct write in the
-worker's library and in its program. The first is the line every worker says at its start, which
-terminfo database its session reads. It is written where it is said because the thread would be
-started for that line alone in every worker, and a thread that starts and ends, or one that stays,
-costs resident memory that the idle measurement counts. The second is the argument parser's message
-for a command line it refuses, which the parser writes itself before it ends the process, so the
-program never holds that line to hand over. The third is the standard library's message for a panic,
-or for another fatal error such as a failed allocation, which it writes where the fault happens, at
-any time. A standard error that has stopped draining before a worker's first line holds the worker
-there, so that it never reports itself ready and never ends, as it always could. One that stops
-later holds neither, nor the worker's final error or the line about a closure. The parser's message,
-a panic's and a fatal error's wait for a stalled standard error where they happen, and the process
-may then not end. A line is handed over whole and written with `write_all`, so a volume that is
-nearly full can take part of it. Nothing bounds how long the
-host stays over the cap: the delays are random, and a holder that stops without ending keeps the
-lock while the others go on looking. The host also stays over the cap when the session that grew
-cannot give up the excess, as when its worker has ended, it holds less than the excess while the
-other workers have taken no output, or it cannot write its boundary: the other workers keep a
-reading that found the host under the cap while they take no output, and find it over the cap when
-that reading, five to six minutes old, is taken again.
+when the worker ended. A line said just before the process ends can be lost to the exit, so the
+program waits up to two seconds for the thread to write what it has been handed before it ends.
+Three writes happen where they are said, and no other write of the worker to its standard error
+does: a lint refuses a direct write in the worker's library and in its program. The first is the
+line every worker says at its start, which terminfo database its session reads. It is written where
+it is said because the thread would be started for that line alone in every worker, and a thread
+that starts and ends, or one that stays, costs resident memory that the idle measurement counts. The
+second is the argument parser's message for a command line it refuses, which the parser writes
+itself before it ends the process, so the program never holds that line to hand over. The third is
+the standard library's message for a panic, or for another fatal error such as a failed allocation,
+which it writes where the fault happens, at any time. A standard error that has stopped draining
+before a worker's first line holds the worker there, so that it never reports itself ready and never
+ends, as it always could. One that stops later holds neither, nor the worker's final error or the
+line about a closure. The parser's message, a panic's and a fatal error's wait for a stalled
+standard error where they happen, and the process may then not end. A line is handed over whole and
+written with `write_all`, so a volume that is nearly full can take part of it. Nothing bounds how
+long the host stays over the cap: the delays are random, and a holder that stops without ending
+keeps the lock while the others go on looking. The host also stays over the cap when the session
+that grew cannot give up the excess, as when its worker has ended, it holds less than the excess
+while the other workers have taken no output, or it cannot write its boundary: the other workers
+keep a reading that found the host under the cap while they take no output, and find it over the cap
+when that reading, five to six minutes old, is taken again.
 
 Eviction is not quiet. A retention pass records the cursor range it took and the bound that took
 it, and a reader asking for a cursor inside that range is told both: `history.page` returns the
