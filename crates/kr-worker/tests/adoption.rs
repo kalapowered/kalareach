@@ -1550,32 +1550,44 @@ fn look_until_named(
 
 /// Waits until the system has finished starting `child`'s program, and says it has.
 ///
-/// A start is told to this process before the program has taken over: for a moment the child still
-/// has this process's image and argument vector, then it has the new image and no argument vector
-/// until the system has written one. A look taken in either moment reads a program that is not the
-/// one started, and two looks that agree there name the interpreter, or this test binary. The new
-/// program's argument vector is what a look reads next, so it is what is waited for: not empty, and
-/// not this process's own.
+/// A start is told to this process before the program has taken over. The child then goes through
+/// three moments: it still has this process's image and argument vector; it has the new image and
+/// no argument vector, until the system has written one; it has the new image and its arguments. A
+/// look taken in the first two reads a program that is not the one started, and two looks that
+/// agree there name the interpreter, or this test binary.
+///
+/// The image is read by one call, and the system changes it in the step that replaces the child's
+/// memory. Once it differs from this process's own, every later read of the child's arguments reads
+/// the new memory: empty until the vector is written, then all of it. So the wait is for the image
+/// to differ and then for a vector that is not empty. (Reading the vector alone does not do: a read
+/// is several calls to the system, and a first call made in the first moment can be followed by one
+/// made in the second, which returns the start of this process's own vector.)
 ///
 /// # Panics
 ///
-/// Panics when the child ends before that, or has not got there within the file's guard.
+/// Panics when the child ends before that, or has not got there within the file's guard (the child
+/// is then ended).
 #[cfg(target_os = "linux")]
 fn started_for_good(mut child: Child) -> Child {
-    let own = std::fs::read("/proc/self/cmdline").expect("this process's arguments");
+    let own = std::fs::read_link("/proc/self/exe").expect("the program this process runs");
     let began = std::time::Instant::now();
     loop {
         if let Some(status) = child.try_wait().expect("the program can be waited for") {
             panic!("the program ended as it started: {status}");
         }
-        let arguments = std::fs::read(format!("/proc/{}/cmdline", child.id())).unwrap_or_default();
-        if !arguments.is_empty() && arguments != own {
+        let replaced =
+            std::fs::read_link(format!("/proc/{}/exe", child.id())).is_ok_and(|image| image != own);
+        if replaced
+            && std::fs::read(format!("/proc/{}/cmdline", child.id()))
+                .is_ok_and(|arguments| !arguments.is_empty())
+        {
             return child;
         }
-        assert!(
-            began.elapsed() < LIVENESS,
-            "the program's arguments were still not those it was started with after {LIVENESS:?}"
-        );
+        if began.elapsed() >= LIVENESS {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the program had not taken over, with its arguments, after {LIVENESS:?}");
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
 }
