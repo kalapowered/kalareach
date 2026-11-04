@@ -181,7 +181,6 @@ struct Case {
     checkout: Account,
     connect: Account,
     person: Account,
-    person_created: bool,
     failures: Vec<String>,
     expected: Vec<Expected>,
     watermark: u64,
@@ -250,8 +249,6 @@ impl Case {
             "connect",
             &std::env::var("KR_BOUNDARY_CONNECT_ACCOUNT").unwrap_or_else(|_| "krb-connect".into()),
         );
-        let person = person_account();
-
         let root =
             PathBuf::from(std::env::var_os("ProgramData").expect("the program data directory"))
                 .join(format!("kr-enforcement-{}", uuid::Uuid::new_v4().simple()));
@@ -262,10 +259,11 @@ impl Case {
                 .arg(&root)
                 .args(["/grant", "Users:(OI)(CI)(M)"]),
         );
+        give_session_access(&checkout.sid);
+        give_session_access(&connect.sid);
 
-        for account in [&checkout, &connect, &person] {
-            give_session_access(&account.sid);
-        }
+        // The person's account is the last thing made before the case that takes it away.
+        let person = person_account();
         let case = Self {
             git_root,
             git,
@@ -274,12 +272,12 @@ impl Case {
             checkout,
             connect,
             person,
-            person_created: true,
             failures: Vec::new(),
             expected: Vec::new(),
             watermark: newest_record(),
             counter: 0,
         };
+        give_session_access(&case.person.sid);
         case.plant_fixtures();
         case
     }
@@ -861,12 +859,6 @@ impl Case {
                 format!("the two boundary accounts were refused under {} rule(s), not their two own: {rules:?}", rules.len())
             });
         }
-        if self.person_created {
-            self.person_created = false;
-            delete_account(&self.person.name);
-        }
-        let _ = std::fs::remove_dir_all(&self.root);
-        let _ = std::fs::remove_dir_all(PathBuf::from(r"C:\Users").join(&self.person.name));
         assert!(
             self.failures.is_empty(),
             "the policy did not hold at run time:\n  {}",
@@ -877,10 +869,9 @@ impl Case {
 
 impl Drop for Case {
     fn drop(&mut self) {
-        // A case that panicked before `finish` still takes its account away.
-        if self.person_created {
-            delete_account(&self.person.name);
-        }
+        // Whether the case ended or panicked, it takes away the account it made and what it wrote.
+        delete_account(&self.person.name);
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
