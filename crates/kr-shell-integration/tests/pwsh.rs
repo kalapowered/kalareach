@@ -583,6 +583,165 @@ fn the_package_refuses_an_editor_version_outside_the_range_it_was_qualified_agai
     }
 }
 
+/// What the module's two waits are asked while the time of day is set under them. The module's
+/// handshake wait and its send deadline are each read from one clock, and the probe puts a clock
+/// of its own in the place of each: the monotonic one moves only when the probe moves it, and the
+/// time of day is set an hour forward or back at the moment the probe chooses. Nothing in it waits
+/// for time to pass, so the verdict is what the module does with the two clocks and not how long
+/// the probe took.
+const CLOCK_PROBE: &str = r#"
+$ErrorActionPreference = 'Stop'
+Import-Module $env:KR_PROBE_MODULE
+$module = Get-Module KalaReach.ShellBridge
+
+# The handshake wait, with the time of day set while the worker's answer is awaited. The answer is
+# on the endpoint at the second look, so it is taken unless the wait is over by then. Set forward,
+# the wait has not run out, because no time has passed on the clock that only goes forward. Set
+# back, the wait has run out, because the clock that only goes forward has passed its length.
+foreach ($scenario in 'set-forward', 'set-back') {
+    $answer = & $module {
+        param($scenario)
+        $script:Probe = @{ Wall = [uint64]1700000000000; Tick = [uint64]60000; Looks = 0; Scenario = $scenario }
+        $body = ConvertTo-KrCbor @{ handshake = @{ accepted = @{} } }
+        $framed = [byte[]]::new($body.Length + 4)
+        $framed[3] = [byte]$body.Length
+        [Array]::Copy($body, 0, $framed, 4, $body.Length)
+        $script:Probe.Frame = $framed
+        Set-Item function:script:Get-KrNowMs -Value { $script:Probe.Wall }
+        Set-Item function:script:Get-KrTickMs -Value { $script:Probe.Tick }
+        Set-Item function:script:Receive-KrAvailable -Value {
+            $script:Probe.Looks++
+            if ($script:Probe.Looks -eq 1) {
+                if ($script:Probe.Scenario -eq 'set-forward') {
+                    $script:Probe.Wall += 3600000
+                } else {
+                    $script:Probe.Wall -= 3600000
+                    $script:Probe.Tick += (Get-KrHandshakeWaitMs) + 1
+                }
+            } elseif ($script:Probe.Looks -eq 2) {
+                $script:Kr.Incoming.AddRange($script:Probe.Frame)
+            } else {
+                return $false
+            }
+            $true
+        }
+        $script:Kr.Socket = [object]::new()
+        $script:Kr.Incoming.Clear()
+        $verdict = @(Wait-KrHandshake)[-1]
+        "$verdict looks=$($script:Probe.Looks)"
+    } $scenario
+    Write-Output "kr-clock[handshake $scenario]=[$answer]"
+}
+
+# The send deadline, with the time of day set under a send that waits for room in a full socket.
+# Each look at the clock that only goes forward is 700 ms after the one before, and each look sets
+# the time of day an hour one way or the other; a look at the time of day moves it an hour forward.
+$directory = Join-Path ([System.IO.Path]::GetTempPath()) ("kr-send-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $directory | Out-Null
+$endpoint = [System.Net.Sockets.UnixDomainSocketEndPoint]::new((Join-Path $directory 's'))
+$listener = [System.Net.Sockets.Socket]::new('Unix', 'Stream', 'Unspecified')
+$listener.Bind($endpoint)
+$listener.Listen(1)
+$client = [System.Net.Sockets.Socket]::new('Unix', 'Stream', 'Unspecified')
+$client.Connect($endpoint)
+$peer = $listener.Accept()
+$client.Blocking = $false
+try {
+    $answer = & $module {
+        param($client)
+        $script:Probe = @{ Wall = [uint64]1700000000000; Tick = [uint64]60000; Reads = 0; First = [uint64]0; Looks = 0 }
+        # A send that reads either clock more than a hundred times has not given up, whichever
+        # clock it reads, and the probe says so instead of waiting on a socket that nobody reads.
+        # The time of day is an hour later at every look at it.
+        Set-Item function:script:Get-KrNowMs -Value {
+            if (++$script:Probe.Looks -gt 100) { throw 'the send did not give up' }
+            $script:Probe.Wall += 3600000
+            $script:Probe.Wall
+        }
+        Set-Item function:script:Get-KrTickMs -Value {
+            if (++$script:Probe.Looks -gt 100) { throw 'the send did not give up' }
+            $script:Probe.Reads++
+            if ($script:Probe.Reads -eq 1) { $script:Probe.First = $script:Probe.Tick }
+            else { $script:Probe.Tick += 700 }
+            if ($script:Probe.Reads % 2 -eq 0) { $script:Probe.Wall += 3600000 } else { $script:Probe.Wall -= 3600000 }
+            $script:Probe.Tick
+        }
+        $script:Kr.Socket = $client
+        $sent = Send-KrBytes ([byte[]]::new(16777216))
+        "$sent after=$($script:Probe.Tick - $script:Probe.First) reads=$($script:Probe.Reads)"
+    } $client
+    Write-Output "kr-clock[send]=[$answer]"
+} finally {
+    $peer.Dispose()
+    $listener.Dispose()
+    Remove-Item -Recurse -Force $directory
+}
+"#;
+
+/// The module measures its handshake wait and its send deadline on a clock that only goes forward,
+/// so setting the time of day neither shortens nor lengthens either.
+///
+/// The probe is [`CLOCK_PROBE`]. A handshake wait read from the time of day gives up on an answer
+/// that is a moment away when the time of day is set an hour forward, and waits on past its length
+/// when it is set an hour back. The send gives up once the clock that only goes forward has passed
+/// two seconds, however the time of day was set while it waited for room in a socket that nobody
+/// reads.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_bridges_waits_are_measured_on_a_clock_that_only_goes_forward() {
+    let package = shellpkg::Package::built(PWSH);
+    let module = package
+        .directory()
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1");
+    let scratch = tempfile::tempdir().expect("a directory on the internal disk");
+    let probe = scratch.path().join("clock-probe.ps1");
+    std::fs::write(&probe, CLOCK_PROBE).expect("the probe is written");
+    let asked = package
+        .command()
+        .args(["-NoProfile", "-NonInteractive", "-File"])
+        .arg(&probe)
+        .env("KR_PROBE_MODULE", &module)
+        .env_remove("KR_SHELL_BRIDGE")
+        .env_remove("KR_SHELL_BRIDGE_SECRET")
+        .env_remove("KR_SESSION")
+        .env_remove("KR_SHELL_BRIDGE_HANDSHAKE_WAIT_MS")
+        .output()
+        .expect("the package's host runs");
+    let said = String::from_utf8_lossy(&asked.stdout).into_owned();
+    let told = String::from_utf8_lossy(&asked.stderr);
+    let answer = |name: &str| -> String {
+        said.lines()
+            .find_map(|line| line.strip_prefix(&format!("kr-clock[{name}]=[")))
+            .unwrap_or_else(|| panic!("the probe said nothing about {name}:\n{said}\n{told}"))
+            .trim_end_matches(']')
+            .to_owned()
+    };
+
+    assert!(
+        answer("handshake set-forward").starts_with("True "),
+        "a time of day set an hour forward ended a handshake wait that no time had passed on: {}",
+        answer("handshake set-forward")
+    );
+    assert!(
+        answer("handshake set-back").starts_with("False "),
+        "a time of day set an hour back kept a handshake wait going past its length: {}",
+        answer("handshake set-back")
+    );
+    let send = answer("send");
+    let (after, reads) = send
+        .strip_prefix("False after=")
+        .and_then(|rest| rest.split_once(" reads="))
+        .unwrap_or_else(|| panic!("the send did not give up on a socket nobody reads: {send}"));
+    let after: u64 = after
+        .parse()
+        .expect("the probe says how far the clock had moved");
+    assert!(
+        (2001..=2700).contains(&after),
+        "the send gave up {after} ms into its two seconds on the clock that only goes forward, \
+         after {reads} looks at it, with the time of day set under it"
+    );
+}
+
 /// KR-REQ-08.49: the package qualifies a runtime only when the reader it counts unread input in
 /// can be read.
 ///

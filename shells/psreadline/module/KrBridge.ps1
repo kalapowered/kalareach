@@ -152,6 +152,8 @@ function Write-KrTrace {
     } catch { }
 }
 
+# The time of day in milliseconds, for a time a report names. A wait is never measured on it: the
+# time of day can be set while a reader waits, so a wait is measured on `Get-KrTickMs`.
 function Get-KrNowMs {
     [uint64][Math]::Floor([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
 }
@@ -675,7 +677,7 @@ function Get-KrHandshakeWaitMs {
 }
 
 function Wait-KrHandshake {
-    $deadline = (Get-KrNowMs) + (Get-KrHandshakeWaitMs)
+    $deadline = (Get-KrTickMs) + (Get-KrHandshakeWaitMs)
     while ($true) {
         $frame = Read-KrFrame
         if ($null -ne $frame) {
@@ -696,7 +698,7 @@ function Wait-KrHandshake {
             return $true
         }
         if ($null -eq $script:Kr.Socket) { return $false }
-        if ((Get-KrNowMs) -gt $deadline) { return $false }
+        if ((Get-KrTickMs) -gt $deadline) { return $false }
         if (-not (Receive-KrAvailable)) { return $false }
         [System.Threading.Thread]::Sleep(2)
     }
