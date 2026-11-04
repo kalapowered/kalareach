@@ -8000,81 +8000,128 @@ async fn withheld_as_not_drained(wired: &mut Wired, why: &str) {
     );
 }
 
-/// KR-REQ-08.49: with a real qualified reader at its prompt, the host's answer to the application
-/// invalidates the fence the reader proved, and the reader proves it again from its own snapshot.
+/// With a real qualified reader of `kind` at its prompt, the host's answer to the application
+/// invalidates the fence the reader proved, and, where `proven_again` says so, the reader proves it
+/// again from its own snapshot.
 ///
 /// The mechanism is `FenceDriver::host_reply_queued`, which tells the fence machine of every byte
 /// the host queues for the terminal that no person typed. The answer goes into the terminal the
 /// real shell is reading, so what the reader's next snapshot accounts for is real input.
 #[cfg(unix)]
+async fn a_readers_fence_is_invalidated_by_the_hosts_answer(kind: ShellKind, proven_again: bool) {
+    let package = installed_package_of(kind);
+    let shell = RealShell::start(
+        &package,
+        kr_protocol::session::LaunchProfile::default(),
+        Vec::new(),
+        None,
+    )
+    .await;
+    // Taking the keys is what starts an exchange, and the real reader answers it.
+    let _keys = shell.keys();
+    // A reader may ask the terminal questions of its own at start (fish does), and the host
+    // answers those as it answers the application. So the answer under test is counted from
+    // the moment the proved fence is seen, and it is queued under the same hold of the session,
+    // which no other answer can enter.
+    let proved = tokio::time::timeout(SOON, async {
+        loop {
+            {
+                let mut session = shell.runtime.session();
+                let proved = session
+                    .fence()
+                    .expect("a driver")
+                    .fence()
+                    .map(|fence| fence.fence_id);
+                if let Some(proved) = proved {
+                    let before = session.fence().expect("a driver").host_reply_bytes();
+                    session.ingest_output(b"\x1b[c");
+                    shell.runtime.flush_input();
+                    let driver = session.fence().expect("a driver");
+                    assert!(
+                        driver.fence().is_none(),
+                        "{kind:?}: the answer reached the reader's terminal behind the fence it proved"
+                    );
+                    assert_eq!(
+                        driver.host_reply_bytes() - before,
+                        b"\x1b[?62;22c".len() as u64
+                    );
+                    return proved;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{kind:?}: the reader never proved a fence"));
+    if !proven_again {
+        shell.close().await;
+        return;
+    }
+    // The reader consumes what it was sent and idles, which is where the exchange is asked for
+    // again, and it answers from its own snapshot.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            {
+                let session = shell.runtime.session();
+                let driver = session.fence().expect("a driver");
+                if driver.state() == FenceState::Fenced
+                    && driver.fence().map(|fence| fence.fence_id) != Some(proved)
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let session = shell.runtime.session();
+        let state = session.fence().map(|driver| driver.state());
+        let seen = retained(&session);
+        panic!(
+            "{kind:?}: the reader never proved its queues again; the fence is {state:?} and the \
+             session's output ends {}",
+            String::from_utf8_lossy(&seen[seen.len().saturating_sub(512)..]).escape_debug()
+        )
+    });
+    shell.close().await;
+}
+
+/// KR-REQ-08.49: with a real qualified reader of Zsh, Bash or Fish at its prompt, the host's answer
+/// to the application invalidates the fence the reader proved, and the reader proves it again from
+/// its own snapshot.
+///
+/// See [`a_readers_fence_is_invalidated_by_the_hosts_answer`] for the mechanism. The PowerShell
+/// reader has a case of its own, which shows the invalidation only.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
 async fn a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_again() {
     for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
-        let package = installed_package_of(kind);
-        let shell = RealShell::start(
-            &package,
-            kr_protocol::session::LaunchProfile::default(),
-            Vec::new(),
-            None,
-        )
-        .await;
-        // Taking the keys is what starts an exchange, and the real reader answers it.
-        let _keys = shell.keys();
-        // A reader may ask the terminal questions of its own at start (fish does), and the host
-        // answers those as it answers the application. So the answer under test is counted from
-        // the moment the proved fence is seen, and it is queued under the same hold of the session,
-        // which no other answer can enter.
-        let proved = tokio::time::timeout(SOON, async {
-            loop {
-                {
-                    let mut session = shell.runtime.session();
-                    let proved = session
-                        .fence()
-                        .expect("a driver")
-                        .fence()
-                        .map(|fence| fence.fence_id);
-                    if let Some(proved) = proved {
-                        let before = session.fence().expect("a driver").host_reply_bytes();
-                        session.ingest_output(b"\x1b[c");
-                        shell.runtime.flush_input();
-                        let driver = session.fence().expect("a driver");
-                        assert!(
-                            driver.fence().is_none(),
-                            "{kind:?}: the answer reached the reader's terminal behind the fence it proved"
-                        );
-                        assert_eq!(
-                            driver.host_reply_bytes() - before,
-                            b"\x1b[?62;22c".len() as u64
-                        );
-                        return proved;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{kind:?}: the reader never proved a fence"));
-        // The reader consumes what it was sent and idles, which is where the exchange is asked for
-        // again, and it answers from its own snapshot.
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                {
-                    let session = shell.runtime.session();
-                    let driver = session.fence().expect("a driver");
-                    if driver.state() == FenceState::Fenced
-                        && driver.fence().map(|fence| fence.fence_id) != Some(proved)
-                    {
-                        return;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{kind:?}: the reader never proved its queues again"));
-        shell.close().await;
+        a_readers_fence_is_invalidated_by_the_hosts_answer(kind, true).await;
     }
+}
+
+/// KR-REQ-08.49: with a real qualified PowerShell reader at its prompt, the host's answer to the
+/// application invalidates the fence the reader proved.
+///
+/// The answer goes into the terminal the real PowerShell is reading, and the fence machine takes it
+/// into its account of the input no person typed, as it does for the readers above. This case
+/// shows that and no more. It does not show the reader proving the fence again: the editor takes
+/// some of the answer's characters into the line as text, in pieces that reach it around any key
+/// typed behind the answer, so the line has text in it for as long as it takes to clear, and a
+/// reader whose line has text in it proves no fence for an empty prompt. The Unix readers drop the
+/// answer and prove again. It also does not show a fence delayed by an answer that arrives while an
+/// exchange is under way.
+///
+/// It needs the PowerShell package published into the root that `KR_SHELL_PACKAGES` names, by
+/// `Publish-KalaReachQualification` with `KR_SHELL_PREFIX` naming the root; a run that names it
+/// without one fails.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the PowerShell package published into the root that KR_SHELL_PACKAGES names; it runs with --ignored on a host that has published one, as the build box's verification does"]
+async fn a_real_powershell_readers_fence_is_invalidated_by_the_hosts_answer() {
+    a_readers_fence_is_invalidated_by_the_hosts_answer(ShellKind::PowerShell, false).await;
 }
 
 // --------------------------------------------------------------------------------------------
