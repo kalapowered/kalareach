@@ -910,6 +910,18 @@ fn remove_one(destination: &AuthorisedDirectory, name: &RelativeName) -> bool {
     target.remove(&leaf).is_ok() && target.sync(kr_flush::NameKind::File).is_ok()
 }
 
+/// Runs one step of a copy that reads or writes. A case that asks for it has the step fail, named
+/// by `step`, as it does for a host that is short of memory.
+fn at<T>(step: &str, operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
+    #[cfg(all(test, unix))]
+    if let Some(error) = tests::failing(step) {
+        return Err(error);
+    }
+    #[cfg(not(all(test, unix)))]
+    let _ = step;
+    operation()
+}
+
 fn copy_one(
     source: &AuthorisedDirectory,
     destination: &AuthorisedDirectory,
@@ -987,7 +999,7 @@ fn copy_one(
     let mut buffer = vec![0_u8; 256 * 1024];
     let outcome = (|| -> Result<()> {
         loop {
-            let read = match handle.read(&mut buffer) {
+            let read = match at("read", || handle.read(&mut buffer)) {
                 Ok(0) => break,
                 Ok(count) => count,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -997,12 +1009,11 @@ fn copy_one(
                     });
                 }
             };
-            written
-                .handle_mut()
-                .write_all(&buffer[..read])
-                .map_err(|error| ProjectError::Destination {
+            at("write", || written.handle_mut().write_all(&buffer[..read])).map_err(|error| {
+                ProjectError::Destination {
                     detail: format!("{leaf} could not be written: {error}").into(),
-                })?;
+                }
+            })?;
         }
         // An executable script that arrives without its executable bit is not the file the user
         // has, so the source's mode is carried across where the platform has one. It goes on
@@ -1010,12 +1021,11 @@ fn copy_one(
         apply_mode(&written, mode)?;
         // The bytes are durable before the name changes, so a power loss cannot leave the
         // destination naming a file whose content never reached the disk.
-        written
-            .handle_mut()
-            .sync_all()
-            .map_err(|error| ProjectError::Destination {
+        at("flush", || written.handle_mut().sync_all()).map_err(|error| {
+            ProjectError::Destination {
                 detail: format!("{leaf} could not be flushed: {error}").into(),
-            })?;
+            }
+        })?;
         Ok(())
     })();
     drop(written);
@@ -1062,10 +1072,8 @@ fn copy_one(
 fn source_mode(file: &kr_transfer::AuthorisedFile) -> Result<Option<u32>> {
     use cap_std::fs::MetadataExt as _;
 
-    let metadata = file
-        .handle()
-        .metadata()
-        .map_err(|error| ProjectError::Destination {
+    let metadata =
+        at("mode", || file.handle().metadata()).map_err(|error| ProjectError::Destination {
             detail: format!("a file's own permissions could not be read: {error}").into(),
         })?;
     Ok(Some(metadata.mode()))
@@ -1091,11 +1099,13 @@ fn apply_mode(file: &kr_transfer::AuthorisedFile, mode: Option<u32>) -> Result<(
     use cap_std::fs::PermissionsExt as _;
 
     if let Some(mode) = mode {
-        file.handle()
-            .set_permissions(cap_std::fs::Permissions::from_mode(mode))
-            .map_err(|error| ProjectError::Destination {
-                detail: format!("a copy's permissions could not be set: {error}").into(),
-            })?;
+        at("permissions", || {
+            file.handle()
+                .set_permissions(cap_std::fs::Permissions::from_mode(mode))
+        })
+        .map_err(|error| ProjectError::Destination {
+            detail: format!("a copy's permissions could not be set: {error}").into(),
+        })?;
     }
     Ok(())
 }
@@ -1135,6 +1145,28 @@ pub fn temporary_name(name: &RelativeName) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    std::thread_local! {
+        /// Set by a case to make a step of a copy fail on its own thread with this error, once
+        /// that many calls of the step have passed.
+        static COPY_FAILS: std::cell::Cell<Option<(&'static str, usize, rustix::io::Errno)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Returns the error the case set for this step of a copy, when this is the call it is set for.
+    #[cfg(unix)]
+    pub(super) fn failing(step: &str) -> Option<std::io::Error> {
+        let (at, passing, errno) = COPY_FAILS.with(std::cell::Cell::get)?;
+        if at != step {
+            return None;
+        }
+        if passing == 0 {
+            return Some(std::io::Error::from(errno));
+        }
+        COPY_FAILS.with(|fails| fails.set(Some((at, passing - 1, errno))));
+        None
+    }
 
     #[test]
     fn every_class_the_status_reports_is_recognised() {
@@ -1299,5 +1331,181 @@ mod tests {
                 .any(|line| line.contains("best-effort conflict detection")),
             "a shared workspace's apply contract is stated: {shared:?}"
         );
+    }
+
+    /// Two files in a source directory, a destination beside it, and the entries that include both.
+    #[cfg(unix)]
+    struct Copying {
+        _root: kr_ipc::testing::PrivateTempDir,
+        from: std::path::PathBuf,
+        to: std::path::PathBuf,
+        source: AuthorisedDirectory,
+        destination: AuthorisedDirectory,
+        entries: Vec<SurveyEntry>,
+    }
+
+    #[cfg(unix)]
+    fn two_files_to_copy() -> Copying {
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let (from, to) = (root.path().join("source"), root.path().join("destination"));
+        std::fs::create_dir(&from).expect("a source");
+        std::fs::create_dir(&to).expect("a destination");
+        std::fs::write(from.join("first.txt"), b"first\n").expect("the first file");
+        std::fs::write(from.join("second.txt"), b"second\n").expect("the second file");
+        let environment_id =
+            kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([15; 16]));
+        let entries = ["first.txt", "second.txt"]
+            .map(|path| SurveyEntry {
+                path: path.to_owned(),
+                class: InclusionClass::DirtyFile,
+                change: ChangeKind::Present,
+                content: ContentClass::Text,
+                byte_len: Some(6),
+                included: true,
+            })
+            .to_vec();
+        let source = AuthorisedDirectory::open_root(environment_id, &from).expect("the source");
+        let destination =
+            AuthorisedDirectory::open_root(environment_id, &to).expect("the destination");
+        Copying {
+            _root: root,
+            from,
+            to,
+            source,
+            destination,
+            entries,
+        }
+    }
+
+    /// Copies what `copying` includes, and returns the outcome with what the copy journalled.
+    #[cfg(unix)]
+    fn copied(copying: &Copying) -> (Result<CopyReport>, Vec<(String, PathOutcome)>) {
+        let mut seen = Vec::new();
+        let outcome = copy_included(
+            &copying.source,
+            &copying.destination,
+            &copying.entries,
+            &mut |path, outcome| {
+                seen.push((path.to_owned(), outcome));
+                Ok(())
+            },
+            None,
+        );
+        (outcome, seen)
+    }
+
+    /// The names in a directory, in order.
+    #[cfg(unix)]
+    fn names_in(directory: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .expect("the directory lists")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A host short of descriptors, processes or memory to read or write one path has said nothing
+    /// of that path, so the inclusion stops there as a fault that passes, which a client sends the
+    /// request again after, and not as a path that could not be carried. What was carried before
+    /// stays, and nothing of the failed copy is left. Any other failure of a step is about that
+    /// one path: the inclusion goes on and reports the path as one that was not applied.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_short_of_memory_when_a_path_is_copied_stops_the_inclusion_as_a_fault_that_passes() {
+        use crate::identity::tests::OPEN_ERRORS;
+
+        // Each step, and how many calls of it the first file takes.
+        for (step, passing) in [
+            ("mode", 1),
+            ("read", 2),
+            ("write", 1),
+            ("flush", 1),
+            ("permissions", 1),
+        ] {
+            for (errno, passes) in OPEN_ERRORS {
+                let copying = two_files_to_copy();
+
+                COPY_FAILS.with(|fails| fails.set(Some((step, passing, errno))));
+                let (outcome, seen) = copied(&copying);
+                COPY_FAILS.with(|fails| fails.set(None));
+
+                let row = format!("{step}, {errno}");
+                if passes {
+                    let Err(refused) = outcome else {
+                        panic!("{row}: the host was short, and the inclusion went on");
+                    };
+                    assert_eq!(
+                        refused.code(),
+                        kr_protocol::error::ErrorCode::UpstreamUnavailable,
+                        "{row}: {refused}"
+                    );
+                    assert!(
+                        refused
+                            .to_string()
+                            .contains(&std::io::Error::from(errno).to_string()),
+                        "it says the reason: {row}: {refused}"
+                    );
+                    assert_eq!(
+                        seen,
+                        [("first.txt".to_owned(), PathOutcome::Carried)],
+                        "{row}"
+                    );
+                } else {
+                    let report = outcome.expect("another failure is about the one path");
+                    assert_eq!(report.copied, ["first.txt"], "{row}");
+                    assert_eq!(report.skipped, ["second.txt"], "{row}");
+                    assert_eq!(
+                        seen,
+                        [
+                            ("first.txt".to_owned(), PathOutcome::Carried),
+                            ("second.txt".to_owned(), PathOutcome::Unapplied)
+                        ],
+                        "{row}"
+                    );
+                }
+                assert_eq!(names_in(&copying.to), ["first.txt"], "{row}");
+            }
+        }
+    }
+
+    /// An inclusion stopped by a shortage leaves what one stopped by the quota leaves: what was
+    /// carried before the stop is there, as the journal was told, and the path it stopped at has
+    /// left nothing in the destination. The service ends the workspace's creation the same way
+    /// for either, because it reads only that the copy failed.
+    #[cfg(unix)]
+    #[test]
+    fn an_inclusion_stopped_by_a_shortage_leaves_what_one_stopped_by_the_quota_leaves() {
+        let over = two_files_to_copy();
+        std::fs::File::create(over.from.join("second.txt"))
+            .expect("the second file is made again")
+            .set_len(MAX_WORKSPACE_COPY_BYTES + 1)
+            .expect("it is larger than a workspace takes");
+        let (outcome, over_seen) = copied(&over);
+        let stopped = outcome.expect_err("more than the quota is not copied");
+        assert!(
+            matches!(stopped, ProjectError::QuotaExceeded { .. }),
+            "{stopped:?}"
+        );
+
+        let short = two_files_to_copy();
+        COPY_FAILS.with(|fails| fails.set(Some(("write", 1, rustix::io::Errno::NOMEM))));
+        let (outcome, short_seen) = copied(&short);
+        COPY_FAILS.with(|fails| fails.set(None));
+        let stopped = outcome.expect_err("a host short of memory stops the copy");
+        assert!(
+            stopped.code().retry_category().permits_automatic_retry(),
+            "{stopped}"
+        );
+
+        assert_eq!(short_seen, over_seen);
+        assert_eq!(names_in(&short.to), names_in(&over.to));
+        assert_eq!(names_in(&short.to), ["first.txt"]);
     }
 }
