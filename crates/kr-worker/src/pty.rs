@@ -275,6 +275,10 @@ impl Pty {
             child,
             identity,
             process_group: foreground_group(self.master.as_ref()),
+            #[cfg(target_os = "linux")]
+            held: None,
+            #[cfg(target_os = "linux")]
+            collected: false,
             #[cfg(windows)]
             console_input: std::sync::Arc::clone(&self.console_input),
         })
@@ -467,6 +471,15 @@ pub struct RootShell {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     identity: ProcessStartIdentity,
     process_group: Option<i32>,
+    /// Where each moment this shell is known to still hold its process number is left, when the
+    /// session's record asked for them: the clock's reading before every call that can collect the
+    /// shell's status and found it not collected before. See [`Self::leave_held_moments_in`].
+    #[cfg(target_os = "linux")]
+    held: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Whether a call has found the shell's status collected, from which a later call proves
+    /// nothing about when the number was held.
+    #[cfg(target_os = "linux")]
+    collected: bool,
     /// The console this shell runs in, which is where a request to stop is delivered.
     ///
     /// This platform has no signal that means "please stop". What it has is the console's own
@@ -504,10 +517,15 @@ impl RootShell {
     ///
     /// Returns [`WorkerError::Pty`] when the status cannot be read.
     pub fn try_wait(&mut self) -> Result<Option<ShellExit>> {
-        self.child
+        #[cfg(target_os = "linux")]
+        let before = self.moment_before_a_wait();
+        let status = self
+            .child
             .try_wait()
-            .map(|status| status.map(exit_from))
-            .map_err(|error| WorkerError::pty("read the root shell's status", error))
+            .map_err(|error| WorkerError::pty("read the root shell's status", error))?;
+        #[cfg(target_os = "linux")]
+        self.note_waited(before, status.is_some());
+        Ok(status.map(exit_from))
     }
 
     /// Waits for the shell to end.
@@ -516,10 +534,41 @@ impl RootShell {
     ///
     /// Returns [`WorkerError::Pty`] when the status cannot be read.
     pub fn wait(&mut self) -> Result<ShellExit> {
-        self.child
+        #[cfg(target_os = "linux")]
+        let before = self.moment_before_a_wait();
+        let status = self
+            .child
             .wait()
-            .map(exit_from)
-            .map_err(|error| WorkerError::pty("wait for the root shell", error))
+            .map_err(|error| WorkerError::pty("wait for the root shell", error))?;
+        #[cfg(target_os = "linux")]
+        self.note_waited(before, true);
+        Ok(exit_from(status))
+    }
+
+    /// Has the shell leave in `held` the latest moment it is known to hold its process number:
+    /// the clock's reading, in milliseconds since the boot, taken before each call that can
+    /// collect its status, for as long as no call has found it collected. The number is the
+    /// shell's from its start until its status is collected, so a process that began before that
+    /// moment began while the number named the shell's session. That is what lets a record tell
+    /// the session it began from a new one on the same number once the shell has been collected.
+    #[cfg(target_os = "linux")]
+    pub fn leave_held_moments_in(&mut self, held: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        self.held = Some(held);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn moment_before_a_wait(&self) -> Option<u64> {
+        (self.held.is_some() && !self.collected).then(kr_ipc::clock::boot_elapsed_ms)
+    }
+
+    /// The call returned, collected or not: the shell held its number at `before` either way,
+    /// when no earlier call had found it collected.
+    #[cfg(target_os = "linux")]
+    fn note_waited(&mut self, before: Option<u64>, collected: bool) {
+        if let (Some(held), Some(moment)) = (&self.held, before) {
+            held.fetch_max(moment, std::sync::atomic::Ordering::AcqRel);
+        }
+        self.collected |= collected;
     }
 
     /// Asks the shell and everything in its process group to stop.

@@ -520,9 +520,30 @@ fn kr_req_07_66_the_children_of_a_parent_that_ended_while_they_were_read_are_not
     tree.end();
 }
 
+/// Waits until the clock has passed the tick a process began in. The record tells the session it
+/// began from a new one on the same number by what began before the root shell's last wait, and a
+/// process that began within the tick of that wait cannot be told from one that began after it.
+fn wait_for_the_clock_to_pass_the_start_of(pid: u32) {
+    let began = kr_ipc::identity::process_start_identity(pid)
+        .expect("the process's identity")
+        .start_value
+        .get();
+    let ticks = rustix::param::clock_ticks_per_second();
+    let deadline = Instant::now() + LIVENESS;
+    while (began + 1) * 1000 > kr_ipc::clock::boot_elapsed_ms() * ticks {
+        assert!(
+            Instant::now() < deadline,
+            "the clock passes the tick {pid} began in"
+        );
+        std::thread::yield_now();
+    }
+}
+
 /// KR-REQ-07.60: a process left in the session after the root shell has ended and been collected
 /// is still found. The session keeps the root shell's identifier while anything is in it, and the
-/// terminal no longer names the session once the root shell has gone.
+/// terminal no longer names the session once the root shell has gone. The record has no other
+/// process of the session to show it by, so what it goes by is that the process began before the
+/// root shell was collected, which the shell's own last wait says.
 #[test]
 fn kr_req_07_60_a_process_left_after_the_root_shell_has_gone_is_found() {
     let _turn = turn();
@@ -533,6 +554,7 @@ fn kr_req_07_60_a_process_left_after_the_root_shell_has_gone_is_found() {
     );
     let left = tree.pid("a process the worker adopted, deaf to a hangup");
     let root = tree.root();
+    wait_for_the_clock_to_pass_the_start_of(left);
     if let Some(pid) = i32::try_from(root)
         .ok()
         .and_then(rustix::process::Pid::from_raw)

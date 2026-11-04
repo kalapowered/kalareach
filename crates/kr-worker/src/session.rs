@@ -839,6 +839,12 @@ impl Session {
                     placed,
                 );
                 let owned = OwnedProcesses::establish(boundary, shell.identity().clone());
+                #[cfg(target_os = "linux")]
+                let shell = {
+                    let mut shell = shell;
+                    shell.leave_held_moments_in(owned.root_held_handle());
+                    shell
+                };
                 if let Some(why) = group_refused {
                     owned.note_unestablished(format!(
                         "the worker runs as a service of its own and could not give the session a \

@@ -30,11 +30,14 @@
 //! parent then exited: nothing ties that one to this session any more, and it is the deliberate
 //! escape section 7 lets outlive the terminal. A child of the worker is read as the root shell's
 //! session's only while that session is shown to be the recorded one: the root shell is still the
-//! process that was recorded, or a process the record already holds is still in the session. Once
-//! the session has emptied, its number can name a new session, and the children of that one are
-//! not this session's. Elsewhere the session's processes are the terminal's, and a descendant that
-//! calls `setsid` leaves the terminal and stops being visible. Nothing here pretends otherwise:
-//! such a host reports incomplete coverage and lists what it confirmed.
+//! process that was recorded, or a process in the session began while the root shell still held
+//! its number, which the shell's own waits say. Once the session has emptied, its number can name
+//! a new session, and the children of that one are not this session's. A process that began within
+//! a tick of the clock (ten milliseconds) of the root shell's collection is not shown that way
+//! when nothing older is left in the session; the record says it left such children out.
+//! Elsewhere the session's processes are the terminal's, and a descendant that calls `setsid`
+//! leaves the terminal and stops being visible. Nothing here pretends otherwise: such a host
+//! reports incomplete coverage and lists what it confirmed.
 //!
 //! A process the worker adopted keeps its entry in the process table, counted against the account's
 //! process limit, after it ends, until its parent collects its exit status. The record collects
@@ -199,6 +202,13 @@ pub struct OwnedProcesses {
     /// as running is put there. Not shared with a copy, which makes its own readings.
     #[cfg(target_os = "linux")]
     noted_elsewhere: Vec<ProcessStartIdentity>,
+    /// The latest moment, in milliseconds on the machine's continuous clock, at which the root
+    /// shell was known to still hold its process number: taken before a reading that found it
+    /// there, or before the call that collects its status. Zero until then. A process that
+    /// began before it began while the number named the root shell's session. See
+    /// [`Self::session_is_the_recorded_one`]. Shared with every copy, and with the root shell.
+    #[cfg(target_os = "linux")]
+    root_held: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The most processes `seen` holds.
     cap: usize,
     /// Whether a process was refused for want of room, and said so.
@@ -385,6 +395,8 @@ impl OwnedProcesses {
             elsewhere: std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             #[cfg(target_os = "linux")]
             noted_elsewhere: Vec::new(),
+            #[cfg(target_os = "linux")]
+            root_held: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cap: MAX_RECORDED_PROCESSES,
             refused_for_room: false,
             #[cfg(test)]
@@ -402,6 +414,15 @@ impl OwnedProcesses {
             },
         );
         owned
+    }
+
+    /// Where the root shell leaves the moments it is known to hold its process number, which is
+    /// what lets a reading tell the session it began from a new one on the same number once the
+    /// shell has been collected.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn root_held_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.root_held)
     }
 
     /// Copies out what an observation of the boundary works on, so that the kernel can be read
@@ -452,6 +473,8 @@ impl OwnedProcesses {
                 elsewhere: std::sync::Arc::clone(&self.elsewhere),
                 #[cfg(target_os = "linux")]
                 noted_elsewhere: Vec::new(),
+                #[cfg(target_os = "linux")]
+                root_held: std::sync::Arc::clone(&self.root_held),
                 cap: self.cap,
                 refused_for_room: self.refused_for_room,
                 #[cfg(test)]
@@ -1841,7 +1864,13 @@ impl OwnedProcesses {
         let mut pending: Vec<(u32, ProcessStartIdentity)> = Vec::new();
         // The root shell, if it is still the process that was recorded. A shell that has gone
         // leaves its session's processes to this worker, and the second list finds them.
+        #[cfg(target_os = "linux")]
+        let before = kr_ipc::clock::boot_elapsed_ms();
         if kr_ipc::identity::process_start_identity(root).is_ok_and(|now| now == self.root) {
+            // Held at the moment before it was asked.
+            #[cfg(target_os = "linux")]
+            self.root_held
+                .fetch_max(before, std::sync::atomic::Ordering::AcqRel);
             pending.push((root, self.root.clone()));
         }
         loop {
@@ -1895,17 +1924,27 @@ impl OwnedProcesses {
                 if walked.contains(&child) || !in_session(child) {
                     continue;
                 }
+                // A process that holds the root's number and is not the root shell is the leader
+                // of another session, whatever it says about its children.
                 if let Ok(lineage) = kr_ipc::identity::process_lineage(child)
                     && lineage.parent == worker
                     && lineage.session == Some(root)
+                    && (child != root || lineage.identity == self.root)
                 {
                     in_the_session.push((child, lineage.identity));
                 }
             }
             // Asked after the children were read, so that what shows the session is the original
             // one was there when they were.
-            if !in_the_session.is_empty() && self.session_is_the_recorded_one(root) {
-                pending.extend(in_the_session);
+            if !in_the_session.is_empty() {
+                if self.session_is_the_recorded_one(root, &in_the_session) {
+                    pending.extend(in_the_session);
+                } else {
+                    self.note_unestablished(format!(
+                        "the worker holds processes in the session numbered {root}, which was not \
+                         shown to be the session this record began, so they were not recorded"
+                    ));
+                }
             }
             if pending.is_empty() {
                 return Some(members);
@@ -1920,31 +1959,65 @@ impl OwnedProcesses {
     /// process group or as its session. So a session's number is passed to a new process only
     /// after the session has emptied, and a process that then calls `setsid` leads a new session
     /// of the same number, whose children this worker adopts if their parents end. The leader
-    /// being gone says nothing about which session the number names. What does is a process
-    /// that is still in the session: the root shell, while it is the process that was recorded
-    /// (running, or ended and not yet collected), or a process this record held before the
-    /// reading that is still in the session now. Nothing joins a session by its number, so such a
-    /// process has been in it since it began, and the number has named this session throughout.
+    /// being gone says nothing about which session the number names. What does is, first, the root
+    /// shell itself, while it is the process that was recorded (running, or ended and not yet
+    /// collected), and then a process that is in the session now and began while the root shell
+    /// still held the number: it can only have joined the session by being born in it, so the
+    /// number has named this session since, and any other process in the session is in it too.
+    /// How long the root shell held the number is [`Self::root_held`], and a process began before
+    /// it when the clock tick it began in ended before it.
     ///
-    /// With neither, the session is not taken to be this one, whatever the host says about who
-    /// holds the number: an answer that could not be had is no evidence either. That leaves
-    /// unrecorded the processes of a session that has lost every process the record knows, until
-    /// a listing shows them.
+    /// The candidates are the children of the worker just read in the session; the processes the
+    /// record already holds are looked at too, whichever way they were recorded. Each is read once
+    /// more here, after all of them were read, so that it is in the session still.
+    ///
+    /// With no such process the session is not taken to be this one, whatever the host says about
+    /// who holds the number: an answer that could not be had is no evidence either. That leaves
+    /// unrecorded the processes of a session whose root shell was collected within a clock tick
+    /// (ten milliseconds) of their beginning, when the record knows nothing older that is still in
+    /// the session; the record says so.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn session_is_the_recorded_one(&self, root: u32) -> bool {
+    fn session_is_the_recorded_one(
+        &self,
+        root: u32,
+        candidates: &[(u32, ProcessStartIdentity)],
+    ) -> bool {
         match kr_ipc::identity::query_process(root) {
             kr_ipc::identity::ProcessQuery::Present(now) => return now == self.root,
             kr_ipc::identity::ProcessQuery::Gone
             | kr_ipc::identity::ProcessQuery::CannotEstablish(_) => {}
         }
-        self.live.values().any(|member| {
-            // Not the root's number: it is what is in question.
-            u32::try_from(member.pid.get())
-                .ok()
-                .filter(|pid| *pid != root)
-                .and_then(|pid| kr_ipc::identity::process_lineage(pid).ok())
-                .is_some_and(|now| now.identity == *member && now.session == Some(root))
-        })
+        #[cfg(target_os = "linux")]
+        {
+            let held = self.root_held.load(std::sync::atomic::Ordering::Acquire);
+            let ticks = rustix::param::clock_ticks_per_second();
+            // The tick a process began in is over before `held` when the tick after it starts no
+            // later: the process began no later than `held`.
+            let began_before = |identity: &ProcessStartIdentity| {
+                identity
+                    .start_value
+                    .get()
+                    .saturating_add(1)
+                    .saturating_mul(1000)
+                    <= held.saturating_mul(ticks)
+            };
+            candidates
+                .iter()
+                .map(|(_, identity)| identity)
+                .chain(self.live.values())
+                .filter(|member| member.pid.get() != u64::from(root) && began_before(member))
+                .any(|member| {
+                    u32::try_from(member.pid.get())
+                        .ok()
+                        .and_then(|pid| kr_ipc::identity::process_lineage(pid).ok())
+                        .is_some_and(|now| now.identity == *member && now.session == Some(root))
+                })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = candidates;
+            false
+        }
     }
 
     /// Records every process the session's job object currently holds.
@@ -2841,8 +2914,7 @@ mod tests {
         use rustix::process::{Pid, Signal, kill_process};
 
         kill_process(
-            Pid::from_raw(i32::try_from(command.pid.get()).expect("a number"))
-                .expect("a process"),
+            Pid::from_raw(i32::try_from(command.pid.get()).expect("a number")).expect("a process"),
             Signal::KILL,
         )
         .expect("ends the command");
@@ -3126,7 +3198,10 @@ mod tests {
             "the set holds a process the record holds as running"
         );
         owned.in_a_scope.insert(key(&process));
-        let recorded = owned.seen.get(&key(&process)).expect("the process is recorded");
+        let recorded = owned
+            .seen
+            .get(&key(&process))
+            .expect("the process is recorded");
         assert!(
             owned.has_left(recorded, &Scopes::default()),
             "the process is read as having left"
@@ -3187,16 +3262,49 @@ mod tests {
         }
     }
 
-    /// Starts a leader of a session of its own that starts `count` processes which outlive it, and
-    /// names them; ends the leader and collects it. The processes then belong to this worker, in
-    /// the leader's session, and the leader's number names no process, which is how a session
-    /// looks once its root shell has been collected.
-    ///
-    /// Returns the leader as it was, the processes, and what ends them.
+    /// Waits until the clock has passed the tick `identity` began in, and returns the clock then:
+    /// a moment from which the process is known to have begun.
     #[cfg(target_os = "linux")]
-    fn a_session_whose_leader_was_collected(
-        count: usize,
-    ) -> (ProcessStartIdentity, Vec<ProcessStartIdentity>, Adopted) {
+    fn after_the_tick_of(identity: &ProcessStartIdentity) -> u64 {
+        let ticks = rustix::param::clock_ticks_per_second();
+        let waited = std::time::Instant::now();
+        loop {
+            let now = kr_ipc::clock::boot_elapsed_ms();
+            if identity
+                .start_value
+                .get()
+                .saturating_add(1)
+                .saturating_mul(1000)
+                <= now.saturating_mul(ticks)
+            {
+                return now;
+            }
+            assert!(
+                waited.elapsed() < std::time::Duration::from_secs(60),
+                "the clock did not pass the tick the process began in"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// A session whose root shell has been collected while processes it started live on.
+    #[cfg(target_os = "linux")]
+    struct EmptiedSession {
+        /// The leader as it was.
+        leader: ProcessStartIdentity,
+        /// The processes it started, which belong to this worker now, in the leader's session.
+        processes: Vec<ProcessStartIdentity>,
+        /// The clock after the last of them began and before the leader was collected: the moment
+        /// a root shell would be known to hold its number.
+        held: u64,
+        _ending: Adopted,
+    }
+
+    /// Starts a leader of a session of its own that starts `count` processes which outlive it, and
+    /// names them; ends the leader and collects it. The leader's number then names no process,
+    /// which is how a session looks once its root shell has been collected.
+    #[cfg(target_os = "linux")]
+    fn a_session_whose_leader_was_collected(count: usize) -> EmptiedSession {
         use std::io::{BufRead as _, Write as _};
 
         adopt_orphans();
@@ -3230,7 +3338,12 @@ mod tests {
             kr_ipc::identity::process_start_identity(number).expect("the process's identity")
         };
         let session = identity(leader.id());
-        let processes = numbers.iter().copied().map(identity).collect();
+        let processes: Vec<ProcessStartIdentity> = numbers.iter().copied().map(identity).collect();
+        let last = processes
+            .iter()
+            .max_by_key(|process| process.start_value.get())
+            .expect("a process");
+        let held = after_the_tick_of(last);
         writeln!(told).expect("tells the leader to end");
         drop(told);
         leader.wait().expect("collects the leader");
@@ -3238,27 +3351,45 @@ mod tests {
             !is_in_the_process_table(&session),
             "the leader's number names no process"
         );
-        (session, processes, ending)
+        EmptiedSession {
+            leader: session,
+            processes,
+            held,
+            _ending: ending,
+        }
     }
 
     /// KR-REQ-07.14 and KR-REQ-07.60: the children of the worker in a session are taken as the
     /// record's session's only on evidence that the session still exists. Once the session the
     /// record began has emptied, its root's number can name a new session, whose leader took the
     /// number and called `setsid` and has gone: the children it left carry the number as their
-    /// session, and are not the record's. An absent leader is no evidence of anything.
+    /// session, and are not the record's. An absent leader is no evidence of anything, and neither
+    /// is a process the record holds because a listing named it, or one in another session.
     ///
     /// The case is the new session. The kernel does not give a number out while a session of that
     /// number has a member, so the record is made to hold another process's start for the number,
-    /// as it does when the original root shell was collected before the number was reused.
+    /// as it does when the original root shell was collected before the number was reused, and the
+    /// last moment that shell was known to hold the number is from before the new session began.
+    /// The record holds a process of another session that began before that moment, and one of
+    /// the new session's, as the session's control group would have it listed.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_children_of_a_new_session_on_the_number_of_an_emptied_one_are_not_the_recorded_sessions()
     {
-        let (leader, processes, _ending) = a_session_whose_leader_was_collected(2);
+        let old = Sleepers(vec![
+            std::process::Command::new("sleep")
+                .arg("600")
+                .spawn()
+                .expect("starts a process in another session"),
+        ]);
+        let old_identity = kr_ipc::identity::process_start_identity(old.0[0].id())
+            .expect("the process's identity");
+        let before_the_new_session = after_the_tick_of(&old_identity);
+        let session = a_session_whose_leader_was_collected(2);
         let recorded = ProcessStartIdentity::new(
-            leader.pid.get(),
-            leader.source,
-            leader.start_value.get() + 1,
+            session.leader.pid.get(),
+            session.leader.source,
+            session.leader.start_value.get() + 1,
         );
         let mut owned = OwnedProcesses::establish(
             OwnershipBoundary::TerminalGroup {
@@ -3267,17 +3398,12 @@ mod tests {
             },
             recorded,
         );
-        // A process the record holds that is in another session shows nothing about this one.
-        let other = Sleepers(vec![
-            std::process::Command::new("sleep")
-                .arg("600")
-                .spawn()
-                .expect("starts a process in another session"),
-        ]);
-        owned.take([kr_ipc::identity::process_start_identity(other.0[0].id())
-            .expect("the process's identity")]);
+        owned
+            .root_held
+            .store(before_the_new_session, std::sync::atomic::Ordering::Release);
+        owned.take([old_identity, session.processes[0].clone()]);
         let found = tree_once_read(&mut owned);
-        for process in &processes {
+        for process in &session.processes {
             assert!(
                 !found.contains(process),
                 "process {} is a child of the worker in a session the record did not begin, and \
@@ -3285,6 +3411,14 @@ mod tests {
                 process.pid
             );
         }
+        assert!(
+            owned
+                .unestablished()
+                .iter()
+                .any(|note| note.contains("not shown to be the session this record began")),
+            "the record says it left them out: {:?}",
+            owned.unestablished()
+        );
     }
 
     /// KR-REQ-07.14 and KR-REQ-07.60: a process that holds the number of the record's root shell
@@ -3325,27 +3459,30 @@ mod tests {
     }
 
     /// KR-REQ-07.14 and KR-REQ-07.60: control for the case above. The root shell has been
-    /// collected, and a process the record already holds is still in the session, so the number
-    /// still names the record's session and the children of the worker in it are the record's.
+    /// collected, the record holds nothing in the session, and the processes it left began while it
+    /// still held its number, as the shell's last wait before its collection says: they are the
+    /// recorded session's, and the walk finds them.
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_children_of_the_worker_in_a_session_a_recorded_process_is_still_in_are_the_recorded_sessions()
+    fn the_children_of_the_worker_that_began_while_the_root_held_its_number_are_the_recorded_sessions()
      {
-        let (leader, processes, _ending) = a_session_whose_leader_was_collected(2);
+        let session = a_session_whose_leader_was_collected(2);
         let mut owned = OwnedProcesses::establish(
             OwnershipBoundary::TerminalGroup {
                 group: 1,
                 terminal: None,
             },
-            leader,
+            session.leader.clone(),
         );
-        owned.take([processes[0].clone()]);
+        owned
+            .root_held
+            .store(session.held, std::sync::atomic::Ordering::Release);
         let found = tree_once_read(&mut owned);
-        for process in &processes {
+        for process in &session.processes {
             assert!(
                 found.contains(process),
-                "process {} is a child of the worker in the recorded session and the walk did not \
-                 read it: {found:?}",
+                "process {} is a child of the worker that began while the recorded session's root \
+                 shell held its number, and the walk did not read it: {found:?}",
                 process.pid
             );
         }
