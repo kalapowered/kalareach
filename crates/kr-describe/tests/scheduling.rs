@@ -450,6 +450,52 @@ fn coalescing_keeps_the_aging_position_so_a_quiet_session_is_not_left_behind() {
     assert_eq!(first.session_id, session(1));
 }
 
+/// KR-REQ-22.14: the time to look again is the moment the first of the waiting sessions may be
+/// described: an ordinary session a cadence after it was last described and a priority session a
+/// cooldown after, one that was never described now, and never a moment that has gone by. The host
+/// sleeps until then, so a time too soon wakes it for nothing and one too late leaves a session
+/// waiting. The service time is long enough that the cadence is longer than the cooldown.
+#[test]
+fn the_time_to_look_again_is_the_moment_the_first_waiting_session_may_be_described() {
+    let cooldown = Budgets::DEFAULTS.session_cooldown_ms;
+    let mut scheduler = Scheduler::new(Budgets::DEFAULTS);
+    assert_eq!(scheduler.next_due_ms(at(0)), None);
+    scheduler.record_service(2 * cooldown);
+    scheduler.enqueue(Priority::Ordinary, context_for(&session(1), 1), at(1_000));
+    scheduler.enqueue(Priority::Foreground, context_for(&session(2), 1), at(1_000));
+    assert_eq!(
+        scheduler.next_due_ms(at(1_000)),
+        Some(1_000),
+        "sessions never described are due now"
+    );
+    for _ in 0..2 {
+        scheduler.dequeue(at(1_000)).expect("a session to describe");
+    }
+
+    // Both change again, and wait.
+    scheduler.enqueue(Priority::Ordinary, context_for(&session(1), 2), at(2_000));
+    scheduler.enqueue(Priority::Foreground, context_for(&session(2), 2), at(2_000));
+    let cadence = scheduler.cadence_ms(at(5_000));
+    assert!(cadence > cooldown, "{cadence} against {cooldown}");
+    assert_eq!(
+        scheduler.next_due_ms(at(5_000)),
+        Some(1_000 + cooldown),
+        "the priority session is due after the cooldown, the first of the two"
+    );
+    assert!(scheduler.cancel(&session(2)));
+    assert_eq!(
+        scheduler.next_due_ms(at(5_000)),
+        Some(1_000 + cadence),
+        "the ordinary session is due after the cadence"
+    );
+    let late = 1_000 + cadence + 7_000;
+    assert_eq!(
+        scheduler.next_due_ms(at(late)),
+        Some(late),
+        "a session that may be described already is due now"
+    );
+}
+
 /// KR-REQ-22.14: a job put back because it did not finish keeps its aging position, and when its
 /// session queued a newer job meanwhile, the newer content takes that older position and is not
 /// left behind a session that queued between them. A job put back as priority work makes the newer

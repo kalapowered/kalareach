@@ -2346,29 +2346,6 @@ fn the_cadence_holds_under_mixed_demand_through_the_process() {
             now += 1_000;
             before = standing(&rig.driver, now);
             rig.driver.turn(&roomy(), at(now)).expect("a turn");
-            if rig.driver.service().in_flight() == 0 {
-                // Nothing was sent, so every session is waiting out its cadence or its cooldown, and
-                // the driver says it is to look when the first of them ends: the host sleeps until
-                // then and no sooner. It is worked out here from the times the jobs were sent.
-                let cadence = rig.driver.service().scheduler().cadence_ms(at(now));
-                let first_due = std::iter::once(ordinary)
-                    .chain(foreground.iter().copied())
-                    .map(|session_id| {
-                        let wait = if session_id == ordinary {
-                            cadence
-                        } else {
-                            cooldown_ms
-                        };
-                        last.get(&session_id)
-                            .map_or(now, |sent_at| (sent_at + wait).max(now))
-                    })
-                    .min();
-                assert_eq!(
-                    rig.driver.due_ms(),
-                    first_due,
-                    "the time to look again, with every session waiting at {now} ms"
-                );
-            }
         }
         dispatched_at = now;
     }
@@ -2382,6 +2359,62 @@ fn the_cadence_holds_under_mixed_demand_through_the_process() {
             .all(|gap| *gap > cooldown_ms + service_ms),
         "every ordinary gap is longer than a cooldown-only queue's forty seconds: {ordinary_gaps:?}"
     );
+}
+
+/// KR-REQ-22.14: a session that changes again as its description is published waits out its cadence
+/// or its cooldown, and the driver says when to look again: the moment the session may be described,
+/// so that the host sleeps until then and no sooner. A look one millisecond short of it sends
+/// nothing, and a look at it sends the job. The time is worked out from the reading at which the job
+/// was sent. The cases are an ordinary session, which waits the cadence, and a priority session,
+/// which waits the cooldown.
+#[test]
+fn a_session_that_changed_again_is_looked_for_the_moment_its_wait_ends() {
+    for priority in [Priority::Ordinary, Priority::Foreground] {
+        let mut rig = Rig::new(&Script::default());
+        queue(rig.service(), &session(1), priority, at(0));
+        let sent_at = 3_000;
+        rig.until(&roomy(), at(sent_at), "the description", |reports, _| {
+            a_job_ended(reports)
+        });
+        change_and_settle(rig.service(), &session(1), 1, sent_at + 100);
+        let wait = match priority {
+            Priority::Ordinary => rig
+                .driver
+                .service()
+                .scheduler()
+                .cadence_ms(at(sent_at + 100)),
+            Priority::Foreground => Budgets::DEFAULTS.session_cooldown_ms,
+        };
+        assert!(wait > 0, "{priority:?}");
+
+        let reports = rig
+            .driver
+            .turn(&roomy(), at(sent_at + 100))
+            .expect("a turn");
+        assert_eq!(
+            rig.driver.service().in_flight(),
+            0,
+            "{priority:?}: {reports:?}"
+        );
+        assert_eq!(
+            rig.driver.due_ms(),
+            Some(sent_at + wait),
+            "{priority:?}: the time to look again"
+        );
+        let reports = rig
+            .driver
+            .turn(&roomy(), at(sent_at + wait - 1))
+            .expect("a turn");
+        assert_eq!(
+            rig.driver.service().in_flight(),
+            0,
+            "{priority:?}: {reports:?}"
+        );
+        assert_eq!(rig.driver.due_ms(), Some(sent_at + wait), "{priority:?}");
+        rig.until(&roomy(), at(sent_at + wait), "the job", |_, driver| {
+            driver.service().in_flight() == 1
+        });
+    }
 }
 
 /// Records a change to a session that settles at once, as a debounce that began two seconds ago.
