@@ -76,11 +76,11 @@ fn a_cursor_report_describes_the_canonical_grid() {
     );
 }
 
-/// KR-REQ-08.41, the part about features negotiated outside terminfo: a mode query is answered
-/// from what the profile tracks and acts on, and a feature the profile has no capability for
-/// (grapheme clustering, in-band resize) is reported as not recognised, so an application falls
-/// back instead of assuming it. Not shown here: a query other than a mode report, such as the Kitty
-/// keyboard query, or a feature the profile has and the database does not name.
+/// KR-REQ-08.41, the part about features negotiated outside terminfo: a mode query is answered from
+/// what the profile tracks, and two features the profile has no capability for (grapheme clustering
+/// and in-band resize) are reported as not recognised. Not shown here: a feature the profile has a
+/// capability for (bracketed paste, synchronised output, the Kitty keyboard subset) being reported
+/// or honoured, or any query other than a mode report.
 #[test]
 fn mode_reports_say_what_the_profile_actually_does() {
     let mut engine = engine();

@@ -495,9 +495,10 @@ fn tmux_unescape(text: &str) -> Vec<u8> {
 ///
 /// KR-REQ-08.41, the part about nested multiplexer behaviour: with `tmux` run inside a managed
 /// session, its own list of what it read for the outer terminal holds the private database's
-/// truecolour flags and the database's value for every string capability but the five `tmux` sets
-/// by rule; a program in a pane still reads the private directory; the outer session's `TERM`,
-/// `TERMINFO` and database file are what they were before `tmux` ran; and each sequence `tmux`
+/// truecolour flags and, for every string capability it lists that the database has, the database's
+/// value but for the five `tmux` sets by rule; a pane's `TERMINFO` still names the private
+/// directory; before `tmux` ran the session's library read the private database's file, and after
+/// it ran the session's `TERM` and `TERMINFO` are the ones it was given; and each sequence `tmux`
 /// wrote that the terminal engine does not classify is a mode `tmux` sets for any terminal whose
 /// name begins with `xterm` or one the database's own output capabilities expand to. Not shown
 /// here: another multiplexer, or a host with no `tmux`: the case then prints that it skipped and
