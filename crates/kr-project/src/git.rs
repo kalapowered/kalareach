@@ -4322,6 +4322,13 @@ fn collect(child: &mut std::process::Child) -> std::io::Result<std::process::Exi
 
 /// Ends the group the child led, which is every process it started that stayed in it.
 fn end_group(child: &std::process::Child) {
+    // A case that asks for it looks at the child at the moment its group is signalled.
+    #[cfg(all(test, unix))]
+    tests::AT_THE_END_OF_THE_GROUP.with(|looks| {
+        if let Some(looks) = looks.take() {
+            looks(child.id());
+        }
+    });
     #[cfg(unix)]
     if let Ok(raw) = i32::try_from(child.id())
         && let Some(group) = rustix::process::Pid::from_raw(raw)
@@ -5462,6 +5469,10 @@ mod tests {
         /// Set by a case to run something once on its own thread right after a read of a probe's
         /// output has returned, before anything is decided from what it returned.
         pub(super) static AFTER_THE_READ: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::Cell::new(None) };
+        /// Set by a case to run something once on its own thread when a child's group is signalled,
+        /// given the child's number.
+        pub(super) static AT_THE_END_OF_THE_GROUP: std::cell::Cell<Option<Box<dyn FnOnce(u32)>>> =
             const { std::cell::Cell::new(None) };
         /// Set by a case to replace the machine's clock on its own thread with one it moves by
         /// hand.
@@ -7566,5 +7577,217 @@ mod tests {
             "1",
             Duration::from_millis(300),
         );
+    }
+
+    /// An exit seen after the time the look was given is the clock's though the program had
+    /// written more than the limit, in time: what it wrote is not weighed either. The first poll is
+    /// made in time and reads the output to the limit, the program having ended with every byte
+    /// of it in a pipe raised to hold it, so the output is past the limit when the exit is seen,
+    /// which is then after the time (the case has the time read as used up from the loop's first
+    /// look at it). A late exit refused only after the wait for the output would find the output
+    /// first and refuse it as more than was asked, which is the program's, with the step to
+    /// install Git. Raising a pipe's size is Linux's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exit_seen_after_the_time_ran_out_is_the_clocks_though_the_output_passed_the_limit_in_time()
+     {
+        TIME_IS_UP.with(|up| up.set(true));
+        let (outcome, _directory) = ask_with_the_first_poll_after_the_stand_in_ended(
+            "/usr/bin/perl -e 'fcntl(STDOUT, 1031, 1048576) or die; \
+             syswrite(STDOUT, \"x\" x 200000) == 200000 or die;'",
+            Duration::from_secs(60),
+            false,
+        );
+        TIME_IS_UP.with(|up| up.set(false));
+
+        let refusal = match outcome {
+            Err(Asked::Overran(refusal)) => refusal,
+            other => panic!(
+                "an exit seen after the time is not an answer: {:?}",
+                other.map_err(Asked::into_error)
+            ),
+        };
+        assert!(
+            matches!(refusal, ProjectError::GitFailed { .. })
+                && refusal.to_string().contains("was not seen to end"),
+            "it is refused for the exit, and not for the output: {refusal:?}"
+        );
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::UpstreamUnavailable
+        );
+    }
+
+    /// A copy of Git that has ended and left its output open to a process outside its group is not
+    /// an answer, and the whole look is refused with it, as the program's: a look that took the
+    /// stand-in for Git on the strength of it would keep a program that cannot run. A copy that ran
+    /// and said no is another thing: it is declined, and the program the search found runs. The
+    /// copy's second runs out when the case moves its clock on to it, between the wait's first poll
+    /// and the next, so nothing here depends on how fast the machine runs.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn a_copy_of_git_that_leaves_its_output_open_refuses_the_whole_look() {
+        let clock = StandingClock::start();
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let (helpers, declining) = (
+            directory.path().join("helpers"),
+            directory.path().join("declining"),
+        );
+        for made in [&helpers, &declining] {
+            std::fs::create_dir(made).expect("a helper directory");
+        }
+        stand_in_whose_output_a_process_outside_its_group_holds(&helpers);
+        place_stand_in(&declining, "exit 1");
+        let program = directory.path().join("the-program-on-the-search-path");
+        let version = "git version 2.50.1";
+
+        let kept = handed_off_to(
+            &program,
+            &declining,
+            version,
+            clock.now() + Duration::from_secs(60),
+        )
+        .expect("a copy that said no leaves the program on the search path");
+        assert_eq!(kept, program);
+
+        BEFORE_THE_NEXT_POLL.with(|stall| {
+            let clock = clock.handle();
+            stall.set(Some(Box::new(move |limits| {
+                clock.advance_to(limits.second);
+            })));
+        });
+        let held = handed_off_to(
+            &program,
+            &helpers,
+            version,
+            clock.now() + Duration::from_secs(60),
+        );
+        let_go(&helpers);
+
+        let Err(refusal) = held else {
+            panic!("a copy that leaves its output open is not passed over for the program");
+        };
+        assert!(
+            matches!(refusal, ProjectError::GitUnavailable { .. })
+                && refusal.to_string().contains("left its output open"),
+            "what the copy does is the copy's: {refusal:?}"
+        );
+    }
+
+    /// A copy of Git that answers either question with more than a version and a directory is not
+    /// an answer, and the whole look is refused with it, as the program's, whichever question it
+    /// is: neither is a copy that answers differently, which leaves the program on the search path.
+    /// The rows are the version, the directory, and a copy that answers both as the program does,
+    /// which is the one that runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_of_git_that_answers_either_question_without_end_refuses_the_whole_look() {
+        let clock = StandingClock::start();
+        let directory = tempfile::tempdir().expect("a directory for this test");
+        let program = directory.path().join("the-program-on-the-search-path");
+        let version = "git version 2.50.1";
+
+        for (row, version_answer, directory_answer, refused) in [
+            ("the version", "$LONG", "$HELPERS", true),
+            ("the directory", "'git version 2.50.1'", "$LONG", true),
+            ("neither", "'git version 2.50.1'", "$HELPERS", false),
+        ] {
+            let helpers = directory.path().join(row.replace(' ', "-"));
+            std::fs::create_dir(&helpers).expect("a helper directory");
+            let helpers = helpers.canonicalize().expect("the directory resolves");
+            place_stand_in(
+                &helpers,
+                &format!(
+                    "LONG=$(head -c 200000 /dev/zero | tr '\\0' x)\nHELPERS='{}'\n\
+                     case \"$1\" in\n--version) echo {version_answer} ;;\n\
+                     --exec-path) echo {directory_answer} ;;\nesac",
+                    helpers.display()
+                ),
+            );
+
+            let handed = handed_off_to(
+                &program,
+                &helpers,
+                version,
+                clock.now() + Duration::from_secs(60),
+            );
+
+            if refused {
+                let Err(refusal) = handed else {
+                    panic!("{row}: a copy that answers without end is not passed over");
+                };
+                assert!(
+                    matches!(refusal, ProjectError::GitUnavailable { .. })
+                        && refusal
+                            .to_string()
+                            .contains("more than a version and a directory"),
+                    "{row}: {refusal:?}"
+                );
+            } else {
+                assert_eq!(
+                    handed.expect("a copy that answers as the program does runs"),
+                    helpers.join(GIT_FILE_NAME),
+                    "{row}"
+                );
+            }
+        }
+    }
+
+    /// The group a probe left running is ended while its leader has ended and is not yet
+    /// collected. The leader's number is its own until it is collected: a group signalled by it
+    /// after that can be a stranger's, since the number may belong to another process by then, and
+    /// nothing else says that the group was signalled in time. The case looks at the leader at the
+    /// moment its group is signalled, and then at the process it left.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn the_group_a_probe_left_is_ended_while_its_leader_is_not_yet_collected() {
+        let uncollected = std::rc::Rc::new(std::cell::Cell::new(None::<bool>));
+        AT_THE_END_OF_THE_GROUP.with(|looks| {
+            let uncollected = std::rc::Rc::clone(&uncollected);
+            looks.set(Some(Box::new(move |leader| {
+                use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+                let leader = Pid::from_raw(i32::try_from(leader).expect("a process number"))
+                    .expect("a process number");
+                uncollected.set(Some(matches!(
+                    waitid(
+                        WaitId::Pid(leader),
+                        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+                    ),
+                    Ok(Some(_))
+                )));
+            })));
+        });
+
+        let (outcome, directory) = ask_with_the_first_poll_after_the_stand_in_ended(
+            "sleep 120 &\necho $! > \"$(dirname \"$0\")/sleeper\"\necho git version 2.50.1",
+            Duration::from_secs(60),
+            false,
+        );
+        AT_THE_END_OF_THE_GROUP.with(|looks| drop(looks.take()));
+
+        assert_eq!(
+            outcome
+                .map_err(Asked::into_error)
+                .expect("the program answered"),
+            "git version 2.50.1\n"
+        );
+        assert_eq!(
+            uncollected.get(),
+            Some(true),
+            "the group was signalled while its leader waited to be collected"
+        );
+        let sleeper = std::fs::read_to_string(directory.path().join("sleeper"))
+            .expect("the stand-in recorded the process it left in its group")
+            .trim()
+            .to_owned();
+        let guard = Instant::now() + Duration::from_secs(30);
+        while running(&sleeper) {
+            assert!(
+                Instant::now() < guard,
+                "the process the stand-in left in its group is still running"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
