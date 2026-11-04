@@ -1,8 +1,6 @@
 //! Project repositories: identity, authorised destinations, staged publication, the credential
 //! rule and the reconciliation of an interrupted publish.
 //!
-//! KR-REQ-14.06, 14.17, 14.18, 14.19, 23.42.
-//!
 //! Every test here asks the project service to run Git. On Windows it runs none: an application
 //! container cannot keep a repository from being executed from and cannot bound which ports a
 //! remote operation reaches, so the service refuses there rather than claiming a boundary it does
@@ -36,6 +34,19 @@ use support::{
     Fixture, action, actor, destination, installed_broker, named_broker, ordinary_repository,
 };
 
+/// KR-REQ-14.17, the part about creating a repository: `project.init` into an absent destination
+/// makes a ready repository that `project.read` returns and a list scoped to the environment names
+/// once. Not shown here: selecting or cloning one, or that `catalogue.*` cannot create one.
+///
+/// KR-REQ-14.18, the part about staging and publishing: new content is staged in a private sibling
+/// of the destination and published, and the sibling is removed, so the parent holds only the
+/// destination and the operation reports the removed staging path. Not shown here: a crash during
+/// publication.
+///
+/// KR-REQ-23.42, the part about `project.init` and the reads that follow it: the action creates the
+/// repository through a destination, `project.read` returns its record and `project.list` for the
+/// environment names it once. Not shown here: a refusal for a missing right, or a read outside a
+/// caller's scope.
 #[test]
 fn an_initialised_repository_is_published_from_a_private_sibling_and_nothing_is_left_behind() {
     let fixture = Fixture::create();
@@ -103,6 +114,14 @@ fn an_initialised_repository_is_published_from_a_private_sibling_and_nothing_is_
     );
 }
 
+/// KR-REQ-14.18, the part about an existing destination: an initialisation or a clone into an
+/// existing directory, an empty one included, is refused with nothing written into it and the
+/// refusal names the existing-checkout flow, which then admits it and changes nothing inside; a
+/// directory with no checkout is refused by that flow. Not shown here: the authorised destination
+/// handle, or an idempotent action.
+///
+/// KR-REQ-14.17, the part about selecting an existing repository: the existing-checkout flow admits
+/// one as an adopted project and stages nothing. Not shown here: creating or cloning one.
 #[test]
 fn an_existing_destination_is_refused_unless_the_adoption_flow_is_chosen() {
     let fixture = Fixture::create();
@@ -220,6 +239,11 @@ fn an_existing_destination_is_refused_unless_the_adoption_flow_is_chosen() {
 /// answered with the one `project_repository_id` and a listing that names one repository. Not
 /// shown here: `workspace_id`, the change set identifier and version, the workflow identifiers and
 /// `causal_root_id`.
+///
+/// KR-REQ-14.18, the part about an idempotent action: the same creation action sent twice is
+/// answered from the record, not refused for an existing destination, and makes one repository, and
+/// a different request under the same action identifier is an identifier conflict. Not shown here:
+/// a crash during publication.
 #[test]
 fn two_copies_of_one_creation_action_produce_one_repository() {
     let fixture = Fixture::create();
@@ -284,6 +308,14 @@ fn two_copies_of_one_creation_action_produce_one_repository() {
     assert_eq!(refusal.code(), ErrorCode::IdConflict);
 }
 
+/// KR-REQ-14.17, the part about cloning a repository: a clone from a local path completes, brings
+/// the commit across and has an object store of its own. Not shown here: selecting or creating one,
+/// or a clone over the network.
+///
+/// KR-REQ-14.19, the part about naming what a fetch used: the project record names the remote, its
+/// transport, provider and credential broker, and the repository stores exactly the URL it was
+/// given under the name it was given. Not shown here: a fetch over the network, where a provider
+/// and a broker are named.
 #[test]
 fn a_clone_names_the_remote_the_provider_and_the_broker_and_stores_no_credential() {
     let fixture = Fixture::with_brokers(installed_broker());
@@ -334,6 +366,9 @@ fn a_clone_names_the_remote_the_provider_and_the_broker_and_stores_no_credential
     assert!(fixture.work().join("clone/README.md").is_file());
 }
 
+/// KR-REQ-14.19, the part about no credential in a URL: a clone whose URL carries a credential,
+/// over HTTPS or SSH, is refused as untrusted without repeating the credential, and nothing is
+/// staged. Not shown here: a diagnostic or remote state other than the refusal.
 #[test]
 fn a_credential_in_a_url_is_refused_before_anything_is_staged() {
     let fixture = Fixture::with_brokers(named_broker());
@@ -375,6 +410,9 @@ fn a_credential_in_a_url_is_refused_before_anything_is_staged() {
     assert_eq!(support::names_in(fixture.work()), Vec::<String>::new());
 }
 
+/// KR-REQ-14.19, the part about validating the transport and the broker: a git, ext, file or plain
+/// HTTP URL is refused as untrusted, and so is a credential broker this host does not approve. Not
+/// shown here: the repository's own configuration, or that no Git program ran before the refusal.
 #[test]
 fn a_transport_this_host_does_not_use_is_refused_by_name() {
     let fixture = Fixture::with_brokers(named_broker());
@@ -636,6 +674,10 @@ fn an_added_worktree_is_its_own_object_and_a_record_of_one_tree_never_covers_ano
     );
 }
 
+/// KR-REQ-14.18, the part about a crash or ambiguous publish: a replacement daemon settles the
+/// publication as unknown under its create token without looking at the staging directory, names
+/// that directory and why, leaves what was published untouched, and answers a repeat of the action
+/// from the unknown outcome instead of cloning again.
 #[test]
 fn an_interrupted_publication_is_settled_unknown_by_a_recovery_that_reaches_nothing() {
     // The operation row's key is the caller's action identifier, and the staged object's identity
@@ -1054,6 +1096,10 @@ fn an_operation_that_never_published_is_closed_and_its_staging_named_without_bei
     assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
 }
 
+/// KR-REQ-14.19, the part about cancellation stopping owned subprocesses: a clone blocked on a
+/// connection that never answers ends with the owner-stopped code once the cancellation is
+/// requested, and the cancellation counts the subprocess it stopped. Not shown here: the report of
+/// retained and removed staging paths.
 #[test]
 fn a_cancellation_ends_the_subprocess_this_host_started() {
     // The one thing a cancellation has to do is stop the child. The endpoint is a listener on this
@@ -1137,6 +1183,10 @@ fn a_cancellation_ends_the_subprocess_this_host_started() {
     let _ = held.join();
 }
 
+/// KR-REQ-14.19, the part about reporting staging paths: the owner's cancellation of finished work
+/// undoes nothing and answers with the operation's completed state, no stopped process and the
+/// staging path the operation removed; another actor's cancellation is refused, and an unknown
+/// operation is not cancelled. Not shown here: the stopping of a running subprocess.
 #[test]
 fn a_cancellation_reaches_only_authorised_owned_work() {
     let fixture = Fixture::create();
@@ -1200,6 +1250,10 @@ fn a_cancellation_reaches_only_authorised_owned_work() {
     assert_eq!(refusal.code(), ErrorCode::ResourceUnavailable);
 }
 
+/// KR-REQ-14.18, the part about authorised destination handles: a destination that is not one name
+/// inside an absolute parent, with a separator, a traversal segment, an empty name or a relative
+/// parent, is refused, and so is a destination in another environment. Not shown here: a
+/// destination under a location the owner authorised.
 #[test]
 fn a_destination_is_one_name_inside_a_directory_this_host_holds_a_handle_to() {
     let fixture = Fixture::create();
@@ -2175,6 +2229,12 @@ fn replace_published(published: &Path, other: &Path, how: Replacement) {
 /// published one: the object at the destination is decided by the identity staged for it before
 /// Git is asked anything there, and nothing of what is there is audited. Nor is a directory inside
 /// what was published, which a path that became a link leads to.
+///
+/// KR-REQ-14.06, the part about identity being the staged object and not the path: another
+/// repository, or a directory inside the published one, that takes the destination's place after
+/// publication is not read as the published repository; the operation ends with an unknown outcome
+/// and no Git invocation starts there. Not shown here: a rename of a registered checkout, or a
+/// worktree.
 #[cfg(unix)]
 #[test]
 fn a_repository_that_takes_a_published_destinations_place_is_not_read_as_the_published_one() {
@@ -2230,6 +2290,10 @@ fn a_repository_that_takes_a_published_destinations_place_is_not_read_as_the_pub
 
 /// And so it does for a repository published beneath a location: what took the name after the
 /// publication is not read as the published one.
+///
+/// KR-REQ-14.06, the part about identity being the staged object and not the path: the same for a
+/// repository published beneath a location; another repository at its name is refused as an unknown
+/// outcome and no Git invocation starts there. Not shown here: a rename, or a worktree.
 #[cfg(unix)]
 #[test]
 fn a_repository_that_takes_a_published_places_beneath_a_location_is_not_read_as_the_published_one()
@@ -2283,6 +2347,11 @@ fn a_repository_that_takes_a_published_places_beneath_a_location_is_not_read_as_
 /// The same holds when an interrupted publication is finished: the first open of the destination
 /// fails for another reason, the host finishes the publication it reconciled, and what took the
 /// name in between is not read as the published repository either.
+///
+/// KR-REQ-14.06, the part about identity being the staged object and not the path: the same for a
+/// publication finished after its first open failed; another repository that took the name
+/// meanwhile is refused as an unknown outcome and no Git invocation starts there. Not shown here: a
+/// rename, or a worktree.
 #[cfg(unix)]
 #[test]
 fn a_repository_that_takes_the_place_of_a_publication_being_finished_is_not_read_as_it() {

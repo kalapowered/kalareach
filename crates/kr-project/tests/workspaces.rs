@@ -1,8 +1,6 @@
 //! Workspaces: the explicit choice, the inclusion preview, what a creation copies, and what a
 //! removal may take.
 //!
-//! KR-REQ-14.20, 14.21, 14.22, 23.43, 24.08.
-//!
 //! Every test here asks the project service to run Git. On Windows it runs none: an application
 //! container cannot keep a repository from being executed from and cannot bound which ports a
 //! remote operation reaches, so the service refuses there rather than claiming a boundary it does
@@ -65,6 +63,10 @@ fn count(preview: &kr_protocol::project::InclusionPreview, class: InclusionClass
     (row.total.get(), row.included.get())
 }
 
+/// KR-REQ-14.20, the part about the inclusion preview: a request for an isolated workspace with
+/// preview only counts each class of work by what exists and what the policy includes, names the
+/// paths of a sample and which are binary, states the limitations, and creates nothing. Not shown
+/// here: a shared workspace.
 #[test]
 fn a_preview_names_what_a_reviewer_would_see_and_creates_nothing() {
     let fixture = Fixture::create();
@@ -158,6 +160,10 @@ fn a_preview_names_what_a_reviewer_would_see_and_creates_nothing() {
     );
 }
 
+/// KR-REQ-14.20, the part about an isolated workspace selected explicitly: it is created as a Git
+/// worktree under the policy the request names, the dirty tracked file arrives with the user's
+/// content and the excluded classes do not, and the copied work is retained against its removal.
+/// Not shown here: the preview.
 #[test]
 fn an_isolated_workspace_copies_what_the_policy_includes_and_the_source_keeps_everything() {
     // KR-REQ-14.21: never clean, stash or discard untracked files to start a reviewer.
@@ -348,6 +354,10 @@ fn a_caller_bounded_by_a_grant_reaches_a_shared_workspace_only_through_a_source_
         .expect("the owner's shared workspace is the repository's own tree");
 }
 
+/// KR-REQ-14.20, the part about a shared workspace selected explicitly: a shared workspace is the
+/// repository's own tree at its own path, nothing is relocated, its preview includes every class as
+/// it is, and a request that asks it to exclude anything is refused. Not shown here: an isolated
+/// workspace.
 #[test]
 fn a_shared_workspace_is_the_users_own_tree_and_nothing_is_relocated() {
     let fixture = Fixture::create();
@@ -649,6 +659,11 @@ fn numbers_of(path: &std::path::Path) -> (i64, i64) {
     target_os = "linux",
     ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"
 )]
+/// KR-REQ-14.06, the part about identity including the filesystem: a registered repository is
+/// refused when another filesystem gives the directory at its path the inodes the registered one
+/// had, no Git invocation starts there, and the repository is accepted on the filesystem it was
+/// registered on. The case is ignored by default and run where a second filesystem can be made.
+/// Not shown here: a rename, or a worktree.
 fn a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers() {
     volumes::with_volumes(
         "a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers",
@@ -2136,6 +2151,12 @@ fn a_workspace_of_a_repository_registered_through_a_subdirectory_is_still_read()
 /// the directory it was registered through is not read as the registered one: it has the device
 /// number the recorded tree has, and only its own mount tells it from the tree it covers, so the
 /// climb from it to the recorded tree stops at the mount and no Git invocation starts in it.
+///
+/// KR-REQ-14.06, the part about identity including the filesystem: a directory bound over the
+/// parent of the directory a repository was registered through, with the device number the recorded
+/// tree has, is not read as the registered one, and no Git invocation starts in it. The case is ignored by
+/// default and run where a second filesystem can be made. Not shown here: a rename, or a
+/// worktree.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"]
@@ -2269,6 +2290,10 @@ fn top_of(top: &std::path::Path) -> std::path::PathBuf {
     target_os = "linux",
     ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"
 )]
+/// KR-REQ-14.06, the part about identity including the filesystem: another filesystem mounted over
+/// the directory a repository was registered through is not read as that directory, and no Git
+/// invocation starts in it. The case is ignored by default and run where a second filesystem can be
+/// made. Not shown here: a rename, or a worktree.
 fn a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it() {
     volumes::with_volumes(
         "a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it",
@@ -2662,6 +2687,15 @@ fn a_removal_is_refused_while_a_bound_session_is_live() {
     assert!(fixture.work().join("bound/README.md").is_file());
 }
 
+/// KR-REQ-14.22, the part about what a removal retains: a removal under the policy that cannot lose
+/// work leaves the workspace pending removal, removes nothing while dirty content, a pinned change
+/// set or review evidence is held, and says what is held; only the policy that names what it
+/// removes, which is the user's approval, removes the working files, and the record survives it.
+/// Not shown here: bound sessions or runs, or a retention policy the user selected for cleanup.
+///
+/// KR-REQ-24.08, the part about cleanup respecting pins: a pinned change set keeps the workspace's
+/// working files until the removal that names what it removes. Not shown here: that versions and
+/// partial progress survive the daemon's death.
 #[test]
 fn a_removal_keeps_dirty_content_a_pin_and_review_evidence_until_the_user_approves() {
     let fixture = Fixture::create();
@@ -3390,6 +3424,9 @@ fn a_path_this_host_cannot_read_is_excluded_by_an_exclusion_and_named_by_an_incl
     );
 }
 
+/// KR-REQ-14.22, the part about runs: a removal is refused while an automation run is bound to the
+/// workspace, a read names that run, and the run's end admits the removal. Not shown here: dirty
+/// content, pins or review evidence.
 #[test]
 fn a_live_automation_run_refuses_a_removal_as_a_live_session_does() {
     // Section 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace
@@ -3471,6 +3508,10 @@ fn a_live_automation_run_refuses_a_removal_as_a_live_session_does() {
     );
 }
 
+/// KR-REQ-14.22, the part about dirty content: work added inside a workspace after its creation
+/// keeps it, since the tree is measured before a removal decides, so a removal under the policy
+/// that keeps everything leaves the workspace pending removal and the new file in place. Not shown
+/// here: pins or review evidence.
 #[test]
 fn work_added_after_a_workspace_was_created_still_keeps_it() {
     // An empty retention table does not establish a clean tree. The tree is measured before a

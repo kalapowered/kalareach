@@ -1,8 +1,7 @@
 //! The owner's authorised locations: the policy, the held handles, the confirmation each decision
 //! needs and the binding of a repository to the source it is read through.
 //!
-//! KR-REQ-23.42 and 23.43 (the policy half: every name this host resolves through a location
-//! descends from a handle the owner authorised), KR-REQ-14.06.
+//! Every name this host resolves through a location descends from a handle the owner authorised.
 //!
 //! The owner's own location-bound path is here too: a clone and a workspace made through
 //! locations, the withdrawal that stops each at its next admission, and the metadata discovery
@@ -644,6 +643,16 @@ fn a_location_for_a_grant_is_confirmed_for_the_device_that_holds_it_and_admits_t
 
 /// A caller bounded by a grant clones, makes an isolated working copy and removes it, all through
 /// the locations the owner authorised for its grant, where every read it causes is bounded.
+///
+/// KR-REQ-23.42, the part about `project.clone` bounded by a grant: a caller bounded by a grant
+/// clones from a source location into a destination location the owner authorised for that grant,
+/// and the clone completes. Not shown here: a caller without the right, or a read outside a
+/// caller's scope.
+///
+/// KR-REQ-23.43, the part about `workspace.create` and `workspace.remove` bounded by a grant: the
+/// caller makes a working copy beneath a destination location the owner authorised for its grant
+/// and removes it through the location it was made through. Not shown here: a caller without
+/// `workspace.manage`, or a read.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_caller_bounded_by_a_grant_clones_makes_a_working_copy_and_removes_it_through_its_locations() {
@@ -2419,6 +2428,11 @@ fn withdrawal_survives_a_restart_and_owner_cleanup_works() {
 /// registered when its source is bound: the record takes the number the working tree has now, in
 /// the transaction that writes the binding. A working tree that is another object is refused under
 /// any number.
+///
+/// KR-REQ-14.06, the part about identity being the filesystem object: a repository whose recorded
+/// device number is stale is still the registered one when its source is bound, and the record
+/// takes the number the filesystem has now; a working tree that is another object is refused as a
+/// source that changed. Not shown here: a rename, or a worktree.
 #[cfg(unix)]
 #[test]
 fn a_repository_recorded_under_another_device_number_is_bound_to_the_source_that_reaches_it() {
@@ -2535,6 +2549,11 @@ fn a_bound_repository_recorded_under_other_device_numbers_is_cloned_from_and_wor
 /// A directory that is not the repository a source location is bound to is not read through it: a
 /// clone by registration and a workspace made through a location are each refused, and no Git
 /// invocation starts in that directory.
+///
+/// KR-REQ-14.06, the part about identity being the recorded object and not the path: when the
+/// record names another directory than the one at the bound path, a clone by registration and a
+/// workspace made through a location are each refused as a source that changed and no Git
+/// invocation starts there. Not shown here: a rename, or a worktree.
 #[cfg(unix)]
 #[test]
 fn a_directory_that_is_not_the_bound_repository_is_not_read_through_its_source() {
@@ -4026,6 +4045,10 @@ fn attaching_a_different_source_root_keeps_creation_provenance() {
     );
 }
 
+/// KR-REQ-14.06, the part about renames: after the parent of a bound source is moved out of its
+/// location and another repository put in its place, a clone by registration is refused as a source
+/// that changed and nothing is cloned; a repository recorded outside a location and then moved
+/// inside it is not bound through the location. Not shown here: a worktree.
 #[test]
 fn source_parent_rename_cannot_fabricate_containment() {
     // A source S in a parent P beneath a location's root R. The binding names S's object: once P
@@ -4202,6 +4225,9 @@ fn recursive_alternates_are_bounded_and_acyclic() {
     assert!(refused.contains("deep"), "{refused}");
 }
 
+/// KR-REQ-14.06, the part about worktrees: discovery through a location refuses a main tree whose
+/// Git directory carries the backlink of a linked tree, and a linked tree whose `.git` file names
+/// an absolute Git directory. Not shown here: a rename, or a record of one tree covering another.
 #[test]
 fn an_ordinary_linked_worktree_is_refused_through_a_location() {
     // A linked worktree's `.git` file names an absolute Git directory, and its repository carries
