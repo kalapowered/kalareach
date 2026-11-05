@@ -562,3 +562,37 @@ fn a_send_another_command_recorded_meanwhile_stays_in_the_record() {
     assert_eq!(removed, Settled::Removed);
     assert!(files(&drafts).is_empty());
 }
+
+/// KR-REQ-11.63: the uncertain send a later send names is the newest by the host's record of it,
+/// and then by identifier, whatever order the record lists the sends in.
+#[test]
+fn the_send_a_later_send_names_is_the_newest_by_the_hosts_record_and_then_by_identifier() {
+    use super::{Earlier, SendState};
+
+    let unknown = |at: u64| SendState::Unknown {
+        revision: 3,
+        updated_at_ms: TimestampMs::new(at),
+    };
+    // The record lists the send the host wrote last first.
+    let earlier = Earlier {
+        sends: vec![
+            (action(1), unknown(9_000)),
+            (action(2), unknown(5_000)),
+            (action(3), SendState::NoRecord),
+        ],
+    };
+    assert_eq!(
+        earlier.quote().map(|quote| quote.action_id),
+        Some(action(1))
+    );
+    // Written at the same time, the greater identifier is the newer, listed in either order.
+    for sends in [
+        vec![(action(7), unknown(5_000)), (action(4), unknown(5_000))],
+        vec![(action(4), unknown(5_000)), (action(7), unknown(5_000))],
+    ] {
+        assert_eq!(
+            Earlier { sends }.quote().map(|quote| quote.action_id),
+            Some(action(7))
+        );
+    }
+}

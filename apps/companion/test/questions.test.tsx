@@ -430,6 +430,50 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
     })
   })
 
+  it('reads the kept answers again when a new answer is refused because the question ended', async () => {
+    const { port, controls } = fakeHost()
+    let keptReads = 0
+    const counted: HostPort = {
+      ...port,
+      questionKept: () => {
+        keptReads += 1
+        return port.questionKept()
+      }
+    }
+    render(
+      <AppProvider port={counted} initialPlace={{ view: 'attention' }}>
+        <App />
+      </AppProvider>
+    )
+    const question = await questionAbout(WHICH_BRANCH)
+    const person = userEvent.setup()
+    await person.click(within(question).getByRole('radio', { name: 'main' }))
+    act(() => {
+      controls.questions.setReachable(false)
+    })
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    await screen.findByTestId('kept-answer')
+
+    // Contact is back and someone else answered the question. The next reads of the questions are
+    // held, so the page still offers it, and the person answers it again.
+    const held = controls.hold('questionRead')
+    act(() => {
+      controls.questions.setReachable(true)
+      controls.questions.answerElsewhere(QUESTION_SELECT)
+    })
+    const again = await questionAbout(WHICH_BRANCH)
+    await person.click(within(again).getByRole('radio', { name: 'main' }))
+    const before = keptReads
+    await person.click(within(again).getByRole('button', { name: 'Send answer' }))
+    await screen.findByTestId('question-ended')
+    // The refusal removed the answer kept before it, and the page reads what is kept at once.
+    expect(keptReads).toBeGreaterThan(before)
+    await waitFor(() => {
+      expect(screen.queryByTestId('kept-answer')).toBeNull()
+    })
+    held.release()
+  })
+
   it('shows an earlier send that ended uncertain, and the Send it now press names it', async () => {
     const { controls } = start()
     const question = await questionAbout(WHICH_BRANCH)

@@ -310,6 +310,9 @@ export function QuestionRequests({
             [question.question_id]: { question, words, chosen: answerWords(made.answer, question) }
           }))
           setForms((current) => without(current, question.question_id))
+          // The refusal of a new answer removed the answer kept before it: the kept answers are
+          // read again, as for any other refusal.
+          keptChanged()
           return
         }
         setRefusals((current) => ({ ...current, [question.question_id]: words }))

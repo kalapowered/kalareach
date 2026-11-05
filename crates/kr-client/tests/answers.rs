@@ -1625,6 +1625,54 @@ async fn a_cleanup_after_a_late_arrival_leaves_an_answer_stored_meanwhile() {
     );
 }
 
+/// KR-REQ-11.63: when the send the host took was made by another command, a refused send is not
+/// reported as refused because an earlier send of its own answer landed. The refusal is reported as
+/// it is, and the answer the other command stored stays kept with the sends it carries.
+#[tokio::test]
+async fn a_send_another_command_made_is_not_reported_as_an_earlier_one_the_host_took() {
+    let (_directory, drafts) = store();
+    let asked = question(72);
+    let host = Host::with(vec![asked.clone()]);
+    host.line(Line::Lost);
+    answer_via(&host, &drafts, &asked, yes(), 5_000)
+        .await
+        .outcome
+        .expect("kept");
+    let a = host.dispatches()[0].action_id;
+    let lost = host.answers()[0].clone();
+    host.line(Line::Up);
+
+    // Another command stores its own answer, and the host takes that command's send first.
+    let theirs = action(0xc9);
+    *host.late.lock().expect("the lock") = Some((theirs, lost));
+    let replacement = AnswerDraft {
+        version: ANSWER_FORMAT,
+        target: target(),
+        session_id: asked.session_id,
+        question_id: asked.question_id,
+        question_revision: asked.revision,
+        answer: no(),
+        drafted_at_ms: TimestampMs::new(7_000),
+    };
+    let other = drafts.clone();
+    let stored = replacement.clone();
+    *host.on_answer.lock().expect("the lock") = Some(Box::new(move || {
+        begin_with(&other, &stored, theirs);
+    }));
+
+    let refused = answer_via(&host, &drafts, &asked, no(), 6_000)
+        .await
+        .outcome
+        .expect_err("the send was refused, and no send of its own answer was taken");
+    assert_eq!(refused.code(), ErrorCode::QuestionResolved, "{refused:?}");
+    let (kept, basis) = drafts
+        .entry(asked.question_id)
+        .expect("reads")
+        .expect("the other command's answer is still kept");
+    assert_eq!(kept, replacement);
+    assert!(basis.sends().contains(&a) && basis.sends().contains(&theirs));
+}
+
 /// KR-REQ-11.63: a retirement decided from a reading of the pair that another command has since
 /// replaced removes nothing, and the report says the pair changed rather than that the answer is
 /// gone.

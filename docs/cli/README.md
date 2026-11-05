@@ -1208,10 +1208,12 @@ stopped it. What the command says of the answer is what its attempt established,
 it did not send it, that the worker did not take it, or that whether the worker took it is not
 known. It never calls an answer unsent when it may have arrived. A reply that is not a message came
 after the answer went out, so the answer stays kept and the command says that whether the worker
-took it is not known; its code is that of the reply that could not be read. A new answer replaces
+took it is not known; its code is that of the failure to read the reply. A new answer replaces
 the answer kept earlier for its question as soon as it is recorded. If the worker then refuses the
-new answer in its own word, no answer is kept for the question, unless an earlier send of it is
-still unsettled, and then the new answer is the one kept.
+new answer in its own word, the new answer stays kept while an earlier send of it is unsettled, and
+otherwise no answer is kept for the question. A refusal because the question ended or was answered
+removes the new answer once the worker could say what became of each earlier send; if it could not,
+the answer stays kept.
 
 When the answer cannot be written to this device, the command sends nothing, says so, and says
 whether an answer kept earlier for the question is still kept. It exits with 1, or with 9 when an
@@ -1248,7 +1250,9 @@ answer as offered, waiting, unlisted, unsettled, taken or retired.
 `kr question drafts` sends nothing, however often it runs. `kr question send` is the one way a kept
 answer is sent. It reads the question once more, asks the worker about every send already made, and
 sends the answer only while that question is still what the person answered. An answer whose outcome
-was not known is found taken by the next reading if it did arrive, so it is never sent twice.
+was not known is found taken by the next reading if it did arrive, and that reading does not send it
+again. A send made while an earlier one was still on its way can reach the worker after it, and the
+worker then takes one of the two and refuses the other as answered; the command says so.
 
 The worker refuses a later answer from the same caller while a send of the caller's has an outcome
 the worker could not establish, unless the new send names it. `kr question answer` and `kr question
@@ -1257,9 +1261,10 @@ the `earlier` member of their `--json` document, which a failed send carries too
 records at most eight sends whose outcome is not settled. A ninth is not sent, and the answer is
 retired once its question ends. A send the worker refused in its own word leaves the record at once.
 When `kr question send` cannot send the answer, the failure keeps its own code and says the answer
-is still kept. An answer that `kr question answer` gives to a question that ended or moved before
-the answer reached it is not sent, and the command says whether an answer kept for that question
-earlier is still kept.
+is still kept. A `kr question answer` for a question that has ended or moved when the command reads
+it sends nothing, and says whether an answer kept for that question earlier is still kept. A send
+that the worker refuses because the question was answered meanwhile has reached the worker, and the
+command reports the refusal.
 
 A kept answer is retired as gone only on the word of the daemon of the environment its session ran
 in: a closure its registry keeps, or, for a session with no descriptor, no record of the session at

@@ -1695,7 +1695,7 @@ async fn answered<H: QuestionHost + Sync, K: Keeper + Sync>(
             }
             if ended(&failure.error)
                 && !carried.is_empty()
-                && let Some(taken) = ended_after_send(host, drafts, &draft, kept).await?
+                && let Some(taken) = ended_after_send(host, drafts, &draft, kept, &carried).await?
             {
                 return Ok(Answered::TakenAfterRefusal {
                     taken,
@@ -1723,12 +1723,14 @@ fn ended(error: &ClientError) -> bool {
 /// reason, so every send still in the record is read again: one the host took is reported and the
 /// pair removed, and otherwise the pair is removed only when no read failed. `sent` is the digest
 /// of the answer this call sent: an answer another command stored meanwhile is not this one, and
-/// stays.
+/// stays. `carried` are the earlier sends this call knew of: only one of those is reported as the
+/// earlier send the host took, and a send another command made is not.
 async fn ended_after_send<H: QuestionHost>(
     host: &H,
     drafts: &AnswerDrafts,
     draft: &AnswerDraft,
     sent: Digest256,
+    carried: &[ActionId],
 ) -> Result<Option<ActionId>> {
     let basis = drafts.basis(draft.question_id)?;
     let ours = basis.draft() == Some(sent);
@@ -1737,7 +1739,7 @@ async fn ended_after_send<H: QuestionHost>(
     } else {
         learn(host, draft.session_id, basis.sends()).await
     };
-    if let Some(taken) = again.taken() {
+    if let Some(taken) = again.taken().filter(|taken| carried.contains(taken)) {
         if ours {
             let _ = drafts.remove_if_unchanged(draft.question_id, &basis);
         }
@@ -1954,7 +1956,7 @@ async fn sent<H: QuestionHost + Sync, K: Keeper + Sync>(
                 settle_own(keeper, drafts, draft.question_id, digest, action_id, false);
             }
             if ended(&failure.error)
-                && let Some(taken) = ended_after_send(host, drafts, draft, digest).await?
+                && let Some(taken) = ended_after_send(host, drafts, draft, digest, &carried).await?
             {
                 return Ok(Answered::TakenAfterRefusal {
                     taken,

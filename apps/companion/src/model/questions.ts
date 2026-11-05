@@ -167,7 +167,7 @@ export function standingWords(standing: Standing): string {
     case 'taken':
       return `The host took an earlier send of an answer to this question while its reply was lost (action ${standing.action_id}). This device sent nothing again, and will not.`
     case 'unsettled':
-      return 'This answer is not settled: the host could not be asked what became of an earlier send of it, or it changed while it was read. This device will not send it now.'
+      return 'This question ended or changed, and the host could not be asked what became of an earlier send of this answer. This device will not send it now.'
     case 'unlisted':
       return 'The session does not list this question, and nothing says the session ended. This device has sent nothing since.'
     case 'ended':

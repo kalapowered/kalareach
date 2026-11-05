@@ -312,10 +312,24 @@ export class ScriptedQuestions implements FakeQuestions {
       ]
       return { outcome: 'kept', draft }
     }
-    return this.#take(shown, asked.expected_revision, asked.answer)
+    return this.#take(shown, asked.expected_revision, asked.answer, true)
   }
 
-  #take(shown: Question, revision: string, answer: QuestionAnswer): AnswerOutcome {
+  /**
+   * Takes an answer to a question. A new answer that the question's end refuses has replaced the
+   * answer kept for it, and the refusal removes that one too: `replacing` says so.
+   */
+  #take(
+    shown: Question,
+    revision: string,
+    answer: QuestionAnswer,
+    replacing = false
+  ): AnswerOutcome {
+    const ended =
+      shown.state === 'answered' || shown.state === 'cancelled' || shown.state === 'expired'
+    if (ended && replacing) {
+      this.#kept = this.#kept.filter((each) => each.question_id !== shown.question_id)
+    }
     if (shown.state === 'answered' || shown.state === 'cancelled') {
       refuse('QUESTION_RESOLVED', `This question is already ${shown.state}.`)
     }

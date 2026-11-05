@@ -1319,11 +1319,13 @@ async fn the_send_of_a_kept_answer_names_the_newest_uncertain_send() {
     let kr_cbor::CanonicalValue::Map(quoted) = quoted.into_value() else {
         panic!("preconditions are a map");
     };
-    assert!(
-        quoted
-            .get(kr_protocol::action::SUPERSEDES_ACTION_KEY)
-            .is_some(),
-        "the send names the newest uncertain one"
+    let named = quoted
+        .get(kr_protocol::action::SUPERSEDES_ACTION_KEY)
+        .and_then(|value| kr_cbor::from_canonical_value::<kr_protocol::ids::ActionId>(value).ok());
+    assert_eq!(
+        named,
+        Some(newer),
+        "the send names the newest uncertain one by the host's record of it"
     );
     link.answer(&call, &resolution(&worker, QuestionState::Answered))
         .await;
