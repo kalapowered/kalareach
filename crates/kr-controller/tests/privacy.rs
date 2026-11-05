@@ -2536,8 +2536,9 @@ async fn kr_req_24_28_a_repeated_clearing_is_answered_from_its_record_without_ge
 /// may view it is answered from the record. One that may not is told only that the outcome is
 /// unknown, the same for a name and for a refusal.
 ///
-/// Shown here: the rename right, and view authority over what a retained rename answer says. Not
-/// shown here: the create, read and close rights, or the filter of `session.describe`.
+/// Shown here: that the rename right alone admits a rename, and view authority over what a
+/// retained rename answer says. Not shown here: the create and close rights, view authority for
+/// `session.list`, `session.read` or `session.describe`, or the filter of `session.describe`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_34_a_repeated_rename_is_answered_only_under_view_authority_over_its_session() {
     let environment = Environment::start().await;
