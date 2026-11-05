@@ -278,8 +278,9 @@ fn grant_params(
 /// the owner's confirmation, and its generation is synchronised, listed and pinned; an install is
 /// on the hash the verified generation declares, and the capability evidence names that hash. Not
 /// shown here: the refusal of a device without `host.manage`, a root added under a confirmation
-/// that is no owner device's, enlarged trust, the repository's budget or ceiling, the environment
-/// and binding checks, or scoped read authority for capability queries.
+/// that is no owner device's, enlarged trust, the repository's budget or ceiling, an install on a
+/// hash the generation does not declare, the environment and binding checks, or scoped read
+/// authority for capability queries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_23_28_and_23_29_a_paired_device_reaches_every_catalogue_and_plugin_method() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -591,6 +592,11 @@ async fn kr_req_23_28_and_23_29_a_paired_device_reaches_every_catalogue_and_plug
 /// a host that has no account and selects no managed service, and the host trusts and reads it. The
 /// repository is a directory on the machine, as a person's own is; before and after, the host
 /// holds no account and names each managed integration as one it does without.
+///
+/// KR-REQ-23.28, the success path of adding and synchronising a root only: `catalogue.add` under
+/// the owner's confirmation of the root, and `catalogue.sync` to its first generation, answer a
+/// device that holds `host.manage`. Not shown here: that `host.manage` or the confirmation is
+/// required, enlarged trust, the repository's budget, or the other catalogue methods.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_26_42_an_owner_adds_a_private_plugin_repository_to_a_host_with_no_account() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -680,10 +686,11 @@ async fn a_catalogue_mutation_from_a_device_names_an_environment_and_never_a_ses
 ///
 /// Both groups are admitted at this ingress, so what keeps a device out of them is the rights its
 /// grant carries. Every mutation and `catalogue.list` require `host.manage`; `plugin.list` and
-/// `plugin.capabilities` require no right at all, and a device that holds none still reads them.
+/// `plugin.capabilities` require no right at all, and a device without `host.manage` still reads
+/// them.
 ///
 /// Shown here: `catalogue.list`, `catalogue.sync`, `catalogue.remove` and `plugin.enable` require
-/// `host.manage`, and `plugin.list` answers a device that holds no right but refuses an
+/// `host.manage`, and `plugin.list` answers a device without `host.manage` but refuses an
 /// environment this daemon does not own. Not shown here: the other catalogue and plugin mutations,
 /// scoped read authority for `plugin.capabilities`, the repository's root, generation and budget,
 /// the owner's confirmation, or the package hash, ceiling and binding checks.
