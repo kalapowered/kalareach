@@ -1,9 +1,9 @@
 //! A paired device delegating a narrower grant from the one it holds, over real paired connections.
 //!
-//! What these demonstrate: KR-REQ-18.03 (delegation narrows what the delegator holds and no
-//! more; a device revokes only what descends from a grant it holds) and KR-REQ-23.49 (the sharing
-//! method group over a paired device: `grant.create`, `grant.revoke` and `grant.list`, each decided
-//! under a share the device holds). Nothing here starts a worker, so every answer is the daemon's.
+//! What these demonstrate: delegation narrows what the delegator holds and no more, and a device
+//! revokes only what descends from a grant it holds; the sharing method group over a paired device,
+//! `grant.create`, `grant.revoke` and `grant.list`, each decided under a share the device holds.
+//! Nothing here starts a worker, so every answer is the daemon's.
 
 mod net_support;
 

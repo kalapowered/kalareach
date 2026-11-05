@@ -1,11 +1,11 @@
 //! Handing a session's control to another paired device, over real paired connections.
 //!
 //! The person at this machine asks the host to describe the transfer, an owner device answers the
-//! challenge, and `grant.transfer` spends that answer once. What these demonstrate: KR-REQ-18.03
-//! (transfer of control is not a delegation: the receiving device holds the session, the giving
-//! device does not) and KR-REQ-23.49 (the sharing method group: the transfer is confirmed by the
-//! owner for exactly this plan, fenced through the barrier, and answered again, never performed
-//! again, to a repeat). Nothing here starts a worker, so every answer is the daemon's own.
+//! challenge, and `grant.transfer` spends that answer once. What these demonstrate: transfer of
+//! control is not a delegation, so the receiving device holds the session and the giving device
+//! does not; and, in the sharing method group, the transfer is confirmed by the owner for exactly
+//! this plan, fenced through the barrier, and answered again, never performed again, to a repeat.
+//! Nothing here starts a worker, so every answer is the daemon's own.
 
 mod net_support;
 

@@ -1,9 +1,8 @@
 //! Review work from captured change sets, through a real daemon.
 //!
-//! Requirement rows exercised here: KR-REQ-14.35 (a review acknowledgement binds the version it was
-//! made against, a later version is new review work, and promotion stays a separate authorised
-//! action) and KR-REQ-25.04 (what changed since the last visit, and a review that changes no Git
-//! state).
+//! A review acknowledgement binds the version it was made against, a later version is new review
+//! work, and promotion stays a separate authorised action; and what changed since the last visit is
+//! told, and a review changes no Git state.
 //!
 //! A change set is captured through `changeset.capture` by a client of the daemon, for a session
 //! the daemon holds: a worker it adopted at its start, which is the product's own worker over a

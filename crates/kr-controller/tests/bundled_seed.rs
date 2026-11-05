@@ -1,6 +1,6 @@
 //! The daemon binary seeds its catalogue from the generation compiled into it.
 //!
-//! KR-REQ-04.15, KR-REQ-12.01: a fresh installation has the bundled adapters' packages installed
+//! A fresh installation has the bundled adapters' packages installed
 //! with no repository enrolled and nothing fetched. A build with debug assertions trusts the
 //! development lineage's root, which anybody can sign with, so its daemon seeds only when it is
 //! started with `--seed` and a test that starts it and expects an empty catalogue is not changed
