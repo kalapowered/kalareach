@@ -4392,11 +4392,11 @@ impl Idle {
     }
 }
 
-/// KR-REQ-26.10, KR-REQ-26.13: an update to the release that writes the next versions goes ahead over
-/// an environment the release after this one left: its registry is at the schema after this build's
-/// and its configuration document at the version after this build's. Neither is carried or rewritten,
-/// and the registry is read as it is to class its workers, as the release before reads it on the
-/// way back.
+/// KR-REQ-26.10, KR-REQ-26.13: an update to the release that writes the next versions goes ahead
+/// over an environment the release after this one left: its registry is at the schema after this
+/// build's and its configuration document at the version after this build's. Neither is carried or
+/// rewritten, and the registry is read as it is to class its workers, as the release before reads
+/// it on the way back.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_update_back_to_the_release_that_wrote_the_next_versions_reads_them_as_they_are() {

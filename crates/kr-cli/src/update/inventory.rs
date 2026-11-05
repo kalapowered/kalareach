@@ -252,9 +252,8 @@ pub async fn described(environment: &EnvironmentPaths) -> Vec<Stated> {
 /// It is the registry's own migration, the one a daemon's start runs, and nothing else: a registry
 /// at the schema this release reads, or the next one it reads through, is not migrated, and one
 /// this cannot bring forward, because it records a schema past that, no schema or several, or is
-/// not a file, is left for [`classify`]'s
-/// reader to refuse in its own words. A registry that lost a table its records are read from is
-/// refused here, by the table's name.
+/// not a file, is left for [`classify`]'s reader to refuse in its own words. A registry that lost
+/// a table its records are read from is refused here, by the table's name.
 ///
 /// # Errors
 ///

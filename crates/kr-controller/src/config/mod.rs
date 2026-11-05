@@ -69,8 +69,8 @@ pub fn recorded(document: Option<&configuration::ConfigurationDocument>) -> Opti
 /// # Errors
 ///
 /// Returns the state the record is in when this build cannot use it: a version it does not read, a
-/// member it does not know, a value the validation refuses, a level it does not read, or text that
-/// is no document.
+/// member it does not know, a value the validation refuses, a level that is malformed or lower
+/// than its sections need, or text that is no document.
 pub fn from_record(
     recorded: Option<&str>,
 ) -> std::result::Result<Option<configuration::ConfigurationDocument>, configuration::DocumentState>

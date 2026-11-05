@@ -26,11 +26,11 @@
 //!   section of the host configuration document, a stored file read by level, which the build
 //!   lists above the level the earlier release's stored-format lock records (the run says each
 //!   section it passes, because the comparison cannot tell a section from a restriction). A new
-//!   method is a variant added to `Method` that is one plain string constant, whose name no variant of
-//!   the earlier release had and no other variant has (a host of the same level answers a method
-//!   it does not list with `PERMISSION_DENIED`, and a client that meets that refusal for a method
-//!   that is new asks the host a method its level has before it takes the refusal for a lack of
-//!   rights);
+//!   method is a variant added to `Method` that is one plain string constant, whose name no
+//!   variant of the earlier release had and no other variant has (a host of the same level answers
+//!   a method it does not list with `PERMISSION_DENIED`, and a client that meets that refusal for
+//!   a method that is new asks the host a method its level has before it takes the refusal for a
+//!   lack of rights);
 //! * the plugin SDK schema, from the committed file of each release and of this commit, held to
 //!   the same rule. The file is generated, and `kr-plugin-sdk-gen --check` holds the committed
 //!   one equal to the generated one. A release of the level without the file, or a file that does
@@ -213,7 +213,10 @@ pub fn configuration_level_at(repository: &Path, commit: &str) -> Result<u64, St
     let text = file_at(repository, commit, LOCK_PATH)
         .map_err(|error| format!("{LOCK_PATH} at {commit} cannot be read: {error}"))?
         .ok_or_else(|| {
-            format!("{commit} has no {LOCK_PATH}, so the level of its configuration document is not known")
+            format!(
+                "{commit} has no {LOCK_PATH}, so the level of its configuration document is not \
+                 known"
+            )
         })?;
     let lock: Value = serde_json::from_str(&text)
         .map_err(|error| format!("{LOCK_PATH} at {commit} does not read: {error}"))?;
@@ -231,7 +234,10 @@ pub fn configuration_level_at(repository: &Path, commit: &str) -> Result<u64, St
         .and_then(Value::as_u64)
         .filter(|level| *level >= 1)
         .ok_or_else(|| {
-            format!("{LOCK_PATH} at {commit} records no level of the configuration document, or one that is not a whole number of at least 1")
+            format!(
+                "{LOCK_PATH} at {commit} records no level of the configuration document, or one \
+                 that is not a whole number of at least 1"
+            )
         })
 }
 
