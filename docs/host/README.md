@@ -4164,7 +4164,8 @@ request of that method. A receipt that a migration left without a subject digest
 kept no envelope, or one this build cannot read) holds back every request of its method by its
 actor, since no subject says which ask it was; for the five methods above, an envelope this build
 can read still decides. Every uncertain request of a method also holds back a request of that method
-whose parameters do not parse, as the rule above does. Every other method keeps the rule above.
+whose parameters do not parse, as the rule above does. Every other method keeps the rule above, with
+the addition for a receipt that has no subject digest.
 
 When a subject carries several uncertain outcomes, a request has to show the one the journal
 recorded last. For the five methods above that is the last recorded of the outcomes that hold the
