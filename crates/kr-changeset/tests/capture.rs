@@ -1,6 +1,11 @@
 //! `changeset.capture`: the immutable version, the consistency classes, the grants and the
 //! secrets.
 //!
+//! A capture makes an immutable, identified version of a change set with an explicit workspace;
+//! the exact captured version is delivered while the source keeps changing, and later revisions
+//! stay visible beside it. The consistency class is recorded and a concurrent change is retried or
+//! rejected; inclusion rules and file grants apply before capture, and secrets are excluded.
+//!
 //! Every test here asks the project service to run Git, which it does not do on Windows: an
 //! application container there cannot keep a repository from being executed from, so the service
 //! refuses rather than claiming a boundary it does not have.
