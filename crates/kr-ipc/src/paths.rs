@@ -5168,7 +5168,7 @@ mod tests {
 
     /// KR-REQ-26.13: on Windows the question is asked of the file's access-control list: a
     /// configuration file that the Everyone group may write is refused with the list's reason, and a
-    /// file only its owner may reach is read. `WD` is the Everyone group and `OW` the owner.
+    /// file only its owner may reach is accepted. `WD` is the Everyone group and `OW` the owner.
     #[cfg(windows)]
     #[test]
     fn a_configuration_file_another_account_may_write_is_refused_on_windows() {
