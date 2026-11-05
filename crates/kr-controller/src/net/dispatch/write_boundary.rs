@@ -3448,6 +3448,42 @@ async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written(
     };
     assert_eq!(unknown.code, kr_protocol::error::ErrorCode::OutcomeUnknown);
     assert_eq!(unknown.message, super::outcome_not_shown().message);
+    // A result is unknown to the one and the other. What tells them apart is an answer that says
+    // the action did not happen, which the edits make larger: it is refused as too large to an
+    // action's device, and unknown when it was kept, so that a device that may not read it cannot
+    // tell it from a result.
+    let refused = ControlFrame::Response(Response {
+        request_id: RequestId::new(9),
+        outcome: Outcome::Error(kr_protocol::error::ProtocolError::new(
+            kr_protocol::error::ErrorCode::DraftConflict,
+            "/Users/ric/work",
+        )),
+    });
+    let refused_before = size(&refused);
+    assert!(size(&shown(&refused)) > refused_before);
+    for (answers, code) in [
+        (
+            Answers::Action,
+            kr_protocol::error::ErrorCode::InvalidArgument,
+        ),
+        (Answers::Kept, kr_protocol::error::ErrorCode::OutcomeUnknown),
+    ] {
+        let stream = HeldStream::new(false);
+        stream.writer.add_permits(2);
+        let limited = output_receiving(&controller, &stream, &receiving(refused_before));
+        assert_eq!(
+            limited.write_held(&refused, &[], None, answers, None).await,
+            Written::Sent
+        );
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Error(told),
+            ..
+        }) = stream.frames().remove(0)
+        else {
+            panic!("the refused answer was written although it no longer fits");
+        };
+        assert_eq!(told.code, code);
+    }
     // A notification has no request to refuse, so the connection ends with nothing written.
     let limited = output_receiving(&controller, &stream, &receiving(notice_before));
     assert!(!limited.send(&notice).await);
