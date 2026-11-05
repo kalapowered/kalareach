@@ -136,11 +136,12 @@ struct InFlight {
     request: Option<RequestId>,
     /// The revision its answer named, once it has one and until a screen naming it arrives.
     awaiting: Option<u64>,
-    /// The number of the last move it carries, when it carries any.
+    /// The number of the last move it carries, when it carries any. A report that carries none
+    /// carries the size.
     carries: Option<u64>,
-    /// The size last sent before this report, when it carries a new size: what the view owes again
-    /// if the host does not take the report.
-    size_before: Option<Dimensions>,
+    /// Whether the page measured or moved after this report went: a word the view does not rest
+    /// from, whatever the host answers.
+    page_spoke: bool,
 }
 
 /// A move that has settled inside the view, waiting to be told to the page.
@@ -187,6 +188,10 @@ pub struct WindowReports {
     untold: VecDeque<Untold>,
     /// The newest move the page has been told is settled.
     told: u64,
+    /// Whether the newest size is owed to the host whatever the size last sent was, because a
+    /// report of it was not settled. The host may have the size of that report, so even the size
+    /// last sent has to be said again.
+    size_owed: bool,
     /// Whether a size the host did not take for now waits for something to arrive before it goes
     /// again, so that a host that keeps saying so is not asked in a loop.
     resting: bool,
@@ -210,6 +215,7 @@ impl WindowReports {
             taken: 0,
             untold: VecDeque::new(),
             told: 0,
+            size_owed: false,
             resting: false,
             not_taken_in_a_row: 0,
         }
@@ -230,10 +236,14 @@ impl WindowReports {
         }
     }
 
-    /// The page spoke: a new start for whatever waits.
+    /// The page spoke: a new start for whatever waits. A report in flight is told, so that its
+    /// answer does not make the page's word wait.
     const fn page_spoke(&mut self) {
         self.resting = false;
         self.not_taken_in_a_row = 0;
+        if let Some(flight) = self.in_flight.as_mut() {
+            flight.page_spoke = true;
+        }
     }
 
     /// The page moved the window. A move whose number is not above the last one taken is not one
@@ -327,7 +337,7 @@ impl WindowReports {
         if screen.is_none() && self.installed.is_some() {
             return None;
         }
-        let (sending, carries, size_before) = if self.size == self.size_sent {
+        let (sending, carries) = if self.size == self.size_sent && !self.size_owed {
             let screen = screen?;
             loop {
                 let run = self.runs.front().copied()?;
@@ -342,7 +352,6 @@ impl WindowReports {
                                     column: record.column,
                                 },
                                 Some(number),
-                                None,
                             );
                         }
                         // A window on the live screen stays where it is.
@@ -363,7 +372,6 @@ impl WindowReports {
                                         column,
                                     },
                                     Some(last),
-                                    None,
                                 );
                             }
                             None => self.untold.push_back(Untold {
@@ -382,15 +390,15 @@ impl WindowReports {
                     column: record.column,
                 },
                 None,
-                Some(self.size_sent),
             )
         };
         self.size_sent = sending.dimensions;
+        self.size_owed = false;
         self.in_flight = Some(InFlight {
             request: None,
             awaiting: None,
             carries,
-            size_before,
+            page_spoke: false,
         });
         Some(sending)
     }
@@ -412,8 +420,9 @@ impl WindowReports {
     /// The session answered the report in flight.
     ///
     /// A definite refusal settles it and changes nothing. An answer that is neither that nor an
-    /// acceptance settles a move the same way, but not a size: that is not marked sent, and goes
-    /// again with the next word from the host or the page. An acceptance settles it once a screen
+    /// acceptance settles a move the same way, but not a size: the newest size is owed again, with
+    /// the next word from the host or the page, or at once when the page spoke while the report was
+    /// in flight. An acceptance settles it once a screen
     /// naming its revision, or a later one, has arrived, whether that screen came before the answer
     /// or comes after it.
     pub fn answered(&mut self, answer: Answer) {
@@ -440,22 +449,23 @@ impl WindowReports {
 
     /// The host did not take the report in flight for now, or could not say what became of it.
     fn not_taken(&mut self) {
-        let Some(InFlight {
-            size_before: Some(before),
-            ..
-        }) = self.in_flight
-        else {
+        let Some(flight) = self.in_flight else {
+            return;
+        };
+        if flight.carries.is_some() {
             // A move is the person's gesture, and is not made later on their behalf: it is settled
             // as not taken, and they move again.
             self.not_taken_in_a_row = 0;
             self.settle(None);
             return;
-        };
-        // The size was not taken, so it was not sent: it is owed again, after something arrives.
+        }
+        // A size the host did not take is not settled: the newest size is owed again, whatever the
+        // size last sent was, since the host may have taken the one this report carried. It waits
+        // for something to arrive, unless the page spoke while the report was in flight.
         self.in_flight = None;
-        self.size_sent = before;
+        self.size_owed = true;
         self.not_taken_in_a_row = self.not_taken_in_a_row.saturating_add(1);
-        self.resting = true;
+        self.resting = !flight.page_spoke;
     }
 
     /// The report in flight settled: the moves it carried changed the window to `revision`, or
