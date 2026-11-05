@@ -1501,8 +1501,9 @@ async fn kr_req_19_08_a_connection_that_already_acts_for_something_is_not_opened
     adopted.stop().await;
 }
 
-/// A repeated action reaches a worker through a link the host scope does not have: it is refused
-/// by kind, the worker is not asked again, and what it did once stays done once.
+/// A repeated action reaches a worker through a link the host scope does not have: the worker is
+/// not asked again, what it did once stays done once, and the device is told that the outcome of
+/// its action is unknown and not that the repeat was refused, as the action was performed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_19_08_a_repeat_on_the_host_scope_reaches_no_worker() {
     let adopted = Adopted::start(1).await;
@@ -1560,7 +1561,7 @@ async fn kr_req_19_08_a_repeat_on_the_host_scope_reaches_no_worker() {
                 )
                 .await
         ),
-        ErrorCode::InvalidArgument
+        ErrorCode::OutcomeUnknown
     );
     assert_eq!(upstream.prompts(), vec!["once".to_owned()]);
     host_scoped.close();

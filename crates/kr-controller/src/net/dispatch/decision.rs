@@ -19,7 +19,7 @@ use crate::service::net::lifetimes::GrantStanding;
 
 use super::acting::{Acting, Held};
 use super::output::{Answers, RELAY_DECISIONS, ReadUnder, Written};
-use super::{RemoteConnection, failure};
+use super::{RemoteConnection, after_the_outcome, failure, outcome_not_shown};
 
 /// One request of this connection's as the host decided it: what was asked, and the decision,
 /// which carries the time bounds the request stands on. What is cut from the decision ends by
@@ -179,7 +179,19 @@ impl RemoteConnection {
                     asked = again.answering(asked.shown_as);
                     asked.read_under = read_under;
                 }
-                Err(error) => return self.output.send(&failure(request_id, error)).await,
+                // The decision made again refuses what the answer was cut for. An action the
+                // worker carried out is not refused for that: its answer is not shown, and the
+                // device is told the outcome is unknown. So is a device refused an answer kept
+                // from an earlier submission, whatever the answer was: that it was a refusal is
+                // not for a device that may not read it.
+                Err(error) => {
+                    let error = match asked.answers() {
+                        Answers::Action => after_the_outcome(&frame, error),
+                        Answers::Kept => outcome_not_shown(),
+                        Answers::Read | Answers::Nothing => error,
+                    };
+                    return self.output.send(&failure(request_id, error)).await;
+                }
             }
         }
         self.output

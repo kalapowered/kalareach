@@ -139,7 +139,8 @@ async fn kr_req_10_49_a_device_is_shown_a_question_it_answers_as_far_as_its_auth
 /// was performed on: a device that may view it and whose history reaches the question reads the
 /// receipt and the question, and a device that may respond and not view is refused, and so is a
 /// retry of its answer, which is also a read of the receipt. A device is told nothing of what its
-/// action produced by presenting it again once the right to view the session is gone.
+/// action produced by presenting it again once the right to view the session is gone: the read is
+/// refused, and the retry, which the worker took, is told that its outcome is unknown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_34_an_action_is_read_by_its_identifier_only_under_view_authority_over_its_session()
  {
@@ -202,8 +203,8 @@ async fn kr_req_23_34_an_action_is_read_by_its_identifier_only_under_view_author
         } else {
             let denied = read.expect_err("a device that may not view is not told what it did");
             assert_eq!(denied.code, ErrorCode::PermissionDenied, "{denied}");
-            let denied = retried.expect_err("nor by presenting it again");
-            assert_eq!(denied.code, ErrorCode::PermissionDenied, "{denied}");
+            let unknown = retried.expect_err("nor by presenting it again");
+            assert_eq!(unknown.code, ErrorCode::OutcomeUnknown, "{unknown}");
         }
         device.connection.close();
     }

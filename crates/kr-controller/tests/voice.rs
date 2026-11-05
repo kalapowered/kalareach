@@ -2076,7 +2076,8 @@ async fn a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed() {
 /// KR-REQ-09.12 and 26.16: a retry is answered from its record only under the admission this host
 /// asks where a retained answer goes back. A paired device's voice change completes and the same
 /// action is answered from its record; once this host owes a fence it could not raise, the same
-/// action submitted again is refused rather than answered, with the fence's own refusal.
+/// action submitted again is not answered, and its device is told that the outcome of the change
+/// is unknown, as the change was written.
 ///
 /// Finding the record waits, and section 23 has the host check current authority before a retained
 /// receipt goes back. The check is the one every service asks from inside its work, asked without a
@@ -2141,11 +2142,7 @@ async fn a_retry_is_not_answered_from_its_record_while_a_fence_is_owed() {
         .expect_err("a fence owed stops the retained answer");
     assert_eq!(
         refused.code,
-        kr_protocol::error::ErrorCode::PermissionDenied,
-        "{refused:?}"
-    );
-    assert!(
-        refused.message.contains("could not be raised"),
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
         "{refused:?}"
     );
     clear_the_fault(&registry);
@@ -2155,7 +2152,8 @@ async fn a_retry_is_not_answered_from_its_record_while_a_fence_is_owed() {
 
 /// KR-REQ-09.12 and 26.16: the admission is asked after the record is found and not only before it
 /// is looked for. The retry is stopped at the place its answer has been found and has not been
-/// given, and this host comes to owe a fence there: the answer is refused. A check made before the
+/// given, and this host comes to owe a fence there: the answer is not given, and the device is
+/// told the outcome of its grant is unknown, as the grant was written. A check made before the
 /// lookup would have asked while the fence was not yet owed, and the answer would go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_retry_is_not_answered_when_a_fence_is_owed_while_its_record_is_found() {
@@ -2204,15 +2202,11 @@ async fn a_retry_is_not_answered_when_a_fence_is_owed_while_its_record_is_found(
             registry
         }
     );
-    let refused = retried.expect_err("a fence owed while its record was found stops the answer");
+    let withheld = retried.expect_err("a fence owed while its record was found stops the answer");
     assert_eq!(
-        refused.code,
-        kr_protocol::error::ErrorCode::PermissionDenied,
-        "{refused:?}"
-    );
-    assert!(
-        refused.message.contains("could not be raised"),
-        "{refused:?}"
+        withheld.code,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{withheld:?}"
     );
     clear_the_fault(&registry);
     raw.close();

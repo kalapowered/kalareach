@@ -50,8 +50,9 @@ use std::sync::atomic::AtomicBool;
 
 use kr_protocol::actor::ActorEnvelope;
 use kr_protocol::envelope::{ControlFrame, Outcome, Response};
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::{ErrorCode, ProtocolError, RetryCategory};
 use kr_protocol::ids::{AuthorityRevision, ConnectionId, DeviceId, GrantId, RequestId};
+use kr_protocol::receipt::ReceiptState;
 use kr_transport::actor::ConnectionActor;
 use kr_transport::listener::AuthorisedSession;
 
@@ -364,6 +365,64 @@ fn failure(request_id: RequestId, error: ProtocolError) -> ControlFrame {
         request_id,
         outcome: Outcome::Error(error),
     })
+}
+
+/// Whether `refusal` is a definite word that the action it answers did not happen.
+///
+/// A client keeps an action it sent when the answer is `OUTCOME_UNKNOWN` or a transient failure,
+/// and takes any other refusal as the host's word that nothing was done.
+fn is_definite(refusal: &ProtocolError) -> bool {
+    !matches!(
+        refusal.code.retry_category(),
+        RetryCategory::Transient | RetryCategory::OutcomeUnknown
+    )
+}
+
+/// Whether `answer`, the host's answer to an action, leaves it possible that the action took
+/// effect: its result, or a word that does not say it did not happen.
+fn may_have_taken_effect(answer: &ControlFrame) -> bool {
+    match answer {
+        ControlFrame::Response(Response {
+            outcome: Outcome::Ok(_),
+            ..
+        }) => true,
+        ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        }) => !is_definite(error),
+        // A receipt says what became of the action, and only a refusal or a rejection says that
+        // nothing did.
+        ControlFrame::Receipt(response) => !matches!(
+            response.receipt.state,
+            ReceiptState::Refused | ReceiptState::Rejected
+        ),
+        _ => false,
+    }
+}
+
+/// What a device is told when this host will not show it what became of an action that was, or may
+/// have been, carried out.
+///
+/// The refusal to show it is about what the device may be shown, not about the action. A client
+/// takes a definite refusal for the host's word that nothing was done and drops the action, so the
+/// person would be told the action did not happen when it did.
+fn outcome_not_shown() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::OutcomeUnknown,
+        "this action may have been carried out, and this host does not show this device what \
+         became of it",
+    )
+}
+
+/// What a device is told when this host refuses, after it holds `answer` to an action, to show it
+/// that answer: [`outcome_not_shown`] when the answer leaves it possible that the action took
+/// effect, and `refusal` when the answer says it did not.
+fn after_the_outcome(answer: &ControlFrame, refusal: ProtocolError) -> ProtocolError {
+    if may_have_taken_effect(answer) {
+        outcome_not_shown()
+    } else {
+        refusal
+    }
 }
 
 #[cfg(test)]
