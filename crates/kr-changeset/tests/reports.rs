@@ -1,4 +1,4 @@
-//! KR-REQ-25.06: test reports in a documented format are parsed, and said to be parsed.
+//! Test reports in a documented format are parsed, and said to be parsed.
 //!
 //! The reader is held to what real tools wrote (`tests/fixtures/reports`, each recorded from the
 //! tool its name gives) and to the documents a hostile suite could write instead.
