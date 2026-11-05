@@ -2105,12 +2105,17 @@ nothing was changed. A host that does not answer the repeated request, or a conn
 after it was sent, leaves the outcome unknown: the command says so, with `OUTCOME_UNKNOWN`, and
 exits 1, because the host refused nothing. A host that says it cannot take the request now, with a
 transient code, has not refused it either: the command asks again at the next second, and if the
-challenge ends first, exits with that code. A host that answers `OUTCOME_UNKNOWN` ends the wait with
-that answer, and the request is not made again, because it may have been performed. A host that
-does not answer one of the requests before it, for the budgets, for the challenge and for what the
-owner device is shown, within thirty seconds changed nothing, and the command exits 3. If the host has no owner device
-yet, it says so at once and names `kr pair invite --owner`. A host that is not on the network has no
-owner device to ask and returns `HOST_NOT_CONFIGURED`: select a network and restart it.
+challenge ends first, exits with that code. The host spends the owner device's answer before it
+performs the request, so a request can be refused for now after the spend; the next request is then
+told that the owner has to confirm, and when the host no longer lists the challenge, or does not say
+what it lists, the command ends at once with the earlier refusal instead of waiting for the end of
+the challenge. A host that
+answers `OUTCOME_UNKNOWN` ends the wait with that answer, and the request is not made again, because
+it may have been performed. A host that does not answer one of the requests before it, for the
+budgets, for the challenge and for what the owner device is shown, within thirty seconds changed
+nothing, and the command exits 3. If the host has no owner device yet, it says so at once and
+names `kr pair invite --owner`. A host that is not on the network has no owner device to ask and
+returns `HOST_NOT_CONFIGURED`: select a network and restart it.
 
 The second decision is an installation that may do more than the one it replaces or, with none to
 replace, more than its repository permits by itself, and every release that installs a native bridge
