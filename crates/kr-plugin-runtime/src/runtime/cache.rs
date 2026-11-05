@@ -358,7 +358,8 @@ impl CompiledCache {
 
     /// Loads a cached component, or says there is none.
     ///
-    /// The `unsafe` block is this crate's only one, and it is handed the very bytes
+    /// The `unsafe` block is this crate's only one outside the Windows read of a thread's processor
+    /// time, and it is handed the very bytes
     /// [`Self::verify`] checked rather than a path to read again. `deserialize_file` would be the
     /// obvious call here and is the wrong one twice over: it reopens the file, so the bytes it
     /// loads need not be the bytes that were checked, and it maps the file for the component's

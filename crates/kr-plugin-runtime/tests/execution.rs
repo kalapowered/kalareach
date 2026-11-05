@@ -21,28 +21,33 @@ use kr_plugin_runtime::runtime::engine::{ENGINE_VERSION, RuntimeEngine};
 use kr_plugin_runtime::runtime::error::ExhaustedBound;
 use kr_plugin_runtime::runtime::instance::{CallOutcome, Instance};
 use kr_plugin_runtime::runtime::limits::InstanceLimiter;
+use kr_plugin_runtime::runtime::thread_time::with_scripted_thread_cpu_time;
 use kr_plugin_sdk::limits::{
     FAULTS_BEFORE_DISABLE, INSTANCE_MEMORY_BYTES, OBSERVATION_QUEUE_BYTES, OUTPUT_BYTES_PER_CALL,
 };
 use kr_plugin_service::vocabulary::{Admission, BindingFacts, MAX_NODE_BYTES};
 
-/// How long a test waits for a compile. Generous: a machine under load is not the case under test.
-const COMPILE_WAIT: core::time::Duration = core::time::Duration::from_secs(60);
+/// How long a test waits for a compile, or for the instantiation after one. A compile runs at
+/// background priority, so a machine that other work keeps busy leaves it a hundredth of a processor
+/// or less and it takes tens of minutes; a case decides by what the compile comes to, never by this,
+/// which ends only a compile that never does.
+const COMPILE_WAIT: core::time::Duration = core::time::Duration::from_secs(60 * 60);
 
 /// How long a case waits for what a binding's thread does before it calls that a failure. Nothing
 /// is decided by it: the waits are on conditions, and this ends only a binding that never gets
 /// there.
 const LIVENESS: core::time::Duration = core::time::Duration::from_secs(60);
 
-/// The compile budget of a case that is not about how long a compile may take: the host's own size
-/// bound and no time bound.
+/// The compile budget of a case that is not about how much work a compile may do: the host's own
+/// size bound and no bound on processor time.
 ///
-/// A compile takes as long as the machine it runs on lets it, and past the host's time bound its
-/// result is refused as too slow. A machine kept off the CPU for half a minute reaches that, and no
-/// case that shows what a compile makes, files or refuses is about it.
-fn no_compile_time_bound() -> CompileBudget {
+/// What a compile costs is the processor time its thread uses, which a busy machine does not raise,
+/// but a platform that does not say what a thread used holds the budget to the clock, and a machine
+/// kept off the CPU for half a minute reaches the host's bound there. No case that shows what a
+/// compile makes, files or refuses is about it.
+fn no_compile_work_bound() -> CompileBudget {
     CompileBudget {
-        deadline_ms: u64::MAX,
+        processor_ms: u64::MAX,
         ..CompileBudget::defaults()
     }
 }
@@ -58,7 +63,7 @@ struct Host {
 fn host() -> Host {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let mut config = RuntimeConfig::new(directory.path().join("plugin-cache"));
-    config.compile = no_compile_time_bound();
+    config.compile = no_compile_work_bound();
     let runtime = Runtime::new(config).expect("a runtime");
     Host {
         _directory: directory,
@@ -73,7 +78,7 @@ fn host() -> Host {
 fn held_host() -> Host {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let mut config = RuntimeConfig::new(directory.path().join("plugin-cache"));
-    config.compile = no_compile_time_bound();
+    config.compile = no_compile_work_bound();
     let runtime = Runtime::with_epoch_held(config).expect("a runtime");
     Host {
         _directory: directory,
@@ -102,7 +107,7 @@ fn instance_on(
         directory.path().join("plugin-cache"),
     )
     .expect("a cache");
-    let compiled = compile_or_load(engine, &cache, wasm, no_compile_time_bound())
+    let compiled = compile_or_load(engine, &cache, wasm, no_compile_work_bound())
         .expect("the component compiles");
     let instance = Instance::new(
         engine,
@@ -226,7 +231,7 @@ fn kr_req_04_07_a_component_has_explicit_capabilities_only() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(directory.path().join("c"))
         .expect("a cache");
-    let compiled = compile_or_load(&engine, &cache, &wasm, no_compile_time_bound())
+    let compiled = compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
         .expect("the component compiles");
 
     let permitted = kr_plugin_runtime::runtime::imports::permitted_imports();
@@ -258,7 +263,7 @@ fn kr_req_11_40_an_ambient_import_is_refused_and_named() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(directory.path().join("c"))
         .expect("a cache");
-    let error = compile_or_load(&engine, &cache, &wasm, no_compile_time_bound())
+    let error = compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
         .expect_err("a component with ambient imports is refused");
     let RuntimeError::ForbiddenImport { import } = &error else {
         panic!("the refusal was not about an import: {error}");
@@ -848,12 +853,12 @@ fn kr_req_11_41_compilation_is_cached_by_hash_and_engine() {
     )
     .expect("a cache");
 
-    let first = compile_or_load(&engine, &cache, &wasm, no_compile_time_bound())
+    let first = compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
         .expect("the component compiles");
     assert_eq!(first.origin, CompileOrigin::Compiled);
 
     // The same bytes under the same engine come back rather than being compiled again.
-    let second = compile_or_load(&engine, &cache, &wasm, no_compile_time_bound())
+    let second = compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
         .expect("the component loads");
     assert_eq!(second.origin, CompileOrigin::Cached);
     assert_eq!(first.key, second.key);
@@ -862,7 +867,7 @@ fn kr_req_11_41_compilation_is_cached_by_hash_and_engine() {
     let Some(other) = components::component("slow-compile") else {
         return;
     };
-    let different = compile_or_load(&engine, &cache, &other, no_compile_time_bound())
+    let different = compile_or_load(&engine, &cache, &other, no_compile_work_bound())
         .expect("the other component compiles");
     assert_ne!(different.key.wasm_digest, first.key.wasm_digest);
     assert_eq!(different.origin, CompileOrigin::Compiled);
@@ -971,7 +976,7 @@ fn kr_req_11_41_a_cache_another_engine_release_filed_is_compiled_again() {
     // A host that starts afresh over that directory finds nothing under its own engine, so it
     // compiles, and no earlier entry is loaded, refused or touched.
     let restarted = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root).expect("a cache");
-    let compiled = compile_or_load(&engine, &restarted, &wasm, no_compile_time_bound())
+    let compiled = compile_or_load(&engine, &restarted, &wasm, no_compile_work_bound())
         .expect("the component compiles");
     assert_eq!(compiled.origin, CompileOrigin::Compiled);
     for (key, (artefact, manifest)) in earlier.iter().zip(&held) {
@@ -987,7 +992,7 @@ fn kr_req_11_41_a_cache_another_engine_release_filed_is_compiled_again() {
 
     // And the entry this engine filed is the one it loads the next time.
     let again = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root).expect("a cache");
-    let loaded = compile_or_load(&engine, &again, &wasm, no_compile_time_bound())
+    let loaded = compile_or_load(&engine, &again, &wasm, no_compile_work_bound())
         .expect("the component loads");
     assert_eq!(loaded.origin, CompileOrigin::Cached);
 }
@@ -1026,7 +1031,7 @@ fn kr_req_11_41_a_cache_another_target_filed_is_compiled_again() {
     // A host that starts afresh over that directory finds nothing under its own target, so it
     // compiles, and the other target's entry is neither loaded, refused nor touched.
     let restarted = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root).expect("a cache");
-    let compiled = compile_or_load(&engine, &restarted, &wasm, no_compile_time_bound())
+    let compiled = compile_or_load(&engine, &restarted, &wasm, no_compile_work_bound())
         .expect("the component compiles");
     assert_eq!(compiled.origin, CompileOrigin::Compiled);
     assert_eq!(
@@ -1039,7 +1044,7 @@ fn kr_req_11_41_a_cache_another_target_filed_is_compiled_again() {
     );
 
     // And this target's entry is the one it loads the next time.
-    let loaded = compile_or_load(&engine, &restarted, &wasm, no_compile_time_bound())
+    let loaded = compile_or_load(&engine, &restarted, &wasm, no_compile_work_bound())
         .expect("the component loads");
     assert_eq!(loaded.origin, CompileOrigin::Cached);
 }
@@ -1105,11 +1110,11 @@ fn kr_req_11_41_an_entry_another_engine_release_made_is_refused_and_compiled_aga
 
     // The refusal is the entry's and not the binding's: the component compiles, the refused entry
     // goes, and what is filed in its place loads. The earlier release's own entry stays as it was.
-    let compiled = compile_or_load(&engine, &restarted, &wasm, no_compile_time_bound())
+    let compiled = compile_or_load(&engine, &restarted, &wasm, no_compile_work_bound())
         .expect("the component compiles");
     assert_eq!(compiled.origin, CompileOrigin::Compiled);
     let again = kr_plugin_runtime::runtime::cache::CompiledCache::open(&root).expect("a cache");
-    let loaded = compile_or_load(&engine, &again, &wasm, no_compile_time_bound())
+    let loaded = compile_or_load(&engine, &again, &wasm, no_compile_work_bound())
         .expect("the component loads");
     assert_eq!(loaded.origin, CompileOrigin::Cached);
     assert_eq!(
@@ -1130,7 +1135,7 @@ fn kr_req_11_41_a_downloaded_artefact_is_never_deserialised() {
         directory.path().join("plugin-cache"),
     )
     .expect("a cache");
-    let compiled = compile_or_load(&engine, &cache, &wasm, no_compile_time_bound())
+    let compiled = compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
         .expect("the component compiles");
     let artefact = std::fs::read(cache.artefact_path(&compiled.key)).expect("the artefact");
 
@@ -1386,21 +1391,24 @@ async fn kr_req_11_41_a_compile_is_queued_and_the_caller_goes_on_while_it_is_not
     assert_eq!(compiled.origin, CompileOrigin::Compiled);
 }
 
-// KR-REQ-11.41: a compile that takes longer than the compile time bound is refused with the bound
-// named, and its result is discarded rather than filed.
+// KR-REQ-11.41: a compile that uses more processor time than the compile bound is refused with the
+// bound named, and its result is discarded rather than filed.
 //
 // The bound is nothing, so the component is past it however fast the machine is: compiling a
-// component of this size takes at least a millisecond. What follows is the same component compiled
-// again, because the refused one was not filed in the cache that the next preparation reads.
+// component of this size takes the thread some processor time. What follows is the same component
+// compiled again, because the refused one was not filed in the cache that the next preparation
+// reads. On Windows a thread's times advance with the scheduler's accounting, which a compile of a
+// millisecond may not move, so this case reads the platform's clock where that is nanoseconds.
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_11_41_a_compile_past_the_compile_time_bound_is_refused_and_not_filed() {
+async fn kr_req_11_41_a_compile_past_the_compile_bound_is_refused_and_not_filed() {
     let Some(wasm) = components::component("slow-compile") else {
         return;
     };
     let directory = tempfile::tempdir().expect("a temporary directory");
     let mut config = RuntimeConfig::new(directory.path().join("plugin-cache"));
     config.compile = CompileBudget {
-        deadline_ms: 0,
+        processor_ms: 0,
         ..CompileBudget::defaults()
     };
     let runtime = Runtime::new(config).expect("a runtime");
@@ -1411,7 +1419,7 @@ async fn kr_req_11_41_a_compile_past_the_compile_time_bound_is_refused_and_not_f
         .wait(COMPILE_WAIT)
         .await
         .expect_err("a compile past the bound is refused");
-    let RuntimeError::CompilationTooSlow { budget_ms, .. } = error else {
+    let RuntimeError::CompilationOverBudget { budget_ms, .. } = error else {
         panic!("the refusal was {error:?}");
     };
     assert_eq!(budget_ms, 0, "the refusal names the bound it was held to");
@@ -1420,9 +1428,229 @@ async fn kr_req_11_41_a_compile_past_the_compile_time_bound_is_refused_and_not_f
         runtime.engine(),
         runtime.cache(),
         &wasm,
-        no_compile_time_bound(),
+        no_compile_work_bound(),
     )
     .expect("the component compiles");
+    assert_eq!(
+        again.origin,
+        CompileOrigin::Compiled,
+        "the refused compile was filed all the same"
+    );
+}
+
+// KR-REQ-11.41: the compile bound is on the work the compile did and not on the clock, so a compile
+// that a busy machine kept off the processor is accepted and filed when its work was within the
+// bound.
+//
+// The calling thread's processor-time clock is scripted to say that the compile used nothing, and
+// the bound is nothing; the compile itself takes the clock more than that, as any real compile of
+// this component does. A bound held to the clock refuses it, which is what a thread starved of the
+// processor met. What follows is the same component loaded, because the accepted compile was filed.
+#[test]
+fn kr_req_11_41_a_compile_kept_off_the_processor_is_held_to_the_work_it_did() {
+    let Some(wasm) = components::component("slow-compile") else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(directory.path().join("c"))
+        .expect("a cache");
+    let engine = engine();
+    let nothing = CompileBudget {
+        processor_ms: 0,
+        ..CompileBudget::defaults()
+    };
+
+    let compiled = with_scripted_thread_cpu_time(
+        || Some(core::time::Duration::from_millis(5)),
+        || compile_or_load(&engine, &cache, &wasm, nothing),
+    )
+    .expect("a compile that used no processor time is within a bound of none");
+    assert_eq!(compiled.origin, CompileOrigin::Compiled);
+
+    let loaded = compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
+        .expect("the component loads");
+    assert_eq!(
+        loaded.origin,
+        CompileOrigin::Cached,
+        "the accepted compile was not filed"
+    );
+}
+
+// KR-REQ-11.41: where the platform does not say what a thread has used, the budget is held to the
+// clock.
+//
+// The calling thread's processor-time clock is scripted to say nothing, and the bound is nothing,
+// so the compile is past it however fast the machine is: compiling a component of this size takes
+// the clock some time.
+#[test]
+fn kr_req_11_41_where_a_platform_does_not_say_what_a_thread_used_the_budget_is_held_to_the_clock() {
+    let Some(wasm) = components::component("slow-compile") else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(directory.path().join("c"))
+        .expect("a cache");
+    let engine = engine();
+    let nothing = CompileBudget {
+        processor_ms: 0,
+        ..CompileBudget::defaults()
+    };
+
+    let error =
+        with_scripted_thread_cpu_time(|| None, || compile_or_load(&engine, &cache, &wasm, nothing))
+            .expect_err("a compile past the bound on the clock is refused");
+    assert!(
+        matches!(
+            error,
+            RuntimeError::CompilationOverBudget { budget_ms: 0, .. }
+        ),
+        "the refusal was {error:?}"
+    );
+}
+
+// KR-REQ-11.41: a component loaded from the cache is held to the same budget as one compiled.
+//
+// The component is compiled once with no bound, which files it. It is then loaded under the host's
+// bound while the calling thread's processor-time clock is scripted to say that the load used 31
+// seconds, and the load is refused with the work it came to.
+#[test]
+fn kr_req_11_41_a_load_that_used_more_than_the_bound_is_refused() {
+    let Some(wasm) = components::component("well-behaved") else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(directory.path().join("c"))
+        .expect("a cache");
+    let engine = engine();
+    compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
+        .expect("the component compiles");
+    assert!(
+        cache.resident_component(&key_for(&engine, &wasm)).is_some(),
+        "the compile was not filed, so the call below would not be a load"
+    );
+
+    let mut readings = 0_u64;
+    let error = with_scripted_thread_cpu_time(
+        move || {
+            readings += 1;
+            Some(core::time::Duration::from_secs(if readings == 1 {
+                0
+            } else {
+                31
+            }))
+        },
+        || compile_or_load(&engine, &cache, &wasm, CompileBudget::defaults()),
+    )
+    .expect_err("a load that used more than the bound is refused");
+    assert!(
+        matches!(
+            error,
+            RuntimeError::CompilationOverBudget {
+                used_ms: 31_000,
+                budget_ms: 30_000
+            }
+        ),
+        "the refusal was {error:?}"
+    );
+}
+
+// KR-REQ-11.41: the processor time the budget counts is that of the compiling thread, and of no
+// other thing: a thread that waits uses none, however long it waits and whatever other threads do.
+//
+// One thread reads its processor time and waits. Another spins until its own processor time has
+// advanced 300 ms, and says how far it did. The waiting thread then reads its processor time again,
+// and what it used while it waited is far less than what the other used. A clock that ran with the
+// wall, or with the process, would show it nearly the same.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+))]
+#[test]
+fn kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time() {
+    use kr_plugin_runtime::runtime::thread_time::thread_cpu_time;
+
+    let (said, hears) = std::sync::mpsc::channel::<core::time::Duration>();
+    let (read, go) = std::sync::mpsc::channel::<()>();
+    let waiting = std::thread::spawn(move || {
+        let before = thread_cpu_time().expect("this platform reads a thread's processor time");
+        read.send(()).expect("the other thread is there");
+        let used_elsewhere = hears.recv().expect("the other thread said how far it spun");
+        let after = thread_cpu_time().expect("this platform reads a thread's processor time");
+        (after.saturating_sub(before), used_elsewhere)
+    });
+    let spinning = std::thread::spawn(move || {
+        // Not before the other thread has read its clock, so that it is waiting while this spins.
+        go.recv().expect("the other thread read its clock");
+        let from = thread_cpu_time().expect("this platform reads a thread's processor time");
+        let mut sum = 0_u64;
+        let mut used = core::time::Duration::ZERO;
+        // A clock that never reaches 300 ms ends the loop by its count, and the case fails on the
+        // figures it reads.
+        for _ in 0..1_000_000 {
+            for step in 0..10_000_u64 {
+                sum = sum.wrapping_add(std::hint::black_box(step));
+            }
+            used = thread_cpu_time()
+                .expect("this platform reads a thread's processor time")
+                .saturating_sub(from);
+            if used >= core::time::Duration::from_millis(300) {
+                break;
+            }
+        }
+        std::hint::black_box(sum);
+        said.send(used).expect("the waiting thread is there");
+    });
+    spinning.join().expect("the spinning thread ended");
+    let (waited, spun) = waiting.join().expect("the waiting thread ended");
+    assert!(
+        waited.saturating_mul(4) < spun,
+        "the waiting thread used {waited:?} while the other used {spun:?}"
+    );
+}
+
+// KR-REQ-11.41: a compile that did too much work is still refused, and not filed, whatever the
+// clock says.
+//
+// The calling thread's processor-time clock is scripted to say that the compile used 31 seconds
+// against the host's bound of 30, when the clock itself passed a fraction of that. The refusal names
+// the figure the work came to, and the same component compiles again afterwards because the
+// refused one was not filed.
+#[test]
+fn kr_req_11_41_a_compile_that_did_more_work_than_the_bound_is_refused_and_not_filed() {
+    let Some(wasm) = components::component("slow-compile") else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(directory.path().join("c"))
+        .expect("a cache");
+    let engine = engine();
+
+    let mut readings = 0_u64;
+    let error = with_scripted_thread_cpu_time(
+        move || {
+            readings += 1;
+            Some(core::time::Duration::from_secs(if readings == 1 {
+                0
+            } else {
+                31
+            }))
+        },
+        || compile_or_load(&engine, &cache, &wasm, CompileBudget::defaults()),
+    )
+    .expect_err("a compile that did more work than the bound is refused");
+    let RuntimeError::CompilationOverBudget { used_ms, budget_ms } = error else {
+        panic!("the refusal was {error:?}");
+    };
+    assert_eq!(
+        (used_ms, budget_ms),
+        (31_000, 30_000),
+        "the refusal names the work done and the bound"
+    );
+
+    let again = compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
+        .expect("the component compiles");
     assert_eq!(
         again.origin,
         CompileOrigin::Compiled,
@@ -1728,7 +1956,7 @@ fn a_component_this_process_compiled_is_served_from_memory() {
     )
     .expect("a cache");
 
-    let first = compile_or_load(&engine, &cache, &wasm, no_compile_time_bound())
+    let first = compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
         .expect("the component compiles");
     assert_eq!(first.origin, CompileOrigin::Compiled);
     assert_eq!(cache.resident(), 1);
@@ -1738,14 +1966,14 @@ fn a_component_this_process_compiled_is_served_from_memory() {
     // question of provenance arises for it, because no file is read.
     std::fs::remove_file(cache.artefact_path(&first.key)).expect("the artefact is removed");
     std::fs::remove_file(cache.manifest_path(&first.key)).expect("the manifest is removed");
-    let second = compile_or_load(&engine, &cache, &wasm, no_compile_time_bound())
+    let second = compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
         .expect("the component loads");
     assert_eq!(second.origin, CompileOrigin::Cached);
 
     // Removing the entry removes the one in memory too, so a later load is a real miss.
     cache.remove(&first.key).expect("the entry is removed");
     assert_eq!(cache.resident(), 0);
-    let third = compile_or_load(&engine, &cache, &wasm, no_compile_time_bound())
+    let third = compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
         .expect("the component compiles again");
     assert_eq!(third.origin, CompileOrigin::Compiled);
 }
@@ -1763,7 +1991,7 @@ async fn a_replacement_after_a_fault_is_bound_to_the_current_revision() {
         directory.path().join("plugin-cache"),
     )
     .expect("a cache");
-    let compiled = compile_or_load(&engine, &cache, &wasm, no_compile_time_bound())
+    let compiled = compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
         .expect("the component compiles");
     let mut instance = Instance::new(
         &engine,

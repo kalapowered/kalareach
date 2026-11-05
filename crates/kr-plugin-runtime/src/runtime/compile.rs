@@ -16,16 +16,29 @@
 //! * **Size.** A component larger than [`MAX_COMPONENT_BYTES`] is refused before any work starts.
 //!   Machine code is a multiple of its input, so bounding the input is what bounds the memory a
 //!   compile can take.
-//! * **Time.** A compile that finishes outside [`CompileBudget::deadline_ms`] has its result
-//!   discarded and reports how long it took. Cranelift cannot be interrupted part way, so this is
-//!   a threshold on accepting a result rather than a cap on the work: an over-budget compile is
-//!   not used and not cached, and the caller is told the figure. What bounds the resources already
-//!   spent is the size bound above and the pool below.
+//! * **Work.** A compile that uses more than [`CompileBudget::processor_ms`] of its own thread's
+//!   processor time has its result discarded and reports how much it used. Cranelift cannot be
+//!   interrupted part way, so this is a threshold on accepting a result rather than a cap on the
+//!   work: an over-budget compile is not used and not cached, and the caller is told the figure.
+//!   What bounds the resources already spent is the size bound above and the pool below.
+//!
+//! The work is counted in processor time and not on the clock because the two are not the same
+//! thing on a host other work keeps busy. A pool thread runs at background priority, so on such a
+//! host it is kept off the processor for most of the time its compile takes, and a budget held to
+//! the clock would refuse a component for how busy the host was. Refusing it would also leave the
+//! worker to offer the component again, and each offer would start the same compile over. Where the
+//! platform does not say what a thread has used ([`crate::runtime::thread_time`]), the budget is
+//! held to the clock. The figure is the compile thread's alone, which is the whole of the work
+//! because Wasmtime is built here without its parallel-compilation feature (the workspace's
+//! dependency list leaves it off); a build that turned it on would have the compile's work done on
+//! threads this figure does not see.
 //!
 //! The caller has a deadline of its own on top of both, and it is the one that matters to anything
 //! waiting: [`crate::runtime::binding::Runtime::prepare`] bounds the whole preparation -- the
 //! compile, the instantiation and `bind` -- and answers when that runs out, whatever the pool is
-//! still doing.
+//! still doing. That deadline is on the clock, because a caller waits on the clock. A compile it
+//! stopped waiting for goes on and files its result when it is within budget, so the next
+//! preparation of the component finds it.
 //!
 //! The pool itself is the third bound. It has a fixed number of threads and a bounded queue, so a
 //! host that is asked to prepare a hundred bindings at once compiles a few at a time and refuses
@@ -60,6 +73,7 @@ use crate::runtime::cache::{CacheKey, CompiledCache};
 use crate::runtime::engine::RuntimeEngine;
 use crate::runtime::error::{RuntimeError, RuntimeResult};
 use crate::runtime::imports;
+use crate::runtime::thread_time::thread_cpu_time;
 
 /// The largest component this host will compile.
 ///
@@ -79,8 +93,9 @@ pub const COMPILE_QUEUE: usize = 8;
 pub struct CompileBudget {
     /// The largest component that will be compiled at all.
     pub max_bytes: u64,
-    /// How long a compile may take before its result is discarded.
-    pub deadline_ms: u64,
+    /// How much of its own thread's processor time a compile may use before its result is
+    /// discarded, in milliseconds.
+    pub processor_ms: u64,
 }
 
 impl CompileBudget {
@@ -89,7 +104,7 @@ impl CompileBudget {
     pub const fn defaults() -> Self {
         Self {
             max_bytes: MAX_COMPONENT_BYTES,
-            deadline_ms: COMPILE_DEADLINE_MS,
+            processor_ms: COMPILE_DEADLINE_MS,
         }
     }
 }
@@ -395,24 +410,18 @@ pub fn compile_or_load(
         });
     }
     let key = key_for(engine, wasm);
-    let started = std::time::Instant::now();
+    let meter = Meter::start();
 
     match cache.load(engine.engine(), &key) {
         Ok(Some(component)) => {
             imports::check(&component, engine.engine())?;
-            let elapsed_ms = elapsed_ms(started);
-            // The budget covers obtaining a component, not only compiling one. A load that took
-            // longer than a compile is allowed to take is a load this host does not accept either.
-            if elapsed_ms > budget.deadline_ms {
-                return Err(RuntimeError::CompilationTooSlow {
-                    elapsed_ms,
-                    budget_ms: budget.deadline_ms,
-                });
-            }
+            // The budget covers obtaining a component, not only compiling one. A load that used
+            // more than a compile is allowed to use is a load this host does not accept either.
+            meter.within(budget)?;
             return Ok(Compiled {
                 component,
                 origin: CompileOrigin::Cached,
-                elapsed_ms,
+                elapsed_ms: meter.elapsed_ms(),
                 key,
             });
         }
@@ -435,13 +444,7 @@ pub fn compile_or_load(
                 detail: format!("{error:#}"),
             }
         })?;
-    let elapsed_ms = elapsed_ms(started);
-    if elapsed_ms > budget.deadline_ms {
-        return Err(RuntimeError::CompilationTooSlow {
-            elapsed_ms,
-            budget_ms: budget.deadline_ms,
-        });
-    }
+    meter.within(budget)?;
     imports::check(&component, engine.engine())?;
     // Filing the artefact is a convenience for the next preparation, and a failure to file it is
     // not a failure to prepare this binding. It also keeps the component in this process's memory,
@@ -450,13 +453,58 @@ pub fn compile_or_load(
     Ok(Compiled {
         component,
         origin: CompileOrigin::Compiled,
-        elapsed_ms,
+        elapsed_ms: meter.elapsed_ms(),
         key,
     })
 }
 
-fn elapsed_ms(since: std::time::Instant) -> u64 {
-    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+/// What obtaining one component has cost so far, on the clock and in the thread's own processor
+/// time.
+///
+/// It is made on the thread that does the work and read there: the processor time is that of the
+/// thread that made it.
+struct Meter {
+    started: std::time::Instant,
+    processor: Option<core::time::Duration>,
+}
+
+impl Meter {
+    fn start() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            processor: thread_cpu_time(),
+        }
+    }
+
+    /// How long it has taken on the clock, in milliseconds. This is the figure a caller is shown.
+    fn elapsed_ms(&self) -> u64 {
+        millis(self.started.elapsed())
+    }
+
+    /// What the budget is held to: the processor time the thread has used since this was made, or
+    /// the time on the clock where the platform does not say.
+    fn spent(&self) -> core::time::Duration {
+        match (self.processor, thread_cpu_time()) {
+            (Some(from), Some(now)) => now.saturating_sub(from),
+            _ => self.started.elapsed(),
+        }
+    }
+
+    /// Refuses with the figure when more has been spent than the budget allows.
+    fn within(&self, budget: CompileBudget) -> RuntimeResult<()> {
+        let spent = self.spent();
+        if spent > core::time::Duration::from_millis(budget.processor_ms) {
+            return Err(RuntimeError::CompilationOverBudget {
+                used_ms: millis(spent),
+                budget_ms: budget.processor_ms,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn millis(time: core::time::Duration) -> u64 {
+    u64::try_from(time.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn lower_priority() -> BackgroundPriority {
