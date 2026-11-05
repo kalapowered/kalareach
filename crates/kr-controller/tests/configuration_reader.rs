@@ -252,8 +252,7 @@ async fn a_daemon_refuses_a_registry_past_the_version_it_reads_through() {
     let before = recorded(&temp);
     let refused = start(&temp)
         .await
-        .err()
-        .expect("the daemon refuses a registry it cannot read");
+        .expect_err("the daemon refuses a registry it cannot read");
     assert!(
         matches!(
             &refused,

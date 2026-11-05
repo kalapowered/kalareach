@@ -200,17 +200,28 @@ statements say what moves the level:
 A section of the host configuration document (`ConfigurationDocument`) is a member added to a
 stored file that a release reads by level ([Configuration levels](../host/updates.md#configuration-levels)):
 a release that lacks the section ignores and counts it, applies the rest and refuses to edit the
-document, so the section keeps the level. The check passes a member added to that document when
-the build lists it as a section that arrived with a level above the level the earlier release's
-`stored-formats.lock` records for the document (a lock that records none is a release before
-levels, at level 1), when it is not required, and when no other definition refers to the document.
-A lock that is absent, does not read or lists no document fails the check. A change to an existing
-member of the document, to a default, to `required` or to the ceilings, a member added to the
-ceilings, and a section the build does not list above that level still move the level. Two limits
-hold. The published schema of the document stays closed, so a validator built from an earlier
-package rejects a document that holds the new section; no answer a host gives carries the document.
-And the comparison cannot tell a section from a restriction filed as one: a restriction is never a
-level, and only the review of the change that adds the section sees that it is not one.
+document, so the section keeps the level. The check passes a member added to that document when the
+build lists it as a section that arrived with a level above the level the earlier release's
+`stored-formats.lock` records for the document, when it is not required, and when no definition of
+either schema refers to the document. A lock that is absent, does not read, lists no document or
+records no level fails the check, and the member added stays in the failure. A change to an
+existing member of the document, to a default, to `required` or to the ceilings, a member added to
+the ceilings, and a section the build does not list above that level still move the level. The run
+says each section it passes. Three limits hold.
+
+1. The published schema of the document stays closed, so a validator built from an earlier package
+   rejects a document that holds the new section. No answer a host gives carries the document; the
+   file and the registry's copy of it are read by the host.
+2. From the freeze, `kr-protocol-gen --public-contract` fails on the section as on any other
+   difference, so the exemption keeps the level and does not keep the public contract.
+3. The comparison cannot tell a section from a restriction filed as one, and a restriction is never
+   a level. Only the review of the change that adds the section sees that it is not one. That review
+   checks that a release which ignores the section does less than the owner asked and never more
+   than the owner allowed (what narrows a host stays in the ceilings and raises the version);
+   that no check in code narrows what the section holds; that the section has the form
+   `LEVELLED` states (`crates/kr-protocol/src/hostinfo/configuration/levels.rs`), with a test of
+   the downgrade and a round trip of an active value through the file and the registry's copy; and
+   that `LEVELLED`, the level and the stored-format lock change in the same commit.
 
 `kr-protocol-gen --in-level` holds a commit to it. It lists the release tags on origin with
 `git ls-remote`, requires this checkout's tags to be origin's, each at the same commit, and compares
@@ -270,7 +281,8 @@ variant added to a closed object, a member, a variant or a definition removed, a
 `SessionSummary.root` is one: an earlier strict reader cannot read the summary of a command session.
 No client was released, so no shim carries it. A new section of the configuration document is one
 too, though the check of a level passes it ([A level is one surface](#a-level-is-one-surface)):
-the report names what a validator built from an earlier package would reject.
+the report names what a validator built from an earlier package would reject, and from the freeze
+it fails on it.
 
 Until `crates/kr-protocol/retained/PUBLIC_FREEZE` exists, the references are the releases at the
 commit's level, and the check reports and does not fail. That file,

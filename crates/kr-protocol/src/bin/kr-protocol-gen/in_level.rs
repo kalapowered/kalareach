@@ -24,7 +24,8 @@
 //!   removed or changed, is a difference. A definition that is new, a new method and an optional
 //!   member added to an object the earlier release marked read-only metadata are not, nor is a new
 //!   section of the host configuration document, a stored file read by level, which the build
-//!   lists above the level the earlier release's stored-format lock records. A new method
+//!   lists above the level the earlier release's stored-format lock records (the run says each
+//!   section it passes, because the comparison cannot tell a section from a restriction). A new method
 //!   is a variant added to `Method` that is one plain string constant, whose name no variant of
 //!   the earlier release had and no other variant has (a host of the same level answers a method
 //!   it does not list with `PERMISSION_DENIED`, and a client that meets that refusal for a method
@@ -200,13 +201,14 @@ impl Head {
 }
 
 /// The level of the configuration document that a release's stored-format lock records: the
-/// highest level of the sections that release reads. A lock that records no level for the document
-/// is a release before levels, which counts as the base level.
+/// highest level of the sections that release reads.
 ///
 /// # Errors
 ///
 /// When the release has no lock, the lock does not read, lists no configuration document, or
-/// records a level that is no whole number: each is a failure and never a guess.
+/// records no level or one that is no whole number: each is a failure and never a guess. (A release
+/// of the level that records no level reads no sections, and the member `level` that the document
+/// gained with levels would be the first difference.)
 pub fn configuration_level_at(repository: &Path, commit: &str) -> Result<u64, String> {
     let text = file_at(repository, commit, LOCK_PATH)
         .map_err(|error| format!("{LOCK_PATH} at {commit} cannot be read: {error}"))?
@@ -224,12 +226,13 @@ pub fn configuration_level_at(repository: &Path, commit: &str) -> Result<u64, St
                 .find(|store| store["entry"]["store"].as_str() == Some("configuration"))
         })
         .ok_or_else(|| format!("{LOCK_PATH} at {commit} lists no configuration document"))?;
-    match document.get("level") {
-        None => Ok(1),
-        Some(level) => level.as_u64().filter(|level| *level >= 1).ok_or_else(|| {
-            format!("{LOCK_PATH} at {commit} records a level of the configuration document that is not a whole number of at least 1")
-        }),
-    }
+    document
+        .get("level")
+        .and_then(Value::as_u64)
+        .filter(|level| *level >= 1)
+        .ok_or_else(|| {
+            format!("{LOCK_PATH} at {commit} records no level of the configuration document, or one that is not a whole number of at least 1")
+        })
 }
 
 /// What the check found when it did not fail.
@@ -407,12 +410,23 @@ fn compare(
             .map(|(member, _)| member.clone())
             .collect())
     };
-    for line in compare_for_a_level(&schema, &head.schema, &sections)
+    let mut passed = Vec::new();
+    for line in compare_for_a_level(&schema, &head.schema, &sections, &mut passed)
         .map_err(|error| format!("the schema of {tag}: {error}"))?
     {
         if !found.contains(&line) {
             found.push(line);
         }
+    }
+    // The comparison cannot tell a section from a restriction filed as one, so each section it
+    // passes is said, for the review of the change that adds it.
+    for section in passed {
+        notes.push(format!(
+            "{tag}: the section {section} of the configuration document is new to it, and passes as \
+             a section an earlier release ignores and counts; the comparison cannot tell it from a \
+             restriction, and the review of the change that adds it must (docs/releases/packages.md, \
+             \"A level is one surface\")"
+        ));
     }
     let sdk_text = file_at(repository, &release.commit, SDK_SCHEMA_PATH)
         .map_err(|error| format!("{SDK_SCHEMA_PATH} of {tag} cannot be read: {error}"))?
@@ -422,10 +436,15 @@ fn compare(
     let sdk: Value = serde_json::from_str(&sdk_text)
         .map_err(|error| format!("{SDK_SCHEMA_PATH} of {tag}: {error}"))?;
     found.extend(
-        compare_for_a_level(&sdk, &head.sdk_schema, &|| Ok(BTreeSet::new()))
-            .map_err(|error| format!("the plugin SDK schema of {tag}: {error}"))?
-            .into_iter()
-            .map(|line| format!("the plugin SDK schema: {line}")),
+        compare_for_a_level(
+            &sdk,
+            &head.sdk_schema,
+            &|| Ok(BTreeSet::new()),
+            &mut Vec::new(),
+        )
+        .map_err(|error| format!("the plugin SDK schema of {tag}: {error}"))?
+        .into_iter()
+        .map(|line| format!("the plugin SDK schema: {line}")),
     );
     let host = plugin_host_in(repository, &release.commit)?;
     if host != head.plugin_host {

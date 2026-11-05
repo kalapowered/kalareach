@@ -177,9 +177,8 @@ fn member_added_to_the_configuration_document(difference: &Difference) -> Option
         .filter(|member| !member.contains(['.', '#', '[', '{']))
 }
 
-/// Whether a `$ref` to the definition `name` occurs anywhere in a definition of `schema` other than
-/// `name` itself.
-fn is_referred_to_by_another_definition(schema: &Value, name: &str) -> bool {
+/// Whether a `$ref` to the definition `name` occurs anywhere in a definition of `schema`.
+fn is_referred_to(schema: &Value, name: &str) -> bool {
     fn refers(node: &Value, reference: &str) -> bool {
         match node {
             Value::Object(members) => {
@@ -193,8 +192,8 @@ fn is_referred_to_by_another_definition(schema: &Value, name: &str) -> bool {
     let reference = format!("#/$defs/{name}");
     schema["$defs"].as_object().is_some_and(|definitions| {
         definitions
-            .iter()
-            .any(|(other, definition)| other != name && refers(definition, &reference))
+            .values()
+            .any(|definition| refers(definition, &reference))
     })
 }
 
@@ -204,12 +203,13 @@ fn is_referred_to_by_another_definition(schema: &Value, name: &str) -> bool {
 ///
 /// Every one of these holds, or it is a difference like any other:
 ///
-/// * it is a member added directly to `ConfigurationDocument`, which the earlier schema defines;
+/// * it is a member added directly to `ConfigurationDocument`;
 /// * `sections` lists it: the build's table of sections lists it at a level above the level the
 ///   earlier release's stored-format lock records for the document;
 /// * it is not required;
-/// * no other definition refers to `ConfigurationDocument`, so no answer a host gives carries the
-///   document and nothing but the file is read by a release that lacks the section.
+/// * no definition of either schema refers to `ConfigurationDocument`, so no answer a host gives
+///   carries the document, and a reference that moved to a copy of it cannot hide the add: only
+///   the file and the registry's copy of it are read by a release that lacks the section.
 ///
 /// Anything else about the document is compared as it is for every definition, so a change to an
 /// existing member, a default, `required`, a ceiling or a section the table does not list still
@@ -229,10 +229,10 @@ fn is_a_new_section(
         .get("required")
         .and_then(Value::as_array)
         .is_some_and(|required| required.iter().any(|name| name.as_str() == Some(section)));
-    old["$defs"].get(CONFIGURATION_DOCUMENT).is_some()
-        && sections.contains(section)
+    sections.contains(section)
         && !required
-        && !is_referred_to_by_another_definition(new, CONFIGURATION_DOCUMENT)
+        && !is_referred_to(old, CONFIGURATION_DOCUMENT)
+        && !is_referred_to(new, CONFIGURATION_DOCUMENT)
 }
 
 /// As [`compare`], for the check of a level: the differences that fail a commit that stays at the
@@ -243,31 +243,36 @@ fn is_a_new_section(
 ///
 /// A new section of the configuration document passes too, where `sections` (called once, and only
 /// when the schemas differ by a member added to the document) names it: the sections the build
-/// lists above the level the earlier release's lock records.
+/// lists above the level the earlier release's lock records. Each section passed is added to
+/// `passed`. Where `sections` cannot say what they are, the member stays a difference and says
+/// why, so the check fails and the difference is not hidden by the failure to read.
 ///
 /// # Errors
 ///
-/// When a schema cannot be cut, or `sections` cannot say what they are.
+/// When a schema cannot be cut.
 pub fn compare_for_a_level(
     old: &Value,
     new: &Value,
     sections: &dyn Fn() -> Result<BTreeSet<String>, String>,
+    passed: &mut Vec<String>,
 ) -> Result<Vec<String>, String> {
-    let mut sections_above: Option<BTreeSet<String>> = None;
+    let mut sections_above: Option<Result<BTreeSet<String>, String>> = None;
     let mut lines = Vec::new();
     for difference in rejected(old, new)? {
         if is_an_added_method(old, new, &difference) {
             continue;
         }
-        if member_added_to_the_configuration_document(&difference).is_some() {
-            if sections_above.is_none() {
-                sections_above = Some(sections()?);
-            }
-            if sections_above
-                .as_ref()
-                .is_some_and(|above| is_a_new_section(old, new, &difference, above))
-            {
-                continue;
+        if let Some(section) = member_added_to_the_configuration_document(&difference) {
+            match sections_above.get_or_insert_with(sections) {
+                Ok(above) if is_a_new_section(old, new, &difference, above) => {
+                    passed.push(section.to_owned());
+                    continue;
+                }
+                Ok(_) => {}
+                Err(unread) => {
+                    lines.push(format!("{difference}; {unread}"));
+                    continue;
+                }
             }
         }
         lines.push(difference.to_string());
