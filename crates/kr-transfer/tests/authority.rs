@@ -1,7 +1,5 @@
 //! Handle-based filesystem authority, driven from the committed no-escape fixture.
 //!
-//! Requirement rows closed here: KR-REQ-14.05 and the transfer half of KR-ACC-030.
-//!
 //! The fixture at `fixtures/transfer/no-escape.json` is the policy in one place: the names the
 //! validator accepts and refuses, the tree a lookup runs against, and what each lookup must do.
 //! Each platform builds the objects the fixture names for it and runs every lookup against them;
@@ -205,7 +203,9 @@ fn every_lookup_in_the_fixture_resolves_as_the_fixture_says() {
     );
 }
 
-/// KR-REQ-14.05: a component replaced with a link between two lookups is refused at the second.
+/// KR-REQ-14.05 and KR-ACC-030, the part about a link put in a component's place: a component
+/// replaced with a link between two lookups is refused at the second. The replacement is made on
+/// Unix only.
 #[test]
 fn a_component_replaced_with_a_link_is_refused_at_the_next_lookup() {
     let root = kr_ipc::testing::PrivateTempDir::create();
@@ -713,8 +713,9 @@ fn reparse_point(_entry: &Entry, _root: &Path, _path: &Path) -> Result<(), Strin
     Err("this platform has no reparse points".to_owned())
 }
 
-/// KR-REQ-14.05: a component replaced with a link *while* lookups are running never resolves
-/// outside the authorised tree.
+/// KR-REQ-14.05 and KR-ACC-030, the part about a link put in a component's place during a lookup: a
+/// component replaced with a link *while* lookups are running never resolves outside the authorised
+/// tree.
 ///
 /// The case the between-two-lookups test cannot reach is the replacement that lands inside one
 /// resolution. This runs the replacement in a loop beside the lookups and asserts what has to hold
@@ -2010,8 +2011,9 @@ fn a_tree_goes_through_the_handle_that_was_checked_and_nothing_it_links_to_goes(
     );
 }
 
-/// KR-REQ-14.05: a removal goes only through the object that was checked, refuses a replacement
-/// rather than emptying it, and a removal that stops says where and keeps what it removed.
+/// KR-REQ-14.05 and KR-ACC-030, the part about a replaced directory and a removal that stops part
+/// way: a removal goes only through the object that was checked, refuses a replacement rather than
+/// emptying it, and a removal that stops says where and keeps what it removed.
 ///
 /// Three moments. Before it starts, a different directory at the name means nothing is removed at
 /// all. Part way, an entry it cannot take away stops it, and it reports the entry and how many
