@@ -1272,10 +1272,10 @@ export type AnswerOutcome =
   /** The host did not confirm that it took it, so a copy is kept on this device. */
   | { readonly outcome: 'kept'; readonly draft: KeptAnswer }
   /**
-   * The host took an earlier send of an answer to this question while its reply was lost. When
+   * The host took a send of an answer to this question, one the kept record carried. When
    * `refused` is null nothing was sent now; otherwise this press sent `refused`, which the host
-   * refused because the question was answered. The copy kept is retired by an answer, and stays
-   * until it is dismissed by a send of a kept answer.
+   * refused because the question was answered. It claims no order of the two sends. The copy kept
+   * is retired by an answer, and stays until it is dismissed by a send of a kept answer.
    */
   | { readonly outcome: 'landed'; readonly action_id: string; readonly refused: string | null }
   /**

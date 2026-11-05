@@ -145,17 +145,18 @@ export function earlierWords(earlier: readonly EarlierSend[]): string {
 }
 
 /**
- * What the page says when the host took an earlier send of an answer to a question while its reply
- * was lost: the action it took, and that nothing was sent now or that this press's own send was
- * refused because of it. The notice is the one place that action is named once the kept answer is
- * retired. It names no text of the answer, since the answer kept may differ from the one the host
- * took.
+ * What the page says when the host took a send of an answer to a question: the action it took, and
+ * that nothing was sent now or which action this press's own send was, which the host refused
+ * because the question was answered. It claims no order of the sends and does not say that a reply
+ * was lost, since the send taken may be another window's or another command's. The notice is the
+ * one place that action is named once the kept answer is retired. It names no text of the answer,
+ * since the answer kept may differ from the one the host took.
  */
 export function landedWords(taken: string, refused: string | null): string {
-  const host = `The host took an earlier send of an answer to this question while its reply was lost (action ${taken}).`
+  const host = `The host took a send of an answer to this question (action ${taken}).`
   return refused === null
     ? `${host} Nothing was sent again.`
-    : `${host} This press sent an answer too, and the host refused it because the question was answered.`
+    : `${host} This press sent an answer too (action ${refused}), and the host refused it because the question was answered.`
 }
 
 /** What the page says when an answer is held back because an earlier send's outcome is not yet shown. */
