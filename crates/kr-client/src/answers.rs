@@ -735,13 +735,19 @@ impl QuestionHost for Session {
         session_id: SessionId,
         action_id: ActionId,
     ) -> std::result::Result<Receipt, ClientError> {
-        Ok(self
+        let read = self
             .read_receipt(&ActionReadParams {
                 action_id,
                 session_id: Some(session_id),
             })
-            .await?
-            .receipt)
+            .await?;
+        // The connection holds the action of a send until its caller settles it, whatever a receipt
+        // says. The host's record of it has ended, so nothing is left to ask: the connection stops
+        // holding the answer's parameters and the place the action takes in its book.
+        if read.receipt.action_id == action_id && read.receipt.state.is_terminal() {
+            self.settle(action_id).await;
+        }
+        Ok(read.receipt)
     }
 
     async fn session_ended(&self, session_id: SessionId) -> std::result::Result<bool, ClientError> {

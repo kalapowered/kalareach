@@ -1742,6 +1742,69 @@ async fn a_definite_record_of_an_action_nobody_knew_the_end_of_settles_it() {
     serving.abort();
 }
 
+/// KR-REQ-11.63: the answering surface settles the action of a send once the host's record of it is
+/// conclusive. An answer whose outcome the host could not establish is held by its caller, so the
+/// record of it keeps the answer's parameters and takes one of the unresolved actions a connection
+/// allows; the read of its receipt lets both go when the host says it was applied, and not before.
+#[tokio::test]
+async fn a_conclusive_receipt_of_an_answer_lets_the_connection_forget_it() {
+    use kr_client::answers::{Dispatch, QuestionHost, answer_over};
+    use kr_protocol::ids::{QuestionId, QuestionRevision};
+    use kr_protocol::question::{QuestionAnswer, QuestionAnswerParams};
+
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+    let session_id = SessionId::new(Uuid::from_bytes([8; 16]));
+    let send = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x48; 16]));
+
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::OutcomeUnknown);
+    let failure = answer_over(
+        &session,
+        None,
+        target,
+        QuestionAnswerParams {
+            session_id,
+            question_id: QuestionId::new(Uuid::from_bytes([7; 16])),
+            expected_revision: QuestionRevision::new(1),
+            answer: QuestionAnswer::Decision { decided: true },
+        },
+        Dispatch {
+            action_id: send,
+            quote: None,
+        },
+    )
+    .await
+    .expect_err("the host could not establish the outcome");
+    assert!(!failure.settled(), "an uncertain outcome settles nothing");
+    assert_eq!(session.submitted_actions().await.len(), 1);
+
+    // A record that says less than the end of the action settles nothing.
+    *script.record_state.lock().await = Some(ReceiptState::Unknown);
+    let receipt = QuestionHost::receipt(&session, session_id, send)
+        .await
+        .expect("read");
+    assert_eq!(receipt.state, ReceiptState::Unknown);
+    assert_eq!(session.submitted_actions().await.len(), 1);
+
+    // A record that says it was applied does.
+    *script.record_state.lock().await = Some(ReceiptState::Applied);
+    let receipt = QuestionHost::receipt(&session, session_id, send)
+        .await
+        .expect("read");
+    assert_eq!(receipt.state, ReceiptState::Applied);
+    assert!(
+        session.submitted_actions().await.is_empty(),
+        "the answer's parameters are not kept for an action the host has ended"
+    );
+
+    session.close();
+    serving.abort();
+}
+
 /// A request composed first and sent for the first time carries the same unknown as a mutation: the
 /// action its caller named, with what the host said, and it stays held until the caller settles it.
 #[tokio::test]
