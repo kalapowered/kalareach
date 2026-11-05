@@ -363,3 +363,42 @@ opt-level = 3
 
 [profile.dev.package.crc32fast]
 opt-level = 3
+
+# A plugin's component is compiled to machine code by Cranelift, in debug and test builds as much as
+# in release ones, and unoptimised that compiler is about an order of magnitude slower than it is
+# optimised. A component the cases register takes seconds of processor time to compile unoptimised,
+# and the host compiles at background priority, so on a machine other work keeps busy it takes
+# minutes. So the code generator and the packages it is built from are optimised in debug and test
+# builds too; the rest of the dependency tree is not.
+[profile.dev.package.cranelift-assembler-x64]
+opt-level = 3
+
+[profile.dev.package.cranelift-bforest]
+opt-level = 3
+
+[profile.dev.package.cranelift-bitset]
+opt-level = 3
+
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+
+[profile.dev.package.cranelift-codegen-shared]
+opt-level = 3
+
+[profile.dev.package.cranelift-control]
+opt-level = 3
+
+[profile.dev.package.cranelift-entity]
+opt-level = 3
+
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+
+[profile.dev.package.cranelift-native]
+opt-level = 3
+
+[profile.dev.package.regalloc2]
+opt-level = 3
+
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
