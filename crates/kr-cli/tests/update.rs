@@ -5047,6 +5047,57 @@ async fn a_store_too_old_or_unreadable_is_named_and_a_store_in_range_is_not() {
     );
 }
 
+/// KR-REQ-11.63, KR-REQ-26.10: a record of the sends a kept answer went out under that is not a map
+/// in the canonical encoding refuses an update to a release that lists the store, and names the
+/// file. The control is the same update with the record gone.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_damaged_record_of_sends_refuses_an_update_and_is_named() {
+    let (host, one, two, archive) = host_to_update().await;
+    let idle = Idle::new(&host.store);
+    let kept = idle.temp.paths().state_root().join("kept-answers");
+    std::fs::create_dir_all(&kept).expect("the directory of kept answers");
+    let record = kept.join(format!("{}.send", kr_ipc::new_uuid()));
+    std::fs::write(&record, b"not a map in the canonical encoding").expect("a damaged record");
+
+    let stores = release_stores();
+    assert!(
+        stores.iter().any(|store| store.store == "answer-sends"),
+        "the release lists the record of sends"
+    );
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    let name = record
+        .file_name()
+        .expect("a name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        message.contains("answer-sends") && message.contains(name.as_str()),
+        "the damaged record is named: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone()),
+        "nothing was switched"
+    );
+
+    std::fs::remove_file(&record).expect("the record goes");
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "the control: kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["target"], two.name().as_str(), "{said}");
+}
+
 /// KR-REQ-26.08: a control daemon whose release's manifest names a compatibility level its binary
 /// does not retain does not start, and says which level. A manifest that names the levels the
 /// binary retains starts, and so does one that names fewer of them: that only holds more updates
