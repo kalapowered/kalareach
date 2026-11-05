@@ -8005,36 +8005,6 @@ async fn withheld_as_not_drained(wired: &mut Wired, why: &str) {
     );
 }
 
-/// Waits until the PowerShell editor has asked where the cursor is after its prompt, which it does
-/// before it reads a key, and the host has queued the reply.
-///
-/// The shell asks once before it draws the prompt and the editor asks once more after it, so the
-/// second question in what the session retained is the editor's.
-#[cfg(unix)]
-async fn until_the_powershell_editor_is_reading(shell: &RealShell) {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            {
-                let session = shell.runtime.session();
-                let seen = retained(&session);
-                let question = b"\x1b[6n";
-                if seen
-                    .windows(question.len())
-                    .filter(|part| *part == question)
-                    .count()
-                    >= 2
-                {
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the editor asked where the cursor was");
-    until_replies_written(&shell.runtime).await;
-}
-
 /// Queues the host's answer to a primary device-attributes question of the application, under the
 /// hold of the session the caller has, and expects the fence machine to have taken the reader's
 /// fence away and to have counted the answer's bytes.
@@ -8112,11 +8082,13 @@ async fn until_the_reader_proves_a_fence(
 /// the host queues for the terminal that no person typed. The answer goes into the terminal the
 /// real shell is reading, so what the reader's next snapshot accounts for is real input.
 ///
-/// A PowerShell reader proves its first fence at the entry of its read, before its editor has
-/// started, and the editor's first question about the cursor is read from the same input as every
-/// other byte: an answer that reaches the terminal ahead of the reply to that question is read as
-/// part of it. So the case for PowerShell begins once the editor is reading, with a fence the
-/// reader proves there.
+/// The case starts with the shell, before the editor's first read, and the answer is written the
+/// moment the first fence stands. A fence rests on the reader's queues and not on its line, so for
+/// PowerShell the case also asks the line the second fence is over to be empty, as the reader says
+/// in its acknowledgement: an editor that took the answer's characters into the line would leave it
+/// not. A PowerShell editor reads the reply to its question about the cursor from the same input as
+/// every other byte, so the answer must not be written before that reply; the reader proves no first
+/// fence until its editor has asked, which the shell-integration cases show.
 #[cfg(unix)]
 async fn a_readers_fence_is_invalidated_by_the_hosts_answer(kind: ShellKind) {
     let package = installed_package_of(kind);
@@ -8130,9 +8102,6 @@ async fn a_readers_fence_is_invalidated_by_the_hosts_answer(kind: ShellKind) {
     // Taking the keys is what starts an exchange, and the real reader answers it.
     let mut keys = shell.keys();
     let stepping = kind == ShellKind::PowerShell;
-    if stepping {
-        until_the_powershell_editor_is_reading(&shell).await;
-    }
     // A reader may ask the terminal questions of its own at start (fish does), and the host
     // answers those as it answers the application. So the answer under test is counted from
     // the moment the proved fence is seen, and it is queued under the same hold of the session,
@@ -8163,6 +8132,21 @@ async fn a_readers_fence_is_invalidated_by_the_hosts_answer(kind: ShellKind) {
             String::from_utf8_lossy(&seen[seen.len().saturating_sub(512)..]).escape_debug()
         )
     }
+    if kind == ShellKind::PowerShell {
+        use kr_shell_integration::contract::fence::LaunchStanding;
+        let session = shell.runtime.session();
+        let standing = session.launch_standing();
+        let seen = retained(&session);
+        assert!(
+            matches!(
+                standing,
+                Some(LaunchStanding::Fenced(editor)) if editor.acknowledged.buffer_empty
+            ),
+            "{kind:?}: the fence the reader proved again is not over an empty line: {standing:?}; \
+             the session's output ends {}",
+            String::from_utf8_lossy(&seen[seen.len().saturating_sub(512)..]).escape_debug()
+        );
+    }
     shell.close().await;
 }
 
@@ -8187,11 +8171,11 @@ async fn a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_agai
 ///
 /// The answer goes into the terminal the real PowerShell is reading, and the fence machine takes it
 /// into its account of the input no person typed, as it does for the readers above. The module
-/// drops the answer before the editor puts any of it into the line, and the shell-integration
-/// cases show the line empty; this case shows the fence the answer invalidated, the answer's bytes
-/// counted, and a fence proved again once the reader has taken it. It starts once the editor is
-/// reading, and does not show a fence delayed by an answer that arrives while an exchange is under
-/// way.
+/// drops the answer before the editor puts any of it into the line, so the case shows the fence the
+/// answer invalidated, the answer's bytes counted, and a fence proved again over a line that is
+/// empty. It starts with the shell, before the editor's first read, and writes the answer when the
+/// first fence stands. It does not show a fence delayed by an answer that arrives while an exchange
+/// is under way.
 ///
 /// It needs the PowerShell package published into the root that `KR_SHELL_PACKAGES` names, by
 /// `Publish-KalaReachQualification` with `KR_SHELL_PREFIX` naming the root; a run that names it
