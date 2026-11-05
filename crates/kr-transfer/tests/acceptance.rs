@@ -1,5 +1,5 @@
-//! Partial uploads, quota failure, environment boundaries, symbolic links and reparse points, and
-//! concurrent file changes, in one run.
+//! Partial uploads, quota failure, environment boundaries, symbolic links (the reparse points of
+//! Windows are not made here) and concurrent file changes, in one run.
 //!
 //! One test, five conditions, in the order the acceptance row lists them. Each
 //! step asserts both what the host refused and what it kept: a refusal that lost the user's work
@@ -169,7 +169,7 @@ fn partial_uploads_quotas_environments_links_and_concurrent_changes() {
         .expect_err("refuses a request that names another environment");
     assert_eq!(wrong_environment.code(), ErrorCode::EnvironmentUnavailable);
 
-    // ---- 4. Symbolic links and reparse points --------------------------------------------
+    // ---- 4. Symbolic links ----------------------------------------------------------------
     //
     // A read scope resolves through an opened directory handle. A component that is a link is
     // refused rather than followed, and the tree outside the scope is never read.
