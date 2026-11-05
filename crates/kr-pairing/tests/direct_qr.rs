@@ -1,4 +1,4 @@
-//! The direct QR flow, end to end, and its share of KR-ACC-015.
+//! The direct QR flow, end to end.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -399,6 +399,9 @@ fn a_challenge_is_single_use_and_a_stale_one_is_refused() {
 }
 
 /// KR-REQ-10.36: the submitted client endpoint must be the live authenticated peer.
+///
+/// KR-ACC-015, the part about the key-bundle and iroh binding: the client endpoint a redemption
+/// submits must be the live authenticated peer. Not shown here: the other conditions of the row.
 #[test]
 fn the_submitted_endpoint_must_be_the_live_peer() {
     let harness = Harness::new();
@@ -859,6 +862,9 @@ fn a_candidate_sees_only_its_own_status_and_no_secret() {
 }
 
 /// KR-REQ-10.38: neither entry mode replaces a candidate the other has locked.
+///
+/// KR-ACC-015, the part about QR and short-code races: neither entry mode replaces a candidate the
+/// other has locked. Not shown here: the other conditions of the row.
 #[test]
 fn a_locked_candidate_is_not_replaced_by_the_other_entry_mode() {
     let harness = Harness::new();
@@ -884,6 +890,10 @@ fn a_locked_candidate_is_not_replaced_by_the_other_entry_mode() {
 }
 
 /// KR-REQ-10.38: both entry modes share one atomic candidate and consumption record.
+///
+/// KR-ACC-015, the part about QR and short-code races: both entry modes share one atomic candidate
+/// and consumption record, and a write that lost a race does not undo the writer that won. Not
+/// shown here: the other conditions of the row.
 #[test]
 fn a_write_that_lost_a_race_does_not_undo_the_writer_that_won() {
     let harness = Harness::new();
@@ -1210,6 +1220,10 @@ fn a_refused_write_leaves_the_invitation_serving() {
 
 /// KR-REQ-10.33: an invitation nobody used is consumed as expired once its deadline passes, when
 /// the host asks before offering another, and not a moment before.
+///
+/// KR-ACC-015, the part about the expiry limit: an invitation nobody used is consumed as expired
+/// once its deadline passes, when the host asks before offering another, and not a moment before.
+/// Not shown here: the other conditions of the row.
 #[test]
 fn an_unused_invitation_is_consumed_as_expired_once_its_deadline_passes() {
     let harness = Harness::new();
