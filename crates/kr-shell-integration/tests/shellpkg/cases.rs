@@ -977,6 +977,49 @@ pub fn an_escape_and_a_hosts_answer_in_one_delivery_leave_the_escape_a_key(kind:
     );
 }
 
+/// KR-REQ-08.48: in vi insert mode, an Escape a person presses with a host's answer behind it in
+/// one delivery leaves insert mode at once, without another key.
+///
+/// The editor decides whether an Escape is a lone key or the start of a key sequence by looking at
+/// what has arrived behind it. An answer behind it is not part of any key, so the editor has to
+/// take it out of the way and treat the Escape as the key that ends insert mode; a reader that
+/// takes the answer and then waits for another key leaves the line in insert mode. The case turns
+/// on the editor's mode indicator, types a word, an Escape and an answer in one write, waits for
+/// the indicator to say command mode, and then appends a second word with `A` and runs the line.
+/// The indicator is the editor's own drawing, which nothing the person typed can put on the screen.
+///
+/// # Panics
+///
+/// Panics when the indicator does not change, or the line does not print the word.
+#[cfg(unix)]
+pub fn an_escape_and_a_hosts_answer_in_one_delivery_leave_vi_insert_mode(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    assert!(
+        session.run(
+            "set -o vi; bind 'set show-mode-in-prompt on'; printf '%s%s\\n' kr-vi- on",
+            "kr-vi-on"
+        ),
+        "the editor did not switch to vi bindings:\n{}",
+        session.terminal_output()
+    );
+    let _ = session.next_prompt();
+    let start = session.written();
+    let keys = format!("printf '%s%s\\n' kr-\x1b{}", HOST_ANSWERS[0]);
+    session.type_bytes(keys.as_bytes());
+    assert!(
+        session.drew_after(start, "(cmd)", REPLY).was_drawn(),
+        "the editor stayed in insert mode after an Escape with an answer behind it:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        session.finish_line(&keys, "A ab", "kr-ab"),
+        "the line appended in command mode did not run:\n{}",
+        session.terminal_output()
+    );
+}
+
 /// KR-REQ-08.48: the end-of-input gesture a person makes after an Escape sequence the editor does
 /// not know is still the gesture.
 ///
