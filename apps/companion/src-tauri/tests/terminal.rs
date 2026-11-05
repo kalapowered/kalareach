@@ -985,6 +985,13 @@ async fn what_the_page_does_during_a_size_report_the_session_did_not_take_goes_a
             asked.dimensions, expected,
             "the owed size goes with nothing between (the page moves: {page_moves})"
         );
+        // A move to the next column carries the same size, so what tells the size report from it
+        // is the place: the size report leaves the window where it is.
+        assert_eq!(
+            (asked.position.0, asked.column.get()),
+            (None, 0),
+            "the size, not the move (the page moves: {page_moves})"
+        );
     }
 }
 
@@ -1046,6 +1053,11 @@ async fn a_size_the_session_keeps_refusing_for_now_waits_for_the_page_after_thre
             asked.dimensions,
             Dimensions::new(12, 2),
             "the size that is owed goes first (the page moves: {page_moves})"
+        );
+        assert_eq!(
+            (asked.position.0, asked.column.get()),
+            (None, 0),
+            "the size, not the move (the page moves: {page_moves})"
         );
         link.answer(&after, &viewport_answer(1)).await;
     }

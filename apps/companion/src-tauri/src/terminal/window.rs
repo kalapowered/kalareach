@@ -157,11 +157,11 @@ struct Untold {
 /// Where one view's window is, and the viewport reports it owes the session.
 ///
 /// Every report the view sends goes through here, one at a time. What goes next is one choice,
-/// asked after every event: the newest size if it is not the size last sent, else the next run of
-/// moves. Nothing goes while a report is in flight, while a new subscription is being asked for,
-/// whose first screen is what says where the window then is, or, once a screen has arrived, while
-/// the view holds no complete one; before the first, only a size goes, from where the attach put
-/// the window.
+/// asked after every event: the newest size if it is not the size last sent, or if a report of it
+/// was not settled, else the next run of moves. Nothing goes while a report is in flight, while a
+/// new subscription is being asked for, whose first screen is what says where the window then is,
+/// while a size the host did not take for now rests, or, once a screen has arrived, while the view
+/// holds no complete one; before the first, only a size goes, from where the attach put the window.
 #[derive(Debug)]
 pub struct WindowReports {
     /// Where the window is, from the newest complete screen naming at least `answered`, and at the
