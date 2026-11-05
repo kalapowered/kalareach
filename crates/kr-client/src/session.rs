@@ -204,12 +204,14 @@ pub struct SubmittedAction {
     /// answer came to ([`Session::settle`]), whatever the answer was: a refusal of any code is not
     /// a decision about an action whose outcome is being asked after.
     pub held: bool,
-    /// Whether the host last refused this action for now, with a transient code.
+    /// Whether the host last refused this action for now, with a transient code. Only an action
+    /// its caller does not hold is marked.
     ///
-    /// It recorded nothing of it, so the caller may send it again under this identifier
+    /// The host performed nothing of it, so the caller may send it again under this identifier
     /// ([`Session::mutate_continuing`]), and the host performs an identifier at most once. A
     /// service that keeps the refusals it decides answers the same refusal again. Only the newest
-    /// 64 such actions stay on the book, and they do not count toward [`MAX_UNRESOLVED_ACTIONS`].
+    /// 64 such actions stay on the book, and they do not count toward [`MAX_UNRESOLVED_ACTIONS`]
+    /// until a send under the identifier counts again.
     pub refused_for_now: bool,
 }
 
@@ -433,7 +435,11 @@ impl Outcomes {
             .submitted
             .len()
             .saturating_sub(self.refused_for_now.len());
-        if unresolved >= MAX_UNRESOLVED_ACTIONS && !self.submitted.contains_key(&action.action_id) {
+        let counted = self
+            .submitted
+            .get(&action.action_id)
+            .is_some_and(|held| !held.refused_for_now);
+        if unresolved >= MAX_UNRESOLVED_ACTIONS && !counted {
             return Err(ClientError::TooManyUnresolvedActions {
                 limit: MAX_UNRESOLVED_ACTIONS,
             });

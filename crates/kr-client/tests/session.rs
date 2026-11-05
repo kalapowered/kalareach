@@ -1702,6 +1702,45 @@ async fn sends_refused_for_now_do_not_use_up_the_bound_on_unresolved_actions() {
         KEPT_FOR_NOW,
         "the sends refused for now are marked"
     );
+    let carried = kr_client::reconnect::ClientState::from_session(&session, None).await;
+    assert_eq!(
+        carried.unresolved_actions().len(),
+        MAX_UNRESOLVED_ACTIONS,
+        "a send refused for now is not one whose outcome is unresolved"
+    );
+
+    // Sending a marked one again counts it again, so at the bound it is refused and stays marked.
+    let marked = kept
+        .iter()
+        .find(|action| action.refused_for_now)
+        .expect("a marked action")
+        .action_id;
+    let again = session
+        .mutate_continuing(
+            marked,
+            Method::SessionCreate,
+            target.clone(),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("the bound is reached");
+    assert!(
+        matches!(again, ClientError::TooManyUnresolvedActions { .. }),
+        "{again:?}"
+    );
+    assert_eq!(
+        session
+            .submitted_actions()
+            .await
+            .iter()
+            .filter(|action| action.refused_for_now)
+            .count(),
+        KEPT_FOR_NOW,
+        "the refused send stays marked"
+    );
 
     session.close();
     serving.abort();

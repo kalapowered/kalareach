@@ -71,11 +71,17 @@ impl ClientState {
     /// Returns the actions whose outcome is still unresolved.
     ///
     /// Both halves count: the ones whose receipt has not reached a terminal state, and the ones
-    /// that were sent without any receipt arriving at all.
+    /// that were sent without any receipt arriving at all. The actions the host refused for now are
+    /// not among them: `submitted` marks those.
     #[must_use]
     pub fn unresolved_actions(&self) -> Vec<kr_protocol::ids::ActionId> {
         let mut actions = self.receipts.unresolved();
-        for action in &self.submitted {
+        // An action the host refused for now is not one whose outcome is unresolved.
+        for action in self
+            .submitted
+            .iter()
+            .filter(|action| !action.refused_for_now)
+        {
             if !actions.contains(&action.action_id) {
                 actions.push(action.action_id);
             }
