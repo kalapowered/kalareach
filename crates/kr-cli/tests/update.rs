@@ -298,6 +298,26 @@ async fn a_daemon_of_a_release_starts_its_own_release_s_worker_and_holds_the_rel
     host.close(&kr, &display);
 }
 
+/// Asserts that this host's daemon was started from `release`'s own program: the first word of its
+/// command line is the path it was started with. A program of the store finds the store from the
+/// kernel's record of its image, which has every link resolved, so the path expected is the
+/// resolved store's, and a path through `current` is not it.
+#[cfg(target_os = "linux")]
+async fn daemon_was_started_from_the_own_program_of(host: &Host, release: &ReleaseName) {
+    let pid = host.daemon_process().await.pid.get();
+    let command = std::fs::read(format!("/proc/{pid}/cmdline")).expect("the daemon's command");
+    let started_as = command.split(|byte| *byte == 0).next().expect("a program");
+    let resolved = Store::at(std::fs::canonicalize(host.store.root()).expect("the store resolves"));
+    assert_eq!(
+        String::from_utf8_lossy(started_as),
+        resolved
+            .release_program(release, Program::Controller)
+            .display()
+            .to_string(),
+        "the daemon was started from the release's own program"
+    );
+}
+
 /// KR-REQ-26.09: a command that finds no daemon starts the daemon of the release `current` names
 /// by that release's own program, a path with no link in it, and not through `current`: the first
 /// word of the daemon's command line is the path it was started with.
@@ -322,17 +342,7 @@ async fn a_command_that_finds_no_daemon_starts_the_daemon_of_the_release_current
         host.daemon_build().await,
         format!("kr-controller/{}", one.name())
     );
-    let pid = host.daemon_process().await.pid.get();
-    let command = std::fs::read(format!("/proc/{pid}/cmdline")).expect("the daemon's command");
-    let started_as = command.split(|byte| *byte == 0).next().expect("a program");
-    assert_eq!(
-        String::from_utf8_lossy(started_as),
-        host.store
-            .release_program(one.name(), Program::Controller)
-            .display()
-            .to_string(),
-        "the daemon was started from the release's own program"
-    );
+    daemon_was_started_from_the_own_program_of(&host, one.name()).await;
     host.close(&kr, &display);
 }
 
@@ -570,19 +580,7 @@ async fn an_update_replaces_the_daemon_and_a_live_session_keeps_its_release() {
     // It was started from the new release's own program, a path with no link in it, and not
     // through `current`: the first word of its command line is the path it was started with.
     #[cfg(target_os = "linux")]
-    {
-        let pid = host.daemon_process().await.pid.get();
-        let command = std::fs::read(format!("/proc/{pid}/cmdline")).expect("the daemon's command");
-        let started_as = command.split(|byte| *byte == 0).next().expect("a program");
-        assert_eq!(
-            String::from_utf8_lossy(started_as),
-            host.store
-                .release_program(two.name(), Program::Controller)
-                .display()
-                .to_string(),
-            "the daemon was started from the release's own program"
-        );
-    }
+    daemon_was_started_from_the_own_program_of(&host, two.name()).await;
     assert_eq!(
         host.worker_build(session_id).await,
         format!("kr-worker/{}", one.name()),
@@ -2793,7 +2791,11 @@ fn a_store_s_startup_entry_sources_the_current_release_s_entry() {
         String::from_utf8_lossy(&status.stderr)
     );
     let reported = String::from_utf8_lossy(&status.stdout);
-    let own = shells.join("zsh/test-1/bin/zsh");
+    // Spelled as the product spells it: a program of the store finds the store from the kernel's
+    // record of its image, which has every link resolved.
+    let own = std::fs::canonicalize(&shells)
+        .expect("the release's shells resolve")
+        .join("zsh/test-1/bin/zsh");
     assert!(
         reported.contains(&own.display().to_string()),
         "the package's executable is in the release: {reported}"
