@@ -1305,11 +1305,12 @@ fn judge(
         // of that step: it may refuse before it looks up its receipts (for storage, or at a door
         // that checks the caller first), and it may refuse an answer it holds for an earlier action
         // because the authority it was given under has changed. So the step is refused only when
-        // it is the step's first action, which no earlier action can have taken; any step that was
-        // sent before stays sent until the environment can read its record, and a step it could
-        // not answer, or is still running, is not given a result it was not given.
+        // it is the step's first action, which no earlier action can have taken, and the environment
+        // refused it in its definite word; any step that was sent before stays sent until the
+        // environment can read its record, and a step it could not answer, or is still running, or
+        // refused for now, is not given a result it was not given.
         return match (sent, code) {
-            (_, ErrorCode::OutcomeUnknown | ErrorCode::ResourceUnavailable) => Verdict::Pending,
+            (_, _) if !is_definite(code) => Verdict::Pending,
             (Sent::First, _) => Verdict::Refused(ErrorCode::StorageUnavailable, Why::Environment),
             (Sent::Again | Sent::Anew, _) => Verdict::Pending,
         };
@@ -1776,14 +1777,14 @@ mod tests {
         // whose answer it holds and withholds because the authority has changed.
         for code in [
             ErrorCode::PermissionDenied,
-            ErrorCode::StorageUnavailable,
             ErrorCode::DraftConflict,
             ErrorCode::IdConflict,
         ] {
             assert_eq!(
                 judge(&step, None, code, Sent::First),
                 Verdict::Refused(ErrorCode::StorageUnavailable, Why::Environment),
-                "{code:?}: the step's first action, which no earlier action can have taken"
+                "{code:?}: the step's first action, which no earlier action can have taken, \
+                 refused in the environment's definite word"
             );
             for sent in [Sent::Again, Sent::Anew] {
                 assert_eq!(
@@ -1793,7 +1794,16 @@ mod tests {
                 );
             }
         }
-        for code in [ErrorCode::OutcomeUnknown, ErrorCode::ResourceUnavailable] {
+        // An answer that cannot say what became of the step, or that the environment cannot take it
+        // now, is not a refusal of it, even for its first action.
+        for code in [
+            ErrorCode::OutcomeUnknown,
+            ErrorCode::ResourceUnavailable,
+            ErrorCode::StorageUnavailable,
+            ErrorCode::EditorBusy,
+            ErrorCode::RateLimited,
+            ErrorCode::EnvironmentUnavailable,
+        ] {
             for sent in [Sent::First, Sent::Again, Sent::Anew] {
                 assert_eq!(
                     judge(&step, None, code, sent),
