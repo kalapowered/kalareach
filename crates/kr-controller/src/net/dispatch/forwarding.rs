@@ -406,6 +406,8 @@ impl RemoteConnection {
         });
         match effect.await {
             Ok(Ok(answered)) => {
+                #[cfg(feature = "testing")]
+                self.controller.after_the_worker_answered.wait().await;
                 if answered.retained {
                     // A retained answer is a read of somebody's receipt: the worker gave what
                     // this device's grant reached, and it is written under present view

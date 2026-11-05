@@ -1136,6 +1136,18 @@ impl Host {
         self.controller.pause_retained_lookup()
     }
 
+    /// Arms the pause the next mutation of a paired device stops at once its worker has answered,
+    /// before the answer is checked against the device's authority. Returns the end that says the
+    /// call has arrived, and the end that lets it go. The pause fires once.
+    pub fn pause_after_the_worker_answered(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.controller.pause_after_the_worker_answered()
+    }
+
     /// Connects one local client on the daemon's own socket.
     pub async fn client(&self) -> LocalClient {
         LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build())
