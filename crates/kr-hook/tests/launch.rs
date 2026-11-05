@@ -1019,8 +1019,9 @@ fn assert_typed(report: &BTreeMap<String, String>, what: &str) {
 /// KR-REQ-12.07, KR-REQ-05.09, KR-REQ-12.02: the root shell's own child, started after the
 /// establish, with the backend's credential and the answered invocation, is admitted, and its
 /// registration exists when the program first runs and names the program. Its profile records the
-/// executable, the arguments the program ran and the mode. When the program ends, so do the
-/// instance, the endpoint, the credential, the registration and the launch record.
+/// executable, the arguments the program ran and the mode; not shown here: the profile's
+/// distribution, version and authentication state. When the program ends, so do the instance, the
+/// endpoint, the credential, the registration and the launch record.
 #[test]
 fn kr_req_12_07_a_launch_is_published_before_the_program_runs() {
     let shell = Shell::new();
@@ -1347,9 +1348,9 @@ fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_variable() {
     drop(listener);
 }
 
-/// KR-REQ-12.07, KR-REQ-12.02: a launcher that goes away after its admission and before it says it
-/// is going leaves nothing: the registration is taken back and the instance given back, and a retry
-/// of the same invocation is admitted.
+/// KR-REQ-12.07: a launcher that goes away after its admission and before it says it is going
+/// leaves nothing: the registration is taken back and the instance given back, and a retry of the
+/// same invocation is admitted.
 #[test]
 fn kr_req_12_07_a_launch_that_never_goes_is_rolled_back() {
     let shell = Shell::new();
@@ -1382,11 +1383,11 @@ fn kr_req_12_07_a_launch_that_never_goes_is_rolled_back() {
     let _ = finish(child);
 }
 
-/// KR-REQ-12.07, KR-REQ-12.02: a launch whose admission cannot be delivered, because its launcher
-/// went away between the registration being published and the admission being written, gives its
-/// instance and its binding back before it takes the registration down, so nobody who finds the
-/// registration gone finds the launch still holding the instance. The two steps of taking such a
-/// launch back are held apart, and what is true between them is looked at.
+/// KR-REQ-12.07: a launch whose admission cannot be delivered, because its launcher went away
+/// between the registration being published and the admission being written, gives its instance and
+/// its binding back before it takes the registration down, so nobody who finds the registration
+/// gone finds the launch still holding the instance. The two steps of taking such a launch back are
+/// held apart, and what is true between them is looked at.
 #[test]
 fn kr_req_12_07_an_undelivered_admission_gives_the_launch_back_before_the_registration_goes() {
     let shell = Shell::new();
@@ -1451,11 +1452,11 @@ fn kr_req_12_07_an_undelivered_admission_gives_the_launch_back_before_the_regist
     let _ = finish(child);
 }
 
-/// KR-REQ-12.02: a second launcher that presents itself to a backend a launch already holds is
+/// KR-REQ-12.07: a second launcher that presents itself to a backend a launch already holds is
 /// refused and its program runs as typed, and the first launch is left as it was: its program
 /// still runs, its instance is still bound and its registration is still published.
 #[test]
-fn kr_req_12_02_a_second_launch_for_a_backend_a_launch_holds_runs_as_typed_and_leaves_the_first() {
+fn kr_req_12_07_a_second_launch_for_a_backend_a_launch_holds_runs_as_typed_and_leaves_the_first() {
     let shell = Shell::new();
     let answer = shell.establish();
     let registration = Shell::registration(&answer);
