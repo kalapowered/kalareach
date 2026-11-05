@@ -203,9 +203,9 @@ $script:NextHistoryField = $null
 # The history entry the editor loads into the read that is about to start, as an index, or nothing
 # when this editor keeps none this package can read.
 #
-# It is above zero only after a line accepted with AcceptAndGetNext (Ctrl+o), which carries the
-# person's history search into the next read: the editor loads the entry after the one that ran and
-# the next search key goes on from there.
+# It is above zero only after a line accepted with AcceptAndGetNext (Ctrl+o): the editor loads the
+# entry after the one that ran into the next read, and carries the person's history search over to
+# it, so that the next search key goes on from there.
 function Read-KrNextHistoryIndex {
     try {
         if ($null -eq $script:SingletonField) {
@@ -240,8 +240,9 @@ function Read-KrNextHistoryIndex {
 # - The read starts in the insert table. After a line cancelled from the Vi command table the read
 #   starts in the command table, which has nothing bound on the key: the handler would not run and the
 #   reader would report nothing until a bound key.
-# - The editor carries no history search into the read. Any key the editor runs ahead of the person's
-#   ends the search AcceptAndGetNext carried over, so the person's next search key would start again.
+# - The read does not follow a line accepted with AcceptAndGetNext. The editor loads the next history
+#   entry into such a read and carries the person's history search over to it, and any key it runs
+#   ahead of the person's ends that search, so their next search key would start again.
 function Add-KrStartKey {
     if ($IsWindows -or -not $script:Hooks.Start) { return $false }
     try {
