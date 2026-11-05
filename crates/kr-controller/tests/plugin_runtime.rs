@@ -1621,9 +1621,9 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
 /// the worker holds off for the time the daemon named, has its binding told the same reason as soon
 /// as it is made, and not left pending.
 ///
-/// The case does not wait for a registration. The starts are counted in a window of the clock, and
-/// a machine that other work keeps busy delays a registration for longer than the window, which
-/// would let the first start leave it before the fifth is made.
+/// The case waits for no registration, and the window the starts are counted in is held where it is
+/// when the daemon starts, so no start leaves it however long a machine that other work keeps busy
+/// takes over the others: what the case decides by is how many starts were made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_plugin_runtime_that_keeps_ending_is_started_five_times_and_the_binding_is_told_why() {
     let Some(component) = well_behaved() else {
@@ -1631,6 +1631,7 @@ async fn a_plugin_runtime_that_keeps_ending_is_started_five_times_and_the_bindin
     };
     let attempts = kr_controller::service::plugin_runtime::START_ATTEMPTS;
     let world = World::start(&component).await;
+    world.controller().hold_plugin_start_window();
     let created = world.session().await;
     let (mut typing, agent) = world.run_agent(&created).await;
 

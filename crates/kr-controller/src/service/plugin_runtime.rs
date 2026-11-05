@@ -166,6 +166,10 @@ pub struct PluginRuntime {
     packages: PathBuf,
     state: tokio::sync::Mutex<State>,
     budget: std::sync::Mutex<StartBudget>,
+    /// The instant the start window is counted at, where this host's own tests hold it still.
+    /// Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    window_held: std::sync::Mutex<Option<Instant>>,
     /// How long a failure is answered from memory.
     failure_memory: Duration,
 }
@@ -198,8 +202,33 @@ impl PluginRuntime {
             packages,
             state: tokio::sync::Mutex::new(State::Idle),
             budget: std::sync::Mutex::new(StartBudget::default()),
+            #[cfg(feature = "testing")]
+            window_held: std::sync::Mutex::new(None),
             failure_memory: FAILURE_MEMORY,
         }
+    }
+
+    /// The instant a start is counted at: now, or the instant a test holds the window at.
+    fn window_now(&self) -> Instant {
+        #[cfg(feature = "testing")]
+        if let Some(held) = *self
+            .window_held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return held;
+        }
+        Instant::now()
+    }
+
+    /// Counts every start from now on at the instant it is called, so that a start stays inside
+    /// the window however long a case takes to make the others.
+    #[cfg(feature = "testing")]
+    fn hold_window(&self) {
+        *self
+            .window_held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
     }
 
     /// Remembers a failure for as long as `memory` instead, for tests that decide by what was
@@ -256,7 +285,7 @@ impl PluginRuntime {
                             .budget
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .spend(Instant::now());
+                            .spend(self.window_now());
                         if let Err(wait) = spent {
                             return unavailable(
                                 &format!(
@@ -484,6 +513,15 @@ impl Asker {
 }
 
 impl Controller {
+    /// Holds the window the plugin runtime's starts are counted in where it is now: every start is
+    /// counted at this instant from now on, so none leaves the window however long a case takes to
+    /// make the others, and a case that counts starts decides by how many were made. For this
+    /// host's own tests. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn hold_plugin_start_window(&self) {
+        self.plugin_runtime.hold_window();
+    }
+
     /// Checks that a request on the rendezvous endpoint comes from the process this daemon recorded
     /// for the session it names, as the kernel names that process, and from no other.
     ///
