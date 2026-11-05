@@ -4,8 +4,9 @@
 //! shell asks to resolve an integrated invocation, and starts the launcher as its own child, in a job
 //! of its own the way a session's shell runs everything it starts. The program is a copy of
 //! `cmd.exe` named `gemini.exe`, running a short batch file that writes down what it found the moment
-//! it started: the registration, the variable the package declares and the directory it works in.
-//! `cmd.exe` and `ping.exe` are on every Windows machine; nothing else is needed.
+//! it started: the registration, the variable the package declares, the directory it works in and
+//! the arguments after the batch file. `cmd.exe` and `ping.exe` are on every Windows machine;
+//! nothing else is needed.
 //!
 //! The launcher creates its program before it tells the backend, and starts it only when the backend
 //! has committed, so what is checked here is the order as much as the outcome: the backend names the
@@ -102,6 +103,9 @@ struct Shell {
     backends: Arc<CommandBackends>,
     /// The program every case runs: a copy of `cmd.exe` under the name the package integrates.
     executable: PathBuf,
+    /// The flags the package declares and the session's integration carries: none, except for a
+    /// case that asks for some.
+    flags: Vec<String>,
     reports: PathBuf,
     script: PathBuf,
     generation: std::sync::atomic::AtomicU64,
@@ -113,23 +117,24 @@ struct Shell {
 
 impl Shell {
     fn new() -> Self {
-        Self::build(|source, _| source, 0)
+        Self::build(|source, _| source, &[], 0)
     }
 
     /// A shell whose program is `bytes` long, written new so that the system has not seen it: the
     /// size of the largest agent this platform runs, whose first start is scanned as it is read.
     fn large(bytes: u64) -> Self {
-        Self::build(|source, _| source, bytes)
+        Self::build(|source, _| source, &[], bytes)
     }
 
     /// A shell whose connector's installation is granted to read files as well.
     fn reading() -> Self {
-        Self::build(|source, _| fixture::reading(source), 0)
+        Self::build(|source, _| fixture::reading(source), &[], 0)
     }
 
-    /// A shell whose connector's signed records name the program's exact bytes as `version`, with
-    /// a record of another version before them and one after, each for other bytes.
-    fn qualified(version: &str) -> Self {
+    /// A shell whose connector declares `flags`, and whose signed records name the program's exact
+    /// bytes as `version`, with a record of another version before them and one after, each for
+    /// other bytes.
+    fn qualified(version: &str, flags: &[&str]) -> Self {
         let record = |bytes: &[u8], version: &str| QualifiedExecutable {
             digest: Digest256::from_bytes(Sha256::digest(bytes).into()),
             version: version.to_owned(),
@@ -144,14 +149,16 @@ impl Shell {
                 ];
                 source
             },
+            flags,
             0,
         )
     }
 
-    /// Builds a shell whose package is written, then handed to `installed` with the path of the
-    /// program, to be made into the source the connector is admitted from.
+    /// Builds a shell whose package declares `flags` and is written, then handed to `installed`
+    /// with the path of the program, to be made into the source the connector is admitted from.
     fn build(
         installed: impl FnOnce(ConnectorSource, &Path) -> ConnectorSource,
+        flags: &[&str],
         padding: u64,
     ) -> Self {
         let placed = Placed::new();
@@ -175,8 +182,12 @@ impl Shell {
         std::fs::create_dir_all(&store).expect("a store");
         let sources = Arc::new(ConnectorSources::new());
         let source = installed(
-            fixture::package(&store, &placed.forwarder, &fixture::Shape::gemini_cli(&[]))
-                .expect("the package is written"),
+            fixture::package(
+                &store,
+                &placed.forwarder,
+                &fixture::Shape::gemini_cli(flags),
+            )
+            .expect("the package is written"),
             &executable,
         );
         let broker = Arc::new(
@@ -215,6 +226,7 @@ impl Shell {
             broker,
             backends,
             executable,
+            flags: flags.iter().map(|flag| (*flag).to_owned()).collect(),
             reports,
             script,
             generation: std::sync::atomic::AtomicU64::new(1),
@@ -223,12 +235,12 @@ impl Shell {
         }
     }
 
-    fn integration() -> CommandIntegration {
+    fn integration(&self) -> CommandIntegration {
         CommandIntegration {
             plugin_id: kr_protocol::ids::PluginId::new("kalareach/gemini-cli")
                 .expect("a plugin identifier"),
             command: "gemini".to_owned(),
-            flags: Vec::new(),
+            flags: self.flags.clone(),
             enabled: true,
         }
     }
@@ -255,11 +267,19 @@ impl Shell {
     /// Establishes a backend for the next line, as the session does for an integrated resolve, for
     /// an invocation the shell reported running in `cwd`.
     fn establish_in(&self, cwd: &Path) -> CommandBackend {
-        self.establish_typed(&self.typed(), cwd)
+        let typed = self.typed();
+        self.establish_answered(&typed, &typed, &[], cwd)
     }
 
-    /// Establishes a backend for the next line, for the invocation `typed` in `cwd`.
-    fn establish_typed(&self, typed: &[String], cwd: &Path) -> CommandBackend {
+    /// Establishes a backend for the next line, for the invocation `typed` in `cwd`, which the
+    /// integration answers with the vector `arguments`: the typed one with the flags `added`.
+    fn establish_answered(
+        &self,
+        typed: &[String],
+        arguments: &[String],
+        added: &[String],
+        cwd: &Path,
+    ) -> CommandBackend {
         let generation = self
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -268,9 +288,9 @@ impl Shell {
             .establish(&EstablishRequest {
                 prompt_generation: PromptGeneration::new(generation),
                 typed,
-                arguments: typed,
-                added: &[],
-                integration: &Self::integration(),
+                arguments,
+                added,
+                integration: &self.integration(),
                 executable: self.executable.to_str().expect("a text path"),
                 cwd: cwd.to_str().expect("a text path"),
                 cwd_revision: CwdRevision::new(1),
@@ -1514,18 +1534,23 @@ fn a_cold_copy_of_the_largest_agent_is_launched_within_the_deadlines() {
 /// executable is the absolute path of the file the started process runs from, which the kernel's
 /// own record of that process confirms, and not the name that was typed. The version is the one the
 /// connector's signed record names for the digest of that file's bytes, and not another record's.
-/// The arguments are the vector the program was run with, which the program reports as it received
-/// them, and the mode is the application's own bridge. Not shown here: the distribution and the
-/// authentication state of the profile, and a launch of a file that no record names.
+/// The arguments are the vector the integration answered, the typed one with the flag the connector
+/// declares added, and not the typed one; the program's own report of the arguments after its batch
+/// file, the flag among them, agrees. The mode is the application's own bridge. Not shown here: the
+/// distribution and the authentication state of the profile, and a launch of a file that no record
+/// names.
 #[test]
 fn kr_req_12_02_a_windows_launch_records_the_executable_version_arguments_and_mode_it_started() {
-    let shell = Shell::qualified("2.3.4");
+    let flag = "--added-by-the-integration";
+    let shell = Shell::qualified("2.3.4", &[flag]);
     let typed = shell.typed_with(&["first", "second"]);
+    let added = vec![flag.to_owned()];
+    let answered: Vec<String> = typed.iter().chain(&added).cloned().collect();
     let root = shell.placed.host.root();
-    let answer = shell.establish_typed(&typed, root);
+    let answer = shell.establish_answered(&typed, &answered, &added, root);
     let mut launcher = shell.launcher(
         &shell.executable.clone(),
-        &typed,
+        &answered,
         &answer,
         "profiled",
         &[],
@@ -1537,8 +1562,9 @@ fn kr_req_12_02_a_windows_launch_records_the_executable_version_arguments_and_mo
         "the launch was committed and not run as typed: {report:?}"
     );
     assert_eq!(
-        report["args"], "first second",
-        "the program received the arguments after its batch file"
+        report["args"],
+        answered[4..].join(" "),
+        "the program received the arguments after its batch file, the added flag among them"
     );
     let instance = Shell::instance_of(&answer);
     let profile = shell
@@ -1560,10 +1586,6 @@ fn kr_req_12_02_a_windows_launch_records_the_executable_version_arguments_and_mo
     assert!(
         recorded.is_absolute(),
         "the recorded executable is a path and not the name typed: {recorded:?}"
-    );
-    assert_ne!(
-        profile.binary.resolved_path, typed[0],
-        "and is not the name typed"
     );
     assert_eq!(
         recorded, shell.executable,
@@ -1592,8 +1614,8 @@ fn kr_req_12_02_a_windows_launch_records_the_executable_version_arguments_and_mo
 
     // The arguments and the mode the program ran with.
     assert_eq!(
-        profile.arguments, typed,
-        "the arguments are the whole vector the program was run with"
+        profile.arguments, answered,
+        "the arguments are the whole vector the program was run with, the added flag included"
     );
     assert_eq!(profile.mode, IntegrationMode::NativeBridge);
     assert_eq!(
@@ -1602,7 +1624,7 @@ fn kr_req_12_02_a_windows_launch_records_the_executable_version_arguments_and_mo
             .binding_state(instance)
             .expect("the launched instance is live")
             .mode,
-        IntegrationMode::NativeBridge,
+        profile.mode,
         "the instance the launch registered runs in the mode its profile records"
     );
 }
