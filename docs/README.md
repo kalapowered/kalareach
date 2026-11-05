@@ -188,7 +188,7 @@ stops, so a limit that a part has is written in that part's own document.
   Each release in the catalogue states which range of SDKs it is compatible with and which
   executable builds it was qualified against. Free and commercial vendors can run a repository that
   an owner device confirms with `kr plugin repo add`. The catalogue takes no payment and checks no
-  entitlement; a vendor that charges does so for its own service or support. If a host is enrolled
+  entitlement; a vendor can charge for its own service or support. If a host is enrolled
   in an organisation and the applied policy states that only a list of adapters can be used on that
   host, then only those adapters can be used: [catalogue](plugins/catalogue.md) and
   [organisation policy](host/README.md#organisation-policy).
