@@ -9,13 +9,13 @@
 //! parent exits; what places it in the session is the session's job, which holds it because the
 //! shell that started it was put there before it ran and nothing it starts may leave. That, the
 //! named pipe that names it to the worker, and the start identity Windows gives it are the
-//! mechanisms these rows rest on here:
+//! mechanisms the checks below rest on:
 //!
-//! | Row | What is checked here |
-//! | --- | --- |
-//! | KR-REQ-11.52 | The helper is bound to its own process and the creation time Windows records for it, found in the session's job, running the `kr` this test launched |
-//! | KR-REQ-11.54 | A helper reaches the session whose job holds it and no other, whatever it is told |
-//! | KR-REQ-23.31 | The private question methods check the caller token of the question named, and refuse a helper the worker cannot place inside the session |
+//! - The helper is bound to its own process and the creation time Windows records for it, found
+//!   in the session's job, running the `kr` this test launched.
+//! - A helper reaches the session whose job holds it and no other, whatever it is told.
+//! - The private question methods check the caller token of the question named, and refuse a
+//!   helper the worker cannot place inside the session.
 //!
 //! Everything a test launches lives on the internal disk: the `kr` binary is copied to the
 //! temporary directory, the host's runtime and state directories are a temporary tree there, and
