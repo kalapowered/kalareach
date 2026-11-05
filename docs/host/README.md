@@ -4160,11 +4160,11 @@ no envelope keeps which application sent a question or an alert, so two applicat
 that use the same identifier hold each other back. A receipt whose identity the worker cannot read
 holds back every request of its method by the actor in the session, as the rule above does: its
 envelope is gone (privacy mode removes it once an action settles), does not decode, or is not a
-request of that method. A receipt a migration left with no subject digest, because the envelope the
-earlier build kept did not decode, is in the same case for every method: no subject says which ask
-it was, so it holds back every request of its method by its actor. Every uncertain request of a
-method also holds back a request of that method whose parameters do not parse, as the rule above
-does. Every other method keeps the rule above.
+request of that method. A receipt that a migration left without a subject digest (the earlier build
+kept no envelope, or one this build cannot read) holds back every request of its method by its
+actor, since no subject says which ask it was; for the five methods above, an envelope this build
+can read still decides. Every uncertain request of a method also holds back a request of that method
+whose parameters do not parse, as the rule above does. Every other method keeps the rule above.
 
 When a subject carries several uncertain outcomes, a request has to show the one the journal
 recorded last. For the five methods above that is the last recorded of the outcomes that hold the
