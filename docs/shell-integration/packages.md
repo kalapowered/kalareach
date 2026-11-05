@@ -272,7 +272,10 @@ at and the states they wait in are observable, and puts its end-of-file decision
 gesture in front of whatever was bound there. In the Vi edit mode the wrapping of the editor's
 operations and the decision are in the insert table only, as the contract's
 [PSReadLine](README.md#psreadline) section says. It calls the editor's published API and reads the
-editor's own key queue, which is what a fence rests on and what the editor publishes no count of.
+editor's own key queue, which is what a fence rests on and what the editor publishes no count of. It
+also writes to that queue, to queue the key it starts a read with and to give back a key that a
+host's answer did not hold, and it binds the three chords that begin a host's answer and the start
+key.
 
 The editor's own queue is read live and refused when it cannot be: the two fields exist, the editor has an instance, the instance has a queue and the queue answers with a count. A build that renames the queue, has none, or holds something that is not a queue is refused as `psreadline_queue_unreadable` when the module loads, and again when the hooks activate after the profile, because a profile that runs in between can import another editor. The module also calls the editor's own read of the next key, to take a host's answer to a terminal query out of the keys before any of it reaches the line, and an editor that keeps none the module can call is refused as `psreadline_key_read_unreadable` in the same two places. An editor whose queue stops answering later reports its queues as not drained rather than empty. Outside Windows the module also reads the input the .NET runtime has taken from the terminal and not handed to the editor, in its buffer, in the keys it has made and in the bytes its decoder holds for a character not yet whole, and asks the runtime's own poll whether the terminal's queue holds anything. A runtime that keeps no reader where the module was qualified to find it is refused as `runtime_reader_unreadable`, at the two points the editor's queue is checked; the decoder it reads is a field of .NET 9 and later, so the .NET 8 of PowerShell 7.4 is such a runtime; one whose reader stops answering later reports its queues as not drained.
 

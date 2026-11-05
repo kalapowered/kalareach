@@ -831,6 +831,11 @@ fn the_reader_once_it_has_taken_what_the_terminal_holds(
 /// reader claiming the editor is clear when it has not started. The terminal then answers, and the
 /// report comes with the editor's line empty.
 ///
+/// The editor does not wait for a held reply for ever: the runtime gives up on it after about a
+/// second. A harness that is slow between the question and the check, by more than that, sees the
+/// editor start without the reply and the reader report idle, and the case fails. So the case can
+/// fail for want of speed, and it cannot pass for want of it.
+///
 /// # Panics
 ///
 /// Panics when the reader has reported itself idle at a prompt whose editor is still waiting for
