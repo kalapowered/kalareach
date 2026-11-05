@@ -1233,7 +1233,8 @@ every send the answer went out under, so an answer whose reply was lost is found
 answer as offered, waiting, unlisted, unsettled, taken or retired.
 
 - An answer is taken when the worker took one of its sends while the reply was lost. It is not sent
-  again and is no longer kept.
+  again and is no longer kept. The document still holds the text that was kept on this device, which
+  can differ from the text of the send the worker took.
 - An answer is waiting when the worker has a send and has not finished with it. It stays kept and is
   not offered.
 - An answer whose question is still pending at the revision it answered is offered, and stays kept.
