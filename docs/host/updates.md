@@ -64,17 +64,29 @@ What has to follow an update names its path through `current` instead, so it is 
   the running shell's own bridge builtin, so a shell of any release the host keeps reads it and runs
   its own release's integration.
 
-When the host starts a program itself, it reads `current` once and starts the program of the
-release it names, by that release's own path, which has no link in it. A program started from its
-own release, such as the worker a control daemon launches, uses that release's own path and reads
-no link. The starts that read `current` once are, on Linux and macOS, a `kr` that hands its command
-to the store's `kr`, a `kr` that takes in a package manager's release, the standalone start of the
-control daemon, and the start of a daemon again after an update. `kr shell` reads the packages the
-same way, so the packages one read finds are all of one release. On Windows the scheduled task
-starts the daemon, by `current\bin\kr-controller.exe`. The paths in the list above are written for
-something else to start later, so they keep the link. Where the host checks that a program or a
-file is there first (the forwarder, an agent's command and a shell's entry), it asks the release it
-read.
+When the host starts a program itself, it reads `current` once, holds the release it names, and
+starts the program of that release by the release's own path, which has no link in it. The hold
+keeps the release on disk until the program has a hold of its own, so a start that waits while two
+updates switch and collect releases still finds its program. A program started from its own release,
+such as the worker a control daemon launches, uses that release's own path and reads no link. The
+starts that read `current` once and hold the release are, on Linux and macOS, a `kr` that hands its
+command to the store's `kr`, a `kr` that takes in a package manager's release, and the standalone
+start of the control daemon. The start of a daemon again after an update reads the release under the
+update lock, which no switch or collection passes. `kr shell` reads the packages the same way and
+holds the release while it reads, so the packages one read finds are all of one release. On Windows
+the scheduled task's starter starts the daemon by `current\bin\kr-controller.exe`, through the
+junction; a start at the moment a switch replaces the junction has not been measured there. The
+paths in the list above are written for something else to start later, so they keep the link. Where
+the host checks that a program or a file is there before it writes a path (an agent's command and a
+shell's entry, and the forwarder when the control daemon opens its catalogue), it asks the release
+it read, and it writes the registration of a native bridge from that answer without asking again.
+
+A worker admits a bridge only when the connecting process is the forwarder the registration starts.
+A registration through `current` starts the `kr-hook` of whichever release `current` named when the
+application started it, and an update can switch before the forwarder's hello, so the worker admits
+the `kr-hook` of any release the store keeps and does not read the link. A registration that names
+one release's `kr-hook` by its own path admits that one. The `kr-hook` of the worker's own release
+is admitted beside either.
 
 On Linux, a path walk through a link that a rename replaces rarely answers that the path does not
 exist: a few walks in tens of millions, whichever way the link is replaced. A program that an
