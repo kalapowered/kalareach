@@ -196,6 +196,31 @@ function Get-KrStartKey {
     }
 }
 
+$script:NextHistoryField = $null
+
+# The history entry the editor loads into the read that is about to start, as an index, or nothing
+# when this editor keeps none this package can read.
+#
+# It is above zero only after a line accepted with AcceptAndGetNext (Ctrl+o), which carries the
+# person's history search into the next read: the editor loads the entry after the one that ran and
+# the next search key goes on from there.
+function Read-KrNextHistoryIndex {
+    try {
+        if ($null -eq $script:SingletonField) {
+            $script:SingletonField = $script:Rl.GetField('_singleton', 'NonPublic,Static')
+        }
+        if ($null -eq $script:NextHistoryField) {
+            $script:NextHistoryField = $script:Rl.GetField('_getNextHistoryIndex', 'NonPublic,Instance')
+        }
+        if ($null -eq $script:SingletonField -or $null -eq $script:NextHistoryField) { return $null }
+        $singleton = $script:SingletonField.GetValue($null)
+        if ($null -eq $singleton) { return $null }
+        [int]$script:NextHistoryField.GetValue($singleton)
+    } catch {
+        $null
+    }
+}
+
 # Queues the module's own key for the read that is about to start, and says whether it did.
 #
 # The key is the first thing the editor runs once it has started: it asks the terminal where the
@@ -204,13 +229,27 @@ function Get-KrStartKey {
 # has not asked yet, and the reader reports itself idle from the handler, which is where the worker
 # asks for a fence again. Where the key cannot be queued the caller reports idle at once, as it always
 # did.
+#
+# The key is queued only where it cannot change what the person's keys do or fail to run.
+# - The queue is empty. A key the person typed ahead is in it first, and a key of the module's behind
+#   it can be taken as the second key of a chord they began with an Escape, and never runs. The queue
+#   is not clear in that case either, and the editor asks where the cursor is before it runs any key
+#   in it, so no fence is proved before it has asked.
+# - The read starts in the insert table. After a line cancelled from the Vi command table the read
+#   starts in the command table, which has nothing bound on the key: the handler would not run and the
+#   reader would report nothing until a bound key.
+# - The editor carries no history search into the read. Any key the editor runs ahead of the person's
+#   ends the search AcceptAndGetNext carried over, so the person's next search key would start again.
 function Add-KrStartKey {
     if ($IsWindows -or -not $script:Hooks.Start) { return $false }
     try {
         $key = Get-KrStartKey
         $queue = Get-KrKeyQueue
         if ($null -eq $key -or $null -eq $queue) { return $false }
-        # The editor starts every read in its insert mode, which is the table the key is bound in.
+        if ($queue.Count -gt 0) { return $false }
+        if ($script:Rl::InViCommandMode()) { return $false }
+        $next = Read-KrNextHistoryIndex
+        if ($null -eq $next -or $next -gt 0) { return $false }
         $table = (Get-KrBindingTables).Keys
         if (-not $table.ContainsKey($key) -or "$($table[$key].LongDescription)" -cne $script:StartDescription) {
             return $false
@@ -219,6 +258,28 @@ function Add-KrStartKey {
         return $true
     } catch {
         return $false
+    }
+}
+
+# Takes the module's own key out of the editor's queue where it is still there, and leaves every
+# other key in the place and the order it had.
+#
+# The key stays queued when the read it was queued for ended before the editor ran it. Once the
+# module's binding is off, it would reach an editor with nothing bound on it, or with a binding of the
+# person's made since, which would then run without a press.
+function Remove-KrStartKeys {
+    try {
+        $key = Get-KrStartKey
+        $queue = Get-KrKeyQueue
+        if ($null -eq $key -or $null -eq $queue) { return }
+        $held = $queue.ToArray()
+        if (@($held | Where-Object { $key.Equals($_) }).Count -eq 0) { return }
+        $queue.Clear()
+        foreach ($each in $held) {
+            if (-not $key.Equals($each)) { $queue.Enqueue($each) }
+        }
+    } catch {
+        Write-KrTrace "the start key was not taken out of the queue: $($_.Exception.Message)"
     }
 }
 

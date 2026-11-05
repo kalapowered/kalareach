@@ -1122,6 +1122,122 @@ fn the_key_the_module_queues_when_a_read_starts_is_bound_in_every_edit_mode_and_
     );
 }
 
+/// KR-REQ-07.37, KR-REQ-08.49: the module queues its start key only into an empty queue, only for a
+/// read that starts in the insert table and only where the editor carries no history search into the
+/// read, and takes the key out of the queue when it goes.
+///
+/// A key the person typed ahead is first in the queue, and a key of the module's behind it can be
+/// taken as the second key of a chord the person began with an Escape, which leaves the read with
+/// no key of the module's to report it idle. The queue is not clear in that case either, so no fence
+/// is proved before the editor has asked. A search the person was in the middle of goes on across a
+/// line accepted with accept-and-get-next only if the next read starts at its first key; a key of the
+/// module's ahead of the person's would end it. A read that starts in the Vi command table, as one
+/// does after a line cancelled from it, has nothing bound on the key, which would then never run and
+/// leave the reader silent. A start key left in the queue when the module goes
+/// would reach the editor with nothing of the module's bound on it, or with a binding of the
+/// person's, so it is taken out and the person's keys stay in their order.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_module_queues_its_start_key_only_into_an_empty_queue_and_over_no_search_and_takes_it_out_when_it_goes()
+ {
+    let said_in_turn = in_the_package_host(
+        r#"$bound = & $module { $script:Hooks.Start = Install-KrStartHandler; $script:Hooks.Start };
+           & $module {
+               $info = [System.ConsoleKeyInfo]::new([char]27, [System.ConsoleKey]::Escape, $false, $false, $false);
+               $script:TypedKey = $script:Rl.Assembly.GetType('Microsoft.PowerShell.PSKeyInfo').GetMethod(
+                   'FromConsoleKeyInfo', [type[]]@([System.ConsoleKeyInfo])).Invoke($null, @($info));
+               $script:NextHistory = $script:Rl.GetField('_getNextHistoryIndex', 'NonPublic,Instance')
+           };
+           function Show-KrQueue { & $module { Get-KrQueuedKeys } };
+           function Clear-KrQueue { & $module { (Get-KrKeyQueue).Clear() } };
+           $first = & $module { Add-KrStartKey };
+           Write-Output "kr-key[empty]=[$first $(Show-KrQueue)]";
+           $again = & $module { Add-KrStartKey };
+           Write-Output "kr-key[again]=[$again $(Show-KrQueue)]";
+           Clear-KrQueue;
+           & $module { (Get-KrKeyQueue).Enqueue($script:TypedKey) };
+           $behind = & $module { Add-KrStartKey };
+           Write-Output "kr-key[typed]=[$behind $(Show-KrQueue)]";
+           Clear-KrQueue;
+           & $module { $script:NextHistory.SetValue($script:SingletonField.GetValue($null), 3) };
+           $chained = & $module { Add-KrStartKey };
+           Write-Output "kr-key[chain]=[$chained $(Show-KrQueue)]";
+           & $module { $script:NextHistory.SetValue($script:SingletonField.GetValue($null), 0) };
+           $over = & $module { Add-KrStartKey };
+           Write-Output "kr-key[over]=[$over $(Show-KrQueue)]";
+           Clear-KrQueue;
+           Set-PSReadLineOption -EditMode Vi;
+           $null = & $module { $script:Hooks.Start = Install-KrStartHandler };
+           & $module {
+               $script:Dispatch = $script:Rl.GetField('_dispatchTable', 'NonPublic,Instance');
+               $editor = $script:SingletonField.GetValue($null);
+               $script:InsertTable = $script:Dispatch.GetValue($editor);
+               $script:Dispatch.SetValue($editor, $script:Rl.GetField('_viCmdKeyMap', 'NonPublic,Static').GetValue($null))
+           };
+           $command = & $module { Add-KrStartKey };
+           Write-Output "kr-key[command]=[$command $(Show-KrQueue)]";
+           & $module { $script:Dispatch.SetValue($script:SingletonField.GetValue($null), $script:InsertTable) };
+           $insert = & $module { Add-KrStartKey };
+           Write-Output "kr-key[insert]=[$insert $(Show-KrQueue)]";
+           Clear-KrQueue;
+           & $module {
+               $queue = Get-KrKeyQueue;
+               $queue.Enqueue($script:TypedKey); $queue.Enqueue((Get-KrStartKey)); $queue.Enqueue($script:TypedKey)
+           };
+           $before = Show-KrQueue;
+           & $module { Restore-KrStartHandler };
+           Write-Output "kr-key[removed]=[$before $(Show-KrQueue)]""#,
+    );
+    for (name, expected, what) in [
+        (
+            "empty",
+            "True 1",
+            "the module queued no start key into an empty queue",
+        ),
+        (
+            "again",
+            "False 1",
+            "the module queued a second start key behind the first",
+        ),
+        (
+            "typed",
+            "False 1",
+            "the module queued a start key behind a key the person typed ahead",
+        ),
+        (
+            "chain",
+            "False 0",
+            "the module queued a start key ahead of a search the editor carries into the read",
+        ),
+        (
+            "over",
+            "True 1",
+            "the module queued no start key once the editor carried no search",
+        ),
+        (
+            "command",
+            "False 0",
+            "the module queued a start key for a read that starts in the Vi command table, where nothing is bound on it",
+        ),
+        (
+            "insert",
+            "True 1",
+            "the module queued no start key for a read that starts in the Vi insert table",
+        ),
+        (
+            "removed",
+            "3 2",
+            "taking the start key off left it in the queue, or took a key of the person's",
+        ),
+    ] {
+        assert_eq!(
+            said(&said_in_turn, name),
+            expected,
+            "{what}:\n{said_in_turn}"
+        );
+    }
+}
+
 /// KR-REQ-12.07: when the hooks go, the handler the person had before the module's still runs
 /// through a handler of the person's set after the module's.
 ///
