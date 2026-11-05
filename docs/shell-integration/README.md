@@ -813,17 +813,19 @@ it was given.
 - **Nothing waits.** The reader acts on bytes that are already there. A lone Escape, a vi user's
   mode key, goes straight to the editor, and a key typed in the same write as an answer, before or
   after it, reaches the editor whole and in its place. A read that waits for the rest of a key
-  keeps its limit: Zsh's `KEYTIMEOUT` runs from the start of the wait, and an answer taken out of
-  the way does not start it again. A Readline check with a time limit asks again for the time that
-  is left, and a Readline wait with no limit stays one. The longest run the reader follows is 480
-  bytes.
+  keeps its limit: the `KEYTIMEOUT` that Zsh took when the line began runs from the start of the
+  wait, and an answer taken out of the way does not start it again. A Readline check with a time
+  limit asks again for the time that is left, and a Readline wait with no limit stays one. The
+  longest run the reader follows is 480 bytes.
 - **When an answer still reaches the line.** An answer the terminal delivers in two parts is the
   exception: the first part has gone to the editor as keys before the second arrives, as it did
   before. A burst of answers larger than the terminal's input queue, such as a request for 32
   capability names, comes in parts. Zsh widgets that read a character directly (`vigetkey`,
   `getfullchar` and `getzlequery`: the vi `f`, `t` and `r` commands, `zap-to-char` and the
   completion question) do not go through `getkeybuf`, so they still take an answer. Bash drops it
-  at those reads too.
+  at those reads too. With `BAUD` set, Zsh redraws the line only when no input is waiting, so text
+  typed in the same delivery as an answer is drawn with the next key, as it was before the answer
+  was dropped.
 - **Pastes.** Inside a bracketed paste the reader leaves the bytes alone, and so it does in a
   quoted insertion. Readline reads text pasted in vi replace mode, and the target of a character
   search, again key by key without that exemption, so an answer-shaped run in text pasted there is

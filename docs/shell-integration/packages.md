@@ -56,7 +56,7 @@ There are five patches, against `zsh-5.9.2`.
 | `0002-zle-reader-state` | `Src/Zle/zle_misc.c` | Three reader states the detach condition needs |
 | `0004-exec-command-resolve` | `Src/exec.c`, `Src/zsh.h`, `Src/Zle/zle_main.c` | The question in front of each command a line starts, and the launcher its answer can name |
 | `0005-module-paths-from-executable` | `Src/init.c` | The default module path and function path, read from where the executable is |
-| `0006-zle-host-replies` | `Src/Zle/zle.mdd`, `Src/Zle/zle_keymap.c` | A host's answer to a terminal query, taken out of the keys before the key lookup |
+| `0006-zle-host-replies` | `Src/Zle/{zle.mdd,zle_keymap.c,zle_main.c}` | A host's answer to a terminal query, taken out of the keys before the key lookup |
 
 The first patch does five things, all inside `zle_main.c`:
 
@@ -118,15 +118,17 @@ directory that was under the build's prefix is moved under this one. If the shel
 directory the paths it was built with are kept, and user settings in startup files are applied
 afterwards and win.
 
-The sixth patch changes one function. `getkeybuf` is where ZLE takes each byte of a key from the
-terminal, and it now takes it through `kr_zle_key_byte`, which reads with `getbyte` as before and
-asks the bridge about every Escape it gets. The bridge looks at the bytes the terminal has already
+The sixth patch changes one function and makes one variable visible. `getkeybuf` is where ZLE takes
+each byte of a key from the terminal, and it now takes it through `kr_zle_key_byte`, which reads
+with `getbyte` as before and asks the bridge about every Escape it gets. The bridge looks at the bytes the terminal has already
 delivered and takes all of them when they are a whole answer of the host's query broker, as the
 Zsh and Bash section of [README.md](README.md) describes; otherwise it pushes them back with
 `ungetbyte`, so `getbyte` hands them to the key lookup in the order they came, and it keeps a note
 of how many of the pushed-back bytes are its own, so the reader reports them as the terminal's and
-not as keys a widget pushed back. A read that waits for the rest of a key keeps the one `KEYTIMEOUT` limit it started with.
-A `read -k` inside a widget reaches the terminal through `getbyte` directly, and `vared` and
+not as keys a widget pushed back. A read that waits for the rest of a key keeps the one limit ZLE
+took from `KEYTIMEOUT` when the line began, which is why `keytimeout` is no longer private to
+`zle_main.c`: the bridge reads the value ZLE itself uses, not the parameter, which a widget may have
+changed since. A `read -k` inside a widget reaches the terminal through `getbyte` directly, and `vared` and
 `select` are declined by the reader context, so a program that asked for its answer still gets it.
 
 ## What Bash changes
@@ -203,7 +205,8 @@ queue, and takes all of them when they are a whole answer of the host's query br
 gives them back to the front of the reader's buffer with `_rl_unget_char`, in order. The buffer
 holds 511 bytes and the longest run the bridge reads ahead is 480, so what it gives back always
 fits. `_rl_input_available` takes an answer that is at the front of the terminal's bytes before it
-reports input, and asks again for what is left of its time limit, so a caller that checks first and
+reports input, and asks again for what is left of its time limit, measured on a clock that does not
+go backwards, so a caller that checks first and
 then reads is never sent to wait for a key that was an answer. `_rl_nchars_available` counts the
 bytes the reader holds with the terminal's, and the bracketed paste prefix reader reads them, so a
 paste whose opening was read ahead is still found whole in a search or a command name.
