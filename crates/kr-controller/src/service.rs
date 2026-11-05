@@ -599,6 +599,11 @@ pub struct Controller {
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_retained_lookup: ReadPause,
+    /// Where this host's own tests stop a paired device's mutation once its worker has answered,
+    /// before the answer is checked against the device's authority, so that the authority can
+    /// change in between. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_worker_answered: ReadPause,
     /// Where this host's own tests stop a paired device's key registration that found no retained
     /// answer, before it looks again, so that an earlier attempt can finish in between. Compiled
     /// away in every shipped build.

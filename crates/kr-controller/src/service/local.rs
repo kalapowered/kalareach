@@ -301,6 +301,19 @@ impl Controller {
         self.after_the_retained_lookup.arm()
     }
 
+    /// Arms the pause the next mutation of a paired device stops at once its worker has answered,
+    /// before the answer is checked against the device's authority. Returns the end that says the
+    /// call has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_the_worker_answered(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.after_the_worker_answered.arm()
+    }
+
     /// Arms the pause the next key registration of a paired device stops at once its first lookup
     /// for a retained answer has found none, before it looks again. Returns the end that says the
     /// registration has arrived, and the end that lets it go. The pause fires once.

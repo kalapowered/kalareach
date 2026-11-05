@@ -1155,6 +1155,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             after_the_retained_lookup: ReadPause::default(),
             #[cfg(feature = "testing")]
+            after_the_worker_answered: ReadPause::default(),
+            #[cfg(feature = "testing")]
             before_the_second_retained_lookup: ReadPause::default(),
             #[cfg(feature = "testing")]
             after_the_automation_admission: ReadPause::default(),
