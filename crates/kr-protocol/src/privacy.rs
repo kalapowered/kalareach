@@ -40,9 +40,18 @@ pub struct PrivacyRetainedDeleteParams {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PrivacyRetainedDeleteResult {
-    /// True when the service holding the copy has said it no longer holds it. False while the
-    /// request has been made and the service has not answered: the host asks again when it is asked
-    /// to delete the same copy again, and the report shows the copy as one whose deletion was asked.
+    /// True when the service holding the copy has said it no longer holds it.
+    ///
+    /// For a backup generation, false while the request has been made and the service has not
+    /// confirmed every object: the host asks again when it is asked to delete the same copy again,
+    /// and the report shows the copy as one whose deletion was asked.
+    ///
+    /// For a notification the gateway was given, true when the gateway answered the request. It
+    /// answers the same whether it removed a record, never had one or had already swept it, so
+    /// the answer says the gateway holds nothing for that notification now; a gateway that does
+    /// not answer, or that refuses the request, fails the call and no result is given. The host
+    /// records nothing of a deletion the gateway confirmed, so the report goes on listing the
+    /// notification and a second call asks the gateway again.
     pub deleted: bool,
     /// Where privacy mode stands after the request.
     pub report: PrivacyReport,

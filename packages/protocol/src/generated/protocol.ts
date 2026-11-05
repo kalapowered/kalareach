@@ -7331,7 +7331,10 @@ export interface BackupHostKeys {
   writer_public_key: string
 }
 /**
- * The last call to `backup.enable` that did not set backups up, kept until the next one.
+ * The last call to `backup.enable` that ended as declined or unknown, which the daemon keeps until
+ * it stops. A later call that ends in an answer replaces it, or clears it when the answer is that
+ * backups are set up, whether that call set them up or was a repeat answered from the record. A
+ * call that is refused leaves it as it was.
  */
 export interface BackupLastAttempt {
   /**
@@ -7381,7 +7384,7 @@ export interface BackupStatusResult {
    */
   keys: BackupHostKeys | null
   /**
-   * The last call that did not set backups up, if the daemon still holds it.
+   * The last call that ended as declined or unknown, or null when the daemon holds none.
    */
   last_attempt: BackupLastAttempt | null
   /**
@@ -22615,9 +22618,18 @@ export interface PrivacyRetainedDeleteParams {
  */
 export interface PrivacyRetainedDeleteResult {
   /**
-   * True when the service holding the copy has said it no longer holds it. False while the
-   * request has been made and the service has not answered: the host asks again when it is asked
-   * to delete the same copy again, and the report shows the copy as one whose deletion was asked.
+   * True when the service holding the copy has said it no longer holds it.
+   *
+   * For a backup generation, false while the request has been made and the service has not
+   * confirmed every object: the host asks again when it is asked to delete the same copy again,
+   * and the report shows the copy as one whose deletion was asked.
+   *
+   * For a notification the gateway was given, true when the gateway answered the request. It
+   * answers the same whether it removed a record, never had one or had already swept it, so
+   * the answer says the gateway holds nothing for that notification now; a gateway that does
+   * not answer, or that refuses the request, fails the call and no result is given. The host
+   * records nothing of a deletion the gateway confirmed, so the report goes on listing the
+   * notification and a second call asks the gateway again.
    */
   deleted: boolean
   report: PrivacyReport1

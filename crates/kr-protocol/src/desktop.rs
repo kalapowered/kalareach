@@ -91,11 +91,13 @@ impl DesktopSessionKind {
 /// What the login-session generation was read from.
 ///
 /// The generation is the part of a desktop identity that tells two logins apart when they share a
-/// platform session number. Every platform answers it the same way, through the kernel's start
-/// value for the process that owns the login session, and each names a different process. How
-/// completely that distinguishes one login from another follows from the process each platform
-/// names, which is why the source is part of the record; the value is also only ever comparable
-/// with another value from the same source on the same host.
+/// platform session number. macOS and Linux answer it through the kernel's start value for the
+/// process that owns the login session, and each names a different process. Windows has no such
+/// process an account can read, so it answers with the time at which the session's user logged
+/// on, which the account reads for its own session. How completely that distinguishes one login
+/// from another follows from what each platform names, which is why the source is part of the
+/// record; the value is also only ever comparable with another value from the same source on the
+/// same host.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
@@ -105,7 +107,8 @@ pub enum DesktopGenerationSource {
     MacosSessionCreator,
     /// Linux: the kernel's start value for the login session's leader process.
     LinuxSessionLeader,
-    /// Windows: the kernel's start value for the interactive session's logon process.
+    /// Windows: the time the system records for the interactive session's user to have logged on,
+    /// in 100 ns ticks since 1601, which the account reads for its own session.
     WindowsSessionLogon,
     /// The platform offered no generation. The identifier and the boot identity carry the identity
     /// alone, which is sound only where the platform does not reuse a session number within a

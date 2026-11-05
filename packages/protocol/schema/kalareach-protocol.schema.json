@@ -5438,7 +5438,7 @@
     },
     "BackupLastAttempt": {
       "additionalProperties": false,
-      "description": "The last call to `backup.enable` that did not set backups up, kept until the next one.",
+      "description": "The last call to `backup.enable` that ended as declined or unknown, which the daemon keeps until\nit stops. A later call that ends in an answer replaces it, or clears it when the answer is that\nbackups are set up, whether that call set them up or was a repeat answered from the record. A\ncall that is refused leaves it as it was.",
       "properties": {
         "cause": {
           "anyOf": [
@@ -5860,7 +5860,7 @@
               "type": "null"
             }
           ],
-          "description": "The last call that did not set backups up, if the daemon still holds it."
+          "description": "The last call that ended as declined or unknown, or null when the daemon holds none."
         },
         "privacy_mode": {
           "description": "Whether privacy mode is on.",
@@ -12956,7 +12956,7 @@
       "type": "object"
     },
     "DesktopGenerationSource": {
-      "description": "What the login-session generation was read from.\n\nThe generation is the part of a desktop identity that tells two logins apart when they share a\nplatform session number. Every platform answers it the same way, through the kernel's start\nvalue for the process that owns the login session, and each names a different process. How\ncompletely that distinguishes one login from another follows from the process each platform\nnames, which is why the source is part of the record; the value is also only ever comparable\nwith another value from the same source on the same host.",
+      "description": "What the login-session generation was read from.\n\nThe generation is the part of a desktop identity that tells two logins apart when they share a\nplatform session number. macOS and Linux answer it through the kernel's start value for the\nprocess that owns the login session, and each names a different process. Windows has no such\nprocess an account can read, so it answers with the time at which the session's user logged\non, which the account reads for its own session. How completely that distinguishes one login\nfrom another follows from what each platform names, which is why the source is part of the\nrecord; the value is also only ever comparable with another value from the same source on the\nsame host.",
       "oneOf": [
         {
           "const": "macos_session_creator",
@@ -12970,7 +12970,7 @@
         },
         {
           "const": "windows_session_logon",
-          "description": "Windows: the kernel's start value for the interactive session's logon process.",
+          "description": "Windows: the time the system records for the interactive session's user to have logged on,\nin 100 ns ticks since 1601, which the account reads for its own session.",
           "type": "string"
         },
         {
@@ -29121,7 +29121,7 @@
       "description": "The result of `privacy.retained.delete`.",
       "properties": {
         "deleted": {
-          "description": "True when the service holding the copy has said it no longer holds it. False while the\nrequest has been made and the service has not answered: the host asks again when it is asked\nto delete the same copy again, and the report shows the copy as one whose deletion was asked.",
+          "description": "True when the service holding the copy has said it no longer holds it.\n\nFor a backup generation, false while the request has been made and the service has not\nconfirmed every object: the host asks again when it is asked to delete the same copy again,\nand the report shows the copy as one whose deletion was asked.\n\nFor a notification the gateway was given, true when the gateway answered the request. It\nanswers the same whether it removed a record, never had one or had already swept it, so\nthe answer says the gateway holds nothing for that notification now; a gateway that does\nnot answer, or that refuses the request, fails the call and no result is given. The host\nrecords nothing of a deletion the gateway confirmed, so the report goes on listing the\nnotification and a second call asks the gateway again.",
           "type": "boolean"
         },
         "report": {

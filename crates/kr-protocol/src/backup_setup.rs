@@ -182,7 +182,10 @@ pub struct BackupHostKeys {
     pub producer_public_key: StoredEnvelopeKey,
 }
 
-/// The last call to `backup.enable` that did not set backups up, kept until the next one.
+/// The last call to `backup.enable` that ended as declined or unknown, which the daemon keeps until
+/// it stops. A later call that ends in an answer replaces it, or clears it when the answer is that
+/// backups are set up, whether that call set them up or was a repeat answered from the record. A
+/// call that is refused leaves it as it was.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BackupLastAttempt {
@@ -209,7 +212,7 @@ pub struct BackupStatusResult {
     pub keys: Nullable<BackupHostKeys>,
     /// What the account holds at the service.
     pub storage: BackupStorageState,
-    /// The last call that did not set backups up, if the daemon still holds it.
+    /// The last call that ended as declined or unknown, or null when the daemon holds none.
     pub last_attempt: Nullable<BackupLastAttempt>,
 }
 
