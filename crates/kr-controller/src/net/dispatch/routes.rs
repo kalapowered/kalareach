@@ -569,7 +569,12 @@ impl RemoteConnection {
         asked: &mut Option<Asked>,
         received_at: kr_transport::clock::ContinuousInstant,
     ) -> ControlFrame {
-        let own_claim = OwnClaim::none();
+        // Entered among the calls that have not claimed the route of their action until it claims
+        // it or ends, so a refusal of a copy of it that arrives meanwhile is worded as a repeat's.
+        let own_claim = match super::forwarding::request_of(&self.device.principal(), mutation) {
+            Some(request) => OwnClaim::arrived(self.controller.arrivals().arrive(request)),
+            None => OwnClaim::none(),
+        };
         match self
             .serve_mutation(mutation, asked, received_at, &own_claim)
             .await

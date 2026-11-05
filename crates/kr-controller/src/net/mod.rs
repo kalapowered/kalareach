@@ -42,6 +42,7 @@
 //! after the worker has acknowledged that revision. Local input and stopping owned execution never
 //! depend on that lease, because neither is remote dispatch.
 
+pub(crate) mod arrivals;
 pub mod clock_trust;
 pub mod config;
 mod device_errors;
