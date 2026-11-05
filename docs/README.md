@@ -168,9 +168,10 @@ stops, so a limit that a part has is written in that part's own document.
   which prints a document after it creates the invitation, naming the role and, when the host's
   reply to the creation arrives, the actions. A phone accepts the invitation, in the Offers view of
   the companion application. There is no accept command in `kr share`, and the desktop companion
-  does not have an Offers view. `kr share transfer` hands control of a session to another device. A
-  revocation completes through a barrier per worker. To take control of typing, a controller must
-  explicitly take an input lease: [grants](host/README.md#grants-sharing-and-revocation),
+  does not have an Offers view. `kr share transfer` hands control of a session to another device
+  once an owner device has confirmed the plan the host describes. A revocation completes through a
+  barrier per worker. To take control of typing, a controller must explicitly take an input lease:
+  [grants](host/README.md#grants-sharing-and-revocation),
   [pairing](pairing/README.md), [who may type](host/README.md#who-may-type) and
   [cli](cli/README.md).
 - **Automation.** Versioned workflows that react to verified events, under causal budgets and a
@@ -185,9 +186,11 @@ stops, so a limit that a part has is written in that part's own document.
   [the backup service](host/README.md#the-backup-service) and [crypto](crypto/README.md).
 - **The plugin catalogue.** A signed catalogue of adapter packages that can be searched offline.
   Each release in the catalogue states which range of SDKs it is compatible with and which
-  executable builds it was qualified against. If a host is enrolled in an organisation and the
-  applied policy states that only a list of adapters can be used on that host, then only those
-  adapters can be used: [catalogue](plugins/catalogue.md) and
+  executable builds it was qualified against. Free and commercial vendors can run a repository that
+  an owner device confirms with `kr plugin repo add`. The catalogue takes no payment and checks no
+  entitlement; a vendor that charges does so for its own service or support. If a host is enrolled
+  in an organisation and the applied policy states that only a list of adapters can be used on that
+  host, then only those adapters can be used: [catalogue](plugins/catalogue.md) and
   [organisation policy](host/README.md#organisation-policy).
 - **Teams.** Signed leases of membership and the signed chain for the organisation's policy, which a
   host verifies without contacting the service
