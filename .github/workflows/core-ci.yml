@@ -2838,14 +2838,18 @@ jobs:
         run: bash scripts/disk-report.sh end "the release build"
 
       # The idle-resource and attach targets (KR-PERF-003, KR-PERF-004) and the input measurements,
-      # in a release build, each figure printed with the conditions it was taken under and asserted
-      # against its bound. This runner has three processors and 7 GiB, short of section 27's
-      # reference host, so the idle processor figure is recorded here with each missing condition
-      # named and is asserted by the macos-reference job; the idle memory bound and the other
-      # figures are asserted here. Section 27 measures an idle host, so the script starts each
-      # measurement only once the one-minute load average is under the bound named here, half this
-      # runner's three processors, waiting at most ten minutes for it and failing without a figure
-      # when it does not fall. Four such waits fit the limit below with the measurements.
+      # in a release build, each figure printed with the conditions it was taken under. This runner
+      # has three processors and 7 GiB, short of section 27's reference host, and is a GitHub-hosted
+      # runner, so the idle processor figure and the recogniser's upper bounds (each hold's and the
+      # split delimiter's, KR-PERF-002) are recorded here with each missing condition named and not
+      # asserted. The macos-reference job asserts the idle processor figure, its host reading no
+      # shortfall, and records the same upper bounds, being a hosted runner too. Both jobs assert
+      # the other figures (the attach target where the disk's durable writes read within the
+      # reference host's bound) and the recogniser's deadline, each hold's lower bound and
+      # recognition of a split delimiter. Section 27 measures an idle host, so the script starts
+      # each measurement only once the one-minute load average is under the bound named here, half
+      # this runner's three processors, waiting at most ten minutes for it and failing without a
+      # figure when it does not fall. Four such waits fit the limit below with the measurements.
       - name: Performance measurements
         if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
         timeout-minutes: 60
