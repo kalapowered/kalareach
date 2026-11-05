@@ -39,6 +39,7 @@ step cargo test -p kr-worker --test fence -- --ignored --exact \
   a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_again \
   a_real_readers_line_stays_empty_when_the_host_answers_an_application \
   a_real_powershell_readers_fence_is_invalidated_by_the_hosts_answer \
+  a_real_powershell_editor_reads_its_cursor_report_whole_while_the_host_answers_the_application \
   a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_once_from_its_holder_or_not_at_all \
   a_real_root_shell_killed_at_its_prompt_closes_its_session_with_the_signal \
   kr_req_13_11_a_real_reader_is_launchable_at_its_prompt_and_not_after_a_key_until_the_next \

@@ -8537,6 +8537,93 @@ async fn a_real_powershell_readers_fence_is_invalidated_by_the_hosts_answer() {
     a_readers_fence_is_invalidated_by_the_hosts_answer(ShellKind::PowerShell).await;
 }
 
+/// KR-REQ-08.48, KR-REQ-08.49: with a real qualified PowerShell reader, the host's answers to the
+/// application's questions that the host produces after the editor began its read do not go in
+/// ahead of the reply to the editor's question about the cursor.
+///
+/// The editor reads that reply from the same input as every other byte, and joins into it any
+/// byte that comes ahead of it: three answers to a device-attributes question ahead of a reply
+/// make its column 226222621, and the editor throws and stops answering. The case watches from the
+/// start of the shell, so the first read is the one it sees begin: the moment the worker has
+/// registered the editor it asks the terminal for its device attributes eight times, which the host
+/// answers at once, and it expects the editor to go on to prove a fence over an empty line. What
+/// the host held back for the editor's report is written behind it, and the module takes it out of
+/// the keys as it does any answer. An answer written ahead of the report makes the case fail: the
+/// editor does not get to prove a fence, or has part of an answer in its line.
+///
+/// It needs the PowerShell package published into the root that `KR_SHELL_PACKAGES` names, as the
+/// case above does.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the PowerShell package published into the root that KR_SHELL_PACKAGES names; it runs with --ignored on a host that has published one, as the build box's verification does"]
+async fn a_real_powershell_editor_reads_its_cursor_report_whole_while_the_host_answers_the_application()
+ {
+    let package = installed_package_of(ShellKind::PowerShell);
+    let shell = RealShell::start_with_profile(
+        &package,
+        kr_protocol::session::LaunchProfile::default(),
+        Vec::new(),
+        None,
+        "",
+        false,
+    )
+    .await;
+    let mut keys = shell.keys();
+    // The worker has registered the first read of the editor: it has not asked where the cursor is.
+    // Nothing before this moment can make the session leave `Outside`.
+    tokio::time::timeout(REAL_SHELL_LIVENESS, async {
+        loop {
+            let registered = shell
+                .runtime
+                .session()
+                .fence()
+                .is_some_and(|driver| driver.state() != FenceState::Outside);
+            if registered {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the editor never began a read");
+    for _ in 0..8 {
+        shell.runtime.session().ingest_output(b"\x1b[c");
+        shell.runtime.flush_input();
+        tokio::task::yield_now().await;
+    }
+    let proved = until_the_reader_proves_a_fence(
+        &shell,
+        &mut keys,
+        true,
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .await;
+    {
+        let session = shell.runtime.session();
+        let seen = retained(&session);
+        assert!(
+            proved.is_some(),
+            "the editor never proved a fence after the host answered eight questions; the session's \
+             output ends {}",
+            String::from_utf8_lossy(&seen[seen.len().saturating_sub(512)..]).escape_debug()
+        );
+        let standing = session.launch_standing();
+        assert!(
+            matches!(
+                standing,
+                Some(kr_shell_integration::contract::fence::LaunchStanding::Fenced(editor))
+                    if editor.acknowledged.buffer_empty
+            ),
+            "the fence the editor proved is not over an empty line: {standing:?}; the session's \
+             output ends {}",
+            String::from_utf8_lossy(&seen[seen.len().saturating_sub(512)..]).escape_debug()
+        );
+    }
+    shell.close().await;
+}
+
 // --------------------------------------------------------------------------------------------
 // Ownership transfer during an end of input, at a real root prompt.
 // --------------------------------------------------------------------------------------------
