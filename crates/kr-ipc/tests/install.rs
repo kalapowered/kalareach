@@ -328,20 +328,11 @@ fn what_the_host_reads_from_current_once_is_of_one_release_though_a_switch_falls
 }
 
 /// KR-REQ-26.09: a program the host starts from the release `current` names runs that release,
-/// whole, while `current` is being switched over and over: the one its start read, held, from the
-/// image the read named. Judged by a count of starts, not by how long they take.
+/// whole, whichever way `current` is switched around the start: the one its read named, held, from
+/// the image the read named. A switch falls between each read and its start, and another while the
+/// program runs; judged by a count of starts, not by how long they take.
 #[test]
-fn a_program_started_from_the_release_current_names_runs_that_release_during_switches() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// Tells the switching thread to stop however the starts end, a failed assertion included.
-    struct Stop<'a>(&'a AtomicBool);
-    impl Drop for Stop<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
+fn a_program_started_from_the_release_current_names_runs_that_release_through_switches() {
     /// Ends the program a start made if the case leaves before the program has ended.
     struct Started(std::process::Child);
     impl Drop for Started {
@@ -358,64 +349,66 @@ fn a_program_started_from_the_release_current_names_runs_that_release_during_swi
     test.install(&one);
     test.install(&two);
     test.switch(&one);
-    let finished = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let mut round = 0_u32;
-            while !finished.load(Ordering::SeqCst) {
-                test.switch(if round.is_multiple_of(2) { &two } else { &one });
-                round += 1;
-            }
-        });
-        let _stop = Stop(&finished);
-        for start in 0..STARTS {
-            let program = test
-                .store
-                .current_program(Program::Kr)
-                .expect("current is readable")
-                .expect("a release is current");
-            // The release the read named, from the path it returned.
-            let named = program
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .and_then(std::ffi::OsStr::to_str)
-                .map(str::to_owned)
-                .expect("the path is a release's program");
-            assert!(
-                [one.as_str(), two.as_str()].contains(&named.as_str()),
-                "the path names a release of the store, not the link: {}",
-                program.display()
-            );
-            let talk = test.root.join(format!("talk-{start}"));
-            std::fs::create_dir(&talk).expect("a directory to talk through");
-            let mut child = Started(
-                std::process::Command::new(&program)
-                    .args(["--exact", "helper", "--nocapture", "--test-threads", "1"])
-                    .env(HELPER, &talk)
-                    .current_dir(&test.root)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .expect("the program starts"),
-            );
-            wait_for(&talk.join("started"));
-            std::fs::write(talk.join("go"), b"").expect("go");
-            wait_for(&talk.join("said"));
-            let said = std::fs::read_to_string(talk.join("said")).expect("what it found");
-            let mut lines = said.lines();
-            let image = PathBuf::from(lines.next().expect("its image"));
-            let held = lines.next().expect("its release");
-            assert_eq!(held, named, "it runs and holds the release the read named");
-            assert_eq!(
-                std::fs::canonicalize(&image).expect("its image resolves"),
-                std::fs::canonicalize(&program).expect("the program resolves"),
-                "the kernel names the program the read named"
-            );
-            std::fs::write(talk.join("end"), b"").expect("end");
-            assert!(child.0.wait().expect("the program ends").success());
-        }
-    });
+    for start in 0..STARTS {
+        let program = test
+            .store
+            .current_program(Program::Kr)
+            .expect("current is readable")
+            .expect("a release is current");
+        // The release the read named, from the path it returned.
+        let named = program
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("the path is a release's program")
+            .to_owned();
+        let (read, other) = if named == one.as_str() {
+            (&one, &two)
+        } else {
+            (&two, &one)
+        };
+        assert_eq!(
+            program,
+            test.store.release_program(read, Program::Kr),
+            "the path names a release of the store, not the link"
+        );
+
+        // A switch falls between the read and the start: through the link the program would be
+        // the other release's now.
+        test.switch(other);
+        let talk = test.root.join(format!("talk-{start}"));
+        std::fs::create_dir(&talk).expect("a directory to talk through");
+        let mut child = Started(
+            std::process::Command::new(&program)
+                .args(["--exact", "helper", "--nocapture", "--test-threads", "1"])
+                .env(HELPER, &talk)
+                .current_dir(&test.root)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("the program starts"),
+        );
+        wait_for_unless_ended(&talk.join("started"), &mut child.0);
+        // And another while it runs, back to the release it was read in.
+        test.switch(read);
+        std::fs::write(talk.join("go"), b"").expect("go");
+        wait_for_unless_ended(&talk.join("said"), &mut child.0);
+        let said = std::fs::read_to_string(talk.join("said")).expect("what it found");
+        let mut lines = said.lines();
+        let image = PathBuf::from(lines.next().expect("its image"));
+        let held = lines.next().expect("its release");
+        assert_eq!(held, named, "it runs and holds the release the read named");
+        assert_eq!(
+            std::fs::canonicalize(&image).expect("its image resolves"),
+            std::fs::canonicalize(&program).expect("the program resolves"),
+            "the kernel names the program the read named"
+        );
+        std::fs::write(talk.join("end"), b"").expect("end");
+        assert!(child.0.wait().expect("the program ends").success());
+        // So that the next start reads the other release.
+        test.switch(other);
+    }
 }
 
 /// A build outside a store is what it always was: its programs are the ones beside it, and it
