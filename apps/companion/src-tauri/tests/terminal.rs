@@ -952,11 +952,61 @@ async fn a_size_the_session_did_not_take_for_now_goes_again_with_its_next_word()
             "{code:?}: the size that was refused"
         );
         link.answer(&again, &viewport_answer(1)).await;
+        screen(&mut link, 3, 80, vec![row(0, "first"), row(1, "second")], 1).await;
         assert!(
             link.quiet_for(QUIET).await,
-            "{code:?}: an answer settles it, and nothing is owed"
+            "{code:?}: the answer and the screen it names settle it, and nothing is owed"
         );
     }
+}
+
+/// What the page measures or moves while a size report is in flight is not made to wait for the
+/// session by that report's refusal for now: the newest size is owed, and goes at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_the_page_does_during_a_size_report_the_session_did_not_take_goes_at_once() {
+    for page_moves in [false, true] {
+        let mut worker = ScriptedWorker::start(Challenge::Answered);
+        let page_view = Page::new(worker.paths());
+        let at = wide_session();
+        let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+        page_view.resize(&view, 12, 2);
+        let first = link.expect(Method::AttachmentViewport).await;
+        let expected = if page_moves {
+            page_view.pan(&view, 1, 1, 0);
+            Dimensions::new(12, 2)
+        } else {
+            page_view.resize(&view, 14, 3);
+            Dimensions::new(14, 3)
+        };
+        link.refuse_with(&first, ErrorCode::ResourceUnavailable, "not now")
+            .await;
+        let (_, asked) = report(&mut link).await;
+        assert_eq!(
+            asked.dimensions, expected,
+            "the owed size goes with nothing between (the page moves: {page_moves})"
+        );
+    }
+}
+
+/// A size the session cannot say it took may have been taken, so the newest size is said again
+/// though the page measured back to the size last sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_size_of_unknown_outcome_is_said_again_though_the_page_measured_back() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let (view, mut link) = showing(&page_view, &mut worker, 3).await;
+    page_view.resize(&view, 12, 3);
+    let first = link.expect(Method::AttachmentViewport).await;
+    page_view.resize(&view, 10, 2);
+    link.refuse_with(&first, ErrorCode::OutcomeUnknown, "no word of it")
+        .await;
+    let again = link.expect(Method::AttachmentViewport).await;
+    let asked: AttachmentViewportParams = again.params();
+    assert_eq!(
+        asked.dimensions,
+        Dimensions::new(10, 2),
+        "the host may have taken 12 by 3, so it is told the size the page has"
+    );
 }
 
 /// A session that keeps refusing a size for now is not asked once for every word it says: the size
