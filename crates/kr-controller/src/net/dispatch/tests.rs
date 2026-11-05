@@ -4974,7 +4974,7 @@ async fn a_close_whose_answer_does_not_read_in_the_workers_level_is_told_as_unkn
     let controller = &world.controller;
     let connection =
         super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 39));
-    let close = fake::close_request(world.environment_id, world.session_id);
+    let mut close = fake::close_request(world.environment_id, world.session_id);
     let unreadable = ParamsValue::new(kr_cbor::CanonicalValue::Map(
         kr_cbor::CanonicalMap::from_entries([(
             "a_member_no_level_has".to_owned(),
@@ -4983,6 +4983,12 @@ async fn a_close_whose_answer_does_not_read_in_the_workers_level_is_told_as_unkn
         .expect("a map"),
     ));
     script.kept(close.action_id, unreadable);
+    // A first presentation of an action is admitted under a window this connection holds.
+    close.action_window_id = connection
+        .windows
+        .issue(connection.connection_id, controller.boot_epoch)
+        .expect("a window")
+        .action_window_id;
     let answered = connection
         .answer_now(ControlFrame::Mutation(Box::new(close)))
         .await
