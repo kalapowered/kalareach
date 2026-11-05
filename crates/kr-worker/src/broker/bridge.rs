@@ -138,6 +138,11 @@ impl InstalledBridge {
     /// where the platform can name one. A process whose executable cannot be named is refused: the
     /// installation cannot be validated for a process nobody can identify.
     ///
+    /// The process must run the installed forwarder. Where that is registered through a store's
+    /// `current`, the `kr-hook` of any release the store keeps is it, since an update can switch
+    /// between the application's start of the forwarder and its hello; the forwarder of the
+    /// worker's own release is admitted beside the installed one in every case.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::PermissionDenied`] naming what did not match.
@@ -172,16 +177,24 @@ impl InstalledBridge {
                  cannot be the installed forwarder",
             ));
         };
-        let installed = std::fs::canonicalize(&self.forwarder).map_err(|error| {
-            BrokerError::denied(format!(
-                "the installed forwarder {} cannot be read: {error}",
-                self.forwarder.display()
-            ))
-        })?;
         let running = std::fs::canonicalize(running).map_err(|error| {
             BrokerError::denied(format!(
                 "the executable this connection runs, {}, cannot be read: {error}",
                 running.display()
+            ))
+        })?;
+        // A registration through `current` starts the `kr-hook` of whichever release `current`
+        // named at that moment, so the forwarder it started is one of a release the store keeps
+        // whatever `current` names now. The link is not read for it: a walk through a link that a
+        // switch replaces can answer that the path is missing, and a switch between the start and
+        // this hello would refuse a forwarder the host itself started.
+        if running_is_a_forwarder_the_store_keeps(&self.forwarder, &running) {
+            return Ok(());
+        }
+        let installed = std::fs::canonicalize(&self.forwarder).map_err(|error| {
+            BrokerError::denied(format!(
+                "the installed forwarder {} cannot be read: {error}",
+                self.forwarder.display()
             ))
         })?;
         if running == installed || running_is_the_own_forwarder_of(this, &running) {
@@ -193,6 +206,17 @@ impl InstalledBridge {
             installed.display()
         )))
     }
+}
+
+/// Whether `forwarder`, the path a registration starts, goes through the `current` of a store, and
+/// `running` is the `kr-hook` of a release that store keeps.
+///
+/// What the check protects is that the connecting process is the host's own forwarder: a program the
+/// host installed, whichever release it is of. A forwarder registered by one release's own path
+/// names that one, and only the comparison with it admits a process.
+fn running_is_a_forwarder_the_store_keeps(forwarder: &Path, running: &Path) -> bool {
+    kr_ipc::install::Store::of_stable_path(forwarder, kr_ipc::install::Program::Hook)
+        .is_some_and(|store| store.keeps_program(running, kr_ipc::install::Program::Hook))
 }
 
 /// Whether `running` is the `kr-hook` of the release the worker `this` runs.

@@ -1072,6 +1072,46 @@ impl Store {
         there.then(|| self.stable(program))
     }
 
+    /// The store a path written down for a program through `current` ([`Store::stable`]) belongs
+    /// to: `<store>/current/bin/<program>`, where `<store>` holds a store record. `None` for any
+    /// other path.
+    #[must_use]
+    pub fn of_stable_path(path: &Path, program: Program) -> Option<Self> {
+        let bin = path.parent()?;
+        let current = bin.parent()?;
+        let store = Self::at(current.parent()?);
+        (path.file_name()?.to_str()? == program.file_name()
+            && bin.file_name()?.to_str()? == "bin"
+            && current.file_name()?.to_str()? == CURRENT)
+            .then_some(store)
+            .filter(Self::is_store)
+    }
+
+    /// Whether `image`, the path the kernel names for a process's own image, is `program` of a
+    /// release this store keeps in `versions/`. A program under `staging/` or `trash/`, one outside
+    /// the store, and another program of a kept release are not.
+    #[must_use]
+    pub fn keeps_program(&self, image: &Path, program: Program) -> bool {
+        let Ok(versions) = std::fs::canonicalize(self.versions()) else {
+            return false;
+        };
+        let Ok(inside) = image.strip_prefix(versions) else {
+            return false;
+        };
+        let names: Vec<_> = inside
+            .components()
+            .map(|part| match part {
+                std::path::Component::Normal(name) => name.to_str(),
+                _ => None,
+            })
+            .collect();
+        matches!(
+            names.as_slice(),
+            [Some(release), Some("bin"), Some(file)]
+                if ReleaseName::new(*release).is_ok() && *file == program.file_name()
+        )
+    }
+
     /// Creates the store's directories, owner-only, where they are missing. The store record is
     /// the caller's to write: until it exists nothing treats the directory as a store.
     ///
