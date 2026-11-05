@@ -3,17 +3,26 @@
 //! Where this crate differs by platform, Windows differs most: a named pipe in a namespace every
 //! account can see, where Unix has a socket inside an owner-only directory; an access-control list
 //! where Unix has mode bits; and a creation time where Linux has start ticks. Everything here needs
-//! the real thing, so this suite exists only on that platform. What it covers, row by row:
+//! the real thing, so this suite exists only on that platform. What it covers:
 //!
-//! | Row | What is checked here |
-//! | --- | --- |
-//! | KR-REQ-02.04, KR-REQ-05.02 | A worker's endpoint is a pipe whose protected list names its owner and no account the machine does not already trust; a caller that holds every identity the owner holds but the owner's own is refused when it opens it; and the owner arriving over the network is refused as well |
-//! | KR-REQ-02.07 | The listener names the process at the other end of the pipe as the kernel records it: the process that connected, never the listener |
-//! | KR-REQ-05.03 | A descriptor is published under a list that grants its owner alone, and is replaced whole: a reader holding the old version still reads the old version, and a reader by name reads one version or the other and never part of one. A reader refuses a descriptor whose list grants another account, a directory whose list is widened, one reached through a junction, and a file in a directory swapped since it was checked |
-//! | KR-REQ-11.52 | A process's start identity is the creation time the operating system records for that process, two processes started within one second carry two start values, and a process this account may only ask when it started is identified without its liveness being guessed |
+//! - A worker's endpoint is a pipe whose protected list names its owner and no account the
+//!   machine does not already trust; a caller that holds every identity the owner holds but
+//!   the owner's own is refused when it opens it; and the owner arriving over the network is
+//!   refused as well.
+//! - The listener names the process at the other end of the pipe as the kernel records it: the
+//!   process that connected, never the listener.
+//! - A descriptor is published under a list that grants its owner alone, and is replaced whole:
+//!   a reader holding the old version still reads the old version, and a reader by name reads
+//!   one version or the other and never part of one. A reader refuses a descriptor whose list
+//!   grants another account, a directory whose list is widened, one reached through a junction,
+//!   and a file in a directory swapped since it was checked.
+//! - A process's start identity is the creation time the operating system records for that
+//!   process, two processes started within one second carry two start values, and a process
+//!   this account may only ask when it started is identified without its liveness being
+//!   guessed.
 //!
-//! The environment identity's list and the profile it is kept in, KR-REQ-03.08, are checked by
-//! this crate's own tests in `src/paths.rs`, which run on this platform too.
+//! The environment identity's list and the profile it is kept in are checked by this crate's
+//! own tests in `src/paths.rs`, which run on this platform too.
 //!
 //! The boot identity every recorded worker, startup claim and owner confirmation is bound to is
 //! read here thousands of times over several seconds, and one boot gives one value: the kernel's
