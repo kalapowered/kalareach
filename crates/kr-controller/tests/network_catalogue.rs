@@ -1,6 +1,6 @@
 //! The two plugin method groups over the network path.
 //!
-//! What these demonstrate, for the paired-device ingress of the plugin catalogue and plugin method
+//! These cases are about the paired-device ingress of the plugin catalogue and plugin method
 //! groups. The registry admits a device to all thirteen methods; until now the network dispatcher
 //! refused the three reads as unsupported and sent the ten mutations to the worker proxy, which
 //! wants a session a catalogue mutation does not name.
@@ -274,12 +274,12 @@ fn grant_params(
 /// The order is the product order: trust a root, synchronise a generation, install a package from
 /// it, enable it, read what it can do, and take all of it away again.
 ///
-/// Shown here: a root is added under the owner's confirmation and its generation is synchronised,
-/// listed and pinned; an install is on the hash the verified generation declares, and the
-/// capability evidence names that hash; a grant is refused for a capability the package does not
-/// ask for and for a confirmation of another action. Not shown here: a root added under a
-/// confirmation that is no owner device's, the repository's budget, or a grant above the
-/// repository's ceiling.
+/// Shown here: all thirteen methods answer a device that holds `host.manage`; a root is added under
+/// the owner's confirmation, and its generation is synchronised, listed and pinned; an install is
+/// on the hash the verified generation declares, and the capability evidence names that hash. Not
+/// shown here: the refusal of a device without `host.manage`, a root added under a confirmation
+/// that is no owner device's, enlarged trust, the repository's budget or ceiling, the environment
+/// and binding checks, or scoped read authority for capability queries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_23_28_and_23_29_a_paired_device_reaches_every_catalogue_and_plugin_method() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -682,10 +682,11 @@ async fn a_catalogue_mutation_from_a_device_names_an_environment_and_never_a_ses
 /// grant carries. Every mutation and `catalogue.list` require `host.manage`; `plugin.list` and
 /// `plugin.capabilities` require no right at all, and a device that holds none still reads them.
 ///
-/// Shown here: `catalogue.list`, `catalogue.sync`, `catalogue.remove` and `plugin.enable` refuse a
-/// device without `host.manage`, and `plugin.list` answers it but refuses an environment this
-/// daemon does not own. Not shown here: the other catalogue and plugin mutations, or
-/// `plugin.capabilities`.
+/// Shown here: `catalogue.list`, `catalogue.sync`, `catalogue.remove` and `plugin.enable` require
+/// `host.manage`, and `plugin.list` answers a device that holds no right but refuses an
+/// environment this daemon does not own. Not shown here: the other catalogue and plugin mutations,
+/// scoped read authority for `plugin.capabilities`, the repository's root, generation and budget,
+/// the owner's confirmation, or the package hash, ceiling and binding checks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_a_device_without_host_manage_reaches_is_what_the_registry_lists() {
     let owner = DeviceKeys::generate().expect("owner keys");
