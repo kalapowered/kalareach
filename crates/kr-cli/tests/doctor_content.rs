@@ -1,8 +1,8 @@
 //! The content-bearing export of `kr doctor --bundle`, against a real control daemon and real
 //! workers.
 //!
-//! KR-REQ-29.04: a real-content capture is opt-in, leaves private sessions out and is shown to the
-//! person before it is written. KR-REQ-26.44 holds the first of those: no content entry without
+//! A real-content capture is opt-in, leaves private sessions out and is shown to the person
+//! before it is written. The first of those holds in full: no content entry without
 //! `--include-content`.
 //!
 //! Everything here is real. The daemon is the control service, started in this process with the
