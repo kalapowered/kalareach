@@ -40,7 +40,13 @@ import { entryLabel, nodeKindLabel } from '../../model/entry-label'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
 import { StandingBanner } from '../../components/StandingBanner'
 import { isOver, rightsOf } from '../../model/openings'
-import { failureCode, failureMessage, failureRetry, type SessionSubject } from '../../host/port'
+import {
+  failureCode,
+  failureMessage,
+  failureRetry,
+  failureWords,
+  type SessionSubject
+} from '../../host/port'
 import {
   adoptFirstTarget,
   againstCurrent,
@@ -773,7 +779,9 @@ export function MobileSession({
             return
           }
           // A refusal of the earlier result's quote says the host's record is not what was shown:
-          // it is read again at once, so the person sees what it says now.
+          // it names the action the host holds as the newest, and the record is read again at
+          // once, so the person sees what it says now and the next quote is that action's.
+          if (failureCode(failure) === 'DRAFT_CONFLICT') receiptReads.noteRefusal(failureWords(failure))
           if (anyway && failureCode(failure) === 'DRAFT_CONFLICT') receiptReads.askAgain(sessionId)
           lifecycle.setSubmissions((current) =>
             current.map((each) =>

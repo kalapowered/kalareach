@@ -9,6 +9,10 @@
  * host said of it, so the revision it can quote is the one in the newest read it made. This holds
  * those reads for the window. They are kept in memory only: a quote is made from what was shown in
  * this window, and a window that has just started has shown nothing.
+ *
+ * Which uncertain action is the newest is the host's to say, by the order it recorded them in, and
+ * a read does not carry that order. The page picks by the time of the record, and when the host
+ * refuses the quote it names the action it holds as the newest: the next quote is that one.
  */
 
 import type { Receipt } from '@kalareach/protocol'
@@ -42,6 +46,12 @@ export interface Conversation {
   readonly agentBindingRevision: string | null
 }
 
+/** An action identifier, as the host writes one in its words. */
+const ACTION_ID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/
+
+/** How many actions the host named in a refusal this window keeps. */
+const MAX_NAMED = 16
+
 /** Compares two numbers a host writes as decimal text without losing precision. */
 function later(a: string, b: string): boolean {
   try {
@@ -55,6 +65,8 @@ function later(a: string, b: string): boolean {
 export class ReceiptReads {
   readonly #reads = new Map<string, ReceiptRead>()
   readonly #again = new Map<string, Set<() => void>>()
+  /** The actions the host named in a refusal, the one it named last at the end. */
+  readonly #named: string[] = []
 
   /** Keeps what a read of an action's record said, unless a newer revision has been read. */
   note = (receipt: Receipt): void => {
@@ -70,6 +82,22 @@ export class ReceiptReads {
 
   /** What the newest read of an action's record said, when there has been one. */
   read = (actionId: string): ReceiptRead | undefined => this.#reads.get(actionId)
+
+  /**
+   * Keeps the action a host's refusal names, which is the first identifier in its words: the one it
+   * holds as the newest uncertain outcome of the conversation, or the one the quote was about.
+   */
+  noteRefusal = (words: string): void => {
+    const named = ACTION_ID.exec(words)?.[0]
+    if (named === undefined) return
+    const held = this.#named.indexOf(named)
+    if (held >= 0) this.#named.splice(held, 1)
+    this.#named.push(named)
+    if (this.#named.length > MAX_NAMED) this.#named.shift()
+  }
+
+  /** How recently the host named an action in a refusal: higher is later, and -1 is never. */
+  namedAt = (actionId: string): number => this.#named.indexOf(actionId)
 
   /** Has `read` called when a session's actions should be read again; the result stops it. */
   whenAskedAgain = (sessionId: string, read: () => void): (() => void) => {
@@ -93,7 +121,8 @@ export class ReceiptReads {
  * The host's rule is about the conversation: it compares a later request with the newest uncertain
  * outcome of the same method for the same session, instance and binding revision. So only an action
  * whose newest read said unknown counts, only a prompt, only one sent to this conversation, and the
- * newest of those by the time its record was written. Anything else is sent with no quote: an
+ * newest of those: the one the host last named in a refusal, and otherwise the one whose record was
+ * written last. Anything else is sent with no quote: an
  * action the host holds as accepted or dispatching, or one of another method or conversation, does
  * not stand in a prompt's way, and a quote of one would be refused.
  */
@@ -102,7 +131,8 @@ export function supersessionFor(
   reads: ReceiptReads,
   to: Conversation
 ): Supersession | null {
-  let newest: { readonly action_id: string; readonly read: ReceiptRead } | null = null
+  let newest: { readonly action_id: string; readonly read: ReceiptRead; readonly named: number } | null =
+    null
   for (const each of submissions) {
     if (each.state !== 'unknown' || each.actionId === null) continue
     if (
@@ -114,12 +144,15 @@ export function supersessionFor(
     }
     const read = reads.read(each.actionId)
     if (read === undefined || read.state !== 'unknown' || read.method !== PROMPT_METHOD) continue
+    const named = reads.namedAt(each.actionId)
     if (
       newest === null ||
-      later(read.updatedAtMs, newest.read.updatedAtMs) ||
-      (read.updatedAtMs === newest.read.updatedAtMs && each.actionId > newest.action_id)
+      named > newest.named ||
+      (named === newest.named &&
+        (later(read.updatedAtMs, newest.read.updatedAtMs) ||
+          (read.updatedAtMs === newest.read.updatedAtMs && each.actionId > newest.action_id)))
     ) {
-      newest = { action_id: each.actionId, read }
+      newest = { action_id: each.actionId, read, named }
     }
   }
   return newest === null
