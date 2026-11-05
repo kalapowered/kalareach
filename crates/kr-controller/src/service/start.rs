@@ -1227,6 +1227,8 @@ impl Controller {
             #[cfg(test)]
             before_the_effect: ReadPause::default(),
             #[cfg(test)]
+            before_a_voice_change_claims: ReadPause::default(),
+            #[cfg(test)]
             after_a_voice_close_is_held: ReadPause::default(),
             #[cfg(test)]
             before_a_close_asks_for_its_link: ReadPause::default(),
