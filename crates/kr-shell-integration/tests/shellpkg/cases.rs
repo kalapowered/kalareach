@@ -934,6 +934,119 @@ pub fn a_dropped_answer_does_not_wait_for_the_rest_of_a_character_the_terminal_h
     );
 }
 
+/// KR-REQ-07.37: a history search the person is in the middle of goes on at the next prompt after
+/// the line it recalled is accepted with the editor's accept-and-get-next, as it does without the
+/// package.
+///
+/// The editor loads the history entry after the one it ran and keeps the search's chain from the
+/// line that ran, and only then: the next search key continues from the loaded entry. Any key the
+/// editor runs ahead of the person's ends the chain, so a package that queues a key of its own at the
+/// start of a read must queue none where the chain is carried. The case recalls an older line with
+/// a search from a typed prefix, accepts it with Ctrl+o, and presses the search key at the next
+/// prompt. The chain takes it back to the older line; a chain that was ended searches again from the
+/// line the editor loaded, which is the one after it.
+///
+/// # Panics
+///
+/// Panics when a line does not run, or when the search at the second prompt does not go back to the
+/// older line.
+#[cfg(unix)]
+pub fn a_history_search_goes_on_across_a_line_accepted_with_accept_and_get_next(kind: ShellKind) {
+    // Control characters, which no runtime splits or reads as the start of a sequence.
+    const SEARCH_BACKWARD: &[u8] = b"\x0c";
+    const ACCEPT_AND_GET_NEXT: &[u8] = b"\x0f";
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    // The case gives the reader no step. A step is a key, and any key the editor runs between the
+    // search and the acceptance, or ahead of the next search, ends the very thing the case looks
+    // at: the editor forgets the recalled line's place in the history after the first, and the
+    // search chain after the second.
+    session.stepping = false;
+    let bound = "kr-chain-bound";
+    assert!(
+        session.run(
+            &format!(
+                "Set-PSReadLineKeyHandler -Chord Ctrl+l -Function HistorySearchBackward; {}",
+                print_assembled(kind, bound)
+            ),
+            bound
+        ),
+        "the search key was not bound:\n{}",
+        session.terminal_output()
+    );
+    for entry in ["aaa1", "bbb2", "aaa3", "ccc4"] {
+        let marker = format!("kr-chain-{entry}");
+        assert!(
+            session.run(&print_assembled(kind, &marker), &marker),
+            "a line of the history did not run:\n{}",
+            session.terminal_output()
+        );
+    }
+
+    // The first and the third entry begin with the prefix typed here, and the search recalls the
+    // later of them, the third.
+    assert!(
+        session.wait_for_prompt() && session.wait_for_editor_reading(),
+        "the shell drew no prompt to search at:\n{}",
+        session.terminal_output()
+    );
+    let searched = session.written();
+    session.type_bytes(b"Write-Output ('kr-chain-' + 'a");
+    session.type_bytes(SEARCH_BACKWARD);
+    // The editor draws the prefix a search started from in a colour of its own, so the recalled
+    // line is not one run of text: the end of its third entry is.
+    assert!(
+        session.drew_after(searched, "aa3'", REPLY).was_drawn(),
+        "the search did not recall the third entry:\n{}",
+        shown_since(&session, searched)
+    );
+
+    // Accepting it loads the entry after it, the fourth, at the next prompt.
+    session.mark = session.written();
+    let accepted = session.written();
+    session.type_bytes(ACCEPT_AND_GET_NEXT);
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(accepted, "kr-chain-aaa3", deadline),
+        "the recalled line did not run:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        session.wait_for_prompt() && session.wait_for_editor_reading(),
+        "the shell drew no prompt after the recalled line:\n{}",
+        session.terminal_output()
+    );
+
+    assert!(
+        session.drew_after(accepted, "ccc4", REPLY).was_drawn(),
+        "the editor did not load the entry after the accepted line at the next prompt:\n{}",
+        shown_since(&session, accepted)
+    );
+    session.mark = session.written();
+    let continued = session.written();
+    session.type_bytes(SEARCH_BACKWARD);
+    session.type_bytes(b"\r");
+    assert!(
+        session.wait_for_prompt(),
+        "the line the search recalled did not run:\n{}",
+        session.terminal_output()
+    );
+    let shown = shown_since(&session, continued);
+    assert!(
+        shown.contains("kr-chain-aaa3") && !shown.contains("kr-chain-ccc4"),
+        "the search at the next prompt began again from the line the editor loaded, so something \
+         ended the chain the accepted line left:\n{shown}"
+    );
+}
+
+/// What the terminal has shown since `start`.
+#[cfg(unix)]
+fn shown_since(session: &Session, start: usize) -> String {
+    let output = session.output.lock().expect("the output lock");
+    String::from_utf8_lossy(&output[start.min(output.len())..]).into_owned()
+}
+
 /// Types `unread` into the terminal of an idle reader that is stopped, asks it for its queues, and
 /// expects it to say they are not drained. Then types `completion`, which the reader needs to take
 /// what it has, and expects it to say they are.

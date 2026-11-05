@@ -83,6 +83,14 @@ fn a_dropped_answer_does_not_hold_the_reader_while_the_terminal_has_half_a_chara
     shellpkg::a_dropped_answer_does_not_wait_for_the_rest_of_a_character_the_terminal_has_half_delivered(PWSH);
 }
 
+/// KR-REQ-07.37: a history search goes on across a line accepted with the editor's
+/// accept-and-get-next.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_history_search_goes_on_across_a_line_the_editor_accepts_and_gets_the_next_for() {
+    shellpkg::a_history_search_goes_on_across_a_line_accepted_with_accept_and_get_next(PWSH);
+}
+
 /// KR-REQ-08.49: the reader does not report itself idle, which is where a fence is first proved,
 /// before its editor has the terminal's reply to the question where the cursor is.
 #[test]
