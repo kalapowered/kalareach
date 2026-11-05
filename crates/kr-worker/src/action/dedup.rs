@@ -20,7 +20,8 @@ use std::collections::{HashMap, VecDeque};
 use kr_protocol::envelope::MutationRequest;
 use kr_protocol::ids::{ActionId, ActorId, QuestionId};
 use kr_protocol::limits::MAX_OUTSTANDING_MUTATIONS;
-use kr_protocol::question::QuestionAnswerParams;
+use kr_protocol::question::{QuestionAnswerParams, QuestionCancelParams};
+use kr_protocol::wire::WireMessage;
 
 use crate::error::{Result, WorkerError};
 
@@ -128,6 +129,27 @@ impl ShownReceipts {
 /// holds the answer back: this rule refuses where it cannot tell.
 #[must_use]
 pub fn holds_back_an_answer_to(intent: Option<&[u8]>, question_id: QuestionId) -> bool {
+    names_or_hides_question(intent, question_id, |params: &QuestionAnswerParams| {
+        params.question_id
+    })
+}
+
+/// Tells whether an uncertain `question.cancel` receipt holds back a cancellation of `question_id`,
+/// by the rule [`holds_back_an_answer_to`] states for answers.
+#[must_use]
+pub fn holds_back_a_cancellation_of(intent: Option<&[u8]>, question_id: QuestionId) -> bool {
+    names_or_hides_question(intent, question_id, |params: &QuestionCancelParams| {
+        params.question_id
+    })
+}
+
+/// Tells whether the envelope `intent` is a request for `question_id`, or names no question at all:
+/// it is absent, does not decode, or is not a request whose parameters are `P`.
+fn names_or_hides_question<P: WireMessage>(
+    intent: Option<&[u8]>,
+    question_id: QuestionId,
+    question_of: impl Fn(&P) -> QuestionId,
+) -> bool {
     let Some(intent) = intent else {
         return true;
     };
@@ -136,8 +158,8 @@ pub fn holds_back_an_answer_to(intent: Option<&[u8]>, question_id: QuestionId) -
     else {
         return true;
     };
-    match earlier.params.to_typed::<QuestionAnswerParams>() {
-        Ok(params) => params.question_id == question_id,
+    match earlier.params.to_typed::<P>() {
+        Ok(params) => question_of(&params) == question_id,
         Err(_) => true,
     }
 }
