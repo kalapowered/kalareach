@@ -475,10 +475,16 @@ fn the_release_a_command_reads_for_a_start_is_there_to_start_after_two_updates_c
         "the command still holds the release it read"
     );
     drop(current);
-    assert!(
-        test.store.retire(&one, &update).expect("removes"),
-        "nothing holds the release now, so it goes"
-    );
+    // A program another case starts at this moment carries a copy of the descriptor until it takes
+    // over, so the release goes when the last copy has gone, a moment after the command let go.
+    let deadline = Instant::now() + WAIT;
+    while !test.store.retire(&one, &update).expect("removes") {
+        assert!(
+            Instant::now() < deadline,
+            "nothing holds the release now, so it goes"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// KR-REQ-26.09: the hold a command takes on the release `current` names does not read that
