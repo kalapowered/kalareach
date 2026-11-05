@@ -570,6 +570,14 @@ fn an_unbind_a_busy_blocking_pool_holds_up_is_refused_in_time_and_runs_when_the_
             (0, 0),
             "the unbind the caller stopped waiting for was not carried out"
         );
+        // The removals that ran gave their places back: one more unbind is not refused for want of
+        // one. It is answered at the deadline or with what it found, and either is right here.
+        let answered = unbind(&mut host).await;
+        assert!(
+            !matches!(&answered, ResponseBody::Refused { detail, .. }
+                if detail.contains("unbinds it may have waiting")),
+            "a connection whose removals have all run was refused for the removals it has waiting"
+        );
     });
     executor.shutdown_timeout(POOL_THREAD);
 }

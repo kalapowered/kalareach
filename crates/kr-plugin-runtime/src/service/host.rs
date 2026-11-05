@@ -73,11 +73,11 @@ pub const REGISTER_DEADLINE: core::time::Duration =
 const UNBIND_DEADLINE: core::time::Duration = kr_plugin_service::client::DEFAULT_DEADLINE
     .saturating_sub(kr_plugin_service::client::ROUND_TRIP_ALLOWANCE);
 
-/// How many unbinds one connection may have waiting for a thread of the blocking pool.
+/// How many unbinds one connection may have queued or running on the blocking pool.
 ///
 /// A request that stops waiting at its deadline does not take its removal back, so a removal is
-/// counted from the request that queued it until it has run: a connection that asks again while
-/// the pool is busy is refused rather than queued behind itself, and the removals one connection
+/// counted from the request that queued it until it has run: a connection that has this many
+/// behind it is refused the next rather than queued behind itself, and the removals one connection
 /// leaves behind are bounded as the calls it has running are.
 pub const MAX_PENDING_UNBINDS: usize = 16;
 
@@ -1078,7 +1078,7 @@ struct Served {
     writer: Arc<tokio::sync::Mutex<FrameWriter>>,
     /// How much work that enters a component this connection may have running.
     work: Arc<tokio::sync::Semaphore>,
-    /// How many unbinds this connection may have waiting for a thread of the blocking pool.
+    /// How many unbinds this connection may have queued or running on the blocking pool.
     unbinds: Arc<tokio::sync::Semaphore>,
     /// How many bindings it holds.
     ///
