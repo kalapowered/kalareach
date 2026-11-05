@@ -193,6 +193,20 @@ impl ControllerError {
         }
     }
 
+    /// What a repeat of an action is told while the attempt that claimed it is still running.
+    ///
+    /// That attempt carries the action out, or has, so a transient word, which says nothing took
+    /// effect, would be false: what became of the action is not known yet, and the caller asks
+    /// again under the same identifier for the answer.
+    #[must_use]
+    pub fn attempt_still_running() -> Self {
+        Self::Uncertain {
+            detail: "another attempt under this action identifier has not finished, so what \
+                     became of the action is not known yet"
+                .to_owned(),
+        }
+    }
+
     /// Builds a rendezvous refusal.
     pub fn rendezvous(detail: impl std::fmt::Display) -> Self {
         Self::RendezvousRefused {

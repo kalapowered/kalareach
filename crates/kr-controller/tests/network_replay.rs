@@ -239,7 +239,7 @@ async fn kr_req_23_49_a_repeat_while_the_action_runs_is_told_so_and_a_later_repe
 
     let told = second.repeat(&composed).await;
     assert!(
-        matches!(&told, Err(ClientError::Host(error)) if error.code == ErrorCode::ResourceUnavailable),
+        matches!(&told, Err(ClientError::OutcomeUnknown { error, .. }) if error.code == ErrorCode::OutcomeUnknown),
         "{told:?}"
     );
     assert_eq!(attempt.after_first_send(Reply::Lost), Next::Repeat);

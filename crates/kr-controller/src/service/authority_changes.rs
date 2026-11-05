@@ -285,10 +285,9 @@ impl Controller {
                     detail: detail.clone(),
                 }))
             }
-            crate::grants::ActionRecord::InFlight => Some(Err(ControllerError::Refused {
-                code: ErrorCode::ResourceUnavailable,
-                detail: "another attempt under this action identifier has not finished".to_owned(),
-            })),
+            crate::grants::ActionRecord::InFlight => {
+                Some(Err(ControllerError::attempt_still_running()))
+            }
             crate::grants::ActionRecord::Unfinished => match mutation.method.method() {
                 Some(Method::GrantRevoke | Method::DeviceRevoke | Method::GrantTransfer) => None,
                 Some(Method::GrantCreate) => {
@@ -421,9 +420,11 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns a storage error when a result cannot be recorded. A refusal that cannot be recorded
-    /// is not an error of its own: the caller is given the refusal, and a retry reads the action
-    /// as unfinished.
+    /// Returns [`ControllerError::Uncertain`] when a result cannot be recorded: the action was
+    /// carried out, so the caller is not told the store failed, which says nothing took effect.
+    /// The claim stays unfinished, and a retry is answered from what this host's records prove.
+    /// A refusal that cannot be recorded is not an error of its own: the caller is given the
+    /// refusal, and a retry reads the action as unfinished.
     pub(super) fn settle_claim(
         &self,
         hold: &crate::grants::ClaimHold,
@@ -431,11 +432,16 @@ impl Controller {
     ) -> Result<()> {
         let now_ms = kr_ipc::now_ms().get();
         match outcome {
-            Ok(result) => self.sharing.grants().retain_result(
-                hold,
-                &kr_cbor::encode(result.as_value()),
-                now_ms,
-            ),
+            Ok(result) => self
+                .sharing
+                .grants()
+                .retain_result(hold, &kr_cbor::encode(result.as_value()), now_ms)
+                .map_err(|unrecorded| ControllerError::Uncertain {
+                    detail: format!(
+                        "this action was carried out and this host could not record what it came \
+                         to: {unrecorded}"
+                    ),
+                }),
             Err(error)
                 if matches!(
                     error.code().retry_category(),

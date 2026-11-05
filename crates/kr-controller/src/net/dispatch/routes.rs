@@ -1257,13 +1257,11 @@ impl RemoteConnection {
                         })?;
                     let hold = match claimed {
                         crate::grants::ActionClaim::Claimed { hold } => hold,
+                        // An earlier attempt under this identifier claimed the action, and may
+                        // have renamed the session: what became of it is not known here, and a
+                        // transient word would say nothing took effect.
                         crate::grants::ActionClaim::Recorded(_) => {
-                            return Err(crate::error::ControllerError::Refused {
-                                code: ErrorCode::ResourceUnavailable,
-                                detail: "another attempt under this action identifier has not \
-                                         finished"
-                                    .to_owned(),
-                            });
+                            return Err(crate::error::ControllerError::attempt_still_running());
                         }
                     };
                     let outcome = match mutation.target.session_id.as_ref().copied() {

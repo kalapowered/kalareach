@@ -1911,7 +1911,17 @@ impl Controller {
             .map_err(|_| unreadable_close_answer())?;
         // The worker's description of the session goes on in the answer as it came: what a device
         // is shown of it is decided where its answer is written.
-        self.settle_close_answer(session_id, &reply).await?;
+        //
+        // The worker took the close, so a closure it carries that this host cannot record leaves
+        // the close made: the caller is not told the store failed, which says nothing took effect.
+        self.settle_close_answer(session_id, &reply)
+            .await
+            .map_err(|unrecorded| ControllerError::Uncertain {
+                detail: format!(
+                    "the worker closed the session and this host could not record its closure: \
+                     {unrecorded}"
+                ),
+            })?;
         crate::service::encode(&reply)
     }
 

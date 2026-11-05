@@ -676,7 +676,23 @@ impl ProjectModule {
             // A row that is there already is another attempt's unless this attempt wrote the claim
             // for its action, which only one attempt can: the methods that claim settle their own
             // row, and an answer read back from it is this attempt's own.
-            let existing = service.record_action(&actor, action_id, name, digest, &record)?;
+            //
+            // A row that cannot be written leaves the claim as it was. An action that was carried
+            // out is then not told as a failure of the store, which says nothing took effect; one
+            // that was refused is told its refusal.
+            let existing = match service.record_action(&actor, action_id, name, digest, &record) {
+                Ok(existing) => existing,
+                Err(error) if outcome.is_ok() => {
+                    return Err(ProtocolError::new(
+                        ErrorCode::OutcomeUnknown,
+                        format!(
+                            "this action was performed and this host could not record what it \
+                             came to: {error}"
+                        ),
+                    ));
+                }
+                Err(_) => return outcome,
+            };
             if existing.is_some() && !claimed.load(Ordering::Acquire) {
                 copied.store(true, Ordering::Release);
             }
