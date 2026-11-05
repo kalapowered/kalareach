@@ -1,4 +1,4 @@
-//! KR-PERF-007: drain and parse a 5 MiB/s stream without unbounded queues.
+//! Drain and parse a 5 MiB/s stream without unbounded queues.
 //!
 //! The target is about two things at once, and the second matters more. Throughput says the engine
 //! keeps up with a program that is printing hard. Bounded queues say that when it does not keep up,

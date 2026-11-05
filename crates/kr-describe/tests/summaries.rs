@@ -1,4 +1,4 @@
-//! Summaries of what changed in a session (KR-REQ-18.02) in the driven service: a request is
+//! Summaries of what changed in a session in the driven service: a request is
 //! queued as priority work in the session's one place, frozen to the interval it was made for,
 //! generated under a grammar of its own and kept under the profile and the privacy generation it
 //! was written under, with no process at all.
