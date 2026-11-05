@@ -22,7 +22,9 @@
 //! * the whole protocol schema, every definition a root, which is what a client built from the
 //!   protocol package reads: a member or a variant added to an existing definition, and anything
 //!   removed or changed, is a difference. A definition that is new, a new method and an optional
-//!   member added to an object the earlier release marked read-only metadata are not. A new method
+//!   member added to an object the earlier release marked read-only metadata are not, nor is a new
+//!   section of the host configuration document, a stored file read by level, which the build
+//!   lists above the level the earlier release's stored-format lock records. A new method
 //!   is a variant added to `Method` that is one plain string constant, whose name no variant of
 //!   the earlier release had and no other variant has (a host of the same level answers a method
 //!   it does not list with `PERMISSION_DENIED`, and a client that meets that refusal for a method
@@ -62,6 +64,9 @@ use crate::retained::{expected_public_majors_in, plugin_host_in};
 
 /// Where a release keeps the table of what its worker serves, from the root of the repository.
 pub const WORKER_SURFACE_PATH: &str = "crates/kr-protocol/worker-surface.json";
+
+/// Where a release keeps its stored-format lock, from the root of the repository.
+pub const LOCK_PATH: &str = "stored-formats.lock";
 
 /// Where a release keeps its generated schema.
 pub const SCHEMA_PATH: &str = "packages/protocol/schema/kalareach-protocol.schema.json";
@@ -151,6 +156,9 @@ pub struct Head {
     pub plugin_host: String,
     /// The record of its table of public majors.
     pub public_majors: String,
+    /// The sections of the host configuration document that arrived with a level, each with the
+    /// level, as the build lists them.
+    pub sections: Vec<(String, u64)>,
 }
 
 impl Head {
@@ -183,7 +191,44 @@ impl Head {
             worker: WorkerSurface::parse(&worker_surface::document())?,
             plugin_host: PLUGIN_HOST_PROTOCOL.to_owned(),
             public_majors: expected_public_majors_in(repository, commit)?,
+            sections: kr_protocol::hostinfo::configuration::LEVELLED
+                .iter()
+                .map(|section| (section.member.to_owned(), section.level))
+                .collect(),
         })
+    }
+}
+
+/// The level of the configuration document that a release's stored-format lock records: the
+/// highest level of the sections that release reads. A lock that records no level for the document
+/// is a release before levels, which counts as the base level.
+///
+/// # Errors
+///
+/// When the release has no lock, the lock does not read, lists no configuration document, or
+/// records a level that is no whole number: each is a failure and never a guess.
+pub fn configuration_level_at(repository: &Path, commit: &str) -> Result<u64, String> {
+    let text = file_at(repository, commit, LOCK_PATH)
+        .map_err(|error| format!("{LOCK_PATH} at {commit} cannot be read: {error}"))?
+        .ok_or_else(|| {
+            format!("{commit} has no {LOCK_PATH}, so the level of its configuration document is not known")
+        })?;
+    let lock: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("{LOCK_PATH} at {commit} does not read: {error}"))?;
+    let document = lock
+        .get("stores")
+        .and_then(Value::as_array)
+        .and_then(|stores| {
+            stores
+                .iter()
+                .find(|store| store["entry"]["store"].as_str() == Some("configuration"))
+        })
+        .ok_or_else(|| format!("{LOCK_PATH} at {commit} lists no configuration document"))?;
+    match document.get("level") {
+        None => Ok(1),
+        Some(level) => level.as_u64().filter(|level| *level >= 1).ok_or_else(|| {
+            format!("{LOCK_PATH} at {commit} records a level of the configuration document that is not a whole number of at least 1")
+        }),
     }
 }
 
@@ -350,7 +395,19 @@ fn compare(
         .collect();
     // The whole schema, which a client of the protocol package reads, and the plugin SDK schema.
     // A difference both comparisons report is one line.
-    for line in compare_for_a_level(&schema, &head.schema)
+    // A section of the configuration document is new to an older release when the build lists it
+    // above the level that release's lock records. The lock is read only when the schemas differ by
+    // a member added to the document.
+    let sections = || -> Result<BTreeSet<String>, String> {
+        let level = configuration_level_at(repository, &release.commit)?;
+        Ok(head
+            .sections
+            .iter()
+            .filter(|(_, arrived)| *arrived > level)
+            .map(|(member, _)| member.clone())
+            .collect())
+    };
+    for line in compare_for_a_level(&schema, &head.schema, &sections)
         .map_err(|error| format!("the schema of {tag}: {error}"))?
     {
         if !found.contains(&line) {
@@ -365,7 +422,7 @@ fn compare(
     let sdk: Value = serde_json::from_str(&sdk_text)
         .map_err(|error| format!("{SDK_SCHEMA_PATH} of {tag}: {error}"))?;
     found.extend(
-        compare_for_a_level(&sdk, &head.sdk_schema)
+        compare_for_a_level(&sdk, &head.sdk_schema, &|| Ok(BTreeSet::new()))
             .map_err(|error| format!("the plugin SDK schema of {tag}: {error}"))?
             .into_iter()
             .map(|line| format!("the plugin SDK schema: {line}")),

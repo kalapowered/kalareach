@@ -192,9 +192,25 @@ statements say what moves the level:
 2. A new member or value of an existing type moves the level, in a request as in an answer, and in a
    closed enumeration an answer can carry. The exception is an optional member added to an object
    that carries `x-kalareach-read-only-metadata`. A member, a variant or a definition that is
-   removed moves the level too.
+   removed moves the level too. A new section of the host configuration document is the other
+   exception, and its rule is below.
 3. A store of its own at version 1, and a store that reads the next version without writing it,
    move no level.
+
+A section of the host configuration document (`ConfigurationDocument`) is a member added to a
+stored file that a release reads by level ([Configuration levels](../host/updates.md#configuration-levels)):
+a release that lacks the section ignores and counts it, applies the rest and refuses to edit the
+document, so the section keeps the level. The check passes a member added to that document when
+the build lists it as a section that arrived with a level above the level the earlier release's
+`stored-formats.lock` records for the document (a lock that records none is a release before
+levels, at level 1), when it is not required, and when no other definition refers to the document.
+A lock that is absent, does not read or lists no document fails the check. A change to an existing
+member of the document, to a default, to `required` or to the ceilings, a member added to the
+ceilings, and a section the build does not list above that level still move the level. Two limits
+hold. The published schema of the document stays closed, so a validator built from an earlier
+package rejects a document that holds the new section; no answer a host gives carries the document.
+And the comparison cannot tell a section from a restriction filed as one: a restriction is never a
+level, and only the review of the change that adds the section sees that it is not one.
 
 `kr-protocol-gen --in-level` holds a commit to it. It lists the release tags on origin with
 `git ls-remote`, requires this checkout's tags to be origin's, each at the same commit, and compares
@@ -206,8 +222,8 @@ protocol and in the table of public majors. It also compares the protocol schema
 definition a root, and the plugin SDK schema
 (`packages/plugin-sdk/schema/kalareach-plugin-sdk.schema.json`, read from the committed file of the
 commit and of each release) with the same rule as the public contract below, and fails on each
-difference except a new method, a definition that is new, and an optional member added to an object
-the earlier release marked read-only metadata. A new method is a variant added to `Method` that is
+difference except a new method, a definition that is new, an optional member added to an object
+the earlier release marked read-only metadata, and a new section of the configuration document. A new method is a variant added to `Method` that is
 one plain string constant, whose name no variant of the earlier release had and no other variant
 has. Descriptions and titles are ignored. A release from before `worker-surface.json` has no table
 to compare, so its tables are left out and its schema, plugin host protocol and table of public
@@ -252,7 +268,9 @@ optional and the earlier release's object carries `x-kalareach-read-only-metadat
 object's reader drops a member it does not know. Every other difference is reported: a member or a
 variant added to a closed object, a member, a variant or a definition removed, and any change.
 `SessionSummary.root` is one: an earlier strict reader cannot read the summary of a command session.
-No client was released, so no shim carries it.
+No client was released, so no shim carries it. A new section of the configuration document is one
+too, though the check of a level passes it ([A level is one surface](#a-level-is-one-surface)):
+the report names what a validator built from an earlier package would reject.
 
 Until `crates/kr-protocol/retained/PUBLIC_FREEZE` exists, the references are the releases at the
 commit's level, and the check reports and does not fail. That file,

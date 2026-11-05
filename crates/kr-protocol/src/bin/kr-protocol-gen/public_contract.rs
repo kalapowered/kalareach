@@ -17,6 +17,11 @@
 //! * everything else is one: a member or a variant added to a closed object, a member, a variant
 //!   or a definition removed, and anything that changed.
 //!
+//! The check of a level (`--in-level`) also lets one more member pass: a new section of the host
+//! configuration document that an earlier release ignores and counts (`compare_for_a_level`).
+//! This report does not, because a validator built from an earlier package rejects a document that
+//! holds a section it lacks.
+//!
 //! Until public 1.0 freezes, which is the first client release (a host, command line, desktop or
 //! mobile build published for people to install), the public contract may change with a level move,
 //! and this reports and does not fail: the references are every release at the commit's level.
@@ -44,6 +49,9 @@ pub const FREEZE: &str = "crates/kr-protocol/retained/PUBLIC_FREEZE";
 
 /// The keyword that makes an object's reader drop a member it does not know.
 const READ_ONLY_METADATA: &str = "x-kalareach-read-only-metadata";
+
+/// The definition of the host's configuration document, a stored file read by level.
+const CONFIGURATION_DOCUMENT: &str = "ConfigurationDocument";
 
 /// What the comparison found.
 #[derive(Debug, PartialEq, Eq)]
@@ -156,21 +164,115 @@ fn is_an_added_method(old: &Value, new: &Value, difference: &Difference) -> bool
     plain && method_names(new).get(name) == Some(&1) && !method_names(old).contains_key(name)
 }
 
+/// The name of the member that `difference` adds directly to the configuration document: the only
+/// kind of difference that a new section can be.
+fn member_added_to_the_configuration_document(difference: &Difference) -> Option<&str> {
+    if difference.kind != DifferenceKind::Added || difference.detail != "a member" {
+        return None;
+    }
+    difference
+        .at
+        .strip_prefix(CONFIGURATION_DOCUMENT)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .filter(|member| !member.contains(['.', '#', '[', '{']))
+}
+
+/// Whether a `$ref` to the definition `name` occurs anywhere in a definition of `schema` other than
+/// `name` itself.
+fn is_referred_to_by_another_definition(schema: &Value, name: &str) -> bool {
+    fn refers(node: &Value, reference: &str) -> bool {
+        match node {
+            Value::Object(members) => {
+                members.get("$ref").and_then(Value::as_str) == Some(reference)
+                    || members.values().any(|member| refers(member, reference))
+            }
+            Value::Array(items) => items.iter().any(|item| refers(item, reference)),
+            _ => false,
+        }
+    }
+    let reference = format!("#/$defs/{name}");
+    schema["$defs"].as_object().is_some_and(|definitions| {
+        definitions
+            .iter()
+            .any(|(other, definition)| other != name && refers(definition, &reference))
+    })
+}
+
+/// Whether `difference` is a new section of the configuration document that an earlier release
+/// ignores and counts: a stored file read by level, which records the level of the sections it
+/// holds, so an earlier release applies the rest and refuses to edit it.
+///
+/// Every one of these holds, or it is a difference like any other:
+///
+/// * it is a member added directly to `ConfigurationDocument`, which the earlier schema defines;
+/// * `sections` lists it: the build's table of sections lists it at a level above the level the
+///   earlier release's stored-format lock records for the document;
+/// * it is not required;
+/// * no other definition refers to `ConfigurationDocument`, so no answer a host gives carries the
+///   document and nothing but the file is read by a release that lacks the section.
+///
+/// Anything else about the document is compared as it is for every definition, so a change to an
+/// existing member, a default, `required`, a ceiling or a section the table does not list still
+/// fails. What this cannot tell is a section from a restriction filed as one: a restriction is
+/// never a level (`docs/host/updates.md`, "Configuration levels"), and only a review of the change
+/// that adds the section sees that it is not one.
+fn is_a_new_section(
+    old: &Value,
+    new: &Value,
+    difference: &Difference,
+    sections: &BTreeSet<String>,
+) -> bool {
+    let Some(section) = member_added_to_the_configuration_document(difference) else {
+        return false;
+    };
+    let required = new["$defs"][CONFIGURATION_DOCUMENT]
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|required| required.iter().any(|name| name.as_str() == Some(section)));
+    old["$defs"].get(CONFIGURATION_DOCUMENT).is_some()
+        && sections.contains(section)
+        && !required
+        && !is_referred_to_by_another_definition(new, CONFIGURATION_DOCUMENT)
+}
+
 /// As [`compare`], for the check of a level: the differences that fail a commit that stays at the
 /// level. A method a daemon serves keeps the level, because a host of the same level answers a
 /// method it does not list with `PERMISSION_DENIED` and a client that meets that refusal for a
 /// method that is new tells it from a lack of rights, so a new variant of `Method` is not a
 /// difference here. It is one for `--public-contract`, which reports it.
 ///
+/// A new section of the configuration document passes too, where `sections` (called once, and only
+/// when the schemas differ by a member added to the document) names it: the sections the build
+/// lists above the level the earlier release's lock records.
+///
 /// # Errors
 ///
-/// When a schema cannot be cut.
-pub fn compare_for_a_level(old: &Value, new: &Value) -> Result<Vec<String>, String> {
-    Ok(rejected(old, new)?
-        .iter()
-        .filter(|difference| !is_an_added_method(old, new, difference))
-        .map(ToString::to_string)
-        .collect())
+/// When a schema cannot be cut, or `sections` cannot say what they are.
+pub fn compare_for_a_level(
+    old: &Value,
+    new: &Value,
+    sections: &dyn Fn() -> Result<BTreeSet<String>, String>,
+) -> Result<Vec<String>, String> {
+    let mut sections_above: Option<BTreeSet<String>> = None;
+    let mut lines = Vec::new();
+    for difference in rejected(old, new)? {
+        if is_an_added_method(old, new, &difference) {
+            continue;
+        }
+        if member_added_to_the_configuration_document(&difference).is_some() {
+            if sections_above.is_none() {
+                sections_above = Some(sections()?);
+            }
+            if sections_above
+                .as_ref()
+                .is_some_and(|above| is_a_new_section(old, new, &difference, above))
+            {
+                continue;
+            }
+        }
+        lines.push(difference.to_string());
+    }
+    Ok(lines)
 }
 
 /// The non-retired public majors a record of the table lists.

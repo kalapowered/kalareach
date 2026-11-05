@@ -24,6 +24,11 @@ struct Tree {
     roots: Vec<&'static str>,
     /// The plugin SDK schema the release committed, when it had one.
     sdk: Option<Value>,
+    /// The stored-format lock the release committed, when it had one.
+    lock: Option<String>,
+    /// The sections of the configuration document that arrived with a level, as the build that is
+    /// checked against this tree lists them.
+    sections: Vec<(&'static str, u64)>,
 }
 
 fn sdk_schema(description: &str, extra_member: bool) -> Value {
@@ -90,6 +95,8 @@ impl Tree {
             majors: "major=1 versions=1.0 replaced=- supported_until=- retired=false\n",
             roots: vec!["ControlFrame"],
             sdk: Some(sdk_schema("The manifest.", false)),
+            lock: None,
+            sections: Vec::new(),
         }
     }
 
@@ -183,6 +190,13 @@ impl Repo {
                 let _ = std::fs::remove_file(self.directory.join(sdk));
             }
         }
+        let lock = "stored-formats.lock";
+        match &tree.lock {
+            Some(text) => self.write(lock, text),
+            None => {
+                let _ = std::fs::remove_file(self.directory.join(lock));
+            }
+        }
         self.write(
             "crates/kr-protocol/src/hello.rs",
             "pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);\n",
@@ -247,6 +261,11 @@ impl Repo {
             .expect("a table"),
             plugin_host: tree.host.to_owned(),
             public_majors: tree.majors.to_owned(),
+            sections: tree
+                .sections
+                .iter()
+                .map(|(member, level)| ((*member).to_owned(), *level))
+                .collect(),
         }
     }
 }
@@ -1417,5 +1436,260 @@ fn this_trees_retained_source_reads_as_the_build_has_it() {
             .expect("read")
             .as_deref(),
         Some(PLUGIN_HOST_PROTOCOL)
+    );
+}
+
+/// A tree whose schema defines the configuration document and its ceilings, and whose lock records
+/// the level of the document, when it records one.
+fn with_the_configuration_document(lock: Option<String>) -> Tree {
+    let mut tree = Tree::the_level();
+    tree.schema["$defs"]["ConfigurationDocument"] = json!({
+        "type": "object",
+        "properties": {
+            "version": { "type": "integer" },
+            "level": { "type": "integer", "default": 1 },
+            "ceilings": { "$ref": "#/$defs/ConfigurationCeilings" },
+        },
+        "additionalProperties": false,
+    });
+    tree.schema["$defs"]["ConfigurationCeilings"] = json!({
+        "type": "object",
+        "properties": { "session_limit": { "type": ["integer", "null"] } },
+        "additionalProperties": false,
+    });
+    tree.lock = lock;
+    tree
+}
+
+/// A stored-format lock that records `level` for the configuration document.
+fn lock_at(level: u64) -> String {
+    json!({ "format": 1, "stores": [
+        { "entry": { "store": "attention" }, "digest": "aa" },
+        { "entry": { "store": "configuration" }, "digest": "bb", "level": level },
+    ] })
+    .to_string()
+}
+
+/// `tree` with a section `name` added to the document, and its definition.
+fn with_a_section(tree: &Tree, name: &str) -> Tree {
+    let mut grown = tree.clone();
+    grown.schema["$defs"]["ConfigurationDocument"]["properties"][name] =
+        json!({ "$ref": "#/$defs/Gateways" });
+    grown.schema["$defs"]["Gateways"] = json!({
+        "type": "object",
+        "properties": { "origins": { "type": "array", "items": { "type": "string" } } },
+        "additionalProperties": false,
+    });
+    grown
+}
+
+/// A level released once from `tree`, and its inventory.
+fn released_once(name: &str, tree: &Tree) -> (Repo, Vec<crate::releases::Release>) {
+    let repo = Repo::new(name);
+    let commit = repo.commit(tree, "the level");
+    repo.release("0.76.0", &commit);
+    let releases = inventory(&repo.directory).expect("an inventory");
+    (repo, releases)
+}
+
+/// Checks `head_tree`, as this build with `sections` would have it, against the releases.
+fn checked(
+    repo: &Repo,
+    releases: &[crate::releases::Release],
+    head_tree: &Tree,
+    sections: &[(&'static str, u64)],
+) -> Result<Outcome, String> {
+    let grown = Tree {
+        sections: sections.to_vec(),
+        ..head_tree.clone()
+    };
+    let head = repo.commit(&grown, "after");
+    check(&repo.directory, &repo.head(&grown, &head), releases)
+}
+
+/// A section of the configuration document that the build lists above the level the release's
+/// lock records keeps the level: an earlier release ignores and counts it. Anything else about the
+/// document still fails: a section the build does not list above that level, a required one, a
+/// change to an existing member, a ceiling, and a document another definition refers to.
+#[test]
+fn a_new_section_of_the_configuration_document_passes_and_nothing_else_about_it_does() {
+    let before = with_the_configuration_document(Some(lock_at(6)));
+    let (repo, releases) = released_once("sections", &before);
+    let grown = with_a_section(&before, "push");
+
+    checked(&repo, &releases, &grown, &[("push", 7)])
+        .expect("a section the build lists above the release's level keeps the level");
+
+    for (what, sections) in [
+        ("a section the build does not list", vec![]),
+        ("a section at the release's own level", vec![("push", 6)]),
+        ("a section listed under another name", vec![("relays", 7)]),
+    ] {
+        let error = checked(&repo, &releases, &grown, &sections).expect_err(what);
+        assert!(
+            error.contains("ConfigurationDocument.push added: a member"),
+            "{what}: {error}"
+        );
+    }
+
+    // A section is held to the form the lock describes, and a required one is read by no release.
+    let mut required = grown.clone();
+    required.schema["$defs"]["ConfigurationDocument"]["required"] = json!(["push"]);
+    let error = checked(&repo, &releases, &required, &[("push", 7)]).expect_err("required");
+    assert!(error.contains("ConfigurationDocument.push"), "{error}");
+
+    // The section passes by itself: a change beside it fails, and is named without it.
+    let mut beside = grown.clone();
+    beside.schema["$defs"]["ConfigurationDocument"]["properties"]["version"] =
+        json!({ "type": "string" });
+    let error = checked(&repo, &releases, &beside, &[("push", 7)])
+        .expect_err("an existing member of the document changed");
+    assert!(
+        error.contains("ConfigurationDocument.version changed") && !error.contains(".push"),
+        "{error}"
+    );
+    let mut default = grown.clone();
+    default.schema["$defs"]["ConfigurationDocument"]["properties"]["level"]["default"] = json!(2);
+    let error = checked(&repo, &releases, &default, &[("push", 7)])
+        .expect_err("a default of the document changed");
+    assert!(error.contains("ConfigurationDocument.level"), "{error}");
+    let mut removed = grown.clone();
+    removed.schema["$defs"]["ConfigurationDocument"]["properties"]
+        .as_object_mut()
+        .expect("members")
+        .remove("version");
+    let error = checked(&repo, &releases, &removed, &[("push", 7)])
+        .expect_err("a member of the document went");
+    assert!(
+        error.contains("ConfigurationDocument.version removed"),
+        "{error}"
+    );
+
+    // A ceiling is not a section, even when the build lists the name.
+    let mut ceiling = before.clone();
+    ceiling.schema["$defs"]["ConfigurationCeilings"]["properties"]["limits"] =
+        json!({ "type": ["integer", "null"] });
+    let error = checked(&repo, &releases, &ceiling, &[("limits", 7)])
+        .expect_err("a member added to the ceilings narrows what a host may do");
+    assert!(
+        error.contains("ConfigurationCeilings.limits added: a member"),
+        "{error}"
+    );
+
+    // A member added anywhere else is not a section, whatever the build lists.
+    let mut elsewhere = before.clone();
+    elsewhere.schema["$defs"]["OutsideEveryRoot"]["properties"]["push"] =
+        json!({ "type": "string" });
+    let error = checked(&repo, &releases, &elsewhere, &[("push", 7)])
+        .expect_err("a member of another definition");
+    assert!(error.contains("OutsideEveryRoot.push added"), "{error}");
+
+    // The document is a stored file: once an answer a host gives carries it, an earlier reader
+    // reads the section, and it is a difference.
+    let mut carried = grown.clone();
+    carried.schema["$defs"]["Answer"] = json!({
+        "type": "object",
+        "properties": { "document": { "$ref": "#/$defs/ConfigurationDocument" } },
+    });
+    let error = checked(&repo, &releases, &carried, &[("push", 7)])
+        .expect_err("a definition refers to the document");
+    assert!(
+        error.contains("ConfigurationDocument.push added"),
+        "{error}"
+    );
+}
+
+/// The level an earlier release records for the document is read from its lock, and only when the
+/// schemas differ by a member added to the document. A lock that is absent, does not read, lists
+/// no document or records no whole number fails the check; one that records no level is a release
+/// before levels, at the base level.
+#[test]
+fn the_level_of_the_document_is_read_from_the_releases_lock_and_fails_closed() {
+    let grown = |tree: &Tree| with_a_section(tree, "push");
+
+    let none = with_the_configuration_document(None);
+    let (repo, releases) = released_once("no-lock", &none);
+    let error = checked(&repo, &releases, &grown(&none), &[("push", 7)])
+        .expect_err("a release with no lock says no level");
+    assert!(
+        error.contains("has no stored-formats.lock") && error.contains("packages/v0.76.0"),
+        "{error}"
+    );
+    // The lock is not read when nothing about the document differs.
+    checked(&repo, &releases, &none, &[("push", 7)])
+        .expect("a release with no lock holds a commit that adds no section");
+
+    for (what, lock, said) in [
+        ("a lock that does not read", "{ not json", "does not read"),
+        (
+            "a lock that lists no stores",
+            r#"{"format": 1}"#,
+            "lists no configuration document",
+        ),
+        (
+            "a lock that lists no document",
+            r#"{"stores": [{"entry": {"store": "attention"}}]}"#,
+            "lists no configuration document",
+        ),
+        (
+            "a level that is no number",
+            r#"{"stores": [{"entry": {"store": "configuration"}, "level": "six"}]}"#,
+            "not a whole number",
+        ),
+        (
+            "a level of zero",
+            r#"{"stores": [{"entry": {"store": "configuration"}, "level": 0}]}"#,
+            "not a whole number",
+        ),
+    ] {
+        let tree = with_the_configuration_document(Some(lock.to_owned()));
+        let (repo, releases) = released_once("bad-lock", &tree);
+        let error = checked(&repo, &releases, &grown(&tree), &[("push", 7)]).expect_err(what);
+        assert!(error.contains(said), "{what}: {error}");
+    }
+
+    // A document that records no level is a release before levels, at the base level.
+    let before_levels = with_the_configuration_document(Some(
+        r#"{"stores": [{"entry": {"store": "configuration"}}]}"#.to_owned(),
+    ));
+    let (repo, releases) = released_once("before-levels", &before_levels);
+    checked(&repo, &releases, &grown(&before_levels), &[("push", 2)])
+        .expect("a section above the base level is new to it");
+    checked(&repo, &releases, &grown(&before_levels), &[("push", 1)])
+        .expect_err("a section at the base level was read by it");
+
+    // A release that already records the level of the section read it: the section is not new.
+    let at_seven = with_the_configuration_document(Some(lock_at(7)));
+    let (repo, releases) = released_once("at-seven", &at_seven);
+    checked(&repo, &releases, &grown(&at_seven), &[("push", 7)])
+        .expect_err("a release that records level 7 has the section, or should");
+}
+
+/// The public contract still reports the section: a validator built from an earlier package
+/// rejects a document that holds it, and the schema of the document stays closed. Before the first
+/// client release the report does not fail, and the level's check, which passes it, is the one that
+/// reads the lock.
+#[test]
+fn the_public_contract_reports_a_new_section_of_the_configuration_document() {
+    let before = with_the_configuration_document(None);
+    let grown = with_a_section(&before, "push");
+    assert_eq!(
+        crate::public_contract::compare(&before.schema, &grown.schema).expect("compares"),
+        vec!["ConfigurationDocument.push added: a member".to_owned()]
+    );
+    assert!(
+        crate::public_contract::compare_for_a_level(&before.schema, &grown.schema, &|| Ok([
+            "push".to_owned()
+        ]
+        .into()))
+        .expect("compares")
+        .is_empty()
+    );
+    assert!(
+        crate::public_contract::compare_for_a_level(&before.schema, &grown.schema, &|| Err(
+            "the lock cannot be read".to_owned()
+        ))
+        .is_err(),
+        "a section whose level is not known fails the check"
     );
 }
