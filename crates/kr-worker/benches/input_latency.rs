@@ -76,12 +76,38 @@ const RECOGNISER_DEADLINE: Duration = Duration::from_millis(25);
 ///
 /// The deadline is the host's; this covers the timer's own wake-up, the write, the application's
 /// echo and this measurement's polling interval. A figure beyond it is a wait the requirement does
-/// not allow, whatever caused it.
+/// not allow when the process kept its processor for the whole of the hold.
 ///
 /// An allowance cannot tell a twenty-five millisecond deadline from a thirty-five millisecond one,
 /// so the deadline itself is asserted against section 27's figure separately. This bounds the path
 /// around it.
+///
+/// Section 27 states the deadline, which is asserted on every host, and states it for a reference
+/// host. A hold's upper bound is a statement about waits on that path, and no run reads whether
+/// the process kept its processor. It is asserted on every host that reads no shortfall against
+/// the reference host and is not a GitHub-hosted runner, and is recorded with the missing
+/// condition named on any other (see [`upper_bound_withheld`]). A hosted runner is the case that
+/// motivates it: it is a virtual machine on shared hardware that this run cannot see into, and a
+/// thread of a process that only slept has been seen waking more than a hundred milliseconds late
+/// on one, with the recogniser's own part of that hold done at 26 ms. What a hold's lower bound
+/// says, that the byte is not forwarded before the deadline, needs no processor and is asserted
+/// everywhere.
 const RECOGNISER_TOLERANCE: Duration = Duration::from_millis(15);
+
+/// The value `RUNNER_ENVIRONMENT` has on a runner GitHub provides.
+const HOSTED_RUNNER: &str = "github-hosted";
+
+/// How long a held byte is waited for, on a host that is not a GitHub-hosted runner, before the
+/// measurement gives up on it.
+///
+/// It is a limit on waiting for a byte that may never come, and the figure that matters is the
+/// bound above, which a byte arriving after this long has already missed by a wide margin.
+const ARRIVAL_LIMIT: Duration = Duration::from_millis(200);
+
+/// The same where the upper bound is recorded and not asserted (a GitHub-hosted runner): a hold
+/// the machine stretched is waited for and recorded with its figure, and only a byte that does not
+/// arrive within this long is reported as one that never did.
+const ARRIVAL_LIMIT_RECORDED: Duration = Duration::from_secs(5);
 
 /// How many keystrokes the latency measurement sends.
 const SAMPLES: usize = 1_000;
@@ -555,6 +581,84 @@ fn milliseconds(duration: Duration) -> String {
     format!("{:.3} ms", duration.as_secs_f64() * 1000.0)
 }
 
+/// What stands between this run and asserting a hold's upper bound, one entry for each condition,
+/// or nothing when the bound is asserted.
+///
+/// The bound is a claim about a host that gives the process its processor for the whole of a
+/// hold, and no run reads that. What a run can read comes first: each condition of the reference
+/// host that it finds short. A GitHub-hosted runner is then named as well, whatever the run reads
+/// of it: it shares hardware with work the run cannot see, and the hypervisor's time is not read
+/// on every platform.
+fn upper_bound_withheld(conditions: &record::Conditions) -> Vec<String> {
+    withheld_on(conditions.shortfalls(), runner_environment().as_deref())
+}
+
+/// The value of `RUNNER_ENVIRONMENT`, where the run has one.
+fn runner_environment() -> Option<String> {
+    std::env::var("RUNNER_ENVIRONMENT").ok()
+}
+
+/// [`upper_bound_withheld`] for the shortfalls a run read and the value of `RUNNER_ENVIRONMENT`
+/// where it has one.
+fn withheld_on(mut missing: Vec<String>, runner_environment: Option<&str>) -> Vec<String> {
+    if runner_environment == Some(HOSTED_RUNNER) {
+        missing.push(
+            "a GitHub-hosted runner is a virtual machine on shared hardware that this run cannot \
+             see into, and a thread of a process that only slept has been seen waking more than a \
+             hundred milliseconds late on one"
+                .to_owned(),
+        );
+    }
+    missing
+}
+
+/// How long to wait for a held byte, given the value of `RUNNER_ENVIRONMENT` where the run has one.
+///
+/// Whether the upper bound is asserted is settled only once the run has read its conditions, after
+/// the holds are taken, and a hosted runner is known from the start.
+fn arrival_limit_on(runner_environment: Option<&str>) -> Duration {
+    if runner_environment == Some(HOSTED_RUNNER) {
+        ARRIVAL_LIMIT_RECORDED
+    } else {
+        ARRIVAL_LIMIT
+    }
+}
+
+/// How long this run waits for a held byte.
+fn arrival_limit() -> Duration {
+    arrival_limit_on(runner_environment().as_deref())
+}
+
+/// The lines that say a measurement's upper bounds were recorded and not asserted, and why: a
+/// verdict the report reader counts as a missed target when `inside` is false, each missing
+/// condition, and what is asserted all the same. None when the bounds were asserted.
+///
+/// `inside` says whether every hold and the split delimiter's time fell within the bound.
+fn withheld_lines(withheld: &[String], inside: bool) -> Vec<String> {
+    if withheld.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "  verdict           {} the target, with a condition missing, so it is recorded and not \
+         asserted here",
+        if inside { "inside" } else { "outside" }
+    )];
+    lines.extend(
+        withheld
+            .iter()
+            .map(|missing| format!("  condition missing {missing}")),
+    );
+    lines.push(
+        "  conditions        not met, so each hold and the split delimiter's time above are \
+         recorded and their upper bounds are not asserted here; the deadline itself, each hold's \
+         lower bound and the recognition of a split delimiter with its payload kept are asserted \
+         on every host, and a byte that has not arrived within the limit the measurement waits is \
+         a failure on every host"
+            .to_owned(),
+    );
+    lines
+}
+
 /// Sends the keystrokes and returns the sorted samples and the host's conditions while they were
 /// taken, plus what closing the sessions did.
 async fn measure_latency() -> (
@@ -818,6 +922,7 @@ fn paste_prefix_recogniser_deadline() {
         milliseconds(allowed),
         milliseconds(RECOGNISER_TOLERANCE)
     ));
+    let withheld = upper_bound_withheld(&report.conditions);
     let met = kr_worker::input::RECOGNISER_DEADLINE == RECOGNISER_DEADLINE
         && report
             .holds
@@ -825,14 +930,18 @@ fn paste_prefix_recogniser_deadline() {
             .all(|(_, held)| *held >= RECOGNISER_DEADLINE && *held <= allowed)
         && report.split <= allowed
         && report.paste_open_after_split;
-    lines.push(format!(
-        "  verdict           {}",
-        if met {
-            "the target is met on this host"
-        } else {
-            "the target is not met on this host"
-        }
-    ));
+    if withheld.is_empty() {
+        lines.push(format!(
+            "  verdict           {}",
+            if met {
+                "the target is met on this host"
+            } else {
+                "the target is not met on this host"
+            }
+        ));
+    } else {
+        lines.extend(withheld_lines(&withheld, met));
+    }
     // Rounds that are recorded and not asserted: where the time of a hold went, for the one that
     // takes longer than the allowance.
     lines.extend(report.recorded.lines());
@@ -861,7 +970,7 @@ fn paste_prefix_recogniser_deadline() {
     );
     for (what, held) in &report.holds {
         assert!(
-            *held <= allowed,
+            !withheld.is_empty() || *held <= allowed,
             "{what} was held for {held:?}, beyond the {RECOGNISER_DEADLINE:?} deadline and the \
              stated allowance around it"
         );
@@ -872,7 +981,7 @@ fn paste_prefix_recogniser_deadline() {
         );
     }
     assert!(
-        report.split <= allowed,
+        !withheld.is_empty() || report.split <= allowed,
         "the split delimiter took {:?} to be recognised",
         report.split
     );
@@ -962,8 +1071,18 @@ impl MutatedHold {
 }
 
 impl BesideMutations {
+    /// Whether every hold and the split delimiter's time fell within `allowed`, and none was
+    /// forwarded before the deadline.
+    fn inside(&self, allowed: Duration) -> bool {
+        self.holds
+            .iter()
+            .all(|hold| hold.held >= RECOGNISER_DEADLINE && hold.held <= allowed)
+            && self.split <= allowed
+    }
+
     /// Asserts the holds against the bound, after the figure has been kept.
     fn assert_met(&self, allowed: Duration) {
+        let upper = upper_bound_withheld(&self.conditions).is_empty();
         assert!(
             self.mutations >= self.holds.len() as u64,
             "journalled mutations did not run beside the holds: {} completed for {} holds, so the \
@@ -979,7 +1098,7 @@ impl BesideMutations {
         for hold in &self.holds {
             let (what, held) = (&hold.what, &hold.held);
             assert!(
-                *held <= allowed,
+                !upper || *held <= allowed,
                 "{what} was held for {held:?} with journalled mutations running beside it, beyond \
                  the {RECOGNISER_DEADLINE:?} deadline and the stated allowance around it"
             );
@@ -989,7 +1108,7 @@ impl BesideMutations {
             );
         }
         assert!(
-            self.split <= allowed,
+            !upper || self.split <= allowed,
             "the split delimiter took {:?} to be recognised with journalled mutations running \
              beside it",
             self.split
@@ -1250,6 +1369,10 @@ async fn measure_recogniser_beside_mutations(
             .filter(|hold| hold.met_a_mutation())
             .count()
     ));
+    lines.extend(withheld_lines(
+        &upper_bound_withheld(&beside.conditions),
+        beside.inside(RECOGNISER_DEADLINE + RECOGNISER_TOLERANCE),
+    ));
     record::report(
         RECORD,
         if beside_a_disk_writer {
@@ -1326,7 +1449,7 @@ async fn recogniser_beside_mutations(
                 ));
             }
             let held = receipt
-                .arrival(&expected, started, RECOGNISER_DEADLINE * 8)
+                .arrival(&expected, started, arrival_limit())
                 .await
                 .ok_or_else(|| {
                     format!(
@@ -1369,7 +1492,7 @@ async fn recogniser_beside_mutations(
     .await?;
     expected.extend_from_slice(b"0~kr-payload");
     let split = receipt
-        .arrival(&expected, started, RECOGNISER_DEADLINE * 8)
+        .arrival(&expected, started, arrival_limit())
         .await
         .ok_or_else(|| "the split delimiter never completed".to_owned())?;
     // A prefix that had expired and was forwarded with the bytes behind it would also arrive whole,
@@ -1517,8 +1640,18 @@ impl AgainstReport {
 }
 
 impl OnItsOwnConnection {
+    /// Whether every hold and the split delimiter's time fell within `allowed`, and none was
+    /// forwarded before the deadline.
+    fn inside(&self, allowed: Duration) -> bool {
+        self.holds
+            .iter()
+            .all(|hold| hold.held >= RECOGNISER_DEADLINE && hold.held <= allowed)
+            && self.split <= allowed
+    }
+
     /// Asserts the holds against the bound, after the figure has been kept.
     fn assert_met(&self, allowed: Duration) {
+        let upper = upper_bound_withheld(&self.conditions).is_empty();
         assert!(
             self.holds.iter().any(|hold| hold.answered_first),
             "no key was answered before the mutation sent just ahead of it on its connection, so \
@@ -1527,7 +1660,7 @@ impl OnItsOwnConnection {
         for hold in &self.holds {
             let (what, held) = (&hold.what, &hold.held);
             assert!(
-                *held <= allowed,
+                !upper || *held <= allowed,
                 "{what} was held for {held:?} behind a mutation on its own connection, beyond the \
                  {RECOGNISER_DEADLINE:?} deadline and the stated allowance around it"
             );
@@ -1537,7 +1670,7 @@ impl OnItsOwnConnection {
             );
         }
         assert!(
-            self.split <= allowed,
+            !upper || self.split <= allowed,
             "the split delimiter took {:?} to be recognised behind a mutation on its own connection",
             self.split
         );
@@ -1739,6 +1872,10 @@ async fn measure_recogniser_on_its_own_connection(
             .filter(|hold| matches!(hold.accepted, AgainstReport::After(_)))
             .count()
     ));
+    lines.extend(withheld_lines(
+        &upper_bound_withheld(&own.conditions),
+        own.inside(RECOGNISER_DEADLINE + RECOGNISER_TOLERANCE),
+    ));
     record::report(
         RECORD,
         if beside_a_disk_writer {
@@ -1796,7 +1933,7 @@ async fn recogniser_on_its_own_connection(
             )
             .await?;
             let held = receipt
-                .arrival(&expected, started, RECOGNISER_DEADLINE * 8)
+                .arrival(&expected, started, arrival_limit())
                 .await
                 .ok_or_else(|| {
                     format!(
@@ -1854,7 +1991,7 @@ async fn recogniser_on_its_own_connection(
     .await?;
     expected.extend_from_slice(b"0~kr-payload");
     let split = receipt
-        .arrival(&expected, started, RECOGNISER_DEADLINE * 8)
+        .arrival(&expected, started, arrival_limit())
         .await
         .ok_or_else(|| "the split delimiter never completed".to_owned())?;
     both_answered(&mut client, &mut answers, viewport, second).await?;
@@ -1986,7 +2123,7 @@ async fn recogniser_samples(hosted: &Hosted) -> Result<Recogniser, String> {
                     accepted.forwarded_bytes.get()
                 ));
             }
-            let held = arrival(&hosted.runtime, &expected, started, RECOGNISER_DEADLINE * 8)
+            let held = arrival(&hosted.runtime, &expected, started, arrival_limit())
                 .await
                 .ok_or_else(|| {
                     format!(
@@ -2039,7 +2176,7 @@ async fn recogniser_samples(hosted: &Hosted) -> Result<Recogniser, String> {
         &hosted.runtime,
         b"\x1b[200~kr-payload",
         started,
-        RECOGNISER_DEADLINE * 8,
+        arrival_limit(),
     )
     .await
     .ok_or_else(|| "the split delimiter never completed".to_owned())?;
@@ -2111,6 +2248,52 @@ fn a_percentile_is_the_rank_it_claims_to_be() {
     assert_eq!(
         percentile(&[Duration::from_millis(7)], 0.99),
         Duration::from_millis(7)
+    );
+}
+
+/// A hold's upper bound is asserted on a host that reads no shortfall against the reference host
+/// and is not a GitHub-hosted runner, and is withheld, with each missing condition named, on a
+/// runner GitHub provides and on a host short of the reference host. A withheld measurement says
+/// whether its figures were inside the bound in a verdict the report reader counts as a missed
+/// target when they were not, and a runner GitHub provides waits longer for a stretched hold.
+#[test]
+fn a_hold_upper_bound_is_withheld_where_the_run_cannot_vouch_for_it() {
+    let reference = record::Conditions::supplied(4, 8 * 1024, Some(0.0));
+    assert!(withheld_on(reference.shortfalls(), None).is_empty());
+    assert!(withheld_on(reference.shortfalls(), Some("self-hosted")).is_empty());
+    assert_eq!(
+        withheld_on(reference.shortfalls(), Some(HOSTED_RUNNER)).len(),
+        1,
+        "a runner GitHub provides is one condition missing, whatever else it reads"
+    );
+    let short = record::Conditions::supplied(3, 7 * 1024, None);
+    assert!(!short.shortfalls().is_empty());
+    assert_eq!(
+        withheld_on(short.shortfalls(), None).len(),
+        short.shortfalls().len()
+    );
+    assert_eq!(
+        withheld_on(short.shortfalls(), Some(HOSTED_RUNNER)).len(),
+        short.shortfalls().len() + 1
+    );
+
+    assert!(withheld_lines(&[], false).is_empty());
+    let withheld = withheld_on(Vec::new(), Some(HOSTED_RUNNER));
+    let verdict = |inside| {
+        withheld_lines(&withheld, inside)
+            .into_iter()
+            .find(|line| line.trim_start().starts_with("verdict "))
+            .expect("a withheld measurement says where its figures stood")
+    };
+    assert!(verdict(false).contains("outside the target"));
+    assert!(verdict(true).contains("inside the target"));
+    assert!(!verdict(true).contains("outside"));
+
+    assert_eq!(arrival_limit_on(None), ARRIVAL_LIMIT);
+    assert_eq!(arrival_limit_on(Some("self-hosted")), ARRIVAL_LIMIT);
+    assert_eq!(
+        arrival_limit_on(Some(HOSTED_RUNNER)),
+        ARRIVAL_LIMIT_RECORDED
     );
 }
 

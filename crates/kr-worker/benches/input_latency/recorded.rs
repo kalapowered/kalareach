@@ -26,7 +26,7 @@ use kr_worker::runtime::{
 };
 use kr_worker::trace::{Event, LockTrace, Recording, Site};
 
-use super::{Hosted, POLL, RECOGNISER_DEADLINE, contains, retained_in, write};
+use super::{Hosted, POLL, RECOGNISER_DEADLINE, arrival_limit, contains, retained_in, write};
 
 /// The round the asserted holds are, so these start after it.
 const FIRST_RECORDED_ROUND: usize = 2;
@@ -348,14 +348,8 @@ async fn hold(
             accepted.forwarded_bytes.get()
         )),
         Ok(_) => {
-            let (held, polls) = arrival(
-                &hosted.runtime,
-                handle,
-                &expected,
-                started,
-                RECOGNISER_DEADLINE * 8,
-            )
-            .await;
+            let (held, polls) =
+                arrival(&hosted.runtime, handle, &expected, started, arrival_limit()).await;
             recorded.polls = polls;
             held.ok_or_else(|| "the prefix never reached the application".to_owned())
                 .and_then(|held| {
