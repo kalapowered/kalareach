@@ -43,6 +43,7 @@ import { AttachmentThumb } from '../components/AttachmentThumb'
 import {
   failureCode,
   failureMessage,
+  failureWords,
   failureRetry,
   MAX_HANDED_BYTES,
   watch,
@@ -496,7 +497,9 @@ export function Conversation({
           }
           const code = failureCode(error) ?? 'UNKNOWN'
           // A refusal of the earlier result's quote says the host's record is not what was shown:
-          // it is read again at once, so the person sees what it says now.
+          // it names the action the host holds as the newest, and the record is read again at
+          // once, so the person sees what it says now and the next quote is that action's.
+          if (code === 'DRAFT_CONFLICT') receiptReads.noteRefusal(failureWords(error))
           if (anyway && code === 'DRAFT_CONFLICT') receiptReads.askAgain(sessionId)
           update((current) => ({
             ...current,
