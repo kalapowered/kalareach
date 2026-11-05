@@ -22,18 +22,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{LIVENESS, Placed};
+use kr_protocol::broker::IntegrationMode;
 use kr_protocol::ids::{ApplicationInstanceId, EnvironmentId, SessionId};
 use kr_protocol::root::{CommandBackend, CwdRevision, PromptGeneration};
-use kr_protocol::scalars::Uuid;
+use kr_protocol::scalars::{Digest256, Uuid};
 use kr_protocol::session::CommandIntegration;
 use kr_worker::broker::Broker;
 use kr_worker::broker::commands::{
     BackendState, CommandBackends, CommandBackendsConfig, EstablishRequest,
 };
-use kr_worker::broker::connectors::{ConnectorSources, fixture};
+use kr_worker::broker::connectors::{
+    ConnectorSource, ConnectorSources, QualifiedExecutable, fixture,
+};
 use kr_worker::persistence::JournalHealth;
 use kr_worker::windows::job::{AgentJob, SessionJob};
 use kr_worker::windows::launch::{Child, Spec};
+use sha2::{Digest as _, Sha256};
 
 /// What the program writes the moment it starts, and what it does next. It waits far longer than
 /// any test takes unless a test tells it to end.
@@ -42,6 +46,7 @@ const SCRIPT: &str = "@echo off\r\n\
 echo variable=%KR_REGISTRATION%\r\n\
 echo relaunch=%GEMINI_CLI_NO_RELAUNCH%\r\n\
 echo cwd=%CD%\r\n\
+echo args=%*\r\n\
 ) > \"%REPORT%.part\"\r\n\
 move /y \"%REPORT%.part\" \"%REPORT%\" > NUL\r\n\
 if defined EXIT_WITH exit /b %EXIT_WITH%\r\n\
@@ -108,24 +113,45 @@ struct Shell {
 
 impl Shell {
     fn new() -> Self {
-        Self::build(|source| source, 0)
+        Self::build(|source, _| source, 0)
     }
 
     /// A shell whose program is `bytes` long, written new so that the system has not seen it: the
     /// size of the largest agent this platform runs, whose first start is scanned as it is read.
     fn large(bytes: u64) -> Self {
-        Self::build(|source| source, bytes)
+        Self::build(|source, _| source, bytes)
     }
 
     /// A shell whose connector's installation is granted to read files as well.
     fn reading() -> Self {
-        Self::build(fixture::reading, 0)
+        Self::build(|source, _| fixture::reading(source), 0)
     }
 
+    /// A shell whose connector's signed records name the program's exact bytes as `version`, with
+    /// a record of another version before them and one after, each for other bytes.
+    fn qualified(version: &str) -> Self {
+        let record = |bytes: &[u8], version: &str| QualifiedExecutable {
+            digest: Digest256::from_bytes(Sha256::digest(bytes).into()),
+            version: version.to_owned(),
+        };
+        Self::build(
+            |mut source, executable| {
+                let program = std::fs::read(executable).expect("the program's bytes");
+                source.qualified = vec![
+                    record(b"another build", "0.0.1"),
+                    record(&program, version),
+                    record(b"a later build", "9.9.9"),
+                ];
+                source
+            },
+            0,
+        )
+    }
+
+    /// Builds a shell whose package is written, then handed to `installed` with the path of the
+    /// program, to be made into the source the connector is admitted from.
     fn build(
-        installed: impl FnOnce(
-            kr_worker::broker::connectors::ConnectorSource,
-        ) -> kr_worker::broker::connectors::ConnectorSource,
+        installed: impl FnOnce(ConnectorSource, &Path) -> ConnectorSource,
         padding: u64,
     ) -> Self {
         let placed = Placed::new();
@@ -151,6 +177,7 @@ impl Shell {
         let source = installed(
             fixture::package(&store, &placed.forwarder, &fixture::Shape::gemini_cli(&[]))
                 .expect("the package is written"),
+            &executable,
         );
         let broker = Arc::new(
             Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
@@ -209,18 +236,30 @@ impl Shell {
     /// The vector every case types, which the integration answers unchanged: the program's name
     /// and the batch file `cmd.exe` runs.
     fn typed(&self) -> Vec<String> {
-        vec![
+        self.typed_with(&[])
+    }
+
+    /// The vector of [`Self::typed`] with `extra` arguments after the batch file, which the batch
+    /// file reports as it received them.
+    fn typed_with(&self, extra: &[&str]) -> Vec<String> {
+        let mut typed = vec![
             "gemini".to_owned(),
             "/d".to_owned(),
             "/c".to_owned(),
             self.script.display().to_string(),
-        ]
+        ];
+        typed.extend(extra.iter().map(|argument| (*argument).to_owned()));
+        typed
     }
 
     /// Establishes a backend for the next line, as the session does for an integrated resolve, for
     /// an invocation the shell reported running in `cwd`.
     fn establish_in(&self, cwd: &Path) -> CommandBackend {
-        let typed = self.typed();
+        self.establish_typed(&self.typed(), cwd)
+    }
+
+    /// Establishes a backend for the next line, for the invocation `typed` in `cwd`.
+    fn establish_typed(&self, typed: &[String], cwd: &Path) -> CommandBackend {
         let generation = self
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -228,8 +267,8 @@ impl Shell {
         self.backends
             .establish(&EstablishRequest {
                 prompt_generation: PromptGeneration::new(generation),
-                typed: &typed,
-                arguments: &typed,
+                typed,
+                arguments: typed,
                 added: &[],
                 integration: &Self::integration(),
                 executable: self.executable.to_str().expect("a text path"),
@@ -1468,5 +1507,102 @@ fn a_cold_copy_of_the_largest_agent_is_launched_within_the_deadlines() {
     eprintln!(
         "small launch: the program ran {:?} after the launcher started",
         started.elapsed()
+    );
+}
+
+/// KR-REQ-12.02: the profile a launch on Windows records says what the launch started. The
+/// executable is the absolute path of the file the started process runs from, which the kernel's
+/// own record of that process confirms, and not the name that was typed. The version is the one the
+/// connector's signed record names for the digest of that file's bytes, and not another record's.
+/// The arguments are the vector the program was run with, which the program reports as it received
+/// them, and the mode is the application's own bridge. Not shown here: the distribution and the
+/// authentication state of the profile, and a launch of a file that no record names.
+#[test]
+fn kr_req_12_02_a_windows_launch_records_the_executable_version_arguments_and_mode_it_started() {
+    let shell = Shell::qualified("2.3.4");
+    let typed = shell.typed_with(&["first", "second"]);
+    let root = shell.placed.host.root();
+    let answer = shell.establish_typed(&typed, root);
+    let mut launcher = shell.launcher(
+        &shell.executable.clone(),
+        &typed,
+        &answer,
+        "profiled",
+        &[],
+        root,
+    );
+    let report = shell.report_from("profiled", &mut launcher);
+    assert_eq!(
+        report["relaunch"], "true",
+        "the launch was committed and not run as typed: {report:?}"
+    );
+    assert_eq!(
+        report["args"], "first second",
+        "the program received the arguments after its batch file"
+    );
+    let instance = Shell::instance_of(&answer);
+    let profile = shell
+        .broker
+        .profile_of(instance)
+        .expect("the launch's profile is recorded");
+
+    // The executable: the file the started process runs from, as its own record in the kernel
+    // names it.
+    let program: u32 = Shell::registered(&answer)["pid"]
+        .parse()
+        .expect("a process identifier");
+    assert_ne!(program, launcher.id(), "the program is not the launcher");
+    let started = kr_worker::windows::file::object_of(
+        &kr_worker::windows::file::image_of(program).expect("the started program's image"),
+    )
+    .expect("the started program's file has an id");
+    let recorded = Path::new(&profile.binary.resolved_path);
+    assert!(
+        recorded.is_absolute(),
+        "the recorded executable is a path and not the name typed: {recorded:?}"
+    );
+    assert_ne!(
+        profile.binary.resolved_path, typed[0],
+        "and is not the name typed"
+    );
+    assert_eq!(
+        recorded, shell.executable,
+        "it is the executable the shell resolved"
+    );
+    assert_eq!(
+        kr_worker::windows::file::object_of(
+            &std::fs::File::open(recorded).expect("the recorded path opens")
+        )
+        .expect("the recorded file has an id"),
+        started,
+        "and it names the file the started process runs from"
+    );
+
+    // The version: the record that names the digest of that file's bytes.
+    let bytes = std::fs::read(recorded).expect("the started file's bytes");
+    assert_eq!(
+        profile.binary.digest,
+        Digest256::from_bytes(Sha256::digest(&bytes).into()),
+        "the profile holds the digest of the bytes that were started"
+    );
+    assert_eq!(
+        profile.binary.version, "2.3.4",
+        "the version is the one the record of those bytes names, and no other record's"
+    );
+
+    // The arguments and the mode the program ran with.
+    assert_eq!(
+        profile.arguments, typed,
+        "the arguments are the whole vector the program was run with"
+    );
+    assert_eq!(profile.mode, IntegrationMode::NativeBridge);
+    assert_eq!(
+        shell
+            .broker
+            .binding_state(instance)
+            .expect("the launched instance is live")
+            .mode,
+        IntegrationMode::NativeBridge,
+        "the instance the launch registered runs in the mode its profile records"
     );
 }
