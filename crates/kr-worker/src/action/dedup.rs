@@ -20,6 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use kr_protocol::envelope::MutationRequest;
 use kr_protocol::ids::{ActionId, ActorId};
 use kr_protocol::limits::MAX_OUTSTANDING_MUTATIONS;
+use kr_protocol::method::Method;
 use kr_protocol::wire::WireMessage;
 
 use crate::error::{Result, WorkerError};
@@ -132,10 +133,12 @@ impl ShownReceipts {
 /// `P` names no identity, and holds the request back: this rule refuses where it cannot tell.
 #[must_use]
 pub fn holds_back<P: WireMessage, I: PartialEq>(
+    method: Method,
     intent: Option<&[u8]>,
     identity: &I,
     identity_of: impl Fn(&P) -> I,
 ) -> bool {
+    let _ = method;
     let Some(intent) = intent else {
         return true;
     };
@@ -269,6 +272,68 @@ mod tests {
 
     fn action(byte: u8) -> ActionId {
         ActionId::new(Uuid::from_bytes([byte; 16]))
+    }
+
+    /// The envelope a worker keeps of a request for `method`.
+    fn envelope(method: Method, params: kr_protocol::envelope::ParamsValue) -> Vec<u8> {
+        use kr_protocol::envelope::ActionTarget;
+        use kr_protocol::ids::{ActionWindowId, EnvironmentId, RequestId};
+        use kr_protocol::method::MethodVersion;
+        use kr_protocol::scalars::{DurationMs, Nullable};
+        kr_cbor::to_canonical_vec(&MutationRequest {
+            request_id: RequestId::new(1),
+            method: method.into(),
+            method_version: MethodVersion::V1,
+            action_id: action(1),
+            grant_id: Nullable::null(),
+            target: ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+            expected: kr_protocol::envelope::ParamsValue::empty(),
+            action_window_id: ActionWindowId::new("window-1").expect("a window identifier"),
+            requested_ttl_ms: DurationMs::new(60_000),
+            params,
+        })
+        .expect("encodes")
+    }
+
+    #[test]
+    fn an_envelope_of_another_method_holds_a_request_back_whatever_its_parameters_read_as() {
+        use kr_protocol::envelope::ParamsValue;
+        use kr_protocol::ids::{QuestionId, QuestionRevision, SessionId};
+        use kr_protocol::question::QuestionCancelParams;
+        let params = |question: u8| {
+            ParamsValue::from_typed(&QuestionCancelParams {
+                session_id: SessionId::new(Uuid::from_bytes([3; 16])),
+                question_id: QuestionId::new(Uuid::from_bytes([question; 16])),
+                expected_revision: QuestionRevision::new(1),
+            })
+            .expect("encodes")
+        };
+        let identity_of = |params: &QuestionCancelParams| params.question_id;
+        let asked = QuestionId::new(Uuid::from_bytes([4; 16]));
+        let cancelling = |question: u8| envelope(Method::QuestionCancel, params(question));
+
+        // A cancellation of another question leaves this one alone; of this question, it holds
+        // the request back.
+        assert!(!holds_back(
+            Method::QuestionCancel,
+            Some(&cancelling(5)),
+            &asked,
+            identity_of
+        ));
+        assert!(holds_back(
+            Method::QuestionCancel,
+            Some(&cancelling(4)),
+            &asked,
+            identity_of
+        ));
+        // An envelope that is another method's names no cancellation, however its parameters read.
+        let another = envelope(Method::QuestionAnswer, params(5));
+        assert!(holds_back(
+            Method::QuestionCancel,
+            Some(&another),
+            &asked,
+            identity_of
+        ));
     }
 
     #[test]

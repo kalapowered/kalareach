@@ -7161,6 +7161,7 @@ impl WorkerService {
                 journal,
                 actor_id,
                 subject,
+                method,
                 mutation,
                 |params: &QuestionAnswerParams| params.question_id,
             ),
@@ -7168,6 +7169,7 @@ impl WorkerService {
                 journal,
                 actor_id,
                 subject,
+                method,
                 mutation,
                 |params: &QuestionCancelParams| params.question_id,
             ),
@@ -7175,6 +7177,7 @@ impl WorkerService {
                 journal,
                 actor_id,
                 subject,
+                method,
                 mutation,
                 |params: &QuestionCancelOwnParams| params.question_id,
             ),
@@ -7182,6 +7185,7 @@ impl WorkerService {
                 journal,
                 actor_id,
                 subject,
+                method,
                 mutation,
                 |params: &QuestionCreateParams| params.request_id.clone(),
             ),
@@ -7189,6 +7193,7 @@ impl WorkerService {
                 journal,
                 actor_id,
                 subject,
+                method,
                 mutation,
                 |params: &AlertCreateParams| params.dedup_id.clone(),
             ),
@@ -7206,6 +7211,7 @@ impl WorkerService {
         journal: &crate::journal::Journal,
         actor_id: &ActorId,
         subject: kr_protocol::scalars::Digest256,
+        method: Method,
         mutation: &MutationRequest,
         identity_of: impl Fn(&P) -> I,
     ) -> Result<Option<(kr_protocol::ids::ActionId, u64)>> {
@@ -7214,7 +7220,7 @@ impl WorkerService {
         };
         let identity = identity_of(&params);
         journal.uncertain_for_subject_matching(actor_id, subject, |intent| {
-            crate::action::dedup::holds_back(intent, &identity, &identity_of)
+            crate::action::dedup::holds_back(method, intent, &identity, &identity_of)
         })
     }
 
