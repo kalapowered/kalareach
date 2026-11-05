@@ -1,9 +1,9 @@
 //! The two transport performance requirements, measured over a real connection.
 //!
-//! * KR-PERF-005: application scheduling adds less than 25 ms p95 above the measured path round
-//!   trip while a bulk transfer is running.
-//! * KR-PERF-006: after the transport is available, usable state arrives within two seconds for a
-//!   120x40 screen, excluding pairing, discovery outage and operating-system suspension. What this
+//! * Application scheduling adds less than 25 ms p95 above the measured path round trip while a
+//!   bulk transfer is running.
+//! * After the transport is available, usable state arrives within two seconds for a 120x40
+//!   screen, excluding pairing, discovery outage and operating-system suspension. What this
 //!   measures is the transport's share of that budget: reconnecting, completing the handshake,
 //!   opening the stream and carrying a screen-sized snapshot. Rendering a real screen from it
 //!   belongs to the terminal and the client that own the snapshot format.
