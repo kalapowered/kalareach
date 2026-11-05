@@ -12,8 +12,8 @@
 //! so a count of one means something.
 //!
 //! What is checked here: an agent holds the handles its launch lists and no other handle of the
-//! worker; a launch waits for a window another start holds; a start made by another part of the
-//! worker, the desktop reading and the time reading, waits for a launch's window.
+//! worker; a launch waits for a window another start holds; the time reading's start waits for a
+//! launch's window; the desktop reading starts no program that could hold the window's handles.
 //!
 //! These tests run one at a time in a process of their own: a process any other test started while
 //! an event was inheritable would hold it too.
