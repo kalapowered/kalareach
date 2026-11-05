@@ -908,6 +908,32 @@ mod filelock {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What a case runs in place of the wait between two tries at a lock, to let go of a lock it
+    /// holds at a try of its choosing.
+    static BETWEEN_TRIES: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Waits a moment before the next try at a lock.
+fn pause_between_tries() {
+    #[cfg(test)]
+    {
+        let ran = BETWEEN_TRIES.with(|hook| match hook.borrow_mut().as_mut() {
+            Some(run) => {
+                run();
+                true
+            }
+            None => false,
+        });
+        if ran {
+            return;
+        }
+    }
+    std::thread::sleep(Duration::from_millis(10));
+}
+
 /// Takes a lock on an open file without blocking, trying again for as long as `within`, and says
 /// whether it was taken.
 fn lock_within(file: &File, path: &Path, locking: Locking, within: Duration) -> Result<bool> {
@@ -915,9 +941,7 @@ fn lock_within(file: &File, path: &Path, locking: Locking, within: Duration) -> 
     loop {
         match filelock::try_take(file, locking) {
             Ok(true) => return Ok(true),
-            Ok(false) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            Ok(false) if Instant::now() < deadline => pause_between_tries(),
             Ok(false) => return Ok(false),
             Err(error) => return Err(InstallError::io("lock", path, error)),
         }
@@ -1094,10 +1118,10 @@ impl Store {
     /// # Errors
     ///
     /// Returns what [`Store::current`] returns, [`InstallError::Io`] when the manifest cannot be
-    /// opened or locked, and [`InstallError::Replaced`] when every release the link was read to
-    /// name was gone, or was being removed for as long as the hold waited.
+    /// opened or locked, and [`InstallError::Replaced`] when the release the link names could not
+    /// be held: it is gone, or is being removed, or a program kept its manifest locked for as long
+    /// as the hold waited.
     pub fn hold_current(&self) -> Result<Option<CurrentRelease>> {
-        let mut gone = None;
         for _ in 0..HOLD_CURRENT_ATTEMPTS {
             let Some(release) = self.current()? else {
                 return Ok(None);
@@ -1110,14 +1134,22 @@ impl Store {
                         hold: Hold { file },
                     }));
                 }
-                Err(error @ InstallError::Replaced { .. }) => gone = Some(error),
+                // A release `current` still names that cannot be held is not one a second read
+                // finds anything else for: a stuck holder would be waited for again.
+                Err(InstallError::Replaced { .. })
+                    if self.current()?.as_ref() == Some(&release) =>
+                {
+                    break;
+                }
+                Err(InstallError::Replaced { .. }) => {}
                 Err(error) => return Err(error),
             }
         }
-        Err(gone.unwrap_or_else(|| InstallError::Replaced {
+        Err(InstallError::Replaced {
             path: self.current_link(),
-            reason: "names a release that is gone or being removed",
-        }))
+            reason: "names a release that could not be held: it is gone or being removed, or a \
+                     program keeps its manifest locked",
+        })
     }
 
     /// The path [`Store::stable`] names, where the program is there.
@@ -2485,8 +2517,8 @@ impl Hold {
     ///
     /// Windows has no call that replaces a process by another, so this process stays and waits,
     /// and Ctrl+C and Ctrl+Break reach the program and not this process, which has nothing to do
-    /// with them. The release is held from this pin until the program has a hold of its own, as
-    /// where a process replaces itself; and if this process is ended first, the program that is
+    /// with them. The release is held until the program has a hold of its own, as where a process
+    /// replaces itself; and if this process is ended first, the program that is
     /// left takes its own hold on starting and is refused when the release has been removed.
     pub fn run(self, command: &mut std::process::Command) -> std::io::Error {
         let ended = windows::while_interrupts_go_to_the_child(|| -> std::io::Result<i32> {
@@ -2628,6 +2660,50 @@ mod tests {
         std::fs::write(&path, b"forwarder").expect("the forwarder stands in");
         assert_eq!(registered_forwarder_of(&running), Some(path));
         let _ = remove_tree(&directory);
+    }
+
+    /// The hold on the current release waits for a lock it finds taken, however many tries that
+    /// takes, and does not refuse the start as if the release were being removed: a probe of
+    /// whether the release is held takes the manifest's lock exclusively for an instant, and so
+    /// does the removal of a release that is not current. The case stands a lock in for it and lets
+    /// go of it at the third wait. The hold that does not wait fails at the first.
+    #[test]
+    fn the_hold_on_the_current_release_waits_for_a_lock_it_finds_taken() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        install(&test.store, &one);
+        std::os::unix::fs::symlink(
+            Path::new(VERSIONS).join(one.as_str()),
+            test.store.current_link(),
+        )
+        .expect("current names the release");
+        let probe = Rc::new(open_regular_file(&test.store.manifest(&one)).expect("the manifest"));
+        assert!(
+            filelock::try_take(&probe, Locking::Exclusive).expect("locks"),
+            "nothing held the release"
+        );
+        let waits = Rc::new(Cell::new(0));
+        let hook = {
+            let (probe, waits) = (Rc::clone(&probe), Rc::clone(&waits));
+            move || {
+                waits.set(waits.get() + 1);
+                if waits.get() == 3 {
+                    filelock::release(&probe).expect("lets go");
+                }
+            }
+        };
+        BETWEEN_TRIES.with(|between| *between.borrow_mut() = Some(Box::new(hook)));
+        let held = test.store.hold_current();
+        BETWEEN_TRIES.with(|between| *between.borrow_mut() = None);
+
+        let held = held
+            .expect("the hold waits for the lock")
+            .expect("a release is current");
+        assert_eq!(held.release(), &one);
+        assert_eq!(waits.get(), 3, "it waited for the lock until it was let go");
     }
 
     /// For a release of a store the forwarder is the path through `current`, which an update keeps
