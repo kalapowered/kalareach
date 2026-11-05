@@ -984,10 +984,12 @@ function Install-KrStartHandler {
     }
 }
 
-# Takes the key off, unless the person has bound the chord since.
+# Takes the key off, unless the person has bound the chord since, and takes the module's own key out
+# of the editor's queue.
 function Restore-KrStartHandler {
     if (-not $script:Hooks.Start) { return }
     $script:Hooks.Start = $false
+    Remove-KrStartKeys
     $current = Get-KrBindingOn $script:StartChord
     if ($null -eq $current -or "$($current.Description)" -cne $script:StartDescription) { return }
     try { Remove-PSReadLineKeyHandler -Chord $script:StartChord } catch {
@@ -1251,7 +1253,9 @@ function Invoke-KalaReachReadLine {
     # proved before the editor asks says nothing about that, and the answer the host writes behind it
     # is the one that joins. So the module queues a key of its own for the editor to meet first, which
     # keeps its queue from being clear, and no fence is proved, until the editor has asked and the
-    # key's handler runs: the reader reports itself idle from there.
+    # key's handler runs: the reader reports itself idle from there. It queues none where that would
+    # change what the person's keys do or the key would not run (`Add-KrStartKey` says where). A queue
+    # that holds keys is not clear either, and the editor asks before it runs them.
     $started = Add-KrStartKey
     Send-KrEditorEnter
     if (-not $started) {
