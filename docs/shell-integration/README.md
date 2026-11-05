@@ -872,9 +872,10 @@ method, and that is exactly what it cannot do:
   `editor_left`, because a line installed before the read would never run. A launch quotes the
   fence of the read it was made for, and the worker publishes this read's fence only after the
   reader has acknowledged one, so what the module reads there is a launch for the read before.
-  Outside Windows the entry does not report the reader idle. The first idle report of a read comes
-  from the handler of a key the module has queued for the editor, which runs once the editor has
-  started (see the cursor reply, below). A key the person bound to a script of their own is theirs and carries no boundary, and an ordinary
+  Outside Windows, where the module can bind and queue its key, the entry does not report the
+  reader idle. The first idle report of a read comes from the handler of a key the module has
+  queued for the editor, which runs once the editor has started (see the cursor reply, below). A
+  key the person bound to a script of their own is theirs and carries no boundary, and an ordinary
   character goes straight to the editor's own insertion, so a request that arrives at a parked
   reader is answered after its next bound key that leaves the editor's queue empty rather than
   immediately; in the Vi command table that is a bound key of the insert table or the next read-line
@@ -933,12 +934,21 @@ method, and that is exactly what it cannot do:
   editor's key queue (`Ctrl+Alt+F24`, which no terminal sends and which the module binds where
   nothing is bound), and the reader reports itself idle from that key's handler. The queue is not
   clear until the editor has run the key, which it does after it has asked where the cursor is and
-  read the reply, and before it reads any other key. No fence is proved before then, so an answer
-  written behind a fence is behind the reply. An answer already in the terminal's input when the
-  editor asks, or one the host writes before the first fence, still joins the reply; the module
+  read the reply, and before it reads a key from the terminal. No fence is proved before then, so an
+  answer written behind a fence is behind the reply. An answer already in the terminal's input when
+  the editor asks, or one still in the lane when the editor asks, still joins the reply; the module
   only keeps a fence from being proved over it. The Windows console has no cursor question in its
-  input, and an editor that cannot have the key bound or queued keeps the entry's own idle report,
-  as before.
+  input. The module queues the key only where that cannot change what the person's keys do. It
+  queues none into a queue that already holds keys: a key the person typed ahead is first in it,
+  and the module's key behind it could be taken as the second key of a chord they began with an
+  Escape. It queues none for a read that starts in the Vi command table, which happens after a line
+  cancelled from that table and has nothing bound on the key. It queues none where the editor
+  carries a history search into the read: a line accepted with accept-and-get-next carries the
+  search on, and any key the editor runs ahead of the person's ends it. In those reads, and where
+  the key cannot be bound or queued, the entry keeps its own idle report, as before. A queue that
+  holds keys is not clear either, and the editor asks where the cursor is before it runs them, so
+  only a read in the Vi command table or one that carries a search can have a fence proved before
+  the editor has asked. The module takes its own key out of the queue when it goes.
 - **A host's answer is dropped before the editor puts it in the line.** The host answers a question
   an application asked the terminal (its attributes, a colour, its version) in the terminal's input,
   and the answer can reach a prompt with nothing typed at it. The runtime has no key for the
@@ -952,10 +962,12 @@ method, and that is exactly what it cannot do:
   control string at a backslash, because the runtime delivers a string's terminator (Escape and
   backslash) as the backslash alone. The handler reads only keys the terminal has delivered and
   never waits for one, so an Escape and a bracket a person pressed take nothing from what they press
-  next. A key no reply holds, a control character or the Escape of something else, ends the drop
-  early and goes back to the front of the editor's queue. When the handler ends the reader reports
-  itself idle, so a fence the answer withheld is asked for again. The module drops any such
-  sequence the runtime has no key for, whoever sent it. The Vi and Windows edit modes bind Escape
+  next. The first byte of a character that has not come whole is no key yet, so the handler ends
+  there and the editor reads the character when it arrives. A key no reply holds, a control
+  character or the Escape of something else, ends the drop early and goes back to the front of the
+  editor's queue. When the handler ends the reader reports itself idle, so a fence the answer
+  withheld is asked for again. The module drops any such sequence the runtime has no key for,
+  whoever sent it. The Vi and Windows edit modes bind Escape
   alone to an operation that must run at once, which a chord on Escape would delay, so no chord is
   bound there and an answer still reaches the editor as keys, which in the Vi modes run as commands.
   An Escape and a bracket that end a read reach the editor as the bracket alone, so a reply that a
