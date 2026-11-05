@@ -366,9 +366,10 @@ pub struct FenceDriver {
     /// Whether the last stimulus was one the machine ignored as belonging to something that ended.
     ignored: bool,
     /// Whether the registered root editor is owed the reply to its cursor question, which it reads
-    /// from the same input as every other byte. Set by an entry of an editor that asks one, and
-    /// ended by a cursor report queued for the terminal, by the reader's idle report, and by the
-    /// editor leaving or the session closing.
+    /// from the same input as every other byte. Set by an accepted entry of a PowerShell editor
+    /// off Windows, and ended by a cursor report queued for the terminal, by the reader's idle
+    /// report, and by the editor leaving (which a loss of the integration makes it do) or the
+    /// session closing.
     cursor_report_owed: bool,
     /// The prompt generation of the acceptance being applied, while one is.
     ///

@@ -577,10 +577,11 @@ parsed first, its report goes out before the hold begins, and the hold that foll
 the reader's idle report); and the reads where the module reports the reader idle at the read's
 entry, before the editor asks (a queue that holds keys, the Vi command table, the read after
 accept-and-get-next, a person's own binding of the module's key), which end the hold at once. Two
-limits come with the rule: a cursor report that never reaches the terminal (the lane is full, it
-lapsed behind a shut gate, or the writer's bounds refuse it) leaves the hold in force until the
-editor is reading keys, leaves, or the integration is lost, and the lane's bound of 128 KiB applies
-to what it keeps. The shell-integration document says how the module is arranged around each.
+limits come with the rule: a cursor report that is not queued for the terminal (the lane is full
+or its budget is spent, the report lapsed behind a shut gate, or the writer's bounds refuse it)
+leaves the hold in force until the editor is reading keys, leaves, the integration is lost or the
+session closes, and the lane's bound of 128 KiB applies to what it keeps. A report that was queued
+and then lapsed in the writer ends the hold all the same. The shell-integration document says how the module is arranged around each.
 
 #### Where a reply is attributed to nothing
 
