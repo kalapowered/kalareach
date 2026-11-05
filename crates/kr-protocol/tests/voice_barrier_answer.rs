@@ -1,9 +1,5 @@
 //! The answers to a voice stop and to a replacement of the voice grant stay inside what one control
 //! frame decodes, however many actions the fence they owed named.
-//!
-//! | Requirement | Tests |
-//! | --- | --- |
-//! | KR-REQ-09.12 | `a_stop_whose_fence_named_more_actions_than_a_frame_holds_is_answered_in_a_frame`, `a_replacement_whose_fence_named_more_actions_than_a_frame_holds_is_answered_in_a_frame`, `a_barrier_that_fits_is_carried_whole` |
 
 use kr_cbor::Limits;
 use kr_protocol::action::{
