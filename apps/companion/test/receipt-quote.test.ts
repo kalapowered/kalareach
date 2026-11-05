@@ -18,9 +18,9 @@ import { queued, type Submission } from '../src/model/receipts'
 const INSTANCE = '8a7b6c50-22bb-4c3d-8e4f-000000000201'
 
 /** A prompt whose outcome the page was told nobody knows, sent to `binding` of the agent. */
-function unknown(action: string, binding = '1'): Submission {
+function unknown(action: string, binding = '1', madeAtMs = 1): Submission {
   return {
-    ...queued(`s-${action}`, 'run it', 1),
+    ...queued(`s-${action}`, 'run it', madeAtMs),
     actionId: action,
     state: 'unknown',
     sentTo: { applicationInstanceId: INSTANCE, agentBindingRevision: binding }
@@ -96,27 +96,41 @@ describe('the action a later prompt names', () => {
     expect(supersessionFor(submissions, reads, TO)?.action_id).toBe(LATER)
 
     // The host's newest is the other: its refusal names it, first.
-    reads.noteRefusal(`the uncertain outcome of this subject is action ${OLDER}, not ${LATER}`)
+    reads.noteRefusal(`the uncertain outcome of this subject is action ${OLDER}, not ${LATER}`, 10)
     expect(supersessionFor(submissions, reads, TO)).toEqual({ action_id: OLDER, revision: '3' })
     // And it names the one now in the way, when the host's newest has moved on.
-    reads.noteRefusal(`the uncertain outcome of this subject is action ${LATER}, not ${OLDER}`)
+    reads.noteRefusal(`the uncertain outcome of this subject is action ${LATER}, not ${OLDER}`, 20)
     expect(supersessionFor(submissions, reads, TO)).toEqual({ action_id: LATER, revision: '4' })
   })
 
-  it('prefers a prompt read after the refusal to the action the refusal named', () => {
+  it('prefers a prompt made after the refusal to the action the refusal named', () => {
     const reads = new ReceiptReads()
     reads.note(record(OLDER, { revision: '3', updated_at_ms: '100' }))
     reads.note(record(LATER, { revision: '4', updated_at_ms: '100' }))
-    reads.noteRefusal(`the uncertain outcome of this subject is action ${OLDER}, not ${LATER}`)
-    // A prompt sent after the refusal, whose outcome nobody knows either, was recorded by the host
+    reads.noteRefusal(`the uncertain outcome of this subject is action ${OLDER}, not ${LATER}`, 10)
+    // A prompt made after the refusal, whose outcome nobody knows either, was recorded by the host
     // after the action it named.
-    const SENT_AFTER = 'c2000000-0000-4000-8000-000000000003'
-    reads.note(record(SENT_AFTER, { revision: '6', updated_at_ms: '200' }))
-    expect(
-      supersessionFor([unknown(OLDER), unknown(LATER), unknown(SENT_AFTER)], reads, TO)
-    ).toEqual({ action_id: SENT_AFTER, revision: '6' })
-    // Until then the named action is the one.
-    expect(supersessionFor([unknown(OLDER), unknown(LATER)], reads, TO)?.action_id).toBe(OLDER)
+    const MADE_AFTER = 'c2000000-0000-4000-8000-000000000003'
+    reads.note(record(MADE_AFTER, { revision: '6', updated_at_ms: '100' }))
+    const before = [unknown(OLDER), unknown(LATER)]
+    expect(supersessionFor([...before, unknown(MADE_AFTER, '1', 20)], reads, TO)).toEqual({
+      action_id: MADE_AFTER,
+      revision: '6'
+    })
+    // Without that prompt the named action is still the one.
+    expect(supersessionFor(before, reads, TO)?.action_id).toBe(OLDER)
+  })
+
+  it('does not take a prompt for a newer one because its record was first read after the refusal', () => {
+    const reads = new ReceiptReads()
+    reads.note(record(OLDER, { revision: '3', updated_at_ms: '100' }))
+    reads.noteRefusal(`the uncertain outcome of this subject is action ${OLDER}, not ${LATER}`, 10)
+    // Made before the refusal, and read for the first time after it: the host's word stands.
+    reads.note(record(LATER, { revision: '4', updated_at_ms: '100' }))
+    expect(supersessionFor([unknown(OLDER), unknown(LATER)], reads, TO)).toEqual({
+      action_id: OLDER,
+      revision: '3'
+    })
   })
 
   it('keeps its own order for a refusal that names no action it could quote', () => {
