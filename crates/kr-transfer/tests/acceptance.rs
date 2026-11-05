@@ -1,5 +1,5 @@
-//! KR-ACC-019: partial uploads, quota failure, environment boundaries, symbolic links and
-//! reparse points, and concurrent file changes, in one run.
+//! Partial uploads, quota failure, environment boundaries, symbolic links and reparse points, and
+//! concurrent file changes, in one run.
 //!
 //! One test, five conditions, in the order the acceptance row lists them. Each
 //! step asserts both what the host refused and what it kept: a refusal that lost the user's work
@@ -16,6 +16,9 @@ use kr_protocol::transfer::{
 use kr_transfer::store::Limits;
 use support::{Harness, digest, pattern};
 
+/// KR-ACC-019: partial uploads, quota failure, environment boundaries, symbolic links and reparse
+/// points, and concurrent file changes, in one run, each step asserting both what the host refused
+/// and what it kept.
 #[test]
 fn partial_uploads_quotas_environments_links_and_concurrent_changes() {
     let harness = Harness::create();
