@@ -370,10 +370,12 @@ pub enum Answered {
     /// The host took an earlier send of this question's answer while its reply was lost. This call
     /// stopped before it sent anything.
     Taken(ActionId),
-    /// The host took an earlier send of this question's answer while its reply was lost, after this
-    /// call had already sent its own, which the host refused because the question was answered.
+    /// The host took a send of this question's answer, one the record carried when this call began,
+    /// and refused the send this call made because the question was answered. It says nothing of
+    /// which of the two reached the host first, or whether the reply to the taken send was lost: the
+    /// taken send may be one another command made.
     TakenAfterRefusal {
-        /// The earlier send the host took.
+        /// The send the host took.
         taken: ActionId,
         /// This call's own send, which the host refused.
         refused: ActionId,

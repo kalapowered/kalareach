@@ -651,10 +651,11 @@ pub enum Answer {
         /// The answer, as it is kept.
         draft: AnswerDraft,
     },
-    /// The host took an earlier send of an answer to this question while its reply was lost. When
+    /// The host took a send of an answer to this question, one the kept record carried. When
     /// `refused` is empty this press sent nothing; otherwise this press sent `refused`, and the host
-    /// refused it because the question was answered. A press of the answer form retires the copy
-    /// kept; a press of a kept answer's send leaves it until the person dismisses it.
+    /// refused it because the question was answered. Nothing here says which of the two reached the
+    /// host first. A press of the answer form retires the copy kept; a press of a kept answer's send
+    /// leaves it until the person dismisses it.
     Landed {
         /// The send the host took.
         action_id: ActionId,

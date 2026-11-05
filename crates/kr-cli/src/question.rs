@@ -278,9 +278,8 @@ fn settled(workers: &Workers, answered: Answered) -> Result<Question> {
         Answered::TakenAfterRefusal { taken, refused } => Err(CliError::Unfinished {
             code: ErrorCode::QuestionResolved,
             message: shown!(
-                "the host took an earlier send of this answer (action {}) while its reply was \
-                 lost; this command's own send (action {}) went out after it and was refused \
-                 because the question was answered",
+                "the host took a send of this answer (action {}); this command's own send \
+                 (action {}) was refused because the question was answered",
                 taken,
                 refused
             ),
