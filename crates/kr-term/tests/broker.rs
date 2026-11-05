@@ -1,4 +1,4 @@
-//! KR-ACC-001: exactly one query responder, with no duplicate answers and no hangs.
+//! Exactly one query responder, with no duplicate answers and no hangs.
 //!
 //! The dangerous failure here is not a wrong answer. It is a second answer, or none: an application
 //! that asked one question and got two replies loses its place in its own input stream, and an
@@ -66,6 +66,9 @@ fn no_reply_carries_a_physical_terminal_identity() {
     }
 }
 
+/// KR-ACC-001, the part about no duplicate answers: each cursor report query is answered by exactly
+/// one reply from the broker's lane. Not shown here: a local and a remote client attached together
+/// (the controller's network case) and a query that goes unanswered.
 #[test]
 fn a_cursor_report_describes_the_canonical_grid() {
     let mut engine = engine();
@@ -295,6 +298,10 @@ fn a_reply_waits_for_the_session_loop() {
 
 /// KR-REQ-08.50: nothing the lane has dropped can be written afterwards: a reset leaves no reply
 /// pending and none to drain.
+///
+/// KR-ACC-001, the part about no late duplicate: a reset leaves no reply pending and none to drain,
+/// so a reply the lane never delivered is not written afterwards. Not shown here: a local and a
+/// remote client attached together.
 #[test]
 fn undelivered_replies_are_not_replayed_after_a_reset() {
     let mut engine = engine();
@@ -519,6 +526,10 @@ fn a_cursor_report_honours_origin_mode() {
 
 /// A colour request is executed once, in order, and each answer comes from the palette at that
 /// point in the request.
+///
+/// KR-ACC-001, the part about no duplicate answers: a colour request with two questions is answered
+/// by exactly two replies, once each and in order. Not shown here: a local and a remote client
+/// attached together, and a query that goes unanswered.
 #[test]
 fn a_colour_request_answers_from_the_palette_at_each_question() {
     let mut engine = engine();
