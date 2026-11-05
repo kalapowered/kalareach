@@ -5196,18 +5196,23 @@ mod tests {
 
     /// KR-REQ-26.13: on Windows a configuration file that another account owns is refused, though
     /// its list names nobody this machine does not already trust, and the host's reader returns none
-    /// of its contents; a file this account made beside it is read. The local system account owns
-    /// the refused file: it is an account this process could not have created a file as, and the
-    /// list it inherited from the directory still names this account, which is what lets it be
-    /// opened to be asked.
+    /// of its contents; a file this account made with the same list is read. The local system
+    /// account owns the refused file: it is an account this process could not have created a file as,
+    /// and the list still grants the Administrators group, which is how this account opens it to be
+    /// asked. `OW` is the owner and `BA` the Administrators group.
     #[cfg(windows)]
     #[test]
     fn a_configuration_file_another_account_owns_is_refused_on_windows() {
         use kr_protocol::hostinfo::configuration::{FileRefusal, read_file};
 
-        let directory = Inheriting::new("configuration-owner");
-        let own = directory.file("own.json");
-        let theirs = directory.file("theirs.json");
+        let root = temporary_root("configuration-owner");
+        let list = "D:P(A;;GA;;;OW)(A;;GA;;;BA)";
+        let own = root.join("own.json");
+        create_file_with_descriptor(&own, list).expect("a file this account made");
+        std::fs::write(&own, b"{}").expect("its contents");
+        let theirs = root.join("theirs.json");
+        create_file_with_descriptor(&theirs, list).expect("a file with the same list");
+        std::fs::write(&theirs, b"{}").expect("its contents");
         run(
             "icacls.exe",
             &[
@@ -5238,7 +5243,7 @@ mod tests {
         // The host's reader asks the same question of the handle it opened, before it reads.
         assert_eq!(
             read_file(&own, 1024, check_configuration_file).expect("a file of this account's"),
-            Some(b"own.json".to_vec()),
+            Some(b"{}".to_vec()),
             "the control is read"
         );
         let refused = read_file(&theirs, 1024, check_configuration_file)
@@ -5249,5 +5254,6 @@ mod tests {
                 .contains("refused by its access-control list"),
             "{refused}"
         );
+        std::fs::remove_dir_all(&root).ok();
     }
 }
