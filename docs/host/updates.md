@@ -65,19 +65,22 @@ What has to follow an update names its path through `current` instead, so it is 
   its own release's integration.
 
 A program the host starts itself reads `current` once and starts the program of the release it
-names, by that release's own path, which has no link in it. That covers a `kr` that hands its
-command to the store's `kr`, a `kr` that takes in a package manager's release, the standalone
-start of the control daemon, and the start of a daemon again after an update. `kr shell` reads a
-shell's packages the same way, so everything it finds is of one release. The paths in the list
-above are written for something else to start later, so they keep the link; the host only checks,
-in the release it read, that the program is there.
+names, by that release's own path, which has no link in it. A program started from its own release,
+such as the worker a control daemon launches, reads nothing. The starts that read it once are, on
+Linux and macOS, a `kr` that hands its command to the store's `kr`, a `kr` that takes in a package
+manager's release, the standalone start of the control daemon, and the start of a daemon again after
+an update. `kr shell` reads the packages the same way, so the packages one read finds are all of one release. On Windows
+the scheduled task starts the daemon, by `current\bin\kr-controller.exe`. The paths in the list
+above are written for something else to start later, so they keep the link. Where the host checks
+that a program is there first (the forwarder, an agent's command and a shell's entry), it asks the
+release it read.
 
 On Linux, a path walk through a link that a rename replaces rarely answers that the path does not
 exist: a few walks in tens of millions, whichever way the link is replaced. A program that an
 application, a terminal, a shell or the service manager starts through `current` at the moment of
 a switch can therefore fail to start with a missing program, and starting it again works. When it
 is the service manager's start of the control daemon, the refusal is said as any refused start is,
-nothing has been started or written, and the next command that needs a daemon asks again.
+no daemon is running for it, and the next command that needs a daemon asks again.
 
 A control daemon of a store holds the install lock, shared, while it takes its environment, and
 exits when `current` names another release: that release's daemon serves the host. It records the
