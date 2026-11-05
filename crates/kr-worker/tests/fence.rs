@@ -8028,6 +8028,30 @@ fn the_host_answers_the_applications_question(
     );
 }
 
+/// Whether the PowerShell editor has asked where the cursor is after its prompt, which it does
+/// before it reads a key, and the host's reply to it is written.
+///
+/// The shell asks once before it draws the prompt and the editor asks once more after it, so the
+/// second question in what the session retained is the editor's.
+#[cfg(unix)]
+fn the_powershell_editor_is_reading(shell: &RealShell) -> bool {
+    let session = shell.runtime.session();
+    let seen = retained(&session);
+    let question = b"\x1b[6n";
+    let asked = seen
+        .windows(question.len())
+        .filter(|part| *part == question)
+        .count()
+        >= 2;
+    asked
+        && session
+            .input()
+            .lock()
+            .unwritten_replies()
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+}
+
 /// Waits until the reader holds a fence other than `not` that it has proved, and returns it. Where
 /// `answering` names a reader, the host answers the application's question in the same hold of the
 /// session that saw the fence, so no other answer can enter between the two.
@@ -8035,7 +8059,10 @@ fn the_host_answers_the_applications_question(
 /// A PowerShell reader answers a request only at a key it has run, and asks again only after it has
 /// reported itself idle, which it does at the end of a key. So where `stepping` is set the wait
 /// gives it a key, Ctrl+F on an empty line, whenever it holds no fence, as a person would: the key
-/// that follows the report is the one that answers the request the report brought.
+/// that follows the report is the one that answers the request the report brought. It gives the
+/// key only once the editor is reading. A key typed before then keeps the reader's queue from being
+/// clear, and so hides a fence the reader would have proved on its own before its editor had asked
+/// where the cursor is, which is the fence an answer written behind it would damage.
 #[cfg(unix)]
 async fn until_the_reader_proves_a_fence(
     shell: &RealShell,
@@ -8063,7 +8090,7 @@ async fn until_the_reader_proves_a_fence(
                     return proved;
                 }
             }
-            if stepping {
+            if stepping && the_powershell_editor_is_reading(shell) {
                 keys.type_bytes(shell, b"\x06");
                 tokio::time::sleep(Duration::from_millis(200)).await;
             } else {
@@ -8087,8 +8114,10 @@ async fn until_the_reader_proves_a_fence(
 /// PowerShell the case also asks the line the second fence is over to be empty, as the reader says
 /// in its acknowledgement: an editor that took the answer's characters into the line would leave it
 /// not. A PowerShell editor reads the reply to its question about the cursor from the same input as
-/// every other byte, so the answer must not be written before that reply; the reader proves no first
-/// fence until its editor has asked, which the shell-integration cases show.
+/// every other byte, so the answer must not be written before that reply. The case gives the reader
+/// no key until the editor has asked where the cursor is, so the first fence stands only if the
+/// reader proved it on its own, and a reader that proves one before the editor has asked has the
+/// answer written ahead of the reply and damages the editor.
 #[cfg(unix)]
 async fn a_readers_fence_is_invalidated_by_the_hosts_answer(kind: ShellKind) {
     let package = installed_package_of(kind);
