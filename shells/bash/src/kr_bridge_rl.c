@@ -403,43 +403,76 @@ kr_rl_source (int source)
   kr_last_source = source;
 }
 
+/* Where a host's answer to a terminal query is left out of the keys. Only the root shell of a
+   session is answered for, and only at the prompts the shell draws: a `read -e' is a program's own
+   read, and a program that asks the terminal something there has asked for its answer. A quoted
+   insertion and a bracketed paste take the terminal's bytes as they come. */
+static int
+kr_rl_replies_are_dropped_here (void)
+{
+  return kr_bridge_managed () != 0 && kr_context () != KR_CONTEXT_READ_BUILTIN
+	 && kr_pending_quoted == 0 && kr_pending_paste_open == 0;
+}
+
+/* Puts held[from..to) back at the front of the typeahead, in order. The typeahead holds more than
+   a run is allowed to be, and a byte comes from the terminal only once the typeahead is empty, so
+   a run always fits. */
+static void
+kr_rl_give_back (const unsigned char *held, size_t from, size_t to)
+{
+  while (to > from)
+    _rl_unget_char (held[--to]);
+}
+
 int
 kr_rl_host_reply_dropped (void)
 {
   unsigned char held[KR_REPLY_MAX];
-  size_t length = 1;
-  int verdict, byte;
+  size_t length = 1, start = 0;
 
-  /* Only the root shell of a session is answered for, and only at the prompts the shell draws: a
-     `read -e' is a program's own read, and a program that asks the terminal something there has
-     asked for its answer. A quoted insertion and a bracketed paste take the terminal's bytes as
-     they come. */
-  if (kr_bridge_managed () == 0 || kr_context () == KR_CONTEXT_READ_BUILTIN
-      || kr_pending_quoted || kr_pending_paste_open)
+  if (kr_rl_replies_are_dropped_here () == 0)
     return 0;
   held[0] = ESC;
-  for (;;)
-    {
-      verdict = kr_reply_classify (held, length);
-      if (verdict != KR_REPLY_MORE || length == sizeof (held))
-	break;
-      byte = _rl_kr_delivered_byte ();
-      if (byte < 0)
-	break;
-      held[length++] = (unsigned char) byte;
-    }
-  if (verdict == KR_REPLY_WHOLE)
+  if (kr_reply_follow (held, &length, sizeof (held), _rl_kr_delivered_byte, &start)
+      == KR_REPLY_WHOLE)
     {
       /* The reader's queues have changed, so the next wait reports itself idle again and the
 	 worker gets its retry point. */
       kr_idle_reported = 0;
+      /* When the answer begins at a later Escape, the first is the person's key and what lies
+	 between the two is keys behind it. */
+      kr_rl_give_back (held, 1, start);
+      return start == 0;
+    }
+  /* Not an answer, or not all of one yet: the key lookup gets every byte but the Escape back. */
+  kr_rl_give_back (held, 1, length);
+  return 0;
+}
+
+int
+kr_rl_drop_delivered_replies (void)
+{
+  unsigned char held[KR_REPLY_MAX];
+  size_t length = 1, start = 0;
+  int byte;
+
+  if (kr_rl_replies_are_dropped_here () == 0)
+    return 0;
+  byte = _rl_kr_delivered_byte ();
+  if (byte < 0)
+    return 0;
+  held[0] = (unsigned char) byte;
+  if (held[0] == ESC
+      && kr_reply_follow (held, &length, sizeof (held), _rl_kr_delivered_byte, &start)
+	 == KR_REPLY_WHOLE)
+    {
+      kr_idle_reported = 0;
+      /* Keys the person typed before the answer stay, and are what the probe now reports. */
+      kr_rl_give_back (held, 0, start);
       return 1;
     }
-  /* Not an answer, or not all of one yet: the key lookup gets every byte but the Escape back. The
-     typeahead holds more than a run is allowed to be, and a byte comes from the terminal only once
-     the typeahead is empty, so they all fit. */
-  while (length > 1)
-    _rl_unget_char (held[--length]);
+  /* A key, or no answer: all of it goes back where the reader will find it. */
+  kr_rl_give_back (held, 0, length);
   return 0;
 }
 

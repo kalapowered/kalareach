@@ -63,11 +63,25 @@ void kr_rl_source (int source);
  * Called with an Escape the reader has just taken from the terminal or its typeahead as a key.
  *
  * When the rest of a host's answer to a question an application asked has already been delivered,
- * the whole answer is taken here, so no part of it is a key, and the call returns non-zero.
- * Otherwise it returns zero with every byte it looked at back in the reader's typeahead, in order,
- * for the key lookup. It never waits for a byte the terminal has not delivered.
+ * the whole answer is taken here, so no part of it is a key, and the call returns non-zero. An
+ * answer that begins at a later Escape, behind the person's own, is taken too: the call returns
+ * zero, the Escape is the key, and the bytes between stay in the typeahead. Otherwise it returns
+ * zero with every byte it looked at back in the reader's typeahead, in order, for the key lookup.
+ * It never waits for a byte the terminal has not delivered.
  */
 int kr_rl_host_reply_dropped (void);
+
+/*
+ * Called when a check for input says the terminal holds some and the typeahead is empty, before
+ * the check reports it: a caller that asks first reads a key next and waits for it, so an answer
+ * that is all the terminal holds must not be reported as one.
+ *
+ * Takes a whole answer at the front of the terminal's bytes and returns non-zero, with any keys
+ * the person typed before it in the typeahead. Otherwise it returns zero with every byte it
+ * looked at back in the typeahead, in order. It never waits for a byte the terminal has not
+ * delivered.
+ */
+int kr_rl_drop_delivered_replies (void);
 
 /* The operations whose key wait a takeover has to be able to end. */
 void kr_rl_pending_quoted_insertion (int active);

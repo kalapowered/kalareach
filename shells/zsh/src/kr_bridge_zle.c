@@ -64,6 +64,11 @@ static int kr_pending_quoted;
 static int kr_pending_numeric;
 static int kr_pending_paste_open;
 static int kr_source_is_pushed_back;
+/* How many of the bytes ZLE has pushed back, from the bottom of its stack, are bytes this reader
+ * read ahead from the terminal and gave back, which are the person's. */
+static int kr_lookahead_held;
+/* True when the byte just taken is one of those. */
+static int kr_source_is_lookahead;
 
 /* A takeover's cancellation: requested inside the wait, consumed at the next boundary. */
 static int kr_cancel_requested;
@@ -1342,9 +1347,9 @@ kr_zle_boundary(void)
     if (done) {
         return 1;		/* a launch was installed and accepted */
     }
-    source = kr_source_is_pushed_back ? KR_SOURCE_PUSHED_BACK
-                                      : (kr_pending_paste_open ? KR_SOURCE_PASTE
-                                                               : KR_SOURCE_TERMINAL);
+    source = (kr_source_is_pushed_back && !kr_source_is_lookahead)
+                 ? KR_SOURCE_PUSHED_BACK
+                 : (kr_pending_paste_open ? KR_SOURCE_PASTE : KR_SOURCE_TERMINAL);
     /*
      * The decision is about the sequence just resolved. A read that ended with none, as an interrupt
      * ends it, leaves `lastchar` at the key before it, and deciding on that key again would take
@@ -1426,13 +1431,26 @@ kr_zle_pass_end(void)
 void
 kr_zle_source_pushed_back(void)
 {
+    /* Called with the top byte of ZLE's stack about to be taken. */
     kr_source_is_pushed_back = 1;
+    if (kr_lookahead_held > (int)kungetct) {
+        kr_lookahead_held = (int)kungetct;
+    }
+    /* The bytes this reader gave back lie below anything pushed since, so the top byte is one of
+     * them exactly when the stack holds nothing else. They came from the terminal and are the
+     * person's keys, whatever carried them back to the editor. */
+    kr_source_is_lookahead = (kr_lookahead_held > 0 && kr_lookahead_held == (int)kungetct);
+    if (kr_source_is_lookahead) {
+        kr_lookahead_held--;
+    }
 }
 
 void
 kr_zle_source_terminal(void)
 {
     kr_source_is_pushed_back = 0;
+    kr_source_is_lookahead = 0;
+    kr_lookahead_held = 0;
 }
 
 /*
@@ -1456,13 +1474,22 @@ kr_zle_delivered_byte(void)
     return (unsigned char)byte;
 }
 
+/* Puts held[from..to) back on ZLE's stack of pushed-back bytes, in order. */
+static void
+kr_zle_give_back(const unsigned char *held, size_t from, size_t to)
+{
+    while (to > from) {
+        ungetbyte(held[--to]);
+    }
+}
+
 int
 kr_zle_host_reply_dropped(void)
 {
     unsigned char held[KR_REPLY_MAX];
     size_t length = 1;
-    int verdict;
-    int byte;
+    size_t start = 0;
+    int dropped = 0;
 
     /*
      * Only the root shell of a session is answered for, and only at the prompts the shell draws:
@@ -1474,32 +1501,61 @@ kr_zle_host_reply_dropped(void)
         return 0;
     }
     held[0] = '\033';
-    for (;;) {
-        verdict = kr_reply_classify(held, length);
-        if (verdict != KR_REPLY_MORE || length == sizeof(held)) {
-            break;
-        }
-        byte = kr_zle_delivered_byte();
-        if (byte < 0) {
-            break;
-        }
-        held[length++] = (unsigned char)byte;
-    }
-    if (verdict == KR_REPLY_WHOLE) {
-        /* The Escape was recorded for a repeat of a vi change like every byte the reader takes. */
-        if (vichgflag && curvichg.bufptr > 0) {
+    if (kr_reply_follow(held, &length, sizeof(held), kr_zle_delivered_byte, &start) ==
+        KR_REPLY_WHOLE) {
+        /* The Escape was recorded for a repeat of a vi change like every byte the reader takes,
+         * and an answer that begins with it is no part of the change. */
+        if (start == 0 && vichgflag && curvichg.bufptr > 0) {
             curvichg.bufptr--;
         }
         /* The reader's queues have changed, so the next wait reports itself idle again and the
          * worker gets its retry point. */
         kr_idle_reported = 0;
-        return 1;
+        /* When the answer begins at a later Escape, the first is the person's key and what lies
+         * between the two is keys behind it. */
+        length = start;
+        dropped = (start == 0);
     }
     /* Not an answer, or not all of one yet: the key lookup gets every byte but the Escape back. */
-    while (length > 1) {
-        ungetbyte(held[--length]);
+    kr_zle_give_back(held, 1, length);
+    /* The stack held nothing when the Escape came from the terminal, so all of it is theirs. */
+    kr_lookahead_held = (int)kungetct;
+    return dropped;
+}
+
+int
+kr_zle_key_byte(long timed)
+{
+    struct timespec began;
+    struct timespec now;
+    long total = 0;
+    long used;
+    long wait = timed;
+    int c;
+
+    /* A read that waits for the rest of a key has one limit, KEYTIMEOUT, and an answer taken out of
+     * the way does not start it again. */
+    if (timed && (total = (long)getiparam("KEYTIMEOUT")) > 0) {
+        zgettime_monotonic_if_available(&began);
+    } else {
+        total = 0;
     }
-    return 0;
+    for (;;) {
+        c = getbyte(wait, NULL, 1);
+        if (c != '\033' || !kr_zle_host_reply_dropped()) {
+            return c;
+        }
+        if (total > 0) {
+            zgettime_monotonic_if_available(&now);
+            used = (long)(now.tv_sec - began.tv_sec) * 100 +
+                   (long)(now.tv_nsec - began.tv_nsec) / 10000000L;
+            if (used >= total) {
+                return lastchar = EOF;
+            }
+            /* A negative value is a limit of its own, in hundredths of a second. */
+            wait = -(total - used);
+        }
+    }
 }
 
 void

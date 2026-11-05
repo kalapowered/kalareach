@@ -1,15 +1,17 @@
 Subject: [PATCH 6/6] zle: leave a host's answer to a terminal query out of the keys
 
-A program that asks the terminal something and ends before it reads the answer, or never reads
-it, leaves the host's answer in the terminal's input, and the line editor finds it at its prompt.
-ZLE decodes it as keys: an unbound sequence beeps and the rest of the answer is typed into the
-line. The reader takes the answer out at the one place the editor reads the first byte of a key,
-before the key lookup sees it: when the byte is an Escape and the terminal has already delivered
-the rest of an answer the host's query broker builds, the whole answer is taken and dropped;
-anything else is given back to the key lookup untouched and in order. Nothing waits for a byte
-the terminal has not delivered, so no key a person presses is held back. A `read -k` in a widget
-never goes through this read, and `vared`, `select`, a quoted insertion and a bracketed paste are
-left alone.
+A program that asks the terminal something and ends before it reads the answer, or never reads it,
+leaves the host's answer in the terminal's input, and the line editor finds it at its prompt. ZLE
+decodes it as keys: an unbound sequence beeps and the rest of the answer is typed into the line. The
+reader takes the answer out at the one place the editor takes each byte of a key, before the key
+lookup sees it: when the byte is an Escape and the terminal has already delivered the rest of an
+answer the host's query broker builds, the whole answer is taken and dropped; anything else is given
+back to the key lookup untouched and in order. The bytes given back are still the person's, and the
+bridge reports them as the terminal's, not as keys a widget pushed back. A read that waits for the
+rest of a key keeps its one KEYTIMEOUT limit however many answers it takes out of the way. Nothing
+waits for a byte the terminal has not delivered, so no key a person presses is held back. A widget's
+own one-key read, `read -k`, never goes through this read, and `vared`, `select`, a quoted insertion
+and a bracketed paste are left alone.
 
 This patch is a derivative work of Zsh and carries the Zsh licence; see shells/zsh/LICENSE.
 
@@ -36,20 +38,16 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  
  /*
   * Keymap structures:
-@@ -1693,7 +1696,15 @@
+@@ -1693,7 +1696,11 @@
  static int
  getkeybuf(int w)
  {
 -    int c = getbyte((long)w, NULL, 1);
-+    int c;
-+
 +    /*
 +     * A host's answer to a terminal query is no key: when an Escape begins one, the reader takes
 +     * the whole answer here and reads on.
 +     */
-+    do {
-+	c = getbyte((long)w, NULL, 1);
-+    } while (c == '\033' && kr_zle_host_reply_dropped());
++    int c = kr_zle_key_byte((long)w);
  
      if(c < 0)
  	return EOF;

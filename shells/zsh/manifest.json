@@ -60,7 +60,7 @@
       "name": "zle-host-replies",
       "file": "patches/0006-zle-host-replies.patch",
       "revision": "1",
-      "purpose": "Where the line editor reads the first byte of a key, an Escape that begins a host's answer to a terminal query, delivered whole, is taken with the rest of the answer and left out of the keys, so none of it is typed into the line; any other run of bytes goes back to the key lookup untouched and in order, and the reader never waits for a byte the terminal has not delivered."
+      "purpose": "Where the line editor takes each byte of a key, an Escape that begins a host's answer to a terminal query, delivered whole, is taken with the rest of the answer and left out of the keys, so none of it is typed into the line, even when it follows the person's own Escape; any other run of bytes goes back to the key lookup untouched and in order, and is still reported as the terminal's; a wait for the rest of a key keeps its one KEYTIMEOUT limit; and the reader never waits for a byte the terminal has not delivered."
     }
   ],
   "sources": [

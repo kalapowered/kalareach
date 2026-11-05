@@ -49,14 +49,24 @@ void kr_zle_source_pushed_back(void);
 void kr_zle_source_terminal(void);
 
 /*
- * Called with an Escape the reader has just taken from the terminal as the first byte of a key.
+ * Called with an Escape the reader has just taken from the terminal as a byte of a key.
  *
  * When the terminal has already delivered the rest of a host's answer to a question an
  * application asked, the whole answer is taken here, so no part of it is a key, and the call
- * returns non-zero. Otherwise it returns zero with every byte it looked at back in the reader's
- * input, in order, for the key lookup. It never waits for a byte the terminal has not delivered.
+ * returns non-zero. An answer that begins at a later Escape, behind the person's own, is taken
+ * too: the call returns zero, the Escape is the key, and the bytes between stay in the reader's
+ * input. Otherwise it returns zero with every byte it looked at back in the reader's input, in
+ * order, for the key lookup. It never waits for a byte the terminal has not delivered.
  */
 int kr_zle_host_reply_dropped(void);
+
+/*
+ * The next byte of a key, which ZLE's own read of one byte gives, except that a host's answer
+ * to a terminal query is taken out of the way and the read goes on. `timed` is what ZLE passes
+ * its read: non-zero for a byte that must follow within KEYTIMEOUT. The limit runs from the
+ * start of this call, so answers taken out of the way do not start it again.
+ */
+int kr_zle_key_byte(long timed);
 
 /* The operations whose key wait a takeover has to be able to end. */
 void kr_zle_pending_quoted_insertion(int active);

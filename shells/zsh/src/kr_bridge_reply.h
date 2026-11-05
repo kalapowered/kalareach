@@ -41,4 +41,22 @@ enum {
  */
 int kr_reply_classify(const unsigned char *bytes, size_t length);
 
+/*
+ * Follows the bytes a reader has taken after an Escape until it can say whether an answer is among
+ * them.
+ *
+ * `held` holds `*length` bytes, the first an Escape, in a buffer of `capacity` bytes. `next`
+ * returns the next byte the terminal has already delivered, or -1 when it holds none; it must not
+ * wait. A run that stops being an answer at a later Escape is followed again from that Escape,
+ * since the person's Escape and an answer can arrive in one delivery, so the first Escape is the
+ * person's key and the answer begins at the second.
+ *
+ * Returns KR_REPLY_WHOLE when an answer is complete: it begins at `held[*start]` and ends with the
+ * last byte held, and `held[0..*start)` is what came before it. Returns KR_REPLY_MORE when the run
+ * is the start of an answer and `next` has no more, and KR_REPLY_NOT when no answer is in it. In
+ * both of those `*length` is the number of bytes the caller has to give back.
+ */
+int kr_reply_follow(unsigned char *held, size_t *length, size_t capacity, int (*next)(void),
+                    size_t *start);
+
 #endif /* KR_BRIDGE_REPLY_H */

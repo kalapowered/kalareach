@@ -229,3 +229,40 @@ kr_reply_classify(const unsigned char *bytes, size_t length)
         return KR_REPLY_NOT;
     }
 }
+
+int
+kr_reply_follow(unsigned char *held, size_t *length, size_t capacity, int (*next)(void),
+                size_t *start)
+{
+    size_t at = 0;
+    size_t scan;
+    int verdict;
+    int byte;
+
+    if (capacity > KR_REPLY_MAX) {
+        capacity = KR_REPLY_MAX;
+    }
+    for (;;) {
+        verdict = kr_reply_classify(held + at, *length - at);
+        if (verdict == KR_REPLY_WHOLE) {
+            *start = at;
+            return KR_REPLY_WHOLE;
+        }
+        if (verdict == KR_REPLY_MORE && *length < capacity) {
+            byte = next();
+            if (byte < 0) {
+                return KR_REPLY_MORE;
+            }
+            held[(*length)++] = (unsigned char)byte;
+            continue;
+        }
+        /* No answer begins at this Escape, or the run has filled the buffer and is too long to be
+         * one. An Escape later in the run can begin one. */
+        for (scan = at + 1; scan < *length && held[scan] != KR_ESCAPE; scan++) {
+        }
+        if (scan == *length) {
+            return KR_REPLY_NOT;
+        }
+        at = scan;
+    }
+}
