@@ -467,6 +467,96 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
         .count()
 }
 
+/// How many times a delimiter split across two writes is offered, at most, before a run is taken
+/// for one that cannot keep the recogniser's deadline at all.
+const SPLIT_OFFERS: u32 = 20;
+
+/// What became of the first part of a split delimiter by the time the second had been answered.
+#[derive(Debug, PartialEq, Eq)]
+enum Offered {
+    /// The second part reached the recogniser while the first was still held, which is what the
+    /// requirement is about. `opened` says whether the framer recorded the paste the whole
+    /// delimiter opens.
+    InTime { opened: bool },
+    /// The first part ran out of time before the second reached the recogniser, as the deadline
+    /// means it to, having been held this long. The second part came after the first part's
+    /// deadline, whatever delayed it, which says nothing of the requirement: the delimiter is
+    /// offered again.
+    Late(Duration),
+}
+
+/// Reads from the recogniser what became of the first part of a split delimiter that was written at
+/// or after `first_began`, once the second part has been answered.
+///
+/// A split delimiter is recognised when its second part reaches the recogniser inside the
+/// deadline, and a second part sent after the answer to the first part reaches it when the
+/// machine lets the sending task run and the worker takes the write, which no measurement here
+/// controls. Whether the second part came in time is therefore read from the recogniser, which
+/// keeps the last prefix it forwarded because it had held it for the deadline, and not inferred
+/// from the time the two writes took.
+fn offered(runtime: &SessionRuntime, first_began: Instant) -> Result<Offered, String> {
+    let input = runtime.input().lock();
+    let held = input
+        .last_expiry()
+        .filter(|expired| expired.since >= first_began)
+        .map(|expired| expired.now.saturating_duration_since(expired.since));
+    judged(held, input.paste_open())
+}
+
+/// [`offered`] for how long the recogniser held the first part before it forwarded it, where it
+/// did, and whether the framer has a paste open.
+///
+/// A first part that was forwarded must have been held for the whole deadline and must not have
+/// completed the delimiter: anything else is a recogniser that forwards too soon, or recognises a
+/// delimiter whose halves arrived further apart than its deadline, and the measurement fails on
+/// every host.
+fn judged(forwarded_after: Option<Duration>, paste_open: bool) -> Result<Offered, String> {
+    match forwarded_after {
+        None => Ok(Offered::InTime { opened: paste_open }),
+        Some(held) if held < RECOGNISER_DEADLINE => Err(format!(
+            "the recogniser forwarded the first part of a split delimiter after holding it for \
+             {held:?}, before its {RECOGNISER_DEADLINE:?} deadline"
+        )),
+        Some(_) if paste_open => Err(
+            "a first part that had run out of time still completed the delimiter and opened a paste"
+                .to_owned(),
+        ),
+        Some(held) => Ok(Offered::Late(held)),
+    }
+}
+
+/// The failure of a measurement none of whose offers of a split delimiter reached the recogniser
+/// inside its deadline, with how long it had held the first part each time.
+fn never_in_time(late: &[Duration]) -> String {
+    format!(
+        "none of {SPLIT_OFFERS} offers of the split delimiter reached the recogniser inside its \
+         deadline: the first part was held for {}",
+        late.iter()
+            .map(|held| milliseconds(*held))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The line that says how many offers of a split delimiter reached the recogniser after the first
+/// part's deadline, and were offered again. None when every offer was inside it.
+fn late_offers(late: &[Duration]) -> Vec<String> {
+    if late.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "  split delimiter   {} of {} offers reached the recogniser after the first part's \
+         deadline, the first part having been held {}, which says nothing of the requirement, so \
+         the delimiter was offered again",
+        late.len(),
+        late.len() + 1,
+        late.iter()
+            .map(|held| milliseconds(*held))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )]
+}
+
 /// Waits for `marker` in the retained output, and returns how long it took to appear.
 ///
 /// `None` means it never did within `within`, which for a held prefix is a failure of the
@@ -651,9 +741,10 @@ fn withheld_lines(withheld: &[String], inside: bool) -> Vec<String> {
     lines.push(
         "  conditions        not met, so each hold and the split delimiter's time above are \
          recorded and their upper bounds are not asserted here; the deadline itself, each hold's \
-         lower bound and the recognition of a split delimiter with its payload kept are asserted \
-         on every host, and a byte that has not arrived within the limit the measurement waits is \
-         a failure on every host"
+         lower bound and the recognition of a split delimiter whose second part reaches the \
+         recogniser inside its deadline, with its payload kept, are asserted on every host, and a \
+         byte that has not arrived within the limit the measurement waits is a failure on every \
+         host"
             .to_owned(),
     );
     lines
@@ -916,6 +1007,7 @@ fn paste_prefix_recogniser_deadline() {
             ", and the framer did not record the paste it opened"
         }
     ));
+    lines.extend(late_offers(&report.late_splits));
     lines.push(format!(
         "  bound             at least the deadline and at most {} for each hold, which allows {} \
          for the path around the deadline",
@@ -1022,8 +1114,12 @@ fn paste_prefix_recogniser_deadline() {
 struct BesideMutations {
     /// One entry per prefix of each delimiter, as in [`Recogniser`].
     holds: Vec<MutatedHold>,
-    /// How long the split delimiter took to be recognised once its second half arrived.
+    /// How long the split delimiter took to be recognised once its second half arrived, in the
+    /// offer whose second half reached the recogniser inside its deadline.
     split: Duration,
+    /// How long the first part had been held in each earlier offer, whose second part reached the
+    /// recogniser after its deadline.
+    late_splits: Vec<Duration>,
     /// The host while the holds were taken, and how many mutations were completed beside them.
     conditions: record::Conditions,
     /// How many mutations were completed while the holds were taken.
@@ -1358,6 +1454,7 @@ async fn measure_recogniser_beside_mutations(
         "  split delimiter   recognised once, in {}, and the framer recorded the paste it opened",
         milliseconds(beside.split)
     ));
+    lines.extend(late_offers(&beside.late_splits));
     lines.push(format!(
         "  mutations         {} completed beside the {} holds; {} of them met a mutation holding \
          the session",
@@ -1469,37 +1566,57 @@ async fn recogniser_beside_mutations(
             measured.push((what, held, trace.offset(started)));
         }
     }
-    // A delimiter split across two frames, recognised once.
-    write(
-        hosted,
-        &mut client,
-        attachment_id,
-        epoch,
-        &mut sequence,
-        b"\x1b[20",
-    )
-    .await?;
-    expected.extend_from_slice(b"\x1b[20");
-    let started = Instant::now();
-    write(
-        hosted,
-        &mut client,
-        attachment_id,
-        epoch,
-        &mut sequence,
-        b"0~kr-payload",
-    )
-    .await?;
-    expected.extend_from_slice(b"0~kr-payload");
-    let split = receipt
-        .arrival(&expected, started, arrival_limit())
-        .await
-        .ok_or_else(|| "the split delimiter never completed".to_owned())?;
-    // A prefix that had expired and was forwarded with the bytes behind it would also arrive whole,
-    // and opens no paste: the framer says whether the delimiter was recognised.
-    if !hosted.runtime.input().lock().paste_open() {
-        return Err("the split delimiter reached the application but opened no paste".to_owned());
+    // A delimiter split across two frames, recognised once. An offer whose second part came after
+    // the first had run out of time says nothing of the requirement and is offered again.
+    let mut late_splits = Vec::new();
+    let mut settled = None;
+    for _ in 1..=SPLIT_OFFERS {
+        let first_began = Instant::now();
+        write(
+            hosted,
+            &mut client,
+            attachment_id,
+            epoch,
+            &mut sequence,
+            b"\x1b[20",
+        )
+        .await?;
+        expected.extend_from_slice(b"\x1b[20");
+        let started = Instant::now();
+        write(
+            hosted,
+            &mut client,
+            attachment_id,
+            epoch,
+            &mut sequence,
+            b"0~kr-payload",
+        )
+        .await?;
+        expected.extend_from_slice(b"0~kr-payload");
+        let answered = offered(&hosted.runtime, first_began)?;
+        let reached = receipt
+            .arrival(&expected, started, arrival_limit())
+            .await
+            .ok_or_else(|| "the split delimiter never completed".to_owned())?;
+        match answered {
+            Offered::Late(held) => late_splits.push(held),
+            // A prefix that had expired and was forwarded with the bytes behind it would also
+            // arrive whole, and opens no paste: the framer says whether the delimiter was
+            // recognised.
+            Offered::InTime { opened: true } => {
+                settled = Some(reached);
+                break;
+            }
+            Offered::InTime { opened: false } => {
+                return Err(
+                    "the split delimiter reached the application but opened no paste".to_owned(),
+                );
+            }
+        }
     }
+    let Some(split) = settled else {
+        return Err(never_in_time(&late_splits));
+    };
     let conditions = window.close();
     let mutations = mutating.end().await?;
     drop(client);
@@ -1544,6 +1661,7 @@ async fn recogniser_beside_mutations(
     Ok(BesideMutations {
         holds,
         split,
+        late_splits,
         conditions,
         mutations,
     })
@@ -1559,8 +1677,12 @@ async fn recogniser_beside_mutations(
 /// followed.
 struct OnItsOwnConnection {
     holds: Vec<OwnHold>,
-    /// How long the split delimiter took to be recognised once its second half arrived.
+    /// How long the split delimiter took to be recognised once its second half arrived, in the
+    /// offer whose second half reached the recogniser inside its deadline.
     split: Duration,
+    /// How long the first part had been held in each earlier offer, whose second part reached the
+    /// recogniser after its deadline.
+    late_splits: Vec<Duration>,
     conditions: record::Conditions,
     /// How many viewport reports the connection sent and had answered.
     viewports: u64,
@@ -1852,6 +1974,7 @@ async fn measure_recogniser_on_its_own_connection(
         "  split delimiter   recognised once, in {}, and the framer recorded the paste it opened",
         milliseconds(own.split)
     ));
+    lines.extend(late_offers(&own.late_splits));
     lines.push(format!(
         "  viewport reports  {} sent and answered beside the {} holds; the key was answered \
          before the report in {} of them, and taken before the report took the session in {}, \
@@ -1967,38 +2090,57 @@ async fn recogniser_on_its_own_connection(
         }
     }
     // A delimiter split across two frames, recognised once, the second half behind a report too.
-    let first = send_key(
-        hosted,
-        &mut client,
-        attachment_id,
-        epoch,
-        &mut sequence,
-        b"\x1b[20",
-    )
-    .await?;
-    answers.until(&mut client, first).await?;
-    expected.extend_from_slice(b"\x1b[20");
-    let viewport = send_viewport(hosted, &mut client, attachment_id).await?;
-    let started = Instant::now();
-    let second = send_key(
-        hosted,
-        &mut client,
-        attachment_id,
-        epoch,
-        &mut sequence,
-        b"0~kr-payload",
-    )
-    .await?;
-    expected.extend_from_slice(b"0~kr-payload");
-    let split = receipt
-        .arrival(&expected, started, arrival_limit())
-        .await
-        .ok_or_else(|| "the split delimiter never completed".to_owned())?;
-    both_answered(&mut client, &mut answers, viewport, second).await?;
-    viewports.fetch_add(1, Ordering::AcqRel);
-    if !hosted.runtime.input().lock().paste_open() {
-        return Err("the split delimiter reached the application but opened no paste".to_owned());
+    // An offer whose second part came after the first had run out of time says nothing of the
+    // requirement and is offered again, with a report of its own.
+    let mut late_splits = Vec::new();
+    let mut settled = None;
+    for _ in 1..=SPLIT_OFFERS {
+        let first_began = Instant::now();
+        let first = send_key(
+            hosted,
+            &mut client,
+            attachment_id,
+            epoch,
+            &mut sequence,
+            b"\x1b[20",
+        )
+        .await?;
+        answers.until(&mut client, first).await?;
+        expected.extend_from_slice(b"\x1b[20");
+        let viewport = send_viewport(hosted, &mut client, attachment_id).await?;
+        let started = Instant::now();
+        let second = send_key(
+            hosted,
+            &mut client,
+            attachment_id,
+            epoch,
+            &mut sequence,
+            b"0~kr-payload",
+        )
+        .await?;
+        expected.extend_from_slice(b"0~kr-payload");
+        let reached = receipt
+            .arrival(&expected, started, arrival_limit())
+            .await
+            .ok_or_else(|| "the split delimiter never completed".to_owned())?;
+        both_answered(&mut client, &mut answers, viewport, second).await?;
+        viewports.fetch_add(1, Ordering::AcqRel);
+        match offered(&hosted.runtime, first_began)? {
+            Offered::Late(held) => late_splits.push(held),
+            Offered::InTime { opened: true } => {
+                settled = Some(reached);
+                break;
+            }
+            Offered::InTime { opened: false } => {
+                return Err(
+                    "the split delimiter reached the application but opened no paste".to_owned(),
+                );
+            }
+        }
     }
+    let Some(split) = settled else {
+        return Err(never_in_time(&late_splits));
+    };
     let conditions = window.close();
     let reports = viewports.load(Ordering::Acquire);
     drop(client);
@@ -2041,6 +2183,7 @@ async fn recogniser_on_its_own_connection(
     Ok(OnItsOwnConnection {
         holds,
         split,
+        late_splits,
         conditions,
         viewports: reports,
     })
@@ -2049,8 +2192,12 @@ async fn recogniser_on_its_own_connection(
 struct Recogniser {
     /// One entry per prefix of each delimiter, plus the lone Escape, each measured on its own.
     holds: Vec<(String, Duration)>,
-    /// How long the split delimiter took to be recognised once its second half arrived.
+    /// How long the split delimiter took to be recognised once its second half arrived, in the
+    /// offer whose second half reached the recogniser inside its deadline.
     split: Duration,
+    /// How long the first part had been held in each earlier offer, whose second part reached the
+    /// recogniser after its deadline.
+    late_splits: Vec<Duration>,
     /// Whether the framer recorded the paste that delimiter opened.
     paste_open_after_split: bool,
     /// The host while the prefixes were measured.
@@ -2142,54 +2289,75 @@ async fn recogniser_samples(hosted: &Hosted) -> Result<Recogniser, String> {
         }
     }
 
-    // A delimiter split across two frames: recognised once, with the payload behind it kept.
-    let marker = b"<split>";
-    write(
-        hosted,
-        &mut client,
-        attachment_id,
-        epoch,
-        &mut sequence,
-        marker,
-    )
-    .await?;
-    write(
-        hosted,
-        &mut client,
-        attachment_id,
-        epoch,
-        &mut sequence,
-        b"\x1b[20",
-    )
-    .await?;
-    let started = Instant::now();
-    write(
-        hosted,
-        &mut client,
-        attachment_id,
-        epoch,
-        &mut sequence,
-        b"0~kr-payload",
-    )
-    .await?;
-    let split = arrival(
-        &hosted.runtime,
-        b"\x1b[200~kr-payload",
-        started,
-        arrival_limit(),
-    )
-    .await
-    .ok_or_else(|| "the split delimiter never completed".to_owned())?;
-    let seen = retained(&hosted.runtime);
-    if count(&seen, b"\x1b[200~") != 1 {
-        return Err(format!(
-            "the completed delimiter was emitted exactly once: {} times",
-            count(&seen, b"\x1b[200~")
-        ));
+    // A delimiter split across two frames: recognised once, with the payload behind it kept. The
+    // second part is sent once the first has been answered, and it reaches the recogniser when the
+    // machine lets this task run, so an offer whose second part came after the first had run out
+    // of time says nothing of the requirement and is offered again, with a payload of its own so
+    // that what each one made of it can be told apart in the output.
+    let mut late_splits = Vec::new();
+    let mut settled = None;
+    for offer in 1..=SPLIT_OFFERS {
+        let marker = format!("<split{offer}>");
+        write(
+            hosted,
+            &mut client,
+            attachment_id,
+            epoch,
+            &mut sequence,
+            marker.as_bytes(),
+        )
+        .await?;
+        let delimiters_before = count(&retained(&hosted.runtime), b"\x1b[200~");
+        let first_began = Instant::now();
+        write(
+            hosted,
+            &mut client,
+            attachment_id,
+            epoch,
+            &mut sequence,
+            b"\x1b[20",
+        )
+        .await?;
+        let started = Instant::now();
+        let payload = format!("kr-payload-{offer}");
+        write(
+            hosted,
+            &mut client,
+            attachment_id,
+            epoch,
+            &mut sequence,
+            &[&b"0~"[..], payload.as_bytes()].concat(),
+        )
+        .await?;
+        let answered = offered(&hosted.runtime, first_began)?;
+        let reached = arrival(
+            &hosted.runtime,
+            &[&b"\x1b[200~"[..], payload.as_bytes()].concat(),
+            started,
+            arrival_limit(),
+        )
+        .await
+        .ok_or_else(|| "the split delimiter never completed".to_owned())?;
+        let emitted = count(&retained(&hosted.runtime), b"\x1b[200~") - delimiters_before;
+        if emitted != 1 {
+            return Err(format!(
+                "the completed delimiter was emitted exactly once: {emitted} times"
+            ));
+        }
+        match answered {
+            Offered::Late(held) => late_splits.push(held),
+            // What the framer made of it, rather than only what the application received: a path
+            // that forwarded the same bytes without recognising them would look identical in the
+            // output.
+            Offered::InTime { opened } => {
+                settled = Some((reached, opened));
+                break;
+            }
+        }
     }
-    // What the framer made of it, rather than only what the application received: a path that
-    // forwarded the same bytes without recognising them would look identical in the output.
-    let paste_open_after_split = hosted.runtime.session().paste_open();
+    let Some((split, paste_open_after_split)) = settled else {
+        return Err(never_in_time(&late_splits));
+    };
     let conditions = window.close();
     let recorded =
         recorded::record_rounds(hosted, &mut client, attachment_id, epoch, &mut sequence).await;
@@ -2197,6 +2365,7 @@ async fn recogniser_samples(hosted: &Hosted) -> Result<Recogniser, String> {
     Ok(Recogniser {
         holds,
         split,
+        late_splits,
         paste_open_after_split,
         conditions,
         recorded,
@@ -2294,6 +2463,42 @@ fn a_hold_upper_bound_is_withheld_where_the_run_cannot_vouch_for_it() {
     assert_eq!(
         arrival_limit_on(Some(HOSTED_RUNNER)),
         ARRIVAL_LIMIT_RECORDED
+    );
+}
+
+/// A split delimiter is asserted where its second part reached the recogniser inside the deadline,
+/// and a second part that came after the first had run out of time is offered again; a first part
+/// forwarded before its deadline, or one that still completed the delimiter, fails on every host.
+#[test]
+fn a_split_delimiter_is_judged_by_what_the_recogniser_did_with_its_first_part() {
+    let millis = Duration::from_millis;
+    assert_eq!(
+        judged(None, true),
+        Ok(Offered::InTime { opened: true }),
+        "a first part still held when the second came is the requirement's case"
+    );
+    assert_eq!(
+        judged(None, false),
+        Ok(Offered::InTime { opened: false }),
+        "and one that opened no paste is left for the measurement to fail"
+    );
+    assert_eq!(
+        judged(Some(millis(26)), false),
+        Ok(Offered::Late(millis(26))),
+        "a first part that ran out of time says nothing of the requirement"
+    );
+    assert_eq!(
+        judged(Some(RECOGNISER_DEADLINE), false),
+        Ok(Offered::Late(RECOGNISER_DEADLINE)),
+        "and the deadline itself is a whole deadline"
+    );
+    assert!(
+        judged(Some(millis(24)), false).is_err(),
+        "a first part forwarded before its deadline is a recogniser that forwards too soon"
+    );
+    assert!(
+        judged(Some(millis(26)), true).is_err(),
+        "a first part that had run out of time cannot have completed the delimiter"
     );
 }
 
