@@ -1747,6 +1747,14 @@ fn cancelling(
 /// Reads the receipt of `action_id` over the wire, as a person's client does, and returns the
 /// revision it was shown.
 async fn revision_shown_for(client: &mut Client<impl Codec>, action_id: ActionId) -> u64 {
+    receipt_read_for(client, action_id).await.revision.get()
+}
+
+/// Reads the receipt of `action_id` over the wire, as a person's client does.
+async fn receipt_read_for(
+    client: &mut Client<impl Codec>,
+    action_id: ActionId,
+) -> kr_protocol::receipt::Receipt {
     let read = send_request(
         client,
         Request {
@@ -1765,7 +1773,7 @@ async fn revision_shown_for(client: &mut Client<impl Codec>, action_id: ActionId
         panic!("the receipt is readable: {read:?}");
     };
     let shown: kr_protocol::receipt::ActionReadResult = value.to_typed().expect("decodes");
-    shown.receipt.revision.get()
+    shown.receipt
 }
 
 /// The question an answer or a cancellation that the worker took is recorded against, and where
@@ -1794,9 +1802,53 @@ async fn an_uncertain_answer_to_one_question_does_not_hold_back_the_answer_to_an
     an_uncertain_outcome_of(&host, &caller, &lost);
 
     let answer = answering(&client, &host, &second, ParamsValue::empty());
+    let sent = kr_cbor::to_canonical_vec(&answer).expect("encodes");
+    let action_id = answer.action_id;
     let taken = resolved(send_mutation(&mut client, answer).await);
     assert_eq!(taken.question_id, second.question_id);
     assert_eq!(taken.state, kr_protocol::question::QuestionState::Answered);
+
+    // The envelope the cases plant for an uncertain answer is the one the worker keeps of a real
+    // one: the whole request, the question it answers included.
+    assert_eq!(
+        host.service
+            .runtime()
+            .session()
+            .journal_mut()
+            .expect("a journal")
+            .read_intent(&caller, action_id)
+            .expect("readable"),
+        Some(sent),
+        "the envelope kept of an answer"
+    );
+}
+
+/// KR-REQ-11.63: a `question.answer` whose parameters do not parse is refused in validation, after
+/// its receipt is written, as it was before an answer was told apart by its question.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_answer_is_refused_and_leaves_a_rejected_receipt() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let malformed = MutationRequest {
+        method: Method::QuestionAnswer.into(),
+        params: ParamsValue::empty(),
+        ..close_mutation(
+            &client,
+            &host,
+            DEFAULT_MUTATION_TTL.get(),
+            ParamsValue::empty(),
+        )
+    };
+    let action_id = malformed.action_id;
+    let Outcome::Error(error) = send_mutation(&mut client, malformed).await else {
+        panic!("an answer with no question is refused");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(
+        receipt_read_for(&mut client, action_id).await.state,
+        ReceiptState::Rejected,
+        "the refusal is recorded"
+    );
 }
 
 /// KR-REQ-11.63: an answer whose outcome is uncertain still holds back a second answer to the same

@@ -7066,7 +7066,8 @@ impl WorkerService {
     ///   request names that outcome and the revision it was read at. That is what stops a service
     ///   from choosing a fresh identifier to evade de-duplication. An answer to a question is
     ///   held back by an uncertain answer to that question alone, not by one to another question
-    ///   of the session ([`Self::uncertain_outcome_in_the_way`]).
+    ///   of the session, except that an uncertain answer whose question cannot be read holds back
+    ///   every answer ([`Self::uncertain_outcome_in_the_way`]).
     /// * An actor holds at most eight admitted, unsettled mutations at once, lowered by whatever
     ///   the connection negotiated.
     fn check_admission_limits(
@@ -7138,7 +7139,9 @@ impl WorkerService {
     /// It is the newest uncertain outcome of the subject, except for an answer to a question: the
     /// subject of every answer in a session is the same, and an answer to one question asks for
     /// something else than an answer to another, so only an uncertain answer to the question this
-    /// request answers stands in its way.
+    /// request answers stands in its way. An uncertain answer whose question cannot be read stands
+    /// in the way of every answer, and so does any uncertain answer to a request whose parameters
+    /// do not parse: that request is refused where it always was, in validation, with a receipt.
     fn uncertain_outcome_in_the_way(
         journal: &crate::journal::Journal,
         actor_id: &ActorId,
@@ -7149,7 +7152,10 @@ impl WorkerService {
         if method != Method::QuestionAnswer {
             return journal.uncertain_for_subject(actor_id, subject);
         }
-        let params: kr_protocol::question::QuestionAnswerParams = parse(&mutation.params)?;
+        let Ok(params) = parse::<kr_protocol::question::QuestionAnswerParams>(&mutation.params)
+        else {
+            return journal.uncertain_for_subject(actor_id, subject);
+        };
         journal.uncertain_for_subject_matching(actor_id, subject, |intent| {
             crate::action::dedup::holds_back_an_answer_to(intent, params.question_id)
         })
