@@ -4107,6 +4107,15 @@ it. So a fresh identifier for a subject that already carries an uncertain outcom
 its preconditions name that action and the receipt revision the caller read it at. A service that
 wanted to hide the uncertainty would have to name the receipt it was hiding.
 
+The subject of every `question.answer` in a session is the target alone, so its digest cannot tell
+the answers to two questions apart. The worker reads the envelope the receipt kept instead: an
+answer to a question is refused for an uncertain answer to that same question, and an answer to
+another question of the session is admitted. A request that names an uncertain answer to another
+question names nothing this answer has to show, and is refused. A receipt whose envelope is gone or
+does not decode, which privacy mode causes once an action settles, holds back every answer of the
+actor in the session, as the rule above does. `question.cancel` and every other method keep the
+rule above.
+
 The revision has to be one the caller was shown. The worker remembers, in memory and for a bounded
 number of receipts, the revision of each receipt that `action.read` answered to each actor, and a
 request that quotes any other revision is refused although the number is right: it is a number
