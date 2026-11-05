@@ -1,10 +1,14 @@
 //! The ConPTY win32 input mode: where its requests stop, and what a record is encoded as.
 //!
-//! | Row | What is checked here |
-//! | --- | --- |
-//! | KR-REQ-08.53 | The worker records its owned backend's input encoding from what that backend asked for, and encodes the records it is given as the console reported them: a character outside the basic plane as two records, a composed character and a dead key without a key invented for them, AltGr with the state it was reported in, and a repeat and a key coming up with their own counts and order |
-//! | KR-REQ-08.55 | Every mode request and reset stops at this boundary and is never broadcast |
-//! | KR-REQ-08.56 | Paste and mouse stay operations of their own beside the keyboard encoding. **Not** the record path's own qualification: nothing here drives a console, an IME or a keyboard, so that stays open for a machine which can |
+//! - The worker records its owned backend's input encoding from what that backend asked for,
+//!   and encodes the records it is given as the console reported them: a character outside the
+//!   basic plane as two records, a composed character and a dead key without a key invented for
+//!   them, AltGr with the state it was reported in, and a repeat and a key coming up with their
+//!   own counts and order.
+//! - Every mode request and reset stops at this boundary and is never broadcast.
+//! - Paste and mouse stay operations of their own beside the keyboard encoding. This is not the
+//!   record path's own qualification: nothing here drives a console, an IME or a keyboard, so
+//!   that stays open for a machine which can.
 //!
 //! None of this needs Windows. The encoding is a rule about bytes, the boundary is a rule about a
 //! stream, and a record is six numbers; writing them out by hand is what lets the same rule be
@@ -59,8 +63,15 @@ fn pressed(virtual_key: u16, scan_code: u16, unicode: u16) -> KeyRecord {
     }
 }
 
+/// KR-REQ-08.53, the part about recording the owned backend's input encoding: before the backend
+/// asks, the session carries legacy VT input; a request for mode 9001 makes the worker record the
+/// records encoding, a query for the mode is answered as set, and a disable returns it to legacy
+/// input. Not shown here: the encoding of a record, and a Windows local attach client.
+///
+/// KR-REQ-08.55, the part about the backend's request and reset: neither the request nor the
+/// disable is forwarded to a client. Not shown here: a nested `wsl.exe`, `ssh` client or console.
 #[test]
-fn the_worker_records_what_its_own_backend_asked_for(/* KR-REQ-08.53 */) {
+fn the_worker_records_what_its_own_backend_asked_for() {
     let mut engine = owned_conpty();
 
     // Before anything asks, the session carries legacy VT input and says so.
@@ -96,8 +107,13 @@ fn the_worker_records_what_its_own_backend_asked_for(/* KR-REQ-08.53 */) {
 /// and none of them is forwarded to a client or listed in a snapshot. Not shown here: the
 /// encoding of a record, and what happens between two consoles inside a session, which is the
 /// console's own behaviour.
+///
+/// KR-REQ-08.55, the part about repeated requests and resets: a request, a repeated request, a
+/// disable and a repeated disable, in any order, each stop here, and none is forwarded to a client
+/// or listed in a snapshot. Not shown here: a nested `wsl.exe`, `ssh` client or console itself,
+/// whose disable is kept from the outer console below this boundary.
 #[test]
-fn a_nested_transition_never_forwards_a_mode_change_across_this_boundary(/* KR-REQ-08.55 */) {
+fn a_nested_transition_never_forwards_a_mode_change_across_this_boundary() {
     // A session runs `wsl.exe`, an `ssh` client, or another ConPTY, and each asks for win32 input
     // and disables it when it ends. Whatever of that reaches this host is what the console it owns
     // chose to send; keeping an inner console's disable from reaching the outer one happens on the
@@ -145,8 +161,11 @@ fn a_nested_transition_never_forwards_a_mode_change_across_this_boundary(/* KR-R
     );
 }
 
+/// KR-REQ-08.55, the part about a request that names other modes: a request for mode 9001 together
+/// with the alternate buffer is not forwarded, and the alternate buffer still changes. Not shown
+/// here: a nested transition.
 #[test]
-fn a_request_that_names_other_modes_keeps_them_and_still_stops_here(/* KR-REQ-08.55 */) {
+fn a_request_that_names_other_modes_keeps_them_and_still_stops_here() {
     let mut engine = owned_conpty();
     let outcome = engine.feed(b"\x1b[?9001;1049h", 0);
     assert!(
@@ -160,8 +179,11 @@ fn a_request_that_names_other_modes_keeps_them_and_still_stops_here(/* KR-REQ-08
     );
 }
 
+/// KR-REQ-08.55, the part about a backend that is not the pseudo-console the worker owns: a request
+/// for mode 9001 is never forwarded however often it comes, and the mode is never entered. Not
+/// shown here: a nested transition.
 #[test]
-fn a_unix_backend_never_enters_the_mode_however_often_it_is_asked(/* KR-REQ-08.55 */) {
+fn a_unix_backend_never_enters_the_mode_however_often_it_is_asked() {
     let mut engine = Engine::new(EngineConfig::default()).expect("an engine");
     for _ in 0..3 {
         let outcome = engine.feed(MODE_SET, 0);
@@ -177,7 +199,7 @@ fn a_unix_backend_never_enters_the_mode_however_often_it_is_asked(/* KR-REQ-08.5
 /// outside the basic plane is two records that both travel. Not shown here: omitted fields, or a
 /// console or an IME producing the records.
 #[test]
-fn a_composed_character_arrives_as_the_records_the_console_produced(/* KR-REQ-08.53 */) {
+fn a_composed_character_arrives_as_the_records_the_console_produced() {
     // Windows IME composition ends in one `WM_CHAR` per UTF-16 code unit, which the console
     // reports as a key record with no virtual key and no scan code: the character was composed,
     // not typed. Encoding it means carrying exactly that, rather than inventing the key somebody
@@ -220,7 +242,7 @@ fn a_composed_character_arrives_as_the_records_the_console_produced(/* KR-REQ-08
 /// and scan code and no code unit, and the character it composes is the next record, in that order.
 /// Not shown here: a console or a keyboard producing them.
 #[test]
-fn a_dead_key_is_its_own_record_and_so_is_what_it_composes(/* KR-REQ-08.53 */) {
+fn a_dead_key_is_its_own_record_and_so_is_what_it_composes() {
     // A dead key produces a record with a virtual key and a scan code and no code unit at all;
     // the key after it produces the composed character. Both are carried, in that order, because
     // an application that tracks the keyboard itself needs to see the dead key happen.
@@ -257,7 +279,7 @@ fn a_dead_key_is_its_own_record_and_so_is_what_it_composes(/* KR-REQ-08.53 */) {
 /// the record the console reported (`\x1b[50;3;64;1;9;1_`), its virtual key, scan code, code unit
 /// and control-key state unchanged, and reads back as the record it was written from, still AltGr.
 #[test]
-fn alt_graph_travels_as_the_state_the_console_reported(/* KR-REQ-08.53 */) {
+fn alt_graph_travels_as_the_state_the_console_reported() {
     // On a keyboard with an AltGr key the console reports right Alt and left Ctrl together. An
     // encoder that decided this was "Ctrl and Alt" and re-encoded it as a control character would
     // turn a perfectly ordinary character into an interrupt.
@@ -282,7 +304,7 @@ fn alt_graph_travels_as_the_state_the_console_reported(/* KR-REQ-08.53 */) {
 /// count and a key coming up is a record of its own after it, written as the console reported them
 /// (`\x1b[65;30;97;1;0;4_\x1b[65;30;97;0;0;1_`).
 #[test]
-fn a_repeat_and_a_key_up_keep_their_own_order_and_their_own_counts(/* KR-REQ-08.53 */) {
+fn a_repeat_and_a_key_up_keep_their_own_order_and_their_own_counts() {
     // A held key is one record with a count. A key coming up is a record of its own, and it comes
     // after the one that put it down. Legacy VT input can express neither.
     let down = KeyRecord {
@@ -306,8 +328,12 @@ fn a_repeat_and_a_key_up_keep_their_own_order_and_their_own_counts(/* KR-REQ-08.
     assert_eq!(decode(sequences[0]).expect("down").repeat, 4);
 }
 
+/// KR-REQ-08.56, the part about paste and mouse: with win32 input mode on, bracketed paste and
+/// mouse reporting are set beside it and stay set when the keyboard encoding is turned off. Not
+/// shown here: the record path's own qualification for an IME, dead keys and restored modes, which
+/// nothing here drives.
 #[test]
-fn paste_and_mouse_stay_the_separate_operations_they_are(/* KR-REQ-08.56 */) {
+fn paste_and_mouse_stay_the_separate_operations_they_are() {
     // Section 8 keeps paste and mouse as their own VT operations whatever the keyboard encoding
     // is. The engine's own state is what proves it: the backend can be in win32 input mode and
     // bracketed paste at the same time, and neither request answers for the other.
