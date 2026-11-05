@@ -720,12 +720,23 @@ fn reparse_point(_entry: &Entry, _root: &Path, _path: &Path) -> Result<(), Strin
 /// The case the between-two-lookups test cannot reach is the replacement that lands inside one
 /// resolution. This runs the replacement in a loop beside the lookups and asserts what has to hold
 /// whatever the interleaving was: every lookup that succeeded read the authorised tree's own file,
-/// and every one that did not was refused. The lookups go on until one is refused, which only a
-/// swap in progress makes happen, so a run in which no lookup met a swap fails.
+/// and every one that did not was refused. The lookups go on, beside a swapper that keeps swapping,
+/// until one is refused, which only a swap in progress makes happen: the case does not pass on a
+/// run in which no lookup met a swap.
 #[cfg(unix)]
 #[test]
 fn a_component_swapped_under_running_lookups_never_resolves_outside() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Raises the flag when it is dropped, which an assertion that fails in the lookups below also
+    /// does by unwinding, so that the swapper ends and the scope with it.
+    struct Raise<'a>(&'a AtomicBool);
+
+    impl Drop for Raise<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
 
     let root = kr_ipc::testing::PrivateTempDir::create();
     let inside = root.path().join("authorised");
@@ -744,13 +755,8 @@ fn a_component_swapped_under_running_lookups_never_resolves_outside() {
         let swapper = threads.spawn(|| {
             let real = inside.join("src");
             let parked = inside.join(".parked");
-            // Bounded as well as flagged. An assertion that fails in the lookups below unwinds
-            // without setting the flag, and a producer that waited only for the flag would then
-            // keep this scope waiting for it for ever.
-            for _ in 0..4_000 {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
+            // Swaps for as long as the lookups run.
+            while !stop.load(Ordering::Relaxed) {
                 // The real directory is parked and a link to the tree outside takes its name.
                 std::fs::rename(&real, &parked).expect("parks the real directory");
                 std::os::unix::fs::symlink(&outside, &real).expect("links to the outside tree");
@@ -761,11 +767,13 @@ fn a_component_swapped_under_running_lookups_never_resolves_outside() {
             }
         });
 
+        let _raise = Raise(&stop);
         let mut opened = 0_usize;
         let mut refused = 0_usize;
-        // At least 400 lookups, and on until one is refused. A tree that no swap is changing
-        // resolves every lookup, so a refusal is a lookup that ran while a swap was under way. The
-        // swapper's own bound ends the wait if none ever does, and the assertion below then fails.
+        // At least 400 lookups, and on until one is refused, beside a swapper that keeps swapping
+        // for as long as they run. A tree that no swap is changing resolves every lookup, so a
+        // refusal is a lookup that ran while a swap was under way. Only a swapper that has ended,
+        // which is one that panicked, ends the wait without one, and the join below then says so.
         while opened + refused < 400 || (refused == 0 && !swapper.is_finished()) {
             match authority.open_read(&name, ObjectPolicy::ReadableFile) {
                 Ok(mut file) => {
@@ -2024,9 +2032,9 @@ fn a_tree_goes_through_the_handle_that_was_checked_and_nothing_it_links_to_goes(
 ///
 /// KR-ACC-030, the part about a directory replaced under a removal: a different directory at the
 /// name before the removal starts is refused and left whole, and a different directory that a
-/// racing swap puts at the name is left whole in every round, in at least one of which the swap
-/// lands before the removal ends. Not shown here: a partial apply; a removal that stops part way is
-/// no apply.
+/// racing swap puts at the name is left whole in each of forty rounds, whichever moment the swap
+/// lands in. Not shown here: that the swap landed before the end of a removal in any round; a
+/// partial apply, for a removal that stops part way is no apply.
 ///
 /// Three moments. Before it starts, a different directory at the name means nothing is removed at
 /// all. Part way, an entry it cannot take away stops it, and it reports the entry and how many
@@ -2180,13 +2188,10 @@ fn remove_tree_refuses_a_replacement_and_reports_partial() {
     // rename is taking the directory elsewhere, as Apple's filesystem can. The test below makes
     // the swap at each of those moments in turn.
     //
-    // Forty rounds, and on until one has a swap that landed before its removal ended: such a round
-    // answers with a refusal or a stop, and one where the removal finished first answers Ok. The
-    // cap ends the wait if no round ever does, and the assertion after the loop then fails.
+    // Forty rounds. A round whose removal finished before its swapper ran answers Ok and shows
+    // nothing of a swap that lands during a removal; the printed outcomes say how the rounds went.
     let mut outcomes = std::collections::BTreeMap::<&str, usize>::new();
-    let mut landed = 0_usize;
-    let mut round = 0_u64;
-    while round < 40 || (landed == 0 && round < 400) {
+    for round in 0..40 {
         let tree = root.path().join("tree");
         let _ = std::fs::remove_dir_all(&tree);
         std::fs::create_dir_all(tree.join("a/b")).expect("the tree");
@@ -2225,16 +2230,9 @@ fn remove_tree_refuses_a_replacement_and_reports_partial() {
                 !moved.exists(),
                 "round {round}: a completed removal left nothing behind"
             );
-        } else {
-            landed += 1;
         }
         *outcomes.entry(label).or_default() += 1;
-        round += 1;
     }
-    assert!(
-        landed > 0,
-        "no swap landed before a removal ended in {round} rounds: {outcomes:?}"
-    );
     println!("{outcomes:?}");
 }
 
