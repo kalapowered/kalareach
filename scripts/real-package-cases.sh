@@ -37,6 +37,7 @@ step cargo test -p kr-worker --test fence -- --ignored --exact \
   a_real_shell_that_ran_cd_is_described_by_its_new_directory_at_the_next_prompt \
   a_real_shell_names_the_program_it_resolved_and_not_a_word_it_found_no_file_for \
   a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_again \
+  a_real_readers_line_stays_empty_when_the_host_answers_an_application \
   a_real_powershell_readers_fence_is_invalidated_by_the_hosts_answer \
   a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_once_from_its_holder_or_not_at_all \
   a_real_root_shell_killed_at_its_prompt_closes_its_session_with_the_signal \

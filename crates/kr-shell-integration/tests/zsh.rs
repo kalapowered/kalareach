@@ -43,6 +43,29 @@ fn the_handshake_declares_the_published_zle_patches_and_the_reader_they_build() 
     shellpkg::the_handshake_declares_the_packaged_reader(ZSH);
 }
 
+/// KR-REQ-08.48: the host's answers to a program's questions, written into the terminal in the
+/// middle of what a person types, leave the keys whole and in order.
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_keys_a_person_types_around_a_hosts_answers_arrive_whole_and_in_order() {
+    shellpkg::the_keys_a_person_types_around_a_hosts_answers_arrive_whole_and_in_order(ZSH);
+}
+
+/// KR-REQ-08.48: the host's answer between the cursor keys a person presses leaves them working.
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_hosts_answer_between_cursor_keys_leaves_the_cursor_keys_working() {
+    shellpkg::a_hosts_answer_between_cursor_keys_leaves_the_cursor_keys_working(ZSH);
+}
+
+/// KR-REQ-08.48: a run of bytes shaped like the host's answer inside a bracketed paste is the text
+/// the person pasted.
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_reply_shaped_run_inside_a_bracketed_paste_is_pasted_whole() {
+    shellpkg::a_reply_shaped_run_inside_a_bracketed_paste_is_pasted_whole(ZSH);
+}
+
 /// KR-REQ-07.40: the bridge holds no copy of the bootstrap secret once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]

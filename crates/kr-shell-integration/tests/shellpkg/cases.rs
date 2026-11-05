@@ -514,7 +514,9 @@ fn signal_the_shell(session: &Session, signal: &str) {
 /// count the bytes it has not read. A reader that reaches its mailbox only at a step a person gives
 /// it by typing is given that step first, so the answers are behind it. Once it has taken them a
 /// later exchange says the queues are drained, so a reader that counts bytes it no longer holds is
-/// not the one that passes.
+/// not the one that passes. A reader of Zsh or Bash takes a whole answer out of its keys in one
+/// step, so for those two the answers have three plain keys behind them, and it is the keys that
+/// are waiting when it meets the request.
 ///
 /// PSReadLine is given two more steps and half a character instead, and what the case shows for it
 /// is the count of the bytes the decoder holds. It draws every printable key it takes, and a draw
@@ -540,8 +542,11 @@ pub fn bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(k
         // Two steps, and the first byte of "\u{e9}" in UTF-8 with its second to follow.
         unread_input_is_not_drained(kind, b"\x06\x06\xc3", b"\xa9");
     } else {
-        // Three answers a terminal gives to a primary device-attributes query.
-        unread_input_is_not_drained(kind, b"\x1b[?62;22c\x1b[?62;22c\x1b[?62;22c", b"");
+        // Three answers a terminal gives to a primary device-attributes query, and three keys behind
+        // them. A reader of Zsh or Bash takes whole answers out of its keys as it reads them, so the
+        // answers are never what it is holding unread when it answers the fence; the keys behind
+        // them are, and it counts them until it has read them.
+        unread_input_is_not_drained(kind, b"\x1b[?62;22c\x1b[?62;22c\x1b[?62;22cabc", b"");
     }
 }
 
@@ -793,6 +798,126 @@ pub fn a_hosts_answer_to_a_terminal_query_never_reaches_the_line_the_editor_read
     assert!(
         !latest.editor.buffer_empty,
         "a letter typed behind the start of an answer was taken for its end:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// One answer of each shape the host's query broker writes to the terminal for a program that
+/// asked: device attributes, statuses, cursor positions, mode and window reports, the terminal's
+/// version, the keyboard protocol, a setting, a capability, colours and the clipboard. They are
+/// in the words the broker uses, ending as it ends them.
+#[cfg(unix)]
+const HOST_ANSWERS: &[&str] = &[
+    "\x1b[?62;22c",
+    "\x1b[>41;1;0c",
+    "\x1bP!|4B520001\x1b\\",
+    "\x1b[0n",
+    "\x1b[24;80R",
+    "\x1b[?24;80;1R",
+    "\x1b[?13n",
+    "\x1b[?25;1$y",
+    "\x1b[4;2$y",
+    "\x1b[8;24;80t",
+    "\x1bP>|KalaReach(kr-vt/1)\x1b\\",
+    "\x1b[?0u",
+    "\x1b[>4;0m",
+    "\x1bP1$r0;1m\x1b\\",
+    "\x1bP1+r544e=4b52\x1b\\",
+    "\x1b]11;rgb:0000/0000/0000\x07",
+    "\x1b]4;1;rgb:cdcd/0000/0000\x1b\\",
+    "\x1b]52;c;\x1b\\",
+];
+
+/// KR-REQ-08.48: the host's answers to a program's questions, written into the terminal in the
+/// middle of what a person types, leave what the person typed whole and in order.
+///
+/// A program asked the terminal something and ended, and the answers reach a prompt where the
+/// person is typing, so the keys and the answers arrive in one write. The case types a line that
+/// prints a word from its arguments, each argument followed by one answer, the answers in turn each
+/// of a shape the broker writes. A reader that types an answer into the line puts its characters in
+/// the arguments, and a reader that loses a key loses a letter: either way the word the line prints
+/// is not the word the keys spell. The arguments are separated by spaces, so the line the reader
+/// draws never holds the word, and only the command having run puts it on the screen.
+///
+/// # Panics
+///
+/// Panics when the line does not print the word the keys spell.
+#[cfg(unix)]
+pub fn the_keys_a_person_types_around_a_hosts_answers_arrive_whole_and_in_order(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let letters = "abcdefghijklmnopqrstuvwxyz";
+    let count = HOST_ANSWERS.len();
+    let mut line = format!("printf '{}\\n' kr-", "%s".repeat(count + 1));
+    let mut word = String::from("kr-");
+    for (index, answer) in HOST_ANSWERS.iter().enumerate() {
+        line.push_str(answer);
+        let letter = &letters[index..=index];
+        line.push(' ');
+        line.push_str(letter);
+        word.push_str(letter);
+    }
+    assert!(
+        session.run(&line, &word),
+        "the keys typed around the host's answers did not spell {word:?}:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// KR-REQ-08.48: the host's answer between the cursor keys a person presses leaves the cursor keys
+/// working.
+///
+/// A cursor key begins with an Escape and a bracket as an answer does, and the reader has to tell
+/// them apart without holding a key back. The case types a line that prints a word from two
+/// arguments with a letter missing from the second, presses the left arrow twice, takes in an
+/// answer, presses it twice more and types the letter: the line prints the word only if the
+/// cursor stood at the start of the second argument.
+///
+/// # Panics
+///
+/// Panics when the line does not print the word.
+#[cfg(unix)]
+pub fn a_hosts_answer_between_cursor_keys_leaves_the_cursor_keys_working(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let left = "\x1b[D";
+    let line = format!(
+        "printf '%s%s\\n' kr-ans ered{left}{left}{}{left}{left}w",
+        HOST_ANSWERS[0]
+    );
+    assert!(
+        session.run(&line, "kr-answered"),
+        "the cursor keys around the host's answer did not move the cursor to the letter:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// KR-REQ-08.48: a run of bytes shaped like the host's answer inside a bracketed paste is the text
+/// the person pasted, and reaches the line whole.
+///
+/// The reader takes an answer out of the keys, and a paste is not keys: its bytes are data, whatever
+/// they look like, and a log or a capture pasted into a prompt can hold any escape sequence. The
+/// case pastes a line that prints a string with an answer in the middle of it, through `od` and `tr`
+/// (some `od` pad their columns), so the bytes the shell was given show as hex that no echo of the
+/// typed line can draw.
+///
+/// # Panics
+///
+/// Panics when the line does not print the string with the answer in it.
+#[cfg(unix)]
+pub fn a_reply_shaped_run_inside_a_bracketed_paste_is_pasted_whole(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let line = format!(
+        "\x1b[200~printf '%s' 'x{}y' | od -An -tx1 | tr -s ' '\x1b[201~",
+        HOST_ANSWERS[0]
+    );
+    assert!(
+        session.run(&line, "78 1b 5b 3f 36 32 3b 32 32 63 79"),
+        "the answer inside the paste did not reach the line:\n{}",
         session.terminal_output()
     );
 }
@@ -3761,6 +3886,19 @@ pub fn the_bridge_core_is_identical_in_both_packages() {
                 "shells/zsh/src/{name} and shells/{other}/src/{name} have drifted apart"
             );
         }
+    }
+    // The two packages whose editors read the terminal's bytes as keys share the classifier of the
+    // host's answers; fish's reader drops them itself.
+    for name in ["kr_bridge_reply.h", "kr_bridge_reply.c"] {
+        let zsh = std::fs::read_to_string(root.join("zsh/src").join(name))
+            .unwrap_or_else(|error| panic!("shells/zsh/src/{name}: {error}"));
+        let bash = std::fs::read_to_string(root.join("bash/src").join(name))
+            .unwrap_or_else(|error| panic!("shells/bash/src/{name}: {error}"));
+        assert_eq!(
+            strip_licence_note(&zsh),
+            strip_licence_note(&bash),
+            "shells/zsh/src/{name} and shells/bash/src/{name} have drifted apart"
+        );
     }
 }
 

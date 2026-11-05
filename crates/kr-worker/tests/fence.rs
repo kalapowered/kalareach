@@ -8194,6 +8194,305 @@ async fn a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_agai
     }
 }
 
+/// What an application at a prompt can ask the terminal. The host's query broker answers each in
+/// words of its own, and no answer is a key.
+///
+/// The cursor questions are asked after [`MOVE_THE_CURSOR`], so that the position the broker
+/// reports is not on the first row, where a report cannot be told from a modified function key.
+#[cfg(unix)]
+const APPLICATION_QUESTIONS: &[(&str, &[u8])] = &[
+    ("primary device attributes", b"\x1b[c"),
+    ("secondary device attributes", b"\x1b[>c"),
+    ("tertiary device attributes", b"\x1b[=c"),
+    ("operating status", b"\x1b[5n"),
+    ("cursor position", b"\x1b[6n"),
+    ("extended cursor position", b"\x1b[?6n"),
+    ("printer status", b"\x1b[?15n"),
+    ("user-defined keys", b"\x1b[?25n"),
+    ("keyboard", b"\x1b[?26n"),
+    ("ANSI mode", b"\x1b[4$p"),
+    ("DEC mode", b"\x1b[?25$p"),
+    ("window state", b"\x1b[11t"),
+    ("window position", b"\x1b[13t"),
+    ("window size in pixels", b"\x1b[14t"),
+    ("cell size in pixels", b"\x1b[16t"),
+    ("text area size", b"\x1b[18t"),
+    ("screen size", b"\x1b[19t"),
+    ("terminal version", b"\x1b[>q"),
+    ("keyboard protocol", b"\x1b[?u"),
+    ("modify other keys", b"\x1b[?4m"),
+    ("setting", b"\x1bP$qm\x1b\\"),
+    ("capability", b"\x1bP+q544e\x1b\\"),
+    ("foreground colour", b"\x1b]10;?\x1b\\"),
+    ("background colour", b"\x1b]11;?\x07"),
+    ("palette colour", b"\x1b]4;1;?\x07"),
+    ("clipboard", b"\x1b]52;c;?\x07"),
+];
+
+/// Moves the engine's cursor to row 5, column 7, which the broker's cursor reports then state.
+#[cfg(unix)]
+const MOVE_THE_CURSOR: &[u8] = b"\x1b[5;7H";
+
+/// Waits until the reader proves a fence other than `not` while the host's answers are all in the
+/// terminal and more than `after` bytes of them have been written, and returns that fence.
+///
+/// The first fence the reader proves after the answer is the one that rests on the reader having
+/// taken it, so waiting for a fence other than the last one is what waits for the reader to have
+/// read the answer.
+#[cfg(unix)]
+async fn until_the_reader_has_taken_the_hosts_answer(
+    shell: &RealShell,
+    not: kr_protocol::root::FenceId,
+    after: u64,
+) -> Option<kr_protocol::root::FenceId> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            {
+                let session = shell.runtime.session();
+                // The view holds the input domain, which the count of unwritten answers needs.
+                let (written, proved) = {
+                    let view = session.fence().expect("a driver");
+                    (
+                        view.host_reply_bytes(),
+                        view.fence().map(|fence| fence.fence_id),
+                    )
+                };
+                if written > after
+                    && let Some(proved) = proved
+                    && proved != not
+                    && session
+                        .input()
+                        .lock()
+                        .unwritten_replies()
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == 0
+                {
+                    return proved;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .ok()
+}
+
+/// Says whether the line the reader's newest fence is over is empty, or `None` when no fence
+/// stands.
+#[cfg(unix)]
+fn the_line_under_the_fence_is_empty(shell: &RealShell) -> Option<bool> {
+    use kr_shell_integration::contract::fence::LaunchStanding;
+    match shell.runtime.session().launch_standing() {
+        Some(LaunchStanding::Fenced(editor)) => Some(editor.acknowledged.buffer_empty),
+        _ => None,
+    }
+}
+
+/// Runs a line that prints a word it puts together from two pieces and waits for the word, which
+/// shows the shell takes a line typed after the host's answer and runs it as typed.
+#[cfg(unix)]
+async fn a_line_typed_afterwards_runs(shell: &RealShell, keys: &mut RealKeys) -> bool {
+    keys.type_line(shell, "printf '%s%s\\n' kr-ans wered");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if retained(&shell.runtime.session())
+                .windows(b"kr-answered".len())
+                .any(|part| part == b"kr-answered")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// The end of the retained output, for a failure to show.
+#[cfg(unix)]
+fn the_end_of_the_output(shell: &RealShell) -> String {
+    let seen = retained(&shell.runtime.session());
+    String::from_utf8_lossy(&seen[seen.len().saturating_sub(300)..])
+        .escape_debug()
+        .to_string()
+}
+
+/// KR-REQ-08.48: with a real qualified reader at its prompt, the host's answer to a question an
+/// application put to the terminal never reaches the line the reader edits.
+///
+/// An application asks the terminal something and ends, or never reads, so the answer the host
+/// writes lands in the terminal of a shell at its prompt. The answer is no key the person pressed.
+/// The case sends each question an application can ask to the real worker, whose broker answers it,
+/// and after each answer waits for the fence the reader proves once it has taken the answer. The
+/// fence is over the line the reader edits, which has to be empty, and a line typed afterwards has
+/// to run as typed. Each question is asked at a prompt the reader has proved a fence at, so the
+/// answer is in the terminal when the reader next looks.
+#[cfg(unix)]
+async fn a_hosts_answers_stay_out_of_a_real_readers_line(
+    kind: ShellKind,
+    questions: &[(&str, &[u8])],
+) -> Vec<String> {
+    let package = installed_package_of(kind);
+    let shell = RealShell::start(
+        &package,
+        kr_protocol::session::LaunchProfile::default(),
+        Vec::new(),
+        None,
+    )
+    .await;
+    let mut keys = shell.keys();
+    let mut proved = until_the_reader_proves_a_fence(
+        &shell,
+        &mut keys,
+        false,
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap_or_else(|| panic!("{kind:?}: the reader never proved a fence"));
+    let mut failures = Vec::new();
+    for (name, question) in questions {
+        let after = shell
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .host_reply_bytes();
+        {
+            let mut session = shell.runtime.session();
+            session.ingest_output(MOVE_THE_CURSOR);
+            session.ingest_output(question);
+        }
+        shell.runtime.flush_input();
+        let answered = shell
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .host_reply_bytes()
+            > after;
+        if !answered {
+            failures.push(format!("{kind:?}: the host gave no answer to the {name}"));
+            continue;
+        }
+        let Some(again) = until_the_reader_has_taken_the_hosts_answer(&shell, proved, after).await
+        else {
+            failures.push(format!(
+                "{kind:?}: the reader never proved a fence once the host had answered the {name}; \
+                 the output ends {}",
+                the_end_of_the_output(&shell)
+            ));
+            break;
+        };
+        proved = again;
+        if the_line_under_the_fence_is_empty(&shell) != Some(true) {
+            failures.push(format!(
+                "{kind:?}: the host's answer to the {name} is in the line the reader edits; the \
+                 output ends {}",
+                the_end_of_the_output(&shell)
+            ));
+            break;
+        }
+    }
+    if failures.is_empty() && !a_line_typed_afterwards_runs(&shell, &mut keys).await {
+        failures.push(format!(
+            "{kind:?}: a line typed after the host's answers did not run as typed; the output \
+             ends {}",
+            the_end_of_the_output(&shell)
+        ));
+    }
+    shell.close().await;
+    failures
+}
+
+/// KR-REQ-08.48: with a real qualified reader at its prompt, the host's answer to a question a
+/// program the person ran put to the terminal never reaches the line the reader edits.
+///
+/// The program is `printf`, which writes the question and ends before anything could read the
+/// answer, as the programs that do not read their answers do. The host answers it from the
+/// terminal's output as it answers every question, and the answer waits in the terminal for the
+/// reader of the next prompt.
+#[cfg(unix)]
+async fn a_hosts_answer_to_a_program_that_ended_stays_out_of_a_real_readers_line(
+    kind: ShellKind,
+) -> Vec<String> {
+    let package = installed_package_of(kind);
+    let shell = RealShell::start(
+        &package,
+        kr_protocol::session::LaunchProfile::default(),
+        Vec::new(),
+        None,
+    )
+    .await;
+    let mut keys = shell.keys();
+    let proved = until_the_reader_proves_a_fence(
+        &shell,
+        &mut keys,
+        false,
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap_or_else(|| panic!("{kind:?}: the reader never proved a fence"));
+    let after = shell
+        .runtime
+        .session()
+        .fence()
+        .expect("a driver")
+        .host_reply_bytes();
+    keys.type_line(&shell, "printf '\\033[c'");
+    let mut failures = Vec::new();
+    if until_the_reader_has_taken_the_hosts_answer(&shell, proved, after)
+        .await
+        .is_none()
+    {
+        failures.push(format!(
+            "{kind:?}: the reader never proved a fence once the program's question was answered; \
+             the output ends {}",
+            the_end_of_the_output(&shell)
+        ));
+    } else if the_line_under_the_fence_is_empty(&shell) != Some(true) {
+        failures.push(format!(
+            "{kind:?}: the host's answer to a program that ended is in the line the reader \
+             edits; the output ends {}",
+            the_end_of_the_output(&shell)
+        ));
+    } else if !a_line_typed_afterwards_runs(&shell, &mut keys).await {
+        failures.push(format!(
+            "{kind:?}: a line typed after the host's answer did not run as typed; the output \
+             ends {}",
+            the_end_of_the_output(&shell)
+        ));
+    }
+    shell.close().await;
+    failures
+}
+
+/// KR-REQ-08.48: with a real qualified reader of Zsh or Bash at its prompt, the host's answers to
+/// the questions applications put to the terminal never reach the line the reader edits, and a
+/// line typed afterwards runs as typed.
+///
+/// See [`a_hosts_answers_stay_out_of_a_real_readers_line`] and
+/// [`a_hosts_answer_to_a_program_that_ended_stays_out_of_a_real_readers_line`]. The PowerShell
+/// reader has a case of its own, which needs the package published rather than built.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the built shell packages that KR_SHELL_PACKAGES names; it runs with --ignored in a run that has built them, as the build box's verification does"]
+async fn a_real_readers_line_stays_empty_when_the_host_answers_an_application() {
+    let mut failures = Vec::new();
+    for kind in [ShellKind::Zsh, ShellKind::Bash] {
+        failures.extend(
+            a_hosts_answers_stay_out_of_a_real_readers_line(kind, APPLICATION_QUESTIONS).await,
+        );
+        failures.extend(
+            a_hosts_answer_to_a_program_that_ended_stays_out_of_a_real_readers_line(kind).await,
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// KR-REQ-08.49: with a real qualified PowerShell reader at its prompt, the host's answer to the
 /// application invalidates the fence the reader proved, and the reader proves it again from its own
 /// snapshot.

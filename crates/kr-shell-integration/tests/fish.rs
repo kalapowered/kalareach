@@ -36,6 +36,13 @@ fn the_reader_counts_what_the_host_put_into_its_terminal_as_input_it_has_not_tak
     shellpkg::bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(FISH);
 }
 
+/// KR-REQ-08.48: the host's answer between the cursor keys a person presses leaves them working.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_hosts_answer_between_cursor_keys_leaves_the_cursor_keys_working() {
+    shellpkg::a_hosts_answer_between_cursor_keys_leaves_the_cursor_keys_working(FISH);
+}
+
 /// KR-REQ-07.40: the bridge holds no copy of the bootstrap secret once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
