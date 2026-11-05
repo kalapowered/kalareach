@@ -7197,7 +7197,7 @@ impl WorkerService {
                 mutation,
                 |params: &AlertCreateParams| params.dedup_id.clone(),
             ),
-            _ => journal.uncertain_for_subject(actor_id, subject),
+            _ => journal.uncertain_for_subject(actor_id, method, subject),
         }
     }
 
@@ -7216,10 +7216,10 @@ impl WorkerService {
         identity_of: impl Fn(&P) -> I,
     ) -> Result<Option<(kr_protocol::ids::ActionId, u64)>> {
         let Ok(params) = parse::<P>(&mutation.params) else {
-            return journal.uncertain_for_subject(actor_id, subject);
+            return journal.uncertain_for_subject(actor_id, method, subject);
         };
         let identity = identity_of(&params);
-        journal.uncertain_for_subject_matching(actor_id, subject, |intent| {
+        journal.uncertain_for_subject_matching(actor_id, method, subject, |intent| {
             crate::action::dedup::holds_back(method, intent, &identity, &identity_of)
         })
     }

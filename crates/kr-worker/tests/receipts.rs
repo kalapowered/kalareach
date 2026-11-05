@@ -4596,6 +4596,7 @@ fn a_migrated_record_keeps_the_subject_its_retained_intent_describes() {
             .expect("encodes"),
     };
     let intent = kr_cbor::to_canonical_vec(&mutation).expect("the intent encodes");
+    let tablet = actor("device:tablet");
     {
         let connection = version_2_journal(&path);
         version_2_unknown(
@@ -4605,10 +4606,11 @@ fn a_migrated_record_keeps_the_subject_its_retained_intent_describes() {
             "session.close",
             &intent,
         );
-        // And one whose intent this build cannot read, which keeps no subject at all.
+        // And one of another actor whose intent this build cannot read, which keeps no subject at
+        // all.
         version_2_unknown(
             &connection,
-            "device:phone",
+            "device:tablet",
             crate::action(6),
             "session.close",
             &[0xa0],
@@ -4619,19 +4621,37 @@ fn a_migrated_record_keeps_the_subject_its_retained_intent_describes() {
     let subject = kr_protocol::action::subject_digest(&mutation).expect("a subject");
     assert_eq!(
         journal
-            .uncertain_for_subject(&caller, subject)
+            .uncertain_for_subject(&caller, Method::SessionClose, subject)
             .expect("reads")
             .map(|(action_id, _)| action_id),
         Some(crate::action(5)),
         "the migrated record stands in the way of a fresh identifier for the same subject"
     );
-    // The record whose intent could not be read stands in nothing's way, and the migration said
-    // so by leaving its subject empty rather than guessing at one.
+    // The record whose intent could not be read keeps no subject, and the migration said so rather
+    // than guessing at one. It cannot be told from any request of its actor and its method, so it
+    // stands in the way of all of them, and in nothing else's way.
+    let nowhere = Digest256::from_bytes([0; 32]);
     assert_eq!(
         journal
-            .uncertain_for_subject(&caller, Digest256::from_bytes([0; 32]))
+            .uncertain_for_subject(&tablet, Method::SessionClose, nowhere)
+            .expect("reads")
+            .map(|(action_id, _)| action_id),
+        Some(crate::action(6)),
+        "the record of its actor and its method"
+    );
+    assert_eq!(
+        journal
+            .uncertain_for_subject(&tablet, Method::SessionDetach, nowhere)
             .expect("reads"),
-        None
+        None,
+        "another method"
+    );
+    assert_eq!(
+        journal
+            .uncertain_for_subject(&caller, Method::SessionClose, nowhere)
+            .expect("reads"),
+        None,
+        "another actor"
     );
 }
 
