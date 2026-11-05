@@ -13,6 +13,7 @@
 
 mod net_support;
 
+use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActionId, GrantId, QuestionRevision, SessionId};
@@ -24,11 +25,13 @@ use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{
     SessionCloseParams, SessionCloseResult, SessionOpenParams, SessionState,
 };
-use kr_protocol::sharing::{RoleSelection, SessionRole};
+use kr_protocol::sharing::{GrantRevokeParams, RoleSelection, SessionRole};
 
 use net_support::environment::{Environment, Paired, from, resolved, yes};
 use net_support::worker::{revoke, share};
-use net_support::{Host, RawDevice, refusal};
+use net_support::{
+    Host, RawDevice, an_open_session, delegated, holds, on_the_host, owned_by, recipient, refusal,
+};
 
 const ANSWERING: [ActionRight; 2] = [ActionRight::SessionView, ActionRight::QuestionRespond];
 const CLOSING: [ActionRight; 2] = [ActionRight::SessionView, ActionRight::SessionClose];
@@ -388,6 +391,66 @@ async fn a_repeated_close_a_device_may_not_read_is_told_the_outcome_is_unknown()
     environment.stop().await;
 }
 
+/// A device that may close a session but may not read what became of an action closes it, and its
+/// connection is then opened for the host alone. The close presented again on that connection has
+/// no route to a worker, and the device is told the outcome is unknown, not that the connection
+/// serves no session. A close it had not made is told that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeated_close_on_a_connection_that_now_serves_the_host_alone_is_told_the_outcome_is_unknown()
+ {
+    let environment = Environment::start().await;
+    let device = environment
+        .device(from(&[ActionRight::SessionClose], 1))
+        .await;
+    let params = SessionCloseParams {
+        session_id: environment.worker.session_id,
+    };
+    let target = environment.target();
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let window = device.connection.action_window_id();
+    device
+        .connection
+        .mutate_in(
+            window.clone(),
+            Method::SessionClose,
+            action,
+            target.clone(),
+            &params,
+        )
+        .await
+        .expect("the worker accepts the close");
+    open(&device.connection, None, None).await;
+
+    let told = refusal(
+        device
+            .connection
+            .mutate_in(
+                window.clone(),
+                Method::SessionClose,
+                action,
+                target.clone(),
+                &params,
+            )
+            .await,
+    );
+    assert_unknown(&told);
+    let fresh = refusal(
+        device
+            .connection
+            .mutate_in(
+                window,
+                Method::SessionClose,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &params,
+            )
+            .await,
+    );
+    assert_eq!(fresh.code, ErrorCode::InvalidArgument, "{fresh:?}");
+    device.connection.close();
+    environment.stop().await;
+}
+
 /// A repeat of an action taken under a share arrives on a connection opened for the host alone, or
 /// for the session under the pairing grant, and the host does not serve it there. It is not told
 /// the action was refused; the connection opened under the share itself is answered from the
@@ -487,6 +550,124 @@ async fn a_repeat_under_a_share_that_has_been_revoked_is_told_the_outcome_is_unk
             )
             .await,
     );
+    assert_unknown(&told);
+    again.close();
+    device.connection.close();
+    environment.stop().await;
+}
+
+/// A device revoked what it had delegated, under a share it holds. The share is then revoked, so the
+/// device no longer holds a grant the revocation stands on, and it presents the revocation again
+/// without knowing it was carried out. It is not told the revocation it made was refused; one it had
+/// not made is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeated_revocation_after_the_share_it_stood_on_is_revoked_is_told_the_outcome_is_unknown()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (boss, boss_record) = recipient(&host, &owner).await;
+    let (friend, friend_record) = recipient(&host, &owner).await;
+    let session = an_open_session(&host).0;
+    let (above, boss_connection) = owned_by(&host, session, &boss, &boss_record).await;
+    let (child, friend_connection) = delegated(
+        &host,
+        session,
+        &above.grant,
+        &boss_connection,
+        &friend,
+        &friend_record,
+    )
+    .await;
+    let params = GrantRevokeParams {
+        grant_id: child.grant_id,
+    };
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let window = boss_connection.action_window_id();
+    boss_connection
+        .mutate_in(
+            window.clone(),
+            Method::GrantRevoke,
+            action,
+            on_the_host(&host),
+            &params,
+        )
+        .await
+        .expect("the device revokes what it delegated");
+    assert!(!holds(&host, child.grant_id));
+    revoke(&host, above.grant.grant_id).await;
+    assert!(!holds(&host, above.grant.grant_id));
+
+    let again = RawDevice::connect(&host, &boss, &boss_record).await;
+    let told = refusal(
+        again
+            .mutate_in(
+                window,
+                Method::GrantRevoke,
+                action,
+                on_the_host(&host),
+                &params,
+            )
+            .await,
+    );
+    assert_unknown(&told);
+    let fresh = refusal(
+        again
+            .mutate(
+                Method::GrantRevoke,
+                ActionId::new(kr_ipc::new_uuid()),
+                on_the_host(&host),
+                &params,
+            )
+            .await,
+    );
+    assert_eq!(fresh.code, ErrorCode::PermissionDenied, "{fresh:?}");
+    for connection in [again, boss_connection, friend_connection] {
+        connection.close();
+    }
+    host.stop().await;
+}
+
+/// The host cannot read the routes it keeps, so it cannot say whether it has seen the action a
+/// device presents again. It does not tell the device the action was refused, or that storage is
+/// unavailable for it: the copy that went before may have been carried out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_when_the_host_cannot_read_its_routes_is_told_the_outcome_is_unknown() {
+    let environment = Environment::start().await;
+    let question = environment.worker.ask("unreadable");
+    let device = environment.device(from(&ANSWERING, 1)).await;
+    let params = yes(&environment, &question);
+    let target = environment.target();
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let window = device.connection.action_window_id();
+    let first = resolved(
+        device
+            .connection
+            .mutate_in(
+                window.clone(),
+                Method::QuestionAnswer,
+                action,
+                target.clone(),
+                &params,
+            )
+            .await
+            .expect("the device answers"),
+    );
+    assert_eq!(first.state, QuestionState::Answered);
+    let again = another_connection(&environment.host, &device).await;
+
+    let registry = rusqlite::Connection::open(environment.host.registry_database())
+        .expect("the registry opens");
+    registry
+        .execute_batch("ALTER TABLE network_actions RENAME TO network_actions_hidden")
+        .expect("the routes are hidden");
+    let told = refusal(
+        again
+            .mutate_in(window, Method::QuestionAnswer, action, target, &params)
+            .await,
+    );
+    registry
+        .execute_batch("ALTER TABLE network_actions_hidden RENAME TO network_actions")
+        .expect("the routes are back");
     assert_unknown(&told);
     again.close();
     device.connection.close();

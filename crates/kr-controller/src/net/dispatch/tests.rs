@@ -6194,20 +6194,36 @@ async fn a_key_registration_recorded_after_the_first_lookup_is_not_answered_when
     world.serving.abort();
 }
 
+/// A place a call to the door can be stopped at, so that the world changes under it.
+#[derive(Clone, Copy)]
+enum Stopped {
+    /// The call is not stopped: the world changes before it is served.
+    Never,
+    /// While it waits to open the link to the worker, which a repeat does first to ask for the
+    /// receipt of its action.
+    AtTheWorkersLink,
+    /// While the dispatch lease for it is being taken, after the route is claimed.
+    AtTheLease,
+}
+
 /// A repeat is the device's own route for the action id, with the same request. A refusal the host
 /// makes of one on its own account is told as an unknown outcome, because the copy that went before
 /// may have been carried out; a request the host never routed is refused as ever. This serves one
 /// mutation of a device, routed beforehand when `routed` says so (to its session, or to no session
-/// for an action the host owns the receipt of), after `prepare` has changed the world, and returns
-/// the refusal the device is told.
+/// for an action the host owns the receipt of), and returns the refusal the device is told.
+///
+/// `change` alters the world: before the call is served when it is never stopped, and otherwise
+/// once the call waits at the place `stopped` names.
 async fn a_mutation_refused(
     method: Method,
     routed: Option<bool>,
     byte: u8,
     shape: impl FnOnce(&mut MutationRequest),
-    prepare: impl AsyncFnOnce(
+    stopped: Stopped,
+    change: impl AsyncFnOnce(
         &crate::service::a_close_a_worker_never_answers::Silent,
         &super::RemoteConnection,
+        &crate::service::a_read_that_meets_a_worker_on_its_way_out::Scripted,
     ),
 ) -> kr_protocol::error::ProtocolError {
     use kr_protocol::envelope::ControlFrame;
@@ -6225,6 +6241,7 @@ async fn a_mutation_refused(
                 ActionRight::SessionView,
                 ActionRight::AgentPrompt,
                 ActionRight::SessionRename,
+                ActionRight::SessionClose,
             ]
             .into_iter()
             .collect();
@@ -6238,6 +6255,12 @@ async fn a_mutation_refused(
         })
         .expect("encodes");
     }
+    if method == Method::SessionClose {
+        mutation.params = ParamsValue::from_typed(&kr_protocol::session::SessionCloseParams {
+            session_id: world.session_id,
+        })
+        .expect("encodes");
+    }
     shape(&mut mutation);
     if let Some(to_its_session) = routed {
         let session = to_its_session.then_some(world.session_id);
@@ -6248,11 +6271,30 @@ async fn a_mutation_refused(
             "the route of the action is on record"
         );
     }
-    prepare(&world, &connection).await;
-    let answered = connection
-        .answer_now(ControlFrame::Mutation(Box::new(mutation)))
-        .await
-        .expect("the mutation is answered");
+    let pause = match stopped {
+        Stopped::Never => None,
+        Stopped::AtTheWorkersLink => Some(controller.before_a_proxy_is_opened.arm()),
+        Stopped::AtTheLease => Some(controller.before_the_lease.arm()),
+    };
+    let frame = ControlFrame::Mutation(Box::new(mutation));
+    let answered = match pause {
+        None => {
+            change(&world, &connection, &*script).await;
+            connection.answer_now(frame).await
+        }
+        Some((arrived, go)) => {
+            let (answered, ()) = tokio::join!(connection.answer_now(frame), async {
+                tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
+                    .await
+                    .expect("the call reaches the place it is stopped at")
+                    .expect("the pause is armed");
+                change(&world, &connection, &*script).await;
+                go.send(()).expect("the call is waiting");
+            });
+            answered
+        }
+    }
+    .expect("the mutation is answered");
     let error = error_of(answered.frame()).clone();
     world.serving.abort();
     error
@@ -6274,7 +6316,8 @@ async fn a_repeat_on_a_connection_whose_registration_was_withdrawn_is_told_the_o
             routed,
             71,
             |_| {},
-            async |world, connection| {
+            Stopped::Never,
+            async |world, connection, _| {
                 world
                     .controller
                     .admitted_write()
@@ -6306,7 +6349,8 @@ async fn a_repeat_of_an_action_the_host_owns_is_told_the_outcome_is_unknown_when
                 mutation.action_window_id =
                     kr_protocol::ids::ActionWindowId::new("elsewhere").expect("a window");
             },
-            async |_, _| {},
+            Stopped::Never,
+            async |_, _, _| {},
         )
         .await;
         assert_eq!(error.code, expected, "routed {routed:?}: {error}");
@@ -6329,7 +6373,8 @@ async fn a_repeat_the_worker_refuses_without_a_receipt_is_told_the_outcome_is_un
             routed,
             73,
             |_| {},
-            async |_, _| {},
+            Stopped::Never,
+            async |_, _, _| {},
         )
         .await;
         assert_eq!(error.code, expected, "routed {routed:?}: {error}");
@@ -6352,7 +6397,8 @@ async fn a_repeat_to_a_session_that_has_closed_is_told_the_outcome_is_unknown() 
             routed,
             75,
             |_| {},
-            async |world, _| {
+            Stopped::Never,
+            async |world, _, _| {
                 world
                     .controller
                     .retire(
@@ -6432,5 +6478,88 @@ async fn a_copy_that_claimed_the_route_while_this_one_waited_for_the_link_makes_
             "a copy claimed: {copy_claims}: {error}"
         );
         world.serving.abort();
+    }
+}
+
+/// The connection's registration is withdrawn while a repeat waits for the worker's link, which it
+/// opens to ask for the receipt of its action. The check the connection's own turn makes last
+/// refuses it, and the device is told the outcome is unknown, not that the action was refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_whose_registration_is_withdrawn_while_it_waits_for_the_worker_is_told_the_outcome_is_unknown()
+ {
+    use kr_protocol::error::ErrorCode;
+
+    let error = a_mutation_refused(
+        Method::AgentPromptSubmit,
+        Some(true),
+        77,
+        |_| {},
+        Stopped::AtTheWorkersLink,
+        async |world, connection, _| {
+            world
+                .controller
+                .admitted_write()
+                .remove(&connection.connection_id());
+        },
+    )
+    .await;
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown, "{error}");
+}
+
+/// A fence this host owes stops the forward of a mutation to its worker where the dispatch lease
+/// is taken. For a repeat that refusal says nothing of the copy that went before, so it is told as
+/// an unknown outcome; the same request never routed is refused for the fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_whose_lease_is_refused_is_told_the_outcome_is_unknown() {
+    use kr_protocol::error::ErrorCode;
+
+    for (routed, expected) in [
+        (Some(true), ErrorCode::OutcomeUnknown),
+        (None, ErrorCode::PermissionDenied),
+    ] {
+        let error = a_mutation_refused(
+            Method::AgentPromptSubmit,
+            routed,
+            78,
+            |_| {},
+            Stopped::AtTheLease,
+            async |world, _, _| world.controller.hold_fence(true),
+        )
+        .await;
+        assert_eq!(error.code, expected, "routed {routed:?}: {error}");
+    }
+}
+
+/// A close whose session is still open in the registry and whose worker cannot be reached has no
+/// closure record to answer it from, and the link its repeat opens for itself fails. The repeat is
+/// told the outcome is unknown, not the error of a link; the same close never routed is told it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_close_whose_worker_cannot_be_reached_is_told_the_outcome_is_unknown() {
+    use kr_protocol::error::ErrorCode;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out as scripted;
+
+    for (routed, expected) in [
+        (Some(true), ErrorCode::OutcomeUnknown),
+        (None, ErrorCode::ResourceUnavailable),
+    ] {
+        let error = a_mutation_refused(
+            Method::SessionClose,
+            routed,
+            79,
+            |_| {},
+            Stopped::Never,
+            async |world, _, script| {
+                // The worker goes while a read waits on it, and its endpoint is gone for the
+                // close that follows.
+                let (_arrived, go) = script.end_at_next_read();
+                drop(go);
+                scripted::read(world)
+                    .await
+                    .expect_err("the worker goes while the read waits on it");
+            },
+        )
+        .await;
+        assert_eq!(error.code, expected, "routed {routed:?}: {error}");
     }
 }
