@@ -2024,30 +2024,257 @@ async fn an_answer_has_to_quote_the_newest_uncertain_answer_to_its_own_question(
     assert_eq!(taken.state, kr_protocol::question::QuestionState::Answered);
 }
 
-/// KR-REQ-23.24: the narrowing is the answer's alone. An uncertain cancellation of one question
-/// still holds back the cancellation of every other question of the session until it is quoted.
+/// KR-REQ-11.63: a cancellation whose outcome is uncertain holds back no cancellation of another
+/// question of the session. The host used to refuse every later cancellation of the actor in the
+/// session, so one lost reply stopped the person withdrawing any other question.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_uncertain_cancellation_still_holds_back_the_cancellation_of_another_question() {
+async fn an_uncertain_cancellation_of_one_question_does_not_hold_back_the_cancellation_of_another()
+{
     let host = host().await;
     let mut client = cli(&host).await;
     let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
     let first = asked(&host, "first");
     let second = asked(&host, "second");
     let lost = MutationRequest {
-        action_id: action(64),
+        action_id: action(71),
         ..cancelling(&client, &host, &first)
     };
     an_uncertain_outcome_of(&host, &caller, &lost);
 
     let cancel = cancelling(&client, &host, &second);
-    let Outcome::Error(error) = send_mutation(&mut client, cancel).await else {
-        panic!("a cancellation of another question is held back by the uncertain one");
+    let sent = kr_cbor::to_canonical_vec(&cancel).expect("encodes");
+    let action_id = cancel.action_id;
+    let taken = resolved(send_mutation(&mut client, cancel).await);
+    assert_eq!(taken.question_id, second.question_id);
+    assert_eq!(taken.state, kr_protocol::question::QuestionState::Cancelled);
+
+    // The envelope the cases plant for an uncertain cancellation is the one the worker keeps of a
+    // real one: the whole request, the question it names included.
+    assert_eq!(
+        host.service
+            .runtime()
+            .session()
+            .journal_mut()
+            .expect("a journal")
+            .read_intent(&caller, action_id)
+            .expect("readable"),
+        Some(sent),
+        "the envelope kept of a cancellation"
+    );
+}
+
+/// KR-REQ-11.63: a cancellation whose outcome is uncertain still holds back a second cancellation of
+/// the same question, which has to name the first and the revision its sender was shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_cancellation_of_a_question_with_an_uncertain_cancellation_has_to_quote_it() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+    let first = asked(&host, "first");
+    let lost = MutationRequest {
+        action_id: action(72),
+        ..cancelling(&client, &host, &first)
+    };
+    let revision = an_uncertain_outcome_of(&host, &caller, &lost);
+
+    let again = cancelling(&client, &host, &first);
+    let Outcome::Error(error) = send_mutation(&mut client, again).await else {
+        panic!("a new identifier does not take the uncertain cancellation's place");
     };
     assert_eq!(error.code, ErrorCode::DraftConflict);
     assert!(
-        error.message.contains(&action(64).to_string()),
+        error.message.contains(&action(72).to_string()),
         "the refusal names the cancellation to show: {}",
         error.message
+    );
+
+    let shown = revision_shown_for(&mut client, action(72)).await;
+    assert_eq!(shown, revision);
+    let quoting = MutationRequest {
+        expected: superseding(action(72), shown),
+        ..cancelling(&client, &host, &first)
+    };
+    let taken = resolved(send_mutation(&mut client, quoting).await);
+    assert_eq!(taken.question_id, first.question_id);
+    assert_eq!(taken.state, kr_protocol::question::QuestionState::Cancelled);
+}
+
+/// KR-REQ-11.63: an uncertain cancellation of one question is not an outcome of another question,
+/// so a cancellation of the other question that names it quotes an outcome its subject does not
+/// have, which is refused as a quote of any action that is not uncertain for the subject is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quote_of_an_uncertain_cancellation_of_another_question_shows_nothing() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+    let first = asked(&host, "first");
+    let second = asked(&host, "second");
+    let lost = MutationRequest {
+        action_id: action(73),
+        ..cancelling(&client, &host, &first)
+    };
+    an_uncertain_outcome_of(&host, &caller, &lost);
+    let shown = revision_shown_for(&mut client, action(73)).await;
+
+    let other = MutationRequest {
+        expected: superseding(action(73), shown),
+        ..cancelling(&client, &host, &second)
+    };
+    let Outcome::Error(error) = send_mutation(&mut client, other).await else {
+        panic!("the uncertain cancellation is not an outcome of the other question");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict);
+    assert!(
+        error.message.contains(&action(73).to_string()),
+        "the refusal names the quoted cancellation: {}",
+        error.message
+    );
+}
+
+/// KR-REQ-11.63: of several uncertain cancellations, the one a cancellation has to quote is the
+/// newest of its own question, whether or not a cancellation of another question is newer still.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancellation_has_to_quote_the_newest_uncertain_cancellation_of_its_own_question() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+    let first = asked(&host, "first");
+    let second = asked(&host, "second");
+    // Oldest first: a cancellation of the first question, one of the second, and a newer one of the
+    // first.
+    for (id, question) in [(74, &first), (75, &second), (76, &first)] {
+        let lost = MutationRequest {
+            action_id: action(id),
+            ..cancelling(&client, &host, question)
+        };
+        an_uncertain_outcome_of(&host, &caller, &lost);
+    }
+
+    let unquoted = cancelling(&client, &host, &second);
+    let Outcome::Error(error) = send_mutation(&mut client, unquoted).await else {
+        panic!("the uncertain cancellation of the second question is not shown");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict);
+    assert!(
+        error.message.contains(&action(75).to_string()),
+        "the second question's refusal names its own cancellation: {}",
+        error.message
+    );
+
+    let unquoted = cancelling(&client, &host, &first);
+    let Outcome::Error(error) = send_mutation(&mut client, unquoted).await else {
+        panic!("the uncertain cancellation of the first question is not shown");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict);
+    assert!(
+        error.message.contains(&action(76).to_string()),
+        "the first question's refusal names its newest cancellation: {}",
+        error.message
+    );
+
+    let shown = revision_shown_for(&mut client, action(76)).await;
+    let quoting = MutationRequest {
+        expected: superseding(action(76), shown),
+        ..cancelling(&client, &host, &first)
+    };
+    let taken = resolved(send_mutation(&mut client, quoting).await);
+    assert_eq!(taken.question_id, first.question_id);
+    assert_eq!(taken.state, kr_protocol::question::QuestionState::Cancelled);
+}
+
+/// KR-REQ-11.63: where the worker cannot read which question an uncertain cancellation was for, it
+/// holds back every cancellation of the actor in the session, as it always did. Privacy mode
+/// withholds the envelope a settled receipt kept, an envelope may not decode, and one may decode
+/// and not be a cancellation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uncertain_cancellation_whose_question_cannot_be_read_holds_back_every_cancellation() {
+    for unreadable in [
+        "withheld by privacy mode",
+        "not decodable",
+        "not a cancellation",
+    ] {
+        let host = host().await;
+        let mut client = cli(&host).await;
+        let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+        let first = asked(&host, "first");
+        let second = asked(&host, "second");
+        let lost = MutationRequest {
+            action_id: action(77),
+            ..cancelling(&client, &host, &first)
+        };
+        match unreadable {
+            "withheld by privacy mode" => {
+                host.service
+                    .runtime()
+                    .session()
+                    .enable_privacy(kr_worker::privacy::PrivacyGeneration::new(1), &mut [])
+                    .expect("privacy mode is turned on");
+                an_uncertain_outcome_of(&host, &caller, &lost);
+                assert_eq!(
+                    host.service
+                        .runtime()
+                        .session()
+                        .journal_mut()
+                        .expect("a journal")
+                        .read_intent(&caller, action(77))
+                        .expect("readable"),
+                    None,
+                    "privacy mode kept no envelope of the uncertain cancellation"
+                );
+            }
+            "not decodable" => {
+                an_uncertain_outcome_kept_as(&host, &caller, action(77), &lost, vec![0xff, 0x00]);
+            }
+            _ => {
+                let answer = answering(&client, &host, &first, ParamsValue::empty());
+                an_uncertain_outcome_kept_as(
+                    &host,
+                    &caller,
+                    action(77),
+                    &lost,
+                    kr_cbor::to_canonical_vec(&answer).expect("encodes"),
+                );
+            }
+        }
+
+        let cancel = cancelling(&client, &host, &second);
+        let Outcome::Error(error) = send_mutation(&mut client, cancel).await else {
+            panic!("a cancellation that cannot be told apart from the uncertain one is held back");
+        };
+        assert_eq!(error.code, ErrorCode::DraftConflict, "{unreadable}");
+        assert!(
+            error.message.contains(&action(77).to_string()),
+            "the refusal names the cancellation to show ({unreadable}): {}",
+            error.message
+        );
+    }
+}
+
+/// KR-REQ-11.63: a `question.cancel` whose parameters do not parse is refused in validation, after
+/// its receipt is written, as it was before a cancellation was told apart by its question.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_cancellation_is_refused_and_leaves_a_rejected_receipt() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let malformed = MutationRequest {
+        method: Method::QuestionCancel.into(),
+        params: ParamsValue::empty(),
+        ..close_mutation(
+            &client,
+            &host,
+            DEFAULT_MUTATION_TTL.get(),
+            ParamsValue::empty(),
+        )
+    };
+    let action_id = malformed.action_id;
+    let Outcome::Error(error) = send_mutation(&mut client, malformed).await else {
+        panic!("a cancellation with no question is refused");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(
+        receipt_read_for(&mut client, action_id).await.state,
+        ReceiptState::Rejected,
+        "the refusal is recorded"
     );
 }
 
