@@ -257,13 +257,14 @@ unless a pointer pressed it: a pointer's press leaves the focus where the pointe
 A drag belongs to the view it began in: taking control, the view ending or the session changing
 ends it without sending what it had not sent. The page never decides where the window is. Native
 code sends one viewport report at a time, settles each move on the screen the host names for it, and
-tells the page a move is settled only with a screen that holds it. A new size is settled only by the
-host's word. When the host refuses it for now, or cannot say what became of it, the size is not
-marked as sent: it goes again with the host's next word, up to three times in a row, and then with
-the page's next measure or move. A move the host refuses for now is settled as not taken, like a
-refused one, and is not made later. Until then the page draws its last
+tells the page a move is settled only with a screen that holds it. Until then the page draws its last
 screen shifted to where the waiting moves will put the window, so a move shows at once, and a drag
 follows the pointer to the pixel. The footer says where the window is.
+
+A size counts as sent only once the host has answered it, by accepting it or by a definite refusal.
+When the host refuses it for now, or cannot say what became of it, the size goes again with the
+host's next word, up to three times in a row, and then with the page's next measure or move. A move
+the host refuses for now is settled as not taken, like a refused one, and is not made later.
 
 A session fits a window as narrow as 320 px. Its actions move below its title, in the same order
 and at the same size, a long name or directory wraps whole, and the terminal's badges and footer
