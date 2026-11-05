@@ -7142,9 +7142,9 @@ impl WorkerService {
     /// subject of every cancellation, and a request about one question asks for something else than
     /// a request about another. Only an uncertain request of the same kind about the question this
     /// request names stands in its way. An uncertain request whose question cannot be read stands in
-    /// the way of every request of its kind, and so does any uncertain request to one whose
-    /// parameters do not parse: that request is refused where it always was, in validation, with a
-    /// receipt.
+    /// the way of every request of its kind. A request whose parameters do not parse is held back by
+    /// the newest uncertain outcome of its subject, as it always was, and where nothing holds it back
+    /// validation refuses it and leaves its receipt.
     fn uncertain_outcome_in_the_way(
         journal: &crate::journal::Journal,
         actor_id: &ActorId,
