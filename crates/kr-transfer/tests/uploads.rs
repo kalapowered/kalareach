@@ -214,6 +214,11 @@ fn bounded_chunks_are_verified_and_kept_apart_from_completed_files() {
 /// sender declared for them is refused, and nothing of it is staged or counted. The upload stays
 /// open for the sender to retry: the same chunk sent whole afterwards is accepted as new, not as a
 /// duplicate of the corrupted one, and the file that publishes is the original, byte for byte.
+///
+/// KR-REQ-14.02, the part about integrity checks: a chunk whose bytes do not match the digest its
+/// sender declared is refused, nothing of it is staged or counted, and the upload stays open for
+/// the sender to retry. Not shown here: bounded chunks, resumable progress and the separate storage
+/// of incomplete files.
 #[test]
 fn a_chunk_that_does_not_match_its_digest_is_refused_without_ending_the_upload() {
     let harness = Harness::create();
