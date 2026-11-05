@@ -65,6 +65,7 @@ import {
   unresolved,
   wasRefused,
   failed,
+  leavesOutcomeUnknown,
   type Submission
 } from '../../model/receipts'
 import { supersessionFor } from '../../model/receipt-reads'
@@ -775,22 +776,20 @@ export function MobileSession({
           // A refusal of the earlier result's quote says the host's record is not what was shown:
           // it is read again at once, so the person sees what it says now.
           if (anyway && failureCode(failure) === 'DRAFT_CONFLICT') receiptReads.askAgain(sessionId)
+          // The host's own code, kept: an outcome the host could not establish is the one state
+          // that must never be rounded up to a refusal, and rewriting the code would round it up.
+          const reason = {
+            code: failureCode(failure) ?? 'REQUEST_FAILED',
+            message: failureMessage(failure),
+            retry: failureRetry(failure)
+          }
           lifecycle.setSubmissions((current) =>
-            current.map((each) =>
-              each.localId === submission.localId
-                ? // The host's own code, kept: `OUTCOME_UNKNOWN` is the one state that must never
-                  // be rounded up to a refusal, and rewriting the code would round it up.
-                  failed(each, {
-                    code: failureCode(failure) ?? 'REQUEST_FAILED',
-                    message: failureMessage(failure),
-                    retry: failureRetry(failure)
-                  })
-                : each
-            )
+            current.map((each) => (each.localId === submission.localId ? failed(each, reason) : each))
           )
           if (stillHere()) say(failureMessage(failure), 'danger')
-          // An outcome the host could not establish is never given back as a refusal.
-          end(failureCode(failure) === 'OUTCOME_UNKNOWN' ? 'unknown' : 'refused')
+          // An outcome the host could not establish is never given back as a refusal, whether the
+          // host says it by the code or by the category.
+          end(leavesOutcomeUnknown(reason) ? 'unknown' : 'refused')
         })
         .finally(() => {
           if (stillHere()) setBusyUnder(null)
