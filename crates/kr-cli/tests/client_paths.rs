@@ -1,6 +1,6 @@
 //! Which way the command line reaches a host.
 //!
-//! KR-REQ-04.23. Section 4: the command line is a local IPC client, and remote application access
+//! Section 4: the command line is a local IPC client, and remote application access
 //! uses `kr-client` over iroh. Neither half is this crate's to implement. Reaching a host on this
 //! machine is `kr-ipc`'s socket or named pipe, and reaching one anywhere else is `kr-client`'s
 //! connection, which is why this crate depends on both and on no transport at all.
@@ -39,6 +39,10 @@ fn descriptor_for(endpoint: &kr_ipc::paths::Endpoint) -> WorkerDescriptor {
     }
 }
 
+/// KR-REQ-04.23, the part about the command line as a local IPC client: the command's path to a
+/// session on this machine answers with a `kr_ipc` local client and nothing else, and fails as a
+/// local endpoint fails when nothing listens. Not shown here: remote access through `kr-client`
+/// over iroh.
 #[tokio::test]
 async fn reaching_a_session_on_this_machine_is_a_local_ipc_client() {
     let tree = kr_ipc::testing::TempHost::create();
@@ -69,6 +73,9 @@ async fn reaching_a_session_on_this_machine_is_a_local_ipc_client() {
     );
 }
 
+/// KR-REQ-04.23, the part about the command line as a local IPC client: a request to the control
+/// daemon is a round trip over the local socket, opened as a command line. Not shown here: remote
+/// access through `kr-client` over iroh.
 #[tokio::test]
 async fn reaching_the_control_daemon_is_a_round_trip_over_the_local_socket() {
     // The other half of the local path: the daemon this machine's own commands talk to. A fake one
@@ -112,6 +119,9 @@ async fn reaching_the_control_daemon_is_a_round_trip_over_the_local_socket() {
     serving.abort();
 }
 
+/// KR-REQ-04.23, the part about the command line carrying no transport: the crate declares `kr-ipc`
+/// and `kr-client` and none of iroh, `kr-transport`, quinn or rustls, so reaching a host is one or
+/// the other's. Not shown here: remote access through `kr-client` over iroh.
 #[test]
 fn the_command_line_carries_no_transport_of_its_own() {
     // Its two ways to reach a host are the two the specification names, and both belong to other

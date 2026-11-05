@@ -1,7 +1,7 @@
 //! Where a session's worker and its programs draw on Windows, against a real daemon and a real
 //! worker.
 //!
-//! KR-REQ-03.24: a `headless_user` session has no inherited GUI access. Its worker is started on a
+//! A `headless_user` session has no inherited GUI access. Its worker is started on a
 //! desktop of its own, so neither it nor a program it starts inherits the interactive desktop of
 //! the person signed in. The probe runs in a headless session's shell, which is a console program
 //! in a pseudo-console, so that the shell answering at all shows that such a program still runs on
