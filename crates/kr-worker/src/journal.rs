@@ -21,7 +21,7 @@ use kr_protocol::action::{
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActionId, ActorId, RequestId};
-use kr_protocol::method::{MethodName, MethodVersion};
+use kr_protocol::method::{Method, MethodName, MethodVersion};
 use kr_protocol::receipt::{Receipt, ReceiptState, RejectionReason};
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use rusqlite::{Connection, OptionalExtension as _, params};
@@ -828,7 +828,8 @@ impl Journal {
     /// nothing's way, so leaving the column empty would let a fresh identifier quietly take the
     /// place of an uncertain outcome admitted by the previous build. A record whose intent cannot
     /// be decoded keeps an empty subject, because there is nothing to derive one from, and that is
-    /// recorded here rather than guessed at.
+    /// recorded here rather than guessed at. An uncertain outcome with no subject stands in the way
+    /// of every request of its actor and its method, as the queries for one say.
     ///
     /// This migration goes when there can no longer be a version 2 journal to read, which is the
     /// first release.
@@ -2775,11 +2776,15 @@ impl Journal {
                     ORDER BY e.sequence DESC LIMIT 1) DESC,
                 r.rowid DESC";
 
-    /// Returns this actor's most recent uncertain outcome for a subject, if it has one.
+    /// Returns this actor's most recent uncertain outcome for a subject of `method`, if it has one.
     ///
     /// The subject rather than the action: section 23's rule is about a *new* identifier asking
     /// for the same thing, so what has to be found is the earlier ask rather than the earlier
     /// identifier. The most recent is the one the journal recorded last, whatever the clock says.
+    ///
+    /// An uncertain outcome that keeps no subject (a migration found nothing to derive one from)
+    /// cannot be told apart from the ask, so it stands in the way of every request of its actor
+    /// and its method.
     ///
     /// # Errors
     ///
@@ -2787,6 +2792,7 @@ impl Journal {
     pub fn uncertain_for_subject(
         &self,
         actor_id: &ActorId,
+        method: Method,
         subject_digest: Digest256,
     ) -> Result<Option<(ActionId, u64)>> {
         let row: Option<(Vec<u8>, i64)> = self
@@ -2794,14 +2800,17 @@ impl Journal {
             .query_row(
                 &format!(
                     "SELECT r.action_id, r.revision FROM receipts AS r
-                     WHERE r.actor_id = ?1 AND r.subject_digest = ?2 AND r.state = ?3
+                     WHERE r.actor_id = ?1 AND r.state = ?3
+                       AND (r.subject_digest = ?2
+                            OR (r.subject_digest IS NULL AND r.method = ?4))
                      {} LIMIT 1",
                     Self::NEWEST_RECORDED_FIRST
                 ),
                 params![
                     actor_id.as_str(),
                     subject_digest.as_bytes().as_slice(),
-                    ReceiptState::Unknown.as_str()
+                    ReceiptState::Unknown.as_str(),
+                    method.as_str()
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -2816,13 +2825,17 @@ impl Journal {
         .transpose()
     }
 
-    /// Returns this actor's most recent uncertain outcome for a subject among those whose retained
-    /// intent `matches` accepts, if it has one.
+    /// Returns this actor's most recent uncertain outcome for a subject of `method` among those
+    /// whose retained intent `matches` accepts, if it has one.
     ///
     /// For a method whose subject is shared by requests that ask for different things, such as the
     /// answers to the several questions of one session: the envelope each receipt kept says which
     /// of them it was. `matches` is given that envelope, or `None` where the receipt kept none. The
     /// receipts are taken in the order the journal recorded their outcomes, the last first.
+    ///
+    /// An uncertain outcome of the actor and the method that keeps no subject (a migration found
+    /// nothing to derive one from) is offered to `matches` too, since the subject cannot say that
+    /// it is another ask; its envelope may still say so.
     ///
     /// # Errors
     ///
@@ -2830,6 +2843,7 @@ impl Journal {
     pub fn uncertain_for_subject_matching(
         &self,
         actor_id: &ActorId,
+        method: Method,
         subject_digest: Digest256,
         matches: impl Fn(Option<&[u8]>) -> bool,
     ) -> Result<Option<(ActionId, u64)>> {
@@ -2837,7 +2851,9 @@ impl Journal {
             .connection
             .prepare(&format!(
                 "SELECT r.action_id, r.revision, r.intent FROM receipts AS r
-                 WHERE r.actor_id = ?1 AND r.subject_digest = ?2 AND r.state = ?3
+                 WHERE r.actor_id = ?1 AND r.state = ?3
+                   AND (r.subject_digest = ?2
+                        OR (r.subject_digest IS NULL AND r.method = ?4))
                  {}",
                 Self::NEWEST_RECORDED_FIRST
             ))
@@ -2846,7 +2862,8 @@ impl Journal {
             .query(params![
                 actor_id.as_str(),
                 subject_digest.as_bytes().as_slice(),
-                ReceiptState::Unknown.as_str()
+                ReceiptState::Unknown.as_str(),
+                method.as_str()
             ])
             .map_err(|error| faulted(&self.health, error))?;
         while let Some(row) = rows.next().map_err(|error| faulted(&self.health, error))? {
