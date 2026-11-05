@@ -1197,12 +1197,16 @@ fn the_module_queues_its_start_key_only_into_an_empty_queue_and_over_no_search_a
            Write-Output "kr-key[insert]=[$insert $(Show-KrQueue)]";
            Clear-KrQueue;
            & $module {
+               $letter = [System.ConsoleKeyInfo]::new('a', [System.ConsoleKey]::A, $false, $false, $false);
+               $script:TypedLetter = $script:Rl.Assembly.GetType('Microsoft.PowerShell.PSKeyInfo').GetMethod(
+                   'FromConsoleKeyInfo', [type[]]@([System.ConsoleKeyInfo])).Invoke($null, @($letter));
                $queue = Get-KrKeyQueue;
-               $queue.Enqueue($script:TypedKey); $queue.Enqueue((Get-KrStartKey)); $queue.Enqueue($script:TypedKey)
+               $queue.Enqueue($script:TypedKey); $queue.Enqueue((Get-KrStartKey)); $queue.Enqueue($script:TypedLetter)
            };
            $before = Show-KrQueue;
            & $module { Restore-KrStartHandler };
-           Write-Output "kr-key[removed]=[$before $(Show-KrQueue)]""#,
+           $kept = & $module { (Get-KrKeyQueue).ToArray() | ForEach-Object { $_.AsConsoleKeyInfo().Key } };
+           Write-Output "kr-key[removed]=[$before $(Show-KrQueue) $($kept -join ' ')]""#,
     );
     for (name, expected, what) in [
         (
@@ -1242,8 +1246,8 @@ fn the_module_queues_its_start_key_only_into_an_empty_queue_and_over_no_search_a
         ),
         (
             "removed",
-            "3 2",
-            "taking the start key off left it in the queue, or took a key of the person's",
+            "3 2 Escape A",
+            "taking the start key off left it in the queue, or took a key of the person's, or changed their order",
         ),
     ] {
         assert_eq!(
