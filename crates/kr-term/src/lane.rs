@@ -274,7 +274,7 @@ pub struct ResponseLane {
     last_refill_ms: u64,
     degradation: LaneDegradation,
     delivered: u64,
-    /// Whether any waiting reply carries a `held_since`.
+    /// True whenever a waiting reply carries a `held_since`.
     holding: bool,
 }
 

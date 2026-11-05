@@ -930,19 +930,20 @@ method, and that is exactly what it cannot do:
   or for Fish, which asks one in a write with two other questions and reads the three answers in
   order. What the host does not reach: a reply already in the terminal's input when the editor
   asks, such as the answer to a query of a program that ended before it read it, which the host
-  cannot take back; a reply that has left the lane for the writer; an answer the host writes
+  cannot take back; a reply that the writer has taken (one that waits at the end of the writer's
+  queue behind a fence frame it has not written is passed by the report); an answer the host writes
   between the module reporting the start of the read and the worker applying that report (the
   report and the editor's question are handled by two tasks in no fixed order, and when the
   question is parsed first its report goes out before the hold begins, which then lasts only until
   the start key's idle report); and the reads that keep the entry's own idle report, listed below,
   where the hold ends at the entry. An answer written in one of these ways ahead of the report still
-  joins it. The module does not drop them: it meets an answer only as keys, after the editor has read it from the terminal's input
-  (the next item). What the module controls is when the reader first reports its queues clear. A
-  fence proved before the editor has asked its question comes before the reply, and an answer the
-  host writes behind that fence lands ahead of the reply and joins it: the runtime takes the
-  answer's `ESC [` and its first `;` for the start of the reply and its digits for the position, and
-  gives the other bytes back as keys. Some of the answer then reaches the line, and the fence the
-  reader proves next is over a line that is not empty. So outside Windows the read-line entry
+  joins it. The module does not drop them: it meets an answer only as keys, after the editor has
+  read it from the terminal's input (the next item). What the module controls is when the reader
+  first reports its queues clear. A fence proved before the editor has asked its question comes
+  before the reply, and an answer the host writes behind that fence lands ahead of the reply and
+  joins it: the runtime takes the answer's `ESC [` and its first `;` for the start of the reply and
+  its digits for the position, and gives the other bytes back as keys. Some of the answer then
+  reaches the line, and the fence the reader proves next is over a line that is not empty. So outside Windows the read-line entry
   queues a key of the module's own in the editor's key queue (`Ctrl+Alt+F24`, which no terminal
   sends and which the module binds where nothing is bound), and the reader reports itself idle
   from that key's handler. The queue is not clear until the editor has run the key, which it does

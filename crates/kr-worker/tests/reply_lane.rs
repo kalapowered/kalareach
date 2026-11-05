@@ -509,7 +509,8 @@ async fn a_hold_that_ends_without_the_cursor_report_writes_what_is_young_and_dro
 }
 
 /// KR-REQ-08.48: the cursor report is also written ahead of an answer that already left the lane
-/// and waits for the terminal's writer, which the person's keys behind it do not change.
+/// and waits at the end of the queue for the terminal's writer. A key the person typed behind that
+/// answer keeps the report behind both (the next case).
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cursor_report_is_written_ahead_of_an_answer_still_waiting_for_the_writer() {
@@ -574,6 +575,32 @@ async fn an_answer_kept_for_one_read_is_not_given_the_time_before_the_next_to_re
         fixture.replies(),
         vec![CURSOR_REPORT.to_vec()],
         "the answer is not handed to the second read"
+    );
+}
+
+/// KR-REQ-08.48: two cursor reports asked in one write keep their order, and both stay behind a key
+/// and ahead of an answer that waits at the end of the queue.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn two_cursor_reports_keep_their_order_behind_a_key_and_ahead_of_the_answers_after_it() {
+    let (_clock, time) = manual();
+    let mut fixture = Fixture::managed(time, ShellKind::PowerShell);
+    // A waiting answer, the person's key behind it, and another waiting answer behind that.
+    fixture.application_writes(DEVICE_ATTRIBUTES);
+    fixture.type_bytes(b"x");
+    fixture.application_writes(SECONDARY_ATTRIBUTES);
+    fixture.editor_enters();
+    // Two questions about the cursor, with the cursor moved between them.
+    fixture.application_writes(b"\x1b[6n\x1b[2;5H\x1b[6n");
+    assert_eq!(
+        fixture.queued(),
+        vec![
+            ("reply", DEVICE_ATTRIBUTES_REPLY.to_vec()),
+            ("keys", b"x".to_vec()),
+            ("reply", CURSOR_REPORT.to_vec()),
+            ("reply", b"\x1b[2;5R".to_vec()),
+            ("reply", SECONDARY_ATTRIBUTES_REPLY.to_vec())
+        ]
     );
 }
 
