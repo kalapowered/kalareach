@@ -677,8 +677,8 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
 }
 
 /// KR-REQ-29.01, the part about machine-readable results: a run over a tree that ignores nothing
-/// reports every identifier it keys with a verdict and, for each test that keys it, the outcome and
-/// the comment form that keyed it.
+/// reports every identifier it keys with a verdict and, for each test that keys it, the outcome; a
+/// test keyed twice is recorded once, by its own comment.
 #[test]
 fn a_tree_with_nothing_ignored_reports_every_identifier_as_run() {
     let (document, _evidence) = run("forms").unwrap_or_else(|stopped| panic!("{stopped:?}"));
@@ -1794,9 +1794,9 @@ fn without_display(command: &str) -> String {
     words.join(" ")
 }
 
-/// KR-REQ-29.01, the part about reproducible commands: the steps the report plans for Windows are
-/// the tests and builds the landing workflow's Windows job runs, and the steps it plans for macOS
-/// leave out the cases that job leaves out.
+/// KR-REQ-29.01, the part about reproducible commands: the test steps the report plans for Windows
+/// are the tests the landing workflow's Windows job runs, its build steps are builds that job also
+/// runs, and the steps it plans for macOS leave out the cases that job leaves out.
 #[test]
 fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
     // Windows: every `cargo test` of the workflow's Windows job is a step, and every test step is

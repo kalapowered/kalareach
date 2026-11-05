@@ -216,10 +216,12 @@ fn planting_before(before: &'static [&'static str]) -> (Interposition, Planting)
 // The boundary runs on the platforms that can hold its guarantees; where it refuses, a Git
 // invocation is the refusal and there is nothing here to observe.
 /// KR-ACC-030, KR-REQ-14.23 and KR-REQ-14.24, the part about helpers planted after the repository's
-/// configuration was audited: the clean and smudge filters, the text conversion and the four hooks
-/// written into the repository between the audit and the spawn do not run during a status or a
+/// configuration was audited: the clean filters written into the repository and into the
+/// invocation's temporary directory between the audit and the spawn do not run during a status or a
 /// review refresh, and installed Git run over the same repository afterwards does run the planted
-/// filter. Not shown here: a planted file system monitor or pager.
+/// clean filter. The smudge filters, the text conversion and the four hooks are planted as well
+/// and none ran, though neither command calls a smudge filter or a text conversion. Not shown
+/// here: a planted external diff program, file system monitor or pager.
 #[cfg(unix)]
 #[test]
 fn a_driver_planted_after_the_audit_never_runs_during_a_status_or_a_review_refresh() {
@@ -295,9 +297,10 @@ fn a_driver_planted_after_the_audit_never_runs_during_a_status_or_a_review_refre
 // The boundary runs on the platforms that can hold its guarantees; where it refuses, a Git
 // invocation is the refusal and there is nothing here to observe.
 /// KR-REQ-14.23, the part about a worktree: the filters, the text conversion and the hooks planted
-/// after the audit do not run while a worktree is made for an isolated workspace, which either lands
-/// or is refused because the configuration changed under it. Not shown here: a planted file system
-/// monitor or pager.
+/// after the audit do not run while a worktree is made for an isolated workspace, whether it lands
+/// or is refused. Of the planted programs a checkout calls the smudge filters and the
+/// post-checkout hook. Not shown here: a planted external diff program, file system monitor or
+/// pager.
 #[cfg(unix)]
 #[test]
 fn a_driver_planted_after_the_audit_never_runs_during_a_worktree() {
@@ -363,8 +366,9 @@ fn a_driver_planted_after_the_audit_never_runs_during_a_worktree() {
 // invocation is the refusal and there is nothing here to observe.
 /// KR-REQ-14.23, the part about a clone: the filters, the text conversion and the hooks planted into
 /// the clone's own destination immediately before the checkout that populates it do not run during
-/// that checkout, and the same planting at the published name does make installed Git run the
-/// driver. Not shown here: a planted file system monitor or pager.
+/// that checkout, which calls the smudge filters and the post-checkout hook of them, and the same
+/// planting at the published name does make installed Git run the clean filter. Not shown here: a
+/// planted external diff program, file system monitor or pager.
 #[cfg(unix)]
 #[test]
 fn a_driver_planted_into_a_clones_own_destination_never_runs_during_its_checkout() {
@@ -432,8 +436,8 @@ fn a_driver_planted_into_a_clones_own_destination_never_runs_during_its_checkout
 // does not; a Windows test of the same claim needs its own shape and the platform to run it on.
 /// KR-ACC-030 and KR-REQ-14.06, the part about a tree put at a repository's name while a read runs:
 /// the read is refused as a changed source and not returned as if the tree at the name were the one
-/// that was opened, and the tree that took the name is neither read from nor written to. Not shown
-/// here: a linked worktree or a case alias.
+/// that was opened, and the tree that took the name is not written to and nothing from it is served.
+/// Not shown here: a linked worktree or a case alias.
 #[cfg(unix)]
 #[test]
 fn a_tree_substituted_at_the_path_is_not_what_a_read_is_taken_from() {
@@ -831,9 +835,9 @@ fn a_destination_substituted_before_the_spawn_is_not_one_this_operation_owns() {
     );
 }
 
-/// KR-REQ-14.23, the part about what an invocation may execute: a read executes Git and the helpers
-/// under Git's own directory and nothing else, and only an invocation that reaches a repository can
-/// start the shell Git builds its connection and its credential helper through.
+/// What an invocation may execute: the list for a read has one entry, and the list for an
+/// invocation that reaches a repository (a local path, ssh or https) holds the shell Git builds its
+/// connection and its credential helper through.
 #[test]
 #[cfg_attr(
     windows,

@@ -2011,9 +2011,12 @@ fn a_tree_goes_through_the_handle_that_was_checked_and_nothing_it_links_to_goes(
     );
 }
 
-/// KR-REQ-14.05 and KR-ACC-030, the part about a replaced directory and a removal that stops part
-/// way: a removal goes only through the object that was checked, refuses a replacement rather than
-/// emptying it, and a removal that stops says where and keeps what it removed.
+/// KR-REQ-14.05: a removal goes only through the object that was checked, refuses a replacement
+/// rather than emptying it, and a removal that stops says where and keeps what it removed.
+///
+/// KR-ACC-030, the part about a directory replaced under a removal: a different directory at the
+/// name, before the removal starts or at its end, is refused and left whole. Not shown here: a
+/// partial apply; a removal that stops part way is no apply.
 ///
 /// Three moments. Before it starts, a different directory at the name means nothing is removed at
 /// all. Part way, an entry it cannot take away stops it, and it reports the entry and how many

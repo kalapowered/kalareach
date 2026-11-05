@@ -209,11 +209,11 @@ struct Case {
     counter: u32,
 }
 
-/// KR-ACC-030 and KR-REQ-14.23, the part about the execution list on Windows: for each boundary
-/// account a program planted as a hook and a program a repository's configuration names as a clean
-/// filter never run, and Git reports that it could not start them; a hook script does not run for
-/// the checkout account, whose list holds no shell, and does for the connection account's; the
-/// person's account runs every one of them. Not shown here: a planted file system monitor or pager.
+/// The application-control policy, qualified in a guest: for each boundary account a program
+/// planted as a hook and a program a repository's configuration names as a clean filter never run,
+/// and Git reports that it could not start them; a hook script does not run for the checkout
+/// account, whose list holds no shell, and does for the connection account's; the person's account
+/// runs every one of them.
 #[test]
 #[ignore = "needs an elevated session in a disposable Windows guest where the application-control \
             policy and the two boundary accounts are in place, and it changes that guest's accounts \
