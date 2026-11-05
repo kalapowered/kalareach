@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::attach::{Attaching, TerminalInput};
 use crate::bridge::link::Link;
-use kr_client::error::refusal;
+use kr_client::error::{HostWord, refusal};
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_protocol::attachment::ViewportPosition;
@@ -817,11 +817,21 @@ fn ownership(
     }
 }
 
+/// How many times in a row a size the session did not take for now goes again with the session's
+/// next word. After that it waits for this terminal to be measured or pressed, so a session that
+/// keeps refusing is not asked once for every word it says.
+const RETRIES: u8 = 3;
+
 /// How the host answered one viewport report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Answer {
-    /// Refused: nothing changed.
+    /// Refused in the session's definite word: nothing changed, and the report is settled.
     Refused,
+    /// Not settled: the session refused for now, or could not say what became of the report. A
+    /// size is owed again, since a report states the size and the place, and sending it again
+    /// changes nothing a first one did not. A move, and a return to the live screen, are the
+    /// person's own keys: they are settled as not taken.
+    NotSettled,
     /// Accepted, with the revision the report left the window at, whether this terminal is now
     /// handed the stream, and where the window landed.
     Accepted {
@@ -829,6 +839,27 @@ enum Answer {
         direct: bool,
         landed: Option<u64>,
     },
+}
+
+/// What the session's answer to a viewport report is: the result it gave, or how the report is
+/// settled when it gave none. Only the session's definite word settles a refusal; one for now, or
+/// one that cannot say what became of the report, does not. A success that cannot be read changes
+/// nothing here.
+fn viewport_result(
+    outcome: kr_protocol::envelope::Outcome,
+) -> std::result::Result<kr_protocol::attachment::AttachmentViewportResult, Answer> {
+    match outcome {
+        kr_protocol::envelope::Outcome::Ok(value) => value
+            .to_typed::<kr_protocol::attachment::AttachmentViewportResult>()
+            .map_err(|_| Answer::Refused),
+        kr_protocol::envelope::Outcome::Error(error) => {
+            Err(if HostWord::of(error.code).is_definite() {
+                Answer::Refused
+            } else {
+                Answer::NotSettled
+            })
+        }
+    }
 }
 
 /// Where this terminal's window is, and the viewport reports it owes the session.
@@ -842,10 +873,11 @@ enum Answer {
 ///
 /// What goes next is one choice, and the command's loop asks for it at the top of every turn, so
 /// nothing owed waits on an event that does not come: a return to the live screen, then the
-/// question a refused resize leaves owed, then the newest size if it is not the one last sent,
-/// then the next run of moves. Nothing goes while a report is in flight, while no screen is held
-/// to measure a move from, while a new subscription is being asked for, or once the session has
-/// said it is closing. Holding every report while a subscription is asked for is what lets that
+/// question a refused resize leaves owed, then the newest size if it is not the one last sent or
+/// if a report of it was not settled, then the next run of moves. Nothing goes while a report is
+/// in flight, while no screen is held to measure a move from, while a new subscription is being
+/// asked for, while a size the session did not take for now rests, or once the session has said it
+/// is closing. Holding every report while a subscription is asked for is what lets that
 /// subscription's first delivery settle the report in flight: it can only have been sent before.
 #[derive(Debug)]
 struct WindowReports {
@@ -870,6 +902,15 @@ struct WindowReports {
     size: Dimensions,
     /// The size the last report carried.
     size_sent: Dimensions,
+    /// Whether the newest size is owed to the session whatever the size last sent was, because a
+    /// report of it was not settled. The session may have the size of that report, so even the
+    /// size last sent has to be said again.
+    size_owed: bool,
+    /// Whether a size the session did not take for now waits for something to arrive before it
+    /// goes again, so that a session that keeps saying so is not asked in a loop.
+    resting: bool,
+    /// How many size reports in a row the session did not take for now.
+    not_taken_in_a_row: u8,
     /// Moves not yet sent, in runs: neighbouring moves in one direction merge, and a reversal
     /// starts a new run, so a movement the window cannot make at a limit takes nothing else with it.
     runs: std::collections::VecDeque<i64>,
@@ -886,6 +927,12 @@ struct InFlight {
     request: Option<kr_protocol::ids::RequestId>,
     /// The revision its answer named, once it has one and until a screen naming it arrives.
     awaiting: Option<u64>,
+    /// Whether it carries moves, or the return to the live screen: the person's own keys. A report
+    /// that carries neither carries the size, or asks the question a refused resize leaves owed.
+    moves: bool,
+    /// Whether this terminal was measured or pressed after the report went: a word the window does
+    /// not rest from, whatever the session answers.
+    spoke: bool,
 }
 
 impl WindowReports {
@@ -901,6 +948,9 @@ impl WindowReports {
             question_owed: false,
             size,
             size_sent: size,
+            size_owed: false,
+            resting: false,
+            not_taken_in_a_row: 0,
             runs: std::collections::VecDeque::new(),
             step: 1,
             closing: false,
@@ -922,11 +972,32 @@ impl WindowReports {
             _ if steps != 0 => self.runs.push_back(steps),
             _ => {}
         }
+        self.spoke();
     }
 
-    /// This terminal's size changed.
+    /// This terminal's size changed. Whatever the session did not take for now goes again with the
+    /// next report chosen.
     const fn measured(&mut self, size: Dimensions) {
         self.size = size;
+        self.spoke();
+    }
+
+    /// The session said something. A size it did not take for now goes again, as long as it has not
+    /// failed to take it more than [`RETRIES`] times in a row since this terminal last spoke.
+    const fn heard(&mut self) {
+        if self.not_taken_in_a_row <= RETRIES {
+            self.resting = false;
+        }
+    }
+
+    /// This terminal spoke: a new start for whatever waits. A report in flight is told, so that its
+    /// answer does not make this terminal's word wait.
+    const fn spoke(&mut self) {
+        self.resting = false;
+        self.not_taken_in_a_row = 0;
+        if let Some(flight) = self.in_flight.as_mut() {
+            flight.spoke = true;
+        }
     }
 
     /// This terminal gave the session its size as the owner, which tells the session without a
@@ -934,12 +1005,15 @@ impl WindowReports {
     const fn took_size(&mut self, size: Dimensions) {
         self.size = size;
         self.size_sent = size;
+        self.size_owed = false;
+        self.spoke();
     }
 
     /// A resize was refused because somebody else owns the size, or owns it at another epoch.
     const fn owe_question(&mut self, size: Dimensions) {
         self.size = size;
         self.question_owed = true;
+        self.spoke();
     }
 
     /// The person typed while following the live screen, which takes the window back to it. That
@@ -947,6 +1021,7 @@ impl WindowReports {
     fn return_to_live(&mut self) {
         self.return_owed = true;
         self.runs.clear();
+        self.spoke();
     }
 
     /// A screen arrived whole: the revision of the window it is drawn for, and where it puts the
@@ -997,13 +1072,15 @@ impl WindowReports {
 
     /// The report to send now, if any. It is in flight from here until it settles.
     fn next(&mut self) -> Option<Sending> {
-        if self.closing || self.recovering || self.in_flight.is_some() {
+        if self.closing || self.recovering || self.in_flight.is_some() || self.resting {
             return None;
         }
         let record = self.record?;
         let place = record.map(|row| ViewportPosition::Row(U64::new(row)));
+        let mut moves = false;
         let sending = if self.return_owed {
             self.return_owed = false;
+            moves = true;
             Sending {
                 dimensions: self.size,
                 position: None,
@@ -1015,7 +1092,7 @@ impl WindowReports {
                 dimensions: self.size,
                 position: place,
             }
-        } else if self.size != self.size_sent {
+        } else if self.size != self.size_sent || self.size_owed {
             Sending {
                 dimensions: self.size,
                 position: place,
@@ -1026,6 +1103,7 @@ impl WindowReports {
                 // A movement the window cannot make is spent here, inside the same choice, so the
                 // run behind it goes now rather than waiting for something else to happen.
                 if let Some(position) = scrolled(record, run, self.step) {
+                    moves = true;
                     break Sending {
                         dimensions: self.size,
                         position,
@@ -1034,9 +1112,12 @@ impl WindowReports {
             }
         };
         self.size_sent = sending.dimensions;
+        self.size_owed = false;
         self.in_flight = Some(InFlight {
             request: None,
             awaiting: None,
+            moves,
+            spoke: false,
         });
         Some(sending)
     }
@@ -1050,11 +1131,13 @@ impl WindowReports {
 
     /// The session answered one of this terminal's viewport reports.
     ///
-    /// A refusal settles it and changes nothing. An answer that hands this terminal the stream
-    /// settles it where that answer says the window landed, which for a terminal handed the stream
-    /// is the live screen's origin. Any other answer settles it only once a screen naming its
-    /// revision, or a later one, has arrived, whether that screen came before the answer or comes
-    /// after it.
+    /// A definite refusal settles it and changes nothing. An answer that is neither that nor an
+    /// acceptance settles a move the same way, but not a size: the newest size is owed again, with
+    /// the next word from the session or from this terminal, or at once when this terminal spoke
+    /// while the report was in flight. An answer that hands this terminal the stream settles it
+    /// where that answer says the window landed, which for a terminal handed the stream is the live
+    /// screen's origin. Any other answer settles it only once a screen naming its revision, or a
+    /// later one, has arrived, whether that screen came before the answer or comes after it.
     fn answered(&mut self, request: kr_protocol::ids::RequestId, answer: Answer) {
         let ours = self
             .in_flight
@@ -1062,7 +1145,13 @@ impl WindowReports {
         match answer {
             Answer::Refused => {
                 if ours {
+                    self.not_taken_in_a_row = 0;
                     self.in_flight = None;
+                }
+            }
+            Answer::NotSettled => {
+                if ours {
+                    self.not_taken();
                 }
             }
             Answer::Accepted {
@@ -1071,6 +1160,9 @@ impl WindowReports {
                 landed: at,
             } => {
                 self.answered = self.answered.max(window_revision);
+                if ours {
+                    self.not_taken_in_a_row = 0;
+                }
                 if !ours {
                     return;
                 }
@@ -1088,6 +1180,27 @@ impl WindowReports {
                 }
             }
         }
+    }
+
+    /// The session did not take the report in flight for now, or could not say what became of it.
+    fn not_taken(&mut self) {
+        let Some(flight) = self.in_flight.take() else {
+            return;
+        };
+        if flight.moves {
+            // A move, or a return to the live screen, is the person's own key and is not made later
+            // on their behalf: it is settled as not taken, and the next key asks for it again. A
+            // size report made at the old place after an outcome the session could not say would
+            // put the window back where the key took it from.
+            self.not_taken_in_a_row = 0;
+            return;
+        }
+        // A size the session did not take is not settled: the newest size is owed again, whatever
+        // the size last sent was, since the session may have taken the one this report carried. It
+        // waits for something to arrive, unless this terminal spoke while the report was in flight.
+        self.size_owed = true;
+        self.not_taken_in_a_row = self.not_taken_in_a_row.saturating_add(1);
+        self.resting = !flight.spoke;
     }
 }
 
@@ -1906,6 +2019,10 @@ async fn drive(
                 }
             }
             message = client.recv() => {
+                // Whatever the session says lets a size it did not take for now go again.
+                if message.is_ok() {
+                    window.heard();
+                }
                 match message {
                     Ok(ControlFrame::Notification(notification)) => {
                         // The session has closed, and this is how. It is the last thing the stream
@@ -2136,16 +2253,12 @@ async fn drive(
                             // the answer: an answer can arrive before that screen, and after one
                             // drawn for an earlier window.
                             (Outstanding::Window, outcome) => {
-                                let result = match outcome {
-                                    kr_protocol::envelope::Outcome::Ok(value) => value
-                                        .to_typed::<kr_protocol::attachment::AttachmentViewportResult>(
-                                        )
-                                        .ok(),
-                                    kr_protocol::envelope::Outcome::Error(_) => None,
-                                };
-                                let Some(result) = result else {
-                                    window.answered(answered, Answer::Refused);
-                                    continue;
+                                let result = match viewport_result(outcome) {
+                                    Ok(result) => result,
+                                    Err(answer) => {
+                                        window.answered(answered, answer);
+                                        continue;
+                                    }
                                 };
                                 window.answered(
                                     answered,
@@ -2785,15 +2898,15 @@ mod tests {
         Answer, AttachOutcome, Fallback, Heard, Outstanding, Ownership, SCROLL_BACK_KEY,
         SCROLL_FORWARD_KEY, Sending, Spelling, Subscriptions, WindowReports,
         after_the_reader_stops, drop_unseen_releases, landed, ownership, presses,
-        resizes_in_flight, scroll_keys, scroll_step, scrolled, take_scroll_keys,
+        resizes_in_flight, scroll_keys, scroll_step, scrolled, take_scroll_keys, viewport_result,
     };
     #[cfg(unix)]
     use crate::error::CliError;
+    use kr_client::error::HostWord;
     #[cfg(unix)]
     use kr_client::error::refusal;
     use kr_client::shown::Shown;
     use kr_protocol::attachment::ViewportPosition;
-    #[cfg(unix)]
     use kr_protocol::error::ErrorCode;
     #[cfg(unix)]
     use kr_protocol::method::Method;
@@ -4969,6 +5082,176 @@ mod tests {
         window.installed(1, Some(477));
         let next = send(&mut window, 3).expect("the size goes");
         assert_eq!((next.dimensions, next.position), (size(100, 30), row(477)));
+    }
+
+    /// A size the session does not take for now is not settled: it is said again with the
+    /// session's next word, whatever size was last sent, and not said again once it is taken. The
+    /// control is the session's definite refusal, which settles the report and changes nothing.
+    #[test]
+    fn a_size_the_session_did_not_take_for_now_goes_again_with_its_next_word() {
+        let mut window = WindowReports::new(size(80, 24));
+        window.installed(0, None);
+        window.measured(size(100, 30));
+        let first = send(&mut window, 1).expect("the size goes");
+        assert_eq!((first.dimensions, first.position), (size(100, 30), None));
+        window.answered(request(1), Answer::NotSettled);
+        assert_eq!(
+            window.next(),
+            None,
+            "it rests until the session says something"
+        );
+        window.heard();
+        let again = send(&mut window, 2).expect("the size goes again, though it is the size sent");
+        assert_eq!((again.dimensions, again.position), (size(100, 30), None));
+        window.answered(request(2), accepted(0, None));
+        window.heard();
+        assert_eq!(
+            window.next(),
+            None,
+            "a size the session took is not said again"
+        );
+        window.measured(size(90, 20));
+        assert!(
+            send(&mut window, 3).is_some(),
+            "and nothing stays in flight behind it"
+        );
+
+        let mut window = WindowReports::new(size(80, 24));
+        window.installed(0, None);
+        window.measured(size(100, 30));
+        send(&mut window, 1).expect("the size goes");
+        window.answered(request(1), Answer::Refused);
+        window.heard();
+        assert_eq!(window.next(), None, "a definite refusal settles the report");
+        window.measured(size(90, 20));
+        assert!(
+            send(&mut window, 2).is_some(),
+            "and nothing stays in flight behind it"
+        );
+    }
+
+    /// A session that keeps refusing a size for now is asked again with its next word up to three
+    /// times in a row, and then not until this terminal is measured or pressed.
+    #[test]
+    fn a_session_that_keeps_refusing_a_size_for_now_waits_for_the_terminal_after_three_tries() {
+        let mut window = WindowReports::new(size(80, 24));
+        window.installed(0, None);
+        window.measured(size(100, 30));
+        send(&mut window, 1).expect("the size goes");
+        for id in 2..=4 {
+            window.answered(request(id - 1), Answer::NotSettled);
+            window.heard();
+            send(&mut window, id).expect("and again with the session's next word");
+        }
+        window.answered(request(4), Answer::NotSettled);
+        window.heard();
+        assert_eq!(
+            window.next(),
+            None,
+            "three tries in a row, and the session's words no longer bring it"
+        );
+        window.measured(size(100, 31));
+        let measured = send(&mut window, 5).expect("a measure of the terminal does");
+        assert_eq!(measured.dimensions, size(100, 31));
+        window.answered(request(5), Answer::NotSettled);
+        window.heard();
+        assert!(send(&mut window, 6).is_some(), "and starts the tries again");
+    }
+
+    /// What this terminal does while a size report is in flight is not made to wait behind the rest
+    /// the refusal leaves, and a size measured back to the one sent is still owed.
+    #[test]
+    fn what_the_terminal_does_during_a_size_report_the_session_did_not_take_goes_at_once() {
+        let mut window = WindowReports::new(size(80, 24));
+        window.installed(0, None);
+        window.measured(size(100, 30));
+        send(&mut window, 1).expect("the size goes");
+        window.measured(size(90, 20));
+        window.measured(size(100, 30));
+        window.answered(request(1), Answer::NotSettled);
+        let at_once = send(&mut window, 2).expect("the terminal spoke meanwhile, so no rest");
+        assert_eq!(
+            at_once.dimensions,
+            size(100, 30),
+            "the size is owed though the terminal measured back to the one the report carried"
+        );
+
+        let mut window = parked_at_477();
+        window.measured(size(100, 30));
+        send(&mut window, 2).expect("the size goes");
+        window.pressed(1, 23, size(100, 30));
+        window.answered(request(2), Answer::NotSettled);
+        let size_again = send(&mut window, 3).expect("a press meanwhile ends the rest");
+        assert_eq!(
+            (size_again.dimensions, size_again.position),
+            (size(100, 30), row(477)),
+            "the size goes first, with the window where it is"
+        );
+    }
+
+    /// A move is the person's own key: a move the session did not take for now is settled as not
+    /// taken and is not made again, and the size it carried was already the session's.
+    #[test]
+    fn a_move_the_session_did_not_take_for_now_is_settled_and_not_made_later() {
+        let mut window = parked_at_477();
+        window.pressed(1, 23, size(80, 24));
+        let moved = send(&mut window, 2).expect("the next page back");
+        assert_eq!(moved.position, row(454));
+        window.answered(request(2), Answer::NotSettled);
+        window.heard();
+        assert_eq!(window.next(), None, "it is not made again");
+        window.pressed(1, 23, size(80, 24));
+        assert_eq!(
+            send(&mut window, 3).map(|sending| sending.position),
+            Some(row(454)),
+            "the person presses again, from where the window is"
+        );
+    }
+
+    /// A return to the live screen is the person's own key, like a move: one the session did not
+    /// take for now is settled as not taken, and no size is sent at the row the window was at,
+    /// which would take the window back from where the key put it. The next key asks again.
+    #[test]
+    fn a_return_the_session_did_not_take_for_now_is_settled_and_not_made_later() {
+        let mut window = parked_at_477();
+        window.return_to_live();
+        let back = send(&mut window, 2).expect("the return");
+        assert_eq!(back.position, None);
+        window.answered(request(2), Answer::NotSettled);
+        window.heard();
+        assert_eq!(
+            window.next(),
+            None,
+            "nothing goes, though no screen has said where the window is"
+        );
+        window.return_to_live();
+        assert_eq!(
+            send(&mut window, 3).map(|sending| sending.position),
+            Some(None),
+            "the next key asks for the return again"
+        );
+    }
+
+    /// A refusal of a viewport report settles it only in the session's definite word: the retry
+    /// category of the code tells, whichever the code is. A success that cannot be read is no
+    /// answer the session's word can be read from.
+    #[test]
+    fn a_viewport_report_is_settled_by_a_refusal_only_in_the_definite_word() {
+        use kr_protocol::envelope::{Outcome, ParamsValue};
+        use kr_protocol::error::ProtocolError;
+        for code in ErrorCode::ALL {
+            let answer = viewport_result(Outcome::Error(ProtocolError::new(*code, "said")))
+                .expect_err("a refusal gives no result");
+            let expected = if HostWord::of(*code).is_definite() {
+                Answer::Refused
+            } else {
+                Answer::NotSettled
+            };
+            assert_eq!(answer, expected, "{code:?}");
+        }
+        let unreadable = viewport_result(Outcome::Ok(ParamsValue::empty()))
+            .expect_err("an empty result is not a viewport answer");
+        assert_eq!(unreadable, Answer::Refused);
     }
 
     /// The report a refused resize leaves this terminal owing goes whatever its size, even the
