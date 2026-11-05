@@ -110,7 +110,10 @@ pub struct BridgeHost {
     pub applications: Vec<ApplicationDirectory>,
     /// Where an application's executables are looked for.
     pub search_path: Vec<PathBuf>,
-    /// The forwarder this installation's registrations are expected to start.
+    /// The forwarder this installation's registrations are expected to start: the path an update
+    /// keeps current, where the forwarder was there when this host was built. A registration is
+    /// planned from it without looking at the file again, which for a path through `current` would
+    /// be a second walk through a link a switch replaces.
     pub forwarder: Option<PathBuf>,
     /// Signed qualification records this host's own tests stand in for, read beside the ones a
     /// release carries. No shipped build has the field.
@@ -835,7 +838,7 @@ impl NativeBridges {
             .host
             .forwarder
             .clone()
-            .filter(|path| path.is_absolute() && path.is_file())
+            .filter(|path| path.is_absolute())
             .ok_or_else(|| {
                 format!(
                     "this installation has no {FORWARDER} beside its daemon, so the registration \
