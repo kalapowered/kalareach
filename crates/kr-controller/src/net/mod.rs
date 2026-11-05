@@ -698,6 +698,8 @@ impl NetworkHost {
             {
                 break;
             }
+            #[cfg(feature = "testing")]
+            controller.after_a_frame_is_answered.wait().await;
         }
         relay.abort();
     }

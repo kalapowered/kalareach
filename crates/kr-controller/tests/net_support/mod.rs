@@ -1148,6 +1148,20 @@ impl Host {
         self.controller.pause_after_the_worker_answered()
     }
 
+    /// Arms the pause the connection of a paired device stops at once it has answered its next
+    /// frame, before it goes on to the one after. A connection the authority feed's refusal has
+    /// cut from its worker ends there, and closes under an answer the device has not yet read;
+    /// held at the pause, it ends only when the pause is let go. Returns the end that says the
+    /// answer has been written, and the end that lets the connection go on. The pause fires once.
+    pub fn pause_after_a_frame_is_answered(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.controller.pause_after_a_frame_is_answered()
+    }
+
     /// Connects one local client on the daemon's own socket.
     pub async fn client(&self) -> LocalClient {
         LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build())
