@@ -469,10 +469,10 @@ impl Guard {
 }
 
 /// The steps that scan, by workflow and name. Two scans share a step with other commands, which
-/// the case holds to a plain run of them. The Windows `release` job, which signs and publishes,
-/// scans nothing it packs: the trees it takes were scanned by the `build` job, and the signing
-/// changes the files (`docs/releases/keys.md` names the gap).
-static GUARDS: [(&str, &str, Guard); 8] = [
+/// the case holds to a plain run of them. The Windows `release` job scans the trees it restored the
+/// signed files into, and the archives it packs from them, with a step each: the signing changes
+/// the files the `build` job scanned.
+static GUARDS: [(&str, &str, Guard); 10] = [
     (
         "release-tree.yml",
         "Refuse a private key in the tree",
@@ -525,11 +525,27 @@ static GUARDS: [(&str, &str, Guard); 8] = [
             false,
         ),
     ),
+    (
+        "release-windows.yml",
+        "Refuse a private key in the signed trees",
+        Guard::Scan(
+            r#"python scripts/check-release-secrets.py scan "$(cygpath -m "$RUNNER_TEMP")/unsigned""#,
+            true,
+        ),
+    ),
+    (
+        "release-windows.yml",
+        "Refuse a private key in the signed archives",
+        Guard::Scan(
+            r#"python scripts/check-release-secrets.py scan "$(cygpath -m "$RUNNER_TEMP")/release""#,
+            true,
+        ),
+    ),
 ];
 
 /// For each step of `GUARDS` after which something is kept, the steps that pack, keep or upload
 /// what the job assembled, which have to come after it in the same job.
-static KEPT: [(&str, &str, &[&str]); 7] = [
+static KEPT: [(&str, &str, &[&str]); 9] = [
     (
         "release-tree.yml",
         "Refuse a private key in the tree",
@@ -577,6 +593,16 @@ static KEPT: [(&str, &str, &[&str]); 7] = [
         "Pack the archive and hold it to what a host stages",
         &["Keep the archive this run proved"],
     ),
+    (
+        "release-windows.yml",
+        "Refuse a private key in the signed trees",
+        &["Pack what the gate accepted"],
+    ),
+    (
+        "release-windows.yml",
+        "Refuse a private key in the signed archives",
+        &["Keep the signed archives", "Publish the release"],
+    ),
 ];
 
 /// What a step that keeps is held to, so that it keeps what its scan read and no more.
@@ -590,7 +616,7 @@ enum Holds {
 /// The steps that keep, and what each keeps: the path or the command that the file holds today,
 /// which the scan of its job read or is taken to have read. A path is not derived from the scan's:
 /// the Windows tree upload keeps `tree`, the directory above the scanned `tree/$TOP`.
-static HOLDS: [(&str, &str, Holds); 13] = [
+static HOLDS: [(&str, &str, Holds); 18] = [
     (
         "release-tree.yml",
         "Keep the tree for a release",
@@ -659,6 +685,35 @@ static HOLDS: [(&str, &str, Holds); 13] = [
         "release-windows.yml",
         "Keep the archive this run proved",
         Holds::Path("${{ runner.temp }}/archive"),
+    ),
+    (
+        "release-windows.yml",
+        "Pack what the gate accepted",
+        Holds::Command(r#"temp="$(cygpath -m "$RUNNER_TEMP")""#),
+    ),
+    (
+        "release-windows.yml",
+        "Pack what the gate accepted",
+        Holds::Command(
+            r#"tree="$(ls -d "$temp"/unsigned/unsigned-kalareach-"$target"-*/kalareach-"$target"-*)""#,
+        ),
+    ),
+    (
+        "release-windows.yml",
+        "Pack what the gate accepted",
+        Holds::Command(
+            r#"python scripts/pack-release-zip.py pack --tree "$tree" --out "$temp/release""#,
+        ),
+    ),
+    (
+        "release-windows.yml",
+        "Pack what the gate accepted",
+        Holds::Command(r#"echo "directory=$temp/release" >> "$GITHUB_OUTPUT""#),
+    ),
+    (
+        "release-windows.yml",
+        "Keep the signed archives",
+        Holds::Path("${{ runner.temp }}/release"),
     ),
 ];
 
@@ -1748,11 +1803,13 @@ fn a_step_that_keeps_more_than_its_scan_read_is_refused() {
                 mutant.replace_in_step(step, &format!("path: {path}"), "path: ${{ runner.temp }}");
             }
             Holds::Command(command) => {
-                mutant.replace_in_step(
-                    step,
-                    command,
-                    &command.replacen("$RUNNER_TEMP", "$HOME", 1),
-                );
+                // The temporary folder, named as the step names it, is put somewhere else.
+                let variable = if command.contains("$RUNNER_TEMP") {
+                    "$RUNNER_TEMP"
+                } else {
+                    "$temp"
+                };
+                mutant.replace_in_step(step, command, &command.replacen(variable, "$HOME", 1));
             }
         }
         mutant.is_refused_as(Refusal::KeptPath);

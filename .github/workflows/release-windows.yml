@@ -19,7 +19,9 @@ name: release-windows
 # It takes the trees the `build` job made, signs the files that carry a signature, holds each of them
 # to what a release requires, and then writes each manifest again, since signing changed the files,
 # and signs it with the production channel's release keys. No workflow can use those keys, so the job
-# stops there with a named refusal.
+# stops there with a named refusal. Past that step the job reads each signed tree for a private key
+# before it packs it, and each archive it packs before it keeps or publishes it, since signing changed
+# the files the `build` job read.
 #
 # The signing key is an Azure Artifact Signing key. It stays inside the service, in hardware, and
 # what comes back over the wire is a signature: no copy of it exists in this repository, on a
@@ -616,6 +618,12 @@ jobs:
           Write-Host "::error::the production channel's release keys are not available to this workflow, so this release cannot be signed. Publishing a Windows release waits for the key ceremony, which is the project owner's to hold. Every step before this one ran and passed."
           exit 1
 
+      # Both trees, with the signed files back in them and the manifests written again, are read for
+      # a private key before anything is packed from them.
+      - name: Refuse a private key in the signed trees
+        shell: bash
+        run: python scripts/check-release-secrets.py scan "$(cygpath -m "$RUNNER_TEMP")/unsigned"
+
       # Each tree is packed, and each archive is read as a host stages one: every member against the
       # manifest it carries.
       - name: Pack what the gate accepted
@@ -629,6 +637,12 @@ jobs:
             python scripts/check-release-archive.py check --archive "$temp/release/$(basename "$tree").zip" --sums "$temp/release/SHA256SUMS"
           done
           echo "directory=$temp/release" >> "$GITHUB_OUTPUT"
+
+      # What is kept and published is the archives, so they are read member by member as well, before
+      # the sums are checked, kept or uploaded.
+      - name: Refuse a private key in the signed archives
+        shell: bash
+        run: python scripts/check-release-secrets.py scan "$(cygpath -m "$RUNNER_TEMP")/release"
 
       # The two records people check a download with, held to what their checkers read before
       # anything can upload them: SHA256SUMS beside the archives, and each tree's signatures.txt
