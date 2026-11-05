@@ -1,11 +1,10 @@
 //! What an attachment is granted, against the grant the device holds.
 //!
-//! Requirement rows: KR-REQ-08.68 and KR-REQ-23.35 for the paired-device ingress, and KR-REQ-10.41
-//! for the rule those two rest on. Section 8 says an attachment's granted capabilities are the
-//! requested ones intersected with the actor's rights; section 10 says capabilities describe
-//! feasibility and never authority, so asking for one is not holding it. The worker is where an
-//! attachment is admitted, so the intersection is made here, out of the rights the host checked
-//! the request against.
+//! For the paired-device ingress, and for the rule it rests on: section 8 says an attachment's
+//! granted capabilities are the requested ones intersected with the actor's rights; section 10 says
+//! capabilities describe feasibility and never authority, so asking for one is not holding it. The
+//! worker is where an attachment is admitted, so the intersection is made here, out of the rights
+//! the host checked the request against.
 //!
 //! The four grants are the four default session roles of section 25, written as the rights they
 //! compile to: a role is a way of choosing rights, and the host decides from the rights alone.
