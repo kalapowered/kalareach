@@ -5166,9 +5166,9 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// On Windows the question is asked of the file's access-control list: a configuration file
-    /// that the Everyone group may write is refused with the list's reason, and a file only its
-    /// owner may reach is read. `WD` is the Everyone group and `OW` the owner.
+    /// KR-REQ-26.13: on Windows the question is asked of the file's access-control list: a
+    /// configuration file that the Everyone group may write is refused with the list's reason, and a
+    /// file only its owner may reach is read. `WD` is the Everyone group and `OW` the owner.
     #[cfg(windows)]
     #[test]
     fn a_configuration_file_another_account_may_write_is_refused_on_windows() {
@@ -5192,5 +5192,62 @@ mod tests {
         let file = std::fs::File::open(&narrow).expect("opened");
         assert_eq!(check_configuration_file(&file), Ok(()), "the control");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// KR-REQ-26.13: on Windows a configuration file that another account owns is refused, though
+    /// its list names nobody this machine does not already trust, and the host's reader returns none
+    /// of its contents; a file this account made beside it is read. The local system account owns
+    /// the refused file: it is an account this process could not have created a file as, and the
+    /// list it inherited from the directory still names this account, which is what lets it be
+    /// opened to be asked.
+    #[cfg(windows)]
+    #[test]
+    fn a_configuration_file_another_account_owns_is_refused_on_windows() {
+        use kr_protocol::hostinfo::configuration::{FileRefusal, read_file};
+
+        let directory = Inheriting::new("configuration-owner");
+        let own = directory.file("own.json");
+        let theirs = directory.file("theirs.json");
+        run(
+            "icacls.exe",
+            &[
+                theirs.as_os_str(),
+                "/setowner".as_ref(),
+                "*S-1-5-18".as_ref(),
+            ],
+        );
+
+        let file = std::fs::File::open(&own).expect("opened");
+        assert_eq!(
+            check_configuration_file(&file),
+            Ok(()),
+            "the control: a file this account made"
+        );
+        let file = std::fs::File::open(&theirs).expect("opened");
+        assert!(
+            matches!(
+                check_configuration_file(&file),
+                Err(FileRefusal::AccessList(ref detail))
+                    if detail.contains("belongs to")
+                        && detail.contains("this host runs as another account")
+            ),
+            "{:?}",
+            check_configuration_file(&file)
+        );
+
+        // The host's reader asks the same question of the handle it opened, before it reads.
+        assert_eq!(
+            read_file(&own, 1024, check_configuration_file).expect("a file of this account's"),
+            Some(b"own.json".to_vec()),
+            "the control is read"
+        );
+        let refused = read_file(&theirs, 1024, check_configuration_file)
+            .expect_err("a file of another account's");
+        assert!(
+            refused
+                .as_str()
+                .contains("refused by its access-control list"),
+            "{refused}"
+        );
     }
 }
