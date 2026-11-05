@@ -4378,7 +4378,7 @@ impl Idle {
     /// The environment as a release one version ahead of this build leaves it: the registry
     /// labelled with the schema after this build's, and the configuration document at the version
     /// after this build's. Returns where the document is.
-    fn as_the_next_release_left_it(self) -> (Self, PathBuf) {
+    fn left_by_the_next_release(self) -> (Self, PathBuf) {
         let document = kr_cli::doctor::configuration::document_path(&self.temp.environment());
         kr_ipc::paths::write_owner_only_file(
             &document,
@@ -4403,7 +4403,7 @@ async fn an_update_back_to_the_release_that_wrote_the_next_versions_reads_them_a
     let two =
         Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).reading(writing_the_next_versions());
     let (host, _one, two, archive) = host_to_update_to(two).await;
-    let (idle, document) = Idle::new(&host.store).as_the_next_release_left_it();
+    let (idle, document) = Idle::new(&host.store).left_by_the_next_release();
     let before = idle.records();
 
     let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
@@ -4447,7 +4447,7 @@ async fn a_rollback_over_the_next_versions_is_refused_unless_the_release_reads_t
         let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
         host.install(&two);
         host.put(&one);
-        let (idle, document) = Idle::new(&host.store).as_the_next_release_left_it();
+        let (idle, document) = Idle::new(&host.store).left_by_the_next_release();
         let before = idle.records();
 
         let (output, said) = host.roll_back_to(&one);
