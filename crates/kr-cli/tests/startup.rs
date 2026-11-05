@@ -2,22 +2,25 @@
 //! through the user's own service manager, under the service start.
 //!
 //! What these establish, with the real `kr`, `kr-controller` and `kr-worker` on a real environment
-//! tree. KR-REQ-07.12: with the standalone start selected and no daemon running, `kr new` starts
-//! one, detached from itself: in a session and a process group of its own, with no controlling
-//! terminal and none of the command's own streams, working in the environment's own directory.
-//! Then it goes on as it would against a daemon that was already there. Three commands starting one
-//! at once leave one daemon, at one generation, holding every session they created. A daemon that
-//! does not come up within the bound ends the command with a failure of its own name and leaves no
-//! second daemon, whether it cannot take the environment or is slow to start; a slow one is left to
-//! come up and is then used. The start is selected by a command that needs no daemon, on a host
-//! where none has ever run, and `kr doctor` reports it with the document it came from.
-//! KR-REQ-07.13: with the start selected, neither the command that selects it nor the `kr new`
-//! that starts the daemon runs a service-manager, lingering or privilege tool, and the daemon it
-//! starts runs, while it starts, nothing but read-only queries of the service manager (and, when it
-//! is started inside a service this host started, the one transient scope it moves itself into);
-//! once it serves, with a manager to ask, it launches its workers as transient services. Nothing is
-//! written in the home they are given. KR-REQ-08.02: `kr status` on a session the started daemon holds reports each
-//! terminal attachment's presentation and the reason for it.
+//! tree. With the standalone start selected and no daemon running, `kr new` starts one, detached
+//! from itself: in a session and a process group of its own, with no controlling terminal and none
+//! of the command's own streams, working in the environment's own directory. Then it goes on as it
+//! would against a daemon that was already there. Three commands starting one at once leave one
+//! daemon, at one generation, holding every session they created. A daemon that does not come up
+//! within the bound ends the command with a failure of its own name and leaves no second daemon,
+//! whether it cannot take the environment or is slow to start; a slow one is left to come up and is
+//! then used. The start is selected by a command that needs no daemon, on a host where none has
+//! ever run, and `kr doctor` reports it with the document it came from.
+//!
+//! With the start selected, neither the command that selects it nor the `kr new` that starts the
+//! daemon runs a service-manager, lingering or privilege tool, and the daemon it starts runs, while
+//! it starts, nothing but read-only queries of the service manager (and, when it is started inside
+//! a service this host started, the one transient scope it moves itself into); once it serves, with
+//! a manager to ask, it launches its workers as transient services. Nothing is written in the home
+//! they are given.
+//!
+//! `kr status` on a session the started daemon holds reports each terminal attachment's
+//! presentation and the reason for it.
 //!
 //! The installation is laid out the way a package lays it out: `kr`, its restoration guard, the
 //! daemon and the worker side by side on the internal disk, where `kr` finds the daemon beside
@@ -32,18 +35,18 @@
 //! signalled after it could have passed to something else, and the test process signals nothing.
 //! Every runtime and state directory is inside the test's own temporary tree.
 //!
-//! The service start. KR-REQ-07.12 and KR-REQ-26.04: `kr host startup --set service` writes the
-//! definition of a per-user service in the home it is given, records it and has the service
-//! manager take it; three `kr new` commands at once then converge on the one daemon the manager
-//! starts, whose parent is the manager; `kr doctor` reports that the definition matches; `--clear`
-//! removes the definition and its record and the daemon keeps serving; and a definition kr did not
-//! write, one changed since, or one that has gone is named and never replaced. The installation for
-//! these has the real daemon behind a script that hands over to it with `exec`, so the process the
-//! manager starts is the daemon itself. On macOS the manager is launchd, and the definition, in the
-//! test's own home, is loaded under a label that names the test's own environment. On Linux it is a
-//! user manager of the test's own, run in a delegated scope with the test's home as its home, so it
-//! reads the definition from there; ending the scope ends everything it started. A host with no
-//! user manager says why these did not run, unless `KR_REQUIRE_SERVICE_MANAGER` is set.
+//! The service start. `kr host startup --set service` writes the definition of a per-user service
+//! in the home it is given, records it and has the service manager take it; three `kr new`
+//! commands at once then converge on the one daemon the manager starts, whose parent is the
+//! manager; `kr doctor` reports that the definition matches; `--clear` removes the definition and
+//! its record and the daemon keeps serving; and a definition kr did not write, one changed since,
+//! or one that has gone is named and never replaced. The installation for these has the real
+//! daemon behind a script that hands over to it with `exec`, so the process the manager starts is
+//! the daemon itself. On macOS the manager is launchd, and the definition, in the test's own home,
+//! is loaded under a label that names the test's own environment. On Linux it is a user manager of
+//! the test's own, run in a delegated scope with the test's home as its home, so it reads the
+//! definition from there; ending the scope ends everything it started. A host with no user manager
+//! says why these did not run, unless `KR_REQUIRE_SERVICE_MANAGER` is set.
 
 #![cfg(unix)]
 
