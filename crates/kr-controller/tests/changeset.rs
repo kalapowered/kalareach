@@ -1,10 +1,9 @@
 //! The "Changes and diffs" method group through the real control daemon.
 //!
-//! Requirement rows closed here: KR-REQ-23.44 (the six methods under the daemon's own authority,
-//! with the rights and the version checks section 23 names), KR-REQ-14.31 and KR-ACC-031 (an
-//! immutable version delivered exactly while the source keeps changing), KR-REQ-14.26 (a preflight
-//! conflict returns `DRAFT_CONFLICT` with no writes) and KR-REQ-14.34 (an independent
-//! materialisation of an exact version).
+//! The six methods run under the daemon's own authority, with the rights and the version checks
+//! section 23 names; an immutable version is delivered exactly while the source keeps changing;
+//! a preflight conflict returns `DRAFT_CONFLICT` with no writes; and an independent
+//! materialisation of an exact version is made.
 //!
 //! These run the real endpoint, the real handshake, the real envelope checks and real repositories
 //! built with installed Git. The daemon starts on an environment under the platform's temporary
