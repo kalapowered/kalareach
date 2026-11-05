@@ -16,7 +16,9 @@ use kr_plugin_runtime::runtime::bindings::{
     ActionToken, Argument, EffectClass, Fault, NamedArgument, PreparedOperation, RequestSnapshot,
 };
 use kr_plugin_runtime::runtime::budget::{CallBudget, CallKind};
-use kr_plugin_runtime::runtime::compile::{CompileBudget, CompileOrigin, compile_or_load, key_for};
+use kr_plugin_runtime::runtime::compile::{
+    CompileBudget, CompileOrigin, CompilePool, compile_or_load, key_for,
+};
 use kr_plugin_runtime::runtime::engine::{ENGINE_VERSION, RuntimeEngine};
 use kr_plugin_runtime::runtime::error::ExhaustedBound;
 use kr_plugin_runtime::runtime::instance::{CallOutcome, Instance};
@@ -1476,6 +1478,99 @@ fn kr_req_11_41_a_compile_kept_off_the_processor_is_held_to_the_work_it_did() {
     );
 }
 
+// KR-REQ-11.41: the requests that wait for one compile are held to the pool's queue bound, and a
+// request whose caller has stopped waiting holds no place.
+//
+// The pool is held, so the compile is not done while the requests are made. The queue's worth of
+// requests join the first and the next is refused as pressure; once their callers are gone a new one
+// is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_41_the_requests_waiting_for_one_compile_are_held_to_the_queue_bound() {
+    const QUEUE: usize = 3;
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(directory.path().join("c"))
+        .expect("a cache");
+    let engine = engine();
+    let pool = CompilePool::with_threads(1, QUEUE);
+    let not_wasm: Arc<[u8]> = Arc::from(&b"not wasm at all"[..]);
+    let hold = pool.hold();
+    let ask = || {
+        pool.submit(
+            &engine,
+            &cache,
+            Arc::clone(&not_wasm),
+            no_compile_work_bound(),
+        )
+    };
+
+    let leader = ask().expect("the first request is queued");
+    let mut waiting = Vec::new();
+    for _ in 0..QUEUE {
+        waiting.push(ask().expect("a request joins the compile"));
+    }
+    assert!(
+        matches!(ask(), Err(RuntimeError::CompilationPressure { .. })),
+        "a request past the bound was taken"
+    );
+    drop(waiting);
+    let again = ask().expect("a request takes the place of one whose caller is gone");
+    drop(hold);
+
+    answer_of(leader)
+        .await
+        .expect_err("the component is refused");
+    answer_of(again)
+        .await
+        .expect_err("the component is refused");
+    assert_eq!(
+        pool.compiles_started(),
+        1,
+        "the component was compiled more than once"
+    );
+}
+
+// KR-REQ-11.41: a request on another engine does not join a compile, because a component compiled
+// for one engine is not one another can run.
+//
+// The two engines are built alike, so the component's key is the same on both; each request is
+// compiled for its own engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_41_a_request_on_another_engine_does_not_join_a_compile() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(directory.path().join("c"))
+        .expect("a cache");
+    let (one, another) = (engine(), engine());
+    let pool = CompilePool::with_threads(2, 8);
+    let not_wasm: Arc<[u8]> = Arc::from(&b"not wasm at all"[..]);
+    let hold = pool.hold();
+
+    let first = pool
+        .submit(&one, &cache, Arc::clone(&not_wasm), no_compile_work_bound())
+        .expect("the first request is queued");
+    let second = pool
+        .submit(
+            &another,
+            &cache,
+            Arc::clone(&not_wasm),
+            no_compile_work_bound(),
+        )
+        .expect("the second request is queued");
+    drop(hold);
+
+    answer_of(first)
+        .await
+        .expect_err("the component is refused");
+    answer_of(second)
+        .await
+        .expect_err("the component is refused");
+    assert_eq!(
+        (pool.compiles_started(), pool.requests_joined()),
+        (2, 0),
+        "a request joined a compile on another engine"
+    );
+}
+
 // KR-REQ-11.41: where the platform does not say what a thread has used, the budget is held to the
 // clock.
 //
@@ -1655,6 +1750,161 @@ fn kr_req_11_41_a_compile_that_did_more_work_than_the_bound_is_refused_and_not_f
         again.origin,
         CompileOrigin::Compiled,
         "the refused compile was filed all the same"
+    );
+}
+
+/// Waits for a compile's answer, for as long as a compile may take.
+async fn answer_of(
+    request: tokio::sync::oneshot::Receiver<
+        Result<kr_plugin_runtime::runtime::compile::Compiled, RuntimeError>,
+    >,
+) -> Result<kr_plugin_runtime::runtime::compile::Compiled, RuntimeError> {
+    tokio::time::timeout(COMPILE_WAIT, request)
+        .await
+        .expect("the compile was answered")
+        .expect("the pool answered")
+}
+
+// KR-REQ-11.41: two requests for one component, the second while the first is queued or being
+// compiled, compile it once, and both are given it.
+//
+// The pool is held, so the first request has not begun its compile when the second is made. A worker
+// that offers a component again while its first offer's compile is still going on is this second
+// request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_41_two_requests_for_one_component_compile_it_once_and_both_are_given_it() {
+    let Some(wasm) = components::component("slow-compile") else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(directory.path().join("c"))
+        .expect("a cache");
+    let engine = engine();
+    let pool = CompilePool::with_threads(2, 8);
+    let hold = pool.hold();
+
+    let first = pool
+        .submit(&engine, &cache, Arc::clone(&wasm), no_compile_work_bound())
+        .expect("the first request is queued");
+    let second = pool
+        .submit(&engine, &cache, Arc::clone(&wasm), no_compile_work_bound())
+        .expect("the second request is made");
+    drop(hold);
+
+    let first = answer_of(first).await.expect("the first is given it");
+    let second = answer_of(second).await.expect("the second is given it");
+    assert_eq!(
+        (pool.compiles_started(), pool.requests_joined()),
+        (1, 1),
+        "the pool compiled for one request and held the other for it"
+    );
+    assert_eq!(first.origin, CompileOrigin::Compiled);
+    assert_eq!(second.origin, CompileOrigin::Compiled);
+    assert_eq!(first.key, second.key);
+}
+
+// KR-REQ-11.41: a compile that fails fails every request that waited for it, with the same refusal.
+//
+// The component is not Wasm, so it is refused whatever the machine does. Two requests for it, the
+// second while the first is queued, are both told why, and the component was compiled once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_41_a_compile_that_fails_fails_every_request_that_waited_for_it() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(directory.path().join("c"))
+        .expect("a cache");
+    let engine = engine();
+    let pool = CompilePool::with_threads(2, 8);
+    let not_wasm: Arc<[u8]> = Arc::from(&b"not wasm at all"[..]);
+    let hold = pool.hold();
+
+    let first = pool
+        .submit(
+            &engine,
+            &cache,
+            Arc::clone(&not_wasm),
+            no_compile_work_bound(),
+        )
+        .expect("the first request is queued");
+    let second = pool
+        .submit(
+            &engine,
+            &cache,
+            Arc::clone(&not_wasm),
+            no_compile_work_bound(),
+        )
+        .expect("the second request is made");
+    drop(hold);
+
+    let first = answer_of(first).await.expect_err("the first is refused");
+    let second = answer_of(second).await.expect_err("the second is refused");
+    assert!(
+        matches!(first, RuntimeError::InvalidComponent { .. }),
+        "the first was told {first:?}"
+    );
+    assert_eq!(first, second, "the two were told different things");
+    assert_eq!(
+        (pool.compiles_started(), pool.requests_joined()),
+        (1, 1),
+        "the pool compiled for one request and held the other for it"
+    );
+}
+
+// KR-REQ-11.41: a request for a component that is queued behind another compile joins it, with no
+// thread free to take it up and no place in the queue.
+//
+// The pool has one thread and a queue of two, and the thread is held. The first component is
+// taken up by the thread or waits in the queue; the second waits in the queue; a second request
+// for the second component is made while it waits, and joins it. A request that took a place in
+// the queue instead would be a third compile, and would be refused when the queue was full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_41_a_request_for_a_queued_component_joins_it_without_a_thread_to_take_it_up() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(directory.path().join("c"))
+        .expect("a cache");
+    let engine = engine();
+    let pool = CompilePool::with_threads(1, 2);
+    let first: Arc<[u8]> = Arc::from(&b"the first, not wasm"[..]);
+    let second: Arc<[u8]> = Arc::from(&b"the second, not wasm"[..]);
+    let hold = pool.hold();
+
+    let ahead = pool
+        .submit(&engine, &cache, Arc::clone(&first), no_compile_work_bound())
+        .expect("the first component is queued");
+    let queued = pool
+        .submit(
+            &engine,
+            &cache,
+            Arc::clone(&second),
+            no_compile_work_bound(),
+        )
+        .expect("the second component is queued");
+    let again = pool
+        .submit(
+            &engine,
+            &cache,
+            Arc::clone(&second),
+            no_compile_work_bound(),
+        )
+        .expect("a second request for the second component joins it");
+    assert_eq!(
+        pool.requests_joined(),
+        1,
+        "the request took a place of its own"
+    );
+    drop(hold);
+
+    answer_of(ahead)
+        .await
+        .expect_err("the first component is refused");
+    let queued = answer_of(queued).await.expect_err("the second is refused");
+    let again = answer_of(again)
+        .await
+        .expect_err("the second again is refused");
+    assert_eq!(queued, again, "the two were told different things");
+    assert_eq!(
+        (pool.compiles_started(), pool.requests_joined()),
+        (2, 1),
+        "the second component was compiled once"
     );
 }
 
