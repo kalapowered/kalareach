@@ -876,6 +876,64 @@ pub fn a_reader_reports_itself_idle_only_once_its_editor_has_the_cursors_reply(k
     );
 }
 
+/// KR-REQ-08.48, KR-REQ-08.49: taking a host's answer out of the editor's keys never waits for the
+/// terminal to send more, so half a character behind the start of an answer does not hold the
+/// reader.
+///
+/// The runtime reads the terminal in chunks and keeps the first byte of a character that a chunk
+/// ends inside until the rest of it comes. That byte is no key, and a read of the next key waits
+/// for the rest of the character. The case types an Escape, a capital P and a letter, which begin a
+/// device control string, and the first byte of a two-byte character behind them, and expects the
+/// reader to report itself idle with nothing more sent: it gives the reader no step, because a step
+/// is a key and would end a wait. It then types the rest of the character and expects it in the line,
+/// since nothing took it for part of the answer.
+///
+/// # Panics
+///
+/// Panics when the reader reports nothing once the terminal has delivered the half character, or
+/// when the character the person finishes is not in the line.
+#[cfg(unix)]
+pub fn a_dropped_answer_does_not_wait_for_the_rest_of_a_character_the_terminal_has_half_delivered(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    let first = session.first_prompt();
+    assert!(
+        session.wait_for_prompt() && session.wait_for_editor_reading(),
+        "the shell drew no prompt to type behind:\n{}",
+        session.terminal_output()
+    );
+    session.expect_event(
+        "the idle report of the read the answer is typed into",
+        |event| {
+            matches!(
+                event,
+                BridgeEvent::ReaderIdle(idle) if idle.prompt_generation == first.prompt_generation
+            )
+        },
+    );
+    session.type_bytes(b"\x1bPx\xc3");
+    session.expect_event(
+        "an idle report once the editor has taken what the terminal delivered",
+        |event| {
+            matches!(
+                event,
+                BridgeEvent::ReaderIdle(idle)
+                    if idle.prompt_generation == first.prompt_generation
+                        && idle.editor.buffer_empty
+            )
+        },
+    );
+    session.type_bytes(b"\xa9");
+    let latest = the_reader_once_it_has_taken_what_the_terminal_holds(&mut session, first);
+    assert!(
+        !latest.editor.buffer_empty,
+        "the end of a character the person typed was taken for the end of an answer:\n{}",
+        session.terminal_output()
+    );
+}
+
 /// Types `unread` into the terminal of an idle reader that is stopped, asks it for its queues, and
 /// expects it to say they are not drained. Then types `completion`, which the reader needs to take
 /// what it has, and expects it to say they are.

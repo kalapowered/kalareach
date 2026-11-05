@@ -157,10 +157,12 @@ function Read-KrKey {
 
 # Whether the terminal has delivered a key that the editor has not met: one in the editor's queue,
 # or input the runtime holds or the terminal still has. A read of the next key waits when there is
-# none, so the keys of a reply are read only while this says there are some.
+# none, so the keys of a reply are read only while this says there are some. The first byte of a
+# character that the runtime has read without the rest is no key, and a read of the next key would
+# wait for the rest of the character, so the bytes the runtime's decoder holds are not counted here.
 function Test-KrKeyWaiting {
     if ((Get-KrQueuedKeys) -gt 0) { return $true }
-    $unread = Read-KrRuntimeUnread
+    $unread = Read-KrRuntimeUnread -Keys
     $null -ne $unread -and $unread -gt 0
 }
 
@@ -408,9 +410,13 @@ function Get-KrRuntimeReader {
 # The module reads where the editor's reading thread is idle, between operations, so nothing moves
 # from one of these to the next while they are read.
 #
+# With `-Keys` the bytes the decoder holds are left out: they make no key until the rest of their
+# character comes, and what the caller asks is whether a key can be read now.
+#
 # A Windows console is read through its own records, which this does not see: there the editor's
 # queue is the only count.
 function Read-KrRuntimeUnread {
+    param([switch]$Keys)
     if ($IsWindows) { return [uint64]0 }
     $members = Get-KrRuntimeReader
     if ($null -eq $members) { return $null }
@@ -428,7 +434,7 @@ function Read-KrRuntimeUnread {
         $unread += [uint64]([System.Collections.ICollection]$members.Available.GetValue($inner)).Count
         $unread += [uint64]([System.Collections.ICollection]$members.Pending.GetValue($inner)).Count
         $decoder = $members.Decoder.GetValue($inner)
-        if ($null -ne $decoder) {
+        if ($null -ne $decoder -and -not $Keys) {
             $held = [int]$members.Leftover.GetValue($decoder)
             if ($held -gt 0) { $unread += [uint64]$held }
         }
