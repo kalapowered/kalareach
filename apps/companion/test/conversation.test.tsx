@@ -542,7 +542,7 @@ describe('what the person writes goes where they wrote it (KR-REQ-13.12)', () =>
     openConversation({
       ...port,
       composerSubmit: (params) => {
-        sent.push(params.text)
+        sent.push(params.text ?? '')
         // The host's word that dispatch may have happened: its category is the protocol's own.
         return Promise.reject({
           code: 'OUTCOME_UNKNOWN',
