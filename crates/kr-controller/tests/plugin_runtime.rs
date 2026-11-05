@@ -71,14 +71,11 @@ const PATIENCE: Duration = Duration::from_secs(90);
 /// binding that is never registered.
 const REGISTRATION_PATIENCE: Duration = Duration::from_secs(60 * 60);
 
-/// The most seconds the program a test runs in a session stays running. A binding ends with its
-/// program, so the program has to outlast any wait for a registration; it ends when the test's tree
-/// is removed, which is long before this.
-const STAND_IN_SECONDS: u64 = 24 * 60 * 60;
-
-/// The variable that makes a placed copy of this binary a program a person starts in a session: it
-/// stays running for as many seconds as it names, or until the file [`STAND_IN_RUNNING`] names is
-/// gone.
+/// The variable that makes a placed copy of this binary a program a person starts in a session. It
+/// names the process the program belongs to, which is the test run that started it, and the program
+/// stays running while that process is and while the file [`STAND_IN_RUNNING`] names is there. A
+/// binding ends with its program, so the program has to outlast any wait for a registration; it
+/// ends with the run, whichever way the run ends.
 const STAND_IN: &str = "KR_RUNTIME_STAND_IN";
 
 /// The variable that names a file the stand-in writes its process identifier to once it runs.
@@ -93,17 +90,28 @@ const REQUIRE_FIXTURES: &str = "KR_REQUIRE_PLUGIN_FIXTURES";
 /// The stand-in program's body. Run by the test harness with nothing set, it does nothing.
 #[test]
 fn the_stand_in_program() {
-    if let Ok(seconds) = std::env::var(STAND_IN) {
+    if let Ok(owner) = std::env::var(STAND_IN) {
         let running = std::env::var_os(STAND_IN_RUNNING).map(PathBuf::from);
         if let Some(running) = &running {
             std::fs::write(running, std::process::id().to_string()).expect("says it is running");
         }
-        let until = std::time::Instant::now() + Duration::from_secs(seconds.parse().unwrap_or(60));
-        // It stays while the file that says it is running is there, and a look at the file that
-        // fails is not its being gone. The test's tree takes the file with it, which ends a program
-        // that a session's shell holds in the background, where the shell's end would not reach it.
+        // The run that started it, held by the identity it had when this program began, so that a
+        // number the system gives to another process later is not taken for it. A run that is
+        // already gone has nothing to stay for. A look at the run that does not answer is not its
+        // being gone.
+        let owner = owner
+            .parse::<u32>()
+            .ok()
+            .and_then(|pid| kr_ipc::identity::process_start_identity(pid).ok());
+        // It stays while the run is there and the file that says it is running is there, and a look
+        // at the file that fails is not its being gone. The test's tree takes the file with it,
+        // which ends a program that a session's shell holds in the background, where the shell's
+        // end would not reach it; a run that is stopped before it removes its tree ends it by the
+        // run's own end.
         let stays = || {
-            std::time::Instant::now() < until
+            owner
+                .as_ref()
+                .is_some_and(|owner| kr_ipc::identity::process_state(owner) != ProcessState::Ended)
                 && running
                     .as_ref()
                     .is_none_or(|file| file.try_exists().unwrap_or(true))
@@ -123,6 +131,72 @@ fn the_stand_in_program() {
             }
         }
     }
+}
+
+/// A process this case started, ended when the case is over however it ends.
+struct Started(std::process::Child);
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+// The program a test runs in a session belongs to the test run that started it, and ends with that
+// run however the run ends. A run that is interrupted leaves its tree behind, and a program that
+// waited for the tree to go, or for a time it was given, would go on running after it.
+//
+// The run here is another process, which the case ends; the program is the placed copy of this
+// binary, as a session starts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stand_in_program_ends_with_the_test_run_that_started_it() {
+    let tree = tempfile::tempdir().expect("a directory on the internal disk");
+    let placed = tree.path().join("example-agent");
+    kr_ipc::testing::place_and_start_once(
+        &std::env::current_exe().expect("this test's own binary"),
+        &placed,
+        &["--exact", "the_stand_in_program", "--test-threads", "1"],
+    );
+    let running = tree.path().join("agent-running");
+    let mut run = Started(
+        std::process::Command::new("sleep")
+            .arg("1000000")
+            .spawn()
+            .expect("a process to stand for the test run"),
+    );
+    let mut program = Started(
+        std::process::Command::new(&placed)
+            .args(["--exact", "the_stand_in_program", "--test-threads", "1"])
+            .env(STAND_IN, run.0.id().to_string())
+            .env(STAND_IN_RUNNING, &running)
+            .current_dir(tree.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the program starts"),
+    );
+    until("the program to say it runs", || async {
+        std::fs::read_to_string(&running).ok()
+    })
+    .await;
+    assert!(
+        program
+            .0
+            .try_wait()
+            .expect("the program is looked at")
+            .is_none(),
+        "the program ended with its run still there"
+    );
+
+    run.0.kill().expect("the run is ended");
+    run.0.wait().expect("the run is collected");
+    until("the program to end with its run", || {
+        let ended = program.0.try_wait().ok().flatten();
+        async move { ended }
+    })
+    .await;
 }
 
 fn build() -> BuildId {
@@ -861,8 +935,9 @@ impl World {
             .join(format!("agent-running-{}", kr_ipc::new_uuid()));
         typing
             .send(&format!(
-                "{STAND_IN}={STAND_IN_SECONDS} {more} {STAND_IN_RUNNING}='{}' '{}' --exact \
+                "{STAND_IN}={} {more} {STAND_IN_RUNNING}='{}' '{}' --exact \
                  the_stand_in_program --test-threads 1 --nocapture\n",
+                std::process::id(),
                 running.display(),
                 self.agent.display()
             ))
