@@ -1,7 +1,5 @@
 //! A recorded directory is the recorded one on the filesystem it was recorded on.
 //!
-//! Requirement rows closed here: KR-REQ-14.28, KR-REQ-14.33 and KR-REQ-14.34.
-//!
 //! The device number and the inode of a directory do not tell it from the same place on another
 //! filesystem: a filesystem attached in place of another one is given the device number the first
 //! had, and one built in the same order gives its directories the same inodes. Each case here puts
