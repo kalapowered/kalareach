@@ -343,9 +343,10 @@ impl std::error::Error for ClientError {}
 ///
 /// The protocol sorts every code into a retry category, and a host's answer to a send falls into
 /// three kinds by it. A client settles a send, drops it from what it keeps to retry or ask about,
-/// and tells a person it was refused, only on a definite word. It keeps the send of a transient
-/// refusal for a retry under the same action identifier, and keeps an unknown outcome as unknown.
-/// Every place that decides this asks here, so the three kinds are told apart by one rule.
+/// and tells a person it was refused, only on a definite word. A send refused for now is not
+/// settled by that word: a client that may send the same action again keeps it for that, and one
+/// that never sends the action again takes it as not taken and acts anew. An unknown outcome stays
+/// unknown. The places that decide this ask here, so the three kinds are told apart by one rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostWord {
     /// The host's own refusal outside the `Transient` and `OutcomeUnknown` categories: the action
