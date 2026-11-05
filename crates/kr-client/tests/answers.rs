@@ -913,6 +913,37 @@ async fn an_answer_the_host_refuses_or_the_form_forbids_is_not_kept() {
     );
 }
 
+/// KR-REQ-11.63: an answer the host refuses for now, with a transient code, has not been decided:
+/// it is kept to be sent again, as one whose outcome is unknown is, while the host's definite
+/// refusal is shown and not kept.
+#[tokio::test]
+async fn an_answer_the_host_refuses_for_now_is_kept_and_a_definite_refusal_is_not() {
+    for (byte, code, kept) in [
+        (70, ErrorCode::ResourceUnavailable, true),
+        (71, ErrorCode::StorageUnavailable, true),
+        (72, ErrorCode::RateLimited, true),
+        (73, ErrorCode::PermissionDenied, false),
+    ] {
+        let (_directory, drafts) = store();
+        let asked = question(byte);
+        let host = Host::with(vec![asked.clone()]);
+        host.line(Line::Refuses(code));
+        let outcome = answer_via(&host, &drafts, &asked, yes(), 5_000)
+            .await
+            .outcome;
+        if kept {
+            let Ok(Answered::Kept(draft)) = outcome else {
+                panic!("an answer refused for now is kept ({code:?}): {outcome:?}");
+            };
+            assert_eq!(drafts.drafts().expect("reads"), vec![draft], "{code:?}");
+        } else {
+            let refused = outcome.expect_err("a definite refusal is shown");
+            assert_eq!(refused.code(), code);
+            assert!(drafts.drafts().expect("reads").is_empty(), "{code:?}");
+        }
+    }
+}
+
 /// KR-REQ-11.63: the store keeps a draft only its owner can read, in a directory only its owner can
 /// read, narrowing one that was looser; a later answer to the same question replaces the earlier
 /// one whole and leaves no partial file behind; and a link planted under a kept answer's name is
