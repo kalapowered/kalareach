@@ -1094,14 +1094,20 @@ def run_self_test():
                 not isinstance(outcome, SourceError) and says(outcome, "CVE-2026-99001", "no triage row") == needs,
                 str(outcome),
             )
-        def revised_dotnet(items):
-            for item in items:
-                if item["number"] == 476:
-                    item["body"] += "\nV1.1 (10/30/2026): The affected platforms were corrected.\n"
-            return items
-        outcome = attempt(edited(routes(), dotnet, revised_dotnet), now="2026-11-10")
-        expect("a .NET advisory revised after its row", says(outcome, "CVE-2026-96225", "revised"), str(outcome))
-        outcome = attempt(edited(routes(), dotnet, revised_dotnet), now="2026-10-30")
+        # CVE-2026-96225 has two rows, its assessment of 2026-10-24 and the flag of 2026-11-01 that names it.
+        # The flag is the newest, so a revision is read against its day.
+        def revised_dotnet(revised):
+            def revise(items):
+                for item in items:
+                    if item["number"] == 476:
+                        item["body"] += "\nV1.1 (%s): The affected platforms were corrected.\n" % revised
+                return items
+            return revise
+        outcome = attempt(edited(routes(), dotnet, revised_dotnet("10/30/2026")), now="2026-11-10")
+        expect("a .NET advisory revised before the flag that names it", not isinstance(outcome, SourceError) and not says(outcome, "CVE-2026-96225"), str(outcome))
+        outcome = attempt(edited(routes(), dotnet, revised_dotnet("11/03/2026")), now="2026-11-10")
+        expect("a .NET advisory revised after its row", says(outcome, "CVE-2026-96225", "revised 2026-11-03", "newest row of 2026-11-01"), str(outcome))
+        outcome = attempt(edited(routes(), dotnet, revised_dotnet("11/03/2026")), now="2026-11-03")
         expect("a .NET advisory revised inside its allowance", not isinstance(outcome, SourceError) and not says(outcome, "CVE-2026-96225"), str(outcome))
 
         # Each mutation takes away a row the recorded data needs, and the check names the change. It is read
