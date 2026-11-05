@@ -78,8 +78,10 @@ A Unix daemon that found no per-user service manager when it started (on macOS, 
 domain) falls back to a detached process: a worker leads a session of its own, and the plugin
 runtime a process group of its own, each reparented when the control daemon exits. A worker started
 that way is in whatever login context the control daemon is in, so a headless session there has the
-desktop's variables stripped rather than a login context of its own. `kr doctor` reports that as
-what it is.
+desktop's variables stripped rather than a login context of its own. `kr doctor` names the
+mechanism as a detached process and reports the headless profile as `no_service_manager` on Linux
+and `not_established` on a Mac, with the statement that what a logout does to such a process is the
+platform's own behaviour, which this host does not claim to know.
 
 Windows has no fallback and needs none: every worker and the plugin runtime are created by the
 starter of the environment's scheduled task, in the logon session of the user the task logs on as,
