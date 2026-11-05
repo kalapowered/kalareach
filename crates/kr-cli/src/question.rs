@@ -206,6 +206,15 @@ pub async fn answer(
     )
     .await;
     let outcome = match attempt.outcome {
+        // The host has an earlier send, so the answer given now was neither sent nor kept: only an
+        // answer kept before it can still be.
+        Ok(Answered::Waiting(action_id)) => Err(waiting(
+            action_id,
+            shown!(
+                "this command sent no answer and kept no new answer{}",
+                older_copy(question_id, &kept_copy(&drafts, question_id))
+            ),
+        )),
         Ok(answered) => settled(&workers, answered),
         // What the failure says of the answer is what the attempt established, not what the
         // failure's kind suggests.
@@ -273,14 +282,10 @@ fn settled(workers: &Workers, answered: Answered) -> Result<Question> {
                 refused
             ),
         }),
-        Answered::Waiting(action_id) => Err(CliError::AnswerKept {
-            code: ErrorCode::ResourceUnavailable,
-            message: shown!(
-                "the host has an earlier send of this answer (action {}) and has not finished with \
-                 it, so this command sent nothing; the answer is still kept on this device",
-                action_id
-            ),
-        }),
+        Answered::Waiting(action_id) => Err(waiting(
+            action_id,
+            Shown::said("this command sent nothing; the answer is still kept on this device"),
+        )),
         Answered::Held(quote) => Err(CliError::AnswerKept {
             code: ErrorCode::OutcomeUnknown,
             message: shown!(
@@ -289,6 +294,21 @@ fn settled(workers: &Workers, answered: Answered) -> Result<Question> {
                 quote.action_id
             ),
         }),
+    }
+}
+
+/// The failure reported when the host has an earlier send of an answer to the question and has not
+/// finished with it, so nothing was sent. `then` says what became of the answer this command was
+/// given.
+fn waiting(action_id: ActionId, then: Shown) -> CliError {
+    CliError::AnswerKept {
+        code: ErrorCode::ResourceUnavailable,
+        message: shown!(
+            "the host has an earlier send of an answer to this question (action {}) and has not \
+             finished with it, so {}",
+            action_id,
+            then
+        ),
     }
 }
 

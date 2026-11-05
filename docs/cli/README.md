@@ -1215,7 +1215,8 @@ otherwise no answer is kept for the question. A refusal because the question end
 removes the new answer once the worker could say what became of each earlier send; if it could not,
 the answer stays kept. It stays kept too when the worker took a send that another command recorded
 for the answer, because this command cannot say which came first; `kr question drafts` names that
-send.
+send. When the worker has an earlier send and has not finished with it, the command sends nothing
+and keeps no new answer, and says whether an answer kept earlier is still kept.
 
 When the answer cannot be written to this device, the command sends nothing, says so, and says
 whether an answer kept earlier for the question is still kept. It exits with 1, or with 9 when an
