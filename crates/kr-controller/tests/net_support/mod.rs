@@ -2025,6 +2025,7 @@ impl RawDevice {
     /// The frame that submits one mutation, and the request it is.
     fn mutation_frame<P: serde::Serialize + ?Sized>(
         &self,
+        grant_id: Option<kr_protocol::ids::GrantId>,
         action_window_id: kr_protocol::ids::ActionWindowId,
         method: Method,
         action_id: kr_protocol::ids::ActionId,
@@ -2045,7 +2046,7 @@ impl RawDevice {
             method: method.into(),
             method_version: method.entry().version,
             action_id,
-            grant_id: kr_protocol::scalars::Nullable::null(),
+            grant_id: kr_protocol::scalars::Nullable(grant_id),
             target,
             expected: ParamsValue::empty(),
             action_window_id,
@@ -2067,8 +2068,14 @@ impl RawDevice {
     ) -> kr_protocol::ids::RequestId {
         use kr_client::transport::ControlTransport as _;
 
-        let (request_id, frame) =
-            self.mutation_frame(self.action_window_id(), method, action_id, target, params);
+        let (request_id, frame) = self.mutation_frame(
+            None,
+            self.action_window_id(),
+            method,
+            action_id,
+            target,
+            params,
+        );
         self.transport
             .send(&frame)
             .await
@@ -2125,11 +2132,75 @@ impl RawDevice {
         target: kr_protocol::envelope::ActionTarget,
         params: &P,
     ) -> Option<std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError>> {
-        use kr_client::transport::ControlTransport as _;
         use kr_protocol::envelope::{ControlFrame, Outcome};
 
-        let (request_id, frame) =
-            self.mutation_frame(action_window_id, method, action_id, target, params);
+        match self
+            .try_answer_in(None, action_window_id, method, action_id, target, params)
+            .await?
+        {
+            ControlFrame::Response(response) => Some(match response.outcome {
+                Outcome::Ok(value) => Ok(value),
+                Outcome::Error(error) => Err(error),
+            }),
+            other => panic!("the host answered with a frame that is not a response: {other:?}"),
+        }
+    }
+
+    /// As [`Self::mutate_in`], for an action that names the grant it acts under.
+    pub async fn mutate_naming_in<P: serde::Serialize + ?Sized>(
+        &self,
+        grant_id: kr_protocol::ids::GrantId,
+        action_window_id: kr_protocol::ids::ActionWindowId,
+        method: Method,
+        action_id: kr_protocol::ids::ActionId,
+        target: kr_protocol::envelope::ActionTarget,
+        params: &P,
+    ) -> std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
+        use kr_protocol::envelope::{ControlFrame, Outcome};
+
+        match self
+            .try_answer_in(
+                Some(grant_id),
+                action_window_id,
+                method,
+                action_id,
+                target,
+                params,
+            )
+            .await
+            .expect("the host answers on an open control stream")
+        {
+            ControlFrame::Response(response) => match response.outcome {
+                Outcome::Ok(value) => Ok(value),
+                Outcome::Error(error) => Err(error),
+            },
+            other => panic!("the host answered with a frame that is not a response: {other:?}"),
+        }
+    }
+
+    /// Submits one mutation, naming the grant it acts under when `grant_id` is given, and returns
+    /// the frame the host answered it with, a receipt included, or `None` when the host ended the
+    /// control stream instead.
+    pub async fn try_answer_in<P: serde::Serialize + ?Sized>(
+        &self,
+        grant_id: Option<kr_protocol::ids::GrantId>,
+        action_window_id: kr_protocol::ids::ActionWindowId,
+        method: Method,
+        action_id: kr_protocol::ids::ActionId,
+        target: kr_protocol::envelope::ActionTarget,
+        params: &P,
+    ) -> Option<kr_protocol::envelope::ControlFrame> {
+        use kr_client::transport::ControlTransport as _;
+        use kr_protocol::envelope::ControlFrame;
+
+        let (request_id, frame) = self.mutation_frame(
+            grant_id,
+            action_window_id,
+            method,
+            action_id,
+            target,
+            params,
+        );
         if self.transport.send(&frame).await.is_err() {
             return None;
         }
@@ -2139,13 +2210,14 @@ impl RawDevice {
                 .await
                 .expect("the host answers in time");
             let frame = frame?;
-            if let ControlFrame::Response(response) = frame
-                && response.request_id == request_id
-            {
-                return Some(match response.outcome {
-                    Outcome::Ok(value) => Ok(value),
-                    Outcome::Error(error) => Err(error),
-                });
+            match &frame {
+                ControlFrame::Response(response) if response.request_id == request_id => {
+                    return Some(frame);
+                }
+                ControlFrame::Receipt(response) if response.request_id == request_id => {
+                    return Some(frame);
+                }
+                _ => {}
             }
         }
     }

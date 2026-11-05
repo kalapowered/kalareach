@@ -1,6 +1,7 @@
 //! Forwarding to the worker that owns a session, the action routes, receipts and relayed batches.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_protocol::authority::MethodEntry;
 use kr_protocol::envelope::{
@@ -54,6 +55,31 @@ impl RouteRefusal {
     }
 }
 
+/// Whether this host had already routed the action a mutation carries, with the same request,
+/// before the call that is serving it claimed the route itself.
+///
+/// A repeat is the device asking again after an answer it did not get, and the action may have been
+/// carried out by the copy that went before. A refusal this host makes of a repeat on its own
+/// account says nothing of that, so it is not told as a refusal of the action
+/// ([`RemoteConnection::told_of_a_repeat`]). The route a call claims for itself does not make it a
+/// repeat, so a first request refused after its own claim is refused as ever; the claim finding the
+/// route there already, for the same request, does: it is a copy that was running meanwhile.
+pub(super) struct Seen(AtomicBool);
+
+impl Seen {
+    pub(super) const fn new(seen: bool) -> Self {
+        Self(AtomicBool::new(seen))
+    }
+
+    fn set(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn get(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// What a device is told of a retained answer that does not read in the shape of the level its
 /// worker is at.
 ///
@@ -95,6 +121,43 @@ impl RemoteConnection {
     pub(super) fn feed_standing(&self, acting: &kr_protocol::grant::Grant) -> FeedStanding {
         self.controller
             .feed_standing(self.connection_id, &self.device, acting)
+    }
+
+    /// Reads, as a mutation arrives and before this call claims anything, whether this host had
+    /// already routed the action it carries with the same request.
+    ///
+    /// A route this host cannot read leaves it unable to say whether it has seen the action, and it
+    /// answers as it would for a repeat: a refusal then is not a word about an action that may have
+    /// been carried out. The route is the device's own, keyed by the verified actor, so what a
+    /// refusal that depends on it shows is a fact the device already holds.
+    pub(super) fn seen_on_arrival(&self, mutation: &MutationRequest) -> Seen {
+        let actor_id = self.device.principal();
+        Seen::new(
+            match self.devices.action_route(&actor_id, mutation.action_id) {
+                Ok(None) => false,
+                Ok(Some(routed)) => kr_protocol::digest::mutation_digest(mutation, &actor_id)
+                    .is_ok_and(|digest| routed.payload_digest == Some(digest)),
+                Err(_) => true,
+            },
+        )
+    }
+
+    /// What a device is told of a refusal this host made on its own account.
+    ///
+    /// A client takes a definite refusal for the host's word that nothing was done and drops the
+    /// action. For a repeat the refusal is the host's own check failing (a window of another
+    /// connection, a connection opened for something else, a worker that has ended, a registration
+    /// withdrawn), and the host's route shows an earlier copy that may have been carried out, so the
+    /// device is told the outcome is unknown. The host cannot show it was not: the route is
+    /// claimed before dispatch and holds no record of whether a dispatch followed. A code that is
+    /// already `OUTCOME_UNKNOWN` is told as it is, and so is every refusal of a request that is not
+    /// a repeat, which includes a reused identifier carrying another request.
+    pub(super) fn told_of_a_repeat(&self, seen: &Seen, error: ProtocolError) -> ProtocolError {
+        if seen.get() && error.code != ErrorCode::OutcomeUnknown {
+            outcome_not_shown()
+        } else {
+            error
+        }
     }
 
     /// Answers `action.read` for a catalogue action this device performed, where there is one.
@@ -296,6 +359,7 @@ impl RemoteConnection {
     /// Remote dispatch additionally needs a live lease from the current generation and revision,
     /// taken at the moment the dispatch runs rather than one that was valid when the request
     /// arrived, and the lease's own remaining time bounds the deadline the worker is given.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn proxied_mutation(
         &self,
         mutation: &MutationRequest,
@@ -304,22 +368,20 @@ impl RemoteConnection {
         grant_rights: CanonicalSet<ActionRight>,
         acting: &Acting,
         asked: &mut Option<Asked>,
-    ) -> ControlFrame {
+        seen: &Seen,
+    ) -> std::result::Result<ControlFrame, ProtocolError> {
         let Some(session_id) = mutation.target.session_id.as_ref().copied() else {
-            return failure(
-                mutation.request_id,
-                ProtocolError::new(
-                    ErrorCode::InvalidArgument,
-                    "this mutation names the session it acts on",
-                ),
-            );
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                "this mutation names the session it acts on",
+            ));
         };
         let proxy = match self.proxy_for(session_id, acting).await {
             Ok(proxy) => proxy,
-            Err(error) => return failure(mutation.request_id, error.to_protocol_error()),
+            Err(error) => return Err(error.to_protocol_error()),
         };
-        if let Err(refusal) = self.claim_route(mutation, Some(session_id)) {
-            return failure(mutation.request_id, refusal.into_error());
+        if let Err(refusal) = self.claim_route(mutation, Some(session_id), seen) {
+            return Err(refusal.into_error());
         }
         let envelope = self.envelope(acting.grant.grant_id, validated);
         let bound = match self
@@ -333,7 +395,7 @@ impl RemoteConnection {
                 // is written down. What decides is the grant's own deadline: everything else this
                 // failure can mean says nothing about the grant.
                 self.expiry_observer().grant_expired();
-                return failure(mutation.request_id, error.to_protocol_error());
+                return Err(error.to_protocol_error());
             }
         };
         // A prompt that names a draft puts the draft's attachments under the session's retention
@@ -371,7 +433,7 @@ impl RemoteConnection {
                 )
                 .await
         {
-            return failure(mutation.request_id, error);
+            return Err(error);
         }
         // The effect runs on a task that outlives this connection, for the same reason the
         // daemon's own effects do: the worker commits the intent before it answers, and a
@@ -427,22 +489,33 @@ impl RemoteConnection {
                     // already held.
                     match self.may_read_receipts(Some(session_id), answering, acting) {
                         Ok(read) => *asked = Some(read),
-                        Err(_) => return failure(request_id, outcome_not_shown()),
+                        Err(_) => return Err(outcome_not_shown()),
                     }
                 }
                 // What an agent said in refusing what a device put to it is the agent's, not this
                 // host's. It is held where the worker's answer arrives, so the daemon's own
                 // refusals of the same call are told as they are written.
-                super::super::device_errors::upstream_words(
+                let told = super::super::device_errors::upstream_words(
                     answering,
                     ControlFrame::Response(Response {
                         request_id,
                         outcome: answered.response.outcome,
                     }),
-                )
+                );
+                // A worker checks the authority a request stands on before it looks for the
+                // receipt of an action it was sent before, so a refusal it makes that is not read
+                // from a receipt says nothing of an earlier copy. It is the host's word to give as
+                // such, and a repeat is not told it.
+                match told {
+                    ControlFrame::Response(Response {
+                        outcome: Outcome::Error(error),
+                        ..
+                    }) if !answered.retained => Err(error),
+                    told => Ok(told),
+                }
             }
-            Ok(Err(error)) => failure(request_id, error.to_protocol_error()),
-            Err(_) => failure(request_id, outcome_unknown()),
+            Ok(Err(error)) => Err(error.to_protocol_error()),
+            Err(_) => Ok(failure(request_id, outcome_unknown())),
         }
     }
 
@@ -602,6 +675,7 @@ impl RemoteConnection {
         &self,
         mutation: &MutationRequest,
         session_id: Option<SessionId>,
+        seen: &Seen,
     ) -> std::result::Result<(), RouteRefusal> {
         let actor_id = self.device.principal();
         let digest =
@@ -626,6 +700,8 @@ impl RemoteConnection {
             super::super::devices::ActionRoute::Existing(existing)
                 if existing.payload_digest == Some(digest) && existing.session_id == session_id =>
             {
+                // A copy of this request claimed it first, perhaps while this one was arriving.
+                seen.set();
                 Ok(())
             }
             super::super::devices::ActionRoute::Existing(_) => {
@@ -645,8 +721,10 @@ impl RemoteConnection {
     /// Only an action this host has already dispatched is looked up, so an ordinary first
     /// submission costs nothing. A digest that does not match the route's is a reused identifier,
     /// which section 9 refuses; a matching digest is the same action, and the worker's own receipt
-    /// is the answer. A worker that holds no receipt for it leaves the request to the ordinary
-    /// first-admission path, where its window decides.
+    /// is the answer. A worker that holds no receipt for it, or that cannot be asked, leaves the
+    /// request to the ordinary path, where a refusal of it is told as an unknown outcome
+    /// ([`Self::told_of_a_repeat`]) and not as a refusal of the action. A close whose session has
+    /// closed is the exception: the closure record answers it ([`Self::closure_answer`]).
     ///
     /// The answer is returned with the decision it is to be written under: a read of the receipt
     /// over the session it belongs to ([`Self::may_read_receipts`]). A worker holds what it keeps to
@@ -711,10 +789,10 @@ impl RemoteConnection {
         // than leaving the request to be refused for another reason further on.
         self.check_worker_route().map_err(RouteRefusal::not_shown)?;
         // A link that cannot be opened is not an answer. The ordinary path decides what this
-        // request gets, which for a session whose worker has gone is that session's own refusal
-        // rather than a second dispatch.
+        // request gets, except for a close whose session has closed, which the closure record
+        // answers: a worker that has ended holds nothing more to ask.
         let Ok(proxy) = self.proxy_for(session_id, &asked.acting).await else {
-            return Ok(None);
+            return Ok(self.closure_answer(mutation, session_id, read).await);
         };
         let request = Request {
             request_id: mutation.request_id,
@@ -755,12 +833,12 @@ impl RemoteConnection {
             .await
         else {
             // The link failed, not the lookup. The ordinary path decides what happens next.
-            return Ok(None);
+            return Ok(self.closure_answer(mutation, session_id, read).await);
         };
         let Outcome::Ok(value) = response.outcome else {
             // No receipt for it there, or the worker refused the read. Either way this is not an
             // answer, and the request goes on to be admitted or refused on its own terms.
-            return Ok(None);
+            return Ok(self.closure_answer(mutation, session_id, read).await);
         };
         // The answer is read in the shape of the worker's level. One that does not read there is
         // never passed on as it came: the worker held it to a scope in a way this host cannot see.
@@ -811,6 +889,37 @@ impl RemoteConnection {
         Ok(Some((answered, read)))
     }
 
+    /// Answers a repeated close of a session that has closed from the closure record, when the
+    /// worker that owned the session cannot be asked.
+    ///
+    /// The record says the session is closed and how it ended, whatever closed it, which is what a
+    /// close made after the closure is answered with (`Controller::answer_from_the_closure`). It
+    /// is read from the registry and not inferred from the link that failed, which fails for other
+    /// reasons while the session is open, and a repeat is told no more than the decision `read`
+    /// allows. No record leaves the request to the ordinary path.
+    async fn closure_answer(
+        &self,
+        mutation: &MutationRequest,
+        session_id: SessionId,
+        read: Asked,
+    ) -> Option<(ControlFrame, Asked)> {
+        if mutation.method != Method::SessionClose.into() {
+            return None;
+        }
+        let closed = self
+            .controller
+            .answer_from_the_closure(session_id)
+            .await
+            .ok()?;
+        Some((
+            ControlFrame::Response(Response {
+                request_id: mutation.request_id,
+                outcome: Outcome::Ok(closed),
+            }),
+            read,
+        ))
+    }
+
     /// Returns the link to the worker holding one action's receipt.
     ///
     /// The route is durable, so a device that lost its connection, or found this host restarted,
@@ -849,8 +958,8 @@ impl RemoteConnection {
                 None => {
                     let detail = format!(
                         "action {} belongs to this host rather than to a session, and this host \
-                         keeps no receipt for one; submit the action again under the same \
-                         identifier to be given its outcome",
+                         keeps no receipt for one; submit the same request again, exactly as it \
+                         was sent, to be given its outcome when this host holds one",
                         params.action_id
                     );
                     return Err(ProtocolError::new(ErrorCode::InvalidArgument, detail));
