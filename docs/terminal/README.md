@@ -540,6 +540,39 @@ stand-in for the write, which would prove nothing about the write.
 Nothing on the lane is history. `reset` drops everything pending, and a reconnecting client is never
 sent a reply or a probe answer from before it arrived.
 
+#### The cursor report a root editor waits for
+
+One editor asks the terminal where the cursor is and reads the answer from the same input as every
+other byte: PowerShell's, outside Windows. The runtime joins every digit it reads up to the `R` into
+the column, so a byte that comes ahead of the report changes the number, and the editor then
+stops answering. So while that editor is owed its report, `LaneGate::cursor_report_first` is set, and
+`drain` lets the cursor reports out first, in their order, and nothing else until one has gone. The
+replies it keeps follow the report in the order of their queries, in the same drain. The writer's
+queue gets the same order: a cursor report is placed ahead of the replies that still wait there for
+the writer, and never ahead of a person's keys.
+
+The editor is owed its report from the moment the worker registers a read of a PowerShell root off
+Windows until a cursor report is queued for the terminal, the editor reports itself idle (it is
+reading keys, and an answer now reaches it as keys), it leaves, or the session closes. No other
+shell's editor asks, and no program the person's line started is the editor, so for them the
+lane keeps the order of the queries. A program that asks `OSC 11` and then the cursor position, and
+reads to the report, depends on that order.
+
+A reply the hold keeps does not age while it is kept: when a cursor report ends the hold, each of them
+has the time it had left when it was first kept, so the hold never turns into the lane's two-second
+drop. When the hold ends any other way no time is given back, and an answer that is by then older
+than two seconds is dropped, as it is behind a paste: it would reach whatever reads next, which did
+not ask. A reply that had already waited past its deadline when the hold first kept it is dropped
+then.
+
+What the rule does not reach is out of the host's hands, or named: a reply already in the terminal's
+input when the editor asks; a reply that has left the writer's queue; an answer produced after the
+reader registered the read and before the worker applies that registration, which happen in two
+tasks in no fixed order; and the reads where the module reports the reader idle at the read's entry,
+before the editor asks (a queue that holds keys, the Vi command table, the read after
+accept-and-get-next, a person's own binding of the module's key), which end the hold at once. The
+shell-integration document says how the module is arranged around each.
+
 #### Where a reply is attributed to nothing
 
 A reply has its own kind of batch in the worker's queue for the terminal. It carries no lease epoch,
@@ -563,6 +596,7 @@ Each place the worker attributes input says what a reply does there:
 | The writer's check of a lease epoch and an authority deadline | Has none to be checked against, so it is written | `input_lease.rs`, `a_takeover_stops_the_keystrokes_waiting_for_the_terminal_and_not_the_hosts_answer` and `authority_that_ends_while_a_batch_waits_stops_the_keystrokes_and_not_the_hosts_answer` |
 | Input held for a reader transition, and the `editor_busy` event's `released_input_bytes` | Revokes a reserved launch and releases the person's held keys; the count is those keys, under the holder's attachment and epoch | `fence.rs`, `the_client_is_told_the_editor_was_busy_after_the_hosts_answer_released_its_keys` |
 | The root editor's launch and fence | Revokes the launch and invalidates the fence | `fence.rs`, KR-REQ-08.49 |
+| A PowerShell root editor owed the reply to its cursor question | The cursor report goes first and every other reply waits behind it, never behind a person's held keys, so a key typed meanwhile can reach the terminal before a reply that waits | `reply_lane.rs`, `a_cursor_report_is_written_ahead_of_the_answers_to_the_questions_before_it`, `fence.rs`, KR-REQ-08.48 |
 | The origin of an accepted line | A line accepted on a fence the answer took away is unverifiable; one accepted on a fence proved again after the answer is judged on that fence | `fence/driver.rs`, `a_line_accepted_after_an_answer_is_attributed_only_on_a_fence_proved_after_it` |
 | The process-activity mark | Is a hint to process supervision, set once for each look, and not a record of a person's activity, so there is nothing to attribute | None |
 | The journal | Is not journalled: the host keeps no record of input | `input_lease.rs`, KR-REQ-08.66 |
