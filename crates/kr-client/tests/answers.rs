@@ -1673,6 +1673,56 @@ async fn a_send_another_command_made_is_not_reported_as_an_earlier_one_the_host_
     assert!(basis.sends().contains(&a) && basis.sends().contains(&theirs));
 }
 
+/// KR-REQ-11.63: two commands send the same kept answer, and the host takes the later command's
+/// send while that command's reply is lost. The earlier command's send is refused because the
+/// question was answered. It cannot say that the other send came before its own or that a reply was
+/// lost, and it does not name the send; it leaves the pair in place, so the next reading names the
+/// action the host took.
+#[tokio::test]
+async fn a_send_the_host_took_for_another_command_is_named_by_the_next_reading() {
+    let (_directory, drafts) = store();
+    let asked = question(73);
+    let kept = answer_offline(&drafts, &asked).await;
+    let host = Host::with(vec![asked.clone()]);
+
+    // The other command's send reaches the host just before this command's, and it records itself
+    // in the pair first. Nothing reports it: its reply is lost.
+    let theirs = action(0xd1);
+    let params = kept
+        .submission(Some(&asked))
+        .expect("the question is pending");
+    *host.late.lock().expect("the lock") = Some((theirs, params));
+    let other = drafts.clone();
+    let question_id = asked.question_id;
+    *host.on_answer.lock().expect("the lock") = Some(Box::new(move || {
+        let basis = other.basis(question_id).expect("reads");
+        let carried = basis.sends().to_vec();
+        with_leave(|leave| other.record_send(question_id, &basis, &carried, theirs, leave))
+            .expect("recorded by the other command");
+    }));
+
+    let refused = send_via(&host, &drafts, asked.question_id)
+        .await
+        .outcome
+        .expect_err("the send was refused because the question was answered");
+    assert_eq!(refused.code(), ErrorCode::QuestionResolved, "{refused:?}");
+    assert_eq!(
+        sends_of(&drafts, asked.question_id),
+        vec![theirs],
+        "the pair stays, with the send the host took and without the one it refused"
+    );
+
+    // The next reading names the action the host took, and retires the pair.
+    assert_eq!(
+        reconcile(&host, &drafts).await.expect("reconciles"),
+        vec![Reconciled::Taken {
+            draft: kept,
+            action_id: theirs
+        }]
+    );
+    assert!(drafts.drafts().expect("reads").is_empty());
+}
+
 /// KR-REQ-11.63: a retirement decided from a reading of the pair that another command has since
 /// replaced removes nothing, and the report says the pair changed rather than that the answer is
 /// gone.

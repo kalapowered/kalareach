@@ -1213,7 +1213,9 @@ the answer kept earlier for its question as soon as it is recorded. If the worke
 new answer in its own word, the new answer stays kept while an earlier send of it is unsettled, and
 otherwise no answer is kept for the question. A refusal because the question ended or was answered
 removes the new answer once the worker could say what became of each earlier send; if it could not,
-the answer stays kept.
+the answer stays kept. It stays kept too when the worker took a send that another command recorded
+for the answer, because this command cannot say which came first; `kr question drafts` names that
+send.
 
 When the answer cannot be written to this device, the command sends nothing, says so, and says
 whether an answer kept earlier for the question is still kept. It exits with 1, or with 9 when an
@@ -1264,7 +1266,9 @@ When `kr question send` cannot send the answer, the failure keeps its own code a
 is still kept. A `kr question answer` for a question that has ended or moved when the command reads
 it sends nothing, and says whether an answer kept for that question earlier is still kept. A send
 that the worker refuses because the question was answered meanwhile has reached the worker, and the
-command reports the refusal.
+command reports the refusal. If the worker took another send of the answer, one that this command did
+not know of, the answer stays kept and the failure points to `kr question drafts`, which names the
+send.
 
 A kept answer is retired as gone only on the word of the daemon of the environment its session ran
 in: a closure its registry keeps, or, for a session with no descriptor, no record of the session at

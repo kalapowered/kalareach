@@ -451,12 +451,23 @@ fn still_kept_failure(workers: &Workers, question_id: QuestionId, error: AnswerE
     let delivery = workers.delivery();
     let failure = workers.failure();
     let kept = |refusal: &kr_protocol::error::ProtocolError| {
+        // A question that ended may have been ended by a send of the answer that this command did
+        // not make, which the next reading names.
+        let next = if matches!(
+            refusal.code,
+            ErrorCode::QuestionResolved | ErrorCode::QuestionExpired
+        ) {
+            Shown::said("; `kr question drafts` says whether the worker took another send of it")
+        } else {
+            Shown::said("")
+        };
         kr_client::error::refusal(
             refusal.code,
             shown!(
-                "{}; {}",
+                "{}; {}{}",
                 Shown::protocol(refusal),
-                retained(delivery, retention.clone())
+                retained(delivery, retention.clone()),
+                next
             ),
         )
     };

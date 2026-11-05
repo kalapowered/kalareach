@@ -1724,7 +1724,9 @@ fn ended(error: &ClientError) -> bool {
 /// pair removed, and otherwise the pair is removed only when no read failed. `sent` is the digest
 /// of the answer this call sent: an answer another command stored meanwhile is not this one, and
 /// stays. `carried` are the earlier sends this call knew of: only one of those is reported as the
-/// earlier send the host took, and a send another command made is not.
+/// earlier send the host took. A send another command made and the host took is not this call's to
+/// report, since it cannot say which came first or whether that command's reply was lost; the pair
+/// stays, and the next reading names the send.
 async fn ended_after_send<H: QuestionHost>(
     host: &H,
     drafts: &AnswerDrafts,
@@ -1739,11 +1741,15 @@ async fn ended_after_send<H: QuestionHost>(
     } else {
         learn(host, draft.session_id, basis.sends()).await
     };
-    if let Some(taken) = again.taken().filter(|taken| carried.contains(taken)) {
-        if ours {
-            let _ = drafts.remove_if_unchanged(draft.question_id, &basis);
+    match again.taken() {
+        Some(taken) if carried.contains(&taken) => {
+            if ours {
+                let _ = drafts.remove_if_unchanged(draft.question_id, &basis);
+            }
+            return Ok(Some(taken));
         }
-        return Ok(Some(taken));
+        Some(_) => return Ok(None),
+        None => {}
     }
     if ours && !again.failed() {
         let _ = drafts.remove_if_unchanged(draft.question_id, &basis)?;
