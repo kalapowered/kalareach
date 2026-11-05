@@ -1,8 +1,8 @@
 //! The question a release asks before it is published: whether the signed release matrix the
 //! managed service publishes lists a tier for the build being released.
 //!
-//! KR-REQ-17.46: a release is published only if the verified matrix serves its package version.
-//! The check verifies as a host's daemon does, under keys the test chooses, over loopback to the
+//! A release is published only if the verified matrix serves its package version. The check
+//! verifies as a host's daemon does, under keys the test chooses, over loopback to the
 //! stand-in. `crates/kr-release-matrix-check/tests/exit_codes.rs` holds the program that calls it.
 
 use kr_client::services::http::HttpService;
@@ -59,6 +59,9 @@ async fn publishing(matrix: &Value, key: &AuthorisationKeyPair) -> kr_service_st
     served
 }
 
+/// KR-REQ-17.46, the part about the signed matrix and its backward-compatible tier: a release the
+/// compatible tier of a matrix signed by the chosen key serves is supported. Not shown here: relay
+/// and discovery compatibility, and the route error a host is given.
 #[tokio::test]
 async fn a_release_the_compatible_tier_serves_is_supported() {
     let key = AuthorisationKeyPair::generate().expect("a key pair");
@@ -85,6 +88,9 @@ async fn a_release_only_a_later_tier_serves_is_supported_and_says_so() {
     );
 }
 
+/// KR-REQ-17.46, the part about skew: a release no tier of the signed matrix serves is refused with
+/// the exit status 1 and the matrix's revision. Not shown here: the route error a host is given,
+/// and relay and discovery compatibility.
 #[tokio::test]
 async fn a_release_in_no_tier_is_refused() {
     let key = AuthorisationKeyPair::generate().expect("a key pair");
@@ -94,6 +100,8 @@ async fn a_release_in_no_tier_is_refused() {
     assert_eq!(refused.exit_code(), 1);
 }
 
+/// KR-REQ-17.46, the part about the signed matrix: a matrix signed by a key other than the chosen
+/// one is refused. Not shown here: relay and discovery compatibility.
 #[tokio::test]
 async fn a_matrix_signed_by_another_key_is_refused() {
     let key = AuthorisationKeyPair::generate().expect("a key pair");
