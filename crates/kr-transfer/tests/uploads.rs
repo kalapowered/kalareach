@@ -1,7 +1,4 @@
 //! Uploads: bounded chunks, integrity, resumption, quotas, storage layout and expiry.
-//!
-//! Requirement rows closed here: KR-REQ-14.01, KR-REQ-14.02, KR-REQ-14.07, KR-REQ-14.08,
-//! KR-REQ-14.09, KR-REQ-14.10, KR-REQ-14.11, KR-REQ-14.12 and KR-REQ-24.09.
 
 mod support;
 
@@ -594,6 +591,11 @@ fn the_staging_area_is_a_private_random_directory_under_the_environment_state_di
 
 /// KR-REQ-14.12: an interrupted upload resumes from verified chunk status under the same
 /// identifier, and a lost reply to `upload.finish` is resolved through status.
+///
+/// KR-REQ-14.02, the part about resumable progress: the last chunk is sent first, status lists the
+/// chunk still missing and the bytes received, and the upload goes on under the same identifier
+/// with exactly that chunk. Not shown here: bounded chunks, integrity checks and the separate
+/// storage of incomplete files.
 #[test]
 fn an_interrupted_upload_resumes_by_identifier_and_a_lost_finish_reply_resolves_through_status() {
     let harness = Harness::create();
@@ -1450,6 +1452,10 @@ fn a_draft_sent_to_a_session_holds_the_attachments_it_gets_afterwards() {
 
 /// KR-REQ-14.11: an attachment belongs to one session. A prompt to another is refused and records
 /// nothing, so a file is never held by a session that was not asked to keep it.
+///
+/// KR-REQ-14.01, the part about the session: an upload begun for a session is that session's, and a
+/// prompt to another session is refused with nothing recorded. Not shown here: the execution
+/// environment, and Windows and WSL paths.
 #[test]
 fn an_attachment_that_belongs_to_another_session_is_not_taken_by_a_prompt_to_a_second() {
     let harness = Harness::create();
