@@ -6368,3 +6368,69 @@ async fn a_repeat_to_a_session_that_has_closed_is_told_the_outcome_is_unknown() 
         assert_eq!(error.code, expected, "routed {routed:?}: {error}");
     }
 }
+
+/// A copy of the same request that claims the action's route while this one waits for the worker's
+/// link makes this one a repeat: the earlier copy may have been carried out, so a refusal of this
+/// one is told as an unknown outcome. Without that copy the same refusal is the worker's word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_that_claimed_the_route_while_this_one_waited_for_the_link_makes_this_one_a_repeat()
+{
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    for (copy_claims, expected) in [
+        (true, ErrorCode::OutcomeUnknown),
+        (false, ErrorCode::ResourceUnavailable),
+    ] {
+        let script = Scripted::new();
+        let world = scripted::scripted(&script).await;
+        let controller = &world.controller;
+        let connection = super::RemoteConnection::for_test(
+            controller,
+            paired(controller, 76, |grant| {
+                grant.actions = [ActionRight::SessionView, ActionRight::AgentPrompt]
+                    .into_iter()
+                    .collect();
+            }),
+        );
+        let prompt = device_mutation(
+            &world,
+            &connection,
+            Method::AgentPromptSubmit,
+            92,
+            ParamsValue::empty(),
+        );
+        let (arrived, go) = controller.before_a_proxy_is_opened.arm();
+        let (answered, ()) = tokio::join!(
+            connection.answer_now(ControlFrame::Mutation(Box::new(prompt.clone()))),
+            async {
+                arrived
+                    .await
+                    .expect("the request waits for the worker's link");
+                if copy_claims {
+                    assert!(
+                        connection
+                            .claim_route(
+                                &prompt,
+                                Some(world.session_id),
+                                &super::forwarding::Seen::new(false)
+                            )
+                            .is_ok(),
+                        "the other copy claims the route"
+                    );
+                }
+                go.send(()).expect("the request is waiting");
+            }
+        );
+        let answered = answered.expect("the request is answered");
+        let error = error_of(answered.frame());
+        assert_eq!(
+            error.code, expected,
+            "a copy claimed: {copy_claims}: {error}"
+        );
+        world.serving.abort();
+    }
+}
