@@ -151,6 +151,8 @@ pub struct PluginHost {
     /// comparison made before it.
     packages: Arc<cap_std::fs::Dir>,
     started: std::time::Instant,
+    /// How long a registration may keep a worker waiting.
+    register_deadline: core::time::Duration,
     /// The pause the notice writers take between taking a notice and writing it, which a test
     /// holds to stand where a document has left the queue and not yet been written.
     #[cfg(feature = "testing")]
@@ -243,9 +245,21 @@ impl PluginHost {
             payloads: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PAYLOADS)),
             packages: Arc::new(packages),
             started: std::time::Instant::now(),
+            register_deadline: REGISTER_DEADLINE,
             #[cfg(feature = "testing")]
             notice_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
         })
+    }
+
+    /// Gives a registration `deadline` instead of [`REGISTER_DEADLINE`], for the tests of a
+    /// registration: it contains a compile, which a machine that other work keeps busy delays for
+    /// minutes, and a test that registers a component decides by what the registration comes to
+    /// and not by how busy the machine was.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn registering_within(mut self, deadline: core::time::Duration) -> Self {
+        self.register_deadline = deadline;
+        self
     }
 
     /// Holds the notice writers, for the tests of what a connection writes: until the returned hold
@@ -830,7 +844,7 @@ impl PluginHost {
         #[cfg(feature = "testing")]
         self.hold_at_the_registration_gate().await;
         let started = std::time::Instant::now();
-        let deadline = REGISTER_DEADLINE;
+        let deadline = self.register_deadline;
         let BindingRegistration {
             binding_id,
             identity,

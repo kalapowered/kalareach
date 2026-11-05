@@ -19,6 +19,13 @@ use kr_plugin_service::protocol::{
 };
 use kr_plugin_service::vocabulary::Admission;
 
+/// How long a registration may take in these cases. A registration contains a compile at
+/// background priority, which a machine that other work keeps busy leaves a hundredth of a
+/// processor or less, so it takes minutes; a case that registers a component decides by what the
+/// registration comes to, and this ends only a registration that never does. The client waits
+/// a little longer than the host, as it does by default, so the answer is the host's own.
+const REGISTRATION_PATIENCE: core::time::Duration = core::time::Duration::from_secs(60 * 60);
+
 /// A plugin host serving in this process, with a client connected to it.
 struct Served {
     _temp: kr_ipc::testing::TempHost,
@@ -72,7 +79,8 @@ impl Served {
             } else {
                 PluginHost::new(identity, config)
             }
-            .expect("a plugin host"),
+            .expect("a plugin host")
+            .registering_within(REGISTRATION_PATIENCE),
         );
         let endpoint_for_wait =
             kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
@@ -134,6 +142,7 @@ impl Served {
         PluginClient::over(connection, self.descriptor.clone())
             .await
             .expect("the host answers the handshake and the challenge")
+            .registering_within(REGISTRATION_PATIENCE + core::time::Duration::from_secs(5))
     }
 
     /// Puts a component in the packages directory and returns how to name it.

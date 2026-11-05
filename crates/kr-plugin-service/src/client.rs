@@ -290,6 +290,8 @@ pub struct PluginClient {
     offered_bytes: Arc<AtomicU64>,
     #[cfg(feature = "testing")]
     offer_hold: Arc<Hold>,
+    /// How long a registration is waited for.
+    register_deadline: core::time::Duration,
     next_request: AtomicU64,
     descriptor: HostDescriptor,
     reader_task: tokio::task::JoinHandle<()>,
@@ -384,6 +386,7 @@ impl PluginClient {
             offered_bytes,
             #[cfg(feature = "testing")]
             offer_hold,
+            register_deadline: REGISTER_DEADLINE,
             next_request: AtomicU64::new(1),
             descriptor,
             reader_task,
@@ -447,7 +450,7 @@ impl PluginClient {
                     executable: executable.to_owned(),
                     component: component.clone(),
                 })),
-                REGISTER_DEADLINE,
+                self.register_deadline,
             )
             .await?;
         match body {
@@ -543,6 +546,18 @@ impl PluginClient {
     #[must_use]
     pub fn hold_offered_writes(&self) -> HoldHandle {
         self.offer_hold.set()
+    }
+
+    /// Waits `deadline` for a registration instead of [`REGISTER_DEADLINE`]. For the tests of a
+    /// crate that drives this client against a host that waits for a registration for a time of
+    /// its own choosing, which this should exceed, as the default does: a registration contains a
+    /// compile, which a machine that other work keeps busy delays for minutes, and a test that
+    /// registers a component decides by what the registration comes to.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn registering_within(mut self, deadline: core::time::Duration) -> Self {
+        self.register_deadline = deadline;
+        self
     }
 
     /// Offers one source event and waits for the queue's answer.
