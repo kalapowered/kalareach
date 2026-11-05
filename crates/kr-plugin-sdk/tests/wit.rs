@@ -60,10 +60,9 @@ fn the_world_exports_exactly_the_eight_component_functions() {
     );
 }
 
-/// KR-REQ-11.25, the part about the closed import surface: the world imports exactly the four host
-/// interfaces and nothing else, no function or type directly, so no component is given a fifth
-/// import to send through. Not shown here: the functions inside the four interfaces (the case
-/// below), and which grants a binding holds.
+/// The world imports the interfaces `wit::IMPORTS` lists, besides the implicit `types` interface
+/// the loop skips by name, and no function or type directly. The case does not fix the count of
+/// the host interfaces independently of that constant.
 #[test]
 fn the_world_imports_exactly_the_four_host_interfaces() {
     let (resolve, world) = resolve();
@@ -89,11 +88,10 @@ fn the_world_imports_exactly_the_four_host_interfaces() {
     assert_eq!(found, expected);
 }
 
-/// KR-REQ-11.25, the part about the upstream-send handle, as a check of names: no function of any
-/// interface the component world imports has a name that says send, write, submit, dispatch,
-/// respond, spawn or open. Not shown here: what an imported function with another name does, a
-/// bare function import (the case skips imports that are not interfaces; the case above holds the
-/// imports to the four interfaces), and which grants a binding holds, which the broker cases show.
+/// A check of names: no function of any interface the component world imports has a name that
+/// says send, write, submit, dispatch, respond, spawn or open. It does not show what an imported
+/// function with another name does, and it skips a bare function import (the case above holds the
+/// world's imports to interfaces).
 #[test]
 fn no_host_import_sends_anything() {
     // The component proposes effects and the broker dispatches them. An import that sent data
