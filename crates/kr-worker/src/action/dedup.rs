@@ -17,8 +17,10 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use kr_protocol::ids::{ActionId, ActorId};
+use kr_protocol::envelope::MutationRequest;
+use kr_protocol::ids::{ActionId, ActorId, QuestionId};
 use kr_protocol::limits::MAX_OUTSTANDING_MUTATIONS;
+use kr_protocol::question::QuestionAnswerParams;
 
 use crate::error::{Result, WorkerError};
 
@@ -111,6 +113,32 @@ impl ShownReceipts {
     #[must_use]
     pub fn revision(&self, actor: &ActorId, action: ActionId) -> Option<u64> {
         self.shown.get(&(actor.clone(), action)).copied()
+    }
+}
+
+/// Tells whether an uncertain `question.answer` receipt holds back an answer to `question_id`.
+///
+/// A `question.answer` shares its subject with every other answer of the session, because the
+/// subject is the target alone. What it answers is in the envelope the receipt kept, and an answer
+/// to another question is not a new identifier for the same ask, so only an uncertain answer to
+/// the same question stands in its way.
+///
+/// `intent` is that envelope, when the receipt still has one. A receipt that has none (privacy mode
+/// withholds it once an action settles) or whose envelope does not decode names no question, and
+/// holds the answer back: this rule refuses where it cannot tell.
+#[must_use]
+pub fn holds_back_an_answer_to(intent: Option<&[u8]>, question_id: QuestionId) -> bool {
+    let Some(intent) = intent else {
+        return true;
+    };
+    let Ok(earlier) =
+        kr_cbor::from_canonical_slice::<MutationRequest>(intent, &kr_cbor::Limits::DEFAULT)
+    else {
+        return true;
+    };
+    match earlier.params.to_typed::<QuestionAnswerParams>() {
+        Ok(params) => params.question_id == question_id,
+        Err(_) => true,
     }
 }
 

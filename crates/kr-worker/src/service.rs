@@ -7064,7 +7064,9 @@ impl WorkerService {
     ///
     /// * A subject that already carries an uncertain outcome admits a new identifier only when the
     ///   request names that outcome and the revision it was read at. That is what stops a service
-    ///   from choosing a fresh identifier to evade de-duplication.
+    ///   from choosing a fresh identifier to evade de-duplication. An answer to a question is
+    ///   held back by an uncertain answer to that question alone, not by one to another question
+    ///   of the session ([`Self::uncertain_outcome_in_the_way`]).
     /// * An actor holds at most eight admitted, unsettled mutations at once, lowered by whatever
     ///   the connection negotiated.
     fn check_admission_limits(
@@ -7087,8 +7089,7 @@ impl WorkerService {
         // command. The failure is published as the fault it is, and the checks it feeds are
         // skipped rather than guessed at.
         let volatile_permitted = work_class(method).survives_a_journal_fault();
-        let read = journal
-            .uncertain_for_subject(actor_id, subject)
+        let read = Self::uncertain_outcome_in_the_way(journal, actor_id, subject, mutation, method)
             .and_then(|uncertain| journal.outstanding(actor_id).map(|held| (uncertain, held)));
         let (uncertain, outstanding) = match read {
             Ok(pair) => pair,
@@ -7129,6 +7130,29 @@ impl WorkerService {
                 state.peer_limits.max_outstanding_mutations.get(),
             ),
         )
+    }
+
+    /// Returns the actor's uncertain outcome that a fresh `mutation` for `subject` has to show, if
+    /// there is one.
+    ///
+    /// It is the newest uncertain outcome of the subject, except for an answer to a question: the
+    /// subject of every answer in a session is the same, and an answer to one question asks for
+    /// something else than an answer to another, so only an uncertain answer to the question this
+    /// request answers stands in its way.
+    fn uncertain_outcome_in_the_way(
+        journal: &crate::journal::Journal,
+        actor_id: &ActorId,
+        subject: kr_protocol::scalars::Digest256,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Result<Option<(kr_protocol::ids::ActionId, u64)>> {
+        if method != Method::QuestionAnswer {
+            return journal.uncertain_for_subject(actor_id, subject);
+        }
+        let params: kr_protocol::question::QuestionAnswerParams = parse(&mutation.params)?;
+        journal.uncertain_for_subject_matching(actor_id, subject, |intent| {
+            crate::action::dedup::holds_back_an_answer_to(intent, params.question_id)
+        })
     }
 
     /// Refuses an attach by a caller whose grant does not reach the live screen.

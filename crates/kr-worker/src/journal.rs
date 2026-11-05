@@ -2796,6 +2796,53 @@ impl Journal {
         .transpose()
     }
 
+    /// Returns this actor's most recent uncertain outcome for a subject among those whose retained
+    /// intent `matches` accepts, if it has one.
+    ///
+    /// For a method whose subject is shared by requests that ask for different things, such as the
+    /// answers to the several questions of one session: the envelope each receipt kept says which
+    /// of them it was. `matches` is given that envelope, or `None` where the receipt kept none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn uncertain_for_subject_matching(
+        &self,
+        actor_id: &ActorId,
+        subject_digest: Digest256,
+        matches: impl Fn(Option<&[u8]>) -> bool,
+    ) -> Result<Option<(ActionId, u64)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT action_id, revision, intent FROM receipts
+                 WHERE actor_id = ?1 AND subject_digest = ?2 AND state = ?3
+                 ORDER BY updated_at_ms DESC, action_id DESC",
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        let mut rows = statement
+            .query(params![
+                actor_id.as_str(),
+                subject_digest.as_bytes().as_slice(),
+                ReceiptState::Unknown.as_str()
+            ])
+            .map_err(|error| faulted(&self.health, error))?;
+        while let Some(row) = rows.next().map_err(|error| faulted(&self.health, error))? {
+            let (action, revision, intent): (Vec<u8>, i64, Option<Vec<u8>>) = (
+                row.get(0).map_err(|error| faulted(&self.health, error))?,
+                row.get(1).map_err(|error| faulted(&self.health, error))?,
+                row.get(2).map_err(|error| faulted(&self.health, error))?,
+            );
+            if matches(intent.as_deref()) {
+                return Ok(Some((
+                    parse_action(&action)?,
+                    u64::try_from(revision).unwrap_or_default(),
+                )));
+            }
+        }
+        Ok(None)
+    }
+
     /// Finds the one action an identifier names, whichever actor submitted it.
     ///
     /// The de-duplication key is the actor **and** the action, so an identifier is not by itself a
