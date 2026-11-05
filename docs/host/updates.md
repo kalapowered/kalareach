@@ -64,16 +64,17 @@ What has to follow an update names its path through `current` instead, so it is 
   the running shell's own bridge builtin, so a shell of any release the host keeps reads it and runs
   its own release's integration.
 
-A program the host starts itself reads `current` once and starts the program of the release it
-names, by that release's own path, which has no link in it. A program started from its own release,
-such as the worker a control daemon launches, reads nothing. The starts that read it once are, on
-Linux and macOS, a `kr` that hands its command to the store's `kr`, a `kr` that takes in a package
-manager's release, the standalone start of the control daemon, and the start of a daemon again after
-an update. `kr shell` reads the packages the same way, so the packages one read finds are all of one release. On Windows
-the scheduled task starts the daemon, by `current\bin\kr-controller.exe`. The paths in the list
-above are written for something else to start later, so they keep the link. Where the host checks
-that a program is there first (the forwarder, an agent's command and a shell's entry), it asks the
-release it read.
+When the host starts a program itself, it reads `current` once and starts the program of the
+release it names, by that release's own path, which has no link in it. A program started from its
+own release, such as the worker a control daemon launches, uses that release's own path and reads
+no link. The starts that read `current` once are, on Linux and macOS, a `kr` that hands its command
+to the store's `kr`, a `kr` that takes in a package manager's release, the standalone start of the
+control daemon, and the start of a daemon again after an update. `kr shell` reads the packages the
+same way, so the packages one read finds are all of one release. On Windows the scheduled task
+starts the daemon, by `current\bin\kr-controller.exe`. The paths in the list above are written for
+something else to start later, so they keep the link. Where the host checks that a program or a
+file is there first (the forwarder, an agent's command and a shell's entry), it asks the release it
+read.
 
 On Linux, a path walk through a link that a rename replaces rarely answers that the path does not
 exist: a few walks in tens of millions, whichever way the link is replaced. A program that an
