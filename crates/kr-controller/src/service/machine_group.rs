@@ -34,7 +34,6 @@ use std::sync::Arc;
 
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::envelope::{ControlFrame, MutationRequest, ParamsValue};
-use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
 use kr_protocol::ids::{ActionId, ActorId, MachineId};
@@ -978,10 +977,7 @@ fn recorded_answer(record: crate::grants::ActionRecord) -> Result<ParamsValue> {
         crate::grants::ActionRecord::Refused { code, detail } => {
             Err(ControllerError::Refused { code, detail })
         }
-        crate::grants::ActionRecord::InFlight => Err(ControllerError::Refused {
-            code: ErrorCode::ResourceUnavailable,
-            detail: "another attempt under this action identifier has not finished".to_owned(),
-        }),
+        crate::grants::ActionRecord::InFlight => Err(ControllerError::attempt_still_running()),
         crate::grants::ActionRecord::Unfinished => Err(unfinished_and_unknown()),
     }
 }
@@ -1037,6 +1033,8 @@ fn unfinished_and_unknown() -> ControllerError {
 
 #[cfg(test)]
 mod tests {
+    use kr_protocol::error::ErrorCode;
+
     use super::*;
 
     /// A receipt that cannot be read back does not refuse the step it was kept for: the step was

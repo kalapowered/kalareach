@@ -19,7 +19,7 @@ use crate::service::net::lifetimes::GrantStanding;
 
 use super::acting::{Acting, Held};
 use super::output::{Answers, RELAY_DECISIONS, ReadUnder, Written};
-use super::{RemoteConnection, after_the_outcome, failure, outcome_not_shown};
+use super::{RemoteConnection, failure};
 
 /// One request of this connection's as the host decided it: what was asked, and the decision,
 /// which carries the time bounds the request stands on. What is cut from the decision ends by
@@ -192,18 +192,16 @@ impl RemoteConnection {
                 // from an earlier submission, whatever the answer was: that it was a refusal is
                 // not for a device that may not read it.
                 Err(error) => {
-                    let error = match asked.answers() {
-                        Answers::Action => after_the_outcome(&frame, error),
-                        Answers::Kept => outcome_not_shown(),
-                        Answers::Read | Answers::Nothing => error,
-                    };
+                    let error = asked.answers().refusing(&frame, error);
                     return self.output.send(&failure(request_id, error)).await;
                 }
             }
         }
-        self.output
-            .send(&failure(request_id, authority_kept_moving()))
-            .await
+        // The decision held every time it was asked and was lost before each write: the answer is
+        // not written, and what the device is told follows what the answer leaves open, as for a
+        // decision that refuses.
+        let error = asked.answers().refusing(&frame, authority_kept_moving());
+        self.output.send(&failure(request_id, error)).await
     }
 
     /// The session a read is decided over: the one it names, or, for an `action.read` that names an
@@ -1096,9 +1094,10 @@ const fn answered_request(frame: &ControlFrame) -> Option<RequestId> {
 }
 
 /// What a request is told when the time bounds it was decided under ran out and came back while it
-/// waited, a renewal published after a lapse: it is asked again. The code is a transient one, so a
-/// client keeps an action it sent, and asks again under the same identifier: if the worker took the
-/// action, the repeat is answered from what the worker kept.
+/// waited, a renewal published after a lapse: it is asked again. The code is a transient one, which
+/// says nothing took effect, so it is for a request that has not been dispatched; a request whose
+/// action may have been carried out is told what its answer leaves open instead
+/// ([`Answers::refusing`]).
 fn authority_kept_moving() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::ResourceUnavailable,

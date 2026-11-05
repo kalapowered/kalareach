@@ -69,6 +69,9 @@ pub(super) struct Scripted {
     describes_its_close: AtomicBool,
     /// The session its acceptances describe, where a test has them name another one.
     names: std::sync::Mutex<Option<SessionId>>,
+    /// Whether its acceptance carries its own account of how the session ended, as the answer of a
+    /// worker that has finished its closure does.
+    accepts_with_its_closure: AtomicBool,
     /// The answer it gave each close, by the close's action, as its journal keeps it.
     answered: std::sync::Mutex<BTreeMap<ActionId, ParamsValue>>,
     /// Every generation a daemon presented to it, in the order they came.
@@ -137,6 +140,7 @@ impl Scripted {
             gone: Notify::new(),
             describes_its_close: AtomicBool::new(true),
             names: std::sync::Mutex::new(None),
+            accepts_with_its_closure: AtomicBool::new(false),
             answered: std::sync::Mutex::new(BTreeMap::new()),
             generations: std::sync::Mutex::new(Vec::new()),
             connections: AtomicUsize::new(0),
@@ -381,6 +385,12 @@ impl Scripted {
         self.describes_its_close.store(false, Ordering::Release);
     }
 
+    /// Has this worker's acceptances carry the closure of its session, as the answer of a worker
+    /// that finished the close before it answered does.
+    pub(super) fn accepts_with_its_closure(&self) {
+        self.accepts_with_its_closure.store(true, Ordering::Release);
+    }
+
     /// Has this worker's acceptances describe `session_id` in place of its own session.
     fn describing(&self, session_id: SessionId) {
         *self
@@ -405,7 +415,11 @@ impl Scripted {
             session_id,
             state: SessionState::Closing,
             durability: Durability::Durable,
-            closure: Nullable::null(),
+            closure: if self.accepts_with_its_closure.load(Ordering::Acquire) {
+                Nullable::some(closure_of(session_id))
+            } else {
+                Nullable::null()
+            },
             session: self
                 .describes_its_close
                 .load(Ordering::Acquire)

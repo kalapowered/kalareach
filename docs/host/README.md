@@ -2616,7 +2616,7 @@ The step's authority must be valid when the record is replaced, not just when th
 
 A step is claimed in the receipt store that holds the other actions of the daemon's own, by the actor, the action identifier and a digest of the request. The daemon performs it, keeps its result under the claim, and answers a retry from that receipt on any connection, regardless of which window the retry arrives in. The same action with another request is `ID_CONFLICT`. A step the daemon refused after it claimed the action, including one that could not write, is kept as that action's refusal, so asking again takes a new action. If the daemon refuses a step before claiming the action, because it cannot use the record or cannot confirm the previous change to it, it does not spend the action. A retry on the same connection, inside its window, is refused the same way while the cause lasts. A retry on another connection finds no claim and is refused for its window, so the owner asks again under a new action once the cause is gone.
 
-A step whose attempt ended after it wrote the record and before it kept the result is answered from the record while the record's last change names that actor and action. Before taking each step, and once at the beginning before serving any steps, the daemon will record this answer in a claim. It flushes the state directory first, so a result is never given for a change that a crash can still take back. If flushing the directory or reading the record fails, it will not take any steps and will refuse steps with `STORAGE_UNAVAILABLE` without claiming them, and will answer retries of an unfinished earlier step with `OUTCOME_UNKNOWN`. A retry of a step that has a recorded result or refusal is answered from that record whether or not recovery works, and a retry of a step still running is told so with `RESOURCE_UNAVAILABLE`. A retry whose receipt cannot be looked up, and a receipt that is kept and cannot be read back, are answered with `OUTCOME_UNKNOWN`: whether an earlier attempt took the step is not known. A retry of an unfinished step waits behind the steps in progress and is answered from what its claim holds when its turn comes. If a claim contains no result and the record does not name the action, the daemon will answer retries with `OUTCOME_UNKNOWN` and never perform the action again.
+A step whose attempt ended after it wrote the record and before it kept the result is answered from the record while the record's last change names that actor and action. Before taking each step, and once at the beginning before serving any steps, the daemon will record this answer in a claim. It flushes the state directory first, so a result is never given for a change that a crash can still take back. If flushing the directory or reading the record fails, it will not take any steps and will refuse steps with `STORAGE_UNAVAILABLE` without claiming them, and will answer retries of an unfinished earlier step with `OUTCOME_UNKNOWN`. A retry of a step that has a recorded result or refusal is answered from that record whether or not recovery works, and a retry of a step still running is told so with `OUTCOME_UNKNOWN`. A retry whose receipt cannot be looked up, and a receipt that is kept and cannot be read back, are answered with `OUTCOME_UNKNOWN`: whether an earlier attempt took the step is not known. A retry of an unfinished step waits behind the steps in progress and is answered from what its claim holds when its turn comes. If a claim contains no result and the record does not name the action, the daemon will answer retries with `OUTCOME_UNKNOWN` and never perform the action again.
 
 Two outcomes are answered with no path in them, because an answer can reach a paired device. A step that wrote the record and could not flush its directory is answered `OUTCOME_UNKNOWN`: the record shows the change, but whether it survives a crash is not known, and a retry of the same action will return the answer recorded in the step record once the directory has been flushed. A step that wrote the record and could not keep its receipt is answered with its result. Its claim stays unfinished, and the record, which names the step, answers a retry.
 
@@ -3542,6 +3542,13 @@ device that may not is told the outcome is unknown, whatever the answer was, and
 when the authority feed refuses before the answer is written. The service's refusals that are not
 copies of a record, such as the refusal of a request that reaches no record, are told as a fresh
 answer is.
+
+A transient failure says nothing took effect, so the daemon gives one only for a request it has not
+dispatched. Once it has dispatched or committed an action, what it cannot show of the action is told
+as `OUTCOME_UNKNOWN`, whatever the cause: a decision that could not be held while the answer waited
+to be written; an answer, or a session's closure, that it could not record after the action was
+carried out; and an attempt under the action's identifier that is still running when a copy of it
+arrives.
 
 A device that falls behind is told rather than waited for. What the daemon holds for one device is
 bounded in bytes, not in messages, at section 9's send queue per peer; a device that reaches that
@@ -7446,8 +7453,8 @@ caller whose window has closed, or whose daemon has restarted since, is still to
 * the result the change produced, once it has one;
 * the refusal it was given, when that refusal's code says the same request cannot succeed if it is
   sent again (a refusal that says it might, such as a store that could not be written, is not kept);
-* `RESOURCE_UNAVAILABLE` while the first attempt is still running in this daemon, and the caller
-  asks again;
+* `OUTCOME_UNKNOWN` while the first attempt is still running in this daemon, because that attempt
+  may complete the effect at any moment, and the caller asks again under the same identifier;
 * for an attempt that ended without recording what it did (the daemon stopped, or the attempt's
   task ended, in between), what this host's own records prove it did, and otherwise
   `OUTCOME_UNKNOWN`. A share is answered from the grant and the invitation it wrote, which take

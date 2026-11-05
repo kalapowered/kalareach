@@ -2445,7 +2445,7 @@ async fn a_voice_start_is_performed_once_however_long_its_first_attempt_waits() 
     let refusal = retried.expect_err("the retry is answered rather than performed");
     assert_eq!(
         refusal.code,
-        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
         "{refusal:?}"
     );
     assert!(
@@ -2484,7 +2484,7 @@ async fn a_retry_while_a_voice_start_runs_is_told_it_has_not_finished() {
         .expect_err("the retry is answered rather than performed");
     assert_eq!(
         refusal.code,
-        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
         "{refusal:?}"
     );
     assert_eq!(broker.started(), 0, "no call was made");
