@@ -1434,6 +1434,199 @@ async fn a_refusal_made_after_an_answer_is_told_by_what_the_answer_leaves_open()
     drop(controller);
 }
 
+/// KR-REQ-09.09: the answer recorded for a paired device's key registration is what an earlier
+/// attempt of the action produced, and it is given again as that however it is found: by the first
+/// lookup, or by the second that finds an attempt which finished meanwhile. When the authority feed
+/// raises a refusal before it is written, the device is told the outcome is unknown, and it is told
+/// so whether the record holds the registration's result or its refusal, because a device that may
+/// not be shown the record is not left to tell the one from the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recorded_key_registration_is_told_as_unknown_when_a_feed_refusal_rises_before_it_is_written()
+ {
+    use kr_protocol::envelope::{MutationRequest, Outcome, ParamsValue, Response};
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::ids::{ActionId, DeviceKeyRevision, RequestId};
+    use kr_protocol::method::MethodVersion;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    for second_lookup in [false, true] {
+        let world = fake::fake_worker(None).await;
+        let controller = &world.controller;
+        let (connection, recording) =
+            paired_connection(controller, 77, &[ActionRight::SessionView]);
+        let rotated = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a key");
+        // A registration that names another device is refused, and the refusal is recorded under
+        // its action like a result is.
+        let registration = MutationRequest {
+            request_id: RequestId::new(81),
+            method: Method::DevicePreviewKeyUpdate.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::null(),
+            target: kr_protocol::envelope::ActionTarget::environment(world.environment_id),
+            expected: ParamsValue::empty(),
+            action_window_id: connection
+                .windows
+                .issue(connection.connection_id, controller.boot_epoch)
+                .expect("a window")
+                .action_window_id,
+            requested_ttl_ms: DurationMs::new(30_000),
+            params: ParamsValue::from_typed(&kr_protocol::sharing::DevicePreviewKeyUpdateParams {
+                device_id: DeviceId::new(kr_ipc::new_uuid()),
+                notification_preview: *rotated.public(),
+                revision: DeviceKeyRevision::new(2),
+            })
+            .expect("encodes"),
+        };
+        let record_the_refusal = || async {
+            controller
+                .preview_key_update_action(
+                    &connection.device.principal(),
+                    &registration,
+                    crate::authority::AdmittedMutation {
+                        connection_id: connection.connection_id,
+                        admitted_revision: controller.policy().authority_revision(),
+                        deadline: controller
+                            .continuous_now()
+                            .checked_add(Duration::from_secs(30)),
+                    },
+                )
+                .await
+                .expect_err("a device registers only its own key");
+        };
+        let answered = if second_lookup {
+            let (before, look_again) = controller.pause_before_the_second_retained_lookup();
+            let (answered, ()) = tokio::join!(
+                connection.answer_now(ControlFrame::Mutation(Box::new(registration.clone()))),
+                async {
+                    tokio::time::timeout(WAIT_BOUND, before)
+                        .await
+                        .expect("the registration reaches the place it is stopped at")
+                        .expect("the pause is armed");
+                    record_the_refusal().await;
+                    look_again.send(()).expect("the registration goes on");
+                }
+            );
+            answered
+        } else {
+            record_the_refusal().await;
+            connection
+                .answer_now(ControlFrame::Mutation(Box::new(registration.clone())))
+                .await
+        }
+        .expect("the registration is answered");
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Error(found),
+            ..
+        }) = answered.frame()
+        else {
+            panic!("the record holds a refusal: {:?}", answered.frame());
+        };
+        assert_eq!(
+            found.code,
+            ErrorCode::InvalidArgument,
+            "the control: the recorded refusal is what is found"
+        );
+
+        controller.raise_the_unverified_withdrawal_refusal().await;
+        assert!(
+            connection.write_answer(answered).await,
+            "the connection stands"
+        );
+        let frames = recording.frames();
+        let Some(ControlFrame::Response(Response {
+            outcome: Outcome::Error(told),
+            ..
+        })) = frames.last()
+        else {
+            panic!("the answer was written past the refusal: {frames:?}");
+        };
+        assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+        assert_eq!(told.message, super::outcome_not_shown().message);
+        world.serving.abort();
+    }
+}
+
+/// An owner device's confirmation answer that this daemon kept is the answer to an action it took
+/// part in, and is written as one kept from an earlier submission: when the authority feed raises
+/// its refusal before it is written, the device is told the outcome is unknown whatever the answer
+/// was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_owner_confirmation_answer_is_told_as_unknown_when_a_feed_refusal_rises_before_it_is_written()
+ {
+    use kr_protocol::envelope::{MutationRequest, Outcome, ParamsValue, Response};
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+    use kr_protocol::ids::{ActionId, RequestId};
+    use kr_protocol::method::MethodVersion;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = super::super::tests::daemon(&temp).await;
+    let (connection, recording) = paired_connection(
+        &controller,
+        78,
+        &[ActionRight::SessionView, ActionRight::HostManage],
+    );
+    let request = MutationRequest {
+        request_id: RequestId::new(82),
+        method: Method::OwnerConfirmationRequest.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: kr_protocol::envelope::ActionTarget::environment(temp.environment_id()),
+        expected: ParamsValue::empty(),
+        action_window_id: connection
+            .windows
+            .issue(connection.connection_id, controller.boot_epoch)
+            .expect("a window")
+            .action_window_id,
+        requested_ttl_ms: DurationMs::new(30_000),
+        params: ParamsValue::empty(),
+    };
+    // The answer this daemon kept is a refusal, which only a kept answer is told as unknown.
+    let kept = ControlFrame::Response(Response {
+        request_id: request.request_id,
+        outcome: Outcome::Error(ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "the confirmation was refused",
+        )),
+    });
+    let pending = connection
+        .ask(None, Method::OwnerConfirmationPending.entry(), false)
+        .expect("the challenges are read");
+    let asked = connection
+        .read_of_retained(
+            Method::OwnerConfirmationRequest,
+            &request,
+            &kept,
+            &pending.acting,
+        )
+        .expect("the read is decided")
+        .expect("an owner confirmation's answer is decided");
+
+    controller.raise_the_unverified_withdrawal_refusal().await;
+    assert!(
+        connection
+            .write_answer(super::decision::Answered {
+                frame: kept,
+                asked: Some(asked),
+            })
+            .await,
+        "the connection stands"
+    );
+    let frames = recording.frames();
+    let Some(ControlFrame::Response(Response {
+        outcome: Outcome::Error(told),
+        ..
+    })) = frames.last()
+    else {
+        panic!("the answer was written past the refusal: {frames:?}");
+    };
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert_eq!(told.message, super::outcome_not_shown().message);
+    drop(controller);
+}
+
 /// KR-REQ-24.15: an answer decided before the feed removed this host is not written when the
 /// connection's grant rests on the feed, as it is not for the other two refusals: the removal moves
 /// no revision, so a decision taken before it names nothing that has changed. The device is written
