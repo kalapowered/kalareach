@@ -292,8 +292,10 @@ A release is taken in only whole and checked:
 - Every file the manifest lists is there with its length and digest, and nothing else is.
 - The following programs must all be listed as programs of `bin/` in order for a release to be
   accepted, regardless of who signed it: `kr`, `kr-attach-guard`, `kr-controller`, `kr-worker`,
-  `kr-describe-inference`, `kr-hook`, `kr-plugin-host`. If any of those are missing, the entire
-  release will be refused, and the refusal names each one it lacks.
+  `kr-describe-inference`, `kr-hook`, `kr-plugin-host`. The one exception is
+  `kr-describe-inference` for Arm Windows (`aarch64-pc-windows-msvc`), where it is not built and
+  not required. If any of those are missing, the entire release will be refused, and the refusal
+  names each one it lacks.
 - It is for this host's target, and this host's operating system is at or above its floor
   (the macOS release, or the GNU C library's version on Linux).
 - It is newer than the current release.
