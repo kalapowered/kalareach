@@ -103,6 +103,22 @@ describe('the action a later prompt names', () => {
     expect(supersessionFor(submissions, reads, TO)).toEqual({ action_id: LATER, revision: '4' })
   })
 
+  it('prefers a prompt read after the refusal to the action the refusal named', () => {
+    const reads = new ReceiptReads()
+    reads.note(record(OLDER, { revision: '3', updated_at_ms: '100' }))
+    reads.note(record(LATER, { revision: '4', updated_at_ms: '100' }))
+    reads.noteRefusal(`the uncertain outcome of this subject is action ${OLDER}, not ${LATER}`)
+    // A prompt sent after the refusal, whose outcome nobody knows either, was recorded by the host
+    // after the action it named.
+    const SENT_AFTER = 'c2000000-0000-4000-8000-000000000003'
+    reads.note(record(SENT_AFTER, { revision: '6', updated_at_ms: '200' }))
+    expect(
+      supersessionFor([unknown(OLDER), unknown(LATER), unknown(SENT_AFTER)], reads, TO)
+    ).toEqual({ action_id: SENT_AFTER, revision: '6' })
+    // Until then the named action is the one.
+    expect(supersessionFor([unknown(OLDER), unknown(LATER)], reads, TO)?.action_id).toBe(OLDER)
+  })
+
   it('keeps its own order for a refusal that names no action it could quote', () => {
     const reads = new ReceiptReads()
     reads.note(record(OLDER))
