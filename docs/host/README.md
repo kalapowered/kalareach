@@ -4149,13 +4149,18 @@ no envelope keeps which application sent a question or an alert, so two applicat
 that use the same identifier hold each other back. A receipt whose identity the worker cannot read
 holds back every request of its method by the actor in the session, as the rule above does: its
 envelope is gone (privacy mode removes it once an action settles), does not decode, or is not a
-request of that method. Every other method keeps the rule above.
+request of that method. Every uncertain request of a method also holds back a request of that method
+whose parameters do not parse, as the rule above does. Every other method keeps the rule above.
 
 When a subject carries several uncertain outcomes, a request has to show the one the journal
-recorded last. The order comes from the journal's event record. A clock reading cannot give it,
-because two outcomes can share a millisecond and the wall clock can step back, and neither can an
-identifier or the order the actions were admitted in. An outcome with no event in that record,
-written by an earlier build, comes after every outcome that has one.
+recorded last. For the five methods above that is the last recorded of the outcomes that hold the
+request back: a newer outcome of another identity does not qualify, and after privacy mode removed
+the envelopes of two outcomes the newest of them holds back a request of either identity, so a
+caller that shows it has not shown the older one. The order comes from the journal's event record.
+A clock reading cannot give it, because two outcomes can share a millisecond and the wall clock can
+step back, and neither can an identifier or the order the actions were admitted in. An outcome with
+no event in that record, written by an earlier build, comes after every outcome that has one, and
+among such outcomes the one admitted last comes first.
 
 The revision has to be one the caller was shown. The worker remembers, in memory and for a bounded
 number of receipts, the revision of each receipt that `action.read` answered to each actor, and a

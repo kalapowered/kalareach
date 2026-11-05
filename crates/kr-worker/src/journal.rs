@@ -2767,7 +2767,8 @@ impl Journal {
     /// change appends an event whose sequence only increases, so the receipt whose event for the
     /// state has the highest sequence is the newest. A receipt with no such event (a journal an
     /// earlier build wrote has rows and no event history) comes after every receipt that has one,
-    /// in the order it was admitted.
+    /// in the order it was admitted, which is the row number of the table: a compaction that
+    /// renumbers the rows must keep that order, or this fallback has to change.
     const NEWEST_RECORDED_FIRST: &'static str =
         "ORDER BY (SELECT e.sequence FROM receipt_events AS e
                     WHERE e.actor_id = r.actor_id AND e.action_id = r.action_id AND e.state = ?3
