@@ -77,7 +77,7 @@ $script:SingletonField = $null
 # Nothing is assumed of the editor beyond what is read here: the two fields exist, the editor has
 # an instance, the instance has a queue, and the queue answers with a count. Any of those failing
 # is an editor that cannot prove its queue is clear.
-function Read-KrQueuedKeys {
+function Get-KrKeyQueue {
     try {
         if ($null -eq $script:SingletonField -or $null -eq $script:QueuedKeysField) {
             $script:SingletonField = $script:Rl.GetField('_singleton', 'NonPublic,Static')
@@ -90,10 +90,18 @@ function Read-KrQueuedKeys {
         if ($null -eq $queue) { return $null }
         # A collection and not anything that merely answers to `Count`: a scalar has one too.
         if ($queue -isnot [System.Collections.ICollection]) { return $null }
-        return [uint64]([System.Collections.ICollection]$queue).Count
+        # As one value: a function's output is enumerated, and the queue would come out as its keys.
+        return , $queue
     } catch {
         return $null
     }
+}
+
+# How many keys that queue holds, or nothing when it cannot be read.
+function Read-KrQueuedKeys {
+    $queue = Get-KrKeyQueue
+    if ($null -eq $queue) { return $null }
+    [uint64]([System.Collections.ICollection]$queue).Count
 }
 
 # How many keys the reader has taken and not yet acted on.
@@ -101,6 +109,139 @@ function Get-KrQueuedKeys {
     $queued = Read-KrQueuedKeys
     if ($null -eq $queued) { return [uint64]0 }
     $queued
+}
+
+$script:KeyReadMethod = $null
+
+# The editor's own read of the next key, or nothing when this editor keeps none this package can
+# call, or one whose result and queue this package cannot use.
+#
+# Every part of the editor that needs another key reads it here: the second key of a chord, and each
+# key of a search or of a numeric argument. A handler that reads its keys here takes them in the
+# order the editor would have met them, from the editor's queue and, once that is empty, from the
+# terminal, where it waits for one: `Skip-KrReply` reads only when a key is there to be read. The
+# result has to answer for its character and for the key as the console reports it, and the queue
+# has to take keys back at its front, which is how a key that is no part of a reply is given back.
+function Get-KrKeyRead {
+    if ($null -ne $script:KeyReadMethod) { return $script:KeyReadMethod }
+    try {
+        $method = $script:Rl.GetMethod('ReadKey', [System.Reflection.BindingFlags]'NonPublic,Static',
+            $null, [type[]]@(), $null)
+        if ($null -eq $method) { return $null }
+        $returned = $method.ReturnType
+        $public = [System.Reflection.BindingFlags]'Public,Instance'
+        if ($returned.GetMember('KeyChar', $public).Count -eq 0) { return $null }
+        if ($null -eq $returned.GetMethod('AsConsoleKeyInfo', $public, $null, [type[]]@(), $null)) { return $null }
+        $queue = Get-KrKeyQueue
+        if ($null -eq $queue) { return $null }
+        foreach ($name in 'Enqueue', 'Clear', 'ToArray') {
+            if ($null -eq $queue.GetType().GetMethod($name)) { return $null }
+        }
+        $script:KeyReadMethod = $method
+        $method
+    } catch {
+        $null
+    }
+}
+
+# Whether the editor's own read of the next key can be called, which is what taking a host's answer
+# out of its keys rests on.
+function Test-KrKeyReadable {
+    $null -ne (Get-KrKeyRead)
+}
+
+# The next key, read the way the editor reads it.
+function Read-KrKey {
+    (Get-KrKeyRead).Invoke($null, @())
+}
+
+# Whether the terminal has delivered a key that the editor has not met: one in the editor's queue,
+# or input the runtime holds or the terminal still has. A read of the next key waits when there is
+# none, so the keys of a reply are read only while this says there are some.
+function Test-KrKeyWaiting {
+    if ((Get-KrQueuedKeys) -gt 0) { return $true }
+    $unread = Read-KrRuntimeUnread
+    $null -ne $unread -and $unread -gt 0
+}
+
+# Puts keys back at the front of the editor's queue, in the order given.
+function Restore-KrKeys {
+    param([object[]]$Keys)
+    $queue = Get-KrKeyQueue
+    $rest = $queue.ToArray()
+    $queue.Clear()
+    foreach ($key in $Keys) { $queue.Enqueue($key) }
+    foreach ($key in $rest) { $queue.Enqueue($key) }
+}
+
+# What each reply to a question of the terminal's opens with, after its Escape: a control sequence
+# (`CSI ? 62 ; 22 c`, the terminal's attributes), an operating system command (`OSC 11 ; rgb:... ST`,
+# a colour) and a device control string (`DCS > | name ST`, the terminal's version).
+$script:ReplyShapes = @{
+    '[' = 'control'
+    ']' = 'system'
+    'P' = 'device'
+}
+
+# The most keys that are read as one reply: the most the host's response lane writes for one.
+$script:ReplyKeysMax = 8192
+
+# Whether a key is the bell, which ends an operating system command. The editor reports it as the
+# key G with Control held and no character.
+function Test-KrBell {
+    param($Key)
+    if ([int]$Key.KeyChar -eq 0x07) { return $true }
+    $info = $Key.AsConsoleKeyInfo()
+    ($info.Key -eq [System.ConsoleKey]::G) -and (($info.Modifiers -band [System.ConsoleModifiers]::Control) -ne 0)
+}
+
+# Reads the rest of a reply whose introducing character the editor has taken, and drops it.
+#
+# An application asks the terminal something (what it is, where the cursor is, what colour its
+# background is) and the host answers in the terminal's input, in one write. When the application
+# has ended by then, the shell reads the answer at its prompt. It is no key and nobody typed it, but
+# the runtime has no key for such a sequence and hands the editor each part of it as a key of its
+# own: the Escape, the character that introduces the sequence, and every character after it. The
+# editor would put those characters into the line and draw each one.
+#
+# A control sequence ends at its first character from `@` to `~`. An operating system command ends
+# at the bell or at a backslash, and a device control string at a backslash: the runtime delivers a
+# string's terminator, an Escape and a backslash, as the backslash alone. The reply is read only
+# while the terminal has delivered keys, never waited for, so an Escape and a bracket a person
+# pressed take nothing from what they press next; what a read splits is left to the editor. A key
+# that no reply holds, a control character or the Escape of something else, ends the reply early and
+# goes back to the front of the editor's queue. A run longer than the most keys a reply is read as
+# is let go.
+function Skip-KrReply {
+    param([char]$Introducer)
+    $shape = $script:ReplyShapes["$Introducer"]
+    if ($null -eq $shape) { return }
+    $escape = $null
+    for ($taken = 0; $taken -lt $script:ReplyKeysMax; $taken++) {
+        if (-not (Test-KrKeyWaiting)) {
+            if ($null -ne $escape) { Restore-KrKeys @($escape) }
+            return
+        }
+        $key = Read-KrKey
+        $code = [int]$key.KeyChar
+        if ($shape -eq 'control') {
+            if ($code -ge 0x20 -and $code -le 0x3F) { continue }
+            if ($code -ge 0x40 -and $code -le 0x7E) { return }
+            Restore-KrKeys @($key)
+            return
+        }
+        if ($null -ne $escape) {
+            if ($code -ne 0x5C) { Restore-KrKeys @($escape, $key) }
+            return
+        }
+        if ($code -eq 0x5C) { return }
+        if ($code -eq 0x1B) { $escape = $key; continue }
+        if ($shape -eq 'system' -and (Test-KrBell $key)) { return }
+        if ($code -lt 0x20 -or $code -eq 0x7F) {
+            Restore-KrKeys @($key)
+            return
+        }
+    }
 }
 
 # The members of the runtime's own reader of the terminal, resolved once, or nothing when this
