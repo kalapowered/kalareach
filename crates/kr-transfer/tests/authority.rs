@@ -720,9 +720,10 @@ fn reparse_point(_entry: &Entry, _root: &Path, _path: &Path) -> Result<(), Strin
 /// The case the between-two-lookups test cannot reach is the replacement that lands inside one
 /// resolution. This runs the replacement in a loop beside the lookups and asserts what has to hold
 /// whatever the interleaving was: every lookup that succeeded read the authorised tree's own file,
-/// and every one that did not was refused. The lookups go on, beside a swapper that keeps swapping,
-/// until one is refused, which only a swap in progress makes happen: the case does not pass on a
-/// run in which no lookup met a swap.
+/// and every one that did not was refused. The first swap holds its link in place until a lookup
+/// has been refused, which only a swap in progress makes happen, so at least one lookup meets a
+/// changed tree whatever the scheduling; the swaps then go on as fast as they can for as long as
+/// the lookups run.
 #[cfg(unix)]
 #[test]
 fn a_component_swapped_under_running_lookups_never_resolves_outside() {
@@ -749,6 +750,7 @@ fn a_component_swapped_under_running_lookups_never_resolves_outside() {
         AuthorisedDirectory::open_root(environment(), &inside).expect("opens the authority");
     let name = RelativeName::parse("src/notes.txt").expect("a valid relative name");
     let stop = AtomicBool::new(false);
+    let met = AtomicBool::new(false);
     let swaps = AtomicUsize::new(0);
 
     std::thread::scope(|threads| {
@@ -760,6 +762,11 @@ fn a_component_swapped_under_running_lookups_never_resolves_outside() {
                 // The real directory is parked and a link to the tree outside takes its name.
                 std::fs::rename(&real, &parked).expect("parks the real directory");
                 std::os::unix::fs::symlink(&outside, &real).expect("links to the outside tree");
+                // The first link stays until a lookup has been refused, so that a lookup is sure to
+                // meet a changed tree; once one has, the swaps run on without waiting.
+                while !met.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
                 // And then back again.
                 std::fs::remove_file(&real).expect("removes the link");
                 std::fs::rename(&parked, &real).expect("restores the real directory");
@@ -770,10 +777,11 @@ fn a_component_swapped_under_running_lookups_never_resolves_outside() {
         let _raise = Raise(&stop);
         let mut opened = 0_usize;
         let mut refused = 0_usize;
-        // At least 400 lookups, and on until one is refused, beside a swapper that keeps swapping
-        // for as long as they run. A tree that no swap is changing resolves every lookup, so a
-        // refusal is a lookup that ran while a swap was under way. Only a swapper that has ended,
-        // which is one that panicked, ends the wait without one, and the join below then says so.
+        // At least 400 lookups, and on until one is refused. A tree that no swap is changing
+        // resolves every lookup, so a refusal is a lookup that ran while a swap was under way, and
+        // the first swap holds its link until there is one, whatever the scheduling. Only a
+        // swapper that has ended, which is one that panicked, ends the wait without one, and the
+        // join below then says so.
         while opened + refused < 400 || (refused == 0 && !swapper.is_finished()) {
             match authority.open_read(&name, ObjectPolicy::ReadableFile) {
                 Ok(mut file) => {
@@ -801,6 +809,7 @@ fn a_component_swapped_under_running_lookups_never_resolves_outside() {
                         "the refusal names what it found: {escape:?}"
                     );
                     refused += 1;
+                    met.store(true, Ordering::Relaxed);
                 }
             }
         }
@@ -2188,8 +2197,8 @@ fn remove_tree_refuses_a_replacement_and_reports_partial() {
     // rename is taking the directory elsewhere, as Apple's filesystem can. The test below makes
     // the swap at each of those moments in turn.
     //
-    // Forty rounds. A round whose removal finished before its swapper ran answers Ok and shows
-    // nothing of a swap that lands during a removal; the printed outcomes say how the rounds went.
+    // Forty rounds. A round whose removal finished before its swap answers Ok and shows nothing of
+    // a swap that lands during a removal; the printed outcomes say how the rounds went.
     let mut outcomes = std::collections::BTreeMap::<&str, usize>::new();
     for round in 0..40 {
         let tree = root.path().join("tree");
