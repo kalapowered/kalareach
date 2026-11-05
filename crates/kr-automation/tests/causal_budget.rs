@@ -1,6 +1,6 @@
 //! Causal budgets: the ceilings, exhaustion, rearm, and the chain that spans two workflows.
 //!
-//! The central case is KR-ACC-032: two workflows that are each individually acyclic trigger one
+//! The central case is this: two workflows that are each individually acyclic trigger one
 //! another slowly, across controller restarts, and exhaust one persistent budget rather than
 //! escaping through per-run limits that reset with every run.
 //!
