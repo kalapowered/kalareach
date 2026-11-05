@@ -39,6 +39,9 @@ pub(super) struct Asked {
     /// is decided as a read of a receipt, under `action.read`'s entry, and is still the answer to
     /// the method it was kept for, so the two differ there.
     pub(super) shown_as: Method,
+    /// Whether the answer is one kept from an earlier submission of the action, which a device is
+    /// shown only as a read of what that submission produced.
+    kept: bool,
     /// For a page of retained output, the privacy state it was read under, which the page is
     /// released under ([`RemoteConnection::write_answer`]).
     pub(super) read_under: Option<ReadUnder>,
@@ -53,17 +56,19 @@ impl Asked {
         }
     }
 
+    /// Returns the same decision, for an answer kept from an earlier submission of the action.
+    pub(super) fn kept(self) -> Self {
+        Self { kept: true, ..self }
+    }
+
     /// What the answer this was decided for is the answer to.
-    ///
-    /// An answer kept from an earlier submission is decided as a read of its receipt, under
-    /// `action.read`'s entry, and is still the answer to the action it was kept for.
     fn answers(&self) -> Answers {
         if self.shown_as.entry().effect != EffectClass::Write {
             Answers::Read
-        } else if self.entry.method == self.shown_as {
-            Answers::Action
-        } else {
+        } else if self.kept {
             Answers::Kept
+        } else {
+            Answers::Action
         }
     }
 }
@@ -176,8 +181,10 @@ impl RemoteConnection {
             ) {
                 Ok(again) => {
                     let read_under = asked.read_under.take();
+                    let kept = asked.kept;
                     asked = again.answering(asked.shown_as);
                     asked.read_under = read_under;
+                    asked.kept = kept;
                 }
                 // The decision made again refuses what the answer was cut for. An action the
                 // worker carried out is not refused for that: its answer is not shown, and the
@@ -302,6 +309,7 @@ impl RemoteConnection {
             decision,
             acting,
             shown_as: entry.method,
+            kept: false,
             read_under: None,
         })
     }
@@ -1088,7 +1096,9 @@ const fn answered_request(frame: &ControlFrame) -> Option<RequestId> {
 }
 
 /// What a request is told when the time bounds it was decided under ran out and came back while it
-/// waited, a renewal published after a lapse: nothing was done under them, and it is asked again.
+/// waited, a renewal published after a lapse: it is asked again. The code is a transient one, so a
+/// client keeps an action it sent, and asks again under the same identifier: if the worker took the
+/// action, the repeat is answered from what the worker kept.
 fn authority_kept_moving() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::ResourceUnavailable,

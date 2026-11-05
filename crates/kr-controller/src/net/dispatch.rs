@@ -409,8 +409,8 @@ fn may_have_taken_effect(answer: &ControlFrame) -> bool {
 fn outcome_not_shown() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::OutcomeUnknown,
-        "this action may have been carried out, and this host does not show this device what \
-         became of it",
+        "this action may have been carried out, and this host does not report what became of it \
+         in this answer",
     )
 }
 

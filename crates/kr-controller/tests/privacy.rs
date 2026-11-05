@@ -2594,6 +2594,10 @@ async fn kr_req_23_34_a_repeated_rename_is_answered_only_under_view_authority_ov
         } else {
             let denied = again.expect_err("a device that may not view is not answered");
             assert_eq!(denied.code, ErrorCode::OutcomeUnknown, "{denied}");
+            assert!(
+                denied.message.contains("may have been carried out"),
+                "{denied}"
+            );
             assert_eq!(
                 again_refused.code,
                 ErrorCode::OutcomeUnknown,

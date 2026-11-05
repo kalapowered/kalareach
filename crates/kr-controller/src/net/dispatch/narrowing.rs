@@ -521,7 +521,8 @@ impl RemoteConnection {
     ///
     /// # Errors
     ///
-    /// Returns the refusal when the host or the grant no longer reaches what the action did.
+    /// Returns the outcome of the action as not shown, which is told as unknown, when the host or
+    /// the grant no longer reaches what the action did.
     pub(super) async fn retained_working_tree_change(
         &self,
         actor_id: &ActorId,
@@ -578,7 +579,8 @@ impl RemoteConnection {
     ///
     /// # Errors
     ///
-    /// Returns the refusal when the grant no longer reaches the version.
+    /// Returns the outcome of the action as not shown, which is told as unknown, when the grant no
+    /// longer reaches the version.
     pub(super) async fn retained_materialisation(
         &self,
         actor_id: &ActorId,

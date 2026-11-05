@@ -24,13 +24,14 @@ use super::decision::{Asked, session_of};
 use super::output::{RELAY_DECISIONS, RelayGrant, Relaying, Written};
 use super::{RemoteConnection, failure, outcome_not_shown, outcome_unknown};
 
-/// Why a claim on an action's identity did not succeed.
+/// Why a claim on an action's identity did not succeed, or why a repeat of one is not answered.
 ///
 /// The two are answered differently. A conflict is this host's answer about the action: section 9
 /// makes a reused identifier carrying a different payload `ID_CONFLICT`, and nothing is dispatched
 /// under it. Storage being unavailable says nothing about the action, and section 7 does not let a
 /// storage failure stop an authorised stop, so a close goes on without its route while every other
-/// mutation is refused.
+/// mutation is refused. A repeat whose route shows an earlier submission may have carried the action
+/// out, and that this host does not answer, is a conflict that says so ([`Self::not_shown`]).
 pub(super) enum RouteRefusal {
     Conflict(ProtocolError),
     Unavailable(ProtocolError),
@@ -472,7 +473,8 @@ impl RemoteConnection {
         )?;
         Ok(self
             .ask_under(acting.clone(), session_id, entry, false)?
-            .answering(answering))
+            .answering(answering)
+            .kept())
     }
 
     /// Decides the read a retained answer of this daemon's own is written under, when it has one.
@@ -509,7 +511,7 @@ impl RemoteConnection {
         ) {
             return self
                 .ask(None, Method::OwnerConfirmationPending.entry(), false)
-                .map(|read| Some(read.answering(method)));
+                .map(|read| Some(read.answering(method).kept()));
         }
         let subject = mutation
             .target
@@ -649,13 +651,16 @@ impl RemoteConnection {
     /// The answer is returned with the decision it is to be written under: a read of the receipt
     /// over the session it belongs to ([`Self::may_read_receipts`]). A worker holds what it keeps to
     /// the history scope of this device's grant, which goes with the read, and its answer is read
-    /// in the shape of its level: one that does not read there is refused by name, after the daemon
-    /// has used it to settle a close it kept the answer of.
+    /// in the shape of its level: one that does not read there is not passed on, and the device is
+    /// told what became of the action is unknown, after the daemon has used it to settle a close it
+    /// kept the answer of.
     ///
     /// A caller that may not read this session's receipts is not told what its action produced,
-    /// and for a close that is all it is not told: a close it may make is still made, because
-    /// section 7 lets an authorised stop go ahead, and the answer a worker gives a retried close is
-    /// checked again where it comes back.
+    /// and not that it was refused: the route shows an earlier submission may have carried it out,
+    /// so it is told the outcome is unknown ([`RouteRefusal::not_shown`]). For a close that is all
+    /// it is not told: a close it may make is still made, because section 7 lets an authorised stop
+    /// go ahead, and the answer a worker gives a retried close is checked again where it comes
+    /// back.
     pub(super) async fn retained_remotely(
         &self,
         mutation: &MutationRequest,

@@ -4959,6 +4959,44 @@ async fn kr_req_10_49_a_kept_close_result_that_does_not_read_is_not_passed_on() 
     world.serving.abort();
 }
 
+/// A close the worker took and answered in a form this host cannot read in the worker's level is
+/// not refused: the close happened, and the device is told that what became of it is unknown. The
+/// close reaches the worker once, because no route of it was on record to answer the repeat first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_whose_answer_does_not_read_in_the_workers_level_is_told_as_unknown() {
+    use kr_protocol::envelope::ControlFrame;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let connection =
+        super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 39));
+    let close = fake::close_request(world.environment_id, world.session_id);
+    let unreadable = ParamsValue::new(kr_cbor::CanonicalValue::Map(
+        kr_cbor::CanonicalMap::from_entries([(
+            "a_member_no_level_has".to_owned(),
+            kr_cbor::CanonicalValue::integer(1).expect("an integer"),
+        )])
+        .expect("a map"),
+    ));
+    script.kept(close.action_id, unreadable);
+    let answered = connection
+        .answer_now(ControlFrame::Mutation(Box::new(close)))
+        .await
+        .expect("the close is answered");
+    let error = error_of(answered.frame());
+    assert_eq!(
+        error.code,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{error}"
+    );
+    assert_eq!(script.forwarded().len(), 1, "the close reached the worker");
+    world.serving.abort();
+}
+
 /// KR-REQ-10.49: the receipt a worker keeps for a refused action holds no result and an error whose
 /// text the device is not shown: the retry is answered with the receipt as the worker held it to
 /// the device's grant, and nothing the device receives carries the worker's words.
@@ -5138,6 +5176,7 @@ async fn an_action_a_worker_answers_from_its_receipt_is_not_refused_to_a_device_
         kr_protocol::error::ErrorCode::OutcomeUnknown,
         "{error}"
     );
+    assert_eq!(error.message, super::outcome_not_shown().message);
     assert_eq!(script.forwarded().len(), 1, "the worker was asked once");
     world.serving.abort();
 }
@@ -5209,6 +5248,7 @@ async fn kr_req_23_34_a_close_is_made_for_a_caller_that_may_not_read_its_receipt
                 kr_protocol::error::ErrorCode::OutcomeUnknown,
                 "{error}"
             );
+            assert_eq!(error.message, super::outcome_not_shown().message);
             // What it kept is settled all the same.
             let (_arrived, go) = script.end_at_next_read();
             drop(go);
@@ -5542,6 +5582,7 @@ async fn kr_req_23_34_a_retry_of_an_action_other_than_a_close_is_not_answered_to
         kr_protocol::error::ErrorCode::OutcomeUnknown,
         "{error}"
     );
+    assert_eq!(error.message, super::outcome_not_shown().message);
     assert!(!error.message.contains("secret-notes"), "{error}");
     assert_eq!(script.forwarded().len(), 0, "nothing reached the worker");
     world.serving.abort();
@@ -5780,6 +5821,7 @@ async fn a_retry_answered_from_the_workers_receipt_is_not_answered_when_a_fence_
         );
     };
     assert_eq!(refused.code, kr_protocol::error::ErrorCode::OutcomeUnknown);
+    assert_eq!(refused.message, super::outcome_not_shown().message);
     world.serving.abort();
 }
 
@@ -6086,6 +6128,7 @@ async fn a_key_registration_recorded_after_the_first_lookup_is_not_answered_when
         );
     };
     assert_eq!(refused.code, kr_protocol::error::ErrorCode::OutcomeUnknown);
+    assert_eq!(refused.message, super::outcome_not_shown().message);
 
     controller.hold_fence(false);
     let again = connection

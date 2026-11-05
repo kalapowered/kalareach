@@ -2145,6 +2145,10 @@ async fn a_retry_is_not_answered_from_its_record_while_a_fence_is_owed() {
         kr_protocol::error::ErrorCode::OutcomeUnknown,
         "{refused:?}"
     );
+    assert!(
+        refused.message.contains("may have been carried out"),
+        "{refused:?}"
+    );
     clear_the_fault(&registry);
     raw.close();
     host.stop().await;
@@ -2206,6 +2210,10 @@ async fn a_retry_is_not_answered_when_a_fence_is_owed_while_its_record_is_found(
     assert_eq!(
         withheld.code,
         kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{withheld:?}"
+    );
+    assert!(
+        withheld.message.contains("may have been carried out"),
         "{withheld:?}"
     );
     clear_the_fault(&registry);

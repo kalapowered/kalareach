@@ -271,7 +271,8 @@ pub(super) struct Relaying<'a> {
 pub(super) enum Answers {
     /// Nothing a device asked: a notification, or a batch a subscription carries.
     Nothing,
-    /// A read, which carries out nothing.
+    /// A read, which carries out nothing, so a refusal made after it holds an answer says nothing
+    /// of an action.
     Read,
     /// An action the device asked this host to carry out, which the worker may have carried out
     /// whatever the frame says.

@@ -1443,6 +1443,18 @@ fn transport_of(connection: &iroh::endpoint::Connection) -> Transport {
     }
 }
 
+/// What a close is answered when its worker took it and answered in a form this host cannot read.
+///
+/// The close happened, so the answer is not a refusal of it: this host does not know what the
+/// worker said of it, and says so.
+fn unreadable_close_answer() -> ControllerError {
+    ControllerError::Uncertain {
+        detail: "the worker took the close and answered in a form this host cannot read, so what \
+                 it says of the close is unknown"
+            .to_owned(),
+    }
+}
+
 /// The frame that turns a connection away, saying why as a device is told it.
 fn refusal(error: &kr_protocol::error::ProtocolError) -> kr_protocol::envelope::ControlFrame {
     kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
@@ -1884,7 +1896,8 @@ impl Controller {
             // that passed the close on first may not be this one, and what the answer says is then
             // this daemon's only word of the end. The answer is the worker's receipt either way,
             // so it goes whatever the settling found.
-            let (answer, closed) = crate::service::close::read_close_answer(proxy.level(), &value)?;
+            let (answer, closed) = crate::service::close::read_close_answer(proxy.level(), &value)
+                .map_err(|_| unreadable_close_answer())?;
             if let Some(reply) = closed {
                 let _ = self.settle_close_answer(session_id, &reply).await;
             }
@@ -1893,7 +1906,7 @@ impl Controller {
         let reply: kr_protocol::session::SessionCloseResult = proxy
             .level()
             .decode_value(&value)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+            .map_err(|_| unreadable_close_answer())?;
         // The worker's description of the session goes on in the answer as it came: what a device
         // is shown of it is decided where its answer is written.
         self.settle_close_answer(session_id, &reply).await?;
