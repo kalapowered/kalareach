@@ -1690,6 +1690,7 @@ pub(super) fn sync_failure(error: SyncError) -> CommandError {
         code: error.code(),
         user_action: error.user_action().as_str().into(),
         message: error.to_string(),
+        retry: error.code().retry_category(),
     }
 }
 

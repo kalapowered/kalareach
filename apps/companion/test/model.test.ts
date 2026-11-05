@@ -39,10 +39,12 @@ import {
   failed,
   queued,
   reconnectBanner,
+  sendOutcomeOf,
   sent,
   settled,
   stateOfReceipt,
-  unresolved
+  unresolved,
+  wasRefused
 } from '../src/model/receipts'
 import { emptyControlState, evaluate, isRendered, visibilityOf } from '../src/model/controls'
 import { leftBlankOnPhone, stretchesOf, styleOf } from '../src/terminal/cells'
@@ -254,6 +256,44 @@ describe('what the person sent', () => {
     })
     expect(submission.state).toBe('unknown')
     expect(unresolved([submission])).toHaveLength(1)
+  })
+
+  // A host's answer to a send is a definite word, a refusal for now, or an outcome it cannot
+  // establish, and only the first is called a refusal.
+  it('calls a refusal for now not taken, and only a definite word refused', () => {
+    const base = queued('s1', 'hello', 0)
+    const forNow = failed(base, {
+      code: 'RESOURCE_UNAVAILABLE',
+      message: 'the authority this request was decided under changed; ask again',
+      retry: 'transient'
+    })
+    expect(forNow.state).toBe('not_taken')
+    expect(describeState(forNow.state)).toBe('Not taken for now')
+    expect(wasRefused(forNow.state)).toBe(true)
+    expect(sendOutcomeOf(forNow.state)).toBe('refused')
+    // It is not waiting for a receipt, so the reconnect banner does not count it.
+    expect(unresolved([forNow])).toHaveLength(0)
+
+    const definite = failed(base, {
+      code: 'PERMISSION_DENIED',
+      message: 'this device may not',
+      retry: 'configuration_change'
+    })
+    expect(definite.state).toBe('refused')
+    // A failure that names no category is read as a definite word, as every code but one was.
+    expect(failed(base, { code: 'PERMISSION_DENIED', message: 'no' }).state).toBe('refused')
+
+    const unknown = failed(base, {
+      code: 'OUTCOME_UNKNOWN',
+      message: 'the connection ended after the request was sent',
+      retry: 'outcome_unknown'
+    })
+    expect(unknown.state).toBe('unknown')
+    expect(unresolved([unknown])).toHaveLength(1)
+    expect(forNow.error).toEqual({
+      code: 'RESOURCE_UNAVAILABLE',
+      message: 'the authority this request was decided under changed; ask again'
+    })
   })
 
   it('never lets the reconnect banner imply success', () => {

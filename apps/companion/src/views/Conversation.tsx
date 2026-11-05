@@ -43,6 +43,7 @@ import { AttachmentThumb } from '../components/AttachmentThumb'
 import {
   failureCode,
   failureMessage,
+  failureRetry,
   MAX_HANDED_BYTES,
   watch,
   type AttachmentHandle,
@@ -501,7 +502,11 @@ export function Conversation({
             ...current,
             submissions: current.submissions.map((submission) =>
               submission.localId === local.localId
-                ? failed(submission, { code, message: failureMessage(error) })
+                ? failed(submission, {
+                    code,
+                    message: failureMessage(error),
+                    retry: failureRetry(error)
+                  })
                 : submission
             )
           }))

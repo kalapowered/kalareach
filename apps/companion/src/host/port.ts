@@ -125,6 +125,12 @@ export interface HostError {
   readonly message: string
   /** What the person can do about it, where the client knows. */
   readonly user_action: string
+  /**
+   * The retry category of the code: `transient` is the host saying it cannot take the request now,
+   * `outcome_unknown` that it cannot establish what became of it. Absent where native code names
+   * none, which reads as a definite word.
+   */
+  readonly retry?: string
 }
 
 /**
@@ -2837,4 +2843,9 @@ export function failureWords(value: unknown): string {
 /** The protocol code of a failure, or null when it did not carry one. */
 export function failureCode(value: unknown): string | null {
   return isHostError(value) ? value.code : null
+}
+
+/** The retry category of a failure, or null when it did not carry one. */
+export function failureRetry(value: unknown): string | null {
+  return isHostError(value) && typeof value.retry === 'string' ? value.retry : null
 }
