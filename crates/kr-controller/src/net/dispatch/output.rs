@@ -266,6 +266,21 @@ pub(super) struct Relaying<'a> {
     pub(super) redecide: &'a (dyn Fn() -> bool + Send + Sync),
 }
 
+/// What a frame written under a decision is the answer to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Answers {
+    /// Nothing a device asked: a notification, or a batch a subscription carries.
+    Nothing,
+    /// A read, which carries out nothing.
+    Read,
+    /// An action the device asked this host to carry out, which the worker may have carried out
+    /// whatever the frame says.
+    Action,
+    /// The answer kept from an earlier submission of an action, which a device is shown only as a
+    /// read of the receipt it is.
+    Kept,
+}
+
 /// How one write ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Written {
@@ -520,11 +535,12 @@ impl RemoteOutput {
         under: &[HeldBound],
         relaying: Option<Relaying<'_>>,
     ) -> Written {
-        self.write_held(frame, under, relaying, false, None).await
+        self.write_held(frame, under, relaying, Answers::Nothing, None)
+            .await
     }
 
     /// As [`Self::write`], and, for an answer to a request decided before this write, held to the
-    /// refusal the authority feed puts on remote grants when `answer` says so.
+    /// refusal the authority feed puts on remote grants when `answers` says it is one.
     ///
     /// The refusal moves no revision and withdraws no registration, so a decision taken before it
     /// rose names nothing that has changed. It is read where the other bounds are, before the first
@@ -542,7 +558,7 @@ impl RemoteOutput {
         frame: &ControlFrame,
         under: &[HeldBound],
         relaying: Option<Relaying<'_>>,
-        answer: bool,
+        answers: Answers,
         read_under: Option<&ReadUnder>,
     ) -> Written {
         // What this host's failures say of the host is not for a device. It is decided here, before
@@ -578,7 +594,7 @@ impl RemoteOutput {
             return Written::Withdrawn;
         }
         let bounds_hold_now = || {
-            !(answer
+            !(answers != Answers::Nothing
                 && self
                     .authority
                     .controller

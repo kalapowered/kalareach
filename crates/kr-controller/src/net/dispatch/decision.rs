@@ -2,7 +2,9 @@
 //! intersection.
 
 use kr_protocol::actor::ActorIngress;
-use kr_protocol::authority::{HistoryFilter, MethodEntry, RequiredAuthority, ResourceSelectorKind};
+use kr_protocol::authority::{
+    EffectClass, HistoryFilter, MethodEntry, RequiredAuthority, ResourceSelectorKind,
+};
 use kr_protocol::envelope::{ControlFrame, MutationRequest, ParamsValue, Request};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{AuthorityRevision, GrantId, RequestId, SessionId};
@@ -16,7 +18,7 @@ use crate::grants::policy::HeldBound;
 use crate::service::net::lifetimes::GrantStanding;
 
 use super::acting::{Acting, Held};
-use super::output::{RELAY_DECISIONS, ReadUnder, Written};
+use super::output::{Answers, RELAY_DECISIONS, ReadUnder, Written};
 use super::{RemoteConnection, failure};
 
 /// One request of this connection's as the host decided it: what was asked, and the decision,
@@ -48,6 +50,20 @@ impl Asked {
         Self {
             shown_as: method,
             ..self
+        }
+    }
+
+    /// What the answer this was decided for is the answer to.
+    ///
+    /// An answer kept from an earlier submission is decided as a read of its receipt, under
+    /// `action.read`'s entry, and is still the answer to the action it was kept for.
+    fn answers(&self) -> Answers {
+        if self.shown_as.entry().effect != EffectClass::Write {
+            Answers::Read
+        } else if self.entry.method == self.shown_as {
+            Answers::Action
+        } else {
+            Answers::Kept
         }
     }
 }
@@ -139,7 +155,13 @@ impl RemoteConnection {
             };
             match self
                 .output
-                .write_held(&shown, &asked.decision.bounds(), None, true, read_under)
+                .write_held(
+                    &shown,
+                    &asked.decision.bounds(),
+                    None,
+                    asked.answers(),
+                    read_under,
+                )
                 .await
             {
                 Written::Sent => return true,

@@ -9,7 +9,9 @@ use kr_protocol::scalars::{DurationMs, Nullable};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 
-use super::output::{Authorisation, FrameSink, RelayGrant, Relaying, RemoteOutput, Written};
+use super::output::{
+    Answers, Authorisation, FrameSink, RelayGrant, Relaying, RemoteOutput, Written,
+};
 use crate::grants::organisation::testing::TestOrganisation;
 use crate::grants::policy::{HeldBound, Stands};
 use crate::service::Controller;
@@ -2832,7 +2834,7 @@ async fn a_connection_that_decided_a_request_under_a_share_resting_on_the_feed_i
         ] {
             let written = connection
                 .output()
-                .write_held(&batch(), &asked.decision.bounds(), None, true, None)
+                .write_held(&batch(), &asked.decision.bounds(), None, Answers::Read, None)
                 .await;
             assert_eq!(written, written_after_the_removal);
         }
