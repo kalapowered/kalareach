@@ -1,5 +1,4 @@
-//! Deleting a copy that left the host, from the application on the computer the host runs on
-//! (KR-ACC-033).
+//! Deleting a copy that left the host, from the application on the computer the host runs on.
 //!
 //! The daemon is kr-controller's in-process host with a storage service selected, and the service is
 //! the stand-in, which answers as the deployed one does. The host has made two backups and they are
@@ -565,6 +564,11 @@ fn enrolment(
 /// KR-REQ-24.29, the part about an explicit, separately authorised deletion: the person's yes
 /// deletes the copy the host listed, and no other, and asking deletes nothing. Not shown here: that
 /// deletion is logical cleanup and not physical erase.
+///
+/// KR-ACC-033, the part about reporting the earlier retained archives with an explicit deletion
+/// action: the person's yes deletes at the service the copy the host listed and no other. Not shown
+/// here: a restore with the kit, writer and locator substitution, and privacy mode fencing an
+/// export in flight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_yes_deletes_the_copy_the_host_listed_and_no_other() {
     let rig = Rig::after_two_backups_under_privacy_mode().await;
@@ -763,6 +767,10 @@ async fn a_cancelled_or_run_out_or_unknown_confirmation_deletes_nothing() {
 ///
 /// KR-REQ-24.29, the part about the authorisation being for what the person looked at: a
 /// confirmation given before privacy mode changed deletes nothing.
+///
+/// KR-ACC-033, the part about privacy mode and the explicit deletion action: a confirmation given
+/// before privacy mode changed deletes nothing. Not shown here: a restore with the kit, writer and
+/// locator substitution, and privacy mode fencing an export in flight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_confirmation_does_not_outlast_a_change_of_privacy_mode() {
     let rig = Rig::after_two_backups_under_privacy_mode().await;
