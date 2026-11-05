@@ -610,6 +610,43 @@ impl RemoteConnection {
         Ok(None)
     }
 
+    /// What a device is told of `kept`, the answer an earlier submission of its action left in a
+    /// record this host reads: the daemon's own stores, which the door asks before it admits the
+    /// action, and the service that performs it, which asks its own once it has. Both are the same
+    /// answer to the device, so both pass through here.
+    ///
+    /// The answer is written under the decision of a read of the receipt it is, and a device that
+    /// may not read it, or whose registration was withdrawn or replaced while the record was read,
+    /// is told the outcome is unknown, whatever the answer was: that it was a refusal is not for a
+    /// device that may not read it. `asked` is left holding the decision the answer is written
+    /// under.
+    pub(super) async fn kept_answer(
+        &self,
+        kept: ControlFrame,
+        method: Method,
+        mutation: &MutationRequest,
+        validated: AuthorityRevision,
+        decided: &Asked,
+        asked: &mut Option<Asked>,
+    ) -> std::result::Result<ControlFrame, ProtocolError> {
+        *asked = Some(decided.clone().kept());
+        #[cfg(feature = "testing")]
+        self.controller.after_the_retained_lookup.wait().await;
+        // What this host holds is the outcome of an action. When it will not show the device
+        // that outcome, it does not tell the device the action did not happen, or that it did.
+        if self.admitted_to_answer(validated).is_err() {
+            return Err(outcome_not_shown());
+        }
+        // The answer is a read of what an earlier submission produced, and is written under the
+        // decision that read is ([`Self::read_of_retained`]).
+        match self.read_of_retained(method, mutation, &kept, &decided.acting) {
+            Ok(Some(read)) => *asked = Some(read),
+            Ok(None) => {}
+            Err(_) => return Err(outcome_not_shown()),
+        }
+        Ok(kept)
+    }
+
     /// Returns this connection's link to one worker, opening it on first use.
     ///
     /// One link per connection, and one worker per link: a device attaches to one session at a

@@ -436,3 +436,6 @@ mod a_share_a_device_holds;
 
 #[cfg(test)]
 mod a_share_that_names_a_current_decision;
+
+#[cfg(test)]
+mod a_copy_from_a_services_record;

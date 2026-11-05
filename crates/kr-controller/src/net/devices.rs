@@ -34,6 +34,7 @@ use kr_transport::handshake::PairedDirectory;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 
 pub use super::clock_trust::{CLOCK_TOLERANCE_MS, ClockTrust};
 
@@ -865,7 +866,8 @@ impl DeviceDirectory {
     ///
     /// The outcome is written beside the keys, so a retry whose reply was lost finds what happened
     /// however the attempt ended. A failure to reach a store is returned instead and keeps nothing,
-    /// and the next attempt decides afresh.
+    /// and the next attempt decides afresh. The outcome of an earlier attempt that this finds is
+    /// given as a copy.
     ///
     /// # Errors
     ///
@@ -881,7 +883,7 @@ impl DeviceDirectory {
         declared: std::result::Result<DevicePublicKeys, ProtocolError>,
         admitted: impl FnOnce() -> Result<()>,
         now_ms: TimestampMs,
-    ) -> Result<RecordedDeclaration> {
+    ) -> Result<Given<RecordedDeclaration>> {
         let connection = self
             .connection
             .lock()
@@ -895,7 +897,7 @@ impl DeviceDirectory {
         .map_err(ControllerError::registry)?;
         if let Some(recorded) = read_declaration(&transaction, actor_id, action_id)? {
             transaction.commit().map_err(ControllerError::registry)?;
-            return Ok(recorded);
+            return Ok(Given::Copied(recorded));
         }
         let outcome = match admitted() {
             Err(
@@ -925,10 +927,10 @@ impl DeviceDirectory {
             )
             .map_err(ControllerError::registry)?;
         transaction.commit().map_err(ControllerError::registry)?;
-        Ok(RecordedDeclaration {
+        Ok(Given::Fresh(RecordedDeclaration {
             payload_digest,
             outcome,
-        })
+        }))
     }
 
     /// Whether the registry at `path` holds a route or a declaration for this actor's action,
@@ -2100,15 +2102,17 @@ mod tests {
         action_byte: u8,
         declared: std::result::Result<DevicePublicKeys, ProtocolError>,
     ) -> Result<RecordedDeclaration> {
-        directory.declare_keys(
-            &device.principal(),
-            action(action_byte),
-            digest(action_byte),
-            device.device_id,
-            declared,
-            || Ok(()),
-            TimestampMs::new(1_764_003_800_000),
-        )
+        directory
+            .declare_keys(
+                &device.principal(),
+                action(action_byte),
+                digest(action_byte),
+                device.device_id,
+                declared,
+                || Ok(()),
+                TimestampMs::new(1_764_003_800_000),
+            )
+            .map(Given::into_answer)
     }
 
     fn an_earlier_device(directory: &DeviceDirectory, byte: u8) -> DeviceRecord {
@@ -2370,7 +2374,8 @@ mod tests {
                 TimestampMs::new(1_764_003_900_000),
             )
             .expect("answered");
-        assert_eq!(again, first);
+        assert!(again.is_copied(), "an earlier attempt's outcome is a copy");
+        assert_eq!(again.into_answer(), first);
 
         // The record is the actor's own: another actor's action under the same identifier is not
         // it.
@@ -2403,7 +2408,8 @@ mod tests {
                 },
                 TimestampMs::new(1_764_003_800_000),
             )
-            .expect("decided");
+            .expect("decided")
+            .into_answer();
         assert_eq!(
             lapsed.outcome,
             KeyDeclaration::Refused {
@@ -2484,7 +2490,8 @@ mod tests {
                 },
                 TimestampMs::new(1_764_003_800_000),
             )
-            .expect("decided");
+            .expect("decided")
+            .into_answer();
         assert!(asked);
         assert!(matches!(
             completed.outcome,

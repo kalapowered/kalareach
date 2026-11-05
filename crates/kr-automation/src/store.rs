@@ -574,6 +574,9 @@ pub struct Submitted<'a> {
     /// it rights through a workflow that its own grant does not carry. `None` is the host's owner at
     /// this machine, who may act on every workflow.
     pub caller_grant: Option<GrantId>,
+    /// Set by the journal when it answers this submission from the record an earlier submission of
+    /// the action left, so that the host can tell its caller the answer is a copy.
+    pub answered: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for Submitted<'_> {
@@ -2647,6 +2650,9 @@ impl WorkflowStore {
             actor: Some(&submitted.key.actor_id),
         };
         if let Some(record) = journal.action_record(submitted.key)? {
+            if let Some(answered) = submitted.answered {
+                answered.store(true, std::sync::atomic::Ordering::Release);
+            }
             return Ok(Acted::Answered(record));
         }
         match effect(&journal) {
@@ -3849,6 +3855,7 @@ mod tests {
         let admit = || Ok(());
         let installing = key("seen-1", "workflow.install");
         let submit = |key| Submitted {
+            answered: None,
             key,
             admission: &admit,
             caller_grant: None,
@@ -3921,6 +3928,7 @@ mod tests {
         let error = store
             .act(
                 &Submitted {
+                    answered: None,
                     key: &installing,
                     admission: &refuse,
                     caller_grant: None,
@@ -3940,6 +3948,7 @@ mod tests {
         let acted = store
             .act(
                 &Submitted {
+                    answered: None,
                     key: &installing,
                     admission: &admit,
                     caller_grant: None,
@@ -3958,6 +3967,7 @@ mod tests {
         let repeated = store
             .act(
                 &Submitted {
+                    answered: None,
                     key: &installing,
                     admission: &admit,
                     caller_grant: None,
@@ -3979,6 +3989,7 @@ mod tests {
         let error = store
             .act(
                 &Submitted {
+                    answered: None,
                     key: &reused,
                     admission: &admit,
                     caller_grant: None,
@@ -4015,6 +4026,7 @@ mod tests {
         let error = store
             .act(
                 &Submitted {
+                    answered: None,
                     key: &breaching,
                     admission: &admit,
                     caller_grant: None,

@@ -53,6 +53,7 @@ pub mod describe;
 pub mod desktop;
 pub mod directory;
 pub mod error;
+pub mod given;
 pub mod grants;
 pub mod machine;
 pub mod mailbox_reader;

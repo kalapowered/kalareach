@@ -13,6 +13,7 @@ use kr_protocol::method::Method;
 
 use super::super::proxy::Vouched;
 use crate::error::Result;
+use crate::given::Given;
 
 use super::super::Retained;
 use super::decision::{Answered, Asked, unserved_change_set_method};
@@ -735,22 +736,9 @@ impl RemoteConnection {
                 });
         }
         if let Some(retained) = held {
-            *asked = Some(decided.clone().kept());
-            #[cfg(feature = "testing")]
-            self.controller.after_the_retained_lookup.wait().await;
-            // What this host holds is the outcome of an action. When it will not show the device
-            // that outcome, it does not tell the device the action did not happen, or that it did.
-            if self.admitted_to_answer(validated).is_err() {
-                return Err(outcome_not_shown());
-            }
-            // The daemon's own retained answer is a read of what an earlier submission produced,
-            // and is written under the decision that read is ([`Self::read_of_retained`]).
-            match self.read_of_retained(entry.method, mutation, &retained, &decided.acting) {
-                Ok(Some(read)) => *asked = Some(read),
-                Ok(None) => {}
-                Err(_) => return Err(outcome_not_shown()),
-            }
-            return Ok(retained);
+            return self
+                .kept_answer(retained, entry.method, mutation, validated, &decided, asked)
+                .await;
         }
         // A worker holds the receipts of its own actions, and the route says which worker. Section
         // 9 has an existing receipt readable under current authority after the window that
@@ -807,7 +795,12 @@ impl RemoteConnection {
         // What this host reports meanwhile is the revocation as pending for a worker until it
         // acknowledges the revision.
         self.authorised().await?;
-        Ok(match entry.method {
+        #[cfg(test)]
+        self.controller.before_the_effect.wait().await;
+        // Whether the service that answered read its answer from the record of an earlier
+        // submission of the action, which the device is then told as it is told any such answer.
+        let mut copied = false;
+        let answer = match entry.method {
             // The daemon's own effects. They run on a task that outlives this connection, because
             // dropping a future is a cancellation and a durable commit cannot be left half done
             // because a peer went away.
@@ -984,13 +977,10 @@ impl RemoteConnection {
                         .await
                 });
                 match self.controller.within_effect_wait(effect).await {
-                    Ok(Ok(outcome)) => ControlFrame::Response(Response {
-                        request_id,
-                        outcome: match outcome {
-                            Ok(value) => Outcome::Ok(value),
-                            Err(error) => Outcome::Error(error),
-                        },
-                    }),
+                    Ok(Ok(given)) => noting(
+                        &mut copied,
+                        given.map(|outcome| framed_protocol(request_id, outcome)),
+                    ),
                     // The effect is still running, so a wait that ended says the outcome is not
                     // known rather than that the action failed.
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
@@ -1029,7 +1019,10 @@ impl RemoteConnection {
                         .await
                 });
                 match self.controller.within_effect_wait(effect).await {
-                    Ok(Ok(answer)) => super::narrowing::shown_materialisation(answer),
+                    Ok(Ok(given)) => noting(
+                        &mut copied,
+                        given.map(super::narrowing::shown_materialisation),
+                    ),
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
             }
@@ -1070,7 +1063,12 @@ impl RemoteConnection {
                         .await
                 });
                 match self.controller.within_effect_wait(effect).await {
-                    Ok(Ok(answer)) => super::narrowing::shown_working_tree_change(answer, method),
+                    Ok(Ok(given)) => noting(
+                        &mut copied,
+                        given.map(|answer| {
+                            super::narrowing::shown_working_tree_change(answer, method)
+                        }),
+                    ),
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
             }
@@ -1126,13 +1124,10 @@ impl RemoteConnection {
                         .await
                 });
                 match self.controller.within_effect_wait(effect).await {
-                    Ok(Ok(outcome)) => ControlFrame::Response(Response {
-                        request_id,
-                        outcome: match outcome {
-                            Ok(value) => Outcome::Ok(value),
-                            Err(error) => Outcome::Error(error),
-                        },
-                    }),
+                    Ok(Ok(given)) => noting(
+                        &mut copied,
+                        given.map(|outcome| framed_protocol(request_id, outcome)),
+                    ),
                     // The effect is still running, so a wait that ended says the outcome is not
                     // known rather than that the action failed. The action record the module
                     // settles is what a resubmission is answered from.
@@ -1171,7 +1166,7 @@ impl RemoteConnection {
                         .await
                 });
                 match self.controller.within_effect_wait(effect).await {
-                    Ok(Ok(answer)) => answer,
+                    Ok(Ok(given)) => noting(&mut copied, given),
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
             }
@@ -1207,7 +1202,7 @@ impl RemoteConnection {
                     admitted_revision: validated,
                     deadline: Some(accepted.deadline),
                 };
-                let outcome = self
+                let given = self
                     .controller
                     .voice_mutation(
                         crate::service::voice_actions::VoiceIngress {
@@ -1225,13 +1220,10 @@ impl RemoteConnection {
                         carried,
                     )
                     .await;
-                match outcome {
-                    Ok(value) => ControlFrame::Response(Response {
-                        request_id: mutation.request_id,
-                        outcome: Outcome::Ok(value),
-                    }),
-                    Err(error) => failure(mutation.request_id, error.to_protocol_error()),
-                }
+                noting(
+                    &mut copied,
+                    given.map(|answer| framed(mutation.request_id, answer)),
+                )
             }
             // A session's pinned name is this daemon's own effect, once per actor's action. The
             // route names this host as the owner of the receipt, the action is claimed in the
@@ -1322,7 +1314,13 @@ impl RemoteConnection {
                         )
                         .await
                 });
-                settled(request_id, self.controller.within_effect_wait(effect).await)
+                noting(
+                    &mut copied,
+                    settled_by_a_service(
+                        request_id,
+                        self.controller.within_effect_wait(effect).await,
+                    ),
+                )
             }
             // A device delegates a narrower grant from a share it holds, and revokes what lies
             // below a share it holds. They are this daemon's own effects, once per actor's action,
@@ -1391,7 +1389,13 @@ impl RemoteConnection {
                         )
                         .await
                 });
-                settled(request_id, self.controller.within_effect_wait(effect).await)
+                noting(
+                    &mut copied,
+                    settled_by_a_service(
+                        request_id,
+                        self.controller.within_effect_wait(effect).await,
+                    ),
+                )
             }
             // A machine group step changes this environment's own record and nothing else: the
             // daemon's own effect, once per actor's action, and never forwarded to a worker or to
@@ -1416,7 +1420,13 @@ impl RemoteConnection {
                         .machine_step(&actor_id, &mutation, method, carried)
                         .await
                 });
-                settled(request_id, self.controller.within_effect_wait(effect).await)
+                noting(
+                    &mut copied,
+                    settled_by_a_service(
+                        request_id,
+                        self.controller.within_effect_wait(effect).await,
+                    ),
+                )
             }
             // A device presenting the lease its organisation signed for it: the daemon's own
             // effect, on this device's standing and nothing else. The action claims its route like
@@ -1472,13 +1482,9 @@ impl RemoteConnection {
                     .controller
                     .retained_authority_change(&actor_id, mutation)
                 {
-                    *asked = Some(decided.clone().kept());
-                    #[cfg(feature = "testing")]
-                    self.controller.after_the_retained_lookup.wait().await;
-                    return match self.admitted_to_answer(validated) {
-                        Ok(()) => Ok(answer),
-                        Err(_) => Err(outcome_not_shown()),
-                    };
+                    return self
+                        .kept_answer(answer, entry.method, mutation, validated, &decided, asked)
+                        .await;
                 }
                 if self.controller.clock.now() >= accepted.deadline {
                     return Err(ProtocolError::new(
@@ -1494,17 +1500,13 @@ impl RemoteConnection {
                     admitted_revision: validated,
                     deadline: Some(accepted.deadline),
                 };
-                match self
-                    .controller
-                    .preview_key_update_action(&actor_id, mutation, carried)
-                    .await
-                {
-                    Ok(value) => ControlFrame::Response(Response {
-                        request_id: mutation.request_id,
-                        outcome: Outcome::Ok(value),
-                    }),
-                    Err(error) => failure(mutation.request_id, error.to_protocol_error()),
-                }
+                noting(
+                    &mut copied,
+                    self.controller
+                        .preview_key_update_action(&actor_id, mutation, carried)
+                        .await
+                        .map(|answer| framed(mutation.request_id, answer)),
+                )
             }
             // A device handing the host the credential its installation was issued: the daemon's
             // own effect, on the destination of the device this connection authenticated as. Its
@@ -1530,17 +1532,13 @@ impl RemoteConnection {
                     admitted_revision: validated,
                     deadline: Some(accepted.deadline),
                 };
-                match self
-                    .controller
-                    .push_register_action(&actor_id, mutation, carried)
-                    .await
-                {
-                    Ok(value) => ControlFrame::Response(Response {
-                        request_id: mutation.request_id,
-                        outcome: Outcome::Ok(value),
-                    }),
-                    Err(error) => failure(mutation.request_id, error.to_protocol_error()),
-                }
+                noting(
+                    &mut copied,
+                    self.controller
+                        .push_register_action(&actor_id, mutation, carried)
+                        .await
+                        .map(|answer| framed(mutation.request_id, answer)),
+                )
             }
             // A device completing its own record: the daemon's own effect, on this device's own
             // row and nothing else. The parameters name no device; the one written is the one this
@@ -1556,17 +1554,13 @@ impl RemoteConnection {
                     admitted_revision: validated,
                     deadline: Some(accepted.deadline),
                 };
-                match self
-                    .controller
-                    .device_keys_declared(&actor_id, self.device.device_id, mutation, carried)
-                    .await
-                {
-                    Ok(value) => ControlFrame::Response(Response {
-                        request_id: mutation.request_id,
-                        outcome: Outcome::Ok(value),
-                    }),
-                    Err(error) => failure(mutation.request_id, error.to_protocol_error()),
-                }
+                noting(
+                    &mut copied,
+                    self.controller
+                        .device_keys_declared(&actor_id, self.device.device_id, mutation, carried)
+                        .await
+                        .map(|answer| framed(mutation.request_id, answer)),
+                )
             }
             // The automation group. Like a project mutation it is the daemon's own effect: a
             // workflow belongs to this environment rather than to a session, so it goes to the
@@ -1596,13 +1590,10 @@ impl RemoteConnection {
                         .await
                 });
                 match self.controller.within_effect_wait(effect).await {
-                    Ok(Ok(outcome)) => ControlFrame::Response(Response {
-                        request_id,
-                        outcome: match outcome {
-                            Ok(value) => Outcome::Ok(value),
-                            Err(error) => Outcome::Error(error),
-                        },
-                    }),
+                    Ok(Ok(given)) => noting(
+                        &mut copied,
+                        given.map(|outcome| framed_protocol(request_id, outcome)),
+                    ),
                     // The run is still going, or its task ended without an answer. Whether the
                     // action was committed is the journal's to say: if it was, a repeat is
                     // answered from its record, and if it was not, a repeat performs it.
@@ -1643,17 +1634,13 @@ impl RemoteConnection {
                     Some(accepted.deadline),
                 );
                 let life = self.controller.pairing_life(Some(accepted.deadline));
-                match self
-                    .controller
-                    .pairing_write(caller, entry.method, mutation, admission, guard, life)
-                    .await
-                {
-                    Ok(value) => ControlFrame::Response(Response {
-                        request_id: mutation.request_id,
-                        outcome: Outcome::Ok(value),
-                    }),
-                    Err(error) => failure(mutation.request_id, error.to_protocol_error()),
-                }
+                noting(
+                    &mut copied,
+                    self.controller
+                        .pairing_write(caller, entry.method, mutation, admission, guard, life)
+                        .await
+                        .map(|answer| framed(mutation.request_id, answer)),
+                )
             }
             // Everything else belongs to the worker that owns the session.
             _ => {
@@ -1669,7 +1656,13 @@ impl RemoteConnection {
                     )
                     .await;
             }
-        })
+        };
+        if copied {
+            return self
+                .kept_answer(answer, entry.method, mutation, validated, &decided, asked)
+                .await;
+        }
+        Ok(answer)
     }
 }
 
@@ -1678,8 +1671,8 @@ impl RemoteConnection {
 /// The task owns the effect and outlives this connection, so a wait that ran out says the outcome
 /// is unknown rather than that the action failed: the effect is still running, and section 9
 /// forbids reporting an action that may have happened as refused.
-type Effect<Ended> =
-    std::result::Result<std::result::Result<Result<ParamsValue>, tokio::task::JoinError>, Ended>;
+type Effect<Ended, Settled = Result<ParamsValue>> =
+    std::result::Result<std::result::Result<Settled, tokio::task::JoinError>, Ended>;
 
 fn settled<Ended>(request_id: RequestId, outcome: Effect<Ended>) -> ControlFrame {
     match outcome {
@@ -1693,6 +1686,47 @@ fn settled<Ended>(request_id: RequestId, outcome: Effect<Ended>) -> ControlFrame
         }),
         Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
     }
+}
+
+/// As [`settled`], for a service that says whether it answered from its own record. A wait that
+/// ended is not an answer from a record, so it is a fresh word.
+fn settled_by_a_service<Ended>(
+    request_id: RequestId,
+    outcome: Effect<Ended, Given<Result<ParamsValue>>>,
+) -> Given<ControlFrame> {
+    match outcome {
+        Ok(Ok(given)) => given.map(|answer| framed(request_id, answer)),
+        Ok(Err(_)) | Err(_) => Given::Fresh(failure(request_id, outcome_unknown())),
+    }
+}
+
+/// The frame a service's answer goes out as.
+fn framed(request_id: RequestId, answer: Result<ParamsValue>) -> ControlFrame {
+    framed_protocol(
+        request_id,
+        answer.map_err(|error| error.to_protocol_error()),
+    )
+}
+
+/// The frame an answer that carries the protocol's own refusal goes out as.
+fn framed_protocol(
+    request_id: RequestId,
+    answer: std::result::Result<ParamsValue, ProtocolError>,
+) -> ControlFrame {
+    ControlFrame::Response(Response {
+        request_id,
+        outcome: match answer {
+            Ok(value) => Outcome::Ok(value),
+            Err(error) => Outcome::Error(error),
+        },
+    })
+}
+
+/// The frame of an answer a service gave, noting in `copied` when the service read it from a
+/// record.
+fn noting(copied: &mut bool, given: Given<ControlFrame>) -> ControlFrame {
+    *copied |= given.is_copied();
+    given.into_answer()
 }
 
 /// Returns whether an answer is a create the daemon deduplicated rather than performed.

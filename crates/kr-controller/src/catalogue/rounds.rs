@@ -581,7 +581,7 @@ impl Controller {
         method: kr_protocol::method::Method,
         confirmations: Option<&dyn crate::sharing::OwnerConfirmations>,
         admission: Arc<dyn crate::catalogue::Admission>,
-    ) -> crate::catalogue::Answer<kr_protocol::envelope::ParamsValue> {
+    ) -> crate::given::Given<crate::catalogue::Answer<kr_protocol::envelope::ParamsValue>> {
         let before = self.catalogue.admission_revision().await.ok();
         let removal = if method == kr_protocol::method::Method::PluginRemove {
             let plugin = crate::catalogue::plugin_named(method, &mutation.params);

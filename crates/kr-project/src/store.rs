@@ -363,6 +363,12 @@ pub struct Performed<'a> {
     /// The locations this mutation resolved names through, asked again inside the transaction
     /// that begins its effect.
     reach: Option<&'a crate::git::ReadAdmission>,
+    /// Set when the service answers this mutation from the record an earlier submission of its
+    /// action left, so that the host can tell its caller the answer is a copy.
+    answered: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Set when this attempt wrote the claim for its action, which makes every record the action
+    /// has this attempt's own.
+    claimed: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 impl fmt::Debug for Performed<'_> {
@@ -415,6 +421,39 @@ impl<'a> Performed<'a> {
     #[must_use]
     pub const fn reaching(self, reach: Option<&'a crate::git::ReadAdmission>) -> Self {
         Self { reach, ..self }
+    }
+
+    /// Has the service set `flag` when it answers this mutation from the record an earlier
+    /// submission of its action left.
+    #[must_use]
+    pub const fn telling(self, flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        Self {
+            answered: Some(flag),
+            ..self
+        }
+    }
+
+    /// Has the service set `flag` when this attempt writes the claim for its action.
+    #[must_use]
+    pub const fn holding(self, flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        Self {
+            claimed: Some(flag),
+            ..self
+        }
+    }
+
+    /// Notes that this attempt wrote the claim for its action.
+    pub(crate) fn note_claimed(&self) {
+        if let Some(flag) = self.claimed {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Notes that the answer to this mutation is the record's.
+    pub(crate) fn note_answered_from_record(&self) {
+        if let Some(flag) = self.answered {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Returns the action this mutation is claimed against, when it has one.
@@ -844,7 +883,7 @@ impl Store {
         // identifier: a second copy of one action would otherwise be refused for a unique-key
         // collision rather than told that its action is already claimed.
         if let Some(action) = performed.action() {
-            claim_action(&transaction, action, Some(row.action_id.get()))?;
+            claim_for(&transaction, &performed, action, Some(row.action_id.get()))?;
         }
         insert_operation(&transaction, row)?;
         announce(
@@ -1226,7 +1265,12 @@ impl Store {
         let transaction = self.transaction()?;
         performed.admit()?;
         if let Some(action) = performed.action() {
-            claim_action(&transaction, action, Some(row.workspace_id.get()))?;
+            claim_for(
+                &transaction,
+                &performed,
+                action,
+                Some(row.workspace_id.get()),
+            )?;
         }
         insert_workspace(&transaction, row)?;
         announce(
@@ -1352,7 +1396,7 @@ impl Store {
         let transaction = self.transaction()?;
         performed.admit()?;
         if let Some(action) = performed.action() {
-            claim_action(&transaction, action, Some(operation.get()))?;
+            claim_for(&transaction, &performed, action, Some(operation.get()))?;
         }
         transaction.commit().map_err(ProjectError::store)
     }
@@ -1385,7 +1429,7 @@ impl Store {
         let transaction = self.transaction()?;
         performed.admit()?;
         if let Some(action) = performed.action() {
-            claim_action(&transaction, action, Some(workspace_id.get()))?;
+            claim_for(&transaction, &performed, action, Some(workspace_id.get()))?;
         }
         let row = transaction
             .query_row(
@@ -2475,6 +2519,19 @@ pub fn outcome_of(record: &RetainedAction) -> RetainedOutcome {
             ),
         },
     }
+}
+
+/// Claims the action of a mutation as [`claim_action`] does, and notes on `performed` that this
+/// attempt holds the claim, because every record the action then has is this attempt's own.
+fn claim_for(
+    transaction: &Transaction<'_>,
+    performed: &Performed<'_>,
+    action: &Action,
+    subject: Option<Uuid>,
+) -> Result<()> {
+    claim_action(transaction, action, subject)?;
+    performed.note_claimed();
+    Ok(())
 }
 
 /// Claims one action inside a transaction that also writes the state it changes.

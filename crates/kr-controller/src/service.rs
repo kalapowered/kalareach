@@ -654,6 +654,12 @@ pub struct Controller {
     /// action's route in between. Compiled away in every shipped build.
     #[cfg(test)]
     before_a_refusal_is_worded: ReadPause,
+    /// Where this host's own tests stop a remote connection's mutation that found no record of its
+    /// action, once its admission is checked and before the service that performs it is asked, so
+    /// that a copy of the request can perform and record the action in between. Compiled away in
+    /// every shipped build.
+    #[cfg(test)]
+    before_the_effect: ReadPause,
     /// Where this host's own tests stop a close asked for by voice once it is held against its
     /// grant and before the revision and the authority are read, so that a withdrawal of the grant
     /// can land in between. Compiled away in every shipped build.

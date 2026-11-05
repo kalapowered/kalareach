@@ -20,6 +20,7 @@ use kr_protocol::sharing::{
 };
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 
 use super::organisation::OrganisationIntent;
 use super::revocation::Audience;
@@ -927,10 +928,17 @@ impl Controller {
         device_id: kr_protocol::ids::DeviceId,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
-    ) -> Result<ParamsValue> {
-        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let declared = self.declared_keys(device_id, mutation)?;
+    ) -> Given<Result<ParamsValue>> {
+        let digest = match kr_protocol::digest::mutation_digest(mutation, actor_id) {
+            Ok(digest) => digest,
+            Err(error) => {
+                return Given::Fresh(Err(ControllerError::InvalidArgument(error.to_string())));
+            }
+        };
+        let declared = match self.declared_keys(device_id, mutation) {
+            Ok(declared) => declared,
+            Err(error) => return Given::Fresh(Err(error)),
+        };
         let recorded = {
             let registry = self.registry.lock().await;
             self.devices.declare_keys(
@@ -941,9 +949,14 @@ impl Controller {
                 declared,
                 || self.check_admission(&registry, &carried),
                 kr_ipc::now_ms(),
-            )?
+            )
         };
-        declaration_answer(mutation, &digest, recorded)
+        match recorded {
+            Ok(recorded) => {
+                recorded.map(|recorded| declaration_answer(mutation, &digest, recorded))
+            }
+            Err(error) => Given::Fresh(Err(error)),
+        }
     }
 
     /// Makes a declaration's own checks, the ones made before its transaction.
@@ -1008,7 +1021,7 @@ impl Controller {
     /// two `grant.revoke` calls under one action identifier would otherwise advance the revision
     /// twice and fence the host twice for one withdrawal. Only the attempt that writes the claim
     /// performs the change; any other is answered from the record
-    /// ([`Self::recorded_authority_change`]).
+    /// ([`Self::recorded_authority_change`]), and that answer is given as a copy.
     pub(crate) async fn authority_change(
         &self,
         actor_id: &ActorId,
@@ -1016,6 +1029,23 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         carried: crate::authority::AdmittedMutation,
+    ) -> Given<Result<ParamsValue>> {
+        let mut copied = false;
+        let answer = self
+            .change_authority(actor_id, caller, mutation, method, carried, &mut copied)
+            .await;
+        Given::of(answer, copied)
+    }
+
+    /// [`Self::authority_change`], setting `copied` when the answer is the record's.
+    async fn change_authority(
+        &self,
+        actor_id: &ActorId,
+        caller: AuthorityCaller,
+        mutation: &MutationRequest,
+        method: Method,
+        carried: crate::authority::AdmittedMutation,
+        copied: &mut bool,
     ) -> Result<ParamsValue> {
         // A device makes three of these: a share, its revocation and a redemption. The others are
         // the owner's at this machine, and their answers are written for the owner: a device is
@@ -1049,6 +1079,7 @@ impl Controller {
             crate::grants::ActionClaim::Recorded(record) => {
                 // An earlier attempt recorded this action between the lookup that found nothing
                 // and this claim.
+                *copied = true;
                 return self
                     .retained_under_authority(
                         &carried,
@@ -1800,24 +1831,28 @@ impl Controller {
         actor_id: &ActorId,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
-    ) -> Result<ParamsValue> {
-        let hold = match self.claim_authority_change(actor_id, mutation, kr_ipc::now_ms().get())? {
-            crate::grants::ActionClaim::Claimed { hold } => hold,
-            crate::grants::ActionClaim::Recorded(record) => {
-                return self
-                    .retained_under_authority(
+    ) -> Given<Result<ParamsValue>> {
+        let hold = match self.claim_authority_change(actor_id, mutation, kr_ipc::now_ms().get()) {
+            Ok(crate::grants::ActionClaim::Claimed { hold }) => hold,
+            Ok(crate::grants::ActionClaim::Recorded(record)) => {
+                return Given::Copied(
+                    self.retained_under_authority(
                         &carried,
                         self.recorded_authority_change(actor_id, mutation, record),
                     )
-                    .await;
+                    .await,
+                );
             }
+            Err(error) => return Given::Fresh(Err(error)),
         };
         let outcome = self
             .device_preview_key_update(actor_id, mutation, carried)
             .await;
-        self.settle_claim(&hold, &outcome)?;
+        if let Err(error) = self.settle_claim(&hold, &outcome) {
+            return Given::Fresh(Err(error));
+        }
         drop(hold);
-        outcome
+        Given::Fresh(outcome)
     }
 
     /// Registers a paired device's push destination under the action it arrived with, and keeps
@@ -1837,22 +1872,26 @@ impl Controller {
         actor_id: &ActorId,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
-    ) -> Result<ParamsValue> {
-        let hold = match self.claim_authority_change(actor_id, mutation, kr_ipc::now_ms().get())? {
-            crate::grants::ActionClaim::Claimed { hold } => hold,
-            crate::grants::ActionClaim::Recorded(record) => {
-                return self
-                    .retained_under_authority(
+    ) -> Given<Result<ParamsValue>> {
+        let hold = match self.claim_authority_change(actor_id, mutation, kr_ipc::now_ms().get()) {
+            Ok(crate::grants::ActionClaim::Claimed { hold }) => hold,
+            Ok(crate::grants::ActionClaim::Recorded(record)) => {
+                return Given::Copied(
+                    self.retained_under_authority(
                         &carried,
                         self.recorded_authority_change(actor_id, mutation, record),
                     )
-                    .await;
+                    .await,
+                );
             }
+            Err(error) => return Given::Fresh(Err(error)),
         };
         let outcome = self.device_push_register(actor_id, mutation, carried).await;
-        self.settle_claim(&hold, &outcome)?;
+        if let Err(error) = self.settle_claim(&hold, &outcome) {
+            return Given::Fresh(Err(error));
+        }
         drop(hold);
-        outcome
+        Given::Fresh(outcome)
     }
 
     /// Makes a paired device a destination this host delivers notifications to.
@@ -3368,6 +3407,7 @@ mod tests {
             controller
                 .preview_key_update_action(&actor, &mutation, admission)
                 .await
+                .into_answer()
         });
         tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
             .await
@@ -3491,6 +3531,7 @@ mod tests {
                 admission,
             )
             .await
+            .into_answer()
             .expect_err("an expired admission writes nothing");
         assert!(
             matches!(error, crate::error::ControllerError::WindowExpired { .. }),
@@ -3506,6 +3547,7 @@ mod tests {
                 admission,
             )
             .await
+            .into_answer()
             .expect("a standing admission registers");
         assert_eq!(host.revisions(), (2, None));
     }
@@ -3526,6 +3568,7 @@ mod tests {
                 host.admission(Duration::from_secs(10)),
             )
             .await
+            .into_answer()
             .expect("the registration is made");
         host.controller.hold_fence(true);
         let refused = host
@@ -3536,17 +3579,22 @@ mod tests {
                 host.admission(Duration::from_secs(10)),
             )
             .await
+            .into_answer()
             .expect_err("a recorded answer is not given back while a fence is owed");
         assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
         assert!(refused.to_string().contains("fence"), "{refused}");
         host.controller.hold_fence(false);
-        host.controller
+        let again = host
+            .controller
             .preview_key_update_action(
                 &actor,
                 &registration,
                 host.admission(Duration::from_secs(10)),
             )
-            .await
+            .await;
+        assert!(again.is_copied(), "the receipt is a copy of the record");
+        again
+            .into_answer()
             .expect("the receipt is given back once nothing is owed");
         assert_eq!(
             host.revisions(),

@@ -604,6 +604,7 @@ async fn a_caller_grant_reaches_only_the_workflows_under_it() {
 
     fn as_caller(key: &ActionKey, held: GrantId) -> Submitted<'_> {
         Submitted {
+            answered: None,
             key,
             admission: &common::admitted,
             caller_grant: Some(held),
@@ -668,6 +669,7 @@ async fn a_caller_grant_reaches_only_the_workflows_under_it() {
 /// Submits `params` as a paired device holding `held`.
 fn as_device(held: GrantId) -> impl Fn(&kr_automation::ActionKey) -> kr_automation::Submitted<'_> {
     move |key| kr_automation::Submitted {
+        answered: None,
         key,
         admission: &common::admitted,
         caller_grant: Some(held),

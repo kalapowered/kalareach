@@ -29,6 +29,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use kr_automation::resources::{Owned, OwnedState, ResourceLedger, session_principal};
@@ -57,6 +58,7 @@ use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::scalars::Nullable;
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 use crate::service::{Controller, NodeSession};
 
 /// What an automation call answers with: the method's result, or the refusal the service decided.
@@ -3167,6 +3169,8 @@ impl AutomationModule {
     /// `caller_grant` is the grant a paired device holds, when one is submitting: the action
     /// reaches only a workflow that acts under that grant. The owner at this machine passes `None`.
     ///
+    /// An answer the journal reads from the record of an earlier submission is given as a copy.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the service decided, under the service's own code.
@@ -3177,8 +3181,26 @@ impl AutomationModule {
         method: Method,
         admission: Admission,
         caller_grant: Option<GrantId>,
+    ) -> Given<Answer<ParamsValue>> {
+        let copied = Arc::new(AtomicBool::new(false));
+        let answer = self
+            .perform(actor_id, mutation, method, admission, caller_grant, &copied)
+            .await;
+        Given::of(answer, copied.load(Ordering::Acquire))
+    }
+
+    /// [`Self::write`], setting `copied` when the journal answered from its record.
+    async fn perform(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        admission: Admission,
+        caller_grant: Option<GrantId>,
+        copied: &Arc<AtomicBool>,
     ) -> Answer<ParamsValue> {
         let key = action_key(actor_id, mutation, method)?;
+        let copied = Arc::clone(copied);
         let service = Arc::clone(&self.service);
         let params = mutation.params.clone();
         let now_ms = self.daemon.now_ms();
@@ -3194,6 +3216,7 @@ impl AutomationModule {
             Method::WorkflowRun => {
                 let asked: WorkflowRunParams = typed(&params)?;
                 let submitted = Submitted {
+                    answered: Some(&copied),
                     key: &key,
                     admission: &still_admitted,
                     caller_grant,
@@ -3204,6 +3227,7 @@ impl AutomationModule {
                 blocking(move || {
                     let asked: WorkflowInstallParams = typed(&params)?;
                     let submitted = Submitted {
+                        answered: Some(&copied),
                         key: &key,
                         admission: &still_admitted,
                         caller_grant,
@@ -3216,6 +3240,7 @@ impl AutomationModule {
                 blocking(move || {
                     let asked: WorkflowEnableParams = typed(&params)?;
                     let submitted = Submitted {
+                        answered: Some(&copied),
                         key: &key,
                         admission: &still_admitted,
                         caller_grant,
@@ -3228,6 +3253,7 @@ impl AutomationModule {
                 blocking(move || {
                     let asked: WorkflowPauseParams = typed(&params)?;
                     let submitted = Submitted {
+                        answered: Some(&copied),
                         key: &key,
                         admission: &still_admitted,
                         caller_grant,
@@ -3246,6 +3272,7 @@ impl AutomationModule {
                 let rearmed = blocking(move || {
                     let asked: WorkflowRearmParams = typed(&params)?;
                     let submitted = Submitted {
+                        answered: Some(&copied),
                         key: &key,
                         admission: &still_admitted,
                         caller_grant,
@@ -3517,6 +3544,7 @@ mod tests {
             .store()
             .act(
                 &kr_automation::Submitted {
+                    answered: None,
                     key: &key,
                     admission: &admit,
                     caller_grant: None,

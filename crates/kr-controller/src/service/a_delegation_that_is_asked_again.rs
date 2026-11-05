@@ -160,6 +160,19 @@ pub(super) async fn ask_voice(
     method: Method,
     mutation: &MutationRequest,
 ) -> crate::error::Result<ParamsValue> {
+    ask_voice_given(controller, actor_id, device_id, method, mutation)
+        .await
+        .into_answer()
+}
+
+/// As [`ask_voice`], with where the answer came from.
+async fn ask_voice_given(
+    controller: &Arc<Controller>,
+    actor_id: &kr_protocol::ids::ActorId,
+    device_id: kr_protocol::ids::DeviceId,
+    method: Method,
+    mutation: &MutationRequest,
+) -> crate::given::Given<crate::error::Result<ParamsValue>> {
     let accepted = AcceptedDeadline {
         deadline: controller
             .clock
@@ -718,9 +731,16 @@ async fn a_receipt_for_an_effect_is_given_back_as_it_was_kept() {
         },
     };
     keep(&controller, &actor_id, &effect, &kept);
-    let given = ask(&controller, &actor_id, device.device_id, &effect)
-        .await
-        .expect("the receipt goes back");
+    let asked = ask_voice_given(
+        &controller,
+        &actor_id,
+        device.device_id,
+        Method::VoiceDelegate,
+        &effect,
+    )
+    .await;
+    assert!(asked.is_copied(), "the receipt is a copy of the record");
+    let given = asked.into_answer().expect("the receipt goes back");
     assert_eq!(
         given.to_typed::<VoiceDelegateResult>().expect("a result"),
         kept
@@ -842,6 +862,7 @@ async fn a_challenges_route_goes_back_while_its_claim_is_still_held() {
             carried,
         )
         .await
+        .into_answer()
         .expect("the first submission is answered");
     assert!(
         matches!(

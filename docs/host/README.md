@@ -3535,8 +3535,11 @@ reused identifier that carries another request; a request whose route the daemon
 as a repeat. The services behind the door check the registration again where they write, and a copy
 of an action that meets a fence owed there is refused in their words. A service that answers a copy
 of an action from its own record while it carries the action out, because the first copy finished
-meanwhile, hands the door an answer the door does not know to be kept, and it is told as a fresh
-answer is: a result as unknown, and the service's own refusal as that refusal.
+meanwhile, says so to the door, which then tells that answer as it tells one it found in a record
+itself: the recorded answer to a device that may read it, and an unknown outcome, whatever the
+answer was, to one that may not or when the authority feed refuses before the answer is written.
+The service's refusals that are not copies of a record, such as the refusal of a request that
+reaches no record, are told as a fresh answer is.
 
 A device that falls behind is told rather than waited for. What the daemon holds for one device is
 bounded in bytes, not in messages, at section 9's send queue per peer; a device that reaches that

@@ -774,10 +774,10 @@ async fn a_bound_the_boundary_finds_run_out_is_written_down_outside_the_poll() {
 
 /// A recording of every frame a connection hands its stream, each after the stream's own check.
 #[derive(Debug, Default)]
-struct Recording(std::sync::Mutex<Vec<ControlFrame>>);
+pub(super) struct Recording(std::sync::Mutex<Vec<ControlFrame>>);
 
 impl Recording {
-    fn frames(&self) -> Vec<ControlFrame> {
+    pub(super) fn frames(&self) -> Vec<ControlFrame> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1493,6 +1493,7 @@ async fn a_recorded_key_registration_is_told_as_unknown_when_a_feed_refusal_rise
                     },
                 )
                 .await
+                .into_answer()
                 .expect_err("a device registers only its own key");
         };
         let answered = if second_lookup {
@@ -1838,7 +1839,7 @@ async fn a_diagnostics_answer_is_written_with_the_metrics_only_under_a_decision_
 
 /// A device paired with `actions`, under the endpoint and key `byte` makes, and a connection of its
 /// own that records what it is written.
-fn paired_connection(
+pub(super) fn paired_connection(
     controller: &Arc<Controller>,
     byte: u8,
     actions: &[ActionRight],

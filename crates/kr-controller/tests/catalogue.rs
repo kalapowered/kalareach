@@ -5902,6 +5902,7 @@ mod off_the_executor {
                     None,
                 )
                 .await
+                .into_answer()
         })
         .await
         .expect("the change ran to its end")

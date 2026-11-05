@@ -841,6 +841,7 @@ fn racing_request(
                     },
                     (action, Digest256::from_bytes([9; 32])),
                     &|| Ok(()),
+                    &std::sync::atomic::AtomicBool::new(false),
                 )
                 .expect("the request records the identifier first");
         }

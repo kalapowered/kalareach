@@ -608,6 +608,7 @@ async fn shared_by(
             carried,
         )
         .await
+        .into_answer()
 }
 
 /// A share's result, or a panic naming its refusal.
@@ -2534,6 +2535,7 @@ impl Served {
                 carried,
             )
             .await
+            .into_answer()
             .expect("the share is written")
             .to_typed()
             .expect("a share result");
@@ -2572,6 +2574,7 @@ impl Served {
                 carried,
             )
             .await
+            .into_answer()
             .expect("the share is written")
             .to_typed()
             .expect("a share result")

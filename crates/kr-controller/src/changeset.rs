@@ -28,6 +28,7 @@
 //! than handing another one bytes it cannot read.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_changeset::ChangeSetService;
 use kr_changeset::apply::{self, ApplyOrder};
@@ -50,6 +51,7 @@ use kr_protocol::scalars::Nullable;
 use kr_protocol::test_report::{MAX_REPORTS_PER_ANSWER, TestReportsParams, TestReportsResult};
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 
 /// What a change-set call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
@@ -272,7 +274,6 @@ impl ChangeSetModule {
     }
 
     /// Serves one change-set mutation and returns the frame it answers with.
-    #[must_use]
     pub async fn write_frame(
         &self,
         actor_id: &ActorId,
@@ -281,12 +282,10 @@ impl ChangeSetModule {
         carried: crate::authority::AdmittedMutation,
         controller: std::sync::Arc<crate::service::Controller>,
         caller: Caller,
-    ) -> ControlFrame {
-        frame(
-            mutation.request_id,
-            self.write(actor_id, mutation, method, carried, controller, caller)
-                .await,
-        )
+    ) -> Given<ControlFrame> {
+        self.write(actor_id, mutation, method, carried, controller, caller)
+            .await
+            .map(|answer| frame(mutation.request_id, answer))
     }
 
     /// Serves one change-set read.
@@ -343,7 +342,8 @@ impl ChangeSetModule {
         .await
     }
 
-    /// Serves one change-set mutation, answering an exact repeat from its retained record.
+    /// Serves one change-set mutation, answering an exact repeat from its retained record. An
+    /// answer read from that record is given as a copy.
     ///
     /// # Errors
     ///
@@ -356,9 +356,31 @@ impl ChangeSetModule {
         carried: crate::authority::AdmittedMutation,
         controller: std::sync::Arc<crate::service::Controller>,
         caller: Caller,
+    ) -> Given<Answer<ParamsValue>> {
+        let copied = Arc::new(AtomicBool::new(false));
+        let answer = self
+            .perform(
+                actor_id, mutation, method, carried, controller, caller, &copied,
+            )
+            .await;
+        Given::of(answer, copied.load(Ordering::Acquire))
+    }
+
+    /// [`Self::write`], setting `copied` when the answer is the record's.
+    #[allow(clippy::too_many_arguments)]
+    async fn perform(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        carried: crate::authority::AdmittedMutation,
+        controller: std::sync::Arc<crate::service::Controller>,
+        caller: Caller,
+        copied: &Arc<AtomicBool>,
     ) -> Answer<ParamsValue> {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+        let copied = Arc::clone(copied);
         let service = Arc::clone(&self.service);
         let actor = actor_id.clone();
         let params = mutation.params.clone();
@@ -366,6 +388,7 @@ impl ChangeSetModule {
         let name = method.as_str();
         blocking(move || {
             if let Some(retained) = service.retained_action(&actor, action_id, name, digest)? {
+                copied.store(true, Ordering::Release);
                 return match retained {
                     RetainedOutcome::Ok(result) => {
                         kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
@@ -410,6 +433,7 @@ impl ChangeSetModule {
                 // Another copy holds it. Either it has settled, in which case its reply is the
                 // answer, or it has not, in which case this host cannot say what became of the
                 // action and says exactly that.
+                copied.store(true, Ordering::Release);
                 return answer_from_retained(&service, &actor, action_id, name, digest);
             }
             // Every arm runs inside a closure, so a refusal the service decided reaches the
@@ -451,6 +475,7 @@ impl ChangeSetModule {
             // The claim went to another copy of this action. That copy is the one that acts, and
             // this one answers from its reply rather than recording a second outcome over it.
             if deferred.lost() {
+                copied.store(true, Ordering::Release);
                 return answer_from_retained(&service, &actor, action_id, name, digest);
             }
             // An apply that refused before its claim wrote nothing at all, and there is nothing to

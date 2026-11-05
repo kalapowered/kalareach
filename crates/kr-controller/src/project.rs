@@ -29,6 +29,7 @@
 //! this host and a short expiry, signed by one of this host's owner devices and spent once. A host
 //! that is not on the network, or has no owner device yet, confirms nothing and authorises nothing.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use kr_pairing::confirm::ConfirmationExpectation;
@@ -48,6 +49,7 @@ use kr_protocol::pairing::{
 use kr_protocol::scalars::Nullable;
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 use crate::service::net::owner::Resolved;
 use crate::service::net::pairing::PairingHost;
 
@@ -514,6 +516,9 @@ impl ProjectModule {
     /// a paired device's, or none for a caller on this machine's own socket. The service reads it
     /// as the caller's class, so nothing the request carries can make a device the owner.
     ///
+    /// An answer this reads from the record an earlier submission of the action left is given as a
+    /// copy.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the service decided, under the service's own code.
@@ -524,12 +529,34 @@ impl ProjectModule {
         method: Method,
         admission: A,
         grant: Option<GrantId>,
+    ) -> Given<Answer<ParamsValue>>
+    where
+        A: Fn() -> std::result::Result<(), ProtocolError> + Send + 'static,
+    {
+        let copied = Arc::new(AtomicBool::new(false));
+        let answer = self
+            .perform(actor_id, mutation, method, admission, grant, &copied)
+            .await;
+        Given::of(answer, copied.load(Ordering::Acquire))
+    }
+
+    /// [`Self::write`], setting `copied` when the answer is the record's.
+    async fn perform<A>(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        admission: A,
+        grant: Option<GrantId>,
+        copied: &Arc<AtomicBool>,
     ) -> Answer<ParamsValue>
     where
         A: Fn() -> std::result::Result<(), ProtocolError> + Send + 'static,
     {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+        let copied = Arc::clone(copied);
+        let claimed = Arc::new(AtomicBool::new(false));
         let service = Arc::clone(&self.service);
         let actor = actor_id.clone();
         let params = mutation.params.clone();
@@ -543,12 +570,14 @@ impl ProjectModule {
             return blocking(move || {
                 confirmed(
                     &service, &actor, action_id, name, digest, method, &params, owner, &admission,
+                    &copied,
                 )
             })
             .await;
         }
         blocking(move || {
             if let Some(retained) = service.retained_action(&actor, action_id, name, digest)? {
+                copied.store(true, Ordering::Release);
                 return match retained {
                     RetainedOutcome::Ok(result) => {
                         kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
@@ -584,7 +613,10 @@ impl ProjectModule {
             // transaction is the service's own preparation — a destination resolved, a repository
             // opened and surveyed, the journal's lock taken — and a grant revoked or expired in
             // there has to reach an action that then does not begin.
-            let performed = kr_project::store::Performed::from(Some(&claim)).admitted(&admission);
+            let performed = kr_project::store::Performed::from(Some(&claim))
+                .admitted(&admission)
+                .telling(&copied)
+                .holding(&claimed);
             let performed = match grant {
                 Some(grant) => performed.bounded_by(grant),
                 None => performed,
@@ -641,7 +673,14 @@ impl ProjectModule {
                     detail: error.message.clone(),
                 },
             };
-            match service.record_action(&actor, action_id, name, digest, &record)? {
+            // A row that is there already is another attempt's unless this attempt wrote the claim
+            // for its action, which only one attempt can: the methods that claim settle their own
+            // row, and an answer read back from it is this attempt's own.
+            let existing = service.record_action(&actor, action_id, name, digest, &record)?;
+            if existing.is_some() && !claimed.load(Ordering::Acquire) {
+                copied.store(true, Ordering::Release);
+            }
+            match existing {
                 None => outcome,
                 Some(RetainedOutcome::Ok(result)) => {
                     kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
@@ -683,6 +722,7 @@ fn confirmed<A>(
     params: &ParamsValue,
     owner: Option<Arc<HostOwner>>,
     admission: &A,
+    copied: &AtomicBool,
 ) -> Answer<ParamsValue>
 where
     A: Fn() -> std::result::Result<(), ProtocolError>,
@@ -693,6 +733,7 @@ where
     // middle of its confirmation holds, is not an answer: the retry goes on into the service and
     // waits for that submission's transition there, then reads what it recorded.
     if let Some(retained) = service.retained_action(actor, action_id, name, digest)? {
+        copied.store(true, Ordering::Release);
         return match retained {
             RetainedOutcome::Ok(result) => kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
                 .map(ParamsValue::new)
@@ -709,7 +750,9 @@ where
         method: name.to_owned(),
         payload_digest: digest,
     };
-    let performed = kr_project::store::Performed::from(Some(&claim)).admitted(admission);
+    let performed = kr_project::store::Performed::from(Some(&claim))
+        .admitted(admission)
+        .telling(copied);
     let owner = owner.as_deref().map(|owner| owner as &dyn OwnerAuthority);
     match method {
         Method::ProjectLocationAuthorise => {
