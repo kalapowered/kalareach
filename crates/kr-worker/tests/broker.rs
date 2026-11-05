@@ -2902,7 +2902,7 @@ fn kr_req_12_05_a_claims_directory_that_cannot_be_used_refuses_the_launch_and_th
 /// reservation, a registration or an adoption. No other path can take it, so no path can later
 /// give back what another one took.
 #[test]
-fn kr_req_12_02_an_instance_one_path_holds_cannot_be_taken_by_another() {
+fn an_instance_one_path_holds_cannot_be_taken_by_another() {
     let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     let intent = broker
         .prepare_launch(
@@ -2986,7 +2986,7 @@ fn kr_req_12_02_an_instance_one_path_holds_cannot_be_taken_by_another() {
 /// A launch that fails before it commits gives back exactly what it took, whether it failed before
 /// or after its instance was registered, and a retry of the same launch then succeeds.
 #[test]
-fn kr_req_12_02_a_failed_launch_gives_back_only_its_own() {
+fn a_failed_launch_gives_back_only_its_own() {
     let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
         .register_instance(instance(5), IntegrationMode::NativeTerminal, None, None)
@@ -3048,7 +3048,7 @@ fn kr_req_12_02_a_failed_launch_gives_back_only_its_own() {
 /// nothing can register over it, so the guard giving back later cannot remove an instance another
 /// path registered.
 #[test]
-fn kr_req_12_02_a_launch_holds_its_identifier_until_its_guard_finishes() {
+fn a_launch_holds_its_identifier_until_its_guard_finishes() {
     let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     let intent = broker
         .prepare_launch(
@@ -3083,7 +3083,7 @@ fn kr_req_12_02_a_launch_holds_its_identifier_until_its_guard_finishes() {
 /// A reservation registers on the broker that made it, and giving one back touches that broker
 /// alone.
 #[test]
-fn kr_req_12_02_a_reservation_registers_on_its_own_broker() {
+fn a_reservation_registers_on_its_own_broker() {
     let first = Broker::open(None, session(), JournalHealth::shared()).expect("a broker opens");
     let second = Broker::open(None, session(), JournalHealth::shared()).expect("another opens");
     let intent = |broker: &Broker| {
@@ -3730,7 +3730,8 @@ fn kr_req_11_17_evidence_names_the_package_publisher_schema_and_binary_it_was_ga
 /// A launch's profile is written before it is kept. While the journal is faulted nothing can be
 /// written, so a preparation under a profile identifier this host already knows is refused before
 /// anything changes, and the instance launched under that identifier still reads the profile it
-/// was launched with.
+/// was launched with. Of that profile only the version is read here; not shown here: the
+/// executable, the distribution, the arguments, the authentication state and the mode.
 #[test]
 fn kr_req_12_02_a_launch_the_fence_refuses_leaves_the_profile_it_would_have_replaced() {
     let mut store = common::SharedStore::open();
