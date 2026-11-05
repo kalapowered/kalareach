@@ -2305,6 +2305,14 @@ impl Session {
     /// reports a partial key sequence is not asked again, since no key typed here leaves one: that
     /// report is the one that counts.
     ///
+    /// The fence is asked again whether or not the harness has written to the terminal since the
+    /// entry. Keys typed before the entry can still be unread when the fence is judged, in the
+    /// terminal's queue or in the reader's own (Fish and PowerShell report keys they have read and
+    /// not yet acted on as macro input), so the writes made since the entry do not tell input the
+    /// reader has yet to take from input it invented. A reader that reports input out of nothing
+    /// and then reports its queues empty is not told apart from one that was slow to take what it
+    /// was given, and a reader that keeps reporting it fails when the window ends.
+    ///
     /// # Panics
     ///
     /// Panics when that reader reports a queue still holding input at an empty prompt, and keeps
