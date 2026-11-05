@@ -17,8 +17,6 @@
 //!
 //! On Windows the service runs no Git at all, so what this file establishes there is the refusal
 //! itself and the name of the mechanism; everything the other tests build is left unbuilt.
-//!
-//! KR-ACC-030, KR-REQ-14.06, KR-REQ-14.21, KR-REQ-14.23 and KR-REQ-14.24.
 
 #![cfg_attr(
     windows,
@@ -217,6 +215,11 @@ fn planting_before(before: &'static [&'static str]) -> (Interposition, Planting)
 
 // The boundary runs on the platforms that can hold its guarantees; where it refuses, a Git
 // invocation is the refusal and there is nothing here to observe.
+/// KR-ACC-030, KR-REQ-14.23 and KR-REQ-14.24, the part about helpers planted after the repository's
+/// configuration was audited: the clean and smudge filters, the text conversion and the four hooks
+/// written into the repository between the audit and the spawn do not run during a status or a
+/// review refresh, and installed Git run over the same repository afterwards does run the planted
+/// filter. Not shown here: a planted file system monitor or pager.
 #[cfg(unix)]
 #[test]
 fn a_driver_planted_after_the_audit_never_runs_during_a_status_or_a_review_refresh() {
@@ -291,6 +294,10 @@ fn a_driver_planted_after_the_audit_never_runs_during_a_status_or_a_review_refre
 
 // The boundary runs on the platforms that can hold its guarantees; where it refuses, a Git
 // invocation is the refusal and there is nothing here to observe.
+/// KR-REQ-14.23, the part about a worktree: the filters, the text conversion and the hooks planted
+/// after the audit do not run while a worktree is made for an isolated workspace, which either lands
+/// or is refused because the configuration changed under it. Not shown here: a planted file system
+/// monitor or pager.
 #[cfg(unix)]
 #[test]
 fn a_driver_planted_after_the_audit_never_runs_during_a_worktree() {
@@ -354,6 +361,10 @@ fn a_driver_planted_after_the_audit_never_runs_during_a_worktree() {
 
 // The boundary runs on the platforms that can hold its guarantees; where it refuses, a Git
 // invocation is the refusal and there is nothing here to observe.
+/// KR-REQ-14.23, the part about a clone: the filters, the text conversion and the hooks planted into
+/// the clone's own destination immediately before the checkout that populates it do not run during
+/// that checkout, and the same planting at the published name does make installed Git run the
+/// driver. Not shown here: a planted file system monitor or pager.
 #[cfg(unix)]
 #[test]
 fn a_driver_planted_into_a_clones_own_destination_never_runs_during_its_checkout() {
@@ -419,6 +430,10 @@ fn a_driver_planted_into_a_clones_own_destination_never_runs_during_its_checkout
 
 // Both swaps rename a directory this host holds open, which every Unix system permits and Windows
 // does not; a Windows test of the same claim needs its own shape and the platform to run it on.
+/// KR-ACC-030 and KR-REQ-14.06, the part about a tree put at a repository's name while a read runs:
+/// the read is refused as a changed source and not returned as if the tree at the name were the one
+/// that was opened, and the tree that took the name is neither read from nor written to. Not shown
+/// here: a linked worktree or a case alias.
 #[cfg(unix)]
 #[test]
 fn a_tree_substituted_at_the_path_is_not_what_a_read_is_taken_from() {
@@ -463,6 +478,10 @@ fn a_tree_substituted_at_the_path_is_not_what_a_read_is_taken_from() {
     assert!(moved.join(".git").is_dir());
 }
 
+/// KR-ACC-030 and KR-REQ-14.06, the part about a tree put at a repository's name while a write runs:
+/// a worktree added into a reserved destination writes nothing into the tree that took the name,
+/// whether the invocation landed or was refused, and the host refuses a result from a repository
+/// that is no longer where it was. Not shown here: a linked worktree or a case alias.
 #[cfg(unix)]
 #[test]
 fn a_tree_substituted_at_the_path_is_not_what_a_write_lands_in() {
@@ -754,6 +773,9 @@ fn a_write_outside_the_directories_an_operation_owns_is_refused() {
     assert!(outside.join("README.md").is_file());
 }
 
+/// KR-ACC-030, the part about a reserved destination replaced before the spawn: a directory put at
+/// the destination's name is refused as a changed identity before anything starts, and nothing is
+/// written into it.
 #[cfg(unix)]
 #[test]
 fn a_destination_substituted_before_the_spawn_is_not_one_this_operation_owns() {
@@ -809,6 +831,9 @@ fn a_destination_substituted_before_the_spawn_is_not_one_this_operation_owns() {
     );
 }
 
+/// KR-REQ-14.23, the part about what an invocation may execute: a read executes Git and the helpers
+/// under Git's own directory and nothing else, and only an invocation that reaches a repository can
+/// start the shell Git builds its connection and its credential helper through.
 #[test]
 #[cfg_attr(
     windows,
@@ -863,6 +888,10 @@ fn only_an_invocation_that_reaches_a_repository_may_execute_a_shell() {
     }
 }
 
+/// KR-ACC-030, the part about a reserved destination replaced after the boundary was built: the
+/// replacement is refused as a changed identity, which is the declared answer, and the object this
+/// host reserved holds nothing new. Not shown here: that nothing was written into the directory that
+/// took the name, which the case says it does not claim.
 #[cfg(unix)]
 #[test]
 fn a_destination_substituted_after_the_boundary_was_built_is_the_declared_refusal() {
@@ -942,6 +971,9 @@ fn a_destination_substituted_after_the_boundary_was_built_is_the_declared_refusa
     );
 }
 
+/// KR-ACC-030 and KR-REQ-14.06, the part about a repository's Git directory replaced while a status
+/// runs: the result is refused as a changed identity and not taken from a repository nobody
+/// recorded. Not shown here: a linked worktree or a case alias.
 #[cfg(unix)]
 #[test]
 fn a_git_directory_replaced_inside_the_tree_is_the_declared_refusal() {
