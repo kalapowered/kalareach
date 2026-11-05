@@ -163,7 +163,7 @@ The first is what a session does when the person selects nothing; the other two 
 `assessment` says what the change is and whether the pinned release already carries it.
 `Date` is the day the assessment was made. The first assessments (2026-09-20) were made when this register was started, so they count their target from that day and say nothing about when the upstream advisory was published or fixed. `status` is one of `released` (a requalified package is published, and the assessment names the
 identity it was published under), `scheduled` (inside its target date), `flagged` (past its target
-date, with the choices above) or `not-affected`. `not-affected` speaks of the pin: a pin that has moved, and that no published release carries inside its target, is `flagged` until one does.
+date, with the choices above) or `not-affected`. `not-affected` speaks of the pin. A package whose pin has moved, and that no published release carries inside its target, is `flagged` in a row that names the package and what moved the pin, until a release does. Where that row names no change by its identifier, it does not replace the rows that assess each change, which say what the pin does with it.
 
 <!-- kr:triage -->
 | Date | Upstream change | Packages | Assessment | Target release | Status |
