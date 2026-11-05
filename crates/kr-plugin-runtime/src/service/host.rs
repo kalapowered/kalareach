@@ -55,12 +55,12 @@ use crate::service::wire;
 
 /// How long a registration may keep a worker waiting.
 ///
-/// The compilation budget is what bounds the compile, and this is the same figure: a host that
-/// accepted a compile of up to that long has to be willing to wait for one. It covers the whole
-/// registration -- reading the payload, compiling it, instantiating and binding -- rather than each
-/// stage in turn, because what the worker is waiting for is the registration. The worker's own
-/// deadline is a little longer again, so the answer a worker gets is the host's own rather than its
-/// patience running out first.
+/// The compilation budget bounds the compile's processor time, and this is the same figure on the
+/// clock: a host that accepted a compile of up to that much work has to be willing to wait that long
+/// for one. It covers the whole registration -- reading the payload, compiling it, instantiating and
+/// binding -- rather than each stage in turn, because what the worker is waiting for is the
+/// registration. The worker's own deadline is a little longer again, so the answer a worker gets is
+/// the host's own rather than its patience running out first.
 pub const REGISTER_DEADLINE: core::time::Duration =
     core::time::Duration::from_millis(COMPILE_DEADLINE_MS);
 

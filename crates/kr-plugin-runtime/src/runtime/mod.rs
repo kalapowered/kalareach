@@ -30,6 +30,7 @@
 //! | [`imports`] | The import allowlist, checked before instantiation |
 //! | [`cache`] | The compiled-code cache and what it refuses |
 //! | [`compile`] | Lazy compilation at background priority, under its own budget |
+//! | [`thread_time`] | The processor time a thread has used, which the compile budget counts |
 //! | [`instance`] | One instance and the calls into it |
 //! | [`queue`] | The bounded observation queue and its explicit gaps |
 //! | [`binding`] | The binding lifecycle a broker works with |
@@ -48,5 +49,6 @@ pub mod imports;
 pub mod instance;
 pub mod limits;
 pub mod queue;
+pub mod thread_time;
 
 pub use crate::runtime::binding::{Runtime, RuntimeConfig};

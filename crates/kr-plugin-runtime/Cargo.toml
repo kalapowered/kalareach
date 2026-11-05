@@ -28,15 +28,23 @@ wasmtime.workspace = true
 
 # The open flag that stops a name replaced by a named pipe from holding a read open until somebody
 # writes to it. `cap-std` exposes it through its own `OpenOptionsExt`; the constant is this crate's
-# only use of the C library.
+# only use of the C library. The processor time of a thread, which the compile budget counts, is
+# read through `rustix`'s clocks.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+rustix = { workspace = true, features = ["time"] }
+
+# The processor time of a thread on Windows, which the compile budget counts: the thread-times
+# query lives in the threading module.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
 
 [features]
 # What this crate's own tests use to hold the engine's epoch still and advance it one tick at a
 # time, to hold a registration at a gate file in the environment's state directory until the file
-# is removed, and to hold the compiles a registration queues at another. It compiles to nothing
-# without this feature, and no shipped build enables it.
+# is removed, to hold the compiles a registration queues at another, and to script what a thread's
+# processor-time clock reads. It compiles to nothing without this feature, and no shipped build
+# enables it.
 testing = ["kr-plugin-service/testing"]
 
 [dev-dependencies]
@@ -53,9 +61,10 @@ tempfile.workspace = true
 
 # The workspace forbids unsafe code, which a crate that reads a compiled artefact back cannot
 # honour: `wasmtime::component::Component::deserialize` is an unsafe function. This crate denies
-# it instead and allows it in exactly one module, `runtime::cache`, which owns that single call
-# and makes it only on bytes it has just checked against the entry's manifest. Nothing else in
-# this crate may relax the rule.
+# it instead and allows it in exactly two modules. `runtime::cache` owns that call and makes it
+# only on bytes it has just checked against the entry's manifest. `runtime::thread_time` allows it
+# on Windows alone, for the one call that reads a thread's processor time, which no safe interface
+# gives. Nothing else in this crate may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"

@@ -8,7 +8,7 @@
 //! the binding with the reason named here.
 //!
 //! Compilation is deliberately outside that count. Section 11 says a cold compile must not look
-//! like a slow observation, so [`RuntimeError::CompilationTooSlow`] and
+//! like a slow observation, so [`RuntimeError::CompilationOverBudget`] and
 //! [`RuntimeError::CompilationPressure`] are reported to the caller and never counted as faults.
 
 use std::fmt;
@@ -89,11 +89,12 @@ pub enum RuntimeError {
         /// The bound.
         limit: u64,
     },
-    /// Compilation finished outside its budget, so its result was discarded.
-    #[error("compiling the component took {elapsed_ms} ms, over its {budget_ms} ms budget")]
-    CompilationTooSlow {
-        /// How long the compile took.
-        elapsed_ms: u64,
+    /// Compilation used more than its budget, so its result was discarded.
+    #[error("compiling the component used {used_ms} ms, over its {budget_ms} ms budget")]
+    CompilationOverBudget {
+        /// How much of the thread's processor time the compile used, or how long it took on the
+        /// clock where the platform does not say what a thread used.
+        used_ms: u64,
         /// The budget it was given.
         budget_ms: u64,
     },
@@ -272,8 +273,8 @@ mod tests {
 
     #[test]
     fn a_slow_compile_is_not_a_fault_against_the_binding() {
-        let slow = RuntimeError::CompilationTooSlow {
-            elapsed_ms: 40_000,
+        let slow = RuntimeError::CompilationOverBudget {
+            used_ms: 40_000,
             budget_ms: 30_000,
         };
         assert!(!slow.counts_as_fault());

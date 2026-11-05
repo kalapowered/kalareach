@@ -5032,6 +5032,7 @@ dependencies = [
  "kr-plugin-service",
  "kr-protocol",
  "libc",
+ "rustix",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -5041,6 +5042,7 @@ dependencies = [
  "thread-priority",
  "tokio",
  "wasmtime",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -585,7 +585,8 @@ impl Runtime {
     ///
     /// All three inside one caller deadline, because all three are what a caller is waiting for.
     /// A caller that runs out of patience loses nothing: the compile continues on its pool thread
-    /// and files its result, so the next preparation of the same component is quick.
+    /// and, when it is within its budget, files its result, so the next preparation of the same
+    /// component is quick.
     ///
     /// # Errors
     ///
@@ -761,8 +762,9 @@ pub struct Compilation {
 impl Compilation {
     /// Waits for the compilation, up to `deadline`.
     ///
-    /// A caller that gives up loses nothing: the compile continues on its pool thread and its
-    /// result is filed in the cache, so the next preparation of the same component finds it.
+    /// A caller that gives up loses nothing: the compile continues on its pool thread and, when it
+    /// is within its budget, its result is filed in the cache, so the next preparation of the same
+    /// component finds it.
     ///
     /// # Errors
     ///

@@ -37,10 +37,12 @@ pub const FRAME_ENVELOPE_BYTES: u64 = 8 * 1024;
 /// millions of empty nodes for nothing, and "1 MiB of output per call" would bound only the text.
 pub const NODE_OVERHEAD_BYTES: u64 = 64;
 
-/// How long a compile may take before its result is discarded.
+/// How much of its own thread's processor time a compile may use before its result is discarded,
+/// in milliseconds.
 ///
 /// The host's compiler holds to it, and the registration deadlines on both ends of the protocol are
-/// made from it, which is why it is here rather than beside the compiler.
+/// made from it as times to wait on the clock, which is why it is here rather than beside the
+/// compiler.
 pub const COMPILE_DEADLINE_MS: u64 = 30_000;
 
 /// The identifier of one binding.

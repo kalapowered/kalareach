@@ -13,8 +13,8 @@
 //! figure, so on an ordinary machine the deadline is what stops a slow call and fuel is what stops
 //! an unbounded one.
 //!
-//! `bind`, `checkpoint` and `restore` are not in the section's list. `bind` runs under the
-//! compilation budget, because that is when it happens; `checkpoint` and `restore` take the
+//! `bind`, `checkpoint` and `restore` are not in the section's list. `bind` runs under the setup
+//! deadline and allowance, because that is when it happens; `checkpoint` and `restore` take the
 //! snapshot deadline, being the same kind of whole-state operation.
 
 use kr_plugin_sdk::limits::{
@@ -44,15 +44,15 @@ pub const FUEL_PER_DEADLINE_MS: u64 = 100_000_000;
 ///
 /// Neither is a call in section 11's list, so neither has one of its deadlines. Neither is
 /// unbounded either: a component whose constructors never return would otherwise hold a binding
-/// thread for ever. The figure is the compilation budget, because preparation is what both belong
-/// to and a host that accepted a compile of up to that long has to be willing to wait for the
+/// thread for ever. The figure is the compilation budget's, because preparation is what both belong
+/// to and a host that accepted a compile of up to that much work has to be willing to wait for the
 /// instantiation that follows it.
 pub const SETUP_DEADLINE_MS: u64 = kr_plugin_service::vocabulary::COMPILE_DEADLINE_MS;
 
 /// The work allowance instantiation and `bind` run under.
 ///
-/// Neither is a call in section 11's list: both happen during binding preparation, under the
-/// compilation budget. So neither takes its allowance from the call fuel rate, which is what makes
+/// Neither is a call in section 11's list: both happen during binding preparation, under the setup
+/// deadline. So neither takes its allowance from the call fuel rate, which is what makes
 /// "a call budget starts only once the instance is ready" true of the fuel as well as the deadline.
 pub const SETUP_FUEL: u64 = SNAPSHOT_DEADLINE_MS * FUEL_PER_DEADLINE_MS;
 
@@ -170,8 +170,8 @@ impl CallBudget {
     pub const fn with_fuel_rate(kind: CallKind, fuel_per_ms: u64) -> Self {
         let deadline_ms = kind.deadline_ms();
         let fuel = match deadline_ms {
-            // `bind` runs under the compilation budget rather than a call budget, so the call fuel
-            // rate does not apply to it.
+            // `bind` runs under the setup deadline rather than a call budget, so the call fuel rate
+            // does not apply to it.
             None => SETUP_FUEL,
             Some(ms) => ms.saturating_mul(fuel_per_ms),
         };

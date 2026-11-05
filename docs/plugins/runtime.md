@@ -84,7 +84,7 @@ Each call has two bounds, measuring different things.
 
 | Export | Elapsed deadline | Instruction allowance |
 | --- | --- | --- |
-| `bind` | none of its own; runs under the compilation budget | the setup allowance |
+| `bind` | none of its own; runs under the 30 s setup deadline | the setup allowance |
 | `observe` | 10 ms | 10 × the fuel rate |
 | `prepare-action` | 10 ms | 10 × the fuel rate |
 | `decode-request` | 50 ms | 50 × the fuel rate |
@@ -254,23 +254,35 @@ Compilation runs lazily, at binding preparation, on a background pool, under its
 | Bound | Value |
 | --- | --- |
 | Largest component compiled | 16 MiB |
-| Compilation budget | 30 s |
+| Compilation budget | 30 s of the compiling thread's processor time |
 | Concurrent compilations | 2 |
 | Queued compilations | 8 |
 
-A component past the size bound is refused before any work starts. A compile that finishes outside
-its budget has its result discarded and reports the figure. A pool whose queue is full refuses the
-next request rather than starting a hundred compiles.
+A component past the size bound is refused before any work starts. A compile that has used more
+than its budget of its own thread's processor time when it finishes has its result discarded and
+reports the figure. A pool whose queue is full refuses the next request rather than starting a
+hundred compiles.
 
 No call deadline contains a compile. The two steps are separate in the API for that reason: a
 component is compiled, and only then is an instance created and a call budget started. Instantiation
 and `bind` run on the binding's own thread rather than a caller's, and the caller's own deadline
 covers the whole preparation: the compile, the instantiation and `bind` together.
 
-The time half of the budget is a threshold on accepting a result rather than a cap on the work.
+The work half of the budget is a threshold on accepting a result rather than a cap on the work.
 Cranelift cannot be interrupted part way, so an over-budget compile has its result discarded and
 reports the figure; what bounds the resources already spent is the size bound and the pool's fixed
 threads and bounded queue.
+
+The budget is counted in processor time and not on the clock. A pool thread runs at background
+priority, so on a host that other work keeps busy it is off the processor for most of the time its
+compile takes. A budget on the clock would refuse a component because the host was busy, the worker
+would offer it again, and each offer would start the same compile over. A compile within its budget
+is filed when it ends, even after the caller that asked for it stopped waiting, so the next offer
+finds it. A caller's deadline stays on the clock, because a caller waits on the clock. Where a
+platform does not say what a thread has used, the budget is held to the clock. Linux, Android and
+Apple read the thread's CPU-time clock, and Windows reads its kernel and user time. The figure is
+the compiling thread's alone, which is all of a compile's work because the engine is built without
+Wasmtime's parallel compilation.
 
 Each pool thread lowers its own scheduling priority when it starts, through the platform's own
 thread scheduling. What that means is the platform's answer, and a platform that declines is not a
