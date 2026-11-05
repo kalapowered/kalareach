@@ -9,8 +9,6 @@
 //! calls cases through macros and attributes the report cannot see into, and `conventions`, read
 //! and never built as well, steps outside the conventions a helper key relies on. The runs build
 //! into a target directory of their own under the platform's temporary directory.
-//!
-//! KR-REQ-29.01.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -124,6 +122,10 @@ fn run_step_through(
     report::run(&options, &mut |_| {}).map(|document| (document, evidence))
 }
 
+/// KR-REQ-29.01, the part about mapping tests to acceptance identifiers: a key written in each
+/// comment form the report reads, and in a case table, maps the tests it covers to the identifier it
+/// names, and nothing else is keyed. Not shown here: which identifiers a contract or schema change
+/// affects.
 #[test]
 fn every_comment_form_and_a_case_table_key_their_tests() {
     let map = map_of("forms", false);
@@ -674,6 +676,9 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
     assert_eq!(record.needs, [plan::SECRET_STORE_VARIABLE], "{record:?}");
 }
 
+/// KR-REQ-29.01, the part about machine-readable results: a run over a tree that ignores nothing
+/// reports every identifier it keys with a verdict and, for each test that keys it, the outcome and
+/// the comment form that keyed it.
 #[test]
 fn a_tree_with_nothing_ignored_reports_every_identifier_as_run() {
     let (document, _evidence) = run("forms").unwrap_or_else(|stopped| panic!("{stopped:?}"));
@@ -1380,6 +1385,9 @@ fn a_comment_naming_a_row_past_the_acceptance_table_is_refused_before_anything_r
     );
 }
 
+/// KR-REQ-29.01, the part about reproducible commands and the identity of a run: the result names
+/// the command that ran a keyed test and the command of a step, the log that holds a step's output,
+/// the result's schema, the commit and the terminal profile, and it names no path of the checkout.
 #[test]
 fn the_result_names_every_command_and_no_path_of_the_checkout() {
     let (document, evidence) = run("forms").unwrap_or_else(|stopped| panic!("{stopped:?}"));
@@ -1786,6 +1794,9 @@ fn without_display(command: &str) -> String {
     words.join(" ")
 }
 
+/// KR-REQ-29.01, the part about reproducible commands: the steps the report plans for Windows are
+/// the tests and builds the landing workflow's Windows job runs, and the steps it plans for macOS
+/// leave out the cases that job leaves out.
 #[test]
 fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
     // Windows: every `cargo test` of the workflow's Windows job is a step, and every test step is
@@ -1863,6 +1874,10 @@ fn the_performance_group_takes_what_the_performance_script_takes() {
     assert!(script.contains("-- --ignored --exact --nocapture \"$name\""));
 }
 
+/// KR-REQ-29.01, the part about mapping tests to acceptance identifiers, in TypeScript: a key in a
+/// file's header, in a suite's comment, above or inside a test, in a test's title and in a table of
+/// cases maps the tests it covers to the identifier it names, and a mention that keys nothing is
+/// only a reference.
 #[test]
 #[ignore = "reads TypeScript with the packages' own compiler, which `pnpm install --frozen-lockfile` installs; the report's typescript group runs it"]
 fn typescript_comment_forms_and_titles_key_their_tests() {
