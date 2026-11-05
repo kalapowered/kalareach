@@ -6640,6 +6640,163 @@ async fn a_request_refused_after_a_copy_of_it_claimed_the_route_is_told_the_outc
     }
 }
 
+/// A copy of a request is still before its own claim of the action's route, waiting for the
+/// worker's link, when another copy of it is refused on a connection that was not issued its window.
+/// There is no route to read yet, but the copy that has not claimed is going to carry the action
+/// out, so the refusal is told as an unknown outcome and not as a refusal of the action. With no
+/// such copy the same request is refused for the window, as it always was. Once both calls have
+/// ended the set of calls that have not claimed holds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_refused_while_a_copy_of_it_is_before_its_claim_is_told_the_outcome_is_unknown() {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    for (copy_before_its_claim, expected) in [
+        (true, ErrorCode::OutcomeUnknown),
+        (false, ErrorCode::PermissionDenied),
+    ] {
+        let script = Scripted::new();
+        let world = scripted::scripted(&script).await;
+        let controller = &world.controller;
+        let record = paired(controller, 83, |grant| {
+            grant.actions = [ActionRight::SessionView, ActionRight::AgentPrompt]
+                .into_iter()
+                .collect();
+        });
+        // The window is issued to the first connection, so the second is refused for it. Both
+        // connections are the one device's.
+        let first = super::RemoteConnection::for_test(controller, record.clone());
+        let second = super::RemoteConnection::for_test(controller, record);
+        let prompt = device_mutation(
+            &world,
+            &first,
+            Method::AgentPromptSubmit,
+            94,
+            ParamsValue::empty(),
+        );
+        let refused = if copy_before_its_claim {
+            // The first copy waits for the worker's link, which it opens before it claims the route.
+            let (arrived, go) = controller.before_a_proxy_is_opened.arm();
+            let (first_answered, refused) = tokio::join!(
+                first.answer_now(ControlFrame::Mutation(Box::new(prompt.clone()))),
+                async {
+                    arrived
+                        .await
+                        .expect("the first copy waits for the worker's link");
+                    assert_eq!(
+                        controller.arrivals().entered(),
+                        1,
+                        "the first copy is among the calls that have not claimed"
+                    );
+                    assert!(
+                        controller
+                            .devices()
+                            .action_route(&second.device.principal(), prompt.action_id)
+                            .expect("the routes are readable")
+                            .is_none(),
+                        "the first copy has left no route"
+                    );
+                    let refused = second
+                        .answer_now(ControlFrame::Mutation(Box::new(prompt.clone())))
+                        .await
+                        .expect("the second copy is answered");
+                    go.send(()).expect("the first copy is waiting");
+                    refused
+                }
+            );
+            first_answered.expect("the first copy is answered");
+            refused
+        } else {
+            second
+                .answer_now(ControlFrame::Mutation(Box::new(prompt.clone())))
+                .await
+                .expect("the request is answered")
+        };
+        let error = error_of(refused.frame());
+        assert_eq!(
+            error.code, expected,
+            "a copy before its claim: {copy_before_its_claim}: {error}"
+        );
+        assert_eq!(
+            controller.arrivals().entered(),
+            0,
+            "no call is left among those that have not claimed"
+        );
+        world.serving.abort();
+    }
+}
+
+/// A call is among those that have not claimed the route of their action until it has the route:
+/// held at the dispatch lease, which it takes after its claim, it is no longer among them, whether
+/// it wrote the route or found the one a copy of it wrote while it waited for the worker's link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_leaves_those_that_have_not_claimed_once_it_has_its_route() {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    for copy_claimed_first in [false, true] {
+        let script = Scripted::new();
+        let world = scripted::scripted(&script).await;
+        let controller = &world.controller;
+        let connection = super::RemoteConnection::for_test(
+            controller,
+            paired(controller, 84, |grant| {
+                grant.actions = [ActionRight::SessionView, ActionRight::AgentPrompt]
+                    .into_iter()
+                    .collect();
+            }),
+        );
+        let prompt = device_mutation(
+            &world,
+            &connection,
+            Method::AgentPromptSubmit,
+            95,
+            ParamsValue::empty(),
+        );
+        let (waiting, release) = controller.before_a_proxy_is_opened.arm();
+        let (arrived, go) = controller.before_the_lease.arm();
+        let (answered, ()) = tokio::join!(
+            connection.answer_now(ControlFrame::Mutation(Box::new(prompt.clone()))),
+            async {
+                waiting.await.expect("the call waits for the worker's link");
+                assert_eq!(
+                    controller.arrivals().entered(),
+                    1,
+                    "the call is among those that have not claimed"
+                );
+                if copy_claimed_first {
+                    assert!(
+                        connection
+                            .claim_route(
+                                &prompt,
+                                Some(world.session_id),
+                                &super::forwarding::OwnClaim::none()
+                            )
+                            .is_ok(),
+                        "a copy claims the route"
+                    );
+                }
+                release.send(()).expect("the call is waiting");
+                arrived.await.expect("the call waits for its lease");
+                assert_eq!(
+                    controller.arrivals().entered(),
+                    0,
+                    "a copy claimed first: {copy_claimed_first}: the call has the route, and is no \
+                     longer among those that have not claimed"
+                );
+                go.send(()).expect("the call is waiting");
+            }
+        );
+        answered.expect("the call is answered");
+        world.serving.abort();
+    }
+}
+
 /// The authority feed raises a refusal on remote grants while a mutation, which has its lease,
 /// waits for the write half of its link to the worker. For a repeat that refusal says nothing of
 /// the copy that went before, so it is told as an unknown outcome; the same request never routed is

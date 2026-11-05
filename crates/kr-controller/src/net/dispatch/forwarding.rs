@@ -15,6 +15,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_transport::window::AcceptedDeadline;
 
+use super::super::arrivals::{Arrival, Arrivals, Carried};
 use super::super::proxy::{Vouched, WorkerProxy};
 use crate::error::{ControllerError, Result};
 use crate::grants::policy::HeldBound;
@@ -63,20 +64,59 @@ impl RouteRefusal {
 /// ([`RemoteConnection::told_of_a_repeat`]). The route a call claims for itself does not make it a
 /// repeat, so a first request refused after its own claim is refused as ever; this records that the
 /// claim was the call's own. A route found otherwise was made by a copy of the request.
-pub(super) struct OwnClaim(AtomicBool);
+///
+/// It also holds the call's entry among the calls that have not yet claimed the route of their
+/// action ([`Arrivals`]), which it gives up when the route is claimed or found, and when the call
+/// ends.
+pub(super) struct OwnClaim {
+    made: AtomicBool,
+    arrival: std::sync::Mutex<Option<Arrival>>,
+}
 
 impl OwnClaim {
-    /// A call that has claimed nothing.
+    /// A call that has claimed nothing and is not among the calls that have not yet claimed.
     pub(super) const fn none() -> Self {
-        Self(AtomicBool::new(false))
+        Self {
+            made: AtomicBool::new(false),
+            arrival: std::sync::Mutex::new(None),
+        }
     }
 
+    /// A call that has claimed nothing, and is entered among those that have not yet claimed.
+    pub(super) const fn arrived(arrival: Arrival) -> Self {
+        Self {
+            made: AtomicBool::new(false),
+            arrival: std::sync::Mutex::new(Some(arrival)),
+        }
+    }
+
+    /// Records that this call wrote the route of its action, and gives up its entry: the route is
+    /// what a refusal reads from here on.
     fn made(&self) {
-        self.0.store(true, Ordering::Release);
+        self.made.store(true, Ordering::Release);
+        self.leave();
     }
 
     fn is_made(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.made.load(Ordering::Acquire)
+    }
+
+    /// Gives up the entry among the calls that have not claimed, when the route has been found
+    /// rather than written.
+    fn leave(&self) {
+        self.arrival
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
+    /// Whether another call that carries `request` has not yet claimed its route.
+    fn another_has_not_claimed(&self, arrivals: &Arrivals, request: &Carried) -> bool {
+        let own = self
+            .arrival
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        arrivals.another_carries(request, own.as_ref())
     }
 }
 
@@ -113,6 +153,16 @@ fn input_write_refusal(error: &CodecError) -> ProtocolError {
             "the parameters of input.write are not the current ones",
         ),
     }
+}
+
+/// The request `mutation` is, as the set of calls that have not yet claimed keeps it.
+pub(super) fn request_of(
+    actor_id: &kr_protocol::ids::ActorId,
+    mutation: &MutationRequest,
+) -> Option<Carried> {
+    kr_protocol::digest::mutation_digest(mutation, actor_id)
+        .ok()
+        .map(|digest| (actor_id.clone(), mutation.action_id, digest))
 }
 
 impl RemoteConnection {
@@ -161,12 +211,28 @@ impl RemoteConnection {
     ) -> ProtocolError {
         if error.code == ErrorCode::OutcomeUnknown
             || own_claim.is_made()
-            || !self.holds_a_route_for(mutation)
+            || !(self.another_copy_has_not_claimed(own_claim, mutation)
+                || self.holds_a_route_for(mutation))
         {
             error
         } else {
             outcome_not_shown()
         }
+    }
+
+    /// Whether a copy of this request is being served that has not yet claimed the route of its
+    /// action, and so has left no route to be read.
+    ///
+    /// Read before the route is: a call writes its route before it leaves the set, so a reader that
+    /// finds the set without the copy finds the copy's route.
+    fn another_copy_has_not_claimed(
+        &self,
+        own_claim: &OwnClaim,
+        mutation: &MutationRequest,
+    ) -> bool {
+        request_of(&self.device.principal(), mutation).is_some_and(|request| {
+            own_claim.another_has_not_claimed(self.controller.arrivals(), &request)
+        })
     }
 
     /// Answers `action.read` for a catalogue action this device performed, where there is one.
@@ -754,6 +820,7 @@ impl RemoteConnection {
             super::super::devices::ActionRoute::Existing(existing)
                 if existing.payload_digest == Some(digest) && existing.session_id == session_id =>
             {
+                own_claim.leave();
                 Ok(())
             }
             super::super::devices::ActionRoute::Existing(_) => {

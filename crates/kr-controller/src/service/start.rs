@@ -1260,6 +1260,7 @@ impl Controller {
             #[cfg(feature = "testing")]
             effect_wait: crate::testing::effect_wait(),
             devices,
+            arrivals: Arc::default(),
             lifetimes,
             owner,
             policy,

@@ -3514,13 +3514,15 @@ happen. An answer kept from an earlier submission, which the daemon finds in a r
 gives from a receipt it held, is told as unknown whatever it was, so that a device that may not read
 it cannot tell a result from a refusal. A repeat is an action the daemon has already routed for the
 device, asked again with the same request, whether the route was there when the request arrived or a
-copy claimed it while the request waited. The daemon writes the route before it dispatches the
-action and keeps no word of whether a dispatch followed, so it cannot show that the earlier copy did
-not run. A refusal it makes of a repeat on its own account is therefore told as unknown too,
-wherever the check sits: a registration withdrawn, a grant gone or narrowed, a connection opened for
-the host or for another session or grant, a window that belongs to another connection, a session
-whose worker has ended, a worker refusal that the worker did not read from a receipt, or a route the
-daemon cannot read. A repeated close is the one the daemon can still answer without its worker: the
+copy claimed it while the request waited. A copy that has arrived and not yet claimed counts too:
+the daemon keeps in memory the calls it is serving that have not yet written their route, and a
+refusal of a request that meets another such call carrying the same request is told as a repeat's.
+The daemon writes the route before it dispatches the action and keeps no word of whether a dispatch
+followed, so it cannot show that the earlier copy did not run. A refusal it makes of a repeat on its
+own account is therefore told as unknown too, wherever the check sits: a registration withdrawn, a
+grant gone or narrowed, a connection opened for the host or for another session or grant, a window
+that belongs to another connection, a session whose worker has ended, a worker refusal that the
+worker did not read from a receipt, or a route the daemon cannot read. A repeated close is the one the daemon can still answer without its worker: the
 closure record answers it for a device that may read the session's receipts, as it answers a close
 made after the closure. A request the daemon never routed is refused as any request is, and so is a
 reused identifier that carries another request; a request whose route the daemon cannot read counts
