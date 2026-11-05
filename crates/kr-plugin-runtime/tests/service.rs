@@ -9,7 +9,7 @@ mod components;
 
 use std::sync::Arc;
 
-use kr_plugin_runtime::service::host::{HostConfig, PluginHost};
+use kr_plugin_runtime::service::host::{HostConfig, MAX_PENDING_UNBINDS, PluginHost};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_service::client::{PluginClient, new_binding_id};
 use kr_plugin_service::error::ServiceError;
@@ -50,10 +50,11 @@ impl Served {
         Self::start_with(true, None).await
     }
 
-    /// A host that gives an unbind `deadline` to be answered in, instead of a few seconds short of
-    /// what a worker's client waits for it.
+    /// A host that gives an unbind `deadline` to be answered in, instead of half a second short of
+    /// what a worker's client waits for it, and whose epoch no time advances, so that nothing
+    /// registering a component on it is stopped by a deadline of the component's.
     async fn start_unbinding_within(deadline: core::time::Duration) -> Self {
-        Self::start_with(false, Some(deadline)).await
+        Self::start_with(true, Some(deadline)).await
     }
 
     async fn start_with(epoch_held: bool, unbinding_within: Option<core::time::Duration>) -> Self {
@@ -463,6 +464,7 @@ impl Raw {
 // leaves it waiting for a thread of its own, and the request is answered at the host's deadline
 // all the same, with its place among the connection's calls given up. The unbind is not taken back:
 // it runs when the pool has a thread, removes the binding and gives the connection its place back.
+// A connection can leave only so many of them behind, and is refused the next one.
 //
 // The pool has one thread, which the case holds once the binding is registered. A task spawned
 // after the unbind runs after it on that thread, so by the time it has run the unbind has too.
@@ -518,18 +520,38 @@ fn an_unbind_a_busy_blocking_pool_holds_up_is_refused_in_time_and_runs_when_the_
             .expect("the pool's thread was held")
             .expect("the held work started");
 
-        let answered = tokio::time::timeout(
-            POOL_THREAD,
-            host.ask(RequestBody::Unbind {
-                binding_id: request.binding_id.get(),
-            }),
-        )
-        .await
-        .expect("the host answered the unbind, and did not wait for the pool");
+        let unbind = async |host: &mut Raw| {
+            tokio::time::timeout(
+                POOL_THREAD,
+                host.ask(RequestBody::Unbind {
+                    binding_id: request.binding_id.get(),
+                }),
+            )
+            .await
+            .expect("the host answered the unbind, and did not wait for the pool")
+        };
+        let answered = unbind(&mut host).await;
         assert!(
             matches!(&answered, ResponseBody::Refused { detail, .. }
                 if detail.contains(&format!("{} ms", HELD_UNBIND_DEADLINE.as_millis()))),
             "the unbind was answered with {answered:?}"
+        );
+        // A caller that stops waiting leaves its removal behind, and a connection may leave only so
+        // many: each of the unbinds up to that number is answered at the deadline, and the one
+        // after them is refused without being queued.
+        for _ in 1..MAX_PENDING_UNBINDS {
+            let answered = unbind(&mut host).await;
+            assert!(
+                matches!(&answered, ResponseBody::Refused { detail, .. }
+                    if detail.contains(&format!("{} ms", HELD_UNBIND_DEADLINE.as_millis()))),
+                "the unbind was answered with {answered:?}"
+            );
+        }
+        let answered = unbind(&mut host).await;
+        assert!(
+            matches!(&answered, ResponseBody::Refused { detail, .. }
+                if detail.contains("unbinds it may have waiting")),
+            "the unbind past the number a connection may leave behind was answered with {answered:?}"
         );
         // The host answered, and the removal is still to be run: the binding is there.
         let health = host.health().await;
