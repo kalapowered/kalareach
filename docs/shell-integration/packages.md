@@ -48,7 +48,7 @@ protocol, wraps the editor's own entry points and puts its decision on the gestu
 
 ## What Zsh changes
 
-There are four patches, against `zsh-5.9.2`.
+There are five patches, against `zsh-5.9.2`.
 
 | Patch | Files | What it adds |
 | --- | --- | --- |
@@ -56,6 +56,7 @@ There are four patches, against `zsh-5.9.2`.
 | `0002-zle-reader-state` | `Src/Zle/zle_misc.c` | Three reader states the detach condition needs |
 | `0004-exec-command-resolve` | `Src/exec.c`, `Src/zsh.h`, `Src/Zle/zle_main.c` | The question in front of each command a line starts, and the launcher its answer can name |
 | `0005-module-paths-from-executable` | `Src/init.c` | The default module path and function path, read from where the executable is |
+| `0006-zle-host-replies` | `Src/Zle/zle.mdd`, `Src/Zle/zle_keymap.c` | A host's answer to a terminal query, taken out of the keys before the key lookup |
 
 The first patch does five things, all inside `zle_main.c`:
 
@@ -117,11 +118,19 @@ directory that was under the build's prefix is moved under this one. If the shel
 directory the paths it was built with are kept, and user settings in startup files are applied
 afterwards and win.
 
+The sixth patch changes one function. `getkeybuf` is where ZLE takes each byte of a key from the
+terminal, and it now asks the bridge about every Escape it gets. The bridge looks at the bytes the
+terminal has already delivered and takes all of them when they are a whole answer of the host's
+query broker, as the Zsh and Bash section of [README.md](README.md) describes; otherwise it pushes
+them back with `ungetbyte`, so `getbyte` hands them to the key lookup in the order they came. A
+`read -k` inside a widget reaches the terminal through `getbyte` directly, and `vared` and `select`
+are declined by the reader context, so a program that asked for its answer still gets it.
+
 ## What Bash changes
 
-There are twenty-four patches, against `bash-5.3`, which bundles Readline 8.3: the twenty official
+There are twenty-five patches, against `bash-5.3`, which bundles Readline 8.3: the twenty official
 patches of the 5.3 series, `bash53-001` to `bash53-020`, applied first with `patch -p0` as GNU
-publishes them, and four of the package's own.
+publishes them, and five of the package's own.
 
 | Patch | Files | What it adds |
 | --- | --- | --- |
@@ -130,6 +139,7 @@ publishes them, and four of the package's own.
 | `0002-readline-reader-state` | `lib/readline/{text.c,kill.c}` | Two reader states Readline keeps no flag for |
 | `0003-bash-bridge-activation` | `Makefile.in`, `shell.c`, `builtins/Makefile.in` | Loading the bridge, the prompt context and the builtin |
 | `0004-bash-command-resolve` | `execute_cmd.c` | The question in front of each command a line starts, and the launcher its answer can name |
+| `0005-readline-host-replies` | `lib/readline/{Makefile.in,input.c}` | A host's answer to a terminal query, taken out of the keys before the key lookup |
 
 Readline's buffering is why the mailbox is where it is. The reader returns pending and macro input
 without consulting the character callback at all, and `rl_gather_tyi` can call that callback while
@@ -182,6 +192,13 @@ the accepted line: never one a function, a sourced or startup file, an `eval`, a
 `PROMPT_COMMAND` or a subshell runs. When the answer names a launcher, the forked child starts it in
 the command's place with the backend's variables added to the environment it would have had, and a
 launcher that cannot be started leaves the child running the command as it was typed.
+
+The fifth patch changes the branch of `rl_read_key` that reads the typeahead and the terminal. A
+byte that is an Escape is offered to the bridge, which looks at the bytes already delivered, from
+the reader's own buffer and then the terminal's queue, and takes all of them when they are a whole
+answer of the host's query broker. Otherwise it gives them back to the front of the reader's buffer
+with `_rl_unget_char`, in order. The buffer holds 511 bytes and the longest run the bridge reads
+ahead is 480, so what it gives back always fits. A `read -e` is declined by the prompt context.
 
 ## What fish changes
 
@@ -344,6 +361,7 @@ adapter for that reader:
 | `kr_bridge.c`, `kr_bridge.h` | The endpoint, the frames, the handshake, the fence view, the pre-EOF decision and the reader's launch check |
 | `kr_bridge_cbor.c`, `kr_bridge_cbor.h` | KR-CBOR-1: canonical encoding with map keys checked into order as they are written, and a bounded decoder |
 | `kr_bridge_crypto.c`, `kr_bridge_crypto.h` | SHA-256, HMAC-SHA-256, base64url and a wipe the compiler keeps, for the one proof taken at startup |
+| `kr_bridge_reply.c`, `kr_bridge_reply.h` (Zsh and Bash) | The shapes of the answers the host's query broker writes to a terminal, and nothing else: given the bytes of a run that starts with an Escape, it says whether they are not an answer, the start of one, or one |
 | `kr_bridge_zle.c` / `kr_bridge_rl.c` | The reader's own state, read in one operation at one instant, and the shell's own string representation |
 | `kr_bridge_fish.rs` (fish only) | The reader's own state and the shell's own variables and executor, in Rust beside the reader: the same reads, the line's block and capability, and the question in front of each command |
 | `kr_bridge_bash.c` (Bash only) | What only the shell itself can do: put a variable in its exported environment or take one out, say which prompt it is at and what the last line exited with, and decide whether a command is one of the line's own |

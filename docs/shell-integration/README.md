@@ -456,7 +456,9 @@ instants, which is the ambiguity a fence exists to remove, so a qualified packag
 together. A reader cannot tell a byte a person typed from one the host put into the terminal for
 an application, such as the answer to a device query, and it does not try: what it has not read is
 unread input, and the Zsh, Bash and Fish readers do not report their queues drained until they have
-read it. The PowerShell reader counts the keys its editor has queued, what the .NET runtime has read
+read it. The Zsh and Bash readers go one step further for an answer that is already whole in the
+terminal: they read it, drop it before any key is decoded, and report their queues as they stand
+after that. The PowerShell reader counts the keys its editor has queued, what the .NET runtime has read
 from the terminal and not yet handed to the editor, and whether the terminal's queue holds anything.
 It reads the runtime's buffer where it lies, because asking the console whether a key is available
 would take the lock the editor's reading thread holds while it waits. On a Windows console the
@@ -769,6 +771,45 @@ private key into the pseudo-terminal. That fallback is not a value a qualified d
 The four packages answer one contract, and the mechanism table at the top of this document says
 which mechanism each of them answers it with. Two of those mechanisms are not a native hook, so
 what they can and cannot establish is written out here rather than left to be discovered.
+
+### Zsh and Bash
+
+Both answer the contract with a native hook, and the mechanism table above says which. This section
+is about one thing their readers do with the terminal's bytes.
+
+Neither package asks the terminal anything. A device-attributes answer, a cursor report or a colour
+report that reaches one of their prompts is an answer to a program that has ended or never read it:
+the host's query broker wrote it into the terminal's input when the program's question went by, and
+the line editor is the next process to read that input. ZLE and Readline take the terminal a byte at
+a time and look each one up as a key. `ESC [ ?` is no binding, so the editor rings the bell and
+drops those three bytes, and `62;22c` is typed into the line. The host cannot close this. Its lane
+holds an answer only for an editor that has asked a cursor question, and neither of these editors
+asks one; holding it for the next command would give it to a program that did not ask.
+
+The readers take the answer out themselves, at the place the editor reads the first byte of a key
+(`getkeybuf` in ZLE, `rl_read_key` in Readline). When that byte is an Escape, the reader looks at
+the bytes the terminal has already delivered. If they are a whole answer of the broker, the reader
+takes all of them, reports itself idle again, so the worker can prove a fence over the empty line,
+and reads on. If they are not, the reader gives every byte back, in order, and the editor decodes
+the key as it always did.
+
+- **What counts as an answer.** The device-attributes, status, cursor-position, mode, window and
+  keyboard-protocol reports (control sequences), the version, setting, capability and tertiary
+  device-attributes reports (device-control strings), and the colour and clipboard answers
+  (operating-system commands), each in the 7-bit form the broker writes and each recognised by its
+  shape and never by a value in it. A cursor position on the first row with a column from 2 to 16 is
+  also what a function key sends with modifiers, so it is left to the person.
+- **Nothing waits.** The reader acts on bytes that are already there. A lone Escape, a vi user's
+  mode key, goes straight to the editor, and a key typed in the same write as an answer, before or
+  after it, reaches the editor whole and in its place. An answer the terminal delivers in two parts
+  is the exception: the first part has gone to the editor as keys before the second arrives, as it
+  did before. The longest run the reader follows is 480 bytes.
+- **Where it applies.** The root shell of a session, at the prompts the shell draws, primary and
+  continuation. In `vared` and `select` (Zsh) and in `read -e` (Bash) the program that is reading
+  may have asked, so the reader leaves the bytes alone, and so it does inside a bracketed paste or
+  a quoted insertion. A Zsh `read -k` in a widget never goes through the key lookup at all.
+- **What the fence sees.** An answer the reader has taken counts as read, so a fence the worker
+  proves afterwards is over a line the answer did not touch.
 
 ### fish
 
