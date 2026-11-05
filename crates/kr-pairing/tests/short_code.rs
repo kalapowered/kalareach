@@ -1,4 +1,4 @@
-//! The short-code flow, end to end, and the acceptance conditions of KR-ACC-015.
+//! The short-code flow, end to end.
 //!
 //! Every dependency is an in-test implementation of the traits in `kr_pairing::platform`: no
 //! network, no disk, no real clock. What is exercised is the protocol.
@@ -474,6 +474,10 @@ fn a_successful_confirmation_locks_the_invitation_before_any_bundle() {
 
 /// KR-REQ-10.30: five failed confirmation tags consume the invitation, and the count is persisted
 /// as it falls.
+///
+/// KR-ACC-015, the part about the five-attempt limit: five failed confirmation tags consume the
+/// invitation, and the count is persisted as it falls and survives a restart. Not shown here: the
+/// other conditions of the row.
 #[test]
 fn a_wrong_code_exhausts_five_guesses_and_the_count_survives_a_restart() {
     assert_eq!(MAX_CONFIRMATION_FAILURES, 5, "section 10 allows five");
@@ -862,6 +866,10 @@ fn a_fenced_invitation_reports_nothing_and_consumes_nothing() {
 
 /// KR-REQ-10.16, KR-REQ-10.13: what the service returns stays untrusted until the PAKE confirms it,
 /// and the host's own deadline governs whatever expiry the service advertises.
+///
+/// KR-ACC-015, the part about a malicious rendezvous: what the service returns stays untrusted
+/// until the PAKE confirms it, and the host's own deadline governs whatever expiry the service
+/// advertises. Not shown here: the other conditions of the row.
 #[test]
 fn a_malicious_service_cannot_extend_the_deadline_or_forge_an_invitation() {
     let harness = Harness::new();
@@ -915,6 +923,9 @@ fn a_malicious_service_cannot_extend_the_deadline_or_forge_an_invitation() {
 }
 
 /// KR-REQ-10.04, KR-REQ-10.13: an invitation lives five minutes on the host's monotonic deadline.
+///
+/// KR-ACC-015, the part about the expiry limit: an invitation lives five minutes on the host's
+/// monotonic deadline. Not shown here: the other conditions of the row.
 #[test]
 fn an_invitation_expires_on_the_hosts_own_clock() {
     assert_eq!(
@@ -959,6 +970,10 @@ fn a_wall_clock_that_runs_backwards_does_not_extend_an_invitation() {
 }
 
 /// KR-REQ-10.33: a host restart cancels every unfinished invitation and keeps the failure count.
+///
+/// KR-ACC-015, the part about consumed-invitation persistence across a host restart: a restart
+/// cancels every unfinished invitation and keeps the failure count. Not shown here: the other
+/// conditions of the row.
 #[test]
 fn a_host_restart_cancels_unfinished_invitations_and_keeps_consumed_state() {
     let harness = Harness::new();
@@ -1008,6 +1023,10 @@ fn a_locked_candidate_is_swept_by_a_restart_like_any_other() {
 }
 
 /// KR-REQ-10.27: the candidate checks the host it reached against the authenticated host bundle.
+///
+/// KR-ACC-015, the part about the key-bundle and iroh binding: the candidate checks the host it
+/// reached against the authenticated host bundle, and a substituted endpoint is rejected. Not shown
+/// here: the other conditions of the row.
 #[test]
 fn a_substituted_endpoint_at_finish_is_rejected() {
     let harness = Harness::new();
