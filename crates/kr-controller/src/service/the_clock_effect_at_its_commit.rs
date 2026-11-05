@@ -404,7 +404,13 @@ async fn two_copies_of_one_action_establish_the_clock_once() {
         let (owner, caller, guard) = (Arc::clone(&owner), caller.clone(), Arc::clone(&guard));
         let action = (action_id, digest(ttl_ms));
         tokio::task::spawn_blocking(move || {
-            owner.establish_clock(&caller, action, boot, guard.as_ref())
+            owner.establish_clock(
+                &caller,
+                action,
+                boot,
+                guard.as_ref(),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
         })
     };
 

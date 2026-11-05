@@ -1384,6 +1384,7 @@ async fn the_repeat_of_a_rearm_is_recognised_by_a_read_that_changes_nothing() {
         .rearm(
             &params(test_grant_id(1), 0),
             &Submitted {
+                answered: None,
                 key: &common::fresh_action(Method::WorkflowRearm),
                 admission: &common::admitted,
                 caller_grant: Some(test_grant_id(1)),
@@ -1503,6 +1504,7 @@ async fn a_rearm_whose_admission_has_lapsed_writes_nothing() {
         .rearm(
             &params,
             &Submitted {
+                answered: None,
                 key: &key,
                 admission: &lapsed,
                 caller_grant: None,
@@ -1519,6 +1521,7 @@ async fn a_rearm_whose_admission_has_lapsed_writes_nothing() {
         .rearm(
             &params,
             &Submitted {
+                answered: None,
                 key: &key,
                 admission: &common::admitted,
                 caller_grant: None,

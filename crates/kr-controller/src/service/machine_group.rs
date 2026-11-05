@@ -46,6 +46,7 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64};
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 use crate::machine::{Approval, Change, Expected, MachineGroup, MachineStore, Standing};
 use crate::singleton::SingletonLock;
 
@@ -283,24 +284,27 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         carried: crate::authority::AdmittedMutation,
-    ) -> Result<ParamsValue> {
-        let (movement, expected) = read_step(method, &mutation.params)?;
+    ) -> Given<Result<ParamsValue>> {
+        let (movement, expected) = match read_step(method, &mutation.params) {
+            Ok(step) => step,
+            Err(error) => return Given::Fresh(Err(error)),
+        };
         // A daemon with no usable record takes no step, and claims nothing: the answer is the same
         // however often it is asked, and a claim would turn it into an outcome nobody knows.
         if matches!(self.machine.held, Held::Refused(_)) {
-            return Err(ControllerError::Storage {
+            return Given::Fresh(Err(ControllerError::Storage {
                 operation: "change the machine group record",
                 detail: NO_RECORD.to_owned(),
-            });
+            }));
         }
         // A step that carries no freshness is a retry of an action this host may already hold,
         // which has been answered before this point; what it may not do is be performed.
         if carried.deadline.is_none() {
-            return Err(ControllerError::WindowExpired {
+            return Given::Fresh(Err(ControllerError::WindowExpired {
                 detail: "this action carries no freshness, so it may be answered from what this \
                          host holds and may not be performed"
                     .to_owned(),
-            });
+            }));
         }
         let controller = Arc::clone(self);
         let actor_id = actor_id.clone();
@@ -312,15 +316,17 @@ impl Controller {
         })
         .await
         .unwrap_or_else(|_| {
-            Err(ControllerError::Uncertain {
+            Given::Fresh(Err(ControllerError::Uncertain {
                 detail: "the task that took this step ended before it answered, and this host's \
                          records may not show what it did; ask again with the same action to be \
                          told what it did"
                     .to_owned(),
-            })
+            }))
         })
     }
 
+    /// One step, taken after the steps before it ([`Self::take_the_step`]). An answer this reads
+    /// from the record an earlier attempt left is given as a copy.
     async fn machine_step_serially(
         self: &Arc<Self>,
         actor_id: &ActorId,
@@ -328,6 +334,22 @@ impl Controller {
         movement: Move,
         expected: Expected,
         carried: crate::authority::AdmittedMutation,
+    ) -> Given<Result<ParamsValue>> {
+        let mut copied = false;
+        let answer = self
+            .take_the_step(actor_id, mutation, movement, expected, carried, &mut copied)
+            .await;
+        Given::of(answer, copied)
+    }
+
+    async fn take_the_step(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        movement: Move,
+        expected: Expected,
+        carried: crate::authority::AdmittedMutation,
+        copied: &mut bool,
     ) -> Result<ParamsValue> {
         let _serial = self.machine.steps.lock().await;
         // The step before this one may have written the record and ended before its receipt. Its
@@ -347,6 +369,7 @@ impl Controller {
                 // and this claim, which waited for the step lock. What it produced goes back only
                 // under authority that has not been withdrawn, as it does from that lookup, and
                 // without the deadline a receipt outlives.
+                *copied = true;
                 self.check_registration(&crate::authority::AdmittedMutation {
                     deadline: None,
                     ..carried

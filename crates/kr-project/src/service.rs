@@ -2117,7 +2117,7 @@ impl ProjectService {
         let performed = performed.into();
         // A copy of this action that already ran is answered before its source is looked for
         // again: the source location may have gone since, and the answer has not.
-        if let Some(answered) = self.answer_from_record::<CreationAnswer>(performed.action())? {
+        if let Some(answered) = self.answer_from_record::<CreationAnswer>(&performed)? {
             return Ok(ProjectCloneResult {
                 project: answered.project,
                 operation: answered.operation,
@@ -2175,7 +2175,7 @@ impl ProjectService {
     ) -> Result<(ProjectSummary, OperationRecord)> {
         // A copy of this action that already ran is answered from its record before anything else
         // happens, in one read, so two copies cannot reach two different answers.
-        if let Some(answered) = self.answer_from_record::<CreationAnswer>(performed.action())? {
+        if let Some(answered) = self.answer_from_record::<CreationAnswer>(&performed)? {
             return Ok((answered.project, answered.operation));
         }
         self.check_environment(request.environment_id)?;
@@ -2291,7 +2291,7 @@ impl ProjectService {
                     match self.resolve_operation(&current, Some(&destination)) {
                         Ok(step) => {
                             if let Some(answered) =
-                                self.answer_from_record::<CreationAnswer>(performed.action())?
+                                self.own_answer_from_record::<CreationAnswer>(&performed)?
                             {
                                 return Ok((answered.project, answered.operation));
                             }
@@ -2466,7 +2466,7 @@ impl ProjectService {
         // A copy of this action that already settled is answered from its record, and one still
         // in flight is told so, before anything is looked at again.
         if let Some(answered) =
-            self.answer_from_record::<ProjectOperationCancelResult>(performed.action())?
+            self.answer_from_record::<ProjectOperationCancelResult>(&performed)?
         {
             return Ok(answered);
         }
@@ -2629,7 +2629,7 @@ impl ProjectService {
             // its effect is still in flight.
             Err(ProjectError::OutcomeUnknown { .. }) if performed.action().is_some() => {
                 if let Some(answered) =
-                    self.answer_from_record::<ProjectOperationCancelResult>(performed.action())?
+                    self.answer_from_record::<ProjectOperationCancelResult>(&performed)?
                 {
                     return Ok(answered);
                 }
@@ -2791,9 +2791,7 @@ impl ProjectService {
         performed: impl Into<Performed<'a>>,
     ) -> Result<WorkspaceCreateResult> {
         let performed = performed.into();
-        if let Some(answered) =
-            self.answer_from_record::<WorkspaceCreateResult>(performed.action())?
-        {
+        if let Some(answered) = self.answer_from_record::<WorkspaceCreateResult>(&performed)? {
             return Ok(answered);
         }
         check_label(&params.label)?;
@@ -3343,9 +3341,7 @@ impl ProjectService {
         performed: impl Into<Performed<'a>>,
     ) -> Result<WorkspaceRemoveResult> {
         let performed = performed.into();
-        if let Some(answered) =
-            self.answer_from_record::<WorkspaceRemoveResult>(performed.action())?
-        {
+        if let Some(answered) = self.answer_from_record::<WorkspaceRemoveResult>(&performed)? {
             return Ok(answered);
         }
         self.require_git()?;
@@ -3418,7 +3414,7 @@ impl ProjectService {
         // between them. The reservation is then given up whatever happened: what it excludes is a
         // second removal running beside this one, not a second request after it.
         let answered = match outcome {
-            Ok(removed) => self.removal_answer(params.workspace_id, removed, performed.action()),
+            Ok(removed) => self.removal_answer(params.workspace_id, removed, &performed),
             Err(error) => {
                 let detail = error.to_string();
                 let recorded = self.writable().and_then(|mut store| {
@@ -3811,7 +3807,7 @@ impl ProjectService {
         &self,
         workspace_id: WorkspaceId,
         working_files_removed: bool,
-        action: Option<&Action>,
+        performed: &Performed<'_>,
     ) -> Result<WorkspaceRemoveResult> {
         let store = self.writable()?;
         let row = store
@@ -3835,11 +3831,12 @@ impl ProjectService {
         // The claim was opened when the removal was reserved, so this fills it in rather than
         // recording a second row. A claim that is no longer open belongs to a copy of this action
         // that settled first, and that record is the answer both callers get.
-        if let Some(action) = action {
+        if let Some(action) = performed.action() {
             let encoded = kr_cbor::to_canonical_vec(&result).map_err(ProjectError::store)?;
             if store.settle(action, Some(&encoded), None)? == 0
                 && let Some(record) = store.retained_action(&action.actor_id, action.action_id)?
             {
+                performed.note_answered_from_record();
                 return match outcome_of(&record) {
                     RetainedOutcome::Ok(bytes) => {
                         kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
@@ -4203,11 +4200,31 @@ impl ProjectService {
     ///
     /// Asking twice is how two copies of one action end up with two answers, so every caller that
     /// can find an effect already done uses this.
+    ///
+    /// The record is an earlier submission's, and the service says so on `performed`. A caller
+    /// that reads the record its own attempt has just settled reads it with
+    /// [`Self::own_answer_from_record`].
     pub(crate) fn answer_from_record<T: serde::de::DeserializeOwned + serde::Serialize>(
         &self,
-        action: Option<&Action>,
+        performed: &Performed<'_>,
     ) -> Result<Option<T>> {
-        let Some(action) = action else {
+        self.read_the_record(performed, true)
+    }
+
+    /// Reads the record this attempt's own settlement left, which is not a copy.
+    pub(crate) fn own_answer_from_record<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        performed: &Performed<'_>,
+    ) -> Result<Option<T>> {
+        self.read_the_record(performed, false)
+    }
+
+    fn read_the_record<T: serde::de::DeserializeOwned + serde::Serialize>(
+        &self,
+        performed: &Performed<'_>,
+        earlier: bool,
+    ) -> Result<Option<T>> {
+        let Some(action) = performed.action() else {
             return Ok(None);
         };
         let Some(record) = self
@@ -4216,6 +4233,9 @@ impl ProjectService {
         else {
             return Ok(None);
         };
+        if earlier {
+            performed.note_answered_from_record();
+        }
         if record.method != action.method || record.payload_digest != action.payload_digest {
             return Err(ProjectError::IdConflict {
                 action: action.action_id.to_string().into(),

@@ -1014,14 +1014,17 @@ async fn an_authority_change_recorded_before_a_late_attempts_claim_is_not_given_
         .expect("the answer is recorded");
     drop(hold);
 
-    let late = || {
-        controller.authority_change(
-            &actor_id,
-            super::authority_changes::AuthorityCaller::Owner,
-            &mutation,
-            Method::GrantRevoke,
-            carried(&controller, connection_id),
-        )
+    let late = || async {
+        controller
+            .authority_change(
+                &actor_id,
+                super::authority_changes::AuthorityCaller::Owner,
+                &mutation,
+                Method::GrantRevoke,
+                carried(&controller, connection_id),
+            )
+            .await
+            .into_answer()
     };
     late()
         .await
@@ -1060,6 +1063,7 @@ async fn an_authority_change_recorded_before_a_late_attempts_claim_is_not_given_
                     carried,
                 )
                 .await
+                .into_answer()
         }
     });
     tokio::time::timeout(Duration::from_secs(30), arrived)

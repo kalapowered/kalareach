@@ -1196,7 +1196,7 @@ impl ProjectService {
         // no proof whose action already has one is a different request under the same identifier,
         // and the journal says so.
         if let Some(answered) =
-            self.answer_from_record::<ProjectLocationAuthoriseResult>(Some(action))?
+            self.answer_from_record::<ProjectLocationAuthoriseResult>(&performed)?
         {
             return Ok(answered);
         }
@@ -1395,7 +1395,7 @@ impl ProjectService {
     ) -> Result<ProjectLocationWithdrawResult> {
         let performed = performed.into();
         if let Some(answered) =
-            self.answer_from_record::<ProjectLocationWithdrawResult>(performed.action())?
+            self.answer_from_record::<ProjectLocationWithdrawResult>(&performed)?
         {
             return Ok(answered);
         }
@@ -1432,6 +1432,8 @@ impl ProjectService {
         };
         if let Some(action) = performed.action() {
             settle_answer(&transaction, action, row.location_id.get(), &answer, false)?;
+            // The claim was written here, in the transaction that settles it.
+            performed.note_claimed();
         }
         transaction.commit().map_err(ProjectError::store)?;
         held.remove(&row.location_id);
@@ -1458,7 +1460,7 @@ impl ProjectService {
         let key = challenge_key(actor, action);
         let _transition = self.transitions.enter(key.clone())?;
         if let Some(answered) =
-            self.answer_from_record::<ProjectLocationAttachResult>(Some(action))?
+            self.answer_from_record::<ProjectLocationAttachResult>(&performed)?
         {
             return Ok(answered);
         }

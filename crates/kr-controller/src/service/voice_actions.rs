@@ -10,6 +10,7 @@ use kr_protocol::session::{SessionReadParams, SessionReadResult};
 use kr_protocol::voice::{VoiceDelegateResult, VoiceDelegationOutcome};
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 
 use super::authority_changes::decoded;
 use super::{Controller, parse};
@@ -337,6 +338,8 @@ impl Controller {
     /// It is asked again through the check every service asks from inside its work, before
     /// anything is claimed and wherever the coordinator and the grant store write.
     ///
+    /// An answer this reads from what an earlier attempt claimed is given as a copy.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the caller is given.
@@ -347,6 +350,30 @@ impl Controller {
         method: Method,
         authority_revision: AuthorityRevision,
         carried: crate::authority::AdmittedMutation,
+    ) -> Given<Result<ParamsValue>> {
+        let mut copied = false;
+        let answer = self
+            .voice_change(
+                from,
+                mutation,
+                method,
+                authority_revision,
+                carried,
+                &mut copied,
+            )
+            .await;
+        Given::of(answer, copied)
+    }
+
+    /// [`Self::voice_mutation`], setting `copied` when the answer is the record's.
+    async fn voice_change(
+        self: &Arc<Self>,
+        from: VoiceIngress,
+        mutation: &MutationRequest,
+        method: Method,
+        authority_revision: AuthorityRevision,
+        carried: crate::authority::AdmittedMutation,
+        copied: &mut bool,
     ) -> Result<ParamsValue> {
         let VoiceIngress {
             actor_id,
@@ -368,6 +395,7 @@ impl Controller {
         // What it finds goes back under the registration the repeat arrived under, a refusal it
         // kept as much as a result.
         if let Some(found) = self.voice_answered(&actor_id, mutation).await.transpose() {
+            *copied = true;
             return self
                 .retained_under_authority(&carried, async { found })
                 .await;
@@ -384,6 +412,7 @@ impl Controller {
         let hold = match self.claim_voice_action(&actor_id, mutation)? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
+                *copied = true;
                 return self
                     .retained_under_authority(
                         &carried,

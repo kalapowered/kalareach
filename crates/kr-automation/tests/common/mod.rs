@@ -137,6 +137,7 @@ impl Submit for kr_automation::AutomationService {
         self.install(
             params,
             &kr_automation::Submitted {
+                answered: None,
                 key: &key,
                 admission: &admitted,
                 caller_grant: None,
@@ -154,6 +155,7 @@ impl Submit for kr_automation::AutomationService {
         self.enable(
             params,
             &kr_automation::Submitted {
+                answered: None,
                 key: &key,
                 admission: &admitted,
                 caller_grant: None,
@@ -171,6 +173,7 @@ impl Submit for kr_automation::AutomationService {
         self.pause(
             params,
             &kr_automation::Submitted {
+                answered: None,
                 key: &key,
                 admission: &admitted,
                 caller_grant: None,
@@ -188,6 +191,7 @@ impl Submit for kr_automation::AutomationService {
         self.run(
             params,
             &kr_automation::Submitted {
+                answered: None,
                 key: &key,
                 admission: &admitted,
                 caller_grant: None,
@@ -212,6 +216,7 @@ impl Submit for kr_automation::AutomationService {
                 generation: kr_protocol::scalars::U64::new(leaves),
             },
             &kr_automation::Submitted {
+                answered: None,
                 key: &key,
                 admission: &admitted,
                 caller_grant: None,

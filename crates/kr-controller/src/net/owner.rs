@@ -24,6 +24,7 @@
 //! terminal printed; and a newly issued invitation, whose code or QR confirms nothing.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use kr_pairing::confirm::{
@@ -618,12 +619,15 @@ impl OwnerAuthority {
     /// Returns `PERMISSION_DENIED` for a caller without owner authority, `ID_CONFLICT` for a
     /// reused action, the admission's refusal, and an error when the random generator or the
     /// records are unavailable.
+    ///
+    /// `copied` is set when the answer is the one an earlier submission of the action recorded.
     pub fn request(
         &self,
         caller: &Caller,
         resolved: Resolved,
         action: (ActionId, Digest256),
         admission: &dyn Fn() -> Result<()>,
+        copied: &AtomicBool,
     ) -> Result<OwnerConfirmationRequestResult> {
         self.require_owner(caller)?;
         // Whether the terminal can confirm this one: before the host has an owner, or when it asks
@@ -642,6 +646,7 @@ impl OwnerAuthority {
         // Asked under the lock every challenge is issued under, so two copies of one request meet
         // here and the second is given the challenge the first recorded.
         if let Some(requested) = self.requested(caller, action) {
+            copied.store(true, Ordering::Release);
             return requested;
         }
         self.sweep(&mut state);
@@ -667,6 +672,7 @@ impl OwnerAuthority {
             admission,
         )?;
         if let Some(request) = recorded {
+            copied.store(true, Ordering::Release);
             return Ok(OwnerConfirmationRequestResult {
                 request,
                 initial_bootstrap,
@@ -1050,12 +1056,15 @@ impl OwnerAuthority {
     /// arrived through a channel that is never a confirmation, or comes from a signer this host
     /// does not accept for that channel, `PAIRING_AUTH_FAILED` when its signature fails, and
     /// `ID_CONFLICT` for a reused action.
+    ///
+    /// `copied` is set when the answer is the one an earlier submission of the action recorded.
     pub fn complete(
         &self,
         caller: &Caller,
         params: &OwnerConfirmationCompleteParams,
         action: (ActionId, Digest256),
         admission: &dyn Fn() -> Result<()>,
+        copied: &AtomicBool,
     ) -> Result<OwnerConfirmationCompleteResult> {
         let proof = &params.proof;
         // Section 10: noninteractive confirmation from a session, plugin or contact-tool channel is
@@ -1075,6 +1084,7 @@ impl OwnerAuthority {
         // Asked under the lock every answer is recorded under, so two copies of one completion meet
         // here and the second is given what the first recorded.
         if let Some(completed) = self.completed(caller, action) {
+            copied.store(true, Ordering::Release);
             return completed;
         }
         self.sweep(&mut state);
@@ -1231,6 +1241,7 @@ impl OwnerAuthority {
         caller: &Caller,
         action: (ActionId, Digest256),
         admission: &dyn Fn() -> Result<()>,
+        copied: &AtomicBool,
     ) -> Result<OwnerConfirmationRequestResult> {
         self.request(
             caller,
@@ -1244,6 +1255,7 @@ impl OwnerAuthority {
             },
             action,
             admission,
+            copied,
         )
     }
 
@@ -1291,12 +1303,15 @@ impl OwnerAuthority {
     /// Returns `PERMISSION_DENIED` for a caller without owner authority,
     /// `OWNER_CONFIRMATION_REQUIRED` when no answered confirmation of the clock stands,
     /// `ID_CONFLICT` for a reused action, and whatever the admission or the records refuse with.
+    ///
+    /// `copied` is set when the answer is the one an earlier submission of the action recorded.
     pub fn establish_clock(
         &self,
         caller: &Caller,
         action: (ActionId, Digest256),
         boot: BootEpoch,
         guarded: &CommitFn,
+        copied: &AtomicBool,
     ) -> Result<HostClockEstablishResult> {
         self.require_owner(caller)?;
         let rights = CanonicalSet::new();
@@ -1312,6 +1327,7 @@ impl OwnerAuthority {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut state = self.state();
         if let Some(answered) = self.established(caller, action) {
+            copied.store(true, Ordering::Release);
             return answered;
         }
         let spendable = self.select(&mut state, &expectation, &|display| {

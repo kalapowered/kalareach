@@ -6000,6 +6000,7 @@ async fn a_repeated_key_update_is_answered_with_the_result_it_first_had() {
                 admission.carried,
             )
             .await
+            .into_answer()
             .expect("revision 2 is recorded"),
     );
     assert_eq!(first_answer.revision, DeviceKeyRevision::new(2));
@@ -6010,17 +6011,24 @@ async fn a_repeated_key_update_is_answered_with_the_result_it_first_had() {
             admission.carried,
         )
         .await
+        .into_answer()
         .expect("revision 3 is recorded");
 
     // The answer to the revision-2 action was lost, and the device asks again with it.
+    let repeat = controller
+        .preview_key_update_action(
+            &actor_id,
+            &key_update(&controller, 99, device_id, *second.public(), 2),
+            admission.carried,
+        )
+        .await;
+    assert!(
+        repeat.is_copied(),
+        "the service gives a repeat's answer as the copy of its record that it is"
+    );
     let repeated = result(
-        controller
-            .preview_key_update_action(
-                &actor_id,
-                &key_update(&controller, 99, device_id, *second.public(), 2),
-                admission.carried,
-            )
-            .await
+        repeat
+            .into_answer()
             .expect("a repeat is answered from its retained result, not refused as stale"),
     );
     assert_eq!(repeated, first_answer);
@@ -6032,6 +6040,7 @@ async fn a_repeated_key_update_is_answered_with_the_result_it_first_had() {
                 admission.carried,
             )
             .await
+            .into_answer()
             .is_err(),
         "a new action with the old revision is refused"
     );

@@ -14,6 +14,7 @@
 //! database can each outlast either.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_pairing::confirm::HostEnrolment;
 use kr_protocol::actor::ActorIngress;
@@ -36,6 +37,7 @@ use super::pairing::PairingHost;
 use super::rendezvous::Life;
 use crate::authority::AdmittedMutation;
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 use crate::service::Controller;
 
 /// Returns true for the methods this module serves.
@@ -243,8 +245,29 @@ impl Controller {
         admission: Admission,
         guard: CommitGuard,
         life: Life,
+    ) -> Given<Result<ParamsValue>> {
+        let copied = Arc::new(AtomicBool::new(false));
+        let answer = self
+            .write_pairing(caller, method, mutation, admission, guard, life, &copied)
+            .await;
+        Given::of(answer, copied.load(Ordering::Acquire))
+    }
+
+    /// [`Self::pairing_write`], setting `copied` when the answer is the one an earlier submission
+    /// of the action recorded.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_pairing(
+        self: &Arc<Self>,
+        caller: Caller,
+        method: Method,
+        mutation: &MutationRequest,
+        admission: Admission,
+        guard: CommitGuard,
+        life: Life,
+        copied: &Arc<AtomicBool>,
     ) -> Result<ParamsValue> {
         let action = (mutation.action_id, mutation_digest(mutation, &caller)?);
+        let copied = Arc::clone(copied);
         match method {
             // The effect that spends an owner's confirmation of the clock, and the confirmation
             // of it, are the daemon's own: a host off the network has no pairing service and
@@ -254,12 +277,18 @@ impl Controller {
                 let _: HostClockEstablishParams = decode(&mutation.params)?;
                 let owner = Arc::clone(&self.owner);
                 let boot = self.boot_epoch;
-                blocking(move || owner.establish_clock(&caller, action, boot, guard.as_ref())).await
+                blocking(move || {
+                    owner.establish_clock(&caller, action, boot, guard.as_ref(), &copied)
+                })
+                .await
             }
             Method::OwnerConfirmationComplete => {
                 let params: OwnerConfirmationCompleteParams = decode(&mutation.params)?;
                 let owner = Arc::clone(&self.owner);
-                blocking(move || owner.complete(&caller, &params, action, admission.as_ref())).await
+                blocking(move || {
+                    owner.complete(&caller, &params, action, admission.as_ref(), &copied)
+                })
+                .await
             }
             Method::OwnerConfirmationRequest => {
                 let params: OwnerConfirmationRequestParams = decode(&mutation.params)?;
@@ -289,7 +318,7 @@ impl Controller {
                                     .to_owned(),
                             ));
                         }
-                        owner.request_clock(&caller, action, admission.as_ref())
+                        owner.request_clock(&caller, action, admission.as_ref(), &copied)
                     })
                     .await;
                 }
@@ -306,10 +335,11 @@ impl Controller {
                         // its terminal, and that works off the network, as the clock's does.
                         owner.require_owner(&caller)?;
                         if let Some(requested) = owner.requested(&caller, action) {
+                            copied.store(true, Ordering::Release);
                             return requested;
                         }
                         let resolved = controller.organisation_exclusive_resolved(exclusive)?;
-                        owner.request(&caller, resolved, action, admission.as_ref())
+                        owner.request(&caller, resolved, action, admission.as_ref(), &copied)
                     })
                     .await;
                 }
@@ -338,7 +368,13 @@ impl Controller {
                         bootstrap: false,
                     };
                     return blocking(move || {
-                        pairing.request_resolved(&caller, resolved, action, admission.as_ref())
+                        pairing.request_resolved(
+                            &caller,
+                            resolved,
+                            action,
+                            admission.as_ref(),
+                            &copied,
+                        )
                     })
                     .await;
                 }
@@ -353,7 +389,13 @@ impl Controller {
                     return blocking(move || {
                         pairing.require_owner(&caller)?;
                         controller.check_organisation_proposal(&proposed_grant)?;
-                        pairing.request_confirmation(&caller, &params, action, admission.as_ref())
+                        pairing.request_confirmation(
+                            &caller,
+                            &params,
+                            action,
+                            admission.as_ref(),
+                            &copied,
+                        )
                     })
                     .await;
                 }
@@ -365,7 +407,13 @@ impl Controller {
                     return blocking(move || {
                         pairing.require_owner(&caller)?;
                         let resolved = controller.organisation_enrol_resolved(&enrol)?;
-                        pairing.request_resolved(&caller, resolved, action, admission.as_ref())
+                        pairing.request_resolved(
+                            &caller,
+                            resolved,
+                            action,
+                            admission.as_ref(),
+                            &copied,
+                        )
                     })
                     .await;
                 }
@@ -397,12 +445,24 @@ impl Controller {
                             detail: error.message,
                         })?;
                     return blocking(move || {
-                        pairing.request_resolved(&caller, resolved, action, admission.as_ref())
+                        pairing.request_resolved(
+                            &caller,
+                            resolved,
+                            action,
+                            admission.as_ref(),
+                            &copied,
+                        )
                     })
                     .await;
                 }
                 blocking(move || {
-                    pairing.request_confirmation(&caller, &params, action, admission.as_ref())
+                    pairing.request_confirmation(
+                        &caller,
+                        &params,
+                        action,
+                        admission.as_ref(),
+                        &copied,
+                    )
                 })
                 .await
             }

@@ -2246,6 +2246,7 @@ async fn a_project_mutation_does_not_act_while_a_fence_is_owed() {
             None,
         )
         .await
+        .into_answer()
         .expect_err("the project service's own check refuses it");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert!(

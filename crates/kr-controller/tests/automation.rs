@@ -2064,6 +2064,7 @@ async fn trigger_left_pending(state_dir: &Path, environment_id: EnvironmentId) -
         digest: kr_ipc::new_uuid().as_bytes().to_vec(),
     };
     let submitted = |key| kr_automation::Submitted {
+        answered: None,
         key,
         admission: &standing,
         caller_grant: None,

@@ -92,6 +92,7 @@ use kr_worker::history_filter::{HistoryFilter, Surface, ViewerScope};
 
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 
 mod change_sets;
 
@@ -2250,6 +2251,9 @@ impl AttentionModule {
     /// and again inside the store's transaction before its first write, so a deadline that passes
     /// while the write waits for the store refuses the action rather than letting it write.
     ///
+    /// An answer the store reads from the record of an earlier submission of the action is given
+    /// as a copy.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the store or the admission decided.
@@ -2261,6 +2265,33 @@ impl AttentionModule {
         mutation: &MutationRequest,
         method: Method,
         carried: &crate::authority::AdmittedMutation,
+    ) -> Given<Answer<ParamsValue>> {
+        let mut copied = false;
+        let answer = self
+            .perform(
+                controller,
+                caller,
+                actor,
+                mutation,
+                method,
+                carried,
+                &mut copied,
+            )
+            .await;
+        Given::of(answer, copied)
+    }
+
+    /// [`Self::write`], setting `copied` when the answer is the record's.
+    #[allow(clippy::too_many_arguments)]
+    async fn perform(
+        &self,
+        controller: &crate::service::Controller,
+        caller: &Caller,
+        actor: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        carried: &crate::authority::AdmittedMutation,
+        copied: &mut bool,
     ) -> Answer<ParamsValue> {
         self.check_mutation(caller, actor, mutation, method)?;
         let key = action_key(actor, mutation, method)?;
@@ -2387,7 +2418,10 @@ impl AttentionModule {
         self.wake.notify_one();
         let answer = match performed {
             Performed::Done(answer) => result_of(&answer, reading),
-            Performed::Retained(record) => decode_answer(&record.answer),
+            Performed::Retained(record) => {
+                *copied = true;
+                decode_answer(&record.answer)
+            }
         }?;
         if method == Method::VisitAcknowledge {
             return self.shown_visit(caller, actor, mutation, answer);
@@ -2461,12 +2495,10 @@ impl AttentionModule {
         mutation: &MutationRequest,
         method: Method,
         carried: &crate::authority::AdmittedMutation,
-    ) -> ControlFrame {
-        frame(
-            mutation.request_id,
-            self.write(controller, caller, actor, mutation, method, carried)
-                .await,
-        )
+    ) -> Given<ControlFrame> {
+        self.write(controller, caller, actor, mutation, method, carried)
+            .await
+            .map(|answer| frame(mutation.request_id, answer))
     }
 
     // ----- Links ---------------------------------------------------------------------------
@@ -8838,6 +8870,7 @@ pub(crate) mod tests {
         journal
             .act(
                 &kr_automation::Submitted {
+                    answered: None,
                     key: &key,
                     admission: &admit,
                     caller_grant: None,

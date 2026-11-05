@@ -62,6 +62,7 @@ use kr_protocol::receipt::ReceiptState;
 use kr_protocol::scalars::{Digest256, Nullable, U64};
 use tokio::sync::Mutex;
 
+use crate::given::Given;
 use crate::sharing::{ConfirmedAction, OwnerConfirmations};
 
 /// What a catalogue call answers with: the method's result, or the refusal the service decided.
@@ -1433,7 +1434,8 @@ impl CatalogueModule {
                 admission,
                 removal,
             )
-            .await,
+            .await
+            .into_answer(),
         )
     }
 
@@ -1469,6 +1471,8 @@ impl CatalogueModule {
     /// package and the admission revision their reports were at; the removal answers with that
     /// count only when it commits right after that revision.
     ///
+    /// An answer read from the record of an earlier submission of the action is given as a copy.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the catalogue decided, under the catalogue's own code.
@@ -1480,18 +1484,22 @@ impl CatalogueModule {
         confirmations: Option<&dyn OwnerConfirmations>,
         admission: Arc<dyn Admission>,
         removal: Option<(u64, u64)>,
-    ) -> Answer<ParamsValue> {
+    ) -> Given<Answer<ParamsValue>> {
         let mut catalogue = self.catalogue.lock().await;
-        self.off_the_executor_async(self.write_locked(
-            &mut catalogue,
-            actor_id,
-            mutation,
-            method,
-            confirmations,
-            admission,
-            removal,
-        ))
-        .await
+        let mut copied = false;
+        let answer = self
+            .off_the_executor_async(self.write_locked(
+                &mut catalogue,
+                actor_id,
+                mutation,
+                method,
+                confirmations,
+                admission,
+                removal,
+                &mut copied,
+            ))
+            .await;
+        Given::of(answer, copied)
     }
 
     /// Serves one catalogue or plugin mutation under the catalogue's lock: the claim, the change,
@@ -1508,6 +1516,7 @@ impl CatalogueModule {
         confirmations: Option<&dyn OwnerConfirmations>,
         admission: Arc<dyn Admission>,
         removal: Option<(u64, u64)>,
+        copied: &mut bool,
     ) -> Answer<ParamsValue> {
         #[cfg(feature = "testing")]
         let admission: Arc<dyn Admission> = match self.testing_hook() {
@@ -1534,7 +1543,10 @@ impl CatalogueModule {
             .claim(&claim, kr_ipc::now_ms().get())
             .map_err(ProtocolError::from)?
         {
-            Claimed::Retained(record) => return answered(&record, &digest, mutation.action_id),
+            Claimed::Retained(record) => {
+                *copied = true;
+                return answered(&record, &digest, mutation.action_id);
+            }
             Claimed::Fresh => {}
         }
         // Every change the action makes commits through this recording, so what it left behind

@@ -19,6 +19,7 @@
 //! then spends.
 
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -380,10 +381,12 @@ impl PairingHost {
         params: &OwnerConfirmationRequestParams,
         action: (ActionId, Digest256),
         admission: &dyn Fn() -> Result<()>,
+        copied: &AtomicBool,
     ) -> Result<OwnerConfirmationRequestResult> {
         // A retry is answered before anything about the subject is resolved again: the invitation
         // it named may be gone, and the answer it was owed is the challenge it was given.
         if let Some(requested) = self.owner.requested(caller, action) {
+            copied.store(true, std::sync::atomic::Ordering::Release);
             return requested;
         }
         let resolved = match &params.subject {
@@ -442,7 +445,7 @@ impl PairingHost {
                 }
             }
             ConfirmationSubject::EstablishClock => {
-                return self.owner.request_clock(caller, action, admission);
+                return self.owner.request_clock(caller, action, admission, copied);
             }
             ConfirmationSubject::TransferControl(_) => {
                 // A transfer is described from the grant and the two devices this daemon holds,
@@ -499,7 +502,8 @@ impl PairingHost {
                 }
             }
         };
-        self.owner.request(caller, resolved, action, admission)
+        self.owner
+            .request(caller, resolved, action, admission, copied)
     }
 
     /// Refuses a caller that is not this host's owner before the catalogue resolves a subject for
@@ -525,11 +529,14 @@ impl PairingHost {
         resolved: Resolved,
         action: (ActionId, Digest256),
         admission: &dyn Fn() -> Result<()>,
+        copied: &AtomicBool,
     ) -> Result<OwnerConfirmationRequestResult> {
         if let Some(requested) = self.owner.requested(caller, action) {
+            copied.store(true, std::sync::atomic::Ordering::Release);
             return requested;
         }
-        self.owner.request(caller, resolved, action, admission)
+        self.owner
+            .request(caller, resolved, action, admission, copied)
     }
 
     /// `pair.invite`: issues one invitation under a fresh owner confirmation naming its grant.

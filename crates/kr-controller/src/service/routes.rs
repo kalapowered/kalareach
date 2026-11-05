@@ -12,6 +12,7 @@ use kr_protocol::scalars::Nullable;
 use kr_transport::window::AcceptedDeadline;
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 
 use super::{Controller, encode, error_reply, net, parse, respond};
 
@@ -70,23 +71,24 @@ impl Controller {
         method: Method,
         carried: crate::authority::AdmittedMutation,
         grant: Option<GrantId>,
-    ) -> std::result::Result<ParamsValue, ProtocolError> {
+    ) -> Given<std::result::Result<ParamsValue, ProtocolError>> {
         // A mutation carrying no freshness at all is a retry of an action this host may already
         // hold: section 9 keeps its record readable after the window that admitted it is gone, and
         // the project service's own retained record is where such a retry is answered from above.
         // What it may not do is perform the action again.
         if carried.deadline.is_none() {
-            return Err(ControllerError::WindowExpired {
+            return Given::Fresh(Err(ControllerError::WindowExpired {
                 detail: "this action carries no freshness, so it may be answered from what this \
                          host holds and may not be performed"
                     .to_owned(),
             }
-            .to_protocol_error());
+            .to_protocol_error()));
         }
         {
             let registry = self.registry.lock().await;
-            self.check_admission(&registry, &carried)
-                .map_err(|error| error.to_protocol_error())?;
+            if let Err(error) = self.check_admission(&registry, &carried) {
+                return Given::Fresh(Err(error.to_protocol_error()));
+            }
         }
         // And again inside the service's own work. Between the answer above and the effect there
         // is a blocking task to be scheduled and a retained record to be looked for, and a clone
@@ -130,22 +132,23 @@ impl Controller {
         method: Method,
         carried: crate::authority::AdmittedMutation,
         caller_grant: Option<kr_protocol::ids::GrantId>,
-    ) -> std::result::Result<ParamsValue, ProtocolError> {
+    ) -> Given<std::result::Result<ParamsValue, ProtocolError>> {
         // A mutation carrying no freshness at all is a retry of an action this host may already
         // hold, and the journal's record is where such a retry is answered from. What it may not
         // do is perform the action.
         if carried.deadline.is_none() {
-            return Err(ControllerError::WindowExpired {
+            return Given::Fresh(Err(ControllerError::WindowExpired {
                 detail: "this action carries no freshness, so it may be answered from what this \
                          host holds and may not be performed"
                     .to_owned(),
             }
-            .to_protocol_error());
+            .to_protocol_error()));
         }
         {
             let registry = self.registry.lock().await;
-            self.check_admission(&registry, &carried)
-                .map_err(|error| error.to_protocol_error())?;
+            if let Err(error) = self.check_admission(&registry, &carried) {
+                return Given::Fresh(Err(error.to_protocol_error()));
+            }
         }
         let admission: crate::automation::Admission = Arc::new(self.admission_in_service(carried));
         #[cfg(feature = "testing")]
@@ -375,7 +378,8 @@ impl Controller {
             let life = self.pairing_life(accepted.map(|accepted| accepted.deadline));
             let outcome = self
                 .pairing_write(caller, method, mutation, admission, guard, life)
-                .await;
+                .await
+                .into_answer();
             return respond(mutation.request_id, outcome);
         }
         if crate::transfer::TransferModule::serves(method) {
@@ -499,7 +503,8 @@ impl Controller {
                     authority_revision,
                     carried,
                 )
-                .await,
+                .await
+                .into_answer(),
             );
         }
         if crate::catalogue::CatalogueModule::serves(method) {
@@ -533,7 +538,8 @@ impl Controller {
             return crate::catalogue::frame(
                 mutation.request_id,
                 self.catalogue_write(actor_id, mutation, method, confirmations, admission)
-                    .await,
+                    .await
+                    .into_answer(),
             );
         }
         if crate::project::ProjectModule::serves(method) {
@@ -554,7 +560,8 @@ impl Controller {
                 mutation.request_id,
                 // The machine's own socket: the caller holds no grant.
                 self.project_mutation(actor_id, mutation, method, carried, None)
-                    .await,
+                    .await
+                    .into_answer(),
             );
         }
         if crate::automation::AutomationModule::serves(method) {
@@ -574,7 +581,8 @@ impl Controller {
             let answered = crate::automation::frame(
                 mutation.request_id,
                 self.automation_mutation(actor_id, mutation, method, carried, None)
-                    .await,
+                    .await
+                    .into_answer(),
             );
             // A run dispatches its nodes and waits for each of them, so the effect and its reply
             // are separated by however long that took, and a revocation can land in the interval.
@@ -626,7 +634,8 @@ impl Controller {
                     method,
                     &carried,
                 )
-                .await;
+                .await
+                .into_answer();
             if let Err(error) = self.authorised(connection_id) {
                 return error_reply(
                     mutation.request_id,
@@ -682,7 +691,8 @@ impl Controller {
             let answered = self
                 .changesets
                 .write_frame(actor_id, mutation, method, carried, controller, None)
-                .await;
+                .await
+                .into_answer();
             // The effect and its reply are separated by everything a blocking task waits for, and
             // a revocation can land in that interval. What this host must not do is **disclose**
             // an answer under authority that has since been withdrawn, so the check is made again
@@ -774,8 +784,8 @@ impl Controller {
             | Method::DeliveryDestinationSecretSet
             | Method::OrganisationEnrol
             | Method::OrganisationExclusiveSet
-            | Method::OrganisationWithdraw => {
-                self.authority_change(
+            | Method::OrganisationWithdraw => self
+                .authority_change(
                     actor_id,
                     super::authority_changes::AuthorityCaller::Owner,
                     mutation,
@@ -783,7 +793,7 @@ impl Controller {
                     carried,
                 )
                 .await
-            }
+                .into_answer(),
             // The policy an organisation signed, applied under the registry's guard and kept in the
             // store of applied policies: no action is claimed and no answer is kept, since the same
             // policy again is accepted and puts its list in force again.
@@ -909,8 +919,8 @@ impl Controller {
             // and a step checked against a revision read afterwards would be checked against the
             // authority that replaced the one it was admitted under.
             Method::MachineJoin | Method::MachineMerge | Method::MachineSplit => match admitted {
-                Some(admitted_revision) => {
-                    self.machine_step(
+                Some(admitted_revision) => self
+                    .machine_step(
                         actor_id,
                         mutation,
                         method,
@@ -920,7 +930,7 @@ impl Controller {
                         },
                     )
                     .await
-                }
+                    .into_answer(),
                 None => Err(ControllerError::PermissionDenied {
                     detail: "the authority this connection was admitted under has been \
                              withdrawn; open a new connection"
