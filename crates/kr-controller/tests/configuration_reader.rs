@@ -16,7 +16,7 @@ use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, NoTerminal, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::verify::ControllerIdentity;
-use kr_protocol::hostinfo::configuration::DocumentState;
+use kr_protocol::hostinfo::configuration::{self, DocumentState};
 use kr_protocol::ids::BuildId;
 use rusqlite::Connection;
 use serde_json::Value;
@@ -136,8 +136,10 @@ fn recorded(temp: &kr_ipc::testing::TempHost) -> (i64, Option<String>, i64) {
 /// KR-REQ-26.13, KR-REQ-26.10: a daemon starts over a registry one schema version ahead of the one
 /// it writes and over a copy of the document it accepted at the next version of the document, when
 /// the copy holds nothing this build lacks. It reads both as found: the registry still records the
-/// version it recorded, the copy is the copy it was, and the daemon, which finds the document on
-/// disk to be the document it accepted, accepts nothing again.
+/// version it recorded, the copy is the copy it was, and the start, which finds the document on
+/// disk to be the document it accepted, accepts nothing again. The first question about what is in
+/// force puts the document through acceptance, which records it at the version this build writes,
+/// in a registry that still records the version it had.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_starts_over_the_next_registry_version_and_the_document_it_accepted() {
     let temp = a_stopped_environment().await;
@@ -166,21 +168,37 @@ async fn a_daemon_starts_over_the_next_registry_version_and_the_document_it_acce
         "the version and the accepted copy are as they were found"
     );
     assert!(after.2 > before.2, "and the start advanced the generation");
-    let writes: i64 = Connection::open(temp.environment().registry_database())
-        .expect("opens")
-        .query_row("SELECT COUNT(*) FROM acceptance_writes", [], |row| {
-            row.get(0)
-        })
-        .expect("the count");
-    assert_eq!(writes, 0, "the start accepted a document it had accepted");
+    let acceptance_writes = || -> i64 {
+        Connection::open(temp.environment().registry_database())
+            .expect("opens")
+            .query_row("SELECT COUNT(*) FROM acceptance_writes", [], |row| {
+                row.get(0)
+            })
+            .expect("the count")
+    };
+    assert_eq!(
+        acceptance_writes(),
+        0,
+        "the start accepted a document it had accepted"
+    );
 
     let effective = controller.effective_configuration().await;
     assert_eq!(effective.status.state, DocumentState::Loaded);
     drop(controller);
+    let as_this_build_reads_it = configuration::load(Some(golden.as_bytes()))
+        .document
+        .expect("this build reads the document");
+    assert_eq!(as_this_build_reads_it.version, configuration::VERSION);
+    let accepted = recorded(&temp);
     assert_eq!(
-        recorded(&temp).0,
-        16,
-        "and no acceptance writes the registry's version"
+        accepted.0, 16,
+        "no acceptance writes the registry's version"
+    );
+    assert_eq!(acceptance_writes(), 1, "the question accepted the document");
+    assert_eq!(
+        accepted.1.as_deref(),
+        Some(configuration::contents(&as_this_build_reads_it).as_str()),
+        "and recorded it as this build reads it, at the version this build writes"
     );
     assert_eq!(
         std::fs::read_to_string(document_path(&temp)).expect("the document"),
