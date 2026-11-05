@@ -927,6 +927,82 @@ async fn a_refused_size_is_not_sent_again_and_a_newer_one_goes_after_it() {
     );
 }
 
+/// A size the session refuses for now, or cannot say it took, is not settled by that word and is
+/// not marked sent: it goes again with the session's next word, and an answer settles it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_size_the_session_did_not_take_for_now_goes_again_with_its_next_word() {
+    for code in [ErrorCode::ResourceUnavailable, ErrorCode::OutcomeUnknown] {
+        let mut worker = ScriptedWorker::start(Challenge::Answered);
+        let page_view = Page::new(worker.paths());
+        let (view, mut link) = showing(&page_view, &mut worker, 3).await;
+        page_view.resize(&view, 12, 3);
+        let first = link.expect(Method::AttachmentViewport).await;
+        link.refuse_with(&first, code, "the session cannot take that now")
+            .await;
+        assert!(
+            link.quiet_for(QUIET).await,
+            "{code:?}: nothing goes again before something arrives"
+        );
+        screen(&mut link, 2, 60, vec![row(0, "first"), row(1, "second")], 0).await;
+        let again = link.expect(Method::AttachmentViewport).await;
+        let asked: AttachmentViewportParams = again.params();
+        assert_eq!(
+            asked.dimensions,
+            Dimensions::new(12, 3),
+            "{code:?}: the size that was refused"
+        );
+        link.answer(&again, &viewport_answer(1)).await;
+        assert!(
+            link.quiet_for(QUIET).await,
+            "{code:?}: an answer settles it, and nothing is owed"
+        );
+    }
+}
+
+/// A session that keeps refusing a size for now is not asked once for every word it says: the size
+/// goes again with its next word three times, and after that waits for the page to measure again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_size_the_session_keeps_refusing_for_now_waits_for_the_page_after_three_tries() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let (view, mut link) = showing(&page_view, &mut worker, 3).await;
+    page_view.resize(&view, 12, 3);
+    let mut call = link.expect(Method::AttachmentViewport).await;
+    for round in 1..=3_u64 {
+        link.refuse_with(&call, ErrorCode::ResourceUnavailable, "not now")
+            .await;
+        screen(
+            &mut link,
+            1 + round,
+            40 + 20 * round,
+            vec![row(0, "first"), row(1, "second")],
+            0,
+        )
+        .await;
+        call = link.expect(Method::AttachmentViewport).await;
+    }
+    link.refuse_with(&call, ErrorCode::ResourceUnavailable, "not now")
+        .await;
+    screen(
+        &mut link,
+        5,
+        120,
+        vec![row(0, "first"), row(1, "second")],
+        0,
+    )
+    .await;
+    assert!(
+        link.quiet_for(QUIET).await,
+        "after three tries it waits for the page, whatever the session says"
+    );
+    page_view.resize(&view, 12, 3);
+    let after = link.expect(Method::AttachmentViewport).await;
+    let asked: AttachmentViewportParams = after.params();
+    assert_eq!(asked.dimensions, Dimensions::new(12, 3));
+    link.answer(&after, &viewport_answer(1)).await;
+    assert!(link.quiet_for(QUIET).await);
+}
+
 /// A size measured before the subscription answers waits for it, and is compared with the size the
 /// view attached at.
 #[tokio::test(flavor = "multi_thread")]
@@ -2014,6 +2090,29 @@ async fn a_refused_move_while_a_newer_size_waits() {
     let (_, asked) = report(&mut link).await;
     assert_eq!(asked.dimensions, Dimensions::new(12, 2));
     assert_eq!(asked.column.get(), 1, "where the window still is");
+}
+
+/// A move is the person's gesture, not an owed report: one the session refuses for now is settled
+/// as not taken, as a refusal is, and is not made later; the person moves again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_the_session_refuses_for_now_is_settled_and_not_made_later() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page_view = Page::new(worker.paths());
+    let at = wide_session();
+    let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+    page_view.pan(&view, 1, 2, 0);
+    let (call, _) = report(&mut link).await;
+    link.refuse_with(&call, ErrorCode::ResourceUnavailable, "not now")
+        .await;
+    let back = page_view.newest(3, |state| settled(state, 1)).await;
+    assert_eq!(place(&back), (0, 0, 0), "nothing moved");
+    let mut repaint = at;
+    repaint.generation = 2;
+    frame(&mut link, &repaint).await;
+    assert!(
+        link.quiet_for(QUIET).await,
+        "the move is not made later, whatever the session says"
+    );
 }
 
 /// While the view takes a new screen it holds no record of where the window is, so a move waits
