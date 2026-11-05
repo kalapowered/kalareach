@@ -2222,13 +2222,16 @@ async fn a_send_the_host_refused_because_an_earlier_one_landed_is_not_called_uns
     assert_eq!(document["code"], "QUESTION_RESOLVED", "{document}");
     let message = document["message"].as_str().expect("a message");
     assert!(
-        message.contains(&format!(
-            "took an earlier send of this answer (action {earlier})"
-        )),
+        message.contains(&format!("took a send of this answer (action {earlier})")),
         "{message}"
     );
     assert!(message.contains("this command's own send"), "{message}");
     assert!(!message.contains("sent nothing"), "{message}");
+    // It says what is known, the send the host took and the send it refused, and claims neither
+    // that a reply was lost nor which of the two went out first.
+    for claim in ["reply was lost", "earlier", "after it"] {
+        assert!(!message.contains(claim), "{claim}: {message}");
+    }
     assert_eq!(
         host.arrivals().len(),
         2,

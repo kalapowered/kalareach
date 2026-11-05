@@ -302,10 +302,18 @@ describe('what a refusal or an earlier send means for the person (KR-REQ-11.63)'
     const taken = 'c2000000-0000-4000-8000-000000000001'
     expect(landedWords(taken, null)).toContain(taken)
     expect(landedWords(taken, null)).toContain('Nothing was sent')
-    const refused = landedWords(taken, 'c2000000-0000-4000-8000-000000000002')
+    expect(landedWords(taken, null)).not.toContain('reply was lost')
+    expect(landedWords(taken, null)).not.toContain('earlier')
+    const own = 'c2000000-0000-4000-8000-000000000002'
+    const refused = landedWords(taken, own)
     expect(refused).toContain(taken)
+    expect(refused).toContain(own)
     expect(refused).toContain('refused')
     expect(refused).not.toContain('Nothing was sent')
+    // It names the send the host took and the one it refused, and claims neither that a reply was
+    // lost nor which of the two went out first.
+    expect(refused).not.toContain('reply was lost')
+    expect(refused).not.toContain('earlier')
   })
 
   it('gives the code of an earlier send the host refused, when it gave one', () => {
@@ -596,7 +604,7 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
     const taken = controls.questions.leaveTaken(QUESTION_SELECT)
     await person.click(within(question).getByRole('button', { name: 'Send answer' }))
     const notice = new RegExp(
-      `while its reply was lost \\(action ${taken}\\)\\. Nothing was sent again\\.`
+      `took a send of an answer to this question \\(action ${taken}\\)\\. Nothing was sent again\\.`
     )
     expect(await screen.findByText(notice)).toBeInTheDocument()
     expect(controls.questions.sent).toHaveLength(0)
@@ -635,7 +643,7 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
     })
     await person.click(screen.getByRole('button', { name: 'Send it now' }))
     const notice = new RegExp(
-      `while its reply was lost \\(action ${taken}\\)\\. Nothing was sent again\\.`
+      `took a send of an answer to this question \\(action ${taken}\\)\\. Nothing was sent again\\.`
     )
     expect(await screen.findByText(notice)).toBeInTheDocument()
     expect(controls.questions.sent).toHaveLength(0)
