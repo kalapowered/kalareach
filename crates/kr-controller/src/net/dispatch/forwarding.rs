@@ -55,27 +55,27 @@ impl RouteRefusal {
     }
 }
 
-/// Whether this host had already routed the action a mutation carries, with the same request,
-/// before the call that is serving it claimed the route itself.
+/// Whether the call that serves a mutation made the claim on the route of its action itself.
 ///
 /// A repeat is the device asking again after an answer it did not get, and the action may have been
 /// carried out by the copy that went before. A refusal this host makes of a repeat on its own
 /// account says nothing of that, so it is not told as a refusal of the action
 /// ([`RemoteConnection::told_of_a_repeat`]). The route a call claims for itself does not make it a
-/// repeat, so a first request refused after its own claim is refused as ever; the claim finding the
-/// route there already, for the same request, does: it is a copy that was running meanwhile.
-pub(super) struct Seen(AtomicBool);
+/// repeat, so a first request refused after its own claim is refused as ever; this records that the
+/// claim was the call's own. A route found otherwise was made by a copy of the request.
+pub(super) struct OwnClaim(AtomicBool);
 
-impl Seen {
-    pub(super) const fn new(seen: bool) -> Self {
-        Self(AtomicBool::new(seen))
+impl OwnClaim {
+    /// A call that has claimed nothing.
+    pub(super) const fn none() -> Self {
+        Self(AtomicBool::new(false))
     }
 
-    fn set(&self) {
+    fn made(&self) {
         self.0.store(true, Ordering::Release);
     }
 
-    fn get(&self) -> bool {
+    fn is_made(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
 }
@@ -123,23 +123,20 @@ impl RemoteConnection {
             .feed_standing(self.connection_id, &self.device, acting)
     }
 
-    /// Reads, as a mutation arrives and before this call claims anything, whether this host had
-    /// already routed the action it carries with the same request.
+    /// Whether this host holds a route for the action a mutation carries, with the same request.
     ///
     /// A route this host cannot read leaves it unable to say whether it has seen the action, and it
     /// answers as it would for a repeat: a refusal then is not a word about an action that may have
     /// been carried out. The route is the device's own, keyed by the verified actor, so what a
     /// refusal that depends on it shows is a fact the device already holds.
-    pub(super) fn seen_on_arrival(&self, mutation: &MutationRequest) -> Seen {
+    fn holds_a_route_for(&self, mutation: &MutationRequest) -> bool {
         let actor_id = self.device.principal();
-        Seen::new(
-            match self.devices.action_route(&actor_id, mutation.action_id) {
-                Ok(None) => false,
-                Ok(Some(routed)) => kr_protocol::digest::mutation_digest(mutation, &actor_id)
-                    .is_ok_and(|digest| routed.payload_digest == Some(digest)),
-                Err(_) => true,
-            },
-        )
+        match self.devices.action_route(&actor_id, mutation.action_id) {
+            Ok(None) => false,
+            Ok(Some(routed)) => kr_protocol::digest::mutation_digest(mutation, &actor_id)
+                .is_ok_and(|digest| routed.payload_digest == Some(digest)),
+            Err(_) => true,
+        }
     }
 
     /// What a device is told of a refusal this host made on its own account.
@@ -149,14 +146,26 @@ impl RemoteConnection {
     /// connection, a connection opened for something else, a worker that has ended, a registration
     /// withdrawn), and the host's route shows an earlier copy that may have been carried out, so the
     /// device is told the outcome is unknown. The host cannot show it was not: the route is
-    /// claimed before dispatch and holds no record of whether a dispatch followed. A code that is
-    /// already `OUTCOME_UNKNOWN` is told as it is, and so is every refusal of a request that is not
-    /// a repeat, which includes a reused identifier carrying another request.
-    pub(super) fn told_of_a_repeat(&self, seen: &Seen, error: ProtocolError) -> ProtocolError {
-        if seen.get() && error.code != ErrorCode::OutcomeUnknown {
-            outcome_not_shown()
-        } else {
+    /// claimed before dispatch and holds no record of whether a dispatch followed.
+    ///
+    /// The route is read now, when the refusal is worded, because a copy of the request can claim it
+    /// at any point while this one waits. A route this call made itself does not count, so a first
+    /// request refused after its own claim is refused as ever, and a route that holds another
+    /// request under the identifier does not either, so a reused identifier keeps its code. A code
+    /// that is already `OUTCOME_UNKNOWN` is told as it is.
+    pub(super) fn told_of_a_repeat(
+        &self,
+        own_claim: &OwnClaim,
+        mutation: &MutationRequest,
+        error: ProtocolError,
+    ) -> ProtocolError {
+        if error.code == ErrorCode::OutcomeUnknown
+            || own_claim.is_made()
+            || !self.holds_a_route_for(mutation)
+        {
             error
+        } else {
+            outcome_not_shown()
         }
     }
 
@@ -368,7 +377,7 @@ impl RemoteConnection {
         grant_rights: CanonicalSet<ActionRight>,
         acting: &Acting,
         asked: &mut Option<Asked>,
-        seen: &Seen,
+        own_claim: &OwnClaim,
     ) -> std::result::Result<ControlFrame, ProtocolError> {
         let Some(session_id) = mutation.target.session_id.as_ref().copied() else {
             return Err(ProtocolError::new(
@@ -380,7 +389,7 @@ impl RemoteConnection {
             Ok(proxy) => proxy,
             Err(error) => return Err(error.to_protocol_error()),
         };
-        if let Err(refusal) = self.claim_route(mutation, Some(session_id), seen) {
+        if let Err(refusal) = self.claim_route(mutation, Some(session_id), own_claim) {
             return Err(refusal.into_error());
         }
         let envelope = self.envelope(acting.grant.grant_id, validated);
@@ -502,8 +511,10 @@ impl RemoteConnection {
                         outcome: answered.response.outcome,
                     }),
                 );
-                // A worker checks the authority a request stands on before it looks for the
-                // receipt of an action it was sent before, so a refusal it makes that is not read
+                // A worker checks a request (its authority, envelope, window and deadline) before
+                // it looks for the receipt of an action it was sent before, and a lookup that finds
+                // none shows only that the worker holds no receipt now: a dispatch of an earlier
+                // copy can still be waiting in its queue. So a refusal it makes that is not read
                 // from a receipt says nothing of an earlier copy. It is the host's word to give as
                 // such, and a repeat is not told it.
                 match told {
@@ -675,7 +686,7 @@ impl RemoteConnection {
         &self,
         mutation: &MutationRequest,
         session_id: Option<SessionId>,
-        seen: &Seen,
+        own_claim: &OwnClaim,
     ) -> std::result::Result<(), RouteRefusal> {
         let actor_id = self.device.principal();
         let digest =
@@ -696,12 +707,15 @@ impl RemoteConnection {
             )
             .map_err(|error| RouteRefusal::Unavailable(error.to_protocol_error()))?;
         match claimed {
-            super::super::devices::ActionRoute::Recorded => Ok(()),
+            super::super::devices::ActionRoute::Recorded => {
+                own_claim.made();
+                Ok(())
+            }
+            // A copy of this request claimed it first, perhaps while this one was arriving: the
+            // route is theirs, and a refusal of this call is worded as that of a repeat.
             super::super::devices::ActionRoute::Existing(existing)
                 if existing.payload_digest == Some(digest) && existing.session_id == session_id =>
             {
-                // A copy of this request claimed it first, perhaps while this one was arriving.
-                seen.set();
                 Ok(())
             }
             super::super::devices::ActionRoute::Existing(_) => {

@@ -264,7 +264,7 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
             with_voice.clone(),
             &connection.pairing_acting(),
             &mut None,
-            &super::forwarding::Seen::new(false),
+            &super::forwarding::OwnClaim::none(),
         )
         .await;
     assert!(
@@ -2036,7 +2036,7 @@ async fn a_receipt_lookup_waiting_for_the_workers_link_is_refused_once_a_feed_re
                 .claim_route(
                     &close,
                     Some(world.session_id),
-                    &super::forwarding::Seen::new(false)
+                    &super::forwarding::OwnClaim::none()
                 )
                 .is_ok(),
             "the route of the close is on record"
@@ -2498,7 +2498,7 @@ async fn a_device_that_reads_a_closed_session_is_told_it_closed_and_not_that_it_
             .claim_route(
                 &close,
                 Some(world.session_id),
-                &super::forwarding::Seen::new(false)
+                &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
         "the route of the close is on record"
@@ -2570,7 +2570,7 @@ async fn a_replacement_daemon_settles_a_devices_retried_close_from_the_workers_r
             .claim_route(
                 &close,
                 Some(world.session_id),
-                &super::forwarding::Seen::new(false)
+                &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
         "the route of the close is on record"
@@ -4884,7 +4884,7 @@ async fn kr_req_10_49_a_retried_close_is_answered_and_the_kept_answer_is_settled
             .claim_route(
                 &close,
                 Some(world.session_id),
-                &super::forwarding::Seen::new(false)
+                &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
         "the route of the close is on record"
@@ -4943,7 +4943,7 @@ async fn kr_req_10_49_a_kept_close_result_that_does_not_read_is_not_passed_on() 
             .claim_route(
                 &close,
                 Some(world.session_id),
-                &super::forwarding::Seen::new(false)
+                &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
         "the route of the close is on record"
@@ -5051,7 +5051,7 @@ async fn kr_req_10_49_a_kept_result_is_not_shown_to_a_device() {
             .claim_route(
                 &prompt,
                 Some(world.session_id),
-                &super::forwarding::Seen::new(false)
+                &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
         "the route of the prompt is on record"
@@ -5118,7 +5118,7 @@ async fn kr_req_10_49_a_kept_answer_that_does_not_read_in_the_workers_level_is_n
                 .claim_route(
                     &prompt,
                     Some(world.session_id),
-                    &super::forwarding::Seen::new(false)
+                    &super::forwarding::OwnClaim::none()
                 )
                 .is_ok(),
             "the route of the prompt is on record"
@@ -5251,7 +5251,7 @@ async fn kr_req_23_34_a_close_is_made_for_a_caller_that_may_not_read_its_receipt
                 .claim_route(
                     &close,
                     Some(world.session_id),
-                    &super::forwarding::Seen::new(false)
+                    &super::forwarding::OwnClaim::none()
                 )
                 .is_ok(),
             "the route of the close is on record"
@@ -5549,7 +5549,7 @@ async fn kr_req_23_34_an_action_read_by_identifier_is_about_the_session_its_rout
             .claim_route(
                 &close,
                 Some(world.session_id),
-                &super::forwarding::Seen::new(false)
+                &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
         "the route of the close is on record"
@@ -5600,7 +5600,7 @@ async fn kr_req_23_34_a_retry_of_an_action_other_than_a_close_is_not_answered_to
             .claim_route(
                 &prompt,
                 Some(world.session_id),
-                &super::forwarding::Seen::new(false)
+                &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
         "the route of the prompt is on record"
@@ -5831,7 +5831,7 @@ async fn a_retry_answered_from_the_workers_receipt_is_not_answered_when_a_fence_
             .claim_route(
                 &close,
                 Some(world.session_id),
-                &super::forwarding::Seen::new(false)
+                &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
         "the route of the close is on record"
@@ -6204,6 +6204,8 @@ enum Stopped {
     AtTheWorkersLink,
     /// While the dispatch lease for it is being taken, after the route is claimed.
     AtTheLease,
+    /// After the door has refused it and before the refusal is worded for the device.
+    BeforeTheRefusalIsWorded,
 }
 
 /// A repeat is the device's own route for the action id, with the same request. A refusal the host
@@ -6224,6 +6226,7 @@ async fn a_mutation_refused(
         &crate::service::a_close_a_worker_never_answers::Silent,
         &super::RemoteConnection,
         &crate::service::a_read_that_meets_a_worker_on_its_way_out::Scripted,
+        &MutationRequest,
     ),
 ) -> kr_protocol::error::ProtocolError {
     use kr_protocol::envelope::ControlFrame;
@@ -6266,7 +6269,7 @@ async fn a_mutation_refused(
         let session = to_its_session.then_some(world.session_id);
         assert!(
             connection
-                .claim_route(&mutation, session, &super::forwarding::Seen::new(false))
+                .claim_route(&mutation, session, &super::forwarding::OwnClaim::none())
                 .is_ok(),
             "the route of the action is on record"
         );
@@ -6275,11 +6278,13 @@ async fn a_mutation_refused(
         Stopped::Never => None,
         Stopped::AtTheWorkersLink => Some(controller.before_a_proxy_is_opened.arm()),
         Stopped::AtTheLease => Some(controller.before_the_lease.arm()),
+        Stopped::BeforeTheRefusalIsWorded => Some(controller.before_a_refusal_is_worded.arm()),
     };
+    let sent = mutation.clone();
     let frame = ControlFrame::Mutation(Box::new(mutation));
     let answered = match pause {
         None => {
-            change(&world, &connection, &*script).await;
+            change(&world, &connection, &*script, &sent).await;
             connection.answer_now(frame).await
         }
         Some((arrived, go)) => {
@@ -6288,7 +6293,7 @@ async fn a_mutation_refused(
                     .await
                     .expect("the call reaches the place it is stopped at")
                     .expect("the pause is armed");
-                change(&world, &connection, &*script).await;
+                change(&world, &connection, &*script, &sent).await;
                 go.send(()).expect("the call is waiting");
             });
             answered
@@ -6317,7 +6322,7 @@ async fn a_repeat_on_a_connection_whose_registration_was_withdrawn_is_told_the_o
             71,
             |_| {},
             Stopped::Never,
-            async |world, connection, _| {
+            async |world, connection, _, _| {
                 world
                     .controller
                     .admitted_write()
@@ -6350,7 +6355,7 @@ async fn a_repeat_of_an_action_the_host_owns_is_told_the_outcome_is_unknown_when
                     kr_protocol::ids::ActionWindowId::new("elsewhere").expect("a window");
             },
             Stopped::Never,
-            async |_, _, _| {},
+            async |_, _, _, _| {},
         )
         .await;
         assert_eq!(error.code, expected, "routed {routed:?}: {error}");
@@ -6374,7 +6379,7 @@ async fn a_repeat_the_worker_refuses_without_a_receipt_is_told_the_outcome_is_un
             73,
             |_| {},
             Stopped::Never,
-            async |_, _, _| {},
+            async |_, _, _, _| {},
         )
         .await;
         assert_eq!(error.code, expected, "routed {routed:?}: {error}");
@@ -6398,7 +6403,7 @@ async fn a_repeat_to_a_session_that_has_closed_is_told_the_outcome_is_unknown() 
             75,
             |_| {},
             Stopped::Never,
-            async |world, _, _| {
+            async |world, _, _, _| {
                 world
                     .controller
                     .retire(
@@ -6462,7 +6467,7 @@ async fn a_copy_that_claimed_the_route_while_this_one_waited_for_the_link_makes_
                             .claim_route(
                                 &prompt,
                                 Some(world.session_id),
-                                &super::forwarding::Seen::new(false)
+                                &super::forwarding::OwnClaim::none()
                             )
                             .is_ok(),
                         "the other copy claims the route"
@@ -6495,7 +6500,7 @@ async fn a_repeat_whose_registration_is_withdrawn_while_it_waits_for_the_worker_
         77,
         |_| {},
         Stopped::AtTheWorkersLink,
-        async |world, connection, _| {
+        async |world, connection, _, _| {
             world
                 .controller
                 .admitted_write()
@@ -6523,7 +6528,7 @@ async fn a_repeat_whose_lease_is_refused_is_told_the_outcome_is_unknown() {
             78,
             |_| {},
             Stopped::AtTheLease,
-            async |world, _, _| world.controller.hold_fence(true),
+            async |world, _, _, _| world.controller.hold_fence(true),
         )
         .await;
         assert_eq!(error.code, expected, "routed {routed:?}: {error}");
@@ -6549,7 +6554,7 @@ async fn a_repeated_close_whose_worker_cannot_be_reached_is_told_the_outcome_is_
             79,
             |_| {},
             Stopped::Never,
-            async |world, _, script| {
+            async |world, _, script, _| {
                 // The worker goes while a read waits on it, and its endpoint is gone for the
                 // close that follows.
                 let (_arrived, go) = script.end_at_next_read();
@@ -6557,6 +6562,80 @@ async fn a_repeated_close_whose_worker_cannot_be_reached_is_told_the_outcome_is_
                 scripted::read(world)
                     .await
                     .expect_err("the worker goes while the read waits on it");
+            },
+        )
+        .await;
+        assert_eq!(error.code, expected, "routed {routed:?}: {error}");
+    }
+}
+
+/// A copy of a request claims the action's route after this one arrived and before the door words
+/// its refusal of it. The route is read when the refusal is worded, so the device is told the
+/// outcome is unknown: the copy may be carried out. Without that copy the same refusal, of a
+/// request the host never routed, is its word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_refused_after_a_copy_of_it_claimed_the_route_is_told_the_outcome_is_unknown() {
+    use kr_protocol::error::ErrorCode;
+
+    for (copy_claims, expected) in [
+        (true, ErrorCode::OutcomeUnknown),
+        (false, ErrorCode::PermissionDenied),
+    ] {
+        let error = a_mutation_refused(
+            Method::AgentPromptSubmit,
+            None,
+            80,
+            |mutation| {
+                mutation.action_window_id =
+                    kr_protocol::ids::ActionWindowId::new("elsewhere").expect("a window");
+            },
+            Stopped::BeforeTheRefusalIsWorded,
+            async |world, connection, _, sent| {
+                if copy_claims {
+                    assert!(
+                        connection
+                            .claim_route(
+                                sent,
+                                Some(world.session_id),
+                                &super::forwarding::OwnClaim::none()
+                            )
+                            .is_ok(),
+                        "the other copy claims the route"
+                    );
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            error.code, expected,
+            "a copy claimed: {copy_claims}: {error}"
+        );
+    }
+}
+
+/// The authority feed raises a refusal on remote grants after a mutation has its lease and before
+/// it is written to its worker. For a repeat that refusal says nothing of the copy that went
+/// before, so it is told as an unknown outcome; the same request never routed is refused for the
+/// feed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_the_feed_refuses_before_it_is_sent_is_told_the_outcome_is_unknown() {
+    use kr_protocol::error::ErrorCode;
+
+    for (routed, expected) in [
+        (Some(true), ErrorCode::OutcomeUnknown),
+        (None, ErrorCode::PermissionDenied),
+    ] {
+        let error = a_mutation_refused(
+            Method::AgentPromptSubmit,
+            routed,
+            81,
+            |_| {},
+            Stopped::AtTheLease,
+            async |world, _, _, _| {
+                world
+                    .controller
+                    .raise_the_unverified_withdrawal_refusal()
+                    .await;
             },
         )
         .await;

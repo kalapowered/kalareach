@@ -451,12 +451,12 @@ async fn a_repeated_close_on_a_connection_that_now_serves_the_host_alone_is_told
     environment.stop().await;
 }
 
-/// A repeat of an action taken under a share arrives on a connection opened for the host alone, or
-/// for the session under the pairing grant, and the host does not serve it there. It is not told
-/// the action was refused; the connection opened under the share itself is answered from the
-/// worker's receipt, as a repeat always was.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_repeat_on_a_connection_opened_for_something_else_is_told_the_outcome_is_unknown() {
+/// An action taken under a share is presented again on a connection that was opened for the host
+/// alone, or for the session under the pairing grant when `for_the_session` says so, and the host
+/// does not serve it there. The device is not told the action was refused. The control: the
+/// connection opened under the share itself is answered from the worker's receipt, as a repeat
+/// always was.
+async fn a_repeat_on_a_connection_opened_for_something_else(for_the_session: bool) {
     let environment = Environment::start_reserved().await;
     let question = environment.worker.ask("shared");
     let device = environment
@@ -473,27 +473,22 @@ async fn a_repeat_on_a_connection_opened_for_something_else_is_told_the_outcome_
     );
 
     let session = environment.worker.session_id;
-    let for_the_host = another_connection(&environment.host, &device).await;
-    open(&for_the_host, None, None).await;
-    let for_the_session = another_connection(&environment.host, &device).await;
-    open(&for_the_session, Some(session), None).await;
-    for connection in [&for_the_host, &for_the_session] {
-        let told = refusal(
-            connection
-                .mutate_naming_in(
-                    held,
-                    window.clone(),
-                    Method::QuestionAnswer,
-                    action,
-                    environment.target(),
-                    &params,
-                )
-                .await,
-        );
-        assert_unknown(&told);
-    }
+    let elsewhere = another_connection(&environment.host, &device).await;
+    open(&elsewhere, for_the_session.then_some(session), None).await;
+    let told = refusal(
+        elsewhere
+            .mutate_naming_in(
+                held,
+                window.clone(),
+                Method::QuestionAnswer,
+                action,
+                environment.target(),
+                &params,
+            )
+            .await,
+    );
+    assert_unknown(&told);
 
-    // The control: the connection opened under the share answers the repeat from the receipt.
     let under_the_share = another_connection(&environment.host, &device).await;
     open(&under_the_share, Some(session), Some(held)).await;
     let repeated = resolved(
@@ -510,11 +505,23 @@ async fn a_repeat_on_a_connection_opened_for_something_else_is_told_the_outcome_
             .expect("the repeat is answered from the worker's receipt"),
     );
     assert_eq!(repeated.state, QuestionState::Answered);
-    for connection in [for_the_host, for_the_session, under_the_share] {
-        connection.close();
-    }
+    elsewhere.close();
+    under_the_share.close();
     device.connection.close();
     environment.stop().await;
+}
+
+/// The connection was opened for the host alone, which a share's action is not served on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_on_a_connection_opened_for_the_host_alone_is_told_the_outcome_is_unknown() {
+    a_repeat_on_a_connection_opened_for_something_else(false).await;
+}
+
+/// The connection was opened for the session under the pairing grant, not under the share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_on_a_connection_opened_for_the_session_under_another_grant_is_told_the_outcome_is_unknown()
+ {
+    a_repeat_on_a_connection_opened_for_something_else(true).await;
 }
 
 /// The share an action was taken under is revoked before the repeat. The device no longer holds
