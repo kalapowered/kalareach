@@ -13,7 +13,7 @@ use kr_protocol::method::Method;
 use kr_protocol::session::SessionListResult;
 
 use super::acting::Acting;
-use super::{RemoteConnection, failure};
+use super::{RemoteConnection, failure, outcome_not_shown};
 use crate::changeset::{ScopedEnvironments, VersionScope};
 
 impl RemoteConnection {
@@ -542,8 +542,11 @@ impl RemoteConnection {
         } else {
             Earlier::Nothing
         };
+        // What the record holds is the outcome of the action, which a device the grant no longer
+        // reaches it for is told neither was refused nor what it came to.
         self.check_working_tree_request(method, &mutation.params, acting, earlier)
-            .await?;
+            .await
+            .map_err(|_| outcome_not_shown())?;
         Ok(Some(shown_working_tree_change(retained, method)))
     }
 
@@ -589,7 +592,9 @@ impl RemoteConnection {
         else {
             return Ok(None);
         };
-        self.check_materialisation(mutation).await?;
+        self.check_materialisation(mutation)
+            .await
+            .map_err(|_| outcome_not_shown())?;
         Ok(Some(shown_materialisation(retained)))
     }
 }

@@ -2533,7 +2533,8 @@ async fn kr_req_24_28_a_repeated_clearing_is_answered_from_its_record_without_ge
 /// KR-REQ-23.34: a device that may rename a session and may not view it renames it, and does not
 /// learn what its action came to by presenting the action again. A retained answer, a name or a
 /// refusal, goes back only under present view authority over the session it names; a device that
-/// may view it is answered from the record.
+/// may view it is answered from the record. One that may not is told only that the outcome is
+/// unknown, the same for a name and for a refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_34_a_repeated_rename_is_answered_only_under_view_authority_over_its_session() {
     let environment = Environment::start().await;
@@ -2592,11 +2593,15 @@ async fn kr_req_23_34_a_repeated_rename_is_answered_only_under_view_authority_ov
             assert_eq!(again_refused.code, ErrorCode::InvalidArgument);
         } else {
             let denied = again.expect_err("a device that may not view is not answered");
-            assert_eq!(denied.code, ErrorCode::PermissionDenied, "{denied}");
+            assert_eq!(denied.code, ErrorCode::OutcomeUnknown, "{denied}");
             assert_eq!(
                 again_refused.code,
-                ErrorCode::PermissionDenied,
+                ErrorCode::OutcomeUnknown,
                 "{again_refused}"
+            );
+            assert_eq!(
+                again_refused.message, denied.message,
+                "a refusal is told as a name is"
             );
         }
         device.connection.close();

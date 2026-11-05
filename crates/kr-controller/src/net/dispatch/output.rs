@@ -568,8 +568,22 @@ impl RemoteOutput {
         let frame: &ControlFrame = match &shown {
             Cow::Owned(mapped) if !super::super::device_errors::fits(mapped, self.max_payload) => {
                 // The host's edits made the answer larger than the stream carries, and the stream
-                // ends the connection for a frame it cannot carry. A response is refused instead.
-                refusal = super::super::device_errors::too_large_for_the_device(mapped);
+                // ends the connection for a frame it cannot carry. A response is refused instead,
+                // unless it answers an action, which the refusal must not say did not happen.
+                refusal = match super::super::device_errors::too_large_for_the_device(mapped) {
+                    Some(ControlFrame::Response(Response {
+                        request_id,
+                        outcome: Outcome::Error(error),
+                    })) => Some(super::failure(
+                        request_id,
+                        match answers {
+                            Answers::Action => super::after_the_outcome(frame, error),
+                            Answers::Kept => super::outcome_not_shown(),
+                            Answers::Nothing | Answers::Read => error,
+                        },
+                    )),
+                    other => other,
+                };
                 match &refusal {
                     Some(refusal) => refusal,
                     None => return Written::Withdrawn,

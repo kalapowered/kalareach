@@ -4912,10 +4912,10 @@ async fn kr_req_10_49_a_retried_close_is_answered_and_the_kept_answer_is_settled
 }
 
 /// KR-REQ-10.49: the close result a worker kept inside its answer is read in the shape of the
-/// worker's level too. One that does not read there is refused by name and the close is not sent
-/// again.
+/// worker's level too. One that does not read there is not passed on, the device is told the
+/// outcome of its close is unknown, and the close is not sent again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_10_49_a_kept_close_result_that_does_not_read_is_refused_not_passed_on() {
+async fn kr_req_10_49_a_kept_close_result_that_does_not_read_is_not_passed_on() {
     use kr_protocol::envelope::ControlFrame;
 
     use crate::service::a_close_a_worker_never_answers as fake;
@@ -4948,7 +4948,7 @@ async fn kr_req_10_49_a_kept_close_result_that_does_not_read_is_refused_not_pass
     let error = error_of(answered.frame());
     assert_eq!(
         error.code,
-        kr_protocol::error::ErrorCode::UnsupportedSchema,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
         "{error}"
     );
     assert_eq!(
@@ -5017,12 +5017,12 @@ async fn kr_req_10_49_a_kept_result_is_not_shown_to_a_device() {
 }
 
 /// KR-REQ-10.49: what a worker kept is passed to a device only as the daemon reads it in the shape
-/// of the worker's level. An answer that does not read there is refused by name and is not passed
-/// on as it came, and the action is not dispatched again to get another. The control is the same
-/// retry answered by a worker whose answer reads: it is answered, with the worker's words withheld.
+/// of the worker's level. An answer that does not read there is not passed on as it came, the
+/// device is told the outcome of its action is unknown, and the action is not dispatched again to
+/// get another. The control is the same retry answered by a worker whose answer reads: it is
+/// answered, with the worker's words withheld.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_10_49_a_kept_answer_that_does_not_read_in_the_workers_level_is_refused_not_passed_on()
- {
+async fn kr_req_10_49_a_kept_answer_that_does_not_read_in_the_workers_level_is_not_passed_on() {
     use kr_protocol::envelope::ControlFrame;
     use kr_protocol::rights::ActionRight;
 
@@ -5078,7 +5078,7 @@ async fn kr_req_10_49_a_kept_answer_that_does_not_read_in_the_workers_level_is_r
             let error = error_of(answered.frame());
             assert_eq!(
                 error.code,
-                kr_protocol::error::ErrorCode::UnsupportedSchema,
+                kr_protocol::error::ErrorCode::OutcomeUnknown,
                 "{error}"
             );
             assert!(!error.message.contains("secret-notes"), "{error}");
@@ -5090,6 +5090,56 @@ async fn kr_req_10_49_a_kept_answer_that_does_not_read_in_the_workers_level_is_r
         }
         world.serving.abort();
     }
+}
+
+/// An action a worker answers from a receipt it already held, to a device that may not read the
+/// session's receipts, is not passed on, and the device is told the outcome is unknown: the worker
+/// took the action, so it is not refused. The route of the action is not on record, so the answer
+/// comes back with the worker's, as it does when two submissions of one action meet at the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_action_a_worker_answers_from_its_receipt_is_not_refused_to_a_device_that_may_not_read_it()
+ {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let connection = super::RemoteConnection::for_test(
+        controller,
+        paired(controller, 38, |grant| {
+            grant.actions = [ActionRight::AgentPrompt].into_iter().collect();
+        }),
+    );
+    let prompt = device_mutation(
+        &world,
+        &connection,
+        Method::AgentPromptSubmit,
+        53,
+        ParamsValue::empty(),
+    );
+    script.kept_without_a_result(
+        prompt.action_id,
+        Method::AgentPromptSubmit,
+        kr_protocol::error::ProtocolError::new(
+            kr_protocol::error::ErrorCode::InvalidArgument,
+            "the agent said no",
+        ),
+    );
+    let answered = connection
+        .answer_now(ControlFrame::Mutation(Box::new(prompt)))
+        .await
+        .expect("the action is answered");
+    let error = error_of(answered.frame());
+    assert_eq!(
+        error.code,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{error}"
+    );
+    assert_eq!(script.forwarded().len(), 1, "the worker was asked once");
+    world.serving.abort();
 }
 
 /// KR-REQ-23.34: a caller that may close a session and may not read its receipts has the close
@@ -5152,10 +5202,11 @@ async fn kr_req_23_34_a_close_is_made_for_a_caller_that_may_not_read_its_receipt
             answered.frame()
         );
         if kept {
+            // The close was made, so the caller is not refused what it is not shown.
             let error = error_of(answered.frame());
             assert_eq!(
                 error.code,
-                kr_protocol::error::ErrorCode::PermissionDenied,
+                kr_protocol::error::ErrorCode::OutcomeUnknown,
                 "{error}"
             );
             // What it kept is settled all the same.
@@ -5439,11 +5490,12 @@ async fn kr_req_23_34_an_action_read_by_identifier_is_about_the_session_its_rout
     );
 }
 
-/// KR-REQ-23.34: a device that may not read a session's receipts is refused its retry of an action
-/// other than a close, and nothing reaches the worker: only a close is made for a caller that may
-/// not read what it produced.
+/// KR-REQ-23.34: a device that may not read a session's receipts is not answered its retry of an
+/// action other than a close, and nothing reaches the worker: only a close is made for a caller
+/// that may not read what it produced. The host cannot say what became of the earlier submission,
+/// so the device is told the outcome is unknown and not that the action was refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_23_34_a_retry_of_an_action_other_than_a_close_is_refused_to_a_caller_that_may_not_view()
+async fn kr_req_23_34_a_retry_of_an_action_other_than_a_close_is_not_answered_to_a_caller_that_may_not_view()
  {
     use kr_protocol::envelope::ControlFrame;
     use kr_protocol::rights::ActionRight;
@@ -5487,7 +5539,7 @@ async fn kr_req_23_34_a_retry_of_an_action_other_than_a_close_is_refused_to_a_ca
     let error = error_of(answered.frame());
     assert_eq!(
         error.code,
-        kr_protocol::error::ErrorCode::PermissionDenied,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
         "{error}"
     );
     assert!(!error.message.contains("secret-notes"), "{error}");
@@ -5670,14 +5722,15 @@ async fn a_voice_grant_whose_end_is_not_on_record_is_refused_as_unrecorded() {
 
 /// KR-REQ-09.12: a device's retry that the worker answers from the receipt it kept goes back only
 /// under the admission asked after that lookup, which the worker's own answer waits for. A fence
-/// this host comes to owe while the lookup is under way stops the answer.
+/// this host comes to owe while the lookup is under way stops the answer, and the device is told
+/// the outcome of its action is unknown, as the worker took it.
 ///
 /// The retry is stopped at the place its answer has been found and has not been given, so the
 /// fence lands there and not before: the admission the retry arrived under stood when the lookup
 /// began, which is what a check made before the lookup would have asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_retry_answered_from_the_workers_receipt_is_refused_when_a_fence_lands_during_the_lookup()
-{
+async fn a_retry_answered_from_the_workers_receipt_is_not_answered_when_a_fence_lands_during_the_lookup()
+ {
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 
     use crate::service::a_close_a_worker_never_answers as fake;
@@ -5726,11 +5779,7 @@ async fn a_retry_answered_from_the_workers_receipt_is_refused_when_a_fence_lands
             answered.frame()
         );
     };
-    assert_eq!(
-        refused.code,
-        kr_protocol::error::ErrorCode::PermissionDenied
-    );
-    assert!(refused.message.contains("fence"), "{refused:?}");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::OutcomeUnknown);
     world.serving.abort();
 }
 
@@ -5959,10 +6008,10 @@ async fn what_a_closure_left_behind_is_written_to_a_device_without_the_hosts_pat
 /// KR-REQ-09.09: a paired device's key registration whose earlier attempt finishes after the first
 /// lookup for a retained answer has found nothing is found by the second lookup, and goes back only
 /// under the admission asked with it in hand. A fence this host comes to owe while that lookup is
-/// under way stops the answer. The control: the same registration, asked again once nothing is
-/// owed, is given its answer.
+/// under way stops the answer, and the device is told the outcome of its registration is unknown.
+/// The control: the same registration, asked again once nothing is owed, is given its answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_key_registration_recorded_after_the_first_lookup_is_refused_when_a_fence_lands_during_the_second()
+async fn a_key_registration_recorded_after_the_first_lookup_is_not_answered_when_a_fence_lands_during_the_second()
  {
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 
@@ -6036,11 +6085,7 @@ async fn a_key_registration_recorded_after_the_first_lookup_is_refused_when_a_fe
             answered.frame()
         );
     };
-    assert_eq!(
-        refused.code,
-        kr_protocol::error::ErrorCode::PermissionDenied
-    );
-    assert!(refused.message.contains("fence"), "{refused:?}");
+    assert_eq!(refused.code, kr_protocol::error::ErrorCode::OutcomeUnknown);
 
     controller.hold_fence(false);
     let again = connection

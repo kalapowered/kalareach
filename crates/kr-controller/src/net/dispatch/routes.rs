@@ -17,7 +17,7 @@ use crate::error::Result;
 use super::super::Retained;
 use super::decision::{Answered, Asked, unserved_change_set_method};
 use super::forwarding::RouteRefusal;
-use super::{RemoteConnection, failure, outcome_unknown};
+use super::{RemoteConnection, failure, outcome_not_shown, outcome_unknown};
 
 /// How long a caller waits for an effect the daemon owns before it is told the outcome is unknown.
 ///
@@ -709,15 +709,17 @@ impl RemoteConnection {
         if let Some(retained) = held {
             #[cfg(feature = "testing")]
             self.controller.after_the_retained_lookup.wait().await;
-            if let Err(error) = self.admitted_to_answer(validated) {
-                return failure(mutation.request_id, error);
+            // What this host holds is the outcome of an action. When it will not show the device
+            // that outcome, it does not tell the device the action did not happen, or that it did.
+            if self.admitted_to_answer(validated).is_err() {
+                return failure(mutation.request_id, outcome_not_shown());
             }
             // The daemon's own retained answer is a read of what an earlier submission produced,
             // and is written under the decision that read is ([`Self::read_of_retained`]).
             match self.read_of_retained(entry.method, mutation, &retained, &decided.acting) {
                 Ok(Some(read)) => *asked = Some(read),
                 Ok(None) => {}
-                Err(error) => return failure(mutation.request_id, error),
+                Err(_) => return failure(mutation.request_id, outcome_not_shown()),
             }
             return retained;
         }
@@ -733,7 +735,7 @@ impl RemoteConnection {
                 self.controller.after_the_retained_lookup.wait().await;
                 return match self.admitted_to_answer(validated) {
                     Ok(()) => answered,
-                    Err(error) => failure(mutation.request_id, error),
+                    Err(_) => failure(mutation.request_id, outcome_not_shown()),
                 };
             }
             Ok(None) => {}
@@ -823,7 +825,7 @@ impl RemoteConnection {
                         &decided.acting,
                     ) {
                         Ok(read) => *asked = Some(read),
-                        Err(error) => return failure(request_id, error),
+                        Err(_) => return failure(request_id, outcome_not_shown()),
                     }
                 }
                 answer
@@ -896,11 +898,15 @@ impl RemoteConnection {
                 });
                 match self.controller.within_effect_wait(answered).await {
                     Ok(Ok(Ok(closed))) => {
+                        let answer = ControlFrame::Response(Response {
+                            request_id,
+                            outcome: Outcome::Ok(closed.value),
+                        });
                         // A close the worker answered from its journal is a read of that receipt,
                         // and this is the check section 23 wants before either half of a retained
                         // result goes back, under the decision the answer is then written under.
                         // The close itself happened: section 7's stop does not wait on this, and
-                        // only the answer does.
+                        // only the answer does, so a close not shown is not told as one refused.
                         match closed.retained {
                             Retained::Not => {}
                             Retained::Record | Retained::Worker => {
@@ -910,14 +916,11 @@ impl RemoteConnection {
                                     &decided.acting,
                                 ) {
                                     Ok(read) => *asked = Some(read),
-                                    Err(error) => return failure(request_id, error),
+                                    Err(_) => return failure(request_id, outcome_not_shown()),
                                 }
                             }
                         }
-                        ControlFrame::Response(Response {
-                            request_id,
-                            outcome: Outcome::Ok(closed.value),
-                        })
+                        answer
                     }
                     Ok(Ok(Err(error))) => failure(request_id, error.to_protocol_error()),
                     // The close is running on a task that outlives this connection, so a wait
@@ -1478,7 +1481,7 @@ impl RemoteConnection {
                     self.controller.after_the_retained_lookup.wait().await;
                     return match self.admitted_to_answer(validated) {
                         Ok(()) => answer,
-                        Err(error) => failure(mutation.request_id, error),
+                        Err(_) => failure(mutation.request_id, outcome_not_shown()),
                     };
                 }
                 if self.controller.clock.now() >= accepted.deadline {

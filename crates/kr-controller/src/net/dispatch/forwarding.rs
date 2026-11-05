@@ -22,7 +22,7 @@ use crate::service::FeedStanding;
 use super::acting::Acting;
 use super::decision::{Asked, session_of};
 use super::output::{RELAY_DECISIONS, RelayGrant, Relaying, Written};
-use super::{RemoteConnection, failure, outcome_unknown};
+use super::{RemoteConnection, failure, outcome_not_shown, outcome_unknown};
 
 /// Why a claim on an action's identity did not succeed.
 ///
@@ -42,17 +42,27 @@ impl RouteRefusal {
             Self::Conflict(error) | Self::Unavailable(error) => error,
         }
     }
+
+    /// The refusal of an action whose route shows it was dispatched before, when this host will
+    /// not, or cannot, show what became of it.
+    ///
+    /// It says nothing of the action, which an earlier submission may have carried out, and is
+    /// told as such ([`outcome_not_shown`]); `_refusal` is what stopped the answer.
+    fn not_shown(_refusal: ProtocolError) -> Self {
+        Self::Conflict(outcome_not_shown())
+    }
 }
 
-/// The refusal for a retained answer that does not read in the shape of the level its worker is
-/// at.
+/// What a device is told of a retained answer that does not read in the shape of the level its
+/// worker is at.
 ///
 /// What the worker kept is not shown to a device as it came, because the host cannot tell what the
-/// worker held it to. The refusal says what the host holds and does not do, never that the action
-/// did not happen: it did, and the caller may well have caused it.
+/// worker held it to. The answer says what the host holds and does not do, never that the action
+/// did not happen: it did, and the caller may well have caused it. The code is the one for an
+/// outcome the host does not report, so a client keeps the action it sent.
 fn unreadable_retained_answer() -> ProtocolError {
     ProtocolError::new(
-        ErrorCode::UnsupportedSchema,
+        ErrorCode::OutcomeUnknown,
         "this host holds what this action produced and does not show it to this device, because \
          the session's worker answered in a form this host cannot read",
     )
@@ -411,10 +421,12 @@ impl RemoteConnection {
                 if answered.retained {
                     // A retained answer is a read of somebody's receipt: the worker gave what
                     // this device's grant reached, and it is written under present view
-                    // authority over the session.
+                    // authority over the session. A device not given it is told neither that the
+                    // action was refused nor what it came to: the worker answered from a receipt it
+                    // already held.
                     match self.may_read_receipts(Some(session_id), answering, acting) {
                         Ok(read) => *asked = Some(read),
-                        Err(error) => return failure(request_id, error),
+                        Err(_) => return failure(request_id, outcome_not_shown()),
                     }
                 }
                 // What an agent said in refusing what a device put to it is the agent's, not this
@@ -688,11 +700,11 @@ impl RemoteConnection {
         let read = match self.may_read_receipts(Some(session_id), answering, &asked.acting) {
             Ok(read) => read,
             Err(_) if answering == Method::SessionClose => return Ok(None),
-            Err(error) => return Err(RouteRefusal::Conflict(error)),
+            Err(error) => return Err(RouteRefusal::not_shown(error)),
         };
         // A connection that serves the host alone has no route to a worker, and says so rather
         // than leaving the request to be refused for another reason further on.
-        self.check_worker_route().map_err(RouteRefusal::Conflict)?;
+        self.check_worker_route().map_err(RouteRefusal::not_shown)?;
         // A link that cannot be opened is not an answer. The ordinary path decides what this
         // request gets, which for a session whose worker has gone is that session's own refusal
         // rather than a second dispatch.
@@ -716,7 +728,7 @@ impl RemoteConnection {
                     },
                 )
                 .map_err(|error| {
-                    RouteRefusal::Conflict(ProtocolError::new(
+                    RouteRefusal::not_shown(ProtocolError::new(
                         ErrorCode::UnsupportedCapability,
                         error.to_string(),
                     ))
@@ -725,7 +737,7 @@ impl RemoteConnection {
         let envelope = self.envelope(asked.acting.grant.grant_id, validated);
         let authority = self
             .authority_deadline(asked)
-            .map_err(RouteRefusal::Conflict)?;
+            .map_err(RouteRefusal::not_shown)?;
         let standing = self.feed_standing(&asked.acting.grant);
         let Ok(response) = proxy
             .forward_read(
@@ -772,7 +784,7 @@ impl RemoteConnection {
                 .settle_close_answer(session_id, &answer)
                 .await;
             let converted = ParamsValue::from_typed(&answer).map_err(|error| {
-                RouteRefusal::Conflict(ProtocolError::new(
+                RouteRefusal::not_shown(ProtocolError::new(
                     ErrorCode::InvalidArgument,
                     error.to_string(),
                 ))

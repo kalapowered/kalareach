@@ -1260,6 +1260,162 @@ async fn an_answer_held_at_the_writer_is_not_written_once_a_feed_refusal_rises()
     }
 }
 
+/// An answer to an action that is held at the writer when the authority feed raises its refusal is
+/// not written, and the device is not told the action was refused unless the answer says it was
+/// not carried out. A fresh answer that is a result, a transient failure or a word that the outcome
+/// is unknown, or a receipt that does not say the action was refused or rejected, leaves it open
+/// that the action took effect, and the device is told its outcome is unknown; a refusal of the
+/// action and a receipt that says it was refused or rejected are replaced by the refusal. An answer
+/// kept from an earlier submission is told as unknown whatever it was, so that a device that may
+/// not read it learns nothing from the difference. The answer to a read is replaced by the refusal
+/// whatever it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_made_after_an_answer_is_told_by_what_the_answer_leaves_open() {
+    use kr_protocol::envelope::{Outcome, ParamsValue, Response};
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+    use kr_protocol::receipt::ReceiptState;
+
+    /// What a row's answer is the answer to.
+    #[derive(Clone, Copy)]
+    enum To {
+        Action,
+        Kept,
+        Read,
+    }
+
+    let receipt = |state: ReceiptState| {
+        let held = kr_protocol::receipt::Receipt {
+            action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            actor_id: ActorId::new("device:a-phone").expect("an actor"),
+            method: Method::SessionRename.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            revision: kr_protocol::scalars::U64::new(1),
+            state,
+            reason: Nullable::null(),
+            payload_digest: kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+            accepted_deadline_ms: Nullable::null(),
+            error: Nullable::null(),
+            error_withheld: false,
+            updated_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        };
+        ControlFrame::Receipt(Box::new(kr_protocol::receipt::ReceiptResponse {
+            request_id: kr_protocol::ids::RequestId::new(1),
+            receipt: held,
+        }))
+    };
+    let error = |code: ErrorCode| {
+        ControlFrame::Response(Response {
+            request_id: kr_protocol::ids::RequestId::new(1),
+            outcome: Outcome::Error(ProtocolError::new(code, "the worker's words")),
+        })
+    };
+    let result = ControlFrame::Response(Response {
+        request_id: kr_protocol::ids::RequestId::new(1),
+        outcome: Outcome::Ok(ParamsValue::empty()),
+    });
+    // The answer, what it answers, and the code the device is told.
+    let table = [
+        (result.clone(), To::Action, ErrorCode::OutcomeUnknown),
+        (
+            error(ErrorCode::ResourceUnavailable),
+            To::Action,
+            ErrorCode::OutcomeUnknown,
+        ),
+        (
+            error(ErrorCode::OutcomeUnknown),
+            To::Action,
+            ErrorCode::OutcomeUnknown,
+        ),
+        (
+            error(ErrorCode::DraftConflict),
+            To::Action,
+            ErrorCode::PermissionDenied,
+        ),
+        (
+            receipt(ReceiptState::Applied),
+            To::Action,
+            ErrorCode::OutcomeUnknown,
+        ),
+        (
+            receipt(ReceiptState::Unknown),
+            To::Action,
+            ErrorCode::OutcomeUnknown,
+        ),
+        (
+            receipt(ReceiptState::Refused),
+            To::Action,
+            ErrorCode::PermissionDenied,
+        ),
+        (
+            receipt(ReceiptState::Rejected),
+            To::Action,
+            ErrorCode::PermissionDenied,
+        ),
+        (result.clone(), To::Kept, ErrorCode::OutcomeUnknown),
+        (
+            error(ErrorCode::DraftConflict),
+            To::Kept,
+            ErrorCode::OutcomeUnknown,
+        ),
+        (
+            receipt(ReceiptState::Refused),
+            To::Kept,
+            ErrorCode::OutcomeUnknown,
+        ),
+        (result, To::Read, ErrorCode::PermissionDenied),
+        (
+            error(ErrorCode::ResourceUnavailable),
+            To::Read,
+            ErrorCode::PermissionDenied,
+        ),
+    ];
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = super::super::tests::daemon(&temp).await;
+    let (connection, recording) = paired_connection(
+        &controller,
+        66,
+        &[ActionRight::SessionView, ActionRight::SessionRename],
+    );
+    let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+    let action = connection
+        .ask(Some(session_id), Method::SessionRename.entry(), false)
+        .expect("the action is decided");
+    let kept = connection
+        .may_read_receipts(Some(session_id), Method::SessionRename, &action.acting)
+        .expect("the read of its receipt is decided");
+    let read = connection
+        .ask(Some(session_id), Method::SessionRead.entry(), false)
+        .expect("the read is decided");
+    controller.raise_the_unverified_withdrawal_refusal().await;
+    for (answer, to, told) in table {
+        let asked = match to {
+            To::Action => action.clone(),
+            To::Kept => kept.clone(),
+            To::Read => read.clone(),
+        };
+        assert!(
+            connection
+                .write_answer(super::decision::Answered {
+                    frame: answer.clone(),
+                    asked: Some(asked),
+                })
+                .await,
+            "the connection stands"
+        );
+        let frames = recording.frames();
+        let Some(ControlFrame::Response(Response {
+            outcome: Outcome::Error(refusal),
+            ..
+        })) = frames.last()
+        else {
+            panic!("the answer was written past the refusal: {frames:?}");
+        };
+        assert_eq!(refusal.code, told, "{answer:?}");
+    }
+    drop(controller);
+}
+
 /// KR-REQ-24.15: an answer decided before the feed removed this host is not written when the
 /// connection's grant rests on the feed, as it is not for the other two refusals: the removal moves
 /// no revision, so a decision taken before it names nothing that has changed. The device is written
@@ -2204,10 +2360,11 @@ async fn an_action_read_of_a_close_carries_the_description_only_as_far_as_the_hi
 
 /// KR-REQ-23.34: a retained answer is written under present view authority over the session it
 /// is about. A replacement lease that keeps `question.respond` and drops `session.view` while the
-/// answer waits refuses it where it is written, and the same lease lets a fresh answer go with the
-/// question left out. The controls are a renewal that kept the right.
+/// answer waits keeps it from being shown where it is written, and the device is told the
+/// outcome of its action is unknown. The same lease lets a fresh answer go with the question left
+/// out. The controls are a renewal that kept the right.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_retained_answer_written_under_a_replacement_lease_without_view_is_refused() {
+async fn a_retained_answer_written_under_a_replacement_lease_without_view_is_not_shown() {
     for (retained, renewed_in_time) in [(true, false), (true, true), (false, false)] {
         let temp = kr_ipc::testing::TempHost::create();
         let (continuous, wall, clocks) = super::super::tests::manual_clocks();
@@ -2309,12 +2466,14 @@ async fn a_retained_answer_written_under_a_replacement_lease_without_view_is_ref
                 assert!(shown.question().is_some());
             }
             // A replacement that dropped the view of the session: the retained answer is a read
-            // of a receipt over the session, which the lease no longer admits.
+            // of a receipt over the session, which the lease no longer admits. The answer is of an
+            // action that was taken, so the device is told its outcome is unknown and not that it
+            // was refused.
             (true, false) => {
                 let kr_protocol::envelope::Outcome::Error(error) = outcome else {
                     panic!("the lease no longer admits the read: {outcome:?}");
                 };
-                assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
+                assert_eq!(error.code, kr_protocol::error::ErrorCode::OutcomeUnknown);
             }
             // A fresh answer decided under `question.respond` alone still goes, and without the
             // question.
@@ -2834,7 +2993,13 @@ async fn a_connection_that_decided_a_request_under_a_share_resting_on_the_feed_i
         ] {
             let written = connection
                 .output()
-                .write_held(&batch(), &asked.decision.bounds(), None, Answers::Read, None)
+                .write_held(
+                    &batch(),
+                    &asked.decision.bounds(),
+                    None,
+                    Answers::Read,
+                    None,
+                )
                 .await;
             assert_eq!(written, written_after_the_removal);
         }
@@ -2948,7 +3113,8 @@ fn a_share_issued_under(
 
 /// An answer that fitted the frame a device can receive, until what names this host was taken out
 /// of it, is refused as too large and not written in a size the stream would end the connection
-/// for; a notification in the same case is not written, and the connection ends.
+/// for, unless it answers an action, which is told as an outcome that is unknown; a notification in
+/// the same case is not written, and the connection ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written() {
     use kr_protocol::envelope::{Notification, Outcome, ParamsValue, Response};
@@ -3030,6 +3196,25 @@ async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written(
     };
     assert_eq!(request_id, RequestId::new(9));
     assert_eq!(refused.code, kr_protocol::error::ErrorCode::InvalidArgument);
+    // The answer to an action is the worker's to have carried out, so the same limit does not
+    // tell the device that the action was refused. The control is the answer to a read, above.
+    let stream = HeldStream::new(false);
+    stream.writer.add_permits(2);
+    let limited = output_receiving(&controller, &stream, &receiving(answer_before));
+    assert_eq!(
+        limited
+            .write_held(&answer, &[], None, Answers::Action, None)
+            .await,
+        Written::Sent
+    );
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Error(unknown),
+        ..
+    }) = stream.frames().remove(0)
+    else {
+        panic!("the answer was written although it no longer fits");
+    };
+    assert_eq!(unknown.code, kr_protocol::error::ErrorCode::OutcomeUnknown);
     // A notification has no request to refuse, so the connection ends with nothing written.
     let limited = output_receiving(&controller, &stream, &receiving(notice_before));
     assert!(!limited.send(&notice).await);
