@@ -16,7 +16,7 @@ use crate::error::Result;
 
 use super::super::Retained;
 use super::decision::{Answered, Asked, unserved_change_set_method};
-use super::forwarding::RouteRefusal;
+use super::forwarding::{RouteRefusal, Seen};
 use super::{RemoteConnection, failure, outcome_not_shown, outcome_unknown};
 
 /// How long a caller waits for an effect the daemon owns before it is told the outcome is unknown.
@@ -558,12 +558,36 @@ impl RemoteConnection {
     }
 
     /// Serves one mutation, and keeps the decision it was taken under in `asked`.
+    ///
+    /// A refusal this host makes on its own account is worded here, once, for the request that
+    /// asked: a repeat of an action the host had already routed is not told it was refused
+    /// ([`Self::told_of_a_repeat`]). What a service, a record or a worker answers is the answer.
     async fn mutate_decided(
         &self,
         mutation: &MutationRequest,
         asked: &mut Option<Asked>,
         received_at: kr_transport::clock::ContinuousInstant,
     ) -> ControlFrame {
+        let seen = self.seen_on_arrival(mutation);
+        match self
+            .serve_mutation(mutation, asked, received_at, &seen)
+            .await
+        {
+            Ok(answer) => answer,
+            Err(refusal) => failure(mutation.request_id, self.told_of_a_repeat(&seen, refusal)),
+        }
+    }
+
+    /// Serves one mutation. `Err` is a refusal this host made on its own account, before or around
+    /// the lookup of the action's record or in the checks of its route; `Ok` is an answer, whether
+    /// it comes from a record, a service or a worker, and it is the answer's own word.
+    async fn serve_mutation(
+        &self,
+        mutation: &MutationRequest,
+        asked: &mut Option<Asked>,
+        received_at: kr_transport::clock::ContinuousInstant,
+        seen: &Seen,
+    ) -> std::result::Result<ControlFrame, ProtocolError> {
         // Section 9 measures a requested lifetime from *receipt* time, which is when the listener
         // read the frame ([`kr_transport::listener::ReceivedFrame`]), before anything that can
         // wait: the frame's wait behind an earlier turn of this connection, the registry's lock, a
@@ -572,16 +596,13 @@ impl RemoteConnection {
         // already spent part of it.
         let entry = match self.admit(mutation.method.as_str(), mutation.method_version) {
             Ok(entry) => entry,
-            Err(error) => return failure(mutation.request_id, error),
+            Err(error) => return Err(error),
         };
         if entry.effect != EffectClass::Write {
-            return failure(
-                mutation.request_id,
-                ProtocolError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("{} is a read and carries no action", entry.name),
-                ),
-            );
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                format!("{} is a read and carries no action", entry.name),
+            ));
         }
         // The registration first, before a retained result is looked up and before any effect is
         // considered. A revoked device gets no further dispatch, and it does not get its own
@@ -590,7 +611,7 @@ impl RemoteConnection {
         // section as that check.
         let validated = match self.admitted_at().await {
             Ok(validated) => validated,
-            Err(error) => return failure(mutation.request_id, error),
+            Err(error) => return Err(error),
         };
         // A retained action is answered before anything about a first admission is considered.
         // Applying the freshness window to a retry would refuse a caller its own completed result
@@ -602,7 +623,7 @@ impl RemoteConnection {
         // configured ceiling leave it. They are what the worker is told the host checked.
         let decided = match self.ask_mutation(mutation, entry) {
             Ok(decided) => decided,
-            Err(error) => return failure(mutation.request_id, error),
+            Err(error) => return Err(error),
         };
         *asked = Some(decided.clone());
         let rights = decided.decision.decided.permitted.rights.clone();
@@ -633,7 +654,7 @@ impl RemoteConnection {
         if held.is_none() && entry.method == Method::ChangesetMaterialize {
             match self.retained_materialisation(&actor_id, mutation).await {
                 Ok(retained) => held = retained,
-                Err(error) => return failure(mutation.request_id, error),
+                Err(error) => return Err(error),
             }
         }
         // A capture's, an apply's and a revert's record is the change-set service's own as well,
@@ -650,7 +671,7 @@ impl RemoteConnection {
                 .await
             {
                 Ok(retained) => held = retained,
-                Err(error) => return failure(mutation.request_id, error),
+                Err(error) => return Err(error),
             }
         }
         // An automation action's record is the workflow journal's, written in the transaction
@@ -713,16 +734,16 @@ impl RemoteConnection {
             // What this host holds is the outcome of an action. When it will not show the device
             // that outcome, it does not tell the device the action did not happen, or that it did.
             if self.admitted_to_answer(validated).is_err() {
-                return failure(mutation.request_id, outcome_not_shown());
+                return Err(outcome_not_shown());
             }
             // The daemon's own retained answer is a read of what an earlier submission produced,
             // and is written under the decision that read is ([`Self::read_of_retained`]).
             match self.read_of_retained(entry.method, mutation, &retained, &decided.acting) {
                 Ok(Some(read)) => *asked = Some(read),
                 Ok(None) => {}
-                Err(_) => return failure(mutation.request_id, outcome_not_shown()),
+                Err(_) => return Err(outcome_not_shown()),
             }
-            return retained;
+            return Ok(retained);
         }
         // A worker holds the receipts of its own actions, and the route says which worker. Section
         // 9 has an existing receipt readable under current authority after the window that
@@ -735,8 +756,8 @@ impl RemoteConnection {
                 #[cfg(feature = "testing")]
                 self.controller.after_the_retained_lookup.wait().await;
                 return match self.admitted_to_answer(validated) {
-                    Ok(()) => answered,
-                    Err(_) => failure(mutation.request_id, outcome_not_shown()),
+                    Ok(()) => Ok(answered),
+                    Err(_) => Err(outcome_not_shown()),
                 };
             }
             Ok(None) => {}
@@ -752,14 +773,14 @@ impl RemoteConnection {
             // so the stop is allowed to happen and the narrower check is the one that gives way.
             Err(RouteRefusal::Unavailable(error)) => {
                 if entry.method != Method::SessionClose {
-                    return failure(mutation.request_id, error);
+                    return Err(error);
                 }
             }
-            Err(RouteRefusal::Conflict(error)) => return failure(mutation.request_id, error),
+            Err(RouteRefusal::Conflict(error)) => return Err(error),
         }
         let accepted = match self.check_envelope(mutation, entry, received_at, &decided) {
             Ok(accepted) => accepted,
-            Err(error) => return failure(mutation.request_id, error),
+            Err(error) => return Err(error),
         };
         // The last check this connection's own turn makes before the effect is admitted. It
         // guarantees nothing about what happens next: it releases the connection table before it
@@ -778,10 +799,8 @@ impl RemoteConnection {
         // What this check does is keep an already-withdrawn connection from getting that far.
         // What this host reports meanwhile is the revocation as pending for a worker until it
         // acknowledges the revision.
-        if let Err(error) = self.authorised().await {
-            return failure(mutation.request_id, error);
-        }
-        match entry.method {
+        self.authorised().await?;
+        Ok(match entry.method {
             // The daemon's own effects. They run on a task that outlives this connection, because
             // dropping a future is a cancellation and a durable commit cannot be left half done
             // because a peer went away.
@@ -790,8 +809,8 @@ impl RemoteConnection {
                 // host named as the owner of what it produces. Without it, an identifier spent on
                 // a create would be free for a mutation on a worker, and section 9 makes
                 // `(verified actor, action)` one operation whoever ends up holding its receipt.
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -826,7 +845,7 @@ impl RemoteConnection {
                         &decided.acting,
                     ) {
                         Ok(read) => *asked = Some(read),
-                        Err(_) => return failure(request_id, outcome_not_shown()),
+                        Err(_) => return Err(outcome_not_shown()),
                     }
                 }
                 answer
@@ -839,25 +858,20 @@ impl RemoteConnection {
             Method::SessionClose => {
                 // A close opens a link of its own to the worker, so the route is refused here,
                 // before it claims an action, on a connection that serves the host alone.
-                if let Err(error) = self.check_worker_route() {
-                    return failure(mutation.request_id, error);
-                }
+                self.check_worker_route()?;
                 let Some(session_id) = mutation.target.session_id.as_ref().copied() else {
-                    return failure(
-                        mutation.request_id,
-                        ProtocolError::new(
-                            ErrorCode::InvalidArgument,
-                            "this mutation names the session it acts on",
-                        ),
-                    );
+                    return Err(ProtocolError::new(
+                        ErrorCode::InvalidArgument,
+                        "this mutation names the session it acts on",
+                    ));
                 };
                 // A conflicting identifier refuses the close; storage that cannot record the
                 // route does not. Section 7 has an authorised stop go ahead when storage fails,
                 // and the worker reports what its own durability then was.
-                match self.claim_route(mutation, Some(session_id)) {
+                match self.claim_route(mutation, Some(session_id), seen) {
                     Ok(()) | Err(RouteRefusal::Unavailable(_)) => {}
                     Err(RouteRefusal::Conflict(error)) => {
-                        return failure(mutation.request_id, error);
+                        return Err(error);
                     }
                 }
                 let controller = Arc::clone(&self.controller);
@@ -917,13 +931,13 @@ impl RemoteConnection {
                                     &decided.acting,
                                 ) {
                                     Ok(read) => *asked = Some(read),
-                                    Err(_) => return failure(request_id, outcome_not_shown()),
+                                    Err(_) => return Err(outcome_not_shown()),
                                 }
                             }
                         }
                         answer
                     }
-                    Ok(Ok(Err(error))) => failure(request_id, error.to_protocol_error()),
+                    Ok(Ok(Err(error))) => return Err(error.to_protocol_error()),
                     // The close is running on a task that outlives this connection, so a wait
                     // that ended says the outcome is not known rather than that it failed.
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
@@ -934,14 +948,12 @@ impl RemoteConnection {
             // worker proxy, and the admission travels with them so the service can ask about it
             // again after the waiting it does of its own.
             _ if crate::project::ProjectModule::serves(entry.method) => {
-                if let Err(error) = self.check_project_authority(entry.method, mutation) {
-                    return failure(mutation.request_id, error);
-                }
+                self.check_project_authority(entry.method, mutation)?;
                 // A project mutation claims its action identity the way every other mutation
                 // does, with this host named as the owner of what it produces. Storage that
                 // cannot record the route refuses it: only section 7's stop goes on without one.
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -987,11 +999,9 @@ impl RemoteConnection {
             // What a device may ask for is a version inside its grant, and what it is told is the
             // materialisation without the host path of its directory.
             Method::ChangesetMaterialize => {
-                if let Err(error) = self.check_materialisation(mutation).await {
-                    return failure(mutation.request_id, error);
-                }
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                self.check_materialisation(mutation).await?;
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -1023,19 +1033,15 @@ impl RemoteConnection {
             // it the owner. This replaces the refusal these three were given whatever the host
             // and the grant.
             Method::ChangesetCapture | Method::DiffApply | Method::DiffRevert => {
-                if let Err(error) = self
-                    .check_working_tree_request(
-                        entry.method,
-                        &mutation.params,
-                        &decided.acting,
-                        super::narrowing::Earlier::Nothing,
-                    )
-                    .await
-                {
-                    return failure(mutation.request_id, error);
-                }
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                self.check_working_tree_request(
+                    entry.method,
+                    &mutation.params,
+                    &decided.acting,
+                    super::narrowing::Earlier::Nothing,
+                )
+                .await?;
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -1063,10 +1069,9 @@ impl RemoteConnection {
             }
             // A change-set mutation the registry lists without a route above is refused rather
             // than handed to a worker, which does not own it.
-            _ if crate::changeset::ChangeSetModule::serves(entry.method) => failure(
-                mutation.request_id,
-                unserved_change_set_method(entry.method),
-            ),
+            _ if crate::changeset::ChangeSetModule::serves(entry.method) => {
+                return Err(unserved_change_set_method(entry.method));
+            }
             // The ten catalogue and plugin mutations. They are the daemon's own effect: a catalogue
             // and an installed package belong to the environment, so no worker owns them and the
             // module performs them under its own lock.
@@ -1076,8 +1081,8 @@ impl RemoteConnection {
                 // what a device that lost its connection has left to say the daemon owns the
                 // receipt. Storage that cannot record it refuses the mutation: only section 7's
                 // stop goes on without a route.
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let carried = crate::authority::AdmittedMutation {
                     connection_id: self.connection_id(),
@@ -1134,10 +1139,10 @@ impl RemoteConnection {
                 if let Err(error) =
                     crate::attention::AttentionModule::check_subject(entry.method, mutation)
                 {
-                    return failure(mutation.request_id, error.to_protocol_error());
+                    return Err(error.to_protocol_error());
                 }
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -1173,14 +1178,11 @@ impl RemoteConnection {
                 // it queued does not go on to write. A retry of a completed voice change is
                 // answered from its own record before the effect.
                 if self.controller.clock.now() >= accepted.deadline {
-                    return failure(
-                        mutation.request_id,
-                        ProtocolError::new(
-                            ErrorCode::PermissionDenied,
-                            "the deadline this action was admitted under passed before it could \
+                    return Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "the deadline this action was admitted under passed before it could \
                              run",
-                        ),
-                    );
+                    ));
                 }
                 let actor_id = self.device.principal();
                 // A voice mutation claims its action identity the way every other mutation does,
@@ -1188,8 +1190,8 @@ impl RemoteConnection {
                 // its own record of the answer, and this claim is what makes `(verified actor,
                 // action)` one key across every route: an identifier a voice mutation used is not
                 // free for a create or a close, and the other way round.
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 // The admission travels with the change, as it does with a project or an
                 // automation mutation, and the voice service asks it again where it writes.
@@ -1230,8 +1232,8 @@ impl RemoteConnection {
             // what it came to under the claim before it is answered, so a retry is answered from
             // that record.
             Method::SessionRename => {
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -1290,8 +1292,8 @@ impl RemoteConnection {
             // committed with its answer and answered on a task that outlives this connection, so
             // a retry is answered from that record.
             Method::GrantRedeem => {
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -1322,37 +1324,28 @@ impl RemoteConnection {
             // under.
             Method::GrantCreate | Method::GrantRevoke => {
                 if decided.acting.held != super::acting::Held::Share {
-                    return failure(
-                        mutation.request_id,
-                        ProtocolError::new(
-                            ErrorCode::PermissionDenied,
-                            "a device delegates from a share it holds, and its pairing grant is \
+                    return Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "a device delegates from a share it holds, and its pairing grant is \
                              not one",
-                        ),
-                    );
+                    ));
                 }
                 if entry.method == Method::GrantCreate {
                     let Ok(params) = mutation
                         .params
                         .to_typed::<kr_protocol::sharing::GrantCreateParams>()
                     else {
-                        return failure(
-                            mutation.request_id,
-                            ProtocolError::new(
-                                ErrorCode::InvalidArgument,
-                                "grant.create takes the parameters of a share",
-                            ),
-                        );
+                        return Err(ProtocolError::new(
+                            ErrorCode::InvalidArgument,
+                            "grant.create takes the parameters of a share",
+                        ));
                     };
                     if params.parent_grant_id.0 != Some(decided.acting.grant.grant_id) {
-                        return failure(
-                            mutation.request_id,
-                            ProtocolError::new(
-                                ErrorCode::PermissionDenied,
-                                "a delegation names the grant it is made from, and the request \
+                        return Err(ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "a delegation names the grant it is made from, and the request \
                                  acts under that grant",
-                            ),
-                        );
+                        ));
                     }
                     // The rights this request was decided with are the grant as this host's
                     // policy leaves it: its configured ceiling, and an organisation's lease where
@@ -1360,18 +1353,15 @@ impl RemoteConnection {
                     // either removed is not delegated, and the session text a share's preview
                     // carries is not read for a device that may not view the session.
                     if !params.selection.actions().is_subset(&rights) {
-                        return failure(
-                            mutation.request_id,
-                            ProtocolError::new(
-                                ErrorCode::PermissionDenied,
-                                "a delegation hands on no right that this host's policy removes \
+                        return Err(ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "a delegation hands on no right that this host's policy removes \
                                  from the grant it is made from",
-                            ),
-                        );
+                        ));
                     }
                 }
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -1402,8 +1392,8 @@ impl RemoteConnection {
             // step is claimed, written and its receipt kept on a task that outlives this
             // connection, so a retry is answered from that record.
             Method::MachineJoin | Method::MachineMerge | Method::MachineSplit => {
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -1428,18 +1418,15 @@ impl RemoteConnection {
             // connection that ends does not cut a presentation between its policy write and its
             // fence; the device that was not answered presents the same lease again.
             Method::MembershipPresent => {
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 if self.controller.clock.now() >= accepted.deadline {
-                    return failure(
-                        mutation.request_id,
-                        ProtocolError::new(
-                            ErrorCode::PermissionDenied,
-                            "the deadline this action was admitted under passed before it could \
+                    return Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "the deadline this action was admitted under passed before it could \
                              run",
-                        ),
-                    );
+                    ));
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -1459,8 +1446,8 @@ impl RemoteConnection {
                 settled(request_id, self.controller.within_effect_wait(effect).await)
             }
             Method::DevicePreviewKeyUpdate => {
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let actor_id = self.device.principal();
                 // A completed registration is answered from what it produced, before the deadline
@@ -1482,19 +1469,16 @@ impl RemoteConnection {
                     #[cfg(feature = "testing")]
                     self.controller.after_the_retained_lookup.wait().await;
                     return match self.admitted_to_answer(validated) {
-                        Ok(()) => answer,
-                        Err(_) => failure(mutation.request_id, outcome_not_shown()),
+                        Ok(()) => Ok(answer),
+                        Err(_) => Err(outcome_not_shown()),
                     };
                 }
                 if self.controller.clock.now() >= accepted.deadline {
-                    return failure(
-                        mutation.request_id,
-                        ProtocolError::new(
-                            ErrorCode::PermissionDenied,
-                            "the deadline this action was admitted under passed before it could \
+                    return Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "the deadline this action was admitted under passed before it could \
                              run",
-                        ),
-                    );
+                    ));
                 }
                 // The admission travels into the writes, as a key declaration's does: the stores
                 // ask about it again where they are written.
@@ -1523,19 +1507,16 @@ impl RemoteConnection {
             // after its window has closed. What reaches this arm is a first request or a copy of
             // one still running, which the claim in `push_register_action` answers.
             Method::DevicePushRegister => {
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let actor_id = self.device.principal();
                 if self.controller.clock.now() >= accepted.deadline {
-                    return failure(
-                        mutation.request_id,
-                        ProtocolError::new(
-                            ErrorCode::PermissionDenied,
-                            "the deadline this action was admitted under passed before it could \
+                    return Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "the deadline this action was admitted under passed before it could \
                              run",
-                        ),
-                    );
+                    ));
                 }
                 let carried = crate::authority::AdmittedMutation {
                     connection_id: self.connection_id(),
@@ -1560,8 +1541,8 @@ impl RemoteConnection {
             // transaction that writes the keys asks about it again and records the outcome beside
             // them, which is what a retry of this action is answered from.
             Method::DeviceKeysComplete => {
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let carried = crate::authority::AdmittedMutation {
                     connection_id: self.connection_id(),
@@ -1587,8 +1568,8 @@ impl RemoteConnection {
             // that act under the grant it holds, so a workflow cannot give it rights its grant
             // does not carry.
             _ if crate::automation::AutomationModule::serves(entry.method) => {
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -1627,18 +1608,15 @@ impl RemoteConnection {
             _ if super::super::methods::serves(entry.method) => {
                 // A pairing mutation claims its action identity the way every other mutation does,
                 // with this host named as the owner of what it produces.
-                if let Err(refusal) = self.claim_route(mutation, None) {
-                    return failure(mutation.request_id, refusal.into_error());
+                if let Err(refusal) = self.claim_route(mutation, None, seen) {
+                    return Err(refusal.into_error());
                 }
                 if self.controller.clock.now() >= accepted.deadline {
-                    return failure(
-                        mutation.request_id,
-                        ProtocolError::new(
-                            ErrorCode::PermissionDenied,
-                            "the deadline this action was admitted under passed before it could \
+                    return Err(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "the deadline this action was admitted under passed before it could \
                              run",
-                        ),
-                    );
+                    ));
                 }
                 let caller = super::super::owner::Caller::device(self.device.clone())
                     .confirming_the_clock_only(
@@ -1672,17 +1650,19 @@ impl RemoteConnection {
             }
             // Everything else belongs to the worker that owns the session.
             _ => {
-                self.proxied_mutation(
-                    mutation,
-                    accepted,
-                    validated,
-                    rights,
-                    &decided.acting,
-                    asked,
-                )
-                .await
+                return self
+                    .proxied_mutation(
+                        mutation,
+                        accepted,
+                        validated,
+                        rights,
+                        &decided.acting,
+                        asked,
+                        seen,
+                    )
+                    .await;
             }
-        }
+        })
     }
 }
 

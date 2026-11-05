@@ -34,10 +34,24 @@ impl Environment {
     /// Starts a daemon on a fresh environment, bootstraps its owner, stops it, starts a worker on
     /// the tree, and starts the daemon again, which adopts the worker.
     pub async fn start() -> Self {
+        Self::start_as(false).await
+    }
+
+    /// As [`Self::start`], for a session the registry also holds an open reservation of, as it
+    /// does for every session a daemon creates. A share or an offer of a session needs one.
+    pub async fn start_reserved() -> Self {
+        Self::start_as(true).await
+    }
+
+    async fn start_as(reserved: bool) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = Host::start(&owner).await;
         let stopped = host.shut_down().await;
-        let worker = Worker::start(stopped.tree(), 1).await;
+        let worker = if reserved {
+            Worker::start_reserved(stopped.tree(), 1).await
+        } else {
+            Worker::start(stopped.tree(), 1).await
+        };
         let settings = stopped.settings().clone();
         let host = stopped.start(settings).await;
         let environment = Self {

@@ -1855,7 +1855,9 @@ async fn action_read_says_how_to_obtain_an_outcome_this_host_owns() {
         .expect_err("this host keeps no receipt for an action of its own");
     assert_eq!(refused.code(), ErrorCode::InvalidArgument);
     assert!(
-        refused.to_string().contains("submit the action again"),
+        refused
+            .to_string()
+            .contains("submit the same request again"),
         "the refusal says how the outcome is obtained: {refused}"
     );
 

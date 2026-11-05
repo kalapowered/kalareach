@@ -264,16 +264,11 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
             with_voice.clone(),
             &connection.pairing_acting(),
             &mut None,
+            &super::forwarding::Seen::new(false),
         )
         .await;
     assert!(
-        matches!(
-            &refused,
-            ControlFrame::Response(kr_protocol::envelope::Response {
-                outcome: kr_protocol::envelope::Outcome::Error(error),
-                ..
-            }) if error.message.contains("never travels to a worker")
-        ),
+        matches!(&refused, Err(error) if error.message.contains("never travels to a worker")),
         "the proxy refuses a voice right: {refused:?}"
     );
     let mut held = controller
@@ -2038,7 +2033,11 @@ async fn a_receipt_lookup_waiting_for_the_workers_link_is_refused_once_a_feed_re
         let close = fake::close_request(world.environment_id, world.session_id);
         assert!(
             connection
-                .claim_route(&close, Some(world.session_id))
+                .claim_route(
+                    &close,
+                    Some(world.session_id),
+                    &super::forwarding::Seen::new(false)
+                )
                 .is_ok(),
             "the route of the close is on record"
         );
@@ -2496,7 +2495,11 @@ async fn a_device_that_reads_a_closed_session_is_told_it_closed_and_not_that_it_
     let close = fake::close_request(controller.paths().environment_id(), world.session_id);
     assert!(
         super::RemoteConnection::for_test(controller, device.clone())
-            .claim_route(&close, Some(world.session_id))
+            .claim_route(
+                &close,
+                Some(world.session_id),
+                &super::forwarding::Seen::new(false)
+            )
             .is_ok(),
         "the route of the close is on record"
     );
@@ -2564,7 +2567,11 @@ async fn a_replacement_daemon_settles_a_devices_retried_close_from_the_workers_r
     let close = fake::close_request(world.environment_id, world.session_id);
     assert!(
         connection
-            .claim_route(&close, Some(world.session_id))
+            .claim_route(
+                &close,
+                Some(world.session_id),
+                &super::forwarding::Seen::new(false)
+            )
             .is_ok(),
         "the route of the close is on record"
     );
@@ -4874,7 +4881,11 @@ async fn kr_req_10_49_a_retried_close_is_answered_and_the_kept_answer_is_settled
     let close = fake::close_request(world.environment_id, world.session_id);
     assert!(
         connection
-            .claim_route(&close, Some(world.session_id))
+            .claim_route(
+                &close,
+                Some(world.session_id),
+                &super::forwarding::Seen::new(false)
+            )
             .is_ok(),
         "the route of the close is on record"
     );
@@ -4929,7 +4940,11 @@ async fn kr_req_10_49_a_kept_close_result_that_does_not_read_is_not_passed_on() 
     let close = fake::close_request(world.environment_id, world.session_id);
     assert!(
         connection
-            .claim_route(&close, Some(world.session_id))
+            .claim_route(
+                &close,
+                Some(world.session_id),
+                &super::forwarding::Seen::new(false)
+            )
             .is_ok(),
         "the route of the close is on record"
     );
@@ -5033,7 +5048,11 @@ async fn kr_req_10_49_a_kept_result_is_not_shown_to_a_device() {
     );
     assert!(
         connection
-            .claim_route(&prompt, Some(world.session_id))
+            .claim_route(
+                &prompt,
+                Some(world.session_id),
+                &super::forwarding::Seen::new(false)
+            )
             .is_ok(),
         "the route of the prompt is on record"
     );
@@ -5096,7 +5115,11 @@ async fn kr_req_10_49_a_kept_answer_that_does_not_read_in_the_workers_level_is_n
         );
         assert!(
             connection
-                .claim_route(&prompt, Some(world.session_id))
+                .claim_route(
+                    &prompt,
+                    Some(world.session_id),
+                    &super::forwarding::Seen::new(false)
+                )
                 .is_ok(),
             "the route of the prompt is on record"
         );
@@ -5225,7 +5248,11 @@ async fn kr_req_23_34_a_close_is_made_for_a_caller_that_may_not_read_its_receipt
         );
         assert!(
             connection
-                .claim_route(&close, Some(world.session_id))
+                .claim_route(
+                    &close,
+                    Some(world.session_id),
+                    &super::forwarding::Seen::new(false)
+                )
                 .is_ok(),
             "the route of the close is on record"
         );
@@ -5519,7 +5546,11 @@ async fn kr_req_23_34_an_action_read_by_identifier_is_about_the_session_its_rout
     );
     assert!(
         connection
-            .claim_route(&close, Some(world.session_id))
+            .claim_route(
+                &close,
+                Some(world.session_id),
+                &super::forwarding::Seen::new(false)
+            )
             .is_ok(),
         "the route of the close is on record"
     );
@@ -5566,7 +5597,11 @@ async fn kr_req_23_34_a_retry_of_an_action_other_than_a_close_is_not_answered_to
     );
     assert!(
         connection
-            .claim_route(&prompt, Some(world.session_id))
+            .claim_route(
+                &prompt,
+                Some(world.session_id),
+                &super::forwarding::Seen::new(false)
+            )
             .is_ok(),
         "the route of the prompt is on record"
     );
@@ -5793,7 +5828,11 @@ async fn a_retry_answered_from_the_workers_receipt_is_not_answered_when_a_fence_
     let close = fake::close_request(world.environment_id, world.session_id);
     assert!(
         connection
-            .claim_route(&close, Some(world.session_id))
+            .claim_route(
+                &close,
+                Some(world.session_id),
+                &super::forwarding::Seen::new(false)
+            )
             .is_ok(),
         "the route of the close is on record"
     );
@@ -6153,4 +6192,179 @@ async fn a_key_registration_recorded_after_the_first_lookup_is_not_answered_when
         again.frame()
     );
     world.serving.abort();
+}
+
+/// A repeat is the device's own route for the action id, with the same request. A refusal the host
+/// makes of one on its own account is told as an unknown outcome, because the copy that went before
+/// may have been carried out; a request the host never routed is refused as ever. This serves one
+/// mutation of a device, routed beforehand when `routed` says so (to its session, or to no session
+/// for an action the host owns the receipt of), after `prepare` has changed the world, and returns
+/// the refusal the device is told.
+async fn a_mutation_refused(
+    method: Method,
+    routed: Option<bool>,
+    byte: u8,
+    shape: impl FnOnce(&mut MutationRequest),
+    prepare: impl AsyncFnOnce(
+        &crate::service::a_close_a_worker_never_answers::Silent,
+        &super::RemoteConnection,
+    ),
+) -> kr_protocol::error::ProtocolError {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let connection = super::RemoteConnection::for_test(
+        controller,
+        paired(controller, byte, |grant| {
+            grant.actions = [
+                ActionRight::SessionView,
+                ActionRight::AgentPrompt,
+                ActionRight::SessionRename,
+            ]
+            .into_iter()
+            .collect();
+        }),
+    );
+    let mut mutation = device_mutation(&world, &connection, method, 91, ParamsValue::empty());
+    if method == Method::SessionRename {
+        mutation.params = ParamsValue::from_typed(&kr_protocol::describe::SessionRenameParams {
+            session_id: world.session_id,
+            title: Nullable::some("a name".to_owned()),
+        })
+        .expect("encodes");
+    }
+    shape(&mut mutation);
+    if let Some(to_its_session) = routed {
+        let session = to_its_session.then_some(world.session_id);
+        assert!(
+            connection
+                .claim_route(&mutation, session, &super::forwarding::Seen::new(false))
+                .is_ok(),
+            "the route of the action is on record"
+        );
+    }
+    prepare(&world, &connection).await;
+    let answered = connection
+        .answer_now(ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .expect("the mutation is answered");
+    let error = error_of(answered.frame()).clone();
+    world.serving.abort();
+    error
+}
+
+/// A device whose registration was withdrawn after it sent an action is not told the action it
+/// presents again was refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_on_a_connection_whose_registration_was_withdrawn_is_told_the_outcome_is_unknown()
+{
+    use kr_protocol::error::ErrorCode;
+
+    for (routed, expected) in [
+        (Some(true), ErrorCode::OutcomeUnknown),
+        (None, ErrorCode::PermissionDenied),
+    ] {
+        let error = a_mutation_refused(
+            Method::AgentPromptSubmit,
+            routed,
+            71,
+            |_| {},
+            async |world, connection| {
+                world
+                    .controller
+                    .admitted_write()
+                    .remove(&connection.connection_id());
+            },
+        )
+        .await;
+        assert_eq!(error.code, expected, "routed {routed:?}: {error}");
+    }
+}
+
+/// An action whose receipt the host owns, with no record of it yet, presented again under a window
+/// this connection was never issued, is told as unknown; the same request, never routed, is refused
+/// for the window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_of_an_action_the_host_owns_is_told_the_outcome_is_unknown_when_its_window_is_not_held()
+ {
+    use kr_protocol::error::ErrorCode;
+
+    for (routed, expected) in [
+        (Some(false), ErrorCode::OutcomeUnknown),
+        (None, ErrorCode::PermissionDenied),
+    ] {
+        let error = a_mutation_refused(
+            Method::SessionRename,
+            routed,
+            72,
+            |mutation| {
+                mutation.action_window_id =
+                    kr_protocol::ids::ActionWindowId::new("elsewhere").expect("a window");
+            },
+            async |_, _| {},
+        )
+        .await;
+        assert_eq!(error.code, expected, "routed {routed:?}: {error}");
+    }
+}
+
+/// A worker's refusal of a repeat that is not read from a receipt says nothing of the copy that
+/// went before: it checks the authority before it looks for the receipt. The repeat is told the
+/// outcome is unknown, and the same request never routed is told the worker's word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_the_worker_refuses_without_a_receipt_is_told_the_outcome_is_unknown() {
+    use kr_protocol::error::ErrorCode;
+
+    for (routed, expected) in [
+        (Some(true), ErrorCode::OutcomeUnknown),
+        (None, ErrorCode::ResourceUnavailable),
+    ] {
+        let error = a_mutation_refused(
+            Method::AgentPromptSubmit,
+            routed,
+            73,
+            |_| {},
+            async |_, _| {},
+        )
+        .await;
+        assert_eq!(error.code, expected, "routed {routed:?}: {error}");
+    }
+}
+
+/// The session an action went to has closed, and the repeat arrives under the window its own
+/// connection holds, so only the worker's absence refuses it. It is told the outcome is unknown,
+/// and a prompt never routed is told the session is closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_to_a_session_that_has_closed_is_told_the_outcome_is_unknown() {
+    use kr_protocol::error::ErrorCode;
+
+    for (routed, expected) in [
+        (Some(true), ErrorCode::OutcomeUnknown),
+        (None, ErrorCode::SessionClosed),
+    ] {
+        let error = a_mutation_refused(
+            Method::AgentPromptSubmit,
+            routed,
+            75,
+            |_| {},
+            async |world, _| {
+                world
+                    .controller
+                    .retire(
+                        &crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of(
+                            world.session_id,
+                        ),
+                    )
+                    .await
+                    .expect("the closure is recorded");
+            },
+        )
+        .await;
+        assert_eq!(error.code, expected, "routed {routed:?}: {error}");
+    }
 }
