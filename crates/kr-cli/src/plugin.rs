@@ -302,12 +302,24 @@ const fn time_left(expires_at_ms: u64, now_ms: u64) -> tokio::time::Duration {
 /// did not answer may have been performed, so its end says the outcome is not known and never that
 /// nothing was changed. That is no refusal, because the host refused nothing: it ends the command
 /// as an unfinished request.
+///
+/// The host spends the owner device's answer before it performs the request, so a refusal for now
+/// can come after the spend, and then the next request is told that the owner has to confirm
+/// again, though no owner device can answer a challenge the host has spent. When that follows a
+/// refusal for now, `challenge_stands` is asked, within the same bound as a request, and unless it
+/// says the host still lists the challenge the earlier refusal is the command's end: it is what
+/// stopped the request, and waiting on would only end at the deadline with a cause that is not
+/// the real one. A host that does not say what it lists is not waited on either, and the earlier
+/// refusal, which is its real word, ends the wait.
 async fn wait_for_an_owner_device<T>(
     deadline: tokio::time::Instant,
     grace: tokio::time::Duration,
     poll: tokio::time::Duration,
     mut ask: impl AsyncFnMut() -> Result<T>,
+    mut challenge_stands: impl AsyncFnMut() -> bool,
 ) -> Result<T> {
+    // The refusal for now the newest request met, until the next one is answered.
+    let mut for_now: Option<kr_protocol::error::ProtocolError> = None;
     loop {
         let answered = tokio::time::timeout_at(deadline + grace, ask()).await;
         match answered {
@@ -324,6 +336,14 @@ async fn wait_for_an_owner_device<T>(
             Ok(Err(CliError::Refused(refused)))
                 if refused.code == ErrorCode::OwnerConfirmationRequired =>
             {
+                if let Some(earlier) = for_now.take()
+                    && !matches!(
+                        tokio::time::timeout_at(deadline + grace, challenge_stands()).await,
+                        Ok(true)
+                    )
+                {
+                    return Err(CliError::Refused(earlier));
+                }
                 let now = tokio::time::Instant::now();
                 if now >= deadline {
                     return Err(CliError::Refused(refusal(
@@ -359,6 +379,7 @@ async fn wait_for_an_owner_device<T>(
                 if now >= deadline {
                     return Err(CliError::Refused(refused));
                 }
+                for_now = Some(refused.clone());
                 tokio::time::sleep(poll.min(deadline - now)).await;
                 if tokio::time::Instant::now() >= deadline {
                     return Err(CliError::Refused(refused));
@@ -379,6 +400,26 @@ async fn wait_for_an_owner_device<T>(
                 });
             }
         }
+    }
+}
+
+/// Whether the host says it still lists the challenge `request` among those an owner device can
+/// answer. An answer the host does not give says nothing of it, and is no reason to wait on.
+async fn still_listed(
+    daemon: &mut Daemon,
+    request: &kr_protocol::pairing::OwnerConfirmationRequest,
+) -> bool {
+    match ask_within(daemon.read::<_, OwnerConfirmationPendingResult>(
+        Method::OwnerConfirmationPending,
+        &OwnerConfirmationPendingParams {},
+    ))
+    .await
+    {
+        Ok(pending) => pending
+            .pending
+            .iter()
+            .any(|listed| listed.request == *request),
+        Err(_) => false,
     }
 }
 
@@ -438,11 +479,15 @@ where
             remaining(expires_at_ms, kr_ipc::now_ms().get())
         ));
     }
-    let answer =
-        wait_for_an_owner_device(deadline, PERFORM_WITHIN, OWNER_DEVICE_POLL, async || {
-            daemon.mutate::<P, T>(method, params).await
-        })
-        .await?;
+    let daemon = tokio::sync::Mutex::new(daemon);
+    let answer = wait_for_an_owner_device(
+        deadline,
+        PERFORM_WITHIN,
+        OWNER_DEVICE_POLL,
+        async || daemon.lock().await.mutate::<P, T>(method, params).await,
+        async || still_listed(&mut **daemon.lock().await, &challenge.request).await,
+    )
+    .await?;
     Ok((answer, challenge.request))
 }
 
@@ -957,20 +1002,31 @@ mod tests {
         tokio::time::Duration::from_millis(5)
     }
 
+    /// The host still lists the challenge among those an owner device can answer.
+    async fn standing() -> bool {
+        true
+    }
+
     /// KR-REQ-07.47: the request is repeated, with nothing added, until the host spends an owner
     /// device's answer, and the result is the host's own.
     #[tokio::test(start_paused = true)]
     async fn a_request_is_repeated_until_the_host_spends_the_answer() {
         let asks = Asks::default();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
-        let done: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
-            asks.note();
-            if asks.count() < 3 {
-                Err(needs_the_owner())
-            } else {
-                Ok(7)
-            }
-        })
+        let done: Result<u32> = wait_for_an_owner_device(
+            deadline,
+            short(),
+            short(),
+            async || {
+                asks.note();
+                if asks.count() < 3 {
+                    Err(needs_the_owner())
+                } else {
+                    Ok(7)
+                }
+            },
+            standing,
+        )
         .await;
         assert!(matches!(done, Ok(7)));
         assert_eq!(asks.count(), 3);
@@ -984,10 +1040,16 @@ mod tests {
         let asks = Asks::default();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(60);
         let started = tokio::time::Instant::now();
-        let ended: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
-            asks.note();
-            Err(needs_the_owner())
-        })
+        let ended: Result<u32> = wait_for_an_owner_device(
+            deadline,
+            short(),
+            short(),
+            async || {
+                asks.note();
+                Err(needs_the_owner())
+            },
+            standing,
+        )
         .await;
         let Err(CliError::Refused(refused)) = ended else {
             panic!("a refusal");
@@ -1012,10 +1074,16 @@ mod tests {
     async fn a_challenge_that_has_ended_is_asked_once() {
         let asks = Asks::default();
         let deadline = tokio::time::Instant::now();
-        let ended: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
-            asks.note();
-            Err(needs_the_owner())
-        })
+        let ended: Result<u32> = wait_for_an_owner_device(
+            deadline,
+            short(),
+            short(),
+            async || {
+                asks.note();
+                Err(needs_the_owner())
+            },
+            standing,
+        )
         .await;
         assert!(matches!(ended, Err(CliError::Refused(_))));
         assert_eq!(asks.count(), 1);
@@ -1036,24 +1104,36 @@ mod tests {
         };
         let asks = Asks::default();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
-        let done: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
-            asks.note();
-            if asks.count() < 3 {
-                Err(for_now())
-            } else {
-                Ok(7)
-            }
-        })
+        let done: Result<u32> = wait_for_an_owner_device(
+            deadline,
+            short(),
+            short(),
+            async || {
+                asks.note();
+                if asks.count() < 3 {
+                    Err(for_now())
+                } else {
+                    Ok(7)
+                }
+            },
+            standing,
+        )
         .await;
         assert!(matches!(done, Ok(7)));
         assert_eq!(asks.count(), 3, "asked again until the host could take it");
 
         let asks = Asks::default();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(60);
-        let ended: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
-            asks.note();
-            Err(for_now())
-        })
+        let ended: Result<u32> = wait_for_an_owner_device(
+            deadline,
+            short(),
+            short(),
+            async || {
+                asks.note();
+                Err(for_now())
+            },
+            standing,
+        )
         .await;
         let Err(CliError::Refused(last)) = ended else {
             panic!("the last refusal ends the wait");
@@ -1084,6 +1164,7 @@ mod tests {
                     Shown::said("this device may not"),
                 )))
             },
+            standing,
         )
         .await;
         assert!(
@@ -1103,6 +1184,7 @@ mod tests {
                     Shown::said("the host cannot tell whether it performed the request"),
                 )))
             },
+            standing,
         )
         .await;
         assert!(
@@ -1112,6 +1194,119 @@ mod tests {
             asks.count(),
             1,
             "a request that may have been performed is not made again"
+        );
+    }
+
+    /// KR-REQ-07.47: the host spends an owner device's answer before it performs the request, so a
+    /// request can be refused for now after the spend, and the next one is told that the owner has
+    /// to confirm, though no owner device can answer a challenge the host has spent. When the host
+    /// no longer lists the challenge, the refusal for now ends the wait at once, as itself, and not
+    /// at the deadline with a cause that is not the real one. The control is a challenge the host
+    /// still lists, which is the owner not having answered yet: the wait goes on, and lands.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_for_now_after_the_confirmation_was_spent_ends_the_wait_with_that_refusal() {
+        let for_now = || {
+            CliError::Refused(refusal(
+                ErrorCode::StorageUnavailable,
+                Shown::said("the host cannot record it now"),
+            ))
+        };
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+
+        let asks = Asks::default();
+        let consulted = Asks::default();
+        let ended: Result<u32> = wait_for_an_owner_device(
+            deadline,
+            short(),
+            short(),
+            async || {
+                asks.note();
+                if asks.count() == 1 {
+                    Err(for_now())
+                } else {
+                    Err(needs_the_owner())
+                }
+            },
+            async || {
+                consulted.note();
+                false
+            },
+        )
+        .await;
+        let Err(CliError::Refused(last)) = ended else {
+            panic!("the refusal for now ends the wait");
+        };
+        assert_eq!(last.code, ErrorCode::StorageUnavailable);
+        assert_eq!(
+            asks.count(),
+            2,
+            "the request told to confirm again was the last"
+        );
+        assert_eq!(
+            consulted.count(),
+            1,
+            "the host was asked what it lists once"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the wait did not run to the deadline"
+        );
+
+        let asks = Asks::default();
+        let consulted = Asks::default();
+        let done: Result<u32> = wait_for_an_owner_device(
+            deadline,
+            short(),
+            short(),
+            async || {
+                asks.note();
+                match asks.count() {
+                    1 => Err(for_now()),
+                    2 | 3 => Err(needs_the_owner()),
+                    _ => Ok(7),
+                }
+            },
+            async || {
+                consulted.note();
+                true
+            },
+        )
+        .await;
+        assert!(matches!(done, Ok(7)), "the owner had not answered yet");
+        assert_eq!(asks.count(), 4);
+        assert_eq!(
+            consulted.count(),
+            1,
+            "only the request that follows a refusal for now asks what the host lists"
+        );
+
+        // A host that never says what it lists is not waited on: the refusal ends the wait, at the
+        // bound a request has and no later.
+        let started = tokio::time::Instant::now();
+        let asks = Asks::default();
+        let silent: Result<u32> = wait_for_an_owner_device(
+            started + tokio::time::Duration::from_millis(20),
+            short(),
+            short(),
+            async || {
+                asks.note();
+                if asks.count() == 1 {
+                    Err(for_now())
+                } else {
+                    Err(needs_the_owner())
+                }
+            },
+            std::future::pending::<bool>,
+        )
+        .await;
+        let Err(CliError::Refused(last)) = silent else {
+            panic!("the refusal for now ends the wait");
+        };
+        assert_eq!(last.code, ErrorCode::StorageUnavailable);
+        assert_eq!(
+            started.elapsed(),
+            tokio::time::Duration::from_millis(25),
+            "the wait ended at the deadline and the bound beyond it, on the paused clock"
         );
     }
 
@@ -1129,7 +1324,13 @@ mod tests {
         // The outer bound is the test's own: a request that is never given up never ends.
         let silent = tokio::time::timeout(
             tokio::time::Duration::from_secs(60),
-            wait_for_an_owner_device::<u32>(deadline, grace, short(), std::future::pending),
+            wait_for_an_owner_device::<u32>(
+                deadline,
+                grace,
+                short(),
+                std::future::pending,
+                standing,
+            ),
         )
         .await
         .expect("the wait ended at its own bound");
@@ -1157,6 +1358,7 @@ mod tests {
                     tokio::time::sleep(tokio::time::Duration::from_millis(after)).await;
                     Ok(7)
                 },
+                standing,
             )
             .await;
             assert_eq!(slow.is_ok(), taken, "an answer after {after} ms");
@@ -1174,6 +1376,7 @@ mod tests {
                     Shown::said("past a budget"),
                 )))
             },
+            standing,
         )
         .await;
         let Err(CliError::Refused(refused)) = other else {
@@ -1227,8 +1430,14 @@ mod tests {
             || CliError::Other(Shown::said("the host's answer could not be read")),
         ];
         for failure in failures {
-            let ended: Result<u32> =
-                wait_for_an_owner_device(deadline, short(), short(), async || Err(failure())).await;
+            let ended: Result<u32> = wait_for_an_owner_device(
+                deadline,
+                short(),
+                short(),
+                async || Err(failure()),
+                standing,
+            )
+            .await;
             let Err(unknown @ CliError::Unfinished { .. }) = ended else {
                 panic!("an unfinished request that says the outcome is not known");
             };
@@ -1238,12 +1447,18 @@ mod tests {
             assert!(said.contains("not known"), "{said}");
             assert!(!said.contains("Nothing was changed"), "{said}");
         }
-        let other: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
-            Err(CliError::Refused(refusal(
-                ErrorCode::QuotaExceeded,
-                Shown::said("past a budget"),
-            )))
-        })
+        let other: Result<u32> = wait_for_an_owner_device(
+            deadline,
+            short(),
+            short(),
+            async || {
+                Err(CliError::Refused(refusal(
+                    ErrorCode::QuotaExceeded,
+                    Shown::said("past a budget"),
+                )))
+            },
+            standing,
+        )
         .await;
         let Err(CliError::Refused(refused)) = other else {
             panic!("a refusal");
