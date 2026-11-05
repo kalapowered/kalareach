@@ -172,6 +172,9 @@ pub struct CompilePool {
     hold: Arc<HoldState>,
     #[cfg(feature = "testing")]
     counts: Arc<Counts>,
+    /// Whether the next compile a pool thread takes up panics instead of running.
+    #[cfg(test)]
+    panics: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Who is waiting for a compile.
@@ -390,6 +393,8 @@ impl CompilePool {
             hold,
             #[cfg(feature = "testing")]
             counts,
+            #[cfg(test)]
+            panics: Arc::default(),
         }
     }
 
@@ -402,6 +407,14 @@ impl CompilePool {
         CompileHold {
             state: Arc::clone(&self.hold),
         }
+    }
+
+    /// Makes the next compile a pool thread takes up panic where it would compile, for the case
+    /// that shows what a compiler that panics comes to: the panic is inside the job that
+    /// [`Self::submit`] queues, where a compiler's would be.
+    #[cfg(test)]
+    fn panic_in_the_next_compile(&self) {
+        self.panics.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Whether a hold on the pool's jobs stands.
@@ -493,13 +506,21 @@ impl CompilePool {
         let hold = Arc::clone(&self.hold);
         #[cfg(feature = "testing")]
         let counts = Arc::clone(&self.counts);
+        #[cfg(test)]
+        let panics = Arc::clone(&self.panics);
         let job = Job(Box::new(move || {
             #[cfg(feature = "testing")]
             {
                 counts.compiles.fetch_add(1, Ordering::SeqCst);
                 hold.wait_until_released();
             }
-            let outcome = caught(|| compile_or_load_keyed(&engine, &cache, &wasm, key, budget));
+            let outcome = caught(|| {
+                #[cfg(test)]
+                if panics.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    panic!("the compiler fell over");
+                }
+                compile_or_load_keyed(&engine, &cache, &wasm, key, budget)
+            });
             // The requests that joined are answered alike, with the component or with why there is
             // none. Ending the compile after it filed its result means a request that comes after
             // this finds the result in the cache, where filing it succeeded.
@@ -518,23 +539,6 @@ impl CompilePool {
             }
             return Err(refused);
         }
-        Ok(wait)
-    }
-
-    /// Queues one piece of work for a pool thread and returns a receiver for what it comes to.
-    #[cfg(test)]
-    fn submit_work(
-        &self,
-        work: impl FnOnce() -> RuntimeResult<Compiled> + Send + 'static,
-    ) -> RuntimeResult<tokio::sync::oneshot::Receiver<RuntimeResult<Compiled>>> {
-        #[cfg(feature = "testing")]
-        let hold = Arc::clone(&self.hold);
-        let (answer, wait) = tokio::sync::oneshot::channel();
-        self.enqueue(Job(Box::new(move || {
-            #[cfg(feature = "testing")]
-            hold.wait_until_released();
-            let _ = answer.send(caught(work));
-        })))?;
         Ok(wait)
     }
 
@@ -862,29 +866,86 @@ mod tests {
         assert!(matches!(error, RuntimeError::InvalidComponent { .. }));
     }
 
-    #[test]
-    fn a_compile_that_panics_is_refused_and_leaves_the_pool_serving_the_next_one() {
-        let pool = CompilePool::with_threads(1, 2);
-        let panicked = pool
-            .submit_work(|| panic!("the compiler fell over"))
-            .expect("the work is queued");
-        // Behind it on the pool's only thread: it runs only if that thread is still there. A lost
-        // thread drops the queue, and this job and its sender with it, so the wait ends in an
-        // error and the case fails instead of being held.
-        let (ran, next) = mpsc::channel::<()>();
-        pool.sender
-            .try_send(Job(Box::new(move || {
-                let _ = ran.send(());
-            })))
-            .expect("the next job is queued");
-        next.recv_timeout(POOL_WAIT)
-            .expect("the pool thread survived the panic");
-        match panicked.blocking_recv().expect("the caller is answered") {
+    /// Waits for a compile's answer, however long that takes. A pool whose thread was lost drops
+    /// the job and with it the answer's sender, so the wait ends in an error then; the guard ends
+    /// only a compile that is never answered.
+    fn answer_of(
+        wait: tokio::sync::oneshot::Receiver<RuntimeResult<Compiled>>,
+    ) -> RuntimeResult<Compiled> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("an executor")
+            .block_on(async move { tokio::time::timeout(POOL_WAIT, wait).await })
+            .expect("the compile was answered")
+            .expect("the compile's answer was not dropped")
+    }
+
+    fn refusal_of_the_panic(answer: RuntimeResult<Compiled>) {
+        match answer {
             Err(RuntimeError::InvalidComponent { detail }) => {
                 assert!(detail.contains("the compiler fell over"), "{detail}");
             }
-            other => panic!("the caller was told {other:?}"),
+            other => panic!("the request was answered {other:?}"),
         }
+    }
+
+    // A compiler that panics refuses the component to everyone who is waiting for it, ends the
+    // compile it was in, and leaves the pool serving the next one.
+    //
+    // The compile is queued by the pool's own submission, which is what a registration queues it
+    // with, and the panic is inside the job that submission makes. A second request for the same
+    // component joins it while the pool's only thread is held. After the panic the same component is
+    // asked for again: that is a compile of its own and not a join to the one that ended, and the
+    // thread that took the panic is the one that compiles it.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_compile_that_panics_is_refused_to_everyone_waiting_for_it_and_the_pool_serves_the_next() {
+        let pool = CompilePool::with_threads(1, COMPILE_QUEUE);
+        let engine = RuntimeEngine::new().expect("an engine");
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let cache = CompiledCache::open(directory.path().join("cache")).expect("a cache");
+        let component: Arc<[u8]> = Arc::from(&b"\0asm\x0d\0\x01\0"[..]);
+        let submit = || {
+            pool.submit(
+                &engine,
+                &cache,
+                Arc::clone(&component),
+                CompileBudget::defaults(),
+            )
+        };
+
+        pool.panic_in_the_next_compile();
+        let hold = pool.hold();
+        let queued = submit().expect("the compile is queued");
+        let mut joined = submit().expect("a request for the same component joins it");
+        assert_eq!(pool.requests_joined(), 1);
+        drop(hold);
+
+        refusal_of_the_panic(answer_of(queued));
+
+        let again =
+            submit().expect("a request after the compile ended queues a compile of its own");
+        assert_eq!(
+            pool.requests_joined(),
+            1,
+            "a request after the compile ended joined it"
+        );
+        // The component has nothing in it, so the compiler takes it and the contract's check
+        // refuses it: an answer that only a compile that ran can give.
+        assert!(
+            matches!(answer_of(again), Err(RuntimeError::MissingExport { .. })),
+            "the thread that took the panic did not compile the next request"
+        );
+        assert_eq!(pool.compiles_started(), 2);
+
+        // The pool's only thread answers in the order it was asked, so what joined the first
+        // compile has been answered by now.
+        refusal_of_the_panic(
+            joined
+                .try_recv()
+                .expect("the request that joined the compile was answered"),
+        );
     }
 
     #[test]
