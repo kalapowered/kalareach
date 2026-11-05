@@ -233,8 +233,8 @@ fn the_console_resizes_and_the_application_reads_the_new_geometry() {
 }
 
 /// KR-ACC-010, the part about draining: a shell that writes two hundred lines and exits at once
-/// leaves every line to be read after it has gone, the first and the last included. Not shown here:
-/// the other parts of the row.
+/// has its first line and its last in the output drained until it ends. Not shown here: that every
+/// line between them is present, reading only after the exit, and the other parts of the row.
 #[test]
 fn everything_the_application_wrote_is_still_there_to_read_after_it_has_gone() {
     // The shell writes a lot and exits at once. Draining after its exit has to produce every line:
@@ -529,7 +529,7 @@ fn the_job_holds_the_shell_and_every_process_it_starts() {
 /// process on one open handle that also gives its creation time. A process outside the job is a
 /// stranger however it came to be listed, and is not recorded.
 #[test]
-fn the_job_names_its_members_by_the_handle_it_asked_and_refuses_a_stranger(/* KR-REQ-07.66 */) {
+fn the_job_names_its_members_by_the_handle_it_asked_and_refuses_a_stranger() {
     use kr_worker::windows::job::MemberReading;
 
     let (_pty, _reader, mut shell) = powershell_in_a_console("Start-Sleep -Seconds 120");

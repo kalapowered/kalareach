@@ -1782,8 +1782,8 @@ fn component_decoded(
 ///
 /// KR-REQ-11.25, the part about observation-only components: a binding that holds observation alone
 /// is refused the registered prompt action on the plugin-action path with a grant error, whatever
-/// the action's label says. Not shown here: the refusal of a binding that holds the grant, and the
-/// token an action is given.
+/// the action's label says. Not shown here: the admission of a binding that holds the grant, and
+/// the token an action is given.
 #[test]
 fn kr_req_11_47_a_label_that_reads_as_a_read_registers_as_its_declared_class() {
     let previewing = declaration(
