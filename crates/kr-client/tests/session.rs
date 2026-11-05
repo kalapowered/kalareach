@@ -1596,6 +1596,66 @@ async fn a_mutation_is_never_sent_again_by_the_library() {
     serving.abort();
 }
 
+/// How many of the sends the host refused for now the client keeps.
+const KEPT_FOR_NOW: usize = 64;
+
+/// A host that keeps refusing for now decides nothing of what it refuses, and the book keeps the
+/// newest of those sends beside every send whose outcome it could not establish: it does not fill
+/// with sends the host recorded nothing of, so the client can still submit.
+#[tokio::test]
+async fn a_host_that_keeps_refusing_for_now_does_not_fill_the_book() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+
+    // One send the host could not establish stays, whatever follows it.
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::OutcomeUnknown);
+    session
+        .mutate(
+            Method::SessionCreate,
+            target.clone(),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("an uncertain outcome");
+    let unknown = session.submitted_actions().await[0].action_id;
+
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::ResourceUnavailable);
+    for _ in 0..(KEPT_FOR_NOW + 6) {
+        let refused = session
+            .mutate(
+                Method::SessionCreate,
+                target.clone(),
+                None,
+                &Empty {},
+                &Empty {},
+                DurationMs::new(120_000),
+            )
+            .await
+            .expect_err("a refusal for now");
+        assert_eq!(refused.code(), ErrorCode::ResourceUnavailable);
+    }
+    let kept = session.submitted_actions().await;
+    assert_eq!(
+        kept.len(),
+        KEPT_FOR_NOW + 1,
+        "the newest sends refused for now, and the one nobody could establish"
+    );
+    assert!(
+        kept.iter().any(|action| action.action_id == unknown),
+        "an unknown outcome is never let go to make room"
+    );
+
+    session.close();
+    serving.abort();
+}
+
 #[tokio::test]
 async fn an_unknown_outcome_is_never_retried_and_names_the_action_to_ask_about() {
     let host = side(1, true).await;

@@ -30,7 +30,8 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION};
 use kr_protocol::identity::{BootIdentity, BootIdentitySource};
 use kr_protocol::ids::{
-    ActionWindowId, ActorId, BootEpoch, BuildId, ConnectionId, EnvironmentId, RequestId, TransferId,
+    ActionId, ActionWindowId, ActorId, BootEpoch, BuildId, ConnectionId, EnvironmentId, RequestId,
+    TransferId,
 };
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
 use kr_protocol::local::{LocalHelloAck, LocalPeer, LocalRole};
@@ -127,6 +128,8 @@ struct Seen {
     /// been written to them.
     legs_ended: usize,
     reservations: usize,
+    /// The action each reservation was asked under, in order.
+    reservation_actions: Vec<ActionId>,
     publications: usize,
     statuses: usize,
     /// How many renewals the attachment-chunk endpoint has written.
@@ -147,6 +150,9 @@ enum Reply {
     Receipt(ReceiptState),
     /// Not yet: the host keeps the reservation and the connection, and never answers.
     Hold,
+    /// The first reservation asked for is refused with this code, and takes nothing; the next is
+    /// answered.
+    RefuseFirst(ErrorCode),
     /// With a result that is not a reservation.
     Unreadable,
 }
@@ -675,49 +681,71 @@ async fn converse(
                         }
                     }
                     (Some(Method::UploadBegin), None) => {
-                        host.seen.lock().expect("what the host saw").reservations += 1;
-                        let reserved = parameters(&params).and_then(|p| host.begin(p));
-                        match host.script.reservation {
-                            Reply::Answer => answer(request_id, reserved),
-                            Reply::Drop => return,
-                            Reply::Unknown => answer(
+                        let asked = {
+                            let mut seen = host.seen.lock().expect("what the host saw");
+                            seen.reservations += 1;
+                            seen.reservation_actions.push(action_id);
+                            seen.reservations
+                        };
+                        if let Reply::RefuseFirst(code) = host.script.reservation
+                            && asked == 1
+                        {
+                            answer(
                                 request_id,
                                 Err(ProtocolError::new(
-                                    ErrorCode::OutcomeUnknown,
-                                    "the host could not report what became of the reservation",
+                                    code,
+                                    "the host takes no reservation now",
                                 )),
-                            ),
-                            Reply::Receipt(state) => {
-                                ControlFrame::Receipt(Box::new(ReceiptResponse {
+                            )
+                        } else {
+                            let reserved = parameters(&params).and_then(|p| host.begin(p));
+                            match host.script.reservation {
+                                Reply::Answer | Reply::RefuseFirst(_) => {
+                                    answer(request_id, reserved)
+                                }
+                                Reply::Drop => return,
+                                Reply::Unknown => answer(
                                     request_id,
-                                    receipt: Receipt {
-                                        action_id,
-                                        actor_id: ActorId::new("local:501").expect("a principal"),
-                                        method,
-                                        method_version,
-                                        revision: U64::new(1),
-                                        state,
-                                        reason: Nullable::null(),
-                                        payload_digest: Digest256::from_bytes([0; 32]),
-                                        accepted_deadline_ms: Nullable::null(),
-                                        error: if state == ReceiptState::Refused {
-                                            Nullable::some(ProtocolError::new(
-                                                ErrorCode::QuotaExceeded,
-                                                "the environment's budget is spent",
-                                            ))
-                                        } else {
-                                            Nullable::null()
+                                    Err(ProtocolError::new(
+                                        ErrorCode::OutcomeUnknown,
+                                        "the host could not report what became of the reservation",
+                                    )),
+                                ),
+                                Reply::Receipt(state) => {
+                                    ControlFrame::Receipt(Box::new(ReceiptResponse {
+                                        request_id,
+                                        receipt: Receipt {
+                                            action_id,
+                                            actor_id: ActorId::new("local:501")
+                                                .expect("a principal"),
+                                            method,
+                                            method_version,
+                                            revision: U64::new(1),
+                                            state,
+                                            reason: Nullable::null(),
+                                            payload_digest: Digest256::from_bytes([0; 32]),
+                                            accepted_deadline_ms: Nullable::null(),
+                                            error: if state == ReceiptState::Refused {
+                                                Nullable::some(ProtocolError::new(
+                                                    ErrorCode::QuotaExceeded,
+                                                    "the environment's budget is spent",
+                                                ))
+                                            } else {
+                                                Nullable::null()
+                                            },
+                                            error_withheld: false,
+                                            updated_at_ms: TimestampMs::new(0),
                                         },
-                                        error_withheld: false,
-                                        updated_at_ms: TimestampMs::new(0),
-                                    },
-                                }))
+                                    }))
+                                }
+                                Reply::Hold => {
+                                    std::future::pending::<()>().await;
+                                    return;
+                                }
+                                Reply::Unreadable => {
+                                    answer(request_id, typed(&serde_json::json!({})))
+                                }
                             }
-                            Reply::Hold => {
-                                std::future::pending::<()>().await;
-                                return;
-                            }
-                            Reply::Unreadable => answer(request_id, typed(&serde_json::json!({}))),
                         }
                     }
                     (Some(Method::UploadFinish), None) => answer(
@@ -1067,6 +1095,44 @@ async fn a_plan_that_holds_a_transfer_starts_from_status() {
     let seen = host.seen();
     assert_eq!(seen.publications, 1, "nothing was published twice");
     assert_eq!(seen.legs.len(), 1, "the resumed plan opened no lane");
+}
+
+/// A host that refuses a reservation for now has taken nothing and may take it later, so the plan
+/// asks again as the same send, under the same action, and the host reserves once. A host that
+/// refuses it in its definite word has decided, and the next ask is a new send.
+#[tokio::test]
+async fn a_reservation_refused_for_now_is_asked_for_again_under_the_same_action() {
+    for (code, same_action) in [
+        (ErrorCode::StorageUnavailable, true),
+        (ErrorCode::ResourceUnavailable, true),
+        (ErrorCode::QuotaExceeded, false),
+    ] {
+        let host = Host::start(Script {
+            reservation: Reply::RefuseFirst(code),
+            ..Script::default()
+        });
+        let session = host.session().await;
+        let mut plan = Upload::new(host.subject(), Box::new(Held::new(pattern(4096))));
+
+        let refused = uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
+            .await
+            .expect_err("the first reservation is refused");
+        assert_eq!(refused.code(), code);
+        assert!(
+            matches!(plan.next(), Ok(uploads::Step::Begin(_))),
+            "{code:?}: the plan may ask again"
+        );
+        uploads::send(&session, &host.route(), &host.target(), &mut plan, TTL)
+            .await
+            .expect("the next reservation is taken and the upload published");
+        let seen = host.seen();
+        assert_eq!(seen.reservations, 2, "{code:?}");
+        assert_eq!(
+            seen.reservation_actions[0] == seen.reservation_actions[1],
+            same_action,
+            "{code:?}: the second ask is the same send only when the first was refused for now"
+        );
+    }
 }
 
 /// A reservation whose reply was lost is never made again by the same plan.

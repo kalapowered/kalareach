@@ -39,7 +39,6 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Bytes, DurationMs, StoredEnvelopeKey, TimestampMs, Uuid};
 
 use crate::error::ClientError;
-use crate::recovery::files::is_a_lost_answer;
 use crate::recovery::{BundleStore, RecoveryError, Result, WriterEnabled, kit_fingerprint};
 use crate::services::ServiceFuture;
 use crate::session::{Session, Settled};
@@ -287,10 +286,10 @@ crate::debug_as_name!(ArchiveEntries, HostCover, HostCovered, Left);
 ///
 /// Returns [`RecoveryError::Service`] when the host cannot be asked or refuses the call, whatever
 /// [`BundleStore::enable_writer`] returns when the bundle cannot be written, and
-/// [`RecoveryError::HostOutcomeUnknown`] when the host's answer to the setup did not come back: a
-/// repeat reads the host's status again and finds the setup if it landed. A host that declines or
-/// refuses has recorded nothing, and the archive the bundle was made to name is taken out of it
-/// again.
+/// [`RecoveryError::HostOutcomeUnknown`] when the host's answer to the setup did not come back or
+/// was a transient refusal: a repeat reads the host's status again and finds the setup if it
+/// landed. A host that declines or refuses it in its definite word has recorded nothing, and the
+/// archive the bundle was made to name is taken out of it again.
 pub async fn cover_host_archive(
     host: &dyn HostBackups,
     bundles: &mut BundleStore,
@@ -442,25 +441,27 @@ pub async fn cover_host_archive(
         }) => Err(RecoveryError::HostOutcomeUnknown {
             retry_after_seconds: retry_after_seconds.0.map(|seconds| seconds.get()),
         }),
-        // The host answered with a refusal of its own, which it gives before it records anything,
-        // so nothing was recorded.
+        // The host answered with a definite refusal of its own, which it gives before it records
+        // anything, so nothing was recorded.
         Err(error) if is_a_definite_refusal(&error) => {
             let _ = entries.withdraw(bundles, seed, now).await;
             Err(RecoveryError::Service(error))
         }
-        // Anything else may have followed a call that was carried out: a lost answer, a broken
-        // connection, a reply that could not be read. The entry stays, and the repeat finds the
-        // setup if it landed.
+        // Anything else may have followed a call that was carried out: a lost answer, a transient
+        // refusal, a broken connection, a reply that could not be read. The entry stays, and the
+        // repeat finds the setup if it landed.
         Err(_) => Err(RecoveryError::HostOutcomeUnknown {
             retry_after_seconds: None,
         }),
     }
 }
 
-/// Whether a failed call to the host is the host refusing it in its own words: an answer that
-/// carries an error and is not one of the codes for an answer that was lost.
+/// Whether a failed call to the host is its definite word that nothing was recorded: an answer that
+/// carries an error whose code is neither transient nor an outcome the host could not establish. A
+/// transient refusal says the call may be made again and may yet be carried out, so it leaves the
+/// entry as a lost answer does.
 fn is_a_definite_refusal(error: &ClientError) -> bool {
-    matches!(error, ClientError::Host(_)) && !is_a_lost_answer(error)
+    matches!(error, ClientError::Host(refusal) if crate::error::is_definite(refusal.code))
 }
 
 /// The call that sets the host up under this computer's recovery, made from the bundle as the
