@@ -922,6 +922,133 @@ pub fn a_reply_shaped_run_inside_a_bracketed_paste_is_pasted_whole(kind: ShellKi
     );
 }
 
+/// KR-REQ-08.48: the host's answer behind text a person has typed leaves the text on the screen.
+///
+/// An answer left over from a program that ended arrives in the same delivery as the keys, behind
+/// them, and the person has not pressed return. The reader takes the answer out of the keys, and
+/// the editor has to go on and draw what was typed: a reader that waits for another key after it
+/// has taken the answer leaves the line in memory and the screen as it was. The editor draws a line
+/// only once it has the keys, and the terminal does not echo while it reads, so the text on the
+/// screen after the keys went in is the editor's drawing.
+///
+/// # Panics
+///
+/// Panics when the typed text is not drawn.
+#[cfg(unix)]
+pub fn a_hosts_answer_behind_typed_text_leaves_the_text_drawn(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+    let _ = session.next_prompt();
+    let start = session.written();
+    let keys = format!("echo ab{}", HOST_ANSWERS[0]);
+    session.type_bytes(keys.as_bytes());
+    assert!(
+        session.drew_after(start, "echo ab", REPLY).was_drawn(),
+        "the text typed in front of the host's answer was not drawn:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// KR-REQ-08.48: an Escape a person presses, with a host's answer behind it in the same delivery,
+/// is still the person's Escape.
+///
+/// The Escape begins a key with the key that follows it, and the answer begins with an Escape of its
+/// own, so the reader that looks at what follows the first Escape finds the second. The case types a
+/// line that prints a word from two arguments with a letter missing from the second, presses
+/// Escape, takes in an answer and presses `b` in the same write: the editor's backward-word. The
+/// letter then goes in front of the second argument only if the Escape and the `b` made the key.
+///
+/// # Panics
+///
+/// Panics when the line does not print the word.
+#[cfg(unix)]
+pub fn an_escape_and_a_hosts_answer_in_one_delivery_leave_the_escape_a_key(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let line = format!("printf '%s%s\\n' kr-ans ered\x1b{}bw", HOST_ANSWERS[0]);
+    assert!(
+        session.run(&line, "kr-answered"),
+        "the Escape in front of the host's answer was not the Escape of the key that followed:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// KR-REQ-08.48: the end-of-input gesture a person makes after an Escape sequence the editor does
+/// not know is still the gesture.
+///
+/// The reader looks at what follows an Escape, and it gives back what is no answer for the editor to
+/// decode. What it gave back came from the person, so the gesture that was among it is the person's
+/// gesture, as it is when the editor reads the same keys from the terminal itself: the reader
+/// consumes it with the hint and the shell stays, where a gesture taken for something the editor
+/// pushed back would reach the shell as an end of file and end it. The case presses Escape, a
+/// closing bracket, which no key sequence of the editors begins with, and the gesture in one write.
+///
+/// # Panics
+///
+/// Panics when the reader does not decide the gesture, or the shell ends.
+#[cfg(unix)]
+pub fn a_gesture_after_an_unknown_escape_sequence_is_still_the_gesture(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+    let enter = session.next_prompt();
+    session.type_bytes(b"\x1b]\x04");
+    let (_, consumed) = session.expect_event("pre_eof_consumed", |event| {
+        matches!(event, BridgeEvent::PreEofConsumed(_))
+    });
+    let BridgeEvent::PreEofConsumed(consumed) = consumed else {
+        unreachable!()
+    };
+    assert_eq!(consumed.prompt_generation, enter.prompt_generation);
+    assert!(
+        session.alive(),
+        "the gesture after an unknown Escape sequence ended the shell"
+    );
+}
+
+/// KR-REQ-08.48: a bracketed paste into a search or a command name a person is typing reaches that
+/// text whole, and nothing in it runs.
+///
+/// A paste begins with an Escape and a bracket, as an answer does, and the editor reads it in a
+/// minibuffer of its own: an incremental search, a search by prefix, a named command. The reader
+/// looks at what follows the Escape and gives it back, and the minibuffer has to find the paste's
+/// opening where it was given back. The case opens each, pastes two lines of which the second prints
+/// a word, ends the search with the abort key and runs a line of its own. The word is printed from
+/// two pieces, so only a command that ran puts it on the screen, and it never is.
+///
+/// # Panics
+///
+/// Panics when a pasted line ran, or the line after them does not run.
+#[cfg(unix)]
+pub fn a_bracketed_paste_inside_a_minibuffer_is_pasted_whole(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    assert!(session.answered("kr-ready"));
+    let _ = session.next_prompt();
+    for opening in [&b"\x12"[..], b"\x1bp", b"\x1bx"] {
+        let mut keys = opening.to_vec();
+        keys.extend_from_slice(b"\x1b[200~true\nprintf '%s%s\\n' kr-ne ver\n\x1b[201~\x07");
+        session.type_bytes(&keys);
+    }
+    assert!(
+        session.run("printf '%s%s\\n' kr-after pastes", "kr-afterpastes"),
+        "the line typed after the pastes did not run:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        !session.terminal_output().contains("kr-never"),
+        "a line pasted into a minibuffer ran:\n{}",
+        session.terminal_output()
+    );
+}
+
 /// Asks the reader for its state until the terminal holds nothing it has not taken, and returns
 /// the last answer.
 ///

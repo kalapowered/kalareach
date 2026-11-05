@@ -66,6 +66,27 @@ fn a_reply_shaped_run_inside_a_bracketed_paste_is_pasted_whole() {
     shellpkg::a_reply_shaped_run_inside_a_bracketed_paste_is_pasted_whole(ZSH);
 }
 
+/// KR-REQ-08.48: the host's answer behind text a person has typed leaves the text on the screen.
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_hosts_answer_behind_typed_text_leaves_the_text_drawn() {
+    shellpkg::a_hosts_answer_behind_typed_text_leaves_the_text_drawn(ZSH);
+}
+
+/// KR-REQ-08.48: an Escape a person presses, with the host's answer behind it in one delivery, is still the person's Escape.
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn an_escape_and_a_hosts_answer_in_one_delivery_leave_the_escape_a_key() {
+    shellpkg::an_escape_and_a_hosts_answer_in_one_delivery_leave_the_escape_a_key(ZSH);
+}
+
+/// KR-REQ-08.48: the end-of-input gesture after an Escape sequence the editor does not know is still the gesture.
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_gesture_after_an_unknown_escape_sequence_is_still_the_gesture() {
+    shellpkg::a_gesture_after_an_unknown_escape_sequence_is_still_the_gesture(ZSH);
+}
+
 /// KR-REQ-07.40: the bridge holds no copy of the bootstrap secret once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]

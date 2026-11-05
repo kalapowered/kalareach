@@ -8277,6 +8277,14 @@ async fn until_the_reader_has_taken_the_hosts_answer(
     .ok()
 }
 
+/// How many answers the writer has dropped without writing them to the terminal. The wait above
+/// ends when the writer owes no answer, which an answer it dropped also satisfies, so a case checks
+/// that this count did not move before it takes the wait to say the terminal was given the answer.
+#[cfg(unix)]
+fn answers_dropped(shell: &RealShell) -> u64 {
+    shell.runtime.session().replies_dropped()
+}
+
 /// Says whether the line the reader's newest fence is over is empty, or `None` when no fence
 /// stands.
 #[cfg(unix)]
@@ -8353,6 +8361,7 @@ async fn a_hosts_answers_stay_out_of_a_real_readers_line(
     .unwrap_or_else(|| panic!("{kind:?}: the reader never proved a fence"));
     let mut failures = Vec::new();
     for (name, question) in questions {
+        let dropped = answers_dropped(&shell);
         let after = shell
             .runtime
             .session()
@@ -8386,6 +8395,13 @@ async fn a_hosts_answers_stay_out_of_a_real_readers_line(
             break;
         };
         proved = again;
+        if answers_dropped(&shell) != dropped {
+            failures.push(format!(
+                "{kind:?}: the writer dropped the host's answer to the {name} instead of writing \
+                 it to the terminal"
+            ));
+            break;
+        }
         if the_line_under_the_fence_is_empty(&shell) != Some(true) {
             failures.push(format!(
                 "{kind:?}: the host's answer to the {name} is in the line the reader edits; the \
@@ -8436,6 +8452,7 @@ async fn a_hosts_answer_to_a_program_that_ended_stays_out_of_a_real_readers_line
     )
     .await
     .unwrap_or_else(|| panic!("{kind:?}: the reader never proved a fence"));
+    let dropped = answers_dropped(&shell);
     let after = shell
         .runtime
         .session()
@@ -8452,6 +8469,11 @@ async fn a_hosts_answer_to_a_program_that_ended_stays_out_of_a_real_readers_line
             "{kind:?}: the reader never proved a fence once the program's question was answered; \
              the output ends {}",
             the_end_of_the_output(&shell)
+        ));
+    } else if answers_dropped(&shell) != dropped {
+        failures.push(format!(
+            "{kind:?}: the writer dropped the host's answer to the program that ended instead of \
+             writing it to the terminal"
         ));
     } else if the_line_under_the_fence_is_empty(&shell) != Some(true) {
         failures.push(format!(
