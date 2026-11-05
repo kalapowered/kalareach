@@ -886,15 +886,21 @@ impl PluginHost {
 
         // Two steps rather than one, because they are two steps: the compile happens on a
         // background thread under its own budget, and only once an instance exists does any
-        // call budget start.
-        let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
+        // call budget start. Queueing it makes the component's key, a digest of up to sixteen
+        // mebibytes, so it is done where a read is done and not on the executor.
+        remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
         #[cfg(feature = "testing")]
         let held = self.hold_compiles_at_the_gate();
-        let compilation = self.runtime.compile(wasm).map_err(refusal)?;
+        let runtime = Arc::clone(&self.runtime);
+        let compilation = tokio::task::spawn_blocking(move || runtime.compile(wasm))
+            .await
+            .map_err(|error| (format!("the compile could not be queued: {error}"), false))?
+            .map_err(refusal)?;
         #[cfg(feature = "testing")]
         if let Some(held) = held {
             held.queued();
         }
+        let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
         let compiled = compilation.wait(remaining).await.map_err(refusal)?;
         let binding = BindingId::new(binding_id);
         let request = BindingRequest {

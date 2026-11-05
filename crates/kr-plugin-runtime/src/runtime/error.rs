@@ -98,10 +98,11 @@ pub enum RuntimeError {
         /// The budget it was given.
         budget_ms: u64,
     },
-    /// Every compilation slot is busy and the queue is full.
-    #[error("the compilation queue is full at {queued} waiting components")]
+    /// Every compilation slot is busy and the queue is full, or as many requests as the queue holds
+    /// already wait for the compile of this component.
+    #[error("compilation has {queued} requests waiting and takes no more")]
     CompilationPressure {
-        /// How many components are already waiting.
+        /// How many requests are already waiting.
         queued: usize,
     },
     /// A cached artefact was refused.

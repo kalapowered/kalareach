@@ -45,6 +45,17 @@
 //! the rest with [`crate::runtime::error::RuntimeError::CompilationPressure`] instead of starting
 //! a hundred compiles.
 //!
+//! # One compile for one component
+//!
+//! A worker offers a component again after a registration ran out its deadline, and on a host that
+//! keeps the pool's background threads waiting for the processor the compile the first offer started
+//! is still going. A second compile of the same bytes would only share the processor time the first
+//! is getting, and both would take longer. So a request for a component that is already queued or
+//! being compiled, on the same engine, into the same cache and under the same budget, waits for that
+//! compile and is answered with its result, whether it succeeds or fails; it takes no place in the
+//! queue and no thread. A request that comes after a successful compile has ended finds its result
+//! in the cache, if filing it succeeded; after a failed one it compiles again.
+//!
 //! # Background priority
 //!
 //! Each pool thread lowers its own scheduling priority when it starts. What that means is the
@@ -62,9 +73,9 @@
 //! them, so nothing here depends on it having worked.
 
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 #[cfg(feature = "testing")]
-use std::sync::{Condvar, PoisonError};
+use std::sync::{Condvar, atomic::AtomicUsize, atomic::Ordering};
 
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_service::vocabulary::COMPILE_DEADLINE_MS;
@@ -116,7 +127,7 @@ impl Default for CompileBudget {
 }
 
 /// What a compilation produced, and where it came from.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Compiled {
     /// The compiled component.
     pub component: wasmtime::component::Component,
@@ -155,8 +166,113 @@ pub struct CompilePool {
     sender: mpsc::SyncSender<Job>,
     priority: Arc<Mutex<Option<BackgroundPriority>>>,
     threads: usize,
+    queue: usize,
+    flights: Arc<Flights>,
     #[cfg(feature = "testing")]
     hold: Arc<HoldState>,
+    #[cfg(feature = "testing")]
+    counts: Arc<Counts>,
+}
+
+/// Who is waiting for a compile.
+type Answer = tokio::sync::oneshot::Sender<RuntimeResult<Compiled>>;
+
+/// The compiles queued or under way, each with the requests that asked for the same component after
+/// it was queued.
+#[derive(Debug, Default)]
+struct Flights {
+    running: Mutex<Running>,
+}
+
+#[derive(Debug, Default)]
+struct Running {
+    next: u64,
+    flights: Vec<Flight>,
+}
+
+/// One compile, and what a request must share with it to be answered by it: the component, the
+/// engine that compiles it, the cache it is filed in and the budget it is held to.
+#[derive(Debug)]
+struct Flight {
+    id: u64,
+    key: CacheKey,
+    engine: wasmtime::Engine,
+    cache: std::path::PathBuf,
+    budget: CompileBudget,
+    joined: Vec<Answer>,
+}
+
+/// What a request for a compile comes to.
+enum Entered {
+    /// It waits for the compile that is queued or under way.
+    Joined,
+    /// A compile of the component is queued or under way, and as many requests as the pool's queue
+    /// holds already wait for it.
+    Full,
+    /// Nothing is compiling the component: the caller queues the compile, with this to answer, and
+    /// ends it by the identifier.
+    Lead(Answer, u64),
+}
+
+impl Flights {
+    /// Parks `answer` with the compile of `key` that is queued or under way, or records a compile of
+    /// `key` and gives `answer` back to the caller, who queues it.
+    fn enter(
+        &self,
+        key: &CacheKey,
+        engine: &RuntimeEngine,
+        cache: &CompiledCache,
+        budget: CompileBudget,
+        bound: usize,
+        answer: Answer,
+    ) -> Entered {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        let flight = running.flights.iter_mut().find(|flight| {
+            flight.key == *key
+                && wasmtime::Engine::same(&flight.engine, engine.engine())
+                && flight.cache == cache.root()
+                && flight.budget == budget
+        });
+        if let Some(flight) = flight {
+            // A request whose caller has stopped waiting holds no place.
+            flight.joined.retain(|waiting| !waiting.is_closed());
+            if flight.joined.len() >= bound {
+                return Entered::Full;
+            }
+            flight.joined.push(answer);
+            return Entered::Joined;
+        }
+        let id = running.next;
+        running.next += 1;
+        running.flights.push(Flight {
+            id,
+            key: key.clone(),
+            engine: engine.engine().clone(),
+            cache: cache.root().to_path_buf(),
+            budget,
+            joined: Vec::new(),
+        });
+        Entered::Lead(answer, id)
+    }
+
+    /// Ends the compile and returns the requests that joined it.
+    fn finish(&self, id: u64) -> Vec<Answer> {
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        running
+            .flights
+            .iter()
+            .position(|flight| flight.id == id)
+            .map(|at| running.flights.swap_remove(at).joined)
+            .unwrap_or_default()
+    }
+}
+
+/// How many requests the pool compiled for, and how many joined a compile already under way.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct Counts {
+    compiles: AtomicUsize,
+    joined: AtomicUsize,
 }
 
 /// How many holds tests have on the pool's jobs, and what a held job waits on.
@@ -234,6 +350,8 @@ impl CompilePool {
         let priority = Arc::new(Mutex::new(None));
         #[cfg(feature = "testing")]
         let hold = Arc::new(HoldState::default());
+        #[cfg(feature = "testing")]
+        let counts = Arc::new(Counts::default());
         for index in 0..threads {
             let receiver = Arc::clone(&receiver);
             let priority = Arc::clone(&priority);
@@ -266,8 +384,12 @@ impl CompilePool {
             sender,
             priority,
             threads,
+            queue,
+            flights: Arc::new(Flights::default()),
             #[cfg(feature = "testing")]
             hold,
+            #[cfg(feature = "testing")]
+            counts,
         }
     }
 
@@ -289,6 +411,22 @@ impl CompilePool {
         self.hold.is_held()
     }
 
+    /// How many compiles a pool thread has taken up, which each request for a component that was
+    /// not queued or being compiled is.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn compiles_started(&self) -> usize {
+        self.counts.compiles.load(Ordering::SeqCst)
+    }
+
+    /// How many requests were made for a component that was queued or being compiled, and were left
+    /// waiting for that compile.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn requests_joined(&self) -> usize {
+        self.counts.joined.load(Ordering::SeqCst)
+    }
+
     /// Returns how many threads the pool was built with.
     #[must_use]
     pub const fn threads(&self) -> usize {
@@ -304,13 +442,19 @@ impl CompilePool {
     /// Submits a compilation and returns a receiver for its result.
     ///
     /// The call returns as soon as the work is queued. Nothing here waits for a compile, which is
-    /// what keeps a caller on the terminal path from ever being behind one.
+    /// what keeps a caller on the terminal path from ever being behind one. The component's key,
+    /// which is a digest of its bytes, is made here, so that a request for a component that is
+    /// queued or being compiled joins that compile without a pool thread to take it up.
+    ///
+    /// A request joins a compile of the same component only on the same engine, into the same cache
+    /// and under the same budget, and is answered with that compile's result.
     ///
     /// # Errors
     ///
     /// Returns [`RuntimeError::ComponentTooLarge`] when the component is past the budget's size
     /// bound, or [`RuntimeError::CompilationPressure`] when every thread is busy and the queue is
-    /// full.
+    /// full, or when as many requests as the queue holds already wait for the compile it would
+    /// join.
     pub fn submit(
         &self,
         engine: &RuntimeEngine,
@@ -325,50 +469,100 @@ impl CompilePool {
                 limit: budget.max_bytes,
             });
         }
+        let key = key_for(engine, &wasm);
+        let (answer, wait) = tokio::sync::oneshot::channel();
+        let (answer, flight) = match self
+            .flights
+            .enter(&key, engine, cache, budget, self.queue, answer)
+        {
+            Entered::Joined => {
+                #[cfg(feature = "testing")]
+                self.counts.joined.fetch_add(1, Ordering::SeqCst);
+                return Ok(wait);
+            }
+            Entered::Full => {
+                return Err(RuntimeError::CompilationPressure { queued: self.queue });
+            }
+            Entered::Lead(answer, flight) => (answer, flight),
+        };
+
         let engine = engine.clone();
         let cache = cache.clone();
-        self.submit_work(move || compile_or_load(&engine, &cache, &wasm, budget))
+        let flights = Arc::clone(&self.flights);
+        #[cfg(feature = "testing")]
+        let hold = Arc::clone(&self.hold);
+        #[cfg(feature = "testing")]
+        let counts = Arc::clone(&self.counts);
+        let job = Job(Box::new(move || {
+            #[cfg(feature = "testing")]
+            {
+                counts.compiles.fetch_add(1, Ordering::SeqCst);
+                hold.wait_until_released();
+            }
+            let outcome = caught(|| compile_or_load_keyed(&engine, &cache, &wasm, key, budget));
+            // The requests that joined are answered alike, with the component or with why there is
+            // none. Ending the compile after it filed its result means a request that comes after
+            // this finds the result in the cache, where filing it succeeded.
+            for waiting in flights.finish(flight) {
+                let _ = waiting.send(outcome.clone());
+            }
+            // A caller that has given up on the compile is not an error: a compile that succeeded
+            // filed its result, so the next preparation finds it.
+            let _ = answer.send(outcome);
+        }));
+        if let Err(refused) = self.enqueue(job) {
+            // Nothing will run the compile, so those that joined it are told what was told to the
+            // request that queued it.
+            for waiting in self.flights.finish(flight) {
+                let _ = waiting.send(Err(refused.clone()));
+            }
+            return Err(refused);
+        }
+        Ok(wait)
     }
 
     /// Queues one piece of work for a pool thread and returns a receiver for what it comes to.
+    #[cfg(test)]
     fn submit_work(
         &self,
         work: impl FnOnce() -> RuntimeResult<Compiled> + Send + 'static,
     ) -> RuntimeResult<tokio::sync::oneshot::Receiver<RuntimeResult<Compiled>>> {
-        // A channel a caller can await rather than block on, so nothing that is waiting for a
-        // compile is holding a thread while it waits.
-        let (answer, wait) = tokio::sync::oneshot::channel();
         #[cfg(feature = "testing")]
         let hold = Arc::clone(&self.hold);
-        let job = Job(Box::new(move || {
+        let (answer, wait) = tokio::sync::oneshot::channel();
+        self.enqueue(Job(Box::new(move || {
             #[cfg(feature = "testing")]
             hold.wait_until_released();
-            // A compiler that panics on a component refuses that component. It does not end the
-            // pool thread it ran on, which would be lost for good and take a share of the pool
-            // with it, and it does not leave the caller told that the pool is gone.
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-                .unwrap_or_else(|panic| {
-                    let message = panic
-                        .downcast_ref::<&str>()
-                        .map(|text| (*text).to_owned())
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "without a message".to_owned());
-                    Err(RuntimeError::InvalidComponent {
-                        detail: format!("the compiler panicked: {message}"),
-                    })
-                });
-            // A caller that has given up on the compile is not an error: the result is cached, so
-            // the next preparation finds it.
-            let _ = answer.send(outcome);
-        }));
-        self.sender.try_send(job).map_err(|error| match error {
-            mpsc::TrySendError::Full(_) => RuntimeError::CompilationPressure {
-                queued: COMPILE_QUEUE,
-            },
-            mpsc::TrySendError::Disconnected(_) => RuntimeError::CompilationPressure { queued: 0 },
-        })?;
+            let _ = answer.send(caught(work));
+        })))?;
         Ok(wait)
     }
+
+    /// Puts a job on the queue, or says why it is not taken.
+    fn enqueue(&self, job: Job) -> RuntimeResult<()> {
+        self.sender.try_send(job).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => RuntimeError::CompilationPressure { queued: self.queue },
+            mpsc::TrySendError::Disconnected(_) => RuntimeError::CompilationPressure { queued: 0 },
+        })
+    }
+}
+
+/// Runs `work`, and turns a panic in it into a refusal of the component.
+///
+/// A compiler that panics on a component refuses that component. It does not end the pool thread it
+/// ran on, which would be lost for good and take a share of the pool with it, and it does not leave
+/// the caller told that the pool is gone.
+fn caught<T>(work: impl FnOnce() -> RuntimeResult<T>) -> RuntimeResult<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|panic| {
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "without a message".to_owned());
+        Err(RuntimeError::InvalidComponent {
+            detail: format!("the compiler panicked: {message}"),
+        })
+    })
 }
 
 impl Default for CompilePool {
@@ -409,7 +603,18 @@ pub fn compile_or_load(
             limit: budget.max_bytes,
         });
     }
-    let key = key_for(engine, wasm);
+    compile_or_load_keyed(engine, cache, wasm, key_for(engine, wasm), budget)
+}
+
+/// As [`compile_or_load`], for a component of a size the budget allows and the key it is filed
+/// under, which the caller has already made.
+fn compile_or_load_keyed(
+    engine: &RuntimeEngine,
+    cache: &CompiledCache,
+    wasm: &[u8],
+    key: CacheKey,
+    budget: CompileBudget,
+) -> RuntimeResult<Compiled> {
     let meter = Meter::start();
 
     match cache.load(engine.engine(), &key) {

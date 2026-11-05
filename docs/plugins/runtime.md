@@ -284,6 +284,15 @@ Apple read the thread's CPU-time clock, and Windows reads its kernel and user ti
 the compiling thread's alone, which is all of a compile's work because the engine is built without
 Wasmtime's parallel compilation.
 
+A request for a component that is already queued or being compiled waits for that compile and is
+answered with its result, or with why there is none. The worker offers a component again after a
+registration ran out its deadline, and on a busy host the compile that first offer started is still
+going; a second compile of the same bytes would only share the processor time the first is getting.
+The request takes no place in the queue and no thread, and it joins only a compile on the same
+engine, into the same cache and under the same budget. As many requests as the queue holds may wait
+for one compile; the next is refused as pressure, like a request for a full queue. A request that comes after a successful compile has ended finds its
+result in the cache, when filing it succeeded; after a failed compile it compiles again.
+
 Each pool thread lowers its own scheduling priority when it starts, through the platform's own
 thread scheduling. What that means is the platform's answer, and a platform that declines is not a
 failure, because the compile still runs off the hot path, which is the property the design is after.
