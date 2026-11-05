@@ -41,13 +41,13 @@
       "key": "diff.marker.textconv",
       "sentinel": "textconv",
       "git_would_run_it_during": "a diff of a path whose attributes name this driver",
-      "how_this_host_stops_it": "blanked by name, and every diff also passes --no-textconv"
+      "how_this_host_stops_it": "the effective configuration is read first and every diff driver it defines has its textconv blanked by name, beside its command and a cachetextconv of false; each is a GIT_CONFIG_KEY_<n> and GIT_CONFIG_VALUE_<n> pair, which beats every configuration file, and GIT_CONFIG_NOSYSTEM is set with the global and system configuration pointed at an empty file"
     },
     {
       "key": "diff.external",
       "sentinel": "external-diff",
       "git_would_run_it_during": "every diff",
-      "how_this_host_stops_it": "diff.external= as an override, and every diff also passes --no-ext-diff"
+      "how_this_host_stops_it": "diff.external set to nothing as a GIT_CONFIG_KEY_<n> and GIT_CONFIG_VALUE_<n> pair, which beats every configuration file; GIT_CONFIG_NOSYSTEM is set with the global and system configuration pointed at an empty file, and GIT_EXTERNAL_DIFF is absent because the child's environment is built from nothing"
     },
     {
       "key": "core.pager",
