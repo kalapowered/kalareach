@@ -1,9 +1,9 @@
 //! The program a release runs before it is published, against the stand-in service.
 //!
-//! KR-REQ-17.46: no release is published whose package version the published, verified matrix
-//! does not list. The program verifies under the key this build pins, which the stand-in does not
-//! sign with, so what is held here is every way the answer is a refusal and the exit status each
-//! gets; that a matrix signed by the pinned key is accepted is held by the library's cases
+//! No release is published whose package version the published, verified matrix does not list.
+//! The program verifies under the key this build pins, which the stand-in does not sign with, so
+//! what is held here is every way the answer is a refusal and the exit status each gets; that a
+//! matrix signed by the pinned key is accepted is held by the library's cases
 //! (`crates/kr-client/tests/release_check.rs`), where the test chooses the pin.
 
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -47,6 +47,8 @@ fn listing_everything(key: &AuthorisationKeyPair) -> Vec<u8> {
     serde_json::to_vec(&signed_release_matrix(&matrix, key)).expect("a reply")
 }
 
+/// KR-REQ-17.46, the part about the signed matrix: a matrix the pinned key does not verify refuses
+/// the release. Not shown here: a tier serving a build, and relay and discovery compatibility.
 #[tokio::test]
 async fn a_matrix_the_pin_does_not_verify_refuses_the_release() {
     let served = serve().await;
@@ -63,6 +65,9 @@ async fn a_matrix_the_pin_does_not_verify_refuses_the_release() {
     );
 }
 
+/// KR-REQ-17.46, the part about no release without a verified matrix: a service that publishes no
+/// matrix refuses the release. Not shown here: a tier serving a build, and relay and discovery
+/// compatibility.
 #[tokio::test]
 async fn a_service_that_publishes_no_matrix_refuses_the_release() {
     let served = serve().await;
