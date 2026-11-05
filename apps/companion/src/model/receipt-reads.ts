@@ -65,11 +65,18 @@ function later(a: string, b: string): boolean {
 export class ReceiptReads {
   readonly #reads = new Map<string, ReceiptRead>()
   readonly #again = new Map<string, Set<() => void>>()
-  /** The actions the host named in a refusal, the one it named last at the end. */
-  readonly #named: string[] = []
+  /** How many refusals that name an action this window has kept. */
+  #refusals = 0
+  /** For each action, how many of those refusals had been kept when its record was first read. */
+  readonly #firstRead = new Map<string, number>()
+  /** The refusal that last named each action, by its number, the one named last at the end. */
+  readonly #named = new Map<string, number>()
 
   /** Keeps what a read of an action's record said, unless a newer revision has been read. */
   note = (receipt: Receipt): void => {
+    if (!this.#firstRead.has(receipt.action_id)) {
+      this.#firstRead.set(receipt.action_id, this.#refusals)
+    }
     const held = this.#reads.get(receipt.action_id)
     if (held !== undefined && later(held.revision, receipt.revision)) return
     this.#reads.set(receipt.action_id, {
@@ -90,14 +97,23 @@ export class ReceiptReads {
   noteRefusal = (words: string): void => {
     const named = ACTION_ID.exec(words)?.[0]
     if (named === undefined) return
-    const held = this.#named.indexOf(named)
-    if (held >= 0) this.#named.splice(held, 1)
-    this.#named.push(named)
-    if (this.#named.length > MAX_NAMED) this.#named.shift()
+    this.#refusals += 1
+    this.#named.delete(named)
+    this.#named.set(named, this.#refusals)
+    for (const oldest of this.#named.keys()) {
+      if (this.#named.size <= MAX_NAMED) break
+      this.#named.delete(oldest)
+    }
   }
 
-  /** How recently the host named an action in a refusal: higher is later, and -1 is never. */
-  namedAt = (actionId: string): number => this.#named.indexOf(actionId)
+  /**
+   * How late the host's word puts an action: the number of the refusal that last named it, or of
+   * the last refusal before its record was first read, whichever is later. An action read after a
+   * refusal is newer than what that refusal named, since the host admitted it afterwards. Zero for
+   * an action no refusal has bearing on.
+   */
+  heldAt = (actionId: string): number =>
+    Math.max(this.#firstRead.get(actionId) ?? 0, this.#named.get(actionId) ?? 0)
 
   /** Has `read` called when a session's actions should be read again; the result stops it. */
   whenAskedAgain = (sessionId: string, read: () => void): (() => void) => {
@@ -121,8 +137,8 @@ export class ReceiptReads {
  * The host's rule is about the conversation: it compares a later request with the newest uncertain
  * outcome of the same method for the same session, instance and binding revision. So only an action
  * whose newest read said unknown counts, only a prompt, only one sent to this conversation, and the
- * newest of those: the one the host last named in a refusal, and otherwise the one whose record was
- * written last. Anything else is sent with no quote: an
+ * newest of those: the one the host last named in a refusal, unless an action was read after that,
+ * and otherwise the one whose record was written last. Anything else is sent with no quote: an
  * action the host holds as accepted or dispatching, or one of another method or conversation, does
  * not stand in a prompt's way, and a quote of one would be refused.
  */
@@ -131,7 +147,7 @@ export function supersessionFor(
   reads: ReceiptReads,
   to: Conversation
 ): Supersession | null {
-  let newest: { readonly action_id: string; readonly read: ReceiptRead; readonly named: number } | null =
+  let newest: { readonly action_id: string; readonly read: ReceiptRead; readonly held: number } | null =
     null
   for (const each of submissions) {
     if (each.state !== 'unknown' || each.actionId === null) continue
@@ -144,15 +160,15 @@ export function supersessionFor(
     }
     const read = reads.read(each.actionId)
     if (read === undefined || read.state !== 'unknown' || read.method !== PROMPT_METHOD) continue
-    const named = reads.namedAt(each.actionId)
+    const held = reads.heldAt(each.actionId)
     if (
       newest === null ||
-      named > newest.named ||
-      (named === newest.named &&
+      held > newest.held ||
+      (held === newest.held &&
         (later(read.updatedAtMs, newest.read.updatedAtMs) ||
           (read.updatedAtMs === newest.read.updatedAtMs && each.actionId > newest.action_id)))
     ) {
-      newest = { action_id: each.actionId, read, named }
+      newest = { action_id: each.actionId, read, held }
     }
   }
   return newest === null
