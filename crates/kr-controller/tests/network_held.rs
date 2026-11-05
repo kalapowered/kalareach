@@ -2,10 +2,10 @@
 //!
 //! A recipient learns of an invitation by asking the host, and by nothing else: `grant.held` lists
 //! what is offered to the device that asks and the shares it holds, and tells no device anything
-//! about another's. What these demonstrate: KR-REQ-25.10 (single-use, expiring invitations: an
-//! invitation that is redeemed, withdrawn or run out is no longer offered) and KR-REQ-18.03 (a
-//! scoped invitation is told to the device it names and to no other), and KR-REQ-18.12 (the owner is
-//! refused an invitation for a session that is not open before it exists). Nothing here starts a
+//! about another's. What these demonstrate: invitations are single-use and expiring, so an
+//! invitation that is redeemed, withdrawn or run out is no longer offered; a scoped invitation
+//! is told to the device it names and to no other; and the owner is refused an invitation for
+//! a session that is not open before it exists. Nothing here starts a
 //! worker, so every answer is the daemon's own; a session is a reservation its registry holds as
 //! open.
 

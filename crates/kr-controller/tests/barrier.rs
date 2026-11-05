@@ -7,7 +7,7 @@
 //! paused: the revocation is announced while the worker cannot answer, and what the daemon reports
 //! in the meantime is `pending` with per-worker status.
 //!
-//! KR-ACC-022 is the whole sequence: pause after durable acceptance, revoke during the worker's
+//! The whole sequence is: pause after durable acceptance, revoke during the worker's
 //! isolation, wait for the true barrier, resume, and prove that no affected undispatched action
 //! executed.
 
