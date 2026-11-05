@@ -1,6 +1,4 @@
 //! Drafts, attachment contributions and the separation of transfer from insertion.
-//!
-//! Requirement rows closed here: KR-REQ-11.49, KR-REQ-12.28 and KR-REQ-23.41.
 
 mod support;
 
