@@ -65,18 +65,13 @@ function later(a: string, b: string): boolean {
 export class ReceiptReads {
   readonly #reads = new Map<string, ReceiptRead>()
   readonly #again = new Map<string, Set<() => void>>()
-  /** How many refusals that name an action this window has kept. */
-  #refusals = 0
-  /** For each action, how many of those refusals had been kept when its record was first read. */
-  readonly #firstRead = new Map<string, number>()
-  /** The refusal that last named each action, by its number, the one named last at the end. */
+  /** The actions the host named in a refusal, and when this window kept it; the last at the end. */
   readonly #named = new Map<string, number>()
+  /** When this window kept the first refusal that named an action, or never. */
+  #firstRefusalAt = Number.POSITIVE_INFINITY
 
   /** Keeps what a read of an action's record said, unless a newer revision has been read. */
   note = (receipt: Receipt): void => {
-    if (!this.#firstRead.has(receipt.action_id)) {
-      this.#firstRead.set(receipt.action_id, this.#refusals)
-    }
     const held = this.#reads.get(receipt.action_id)
     if (held !== undefined && later(held.revision, receipt.revision)) return
     this.#reads.set(receipt.action_id, {
@@ -94,12 +89,12 @@ export class ReceiptReads {
    * Keeps the action a host's refusal names, which is the first identifier in its words: the one it
    * holds as the newest uncertain outcome of the conversation, or the one the quote was about.
    */
-  noteRefusal = (words: string): void => {
+  noteRefusal = (words: string, at: number = Date.now()): void => {
     const named = ACTION_ID.exec(words)?.[0]
     if (named === undefined) return
-    this.#refusals += 1
+    this.#firstRefusalAt = Math.min(this.#firstRefusalAt, at)
     this.#named.delete(named)
-    this.#named.set(named, this.#refusals)
+    this.#named.set(named, at)
     for (const oldest of this.#named.keys()) {
       if (this.#named.size <= MAX_NAMED) break
       this.#named.delete(oldest)
@@ -107,13 +102,13 @@ export class ReceiptReads {
   }
 
   /**
-   * How late the host's word puts an action: the number of the refusal that last named it, or of
-   * the last refusal before its record was first read, whichever is later. An action read after a
-   * refusal is newer than what that refusal named, since the host admitted it afterwards. Zero for
-   * an action no refusal has bearing on.
+   * How late the host's word puts a prompt, by this window's clock: when the refusal that last
+   * named its action was kept, or else when the prompt was made, if that was after the first
+   * refusal, since the host can only have recorded it after what that refusal named. A prompt made
+   * before, that no refusal named, has no word of the host's: zero.
    */
-  heldAt = (actionId: string): number =>
-    Math.max(this.#firstRead.get(actionId) ?? 0, this.#named.get(actionId) ?? 0)
+  heldAt = (actionId: string, madeAtMs: number): number =>
+    Math.max(this.#named.get(actionId) ?? 0, madeAtMs > this.#firstRefusalAt ? madeAtMs : 0)
 
   /** Has `read` called when a session's actions should be read again; the result stops it. */
   whenAskedAgain = (sessionId: string, read: () => void): (() => void) => {
@@ -137,7 +132,7 @@ export class ReceiptReads {
  * The host's rule is about the conversation: it compares a later request with the newest uncertain
  * outcome of the same method for the same session, instance and binding revision. So only an action
  * whose newest read said unknown counts, only a prompt, only one sent to this conversation, and the
- * newest of those: the one the host last named in a refusal, unless an action was read after that,
+ * newest of those: the one the host last named in a refusal, unless a prompt was made after that,
  * and otherwise the one whose record was written last. Anything else is sent with no quote: an
  * action the host holds as accepted or dispatching, or one of another method or conversation, does
  * not stand in a prompt's way, and a quote of one would be refused.
@@ -160,7 +155,7 @@ export function supersessionFor(
     }
     const read = reads.read(each.actionId)
     if (read === undefined || read.state !== 'unknown' || read.method !== PROMPT_METHOD) continue
-    const held = reads.heldAt(each.actionId)
+    const held = reads.heldAt(each.actionId, each.createdAtMs)
     if (
       newest === null ||
       held > newest.held ||
