@@ -29,8 +29,8 @@
 //! holds the release it read ([`Store::hold_current`]), and uses the path of that release, which has
 //! no link in it: a path walk through a link that a rename replaces rarely answers that the path is
 //! missing, on Linux, and two walks through it can name two releases. The hold keeps the release on
-//! disk from the read until the program started has a hold of its own, however many updates fall
-//! between the two.
+//! disk from the read to at least the moment the program started has a hold of its own, however many
+//! updates fall between the two.
 //!
 //! # Which release a process runs
 //!
@@ -680,28 +680,57 @@ fn hold_opened_within(
     release: &ReleaseName,
     within: Duration,
 ) -> Result<(File, ReleaseManifest)> {
+    lock_opened_within(&file, &path, within)?;
+    let manifest = read_manifest(&file, &path, release)?;
+    Ok((file, manifest))
+}
+
+/// Takes the shared hold on a manifest already opened at `path`, waiting up to `within`, and checks
+/// that `path` still names the file locked. The manifest is not read.
+#[cfg(unix)]
+fn lock_opened_within(file: &File, path: &Path, within: Duration) -> Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
-    if !lock_within(&file, &path, Locking::Shared, within)? {
+    if !lock_within(file, path, Locking::Shared, within)? {
         return Err(InstallError::Replaced {
-            path,
+            path: path.to_path_buf(),
             reason: "is being removed or replaced, and that has not finished: this program of it \
                      does not start",
         });
     }
     let held = file
         .metadata()
-        .map_err(|error| InstallError::io("read", &path, error))?;
-    let named = std::fs::symlink_metadata(&path).ok();
+        .map_err(|error| InstallError::io("read", path, error))?;
+    let named = std::fs::symlink_metadata(path).ok();
     if named.is_none_or(|named| named.dev() != held.dev() || named.ino() != held.ino()) {
         return Err(InstallError::Replaced {
-            path,
+            path: path.to_path_buf(),
             reason: "is no longer the file this program locked: its release was removed or \
                      replaced while it started",
         });
     }
-    let manifest = read_manifest(&file, &path, release)?;
-    Ok((file, manifest))
+    Ok(())
+}
+
+/// Opens a release's manifest and takes the shared hold on it, waiting up to `within`, without
+/// reading the manifest: a program that only keeps the release for another to start needs the hold
+/// and not what the manifest says.
+#[cfg(unix)]
+fn hold_unread_within(store: &Store, release: &ReleaseName, within: Duration) -> Result<File> {
+    let path = store.manifest(release);
+    let file = open_regular_file(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            InstallError::Replaced {
+                path: path.clone(),
+                reason: "is gone: this release was removed from this host after this program \
+                         started",
+            }
+        } else {
+            InstallError::io("open", &path, error)
+        }
+    })?;
+    lock_opened_within(&file, &path, within)?;
+    Ok(file)
 }
 
 /// Reads the manifest from an open file at `path`, and checks that it names `release`.
@@ -750,6 +779,15 @@ fn hold_within(
     release: &ReleaseName,
     within: Duration,
 ) -> Result<(File, ReleaseManifest)> {
+    let file = hold_unread_within(store, release, within)?;
+    let manifest = read_manifest(&file, &store.manifest(release), release)?;
+    Ok((file, manifest))
+}
+
+/// [`hold_within`] without reading the manifest: a program that only keeps the release for another
+/// to start needs the hold and not what the manifest says.
+#[cfg(windows)]
+fn hold_unread_within(store: &Store, release: &ReleaseName, within: Duration) -> Result<File> {
     let path = store.manifest(release);
     let file = windows::open_for_hold(&path, within).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -779,8 +817,7 @@ fn hold_within(
                      replaced while it started",
         });
     }
-    let manifest = read_manifest(&file, &path, release)?;
-    Ok((file, manifest))
+    Ok(file)
 }
 
 /// How a lock file is locked.
@@ -1044,34 +1081,43 @@ impl Store {
     /// as the programs of one start, can name two releases. The release stays on disk for as long as
     /// the value lives, though updates switch and remove releases meanwhile: a start that waits
     /// for two updates to collect its release would otherwise find nothing to start. A start that
-    /// replaces the process hands the hold to the program ([`CurrentRelease::into_pin`], then
-    /// [`Pin::exec`]).
+    /// replaces the process hands the hold to the program ([`CurrentRelease::into_hold`], then
+    /// `Hold::exec`).
     ///
-    /// A release that is removed between the read and the hold was not current any more, and the
-    /// link is read again. `None` when no release is current.
+    /// The hold is the one a program of the release takes for itself, and it waits as that one does
+    /// for a brief probe of the release ([`Store::held`]) or a removal to let go. It does not read
+    /// the release's manifest: what the release is is for the program started from it to find out,
+    /// so a `kr` that cannot read a newer release's manifest still hands its command to it. A
+    /// release that is gone, or was taken out of `versions/` while the hold was taken, was not
+    /// current any more, and the link is read again. `None` when no release is current.
     ///
     /// # Errors
     ///
-    /// Returns what [`Store::current`] and [`Store::pin`] return, and [`InstallError::Replaced`]
-    /// when every release the link was read to name was gone or being removed before it could be
-    /// held.
+    /// Returns what [`Store::current`] returns, [`InstallError::Io`] when the manifest cannot be
+    /// opened or locked, and [`InstallError::Replaced`] when every release the link was read to
+    /// name was gone, or was being removed for as long as the hold waited.
     pub fn hold_current(&self) -> Result<Option<CurrentRelease>> {
+        let mut gone = None;
         for _ in 0..HOLD_CURRENT_ATTEMPTS {
             let Some(release) = self.current()? else {
                 return Ok(None);
             };
-            if let Some(pin) = self.pin(&release)? {
-                return Ok(Some(CurrentRelease {
-                    store: self.clone(),
-                    release,
-                    pin,
-                }));
+            match hold_unread_within(self, &release, HOLD_WAIT) {
+                Ok(file) => {
+                    return Ok(Some(CurrentRelease {
+                        store: self.clone(),
+                        release,
+                        hold: Hold { file },
+                    }));
+                }
+                Err(error @ InstallError::Replaced { .. }) => gone = Some(error),
+                Err(error) => return Err(error),
             }
         }
-        Err(InstallError::Replaced {
+        Err(gone.unwrap_or_else(|| InstallError::Replaced {
             path: self.current_link(),
             reason: "names a release that is gone or being removed",
-        })
+        }))
     }
 
     /// The path [`Store::stable`] names, where the program is there.
@@ -1104,10 +1150,14 @@ impl Store {
 
     /// Whether `image`, the path the kernel names for a process's own image, is `program` of a
     /// release this store keeps in `versions/`. A program under `staging/` or `trash/`, one outside
-    /// the store, and another program of a kept release are not.
+    /// the store, and another program of a kept release are not. Both paths are resolved first, so
+    /// a store under a link, and the prefix Windows puts on a resolved path, are the same place.
     #[must_use]
     pub fn keeps_program(&self, image: &Path, program: Program) -> bool {
-        let Ok(versions) = std::fs::canonicalize(self.versions()) else {
+        let (Ok(versions), Ok(image)) = (
+            std::fs::canonicalize(self.versions()),
+            std::fs::canonicalize(image),
+        ) else {
             return false;
         };
         let Ok(inside) = image.strip_prefix(versions) else {
@@ -1500,7 +1550,10 @@ impl Store {
             Err(error) => return Err(InstallError::io("open", &path, error)),
         };
         match hold_opened_within(file, path, release, Duration::ZERO) {
-            Ok((file, manifest)) => Ok(Some(Pin { file, manifest })),
+            Ok((file, manifest)) => Ok(Some(Pin {
+                hold: Hold { file },
+                manifest,
+            })),
             Err(InstallError::Replaced { .. }) => Ok(None),
             Err(error) => Err(error),
         }
@@ -1895,7 +1948,7 @@ const HOLD_CURRENT_ATTEMPTS: usize = 3;
 pub struct CurrentRelease {
     store: Store,
     release: ReleaseName,
-    pin: Pin,
+    hold: Hold,
 }
 
 impl CurrentRelease {
@@ -1917,18 +1970,19 @@ impl CurrentRelease {
         self.store.release_directory(&self.release).join("shells")
     }
 
-    /// The hold, to hand to the program that takes this process's place ([`Pin::exec`]).
+    /// The hold, to hand to the program that takes this process's place (`Hold::exec`).
     #[must_use]
-    pub fn into_pin(self) -> Pin {
-        self.pin
+    pub fn into_hold(self) -> Hold {
+        self.hold
     }
 }
 
-/// A shared hold on a release of a store, taken for a program that is about to start from it.
+/// A shared hold on a release of a store: its manifest, opened and locked.
+///
+/// Where a process replaces itself the hold is passed on to the program that takes over; on
+/// Windows it is kept open until the program has ended. Letting go of it lets the release go.
 #[derive(Debug)]
-pub struct Pin {
-    /// The release's manifest, opened and held. Where a process replaces itself it is passed on to
-    /// the program that takes over; on Windows it is kept open until the program has ended.
+pub struct Hold {
     #[cfg_attr(
         windows,
         expect(
@@ -1937,6 +1991,31 @@ pub struct Pin {
         )
     )]
     file: File,
+}
+
+impl Hold {
+    /// Replaces this process with `command`, which starts holding the release already.
+    ///
+    /// The hold is on an open file, and the file is left open across the replacement, so the
+    /// program that takes this process's place holds the release from its first instruction and
+    /// still holds it while it takes a hold of its own. Returns only when the replacement failed,
+    /// with the reason, and the hold ends with this value.
+    #[cfg(unix)]
+    pub fn exec(self, command: &mut std::process::Command) -> std::io::Error {
+        use std::os::unix::process::CommandExt as _;
+
+        if let Err(error) = rustix::io::fcntl_setfd(&self.file, rustix::io::FdFlags::empty()) {
+            return std::io::Error::from(error);
+        }
+        command.exec()
+    }
+}
+
+/// A shared hold on a release of a store, taken for a program that is about to start from it,
+/// with the manifest that was read to take it.
+#[derive(Debug)]
+pub struct Pin {
+    hold: Hold,
     manifest: ReleaseManifest,
 }
 
@@ -1947,20 +2026,11 @@ impl Pin {
         &self.manifest
     }
 
-    /// Replaces this process with `command`, which starts holding the release already.
-    ///
-    /// The hold is on an open file, and the file is left open across the replacement, so the
-    /// program that takes this process's place holds the release from its first instruction and
-    /// still holds it while it takes a hold of its own. Returns only when the replacement failed,
-    /// with the reason, and the hold ends with the pin.
+    /// Replaces this process with `command`, which starts holding the release already: see
+    /// `Hold::exec`.
     #[cfg(unix)]
     pub fn exec(self, command: &mut std::process::Command) -> std::io::Error {
-        use std::os::unix::process::CommandExt as _;
-
-        if let Err(error) = rustix::io::fcntl_setfd(&self.file, rustix::io::FdFlags::empty()) {
-            return std::io::Error::from(error);
-        }
-        command.exec()
+        self.hold.exec(command)
     }
 }
 
@@ -2312,7 +2382,10 @@ impl Store {
     /// or a missing file, and [`InstallError::Manifest`] for a manifest this build does not read.
     pub fn pin(&self, release: &ReleaseName) -> Result<Option<Pin>> {
         match hold_within(self, release, Duration::ZERO) {
-            Ok((file, manifest)) => Ok(Some(Pin { file, manifest })),
+            Ok((file, manifest)) => Ok(Some(Pin {
+                hold: Hold { file },
+                manifest,
+            })),
             Err(InstallError::Replaced { .. }) => Ok(None),
             Err(error) => Err(error),
         }
@@ -2405,8 +2478,8 @@ impl Store {
 }
 
 #[cfg(windows)]
-impl Pin {
-    /// Runs `command`, which is a program of the pinned release, with the release held until the
+impl Hold {
+    /// Runs `command`, which is a program of the held release, with the release held until the
     /// program ends, and ends this process with its exit code. Returns only when the program could
     /// not be started, with the reason.
     ///
@@ -2427,6 +2500,14 @@ impl Pin {
             }
             Err(error) => error,
         }
+    }
+}
+
+#[cfg(windows)]
+impl Pin {
+    /// Runs `command` with the release held until the program has ended: see `Hold::run`.
+    pub fn run(self, command: &mut std::process::Command) -> std::io::Error {
+        self.hold.run(command)
     }
 }
 

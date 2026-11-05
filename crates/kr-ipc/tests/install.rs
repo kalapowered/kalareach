@@ -481,6 +481,74 @@ fn the_release_a_command_reads_for_a_start_is_there_to_start_after_two_updates_c
     );
 }
 
+/// KR-REQ-26.09: the hold a command takes on the release `current` names does not read that
+/// release's manifest, so a `kr` that cannot read a newer release's manifest still holds the release
+/// and hands its command to it. `Store::pin`, which reads the manifest, is the control.
+#[cfg(unix)]
+#[test]
+fn a_release_whose_manifest_this_build_cannot_read_is_held_for_a_start() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let program = test.install(&one);
+    std::fs::write(
+        test.store.manifest(&one),
+        br#"{"signed":{"_type":"a-release-format-from-later"},"signatures":[]}"#,
+    )
+    .expect("a manifest this build does not read");
+    test.switch(&one);
+
+    assert!(
+        matches!(
+            test.store.pin(&one),
+            Err(kr_ipc::install::InstallError::Manifest { .. })
+        ),
+        "the manifest is not one this build reads"
+    );
+    let current = test
+        .store
+        .hold_current()
+        .expect("current is readable")
+        .expect("a release is current");
+    assert_eq!(current.release(), &one);
+    assert_eq!(current.program(Program::Kr), program);
+    assert!(test.store.held(&one).expect("asks"), "the release is held");
+}
+
+/// KR-REQ-26.09: a probe of whether a release is held, which takes the manifest's lock exclusively
+/// for an instant, does not make the hold on the current release fail as if the release were being
+/// removed. Counted, not timed: a thread probes the release without pause while the hold is taken
+/// a thousand times, and every hold is taken.
+#[cfg(unix)]
+#[test]
+fn a_probe_of_whether_the_current_release_is_held_does_not_refuse_a_hold_on_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    test.install(&one);
+    test.switch(&one);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let probing = {
+        let (store, one, stop) = (test.store.clone(), one.clone(), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = store.held(&one);
+            }
+        })
+    };
+    let mut refused = Vec::new();
+    for round in 0..1000 {
+        if let Err(error) = test.store.hold_current() {
+            refused.push(format!("hold {round}: {error}"));
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    probing.join().expect("the probe ends");
+    assert!(refused.is_empty(), "holds refused: {refused:?}");
+}
+
 /// A build outside a store is what it always was: its programs are the ones beside it, and it
 /// holds nothing.
 #[test]

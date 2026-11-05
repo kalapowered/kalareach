@@ -128,7 +128,7 @@ fn start_stores_kr(store: &Store) -> CliError {
     let mut command = std::process::Command::new(current.program(Program::Kr));
     command.args(std::env::args_os().skip(1));
     // The program starts already holding the release.
-    let error = current.into_pin().exec(&mut command);
+    let error = current.into_hold().exec(&mut command);
     CliError::Other(shown!(
         "the release this host keeps could not be started: {}",
         Shown::io(&error)
