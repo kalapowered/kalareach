@@ -1,9 +1,8 @@
 //! The project service's own quiescence authority: what a capture under it is, what it keeps the
 //! host's writers from doing while it reads, and what its comparison afterwards catches.
 //!
-//! KR-REQ-14.32 (the consistency class is recorded; a concurrent change is retried or rejected;
-//! a quiesced capture rests on a reservation that held) and KR-REQ-25.20 (the writers consult
-//! the quiescence authority).
+//! The consistency class is recorded; a concurrent change is retried or rejected; a quiesced
+//! capture rests on a reservation that held; and the writers consult the quiescence authority.
 //!
 //! Every test here asks the project service to run Git, which it does not do on Windows.
 
