@@ -324,6 +324,15 @@ less the line that joins the two pages, and a read of several of the key is that
 wheel does the same while the window is above the live page, where this terminal's own scrollback
 holds nothing and the reports would otherwise address rows the application's grid does not have.
 
+A size counts as sent only once the session has answered it, by accepting it or by a definite
+refusal. When the session refuses it for now, or cannot say what became of it, the newest size is
+said again, even if the terminal is still at the size that was sent. It goes at once if the terminal
+changed size or a key moved the window while the report was on its way. Otherwise it goes with the
+session's next word, up to three times in a row, and after that with the terminal's next resize or
+key. A move, or the return to the live screen that typing asks for, which the session refuses for
+now or cannot say what became of, is settled as not taken and is not made again: press the key
+again.
+
 A read is one of those keys or it is the session's, whole and unchanged. That is the rule rather
 than a reader that looks inside a batch, because looking inside is how a command starts altering
 what somebody typed: it would have to hold back the beginning of a sequence a read boundary cut in
