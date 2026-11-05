@@ -912,6 +912,9 @@ pub fn a_dropped_answer_does_not_wait_for_the_rest_of_a_character_the_terminal_h
     let package = Package::built(kind);
     let mut session = Session::start(&package);
     let first = session.first_prompt();
+    // No step is given until the last exchange: a step is a key, and it would end the wait of a
+    // drop that waited for the rest of the character.
+    session.stepping = false;
     assert!(
         session.wait_for_prompt() && session.wait_for_editor_reading(),
         "the shell drew no prompt to type behind:\n{}",
@@ -939,6 +942,7 @@ pub fn a_dropped_answer_does_not_wait_for_the_rest_of_a_character_the_terminal_h
         },
     );
     session.type_bytes(b"\xa9");
+    session.stepping = true;
     let latest = the_reader_once_it_has_taken_what_the_terminal_holds(&mut session, first);
     assert!(
         !latest.editor.buffer_empty,
