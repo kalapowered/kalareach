@@ -61,6 +61,13 @@ impl Asked {
         Self { kept: true, ..self }
     }
 
+    /// Whether the answer is held as one kept from an earlier submission of the action, for a test
+    /// that a service marks the copy it reads from its own record.
+    #[cfg(test)]
+    pub(super) const fn is_kept(&self) -> bool {
+        self.kept
+    }
+
     /// What the answer this was decided for is the answer to.
     fn answers(&self) -> Answers {
         if self.shown_as.entry().effect != EffectClass::Write {
