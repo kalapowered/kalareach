@@ -360,6 +360,31 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_names_the_uncertain_outcome_before_the_action_it_was_quoted_for() {
+        // A client reads the first identifier in these words as the action the host holds as the
+        // uncertain outcome in the request's way.
+        let uncertain = Uncertain {
+            action_id: action(1),
+            revision: 3,
+        };
+        let words = |refused: Result<()>| match refused {
+            Err(WorkerError::PreconditionFailed { detail }) => detail,
+            other => panic!("a precondition failure: {other:?}"),
+        };
+        let (newest, quoted) = (action(1).to_string(), action(2).to_string());
+
+        let unquoted = words(check_supersession(Some(uncertain), None, None));
+        assert!(unquoted.contains(&newest), "{unquoted}");
+        let wrong = Supersession {
+            action_id: action(2),
+            revision: 3,
+        };
+        let another = words(check_supersession(Some(uncertain), Some(wrong), Some(3)));
+        let at = |id: &String| another.find(id).expect("the action is named");
+        assert!(at(&newest) < at(&quoted), "{another}");
+    }
+
+    #[test]
     fn an_explicit_later_request_that_shows_the_earlier_result_is_admitted() {
         let uncertain = Uncertain {
             action_id: action(1),

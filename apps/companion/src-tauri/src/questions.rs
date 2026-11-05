@@ -363,6 +363,8 @@ struct Host<'a> {
     taken: Mutex<Option<QuestionResolveResult>>,
     /// Whether a send of this call reached the point where it may be on its way to the host.
     sent: AtomicBool,
+    /// The link the answer the worker took went over, whose book holds the earlier sends of it.
+    over: Mutex<Option<Arc<Link>>>,
 }
 
 impl<'a> Host<'a> {
@@ -375,6 +377,7 @@ impl<'a> Host<'a> {
             exchange: state.questions().exchange(),
             taken: Mutex::new(None),
             sent: AtomicBool::new(false),
+            over: Mutex::new(None),
         }
     }
 
@@ -535,6 +538,8 @@ impl QuestionHost for Host<'_> {
         }
         if let Ok(resolved) = &answer {
             *self.taken.lock().unwrap_or_else(PoisonError::into_inner) = Some(resolved.clone());
+            *self.over.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(Arc::clone(link.link()));
         }
         answer
     }
@@ -555,10 +560,15 @@ impl QuestionHost for Host<'_> {
         self.settle(session_id, link.link(), answer)
     }
 
-    /// Lets the session's link stop holding the earlier sends of an answer the host took, on the
-    /// link the answer went over. A link that cannot be had holds no book to settle.
+    /// Lets the link the answer went over stop holding the earlier sends of an answer the host
+    /// took. A call whose answer the host did not take has no such link, and no link is opened.
     async fn settle_earlier(&self, session_id: SessionId, sends: &[ActionId]) {
-        if let Ok(link) = self.link(session_id).await {
+        let over = self
+            .over
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(link) = over {
             <Session as QuestionHost>::settle_earlier(&link.session, session_id, sends).await;
         }
     }
@@ -1280,8 +1290,10 @@ pub async fn send(
             return Err(CommandError::from(*failed.error));
         }
     };
-    // The worker has the answer. Taking the copy away is the last step, and a failure of it is
-    // told rather than hidden: a copy left behind is retired by the next settling.
+    // The worker has the answer. The earlier sends of it are moot, so the link stops holding them.
+    // Taking the copy away is the last step, and a failure of it is told rather than hidden: a copy
+    // left behind is retired by the next settling.
+    host.settle_earlier(draft.session_id, &carried).await;
     let leftover = store.discard(draft.question_id).is_err();
     Ok(Answer::Taken {
         resolution: Box::new(resolution),
