@@ -1,10 +1,9 @@
 //! `kr backup restore`, against a real control daemon, the storage service stand-in and the real
 //! `kr` binary.
 //!
-//! KR-REQ-24.16, KR-REQ-20.16, KR-REQ-20.19 and KR-ACC-033: a fresh host with only the recovery kit
-//! reads the archive back through its own account, the bundle authenticates under the kit, the
-//! writers and producers it trusts come from that bundle alone, and the data comes back as readable
-//! files while no key, grant or device does.
+//! A fresh host with only the recovery kit reads the archive back through its own account, the
+//! bundle authenticates under the kit, the writers and producers it trusts come from that bundle
+//! alone, and the data comes back as readable files while no key, grant or device does.
 //!
 //! Everything but the service is real. The service is the stand-in (`kr-service-stand-in`), which
 //! answers as the deployed Worker does and is held to a recording of it. The archive and the bundle

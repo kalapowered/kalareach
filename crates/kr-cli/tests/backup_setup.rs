@@ -1,9 +1,9 @@
 //! `kr backup setup`, against a real control daemon, the storage service stand-in and the real `kr`
 //! binary on a pseudo-terminal.
 //!
-//! KR-REQ-20.14, KR-REQ-20.15, KR-REQ-20.18, KR-REQ-24.16 and KR-ACC-033: the owner's command makes
-//! the recovery seed in its own process, shows the kit once, and gives the daemon what it needs to
-//! write the bundle, enrol the host's writer and record the setup, and nothing that opens a backup.
+//! The owner's command makes the recovery seed in its own process, shows the kit once, and gives
+//! the daemon what it needs to write the bundle, enrol the host's writer and record the setup, and
+//! nothing that opens a backup.
 //! Everything but the service is real. The service is the stand-in (`kr-service-stand-in`), which
 //! answers as the deployed Worker does and is held to a recording of it.
 
@@ -655,6 +655,12 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// service holds a bundle at the kit's place that the kit's seed opens. What the daemon was given
 /// carries nothing that opens a backup: not the seed's bytes, not its printed symbols, not the kit,
 /// not the bundle's key; and no file of the host holds them.
+///
+/// KR-REQ-20.18, the part about what the kit carries: the kit shown begins with its format line,
+/// parses with a seed whose checksum holds, names the service's origin, and its locator names a
+/// bundle at the service that the kit's seed opens. Not shown here: the crypto profile version, a
+/// QR form, bundle updates under the stable locator, multiple-service kits and the offline export,
+/// which the restore and export cases show.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_kit_that_setup_shows_is_the_one_the_host_records_and_the_daemon_is_given_no_seed() {
     let rig = Rig::start().await;
