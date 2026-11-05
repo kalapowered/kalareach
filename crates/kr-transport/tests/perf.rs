@@ -21,12 +21,12 @@
 //!
 //! Both are timed, so both print what section 27 asks to be recorded beside a figure: the build,
 //! the operating system and architecture, the processor, the processors, the memory and the load
-//! average. KR-PERF-005 prints two readings besides, because it is the one whose target the
+//! average. The first prints two readings besides, because it is the one whose target the
 //! conditions decide: the share of each phase the hypervisor took from this guest, and how late a
 //! thread of its own was woken while it measured. `tests/support/conditions.rs` says which of
 //! those is a condition and which is evidence, and why.
 //!
-//! KR-PERF-005 is asserted where the host meets every condition it can be shown against, and
+//! The first is asserted where the host meets every condition it can be shown against, and
 //! recorded with the shortfall named where it does not. Its figure is a difference of two
 //! percentiles on the same host, so noise enters it twice and does not cancel: on a host the
 //! hypervisor kept taking the processor from, the figure alone cannot separate what the application
@@ -38,14 +38,14 @@
 //! holds the property behind the figure, with nothing timed in it, and that one is asserted
 //! everywhere.
 //!
-//! KR-PERF-006 is asserted on every run, unoptimised builds included. It has held on every host
+//! The second is asserted on every run, unoptimised builds included. It has held on every host
 //! this has run on by three orders of magnitude, which is why it is asserted unconditionally: that
 //! is a choice about where the line sits rather than a claim that no host could miss it. What it
 //! measures is the transport's share alone: a screen-sized frame arriving, not a screen rendered
 //! from it.
 //!
 //! One thing both assert whatever the host: the transfer was still running at the end of the phase
-//! KR-PERF-005 measured, and the snapshot arrived whole. A harness that measured an idle
+//! the first measured, and the snapshot arrived whole. A harness that measured an idle
 //! connection, or read an empty frame, would otherwise pass by measuring nothing.
 
 mod support;
