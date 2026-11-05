@@ -355,6 +355,9 @@ async fn wait_for_an_owner_device<T>(
                     return Err(CliError::Refused(refused));
                 }
                 tokio::time::sleep(poll.min(deadline - now)).await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(CliError::Refused(refused));
+                }
             }
             // The host's definite refusal is its answer, passed on as itself. Anything else, a
             // connection that ended or an answer that cannot be read, may have come after the host
