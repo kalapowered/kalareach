@@ -126,6 +126,63 @@ impl Default for CompileBudget {
     }
 }
 
+/// A component's bytes together with the digest of exactly those bytes.
+///
+/// The key a compile is filed under, and the one a request for the same component joins a compile
+/// by, is made from the digest, and a digest is a pass over every byte of a component of up to
+/// [`MAX_COMPONENT_BYTES`]. It is made once, where the bytes are read or handed over, and travels
+/// with them: a payload can be made only by digesting its bytes, so the digest it carries is the
+/// digest of the bytes it holds. Making one is that pass, which is blocking work: an async caller
+/// makes it on a thread of the blocking pool and not on its executor, and the calls that queue a
+/// compile take a payload so that none of them has a pass of its own to make.
+#[derive(Clone)]
+pub struct Payload {
+    bytes: Arc<[u8]>,
+    digest: PayloadDigest,
+}
+
+impl core::fmt::Debug for Payload {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Payload")
+            .field("bytes", &self.bytes.len())
+            .field("digest", &self.digest)
+            .finish()
+    }
+}
+
+impl Payload {
+    /// Digests `bytes`.
+    #[must_use]
+    pub fn new(bytes: Arc<[u8]>) -> Self {
+        let digest = PayloadDigest::of(&bytes);
+        Self { bytes, digest }
+    }
+
+    /// Digests `bytes`, and returns them as a payload only if the digest is `expected`.
+    #[must_use]
+    pub fn checked(bytes: Arc<[u8]>, expected: &PayloadDigest) -> Option<Self> {
+        let payload = Self::new(bytes);
+        (payload.digest == *expected).then_some(payload)
+    }
+
+    /// The component's bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The digest of [`Self::bytes`].
+    #[must_use]
+    pub const fn digest(&self) -> &PayloadDigest {
+        &self.digest
+    }
+
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+}
+
 /// What a compilation produced, and where it came from.
 #[derive(Clone, Debug)]
 pub struct Compiled {
@@ -454,10 +511,11 @@ impl CompilePool {
 
     /// Submits a compilation and returns a receiver for its result.
     ///
-    /// The call returns as soon as the work is queued. Nothing here waits for a compile, which is
-    /// what keeps a caller on the terminal path from ever being behind one. The component's key,
-    /// which is a digest of its bytes, is made here, so that a request for a component that is
-    /// queued or being compiled joins that compile without a pool thread to take it up.
+    /// The call returns as soon as the work is queued. Nothing here waits for a compile, and nothing
+    /// here makes a pass over the component's bytes, which is what keeps a caller on the terminal
+    /// path from ever being behind either. The component's key is made here from the payload's
+    /// digest, so that a request for a component that is queued or being compiled joins that compile
+    /// without a pool thread to take it up.
     ///
     /// A request joins a compile of the same component only on the same engine, into the same cache
     /// and under the same budget, and is answered with that compile's result.
@@ -472,17 +530,17 @@ impl CompilePool {
         &self,
         engine: &RuntimeEngine,
         cache: &CompiledCache,
-        wasm: Arc<[u8]>,
+        payload: Payload,
         budget: CompileBudget,
     ) -> RuntimeResult<tokio::sync::oneshot::Receiver<RuntimeResult<Compiled>>> {
-        let bytes = wasm.len() as u64;
+        let bytes = payload.len();
         if bytes > budget.max_bytes {
             return Err(RuntimeError::ComponentTooLarge {
                 bytes,
                 limit: budget.max_bytes,
             });
         }
-        let key = key_for(engine, &wasm);
+        let key = key_of(engine, payload.digest, bytes);
         let (answer, wait) = tokio::sync::oneshot::channel();
         let (answer, flight) = match self
             .flights
@@ -519,7 +577,7 @@ impl CompilePool {
                 if panics.swap(false, std::sync::atomic::Ordering::SeqCst) {
                     panic!("the compiler fell over");
                 }
-                compile_or_load_keyed(&engine, &cache, &wasm, key, budget)
+                compile_or_load_keyed(&engine, &cache, payload.bytes(), key, budget)
             });
             // The requests that joined are answered alike, with the component or with why there is
             // none. Ending the compile after it filed its result means a request that comes after
@@ -578,9 +636,14 @@ impl Default for CompilePool {
 /// Returns the cache key for one component under one engine.
 #[must_use]
 pub fn key_for(engine: &RuntimeEngine, wasm: &[u8]) -> CacheKey {
+    key_of(engine, PayloadDigest::of(wasm), wasm.len() as u64)
+}
+
+/// Returns the cache key for the component of `bytes` bytes that has `digest`, under one engine.
+fn key_of(engine: &RuntimeEngine, digest: PayloadDigest, bytes: u64) -> CacheKey {
     CacheKey {
-        wasm_digest: PayloadDigest::of(wasm),
-        wasm_bytes: wasm.len() as u64,
+        wasm_digest: digest,
+        wasm_bytes: bytes,
         engine_compatibility: engine.compatibility().to_owned(),
         engine_version: engine.version().to_owned(),
         target: engine.target().to_owned(),
@@ -744,7 +807,12 @@ mod tests {
         let oversized: Arc<[u8]> =
             vec![0_u8; usize::try_from(MAX_COMPONENT_BYTES + 1).expect("a usize")].into();
         let error = pool
-            .submit(&engine, &cache, oversized, CompileBudget::defaults())
+            .submit(
+                &engine,
+                &cache,
+                Payload::new(oversized),
+                CompileBudget::defaults(),
+            )
             .expect_err("an oversized component is refused");
         assert!(matches!(error, RuntimeError::ComponentTooLarge { .. }));
     }
@@ -910,7 +978,7 @@ mod tests {
             pool.submit(
                 &engine,
                 &cache,
-                Arc::clone(&component),
+                Payload::new(Arc::clone(&component)),
                 CompileBudget::defaults(),
             )
         };
@@ -996,7 +1064,7 @@ mod tests {
         let outcome = pool.submit(
             &engine,
             &cache,
-            Arc::from(&b"\0asm\x0d\0\x01\0"[..]),
+            Payload::new(Arc::from(&b"\0asm\x0d\0\x01\0"[..])),
             CompileBudget::defaults(),
         );
         assert!(

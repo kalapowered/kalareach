@@ -38,6 +38,7 @@
 //!
 //! use kr_plugin_runtime::runtime::{Runtime, RuntimeConfig};
 //! use kr_plugin_runtime::runtime::binding::{BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE};
+//! use kr_plugin_runtime::runtime::compile::Payload;
 //!
 //! # async fn example(request: BindingRequest, wasm: Arc<[u8]>) -> Result<(), kr_plugin_runtime::RuntimeError> {
 //! let runtime = Arc::new(Runtime::new(RuntimeConfig::new(
@@ -49,12 +50,18 @@
 //! // prepares bindings of its own. A lookup by another owner finds nothing.
 //! let owner = BindingOwner::next();
 //!
+//! // The component's digest is made once, here, on a thread that may block: the runtime hashes
+//! // nothing itself.
+//! let payload = tokio::task::spawn_blocking(move || Payload::new(wasm))
+//!     .await
+//!     .expect("the digest was made");
+//!
 //! // Compilation happens on a background thread under its own budget, and the deadline here is
 //! // the caller's own, across every stage. No call deadline includes a compile.
 //! let binding = runtime.prepare(
 //!     owner,
 //!     request,
-//!     wasm,
+//!     payload,
 //!     core::time::Duration::from_secs(5),
 //!     events,
 //! ).await?;

@@ -17,7 +17,7 @@ use kr_plugin_runtime::runtime::bindings::{
 };
 use kr_plugin_runtime::runtime::budget::{CallBudget, CallKind};
 use kr_plugin_runtime::runtime::compile::{
-    CompileBudget, CompileOrigin, CompilePool, compile_or_load, key_for,
+    CompileBudget, CompileOrigin, CompilePool, Payload, compile_or_load, key_for,
 };
 use kr_plugin_runtime::runtime::engine::{ENGINE_VERSION, RuntimeEngine};
 use kr_plugin_runtime::runtime::error::ExhaustedBound;
@@ -1242,7 +1242,7 @@ async fn a_component_the_engine_refuses_to_compile_is_refused_with_every_cause()
     let host = host();
     let error = host
         .runtime
-        .compile(Arc::from(wasm))
+        .compile(Payload::new(Arc::from(wasm)))
         .expect("the compile is queued")
         .wait(COMPILE_WAIT)
         .await
@@ -1277,7 +1277,7 @@ async fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
     let ticks_before = host.runtime.engine().ticks();
     let compiled = host
         .runtime
-        .compile(Arc::clone(&wasm))
+        .compile(Payload::new(Arc::clone(&wasm)))
         .expect("a compile")
         .wait(COMPILE_WAIT)
         .await
@@ -1340,7 +1340,7 @@ async fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
     // A second preparation of the same component finds it rather than compiling again.
     let cached = host
         .runtime
-        .compile(wasm)
+        .compile(Payload::new(wasm))
         .expect("a compile")
         .wait(COMPILE_WAIT)
         .await
@@ -1364,11 +1364,12 @@ async fn kr_req_11_41_a_compile_is_queued_and_the_caller_goes_on_while_it_is_not
 
     // The call is made on a thread of its own, so that one that blocks fails the case rather than
     // holding it.
+    let payload = Payload::new(wasm);
     let (returned, queued) = std::sync::mpsc::channel();
     let caller = std::thread::spawn({
         let runtime = Arc::clone(&host.runtime);
         move || {
-            let compilation = runtime.compile(wasm);
+            let compilation = runtime.compile(payload);
             let _ = returned.send(());
             compilation
         }
@@ -1416,7 +1417,7 @@ async fn kr_req_11_41_a_compile_past_the_compile_bound_is_refused_and_not_filed(
     let runtime = Runtime::new(config).expect("a runtime");
 
     let error = runtime
-        .compile(Arc::clone(&wasm))
+        .compile(Payload::new(Arc::clone(&wasm)))
         .expect("a compile")
         .wait(COMPILE_WAIT)
         .await
@@ -1499,7 +1500,7 @@ async fn kr_req_11_41_the_requests_waiting_for_one_compile_are_held_to_the_queue
         pool.submit(
             &engine,
             &cache,
-            Arc::clone(&not_wasm),
+            Payload::new(Arc::clone(&not_wasm)),
             no_compile_work_bound(),
         )
     };
@@ -1546,13 +1547,18 @@ async fn kr_req_11_41_a_request_on_another_engine_does_not_join_a_compile() {
     let hold = pool.hold();
 
     let first = pool
-        .submit(&one, &cache, Arc::clone(&not_wasm), no_compile_work_bound())
+        .submit(
+            &one,
+            &cache,
+            Payload::new(Arc::clone(&not_wasm)),
+            no_compile_work_bound(),
+        )
         .expect("the first request is queued");
     let second = pool
         .submit(
             &another,
             &cache,
-            Arc::clone(&not_wasm),
+            Payload::new(Arc::clone(&not_wasm)),
             no_compile_work_bound(),
         )
         .expect("the second request is queued");
@@ -1786,10 +1792,20 @@ async fn kr_req_11_41_two_requests_for_one_component_compile_it_once_and_both_ar
     let hold = pool.hold();
 
     let first = pool
-        .submit(&engine, &cache, Arc::clone(&wasm), no_compile_work_bound())
+        .submit(
+            &engine,
+            &cache,
+            Payload::new(Arc::clone(&wasm)),
+            no_compile_work_bound(),
+        )
         .expect("the first request is queued");
     let second = pool
-        .submit(&engine, &cache, Arc::clone(&wasm), no_compile_work_bound())
+        .submit(
+            &engine,
+            &cache,
+            Payload::new(Arc::clone(&wasm)),
+            no_compile_work_bound(),
+        )
         .expect("the second request is made");
     drop(hold);
 
@@ -1823,7 +1839,7 @@ async fn kr_req_11_41_a_compile_that_fails_fails_every_request_that_waited_for_i
         .submit(
             &engine,
             &cache,
-            Arc::clone(&not_wasm),
+            Payload::new(Arc::clone(&not_wasm)),
             no_compile_work_bound(),
         )
         .expect("the first request is queued");
@@ -1831,7 +1847,7 @@ async fn kr_req_11_41_a_compile_that_fails_fails_every_request_that_waited_for_i
         .submit(
             &engine,
             &cache,
-            Arc::clone(&not_wasm),
+            Payload::new(Arc::clone(&not_wasm)),
             no_compile_work_bound(),
         )
         .expect("the second request is made");
@@ -1849,6 +1865,50 @@ async fn kr_req_11_41_a_compile_that_fails_fails_every_request_that_waited_for_i
         (1, 1),
         "the pool compiled for one request and held the other for it"
     );
+}
+
+// KR-REQ-11.41: a request joins a compile by the digest of the component's bytes and not by their
+// number, so two components of one size are two compiles, each answered with its own result.
+//
+// The pool is held while both are queued, so a request that joined the other's compile would be
+// counted before either runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_41_two_components_of_one_size_are_two_compiles() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(directory.path().join("c"))
+        .expect("a cache");
+    let engine = engine();
+    let pool = CompilePool::with_threads(1, 2);
+    let one: Arc<[u8]> = Arc::from(&b"one, not wasm"[..]);
+    let other: Arc<[u8]> = Arc::from(&b"two, not wasm"[..]);
+    assert_eq!(one.len(), other.len());
+    let hold = pool.hold();
+
+    let first = pool
+        .submit(&engine, &cache, Payload::new(one), no_compile_work_bound())
+        .expect("the first component is queued");
+    let second = pool
+        .submit(
+            &engine,
+            &cache,
+            Payload::new(other),
+            no_compile_work_bound(),
+        )
+        .expect("the second component is queued");
+    assert_eq!(
+        pool.requests_joined(),
+        0,
+        "a component joined the compile of another of its size"
+    );
+    drop(hold);
+
+    answer_of(first)
+        .await
+        .expect_err("the first component is refused");
+    answer_of(second)
+        .await
+        .expect_err("the second component is refused");
+    assert_eq!(pool.compiles_started(), 2);
 }
 
 // KR-REQ-11.41: a request for a component that is queued behind another compile joins it, with no
@@ -1870,13 +1930,18 @@ async fn kr_req_11_41_a_request_for_a_queued_component_joins_it_without_a_thread
     let hold = pool.hold();
 
     let ahead = pool
-        .submit(&engine, &cache, Arc::clone(&first), no_compile_work_bound())
+        .submit(
+            &engine,
+            &cache,
+            Payload::new(Arc::clone(&first)),
+            no_compile_work_bound(),
+        )
         .expect("the first component is queued");
     let queued = pool
         .submit(
             &engine,
             &cache,
-            Arc::clone(&second),
+            Payload::new(Arc::clone(&second)),
             no_compile_work_bound(),
         )
         .expect("the second component is queued");
@@ -1884,7 +1949,7 @@ async fn kr_req_11_41_a_request_for_a_queued_component_joins_it_without_a_thread
         .submit(
             &engine,
             &cache,
-            Arc::clone(&second),
+            Payload::new(Arc::clone(&second)),
             no_compile_work_bound(),
         )
         .expect("a second request for the second component joins it");
@@ -1920,7 +1985,7 @@ async fn kr_req_11_38_three_faults_in_a_minute_disable_the_binding() {
     let (events, mut received) = events();
     let compiled = host
         .runtime
-        .compile(wasm)
+        .compile(Payload::new(wasm))
         .expect("a compile")
         .wait(COMPILE_WAIT)
         .await
@@ -1997,7 +2062,7 @@ async fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
     let (events, mut received) = events();
     let compiled = host
         .runtime
-        .compile(wasm)
+        .compile(Payload::new(wasm))
         .expect("a compile")
         .wait(COMPILE_WAIT)
         .await
@@ -2096,7 +2161,7 @@ async fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() 
     let (first_events, _first_received) = events();
     let compiled = host
         .runtime
-        .compile(Arc::clone(&wasm))
+        .compile(Payload::new(Arc::clone(&wasm)))
         .expect("a compile")
         .wait(COMPILE_WAIT)
         .await
@@ -2446,7 +2511,7 @@ async fn a_document_nobody_received_asks_the_component_to_draw_again() {
         .prepare(
             host.owner,
             components::request("well-behaved", 11),
-            Arc::clone(&wasm),
+            Payload::new(Arc::clone(&wasm)),
             COMPILE_WAIT,
             events,
         )

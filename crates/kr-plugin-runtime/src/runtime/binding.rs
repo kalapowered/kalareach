@@ -65,7 +65,7 @@ use crate::runtime::bindings::{
 };
 use crate::runtime::budget::{CallKind, FUEL_PER_DEADLINE_MS};
 use crate::runtime::cache::CompiledCache;
-use crate::runtime::compile::{CompileBudget, CompilePool, Compiled};
+use crate::runtime::compile::{CompileBudget, CompilePool, Compiled, Payload};
 use crate::runtime::engine::RuntimeEngine;
 use crate::runtime::error::{RuntimeError, RuntimeResult};
 use crate::runtime::faults::{FaultCounter, FaultVerdict};
@@ -513,15 +513,17 @@ impl Runtime {
     ///
     /// Returns as soon as the work is queued. This is the only place a component is compiled, and
     /// it is a separate step from [`Self::instantiate`] so that a caller can see, and a test can
-    /// prove, that no call deadline contains a compile.
+    /// prove, that no call deadline contains a compile. It makes no pass over the component's
+    /// bytes: the payload already carries their digest, and making that is the caller's, where
+    /// blocking work belongs.
     ///
     /// # Errors
     ///
     /// Returns [`RuntimeError::ComponentTooLarge`] or [`RuntimeError::CompilationPressure`].
-    pub fn compile(&self, wasm: Arc<[u8]>) -> RuntimeResult<Compilation> {
+    pub fn compile(&self, payload: Payload) -> RuntimeResult<Compilation> {
         let wait = self
             .pool
-            .submit(&self.engine, &self.cache, wasm, self.config.compile)?;
+            .submit(&self.engine, &self.cache, payload, self.config.compile)?;
         Ok(Compilation { wait })
     }
 
@@ -586,7 +588,8 @@ impl Runtime {
     /// All three inside one caller deadline, because all three are what a caller is waiting for.
     /// A caller that runs out of patience loses nothing: the compile continues on its pool thread
     /// and, when it is within its budget, files its result, so the next preparation of the same
-    /// component is quick.
+    /// component is quick. Nothing here hashes the component: [`Payload::new`] does, and a caller
+    /// on an executor makes the payload on a blocking thread.
     ///
     /// # Errors
     ///
@@ -597,12 +600,12 @@ impl Runtime {
         self: &Arc<Self>,
         owner: BindingOwner,
         request: BindingRequest,
-        wasm: Arc<[u8]>,
+        payload: Payload,
         deadline: core::time::Duration,
         events: tokio::sync::mpsc::Sender<BindingEvent>,
     ) -> RuntimeResult<Arc<BindingHandle>> {
         let started = std::time::Instant::now();
-        let compilation = self.compile(wasm)?;
+        let compilation = self.compile(payload)?;
         let compiled = compilation.wait(deadline).await?;
         let remaining = remaining_of(started, deadline)?;
         self.instantiate(owner, request, &compiled, events, remaining)

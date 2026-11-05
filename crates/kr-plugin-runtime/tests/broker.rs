@@ -16,6 +16,7 @@ use std::sync::Arc;
 use kr_plugin_runtime::runtime::binding::{
     BindingOwner, DEFAULT_EVENT_QUEUE, Runtime, RuntimeConfig,
 };
+use kr_plugin_runtime::runtime::compile::Payload;
 use kr_protocol::broker::{
     ActionName, ActionToken, ActionTokenClaim, BrokerGrant, BrokerGrants, DecodedProjection,
     DecodingTrust, OfferedDecision, TokenError,
@@ -258,7 +259,7 @@ async fn kr_acc_016_an_external_fixture_is_bound_under_this_hosts_own_bounds() {
         .prepare(
             owner,
             request,
-            bytes.clone(),
+            Payload::new(bytes.clone()),
             core::time::Duration::from_secs(60),
             events,
         )
