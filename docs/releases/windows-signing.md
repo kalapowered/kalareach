@@ -169,7 +169,10 @@ the archive to what a host stages. What it signs is no release, and the archive 
 its name. The `release` job takes the two trees. It waits, because it declares the `release-signing`
 environment and that environment has a required reviewer, so a person approves every Windows
 signature. It runs for a tag and for the default branch only (its environment admits only `host/v*` tags
-and `main`), and a run on any other ref shows it skipped. Approve it and the run signs the files of each tree that carry a signature,
+and `main`), and a run on any other ref shows it skipped. Approve it and the run first checks that
+the release matrix the managed service publishes lists a tier for this version ([the release
+matrix](packages.md#the-release-matrix)), and stops if it lists none or if the service does not answer
+in three tries a minute apart. It then signs the files of each tree that carry a signature,
 verifies each of them, puts them back, and then stops, naming the reason: the production update
 channel's release keys are not available to a workflow, so `release.json` cannot be signed again
 after the signatures changed the files. Publishing a Windows release waits for the key ceremony of
