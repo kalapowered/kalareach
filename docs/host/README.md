@@ -3510,12 +3510,17 @@ response that its edits make larger than the device said it can receive. The dev
 `OUTCOME_UNKNOWN`, in a sentence that names nothing of the host, and nothing of the answer is shown.
 A fresh answer that is the worker's own refusal of the action, or a receipt that says the action was
 refused or rejected, stays a refusal, because the action did not happen. An answer kept from an
-earlier submission is told as unknown whatever it was, so that a device that may not read it cannot
-tell a name from a refusal. A repeat that fails a check made before the daemon looks for the
-action's record, such as a window that belongs to another connection or a connection scoped to
-another session, is refused as any request is, and so is one whose worker the daemon cannot reach
-to ask for the receipt. The services behind the door check the registration again where they write,
-and a copy of an action that meets a fence owed there is refused in their words.
+earlier submission, which the daemon finds in a record or the worker gives from a receipt it held,
+is told as unknown whatever it was, so that a device that may not read it cannot tell a result from
+a refusal. A repeat that fails a check made before the daemon looks for the action's record, such
+as a connection scoped to another session, is refused as any request is. So is one for which that
+lookup finds nothing, because the daemon cannot reach the worker to ask for the receipt or the
+worker does not give it, and which then meets the window check: a window that belongs to another
+connection. The services behind the door check the registration again where they write, and a copy
+of an action that meets a fence owed there is refused in their words. A service that answers a
+copy of an action from its own record while it carries the action out, because the first copy
+finished meanwhile, hands the door an answer the door does not know to be kept, and it is told as
+a fresh answer is: a result as unknown, and the service's own refusal as that refusal.
 
 A device that falls behind is told rather than waited for. What the daemon holds for one device is
 bounded in bytes, not in messages, at section 9's send queue per peer; a device that reaches that
