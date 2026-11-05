@@ -439,3 +439,9 @@ mod a_share_that_names_a_current_decision;
 
 #[cfg(test)]
 mod a_copy_from_a_services_record;
+
+#[cfg(test)]
+mod an_answer_that_cannot_be_recorded;
+
+#[cfg(test)]
+mod an_attempt_that_has_not_finished;

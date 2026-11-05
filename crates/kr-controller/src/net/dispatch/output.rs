@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+use kr_protocol::error::ProtocolError;
 use kr_protocol::ids::{ConnectionId, DeviceId, RequestId};
 use kr_transport::listener::{AuthorisedSession, ControlSender};
 
@@ -280,6 +281,24 @@ pub(super) enum Answers {
     /// The answer kept from an earlier submission of an action, which a device is shown only as a
     /// read of the receipt it is.
     Kept,
+}
+
+impl Answers {
+    /// What a device is told when this host will not write it `answer` and refuses with `refusal`
+    /// instead.
+    ///
+    /// The one place a refusal that follows an answer is worded, so that no path can put a
+    /// transient or a definite word on an action that may have been carried out: the outcome is
+    /// unknown for an answer that leaves it possible that the action took effect, and for any
+    /// answer kept from an earlier submission; a read, or a frame that answers nothing a device
+    /// asked, carries out nothing, and is told `refusal`.
+    pub(super) fn refusing(self, answer: &ControlFrame, refusal: ProtocolError) -> ProtocolError {
+        match self {
+            Self::Action => super::after_the_outcome(answer, refusal),
+            Self::Kept => super::outcome_not_shown(),
+            Self::Read | Self::Nothing => refusal,
+        }
+    }
 }
 
 /// How one write ended.
@@ -575,14 +594,7 @@ impl RemoteOutput {
                     Some(ControlFrame::Response(Response {
                         request_id,
                         outcome: Outcome::Error(error),
-                    })) => Some(super::failure(
-                        request_id,
-                        match answers {
-                            Answers::Action => super::after_the_outcome(frame, error),
-                            Answers::Kept => super::outcome_not_shown(),
-                            Answers::Nothing | Answers::Read => error,
-                        },
-                    )),
+                    })) => Some(super::failure(request_id, answers.refusing(frame, error))),
                     other => other,
                 };
                 match &refusal {

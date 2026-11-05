@@ -29,7 +29,7 @@ use crate::service::a_close_a_worker_never_answers as fake;
 const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A mutation of `method` that names the whole environment, on `connection`.
-fn mutation_of(
+pub(super) fn mutation_of(
     world: &fake::Silent,
     connection: &super::RemoteConnection,
     method: Method,
@@ -90,7 +90,7 @@ async fn two_copies(
 }
 
 /// The refusal an answer carries.
-fn refusal_of(answered: &Answered) -> ProtocolError {
+pub(super) fn refusal_of(answered: &Answered) -> ProtocolError {
     let ControlFrame::Response(Response {
         outcome: Outcome::Error(refusal),
         ..
@@ -123,7 +123,35 @@ async fn written(
 }
 
 /// A device of every right, paired under the endpoint and key `byte` makes.
-const EVERY_RIGHT: &[ActionRight] = ActionRight::ALL;
+pub(super) const EVERY_RIGHT: &[ActionRight] = ActionRight::ALL;
+
+/// Gives the device on `connection` a live voice grant, the narrower grant a device is held to for
+/// a voice change beside its pairing grant.
+pub(super) fn with_a_voice_grant(controller: &Controller, connection: &super::RemoteConnection) {
+    let voice_grant = kr_protocol::grant::Grant {
+        grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+        issuer_device_id: controller.sharing().host_device_id(),
+        actions: [ActionRight::VoiceUse, ActionRight::SessionView]
+            .into_iter()
+            .collect(),
+        ..connection.device.grant.clone()
+    };
+    controller
+        .sharing()
+        .grants()
+        .issue(
+            &crate::grants::GrantRecord {
+                grant: voice_grant,
+                session_id: None,
+                issued_at_ms: 1,
+                activated_at_ms: Some(1),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("a live voice grant");
+}
 
 /// A mutation of `method`, which a service of the host refuses and records under its action, is
 /// served twice at once (see [`two_copies`]). The copy that found the record is given the refusal
