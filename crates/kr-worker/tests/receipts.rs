@@ -1567,6 +1567,26 @@ fn an_uncertain_outcome_kept_as(
     mutation: &MutationRequest,
     intent: Vec<u8>,
 ) -> u64 {
+    an_uncertain_outcome_kept_as_at(
+        host,
+        actor_id,
+        action_id,
+        mutation,
+        intent,
+        kr_ipc::now_ms(),
+    )
+}
+
+/// As [`an_uncertain_outcome_kept_as`], for a receipt that settled as uncertain at `settled_at`,
+/// which is what orders it among the others of its subject.
+fn an_uncertain_outcome_kept_as_at(
+    host: &Host,
+    actor_id: &ActorId,
+    action_id: ActionId,
+    mutation: &MutationRequest,
+    intent: Vec<u8>,
+    settled_at: TimestampMs,
+) -> u64 {
     let subject = kr_protocol::action::subject_digest(mutation).expect("a subject digest");
     let mut session = host.service.runtime().session();
     let journal = session.journal_mut().expect("a journal");
@@ -1578,7 +1598,7 @@ fn an_uncertain_outcome_kept_as(
     earlier.intent = intent;
     journal.accept(&earlier).expect("the earlier intent");
     journal
-        .mark_dispatching(actor_id.clone(), action_id, kr_ipc::now_ms())
+        .mark_dispatching(actor_id.clone(), action_id, settled_at)
         .expect("a marker");
     journal
         .settle(
@@ -1587,7 +1607,7 @@ fn an_uncertain_outcome_kept_as(
             ReceiptState::Unknown,
             None,
             None,
-            kr_ipc::now_ms(),
+            settled_at,
         )
         .expect("an uncertain outcome");
     journal
@@ -1657,12 +1677,23 @@ async fn a_quote_of_a_revision_the_caller_was_not_shown_is_refused_until_it_has_
 /// Puts the receipt of exactly `mutation`, with the envelope the worker keeps of it, into the
 /// journal as an uncertain outcome of `actor_id`, and returns the revision it stands at.
 fn an_uncertain_outcome_of(host: &Host, actor_id: &ActorId, mutation: &MutationRequest) -> u64 {
-    an_uncertain_outcome_kept_as(
+    an_uncertain_outcome_of_at(host, actor_id, mutation, kr_ipc::now_ms())
+}
+
+/// As [`an_uncertain_outcome_of`], for a receipt that settled as uncertain at `settled_at`.
+fn an_uncertain_outcome_of_at(
+    host: &Host,
+    actor_id: &ActorId,
+    mutation: &MutationRequest,
+    settled_at: TimestampMs,
+) -> u64 {
+    an_uncertain_outcome_kept_as_at(
         host,
         actor_id,
         mutation.action_id,
         mutation,
         kr_cbor::to_canonical_vec(mutation).expect("encodes"),
+        settled_at,
     )
 }
 
@@ -1986,13 +2017,19 @@ async fn an_answer_has_to_quote_the_newest_uncertain_answer_to_its_own_question(
     let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
     let first = asked(&host, "first");
     let second = asked(&host, "second");
-    // Oldest first: an answer to the first question, one to the second, and a newer one to the first.
-    for (id, question) in [(66, &first), (67, &second), (68, &first)] {
+    // Oldest first, one millisecond apart: an answer to the first question, one to the second, and
+    // a newer one to the first.
+    let begun = kr_ipc::now_ms().get();
+    for (at, (id, question)) in [(66, &first), (67, &second), (68, &first)]
+        .into_iter()
+        .enumerate()
+    {
         let lost = MutationRequest {
             action_id: action(id),
             ..answering(&client, &host, question, ParamsValue::empty())
         };
-        an_uncertain_outcome_of(&host, &caller, &lost);
+        let settled = TimestampMs::new(begun + at as u64);
+        an_uncertain_outcome_of_at(&host, &caller, &lost, settled);
     }
 
     let unquoted = answering(&client, &host, &second, ParamsValue::empty());
@@ -2140,14 +2177,19 @@ async fn a_cancellation_has_to_quote_the_newest_uncertain_cancellation_of_its_ow
     let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
     let first = asked(&host, "first");
     let second = asked(&host, "second");
-    // Oldest first: a cancellation of the first question, one of the second, and a newer one of the
-    // first.
-    for (id, question) in [(74, &first), (75, &second), (76, &first)] {
+    // Oldest first, one millisecond apart: a cancellation of the first question, one of the second,
+    // and a newer one of the first.
+    let begun = kr_ipc::now_ms().get();
+    for (at, (id, question)) in [(74, &first), (75, &second), (76, &first)]
+        .into_iter()
+        .enumerate()
+    {
         let lost = MutationRequest {
             action_id: action(id),
             ..cancelling(&client, &host, question)
         };
-        an_uncertain_outcome_of(&host, &caller, &lost);
+        let settled = TimestampMs::new(begun + at as u64);
+        an_uncertain_outcome_of_at(&host, &caller, &lost, settled);
     }
 
     let unquoted = cancelling(&client, &host, &second);
