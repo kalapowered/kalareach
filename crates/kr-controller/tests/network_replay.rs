@@ -5,9 +5,8 @@
 //! it sent, on a connection other than the one that sent it: the host answers a repeat from its
 //! record before it looks at the window, and the window admits nothing on another connection, so a
 //! repeat can only ever be answered from the record and never performs the action. What these
-//! demonstrate: KR-REQ-09.08 (a retried action is answered from what the host kept) and
-//! KR-REQ-23.49 (the sharing methods are claimed per actor and action). Nothing here starts a
-//! worker.
+//! demonstrate: a retried action is answered from what the host kept, and the sharing methods are
+//! claimed per actor and action. Nothing here starts a worker.
 
 mod net_support;
 

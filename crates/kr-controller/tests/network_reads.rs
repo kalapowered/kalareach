@@ -1,15 +1,15 @@
 //! The reads a paired device makes that the daemon decides itself, over a real paired connection.
 //!
-//! What these demonstrate, for the paired-device ingress: KR-REQ-23.49 for `grant.list`, and
-//! KR-REQ-23.41 for the reads this host refuses a device. The method table admits a paired device
-//! to `grant.list`, `upload.status`, `download.begin` and `download.chunk`, among others.
+//! What these demonstrate, for the paired-device ingress: `grant.list`, and the reads this host
+//! refuses a device. The method table admits a paired device to `grant.list`, `upload.status`,
+//! `download.begin` and `download.chunk`, among others.
 //!
 //! A device lists the grants it issued and everything delegated from them, which is what the
 //! sharing service shows any issuer other than this host itself, and it needs `session.share` to
 //! ask. The other three are refused by name, each with the reason this host does not serve it to a
 //! device: a refusal a device can act on rather than one that names no reason. Before either, a
 //! device whose grant does not reach what it asks about is refused as it always was, and so is a
-//! description of a session its grant does not reach (KR-REQ-23.34).
+//! description of a session its grant does not reach.
 //!
 //! No worker is started here: every answer below is the daemon's own.
 
@@ -92,6 +92,11 @@ fn issued(host: &Host, issuer: DeviceId, recipient: DeviceId, parent: Option<Gra
 /// A device lists the grants it issued and everything delegated from them, and nothing this host
 /// issued or another device issued outside that line. A device without `session.share` is refused,
 /// and so is one whose grant does not admit the session its listing names.
+///
+/// KR-REQ-23.49, the part about `grant.list` as a sharing method: a device lists the grants it
+/// issued and everything delegated from them and no other, needs `session.share`, and is refused a
+/// listing for a session its grant does not admit. Not shown here: expiry, owner confirmation,
+/// parent rights and the barrier of the other grant methods.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_lists_the_grants_it_issued_and_what_was_delegated_from_them() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -198,6 +203,15 @@ async fn a_device_lists_the_grants_it_issued_and_what_was_delegated_from_them() 
 /// are each refused by name, as `UNSUPPORTED_CAPABILITY` with the method and the reason in the
 /// message. A device whose grant does not reach the subject or carry the right is refused first,
 /// as it always was.
+///
+/// KR-REQ-23.41, the part about the media methods a paired device is admitted to: `upload.status`,
+/// `download.begin` and `download.chunk` are each refused by name as `UNSUPPORTED_CAPABILITY` with
+/// the method in the message, and a device without `files.read` is refused a download. Not shown
+/// here: the draft methods, owner revision, environment handles and the file grants of an upload.
+///
+/// KR-REQ-23.34, the part about describe as a rights-bound read: a device whose grant sees another
+/// session is refused the description of this one with a permission error. Not shown here: the
+/// other session methods, and describe as a filtered read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_this_host_does_not_serve_a_device_is_refused_by_name() {
     let owner = DeviceKeys::generate().expect("owner keys");
