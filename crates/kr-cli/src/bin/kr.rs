@@ -1349,7 +1349,12 @@ async fn run(cli: Cli) -> Result<Completion> {
             // Where this installation has a PowerShell package, that package's own executable is
             // the shell asked where its profile is: two editions keep theirs in different places,
             // and an entry written for one is never read by the other.
-            let layout = kr_cli::shell::packages()
+            //
+            // The packages are read once, and the release they come from is held until the command
+            // ends, since that executable is started after they are read.
+            let packages = kr_cli::shell::packages();
+            let layout = packages
+                .as_ref()
                 .ok()
                 .and_then(|packages| {
                     packages
@@ -1376,7 +1381,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                     })
                     .collect::<Result<Vec<_>>>()?,
                 command => {
-                    let packages = kr_cli::shell::packages()?;
+                    let packages = packages?;
                     let selected = kr_cli::shell::selected(&packages, selector)?;
                     match command {
                         ShellCommand::Status(_) => selected

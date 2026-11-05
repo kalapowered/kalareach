@@ -83,21 +83,42 @@ fn installed_store() -> Option<kr_ipc::install::Store> {
         .cloned()
 }
 
+/// The packages this installation has, and the hold that keeps the release they were read from on
+/// disk for as long as this value lives.
+///
+/// What a package names is used after the set is read: the PowerShell package's executable is
+/// started to ask where its profile is. So a command keeps the set until it has finished with it.
+pub struct Packages {
+    set: PackageSet,
+    _held: Option<kr_ipc::install::CurrentRelease>,
+}
+
+kr_client::debug_as_name!(Packages);
+
+impl std::ops::Deref for Packages {
+    type Target = PackageSet;
+
+    fn deref(&self) -> &PackageSet {
+        &self.set
+    }
+}
+
 /// Reads the packages this installation has.
 ///
 /// A kr of an installed release reads the current release's packages: those are the packages a new
 /// session is started with, whichever release this kr is. The release `current` names is read
-/// once and held while the set is read, and every file of the set is read in that release, so a
-/// switch while the set is read cannot give it a shell of one release and a shell of another, or a
-/// package that looks missing, and an update that removes releases cannot take that release from
-/// under the read; the executable a package names is a path with no link in it too. Anywhere else,
-/// the packages the build writes, or those [`PACKAGE_ROOT_VARIABLE`] names.
+/// once and held while the value returned lives, and every file of the set is read in that
+/// release, so a switch while the set is read cannot give it a shell of one release and a shell of
+/// another, or a package that looks missing, and an update that removes releases cannot take the
+/// release from under the read or from under a package's executable; that executable is a path
+/// with no link in it too. Anywhere else, the packages the build writes, or those
+/// [`PACKAGE_ROOT_VARIABLE`] names.
 ///
 /// # Errors
 ///
 /// Returns a configuration failure when a package's manifest cannot be read, when the store's
 /// `current` cannot be read, and when no release is current.
-pub fn packages() -> Result<PackageSet> {
+pub fn packages() -> Result<Packages> {
     if let Some(store) = installed_store() {
         let current = match store.hold_current() {
             Ok(Some(current)) => current,
@@ -116,17 +137,24 @@ pub fn packages() -> Result<PackageSet> {
             }
         };
         let root = current.shells();
-        return PackageSet::discover(&root).map_err(|fault| {
-            CliError::ShellIntegrationUnsupported(crate::shown::package_fault(&fault, &root))
-        });
+        return PackageSet::discover(&root)
+            .map(|set| Packages {
+                set,
+                _held: Some(current),
+            })
+            .map_err(|fault| {
+                CliError::ShellIntegrationUnsupported(crate::shown::package_fault(&fault, &root))
+            });
     }
     let default = default_package_root();
-    PackageSet::installed(&default).map_err(|fault| {
-        // The root the package set read, as it chose it: the variable when it is set.
-        let root =
-            std::env::var_os(PACKAGE_ROOT_VARIABLE).map_or(default, std::path::PathBuf::from);
-        CliError::ShellIntegrationUnsupported(crate::shown::package_fault(&fault, &root))
-    })
+    PackageSet::installed(&default)
+        .map(|set| Packages { set, _held: None })
+        .map_err(|fault| {
+            // The root the package set read, as it chose it: the variable when it is set.
+            let root =
+                std::env::var_os(PACKAGE_ROOT_VARIABLE).map_or(default, std::path::PathBuf::from);
+            CliError::ShellIntegrationUnsupported(crate::shown::package_fault(&fault, &root))
+        })
 }
 
 /// Returns the packages one selector names.
