@@ -46,9 +46,6 @@
 //!
 //! `KR_BOUNDARY_CHECKOUT_ACCOUNT` and `KR_BOUNDARY_CONNECT_ACCOUNT` name the two accounts, and
 //! `KR_GIT_ROOT` the Git installation (`C:\Program Files\Git`).
-//!
-//! KR-REQ-14.04, KR-REQ-14.27, KR-REQ-14.28, KR-REQ-14.29 and KR-ACC-030 on Windows: the execution
-//! list is the part of them this establishes.
 
 #![cfg(windows)]
 #![expect(
@@ -212,6 +209,11 @@ struct Case {
     counter: u32,
 }
 
+/// KR-ACC-030 and KR-REQ-14.23, the part about the execution list on Windows: for each boundary
+/// account a program planted as a hook and a program a repository's configuration names as a clean
+/// filter never run, and Git reports that it could not start them; a hook script does not run for
+/// the checkout account, whose list holds no shell, and does for the connection account's; the
+/// person's account runs every one of them. Not shown here: a planted file system monitor or pager.
 #[test]
 #[ignore = "needs an elevated session in a disposable Windows guest where the application-control \
             policy and the two boundary accounts are in place, and it changes that guest's accounts \
