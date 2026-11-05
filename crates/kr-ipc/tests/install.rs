@@ -263,6 +263,7 @@ fn a_program_started_through_current_keeps_its_release_after_the_switch() {
 /// KR-REQ-26.09: what the host reads from the release `current` names comes from one release
 /// whichever way a switch falls between its looks. Through the link a second look names the other
 /// release (the control); a path read once keeps naming the release it was read in.
+#[cfg(unix)]
 #[test]
 fn what_the_host_reads_from_current_once_is_of_one_release_though_a_switch_falls_between_looks() {
     let test = TestStore::create();
@@ -325,6 +326,7 @@ fn what_the_host_reads_from_current_once_is_of_one_release_though_a_switch_falls
 /// whole, whichever way `current` is switched around the start: the one its read named, held, from
 /// the image the read named. A switch falls between each read and its start, and another while the
 /// program runs; judged by a count of starts, not by how long they take.
+#[cfg(unix)]
 #[test]
 fn a_program_started_from_the_release_current_names_runs_that_release_through_switches() {
     /// Ends the program a start made if the case leaves before the program has ended.

@@ -732,8 +732,8 @@ async fn answered_by(
     }
 }
 
-/// The control daemon the standalone start runs, and the service definition names: the one
-/// installed beside this command.
+/// The control daemon the standalone start runs, and the service definition names: the one of the
+/// installation this command is part of.
 ///
 /// A command of an installed release names the daemon through the store's `current`, so a
 /// service definition written now starts the daemon of whichever release an update has made
@@ -832,8 +832,7 @@ async fn standalone(
     let (program, _held) = daemon_program_now()?;
     if !program.is_file() {
         return Err(CliError::HostUnavailable(shown!(
-            "the standalone start runs the control daemon installed beside this command, {}, and \
-             there is none there",
+            "the standalone start runs the control daemon at {}, and there is none there",
             Shown::root(&program)
         )));
     }
@@ -1061,10 +1060,12 @@ async fn managed(
 /// definition: one that is missing, that is not this environment's own, or that is not the one
 /// this installation registers is `HOST_NOT_CONFIGURED` with the setup action, and nothing is
 /// claimed or run. Then a request to start the daemon is left for the task's starter, and the task
-/// is run. The starter takes the request and starts the daemon installed beside this command, with
-/// its output appended to the log; the Task Scheduler, not this command, is its creator, so it is
-/// in none of this command's jobs. The daemon inherits the environment the Task Scheduler gives the
-/// user, as every process a task starts does.
+/// is run. The starter takes the request and starts the daemon [`daemon_program`] names, with its
+/// output appended to the log; the Task Scheduler, not this command, is its creator, so it is in
+/// none of this command's jobs. For a command of an installed release that path goes through the
+/// store's `current` junction, which the starter walks as it starts the daemon; a start at the
+/// moment a switch replaces the junction has not been measured on Windows. The daemon inherits the
+/// environment the Task Scheduler gives the user, as every process a task starts does.
 ///
 /// The start has one deadline: the request lapses when this command stops waiting, and the command
 /// withdraws it before it says why no daemon answered, so no daemon is started for it after the
@@ -1094,8 +1095,8 @@ async fn start_by_task(
     let program = daemon_program()?;
     if !program.is_file() {
         return Err(CliError::HostUnavailable(shown!(
-            "the standalone start runs the control daemon installed beside this command, {}, and \
-             there is none there; install kr again, then run kr host startup --set standalone",
+            "the standalone start runs the control daemon at {}, and there is none there; install \
+             kr again, then run kr host startup --set standalone",
             Shown::root(&program)
         )));
     }
@@ -1671,7 +1672,7 @@ mod windows {
     use crate::error::{CliError, Result};
 
     /// The task this installation registers for `environment`: this user's, logging on where the
-    /// user is signed in, and running `program`, the daemon installed beside this command, as the
+    /// user is signed in, and running `program`, the daemon [`super::daemon_program`] names, as the
     /// environment's starter.
     fn definition(environment: &EnvironmentPaths, program: &Path) -> Result<TaskDefinition> {
         let user = kr_ipc::starter::current_user_sid().map_err(|error| {
@@ -1756,8 +1757,8 @@ mod windows {
         let standalone = startup == Some(ControllerStartup::Standalone);
         if standalone && !program.is_file() {
             return Err(CliError::Usage(shown!(
-                "the standalone start runs the control daemon installed beside this command, {}, \
-                 and there is none there; nothing was changed",
+                "the standalone start runs the control daemon at {}, and there is none there; \
+                 nothing was changed",
                 Shown::root(&program)
             )));
         }
