@@ -75,10 +75,10 @@ async fn a_release_the_compatible_tier_serves_is_supported() {
     );
 }
 
-/// KR-REQ-17.46, the part about the backward-compatible tier first: a release that only a later
-/// tier of the signed matrix serves is supported, and the result says that it is not in the
-/// compatible tier. Not shown here: relay and discovery compatibility, and the route error for
-/// skew.
+/// KR-REQ-17.46, the part about the release gate on the signed matrix: a release that only a later
+/// tier of the matrix serves is supported, and the result says that it is not in the compatible
+/// tier. Not shown here: that the compatible tier is served first, relay and discovery
+/// compatibility, and the route error for skew.
 #[tokio::test]
 async fn a_release_only_a_later_tier_serves_is_supported_and_says_so() {
     let key = AuthorisationKeyPair::generate().expect("a key pair");
