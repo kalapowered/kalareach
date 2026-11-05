@@ -173,6 +173,9 @@ fn assert_stock_accepting(kind: ShellKind, accepting: &str, whose: &str, a_root_
 /// fish's root shell binds it in each of its modes, and PowerShell's binds it too and, as
 /// `assert_stock_accepting` says, wraps every key that holds an operation in a block of its own that
 /// is labelled with the operation, so for PowerShell this compares those labels and not the blocks.
+/// PowerShell's root shell also binds the three chords an Escape and a bracket, a closing bracket
+/// or a capital P make, to drop a host's answer to a terminal query before the editor puts it in the
+/// line, and those are left out: they hold no function of the shell's own and accept no line.
 /// Every other key keeps its function.
 fn keys_and_functions(kind: ShellKind, bindings: &str) -> String {
     match kind {
@@ -185,7 +188,12 @@ fn keys_and_functions(kind: ShellKind, bindings: &str) -> String {
         ShellKind::PowerShell => bindings
             .lines()
             .filter(|line| {
-                !line.starts_with("Ctrl+d|") && !line.starts_with("Unbound|DeleteCharOrExit|")
+                !line.starts_with("Ctrl+d|")
+                    && !line.starts_with("Unbound|DeleteCharOrExit|")
+                    && !matches!(
+                        line.split('|').take(2).collect::<Vec<_>>().as_slice(),
+                        ["Escape,[" | "Escape,]" | "Escape,P", "KalaReachReply"]
+                    )
             })
             .map(|line| line.rsplit_once('|').map_or(line, |(kept, _)| kept))
             .collect::<Vec<_>>()

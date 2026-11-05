@@ -919,7 +919,35 @@ method, and that is exactly what it cannot do:
   of the cursor reply. The reply to an earlier query can: one already in the terminal's input, such
   as the answer to a query of a program that ended before it read it, and one still waiting in the
   lane. The host cannot take back the first, and holding the second behind the cursor reply would
-  write replies out of the order of their queries.
+  write replies out of the order of their queries. The module does not drop either: it meets an
+  answer only as keys, after the editor has read it from the terminal's input (the next item). The
+  reader proves its first fence at the entry of its read, before the editor asks that question for
+  the first time, so an answer the host writes between the two is read as part of the reply: the
+  runtime takes the answer's `ESC [` and its first `;` for the start of the reply and its digits
+  for the position, and gives the other bytes back as keys, so some of the answer reaches the line.
+- **A host's answer is dropped before the editor puts it in the line.** The host answers a question
+  an application asked the terminal (its attributes, a colour, its version) in the terminal's input,
+  and the answer can reach a prompt with nothing typed at it. The runtime has no key for the
+  sequence, so the editor gets an Escape, the character that introduces the sequence, and each
+  character after it as keys of their own, and would put them in the line and draw each one. In the
+  Emacs edit mode, where Escape is the prefix of two-key chords, the module binds `Escape,[` (a
+  control sequence), `Escape,]` (an operating system command) and `Escape,P` (a device control
+  string) wherever nothing is bound. Each handler reads the rest of the sequence with the editor's
+  own read of the next key and drops it before anything is drawn. A control sequence ends at a
+  character from `@` to `~`, an operating system command at the bell or at a backslash, and a device
+  control string at a backslash, because the runtime delivers a string's terminator (Escape and
+  backslash) as the backslash alone. The handler reads only keys the terminal has delivered and
+  never waits for one, so an Escape and a bracket a person pressed take nothing from what they press
+  next. A key no reply holds, a control character or the Escape of something else, ends the drop
+  early and goes back to the front of the editor's queue. When the handler ends the reader reports
+  itself idle, so a fence the answer withheld is asked for again. The module drops any such
+  sequence the runtime has no key for, whoever sent it. The Vi and Windows edit modes bind Escape
+  alone to an operation that must run at once, which a chord on Escape would delay, so no chord is
+  bound there and an answer still reaches the editor as keys, which in the Vi modes run as commands.
+  An Escape and a bracket that end a read reach the editor as the bracket alone, so a reply that a
+  read splits there reaches the line. The chords come off with the module, except any the person has
+  bound since. An editor with no read of the next key that the module can use is refused as
+  `psreadline_key_read_unreadable`.
 
 Running the module on Windows, where the endpoint is a named pipe and the console has no line
 discipline to name an end-of-file character, so that the module reports the gesture as disabled at its

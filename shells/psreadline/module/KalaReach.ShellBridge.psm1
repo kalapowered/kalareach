@@ -72,12 +72,18 @@ $script:HostAdvisories = @(
 # from a binding of the person's when the key is put back.
 $script:GestureDescription = 'KalaReach: detach at an empty root prompt'
 
+# How the editor describes the bindings this module puts on the chords that begin a host's answer,
+# which is what tells them from a binding of the person's when they are taken off.
+$script:ReplyDescription = 'KalaReach: drop the host answer to a terminal query'
+
 $script:Hooks = @{
     Activated          = $false
     GestureChord       = $null
     GestureBefore      = $null
     GestureBeforeDescribed = $null
     Wrapped            = [System.Collections.Generic.List[hashtable]]::new()
+    # The chords this module bound to drop a host's answer.
+    Replies            = @()
     InnerReadLine      = $null
     InnerIsEditors     = $true
     Wrapper            = $null
@@ -489,6 +495,16 @@ function Test-KrQualifiedEditor {
             Detail = "PSReadLine $version keeps no reader queue this package can read"
         }
     }
+    if (-not (Test-KrKeyReadable)) {
+        # A host's answer is taken out of the editor's keys by reading them with the editor's own
+        # read of the next key, and a build that keeps none where this package was qualified to
+        # find it would put the answer into the line.
+        return @{
+            Ok     = $false
+            Reason = 'psreadline_key_read_unreadable'
+            Detail = "PSReadLine $version keeps no read of the next key this package can call"
+        }
+    }
     if (-not (Test-KrRuntimeReadable)) {
         # The fence also rests on what the runtime has read from the terminal and not handed to the
         # editor, and a runtime that keeps that where this package was qualified to find it is the
@@ -815,6 +831,8 @@ function Enable-KalaReachHooks {
 
     $installed = Install-KrObservedHandlers
     Write-KrTrace ("wrapped " + ((@($installed) | ForEach-Object { "$($_.Chord)=$($_.Function)" }) -join ' '))
+    $script:Hooks.Replies = @(Install-KrReplyHandlers)
+    Write-KrTrace ("reply chords " + ($script:Hooks.Replies -join ' '))
     $gesture = Install-KrGestureHandler
     Write-KrTrace ("gesture chord=$($script:Hooks.GestureChord) ok=$($gesture.Ok) $($gesture.Reason) $($gesture.Detail)")
     Install-KrLookupHandler
@@ -901,6 +919,55 @@ function Install-KrObservedHandlers {
         }
     }
     $wrapped
+}
+
+# Binds the chords a host's answer to a terminal query begins with, in the Emacs edit mode, and
+# returns the chords it bound.
+#
+# The Escape that begins the answer is the editor's prefix of two-key chords in that mode, so the
+# editor reads the next key itself and looks the pair up. The handler on `Escape,[`, `Escape,]` and
+# `Escape,P` reads the rest of the answer and drops it; `Skip-KrReply` says how. A chord the editor
+# or the person has already bound is left as it is, and so is an Escape that is not the chord
+# prefix: the Vi and Windows edit modes bind Escape alone, to an operation the editor must run at
+# once, and a chord on it would make the editor wait for a second key first.
+function Install-KrReplyHandlers {
+    $bound = [System.Collections.Generic.List[string]]::new()
+    try {
+        if ("$((Get-PSReadLineOption).EditMode)" -ne 'Emacs') { return @() }
+        $escape = $null
+        foreach ($entry in (Get-KrBindingTables).Keys.GetEnumerator()) {
+            if ("$($entry.Key)" -ceq 'Escape') { $escape = $entry.Value; break }
+        }
+        if ($null -eq $escape -or "$($escape.BriefDescription)" -cne 'ChordFirstKey') { return @() }
+        foreach ($introducer in $script:ReplyShapes.Keys) {
+            $chord = "Escape,$introducer"
+            if ($null -ne (Get-KrBindingOn $chord)) { continue }
+            if ($chord -cne (Get-KrBoundSpelling $chord)) { continue }
+            try {
+                Set-PSReadLineKeyHandler -Chord $chord -ScriptBlock { param($key, $arg) Invoke-KalaReachReply -Key $key } `
+                    -BriefDescription 'KalaReachReply' -Description $script:ReplyDescription
+                $bound.Add($chord)
+            } catch {
+                Write-KrTrace "reply handler failed $chord : $($_.Exception.Message)"
+            }
+        }
+    } catch {
+        Write-KrTrace "reply handlers failed: $($_.Exception.Message)"
+    }
+    @($bound)
+}
+
+# Takes off the chords this module bound for a host's answer, the ones that are still its own: a
+# chord the person has bound since is theirs.
+function Restore-KrReplyHandlers {
+    foreach ($chord in @($script:Hooks.Replies)) {
+        $current = Get-KrBindingOn $chord
+        if ($null -eq $current -or "$($current.Description)" -cne $script:ReplyDescription) { continue }
+        try { Remove-PSReadLineKeyHandler -Chord $chord } catch {
+            Write-KrTrace "reply restore failed ${chord}: $($_.Exception.Message)"
+        }
+    }
+    $script:Hooks.Replies = @()
 }
 
 # The editor's tables of bindings in the place this module binds into: the keys, and the chords of
@@ -1748,6 +1815,33 @@ function Invoke-KalaReachPending {
     }
 }
 
+function Invoke-KalaReachReply {
+    <#
+    .SYNOPSIS
+    Drops the host's answer to a terminal query, which the editor has begun to take as keys.
+    #>
+    [CmdletBinding()]
+    param($Key)
+
+    # The editor is reading, which is what makes its buffer this reader's own.
+    $script:State.Reading = $true
+    $script:State.IdleReported = $false
+    # The answer is the host's and not a key of the person's.
+    $previousKeys = $script:State.InvokingKeys
+    $script:State.InvokingKeys = [byte[]]::new(0)
+    try {
+        Skip-KrReply ([char]$Key.KeyChar)
+    } finally {
+        $script:State.InvokingKeys = $previousKeys
+        $script:State.IdleReported = $false
+        # The answer is gone and the reader is between operations again, which is where it reports
+        # itself idle and reads the mailbox, so a fence the answer withheld is asked for again.
+        try { Invoke-KalaReachService } catch {
+            Write-KrTrace "the end of a host answer did not read the mailbox: $($_.Exception.Message)"
+        }
+    }
+}
+
 function Invoke-KalaReachGesture {
     <#
     .SYNOPSIS
@@ -2048,6 +2142,7 @@ function Remove-KalaReachHooks {
     [CmdletBinding()]
     param()
     Restore-KrGestureHandler
+    Restore-KrReplyHandlers
     Restore-KrObservedHandlers
     Remove-KrLookupHandler
     # A capability belongs to the line that is running, and nothing runs once the bridge is gone.
@@ -2076,6 +2171,7 @@ Export-ModuleMember -Function @(
     'Invoke-KalaReachReadLine'
     'Invoke-KalaReachService'
     'Invoke-KalaReachPending'
+    'Invoke-KalaReachReply'
     'Invoke-KalaReachGesture'
     'Test-KalaReachBridge'
     'Test-KalaReachCommand'

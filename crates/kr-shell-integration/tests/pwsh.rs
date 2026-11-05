@@ -67,6 +67,14 @@ fn the_reader_counts_bytes_the_runtime_has_read_from_the_terminal_as_input_it_ha
     shellpkg::bytes_the_runtime_has_read_from_the_terminal_are_input_the_reader_has_not_taken(PWSH);
 }
 
+/// KR-REQ-08.48, KR-REQ-08.49: the host's answer to a terminal query, reaching the terminal of an
+/// idle editor, does not reach its line.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_hosts_answer_to_a_terminal_query_never_reaches_the_line_the_editor_reads() {
+    shellpkg::a_hosts_answer_to_a_terminal_query_never_reaches_the_line_the_editor_reads(PWSH);
+}
+
 /// KR-REQ-07.40: the module holds no secret bytes once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
@@ -388,28 +396,34 @@ fn the_gesture_follows_the_end_of_file_character_the_terminal_started_with() {
 }
 
 /// The editors this suite stands in for the real one with: each is a .NET type with the two fields
-/// the module reads its queue from, or something short of that.
+/// the module reads its queue from and the read of the next key it takes a host's answer out of the
+/// keys with, or something short of that.
 ///
 /// `live` is what the qualified editor looks like from the module's side: a static instance whose
 /// queue holds two keys. The others each leave out one thing a fence rests on, and each was
 /// accepted by a check that only asked whether the two fields existed.
 const STAND_IN_EDITORS: &str = r#"
 using System.Collections.Generic;
-public class KrEditorLive { private static KrEditorLive _singleton = new KrEditorLive(); private Queue<object> _queuedKeys = new Queue<object>(new object[] { 1, 2 }); }
+public class KrKey { public char KeyChar = 'x'; public System.ConsoleKeyInfo AsConsoleKeyInfo() { return new System.ConsoleKeyInfo('x', System.ConsoleKey.X, false, false, false); } }
+public class KrEditorLive { private static KrEditorLive _singleton = new KrEditorLive(); private Queue<object> _queuedKeys = new Queue<object>(new object[] { 1, 2 }); private static KrKey ReadKey() { return new KrKey(); } }
+public class KrEditorNoKeyRead { private static KrEditorNoKeyRead _singleton = new KrEditorNoKeyRead(); private Queue<object> _queuedKeys = new Queue<object>(new object[] { 1, 2 }); }
+public class KrEditorKeyOfNoUse { private static KrEditorKeyOfNoUse _singleton = new KrEditorKeyOfNoUse(); private Queue<object> _queuedKeys = new Queue<object>(new object[] { 1, 2 }); private static object ReadKey() { return null; } }
 public class KrEditorRenamed { private static KrEditorRenamed _singleton = new KrEditorRenamed(); private Queue<object> _pendingKeys = new Queue<object>(); }
 public class KrEditorNoInstance { private static KrEditorNoInstance _singleton = null; private Queue<object> _queuedKeys = new Queue<object>(); }
 public class KrEditorNoQueue { private static KrEditorNoQueue _singleton = new KrEditorNoQueue(); private Queue<object> _queuedKeys = null; }
 public class KrEditorNotAQueue { private static KrEditorNotAQueue _singleton = new KrEditorNotAQueue(); private string _queuedKeys = "none"; }
 "#;
 
-/// KR-REQ-07.85: the package qualifies an editor only when the queue a fence rests on answers.
+/// KR-REQ-07.85: the package qualifies an editor only when the queue a fence rests on answers and
+/// the read of the next key a host's answer is dropped with can be called.
 ///
 /// A check that the queue's two fields exist accepts an editor whose instance is not made yet,
 /// whose queue is null or whose field holds something that is not a queue, and the reader would then
 /// report every queue clear because it read nothing. The module reads the live queue instead, through
-/// the function a fence reads it with. Each stand-in editor here is put in the module's place in
-/// turn, and the control is the editor the package was qualified against, which the module read
-/// before any of them was.
+/// the function a fence reads it with. An editor with a queue and no read of the next key is refused
+/// by name, because the module could not take a host's answer out of its keys and would leave it in
+/// the line. Each stand-in editor here is put in the module's place in turn, and the control is the
+/// editor the package was qualified against, which the module read before any of them was.
 #[test]
 #[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn the_package_refuses_an_editor_whose_key_queue_it_cannot_read() {
@@ -425,9 +439,9 @@ fn the_package_refuses_an_editor_whose_key_queue_it_cannot_read() {
          $module = Get-Module KalaReach.ShellBridge; \
          $real = & $module {{ @{{ Reason = (Test-KrQualifiedEditor).Reason; Keys = Get-KrQueuedKeys }} }}; \
          Write-Output \"kr-queue[real]=[$($real.Reason)] keys=[$($real.Keys)]\"; \
-         foreach ($name in 'KrEditorLive', 'KrEditorRenamed', 'KrEditorNoInstance', 'KrEditorNoQueue', 'KrEditorNotAQueue') {{ \
+         foreach ($name in 'KrEditorLive', 'KrEditorNoKeyRead', 'KrEditorKeyOfNoUse', 'KrEditorRenamed', 'KrEditorNoInstance', 'KrEditorNoQueue', 'KrEditorNotAQueue') {{ \
              $answer = & $module {{ param($editor) \
-                 $script:SingletonField = $null; $script:QueuedKeysField = $null; $script:Rl = $editor; \
+                 $script:SingletonField = $null; $script:QueuedKeysField = $null; $script:KeyReadMethod = $null; $script:Rl = $editor; \
                  @{{ Reason = (Test-KrQualifiedEditor).Reason; Keys = Get-KrQueuedKeys }} }} ([type]$name); \
              Write-Output \"kr-queue[$name]=[$($answer.Reason)] keys=[$($answer.Keys)]\" \
          }}"
@@ -461,6 +475,13 @@ fn the_package_refuses_an_editor_whose_key_queue_it_cannot_read() {
         (String::new(), "2".to_owned()),
         "an editor whose queue answers is read for what it holds, not for whether it has fields"
     );
+    for stand_in in ["KrEditorNoKeyRead", "KrEditorKeyOfNoUse"] {
+        assert_eq!(
+            answer(stand_in),
+            ("psreadline_key_read_unreadable".to_owned(), "2".to_owned()),
+            "{stand_in} has no read of the next key the module can use, and was qualified: a host's answer would reach its line"
+        );
+    }
     for stand_in in [
         "KrEditorRenamed",
         "KrEditorNoInstance",
@@ -936,6 +957,70 @@ fn said(output: &str, name: &str) -> String {
         .strip_suffix(']')
         .expect("the line's shape")
         .to_owned()
+}
+
+/// KR-REQ-08.48: the chords the module drops a host's answer with are bound in the Emacs edit mode,
+/// where nothing is bound on them, and nowhere else.
+///
+/// The Vi and Windows modes bind Escape alone, to the operation that leaves insert mode and the one
+/// that reverts the line, and a binding of a chord that begins with Escape would make the editor wait
+/// for a second key before it ran either. So those modes get no chord and keep Escape's own
+/// operation. A chord the person has bound is left as it is, and so is one they bind after the
+/// module's, when the module goes.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_chords_that_drop_a_hosts_answer_are_bound_in_the_emacs_mode_and_never_over_the_persons() {
+    let emacs = in_the_package_host(
+        r#"Set-PSReadLineOption -EditMode Emacs;
+           Set-PSReadLineKeyHandler -Chord 'Escape,]' -ScriptBlock { 'theirs' };
+           $bound = & $module { $script:Hooks.Replies = @(Install-KrReplyHandlers); $script:Hooks.Replies };
+           function Show-KrChords {
+               foreach ($chord in 'Escape,[', 'Escape,]', 'Escape,P') {
+                   $held = Get-PSReadLineKeyHandler -Chord $chord | Where-Object { $_.Key -ceq $chord };
+                   if ($held) { "$chord=$($held.Function)" }
+               }
+           };
+           Write-Output "kr-key[bound]=[$((@('Escape,[', 'Escape,]', 'Escape,P') | Where-Object { @($bound) -contains $_ }) -join ' ')]";
+           Write-Output "kr-key[held]=[$(@(Show-KrChords) -join ' ')]";
+           Set-PSReadLineKeyHandler -Chord 'Escape,P' -ScriptBlock { 'theirs since' };
+           & $module { Restore-KrReplyHandlers };
+           Write-Output "kr-key[after]=[$(@(Show-KrChords) -join ' ')]""#,
+    );
+    assert_eq!(
+        said(&emacs, "bound"),
+        "Escape,[ Escape,P",
+        "the module did not bind the chords nothing was bound on, or bound one the person had:\n{emacs}"
+    );
+    assert_eq!(
+        said(&emacs, "held"),
+        "Escape,[=KalaReachReply Escape,]=CustomAction Escape,P=KalaReachReply",
+        "the editor does not hold the chords the module says it bound, or lost the person's:\n{emacs}"
+    );
+    assert_eq!(
+        said(&emacs, "after"),
+        "Escape,]=CustomAction Escape,P=CustomAction",
+        "taking the module's chords off took off one that is the person's, or left one that is not:\n{emacs}"
+    );
+
+    for (mode, operation) in [("Vi", "ViCommandMode"), ("Windows", "RevertLine")] {
+        let other = in_the_package_host(&format!(
+            r#"Set-PSReadLineOption -EditMode {mode};
+               $bound = & $module {{ Install-KrReplyHandlers }};
+               $escape = Get-PSReadLineKeyHandler -Chord 'Escape' | Where-Object {{ $_.Key -ceq 'Escape' }};
+               Write-Output "kr-key[bound]=[$(@($bound).Count)]";
+               Write-Output "kr-key[escape]=[$($escape.Function)]""#
+        ));
+        assert_eq!(
+            said(&other, "bound"),
+            "0",
+            "the module bound a chord that begins with Escape in the {mode} edit mode:\n{other}"
+        );
+        assert_eq!(
+            said(&other, "escape"),
+            operation,
+            "Escape alone is no longer the {mode} edit mode's own operation:\n{other}"
+        );
+    }
 }
 
 /// KR-REQ-12.07: when the hooks go, the handler the person had before the module's still runs

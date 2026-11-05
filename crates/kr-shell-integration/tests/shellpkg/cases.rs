@@ -658,6 +658,109 @@ pub fn bytes_the_runtime_has_read_from_the_terminal_are_input_the_reader_has_not
     );
 }
 
+/// KR-REQ-08.48, KR-REQ-08.49: the host's answer to a terminal query, reaching the terminal of an
+/// idle reader, never reaches the line the reader edits.
+///
+/// An application asked the terminal something and ended before the answer came, so the host's
+/// answer lands in the terminal of a shell that is at its prompt with nothing typed. The answer is
+/// not the person's input, and a line editor that takes its bytes as keys puts part of them in the
+/// line, draws what it put there, and asks the terminal where the cursor is from the same input
+/// the rest of the answer is still in. The case writes a primary device-attributes answer into the
+/// terminal in one piece, as the host does, and asks the reader for its state until the terminal
+/// holds nothing it has not taken. It expects the line empty, a line typed afterwards to run, and a
+/// return that follows an Escape and a bracket in one write to end the line, as it does for a person.
+///
+/// # Panics
+///
+/// Panics when the reader's line has anything in it once it has taken the answer, when the reader
+/// stops answering, or when a line typed afterwards does not run.
+#[cfg(unix)]
+pub fn a_hosts_answer_to_a_terminal_query_never_reaches_the_line_the_editor_reads(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    let first = session.first_prompt();
+    session.expect_event(
+        "an idle report from this reader with its queues clear",
+        |event| {
+            matches!(
+                event,
+                BridgeEvent::ReaderIdle(idle)
+                    if idle.prompt_generation == first.prompt_generation
+                        && idle.reader_revision == first.reader_revision
+                        && idle.editor.buffer_empty
+                        && idle.snapshot.queued_keys == U64::new(0)
+                        && idle.snapshot.pending_bytes == U64::new(0)
+            )
+        },
+    );
+    // An editor that asks where the cursor is once its prompt is drawn reads the answer from the
+    // same input as its keys, and the answer under test is behind that reply, as a person's keys
+    // are.
+    if dialect(kind).types_at_the_prompt {
+        assert!(
+            session.wait_for_prompt(),
+            "the shell drew no prompt to put the host's answer behind:\n{}",
+            session.terminal_output()
+        );
+        assert!(
+            session.wait_for_editor_reading(),
+            "the editor never asked where the cursor was after the prompt:\n{}",
+            session.terminal_output()
+        );
+    }
+
+    session.type_bytes(b"\x1b[?62;22c");
+
+    // The reader answers at its next boundary, which is after it has acted on the answer, and the
+    // exchange gives it the step that reaches one. The loop asks again while the terminal still
+    // holds what the reader has not taken.
+    let deadline = session.deadline_for(REPLY);
+    let mut entry = first;
+    let mut latest = session.fence_exchange_before(&entry, fence_id(41), deadline.0);
+    while !latest.queues.tty_typeahead_drained && !deadline.passed() {
+        std::thread::sleep(Duration::from_millis(20));
+        entry.prompt_generation = latest.prompt_generation;
+        entry.reader_revision = latest.reader_revision;
+        latest = session.fence_exchange_before(&entry, fence_id(42), deadline.0);
+    }
+    assert!(
+        latest.queues.tty_typeahead_drained,
+        "the reader still reports typeahead after it has had the answer: {:?}\n{}",
+        latest.queues,
+        session.terminal_output()
+    );
+    assert!(
+        latest.editor.buffer_empty,
+        "the host's answer is in the line the reader edits:\n{}",
+        session.terminal_output()
+    );
+    assert_eq!(latest.snapshot.queued_keys, U64::new(0));
+
+    let marker = "kr-answer-ok";
+    assert!(
+        session.run(&print_assembled(kind, marker), marker),
+        "a line typed after the host's answer did not run:\n{}",
+        session.terminal_output()
+    );
+
+    // What begins like an answer and is not one is the person's: an Escape, a bracket and a return
+    // in one write end no sequence, so the return goes back to the editor and ends the line, and
+    // the shell draws its next prompt. An editor that took the return as part of an answer would
+    // draw none.
+    assert!(
+        session.wait_for_prompt() && session.wait_for_editor_reading(),
+        "the shell drew no prompt to type behind:\n{}",
+        session.terminal_output()
+    );
+    session.mark = session.written();
+    session.type_bytes(b"\x1b[\r");
+    assert!(
+        session.wait_for_prompt(),
+        "a return typed behind an Escape and a bracket was taken for part of an answer:\n{}",
+        session.terminal_output()
+    );
+}
+
 /// Types `unread` into the terminal of an idle reader that is stopped, asks it for its queues, and
 /// expects it to say they are not drained. Then types `completion`, which the reader needs to take
 /// what it has, and expects it to say they are.
