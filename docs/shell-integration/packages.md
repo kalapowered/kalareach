@@ -119,12 +119,15 @@ directory the paths it was built with are kept, and user settings in startup fil
 afterwards and win.
 
 The sixth patch changes one function. `getkeybuf` is where ZLE takes each byte of a key from the
-terminal, and it now asks the bridge about every Escape it gets. The bridge looks at the bytes the
-terminal has already delivered and takes all of them when they are a whole answer of the host's
-query broker, as the Zsh and Bash section of [README.md](README.md) describes; otherwise it pushes
-them back with `ungetbyte`, so `getbyte` hands them to the key lookup in the order they came. A
-`read -k` inside a widget reaches the terminal through `getbyte` directly, and `vared` and `select`
-are declined by the reader context, so a program that asked for its answer still gets it.
+terminal, and it now takes it through `kr_zle_key_byte`, which reads with `getbyte` as before and
+asks the bridge about every Escape it gets. The bridge looks at the bytes the terminal has already
+delivered and takes all of them when they are a whole answer of the host's query broker, as the
+Zsh and Bash section of [README.md](README.md) describes; otherwise it pushes them back with
+`ungetbyte`, so `getbyte` hands them to the key lookup in the order they came, and it keeps a note
+of how many of the pushed-back bytes are its own, so the reader reports them as the terminal's and
+not as keys a widget pushed back. A read that waits for the rest of a key keeps the one `KEYTIMEOUT` limit it started with.
+A `read -k` inside a widget reaches the terminal through `getbyte` directly, and `vared` and
+`select` are declined by the reader context, so a program that asked for its answer still gets it.
 
 ## What Bash changes
 
@@ -139,7 +142,7 @@ publishes them, and five of the package's own.
 | `0002-readline-reader-state` | `lib/readline/{text.c,kill.c}` | Two reader states Readline keeps no flag for |
 | `0003-bash-bridge-activation` | `Makefile.in`, `shell.c`, `builtins/Makefile.in` | Loading the bridge, the prompt context and the builtin |
 | `0004-bash-command-resolve` | `execute_cmd.c` | The question in front of each command a line starts, and the launcher its answer can name |
-| `0005-readline-host-replies` | `lib/readline/{Makefile.in,input.c}` | A host's answer to a terminal query, taken out of the keys before the key lookup |
+| `0005-readline-host-replies` | `lib/readline/{Makefile.in,input.c,kill.c}` | A host's answer to a terminal query, taken out of the keys before the key lookup |
 
 Readline's buffering is why the mailbox is where it is. The reader returns pending and macro input
 without consulting the character callback at all, and `rl_gather_tyi` can call that callback while
@@ -193,12 +196,19 @@ the accepted line: never one a function, a sourced or startup file, an `eval`, a
 the command's place with the backend's variables added to the environment it would have had, and a
 launcher that cannot be started leaves the child running the command as it was typed.
 
-The fifth patch changes the branch of `rl_read_key` that reads the typeahead and the terminal. A
-byte that is an Escape is offered to the bridge, which looks at the bytes already delivered, from
-the reader's own buffer and then the terminal's queue, and takes all of them when they are a whole
-answer of the host's query broker. Otherwise it gives them back to the front of the reader's buffer
-with `_rl_unget_char`, in order. The buffer holds 511 bytes and the longest run the bridge reads
-ahead is 480, so what it gives back always fits. A `read -e` is declined by the prompt context.
+The fifth patch changes where Readline takes a key from the typeahead and the terminal, and how it
+asks whether input is waiting. In `rl_read_key`, a byte that is an Escape is offered to the bridge,
+which looks at the bytes already delivered, from the reader's own buffer and then the terminal's
+queue, and takes all of them when they are a whole answer of the host's query broker. Otherwise it
+gives them back to the front of the reader's buffer with `_rl_unget_char`, in order. The buffer
+holds 511 bytes and the longest run the bridge reads ahead is 480, so what it gives back always
+fits. `_rl_input_available` takes an answer that is at the front of the terminal's bytes before it
+reports input, and asks again for what is left of its time limit, so a caller that checks first and
+then reads is never sent to wait for a key that was an answer. `_rl_nchars_available` counts the
+bytes the reader holds with the terminal's, and the bracketed paste prefix reader reads them, so a
+paste whose opening was read ahead is still found whole in a search or a command name.
+`_rl_kr_buffered` also counts the full ring correctly. A `read -e` is declined by the prompt
+context.
 
 ## What fish changes
 

@@ -786,12 +786,23 @@ drops those three bytes, and `62;22c` is typed into the line. The host cannot cl
 holds an answer only for an editor that has asked a cursor question, and neither of these editors
 asks one; holding it for the next command would give it to a program that did not ask.
 
-The readers take the answer out themselves, at the place the editor reads the first byte of a key
-(`getkeybuf` in ZLE, `rl_read_key` in Readline). When that byte is an Escape, the reader looks at
-the bytes the terminal has already delivered. If they are a whole answer of the broker, the reader
-takes all of them, reports itself idle again, so the worker can prove a fence over the empty line,
-and reads on. If they are not, the reader gives every byte back, in order, and the editor decodes
-the key as it always did.
+The readers take the answer out themselves, at the places where the editor takes a byte for a key.
+In ZLE that is `getkeybuf`, which takes each byte of a key. In Readline it is `rl_read_key`, which
+takes each key the editor reads, and `_rl_input_available`, the check Readline makes before it
+reads a key it expects to find. When a byte is an Escape, the reader looks at the bytes the
+terminal has already delivered. If they are a whole answer of the broker, the reader takes all of
+them, reports itself idle again, so the worker can prove a fence, and reads on. If an answer starts
+at a later Escape in those bytes, behind a key the person pressed, the reader takes that answer and
+leaves the key. If they are not an answer, the reader gives every byte back, in order, and the
+editor decodes the key as it always did. The bytes given back are still the person's: the reader
+does not report them as keys the editor pushed back, so an end-of-input gesture among them is
+still a gesture.
+
+Readline asks whether input is waiting in several places, and the code that asks goes on to read a
+key it expects to find. If the only input were an answer, that read would drop it and then wait, so
+text the person had typed would not be drawn until the next key, and a vi user's Escape would not
+leave insert mode. The check drops the answer first, and asks again for what is left of the time
+it was given.
 
 - **What counts as an answer.** The device-attributes, status, cursor-position, mode, window and
   keyboard-protocol reports (control sequences), the version, setting, capability and tertiary
@@ -801,15 +812,29 @@ the key as it always did.
   also what a function key sends with modifiers, so it is left to the person.
 - **Nothing waits.** The reader acts on bytes that are already there. A lone Escape, a vi user's
   mode key, goes straight to the editor, and a key typed in the same write as an answer, before or
-  after it, reaches the editor whole and in its place. An answer the terminal delivers in two parts
-  is the exception: the first part has gone to the editor as keys before the second arrives, as it
-  did before. The longest run the reader follows is 480 bytes.
+  after it, reaches the editor whole and in its place. A read that waits for the rest of a key
+  keeps its limit: Zsh's `KEYTIMEOUT` runs from the start of the wait, and an answer taken out of
+  the way does not start it again. A Readline check with a time limit asks again for the time that
+  is left, and a Readline wait with no limit stays one. The longest run the reader follows is 480
+  bytes.
+- **When an answer still reaches the line.** An answer the terminal delivers in two parts is the
+  exception: the first part has gone to the editor as keys before the second arrives, as it did
+  before. A burst of answers larger than the terminal's input queue, such as a request for 32
+  capability names, comes in parts. Zsh widgets that read a character directly (`vigetkey`,
+  `getfullchar` and `getzlequery`: the vi `f`, `t` and `r` commands, `zap-to-char` and the
+  completion question) do not go through `getkeybuf`, so they still take an answer. Bash drops it
+  at those reads too.
+- **Pastes.** Inside a bracketed paste the reader leaves the bytes alone, and so it does in a
+  quoted insertion. Readline reads text pasted in vi replace mode, and the target of a character
+  search, again key by key without that exemption, so an answer-shaped run in text pasted there is
+  dropped. A paste into a Readline search or a command name (`C-r`, `M-p`, `M-x`) is found whole:
+  the bytes of its opening that the reader read ahead are counted with the terminal's.
 - **Where it applies.** The root shell of a session, at the prompts the shell draws, primary and
   continuation. In `vared` and `select` (Zsh) and in `read -e` (Bash) the program that is reading
-  may have asked, so the reader leaves the bytes alone, and so it does inside a bracketed paste or
-  a quoted insertion. A Zsh `read -k` in a widget never goes through the key lookup at all.
+  may have asked, so the reader leaves the bytes alone. A Zsh `read -k` in a widget never goes
+  through the key lookup at all.
 - **What the fence sees.** An answer the reader has taken counts as read, so a fence the worker
-  proves afterwards is over a line the answer did not touch.
+  proves afterwards is over the line as it was, which the answer did not touch.
 
 ### fish
 
