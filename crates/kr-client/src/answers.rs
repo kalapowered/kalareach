@@ -627,6 +627,23 @@ pub trait QuestionHost {
     fn learned(&self, earlier: &Earlier) {
         let _ = earlier;
     }
+
+    /// Called after the host took a send of the answer, with the earlier sends of it that the
+    /// record carried.
+    ///
+    /// The question is answered, so none of those sends can take effect any more, and no reading of
+    /// the host will settle the ones whose outcome was not established. A host that holds them as
+    /// unsettled, in a book that counts toward a bound, lets go of them here. It lets go of these
+    /// sends and of no others: an earlier send of another answer is still its to account for. A
+    /// host that keeps no such book has nothing to do.
+    fn settle_earlier(
+        &self,
+        session_id: SessionId,
+        sends: &[ActionId],
+    ) -> impl Future<Output = ()> + Send {
+        let _ = (session_id, sends);
+        async {}
+    }
 }
 
 /// The preconditions of a request that names an uncertain send it supersedes, which is how the
@@ -748,6 +765,12 @@ impl QuestionHost for Session {
             self.settle(action_id).await;
         }
         Ok(read.receipt)
+    }
+
+    async fn settle_earlier(&self, _session_id: SessionId, sends: &[ActionId]) {
+        for send in sends {
+            self.settle(*send).await;
+        }
     }
 
     async fn session_ended(&self, session_id: SessionId) -> std::result::Result<bool, ClientError> {
@@ -1685,6 +1708,9 @@ async fn answered<H: QuestionHost + Sync, K: Keeper + Sync>(
     let dispatch = Dispatch { action_id, quote };
     match host.answer(draft.target.clone(), params, dispatch).await {
         Ok(resolved) => {
+            // The earlier sends of this answer are moot, and the connection stops accounting for
+            // them whether or not the kept copy can be removed.
+            host.settle_earlier(draft.session_id, &carried).await;
             // An answer kept earlier for this question has been superseded by this one.
             drafts.remove_after_result(draft.question_id, kept)?;
             Ok(Answered::Sent(Box::new(resolved)))
@@ -1959,6 +1985,7 @@ async fn sent<H: QuestionHost + Sync, K: Keeper + Sync>(
     let dispatch = Dispatch { action_id, quote };
     match host.answer(draft.target.clone(), params, dispatch).await {
         Ok(resolved) => {
+            host.settle_earlier(draft.session_id, &carried).await;
             drafts.remove_after_result(draft.question_id, digest)?;
             Ok(Answered::Sent(Box::new(resolved)))
         }
