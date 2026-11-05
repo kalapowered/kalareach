@@ -4,8 +4,6 @@
 //! out, pruned to the files of the tree in `tests/fixtures/lanes/`). The `-failing` results are
 //! those of the same tests with one assertion broken, and `ios-xcode-26.3.json` is the iOS result
 //! of the Xcode on a hosted runner.
-//!
-//! KR-REQ-29.01.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -112,6 +110,10 @@ fn counts(document: &Document, row: &str) -> (Verdict, usize, usize, usize) {
     )
 }
 
+/// KR-REQ-29.01, the part about results mapped to acceptance IDs with reproducible commands: for
+/// the Android unit tests, a row named above a class reads its verdict and counts from the results
+/// Gradle wrote, and each case's record carries the command that runs it alone and the comment it
+/// was read from. Not shown here: contract changes mapped to acceptance IDs, and a CI run.
 #[test]
 fn a_row_the_android_lane_ran_reads_passed_and_the_ios_files_say_where_they_run() {
     let map = map_of(&fixtures().join("lanes"));
@@ -166,6 +168,10 @@ fn a_row_the_android_lane_ran_reads_passed_and_the_ios_files_say_where_they_run(
     assert_eq!(document.run.toolchain.phones["gradle"], "8.14.3");
 }
 
+/// KR-REQ-29.01, the part about results mapped to acceptance IDs with reproducible commands: for
+/// the iOS unit tests, a row reads its verdict and counts from the classes and cases that name it
+/// in the results Xcode wrote, and each case's record carries the command that runs it alone. Not
+/// shown here: contract changes mapped to acceptance IDs, and a CI run.
 #[test]
 fn a_row_the_ios_lane_ran_reads_passed_from_the_classes_and_cases_that_name_it() {
     let map = map_of(&fixtures().join("lanes"));
@@ -256,6 +262,9 @@ fn a_comment_keys_the_case_below_it_the_class_below_it_or_the_whole_file() {
     );
 }
 
+/// KR-REQ-29.01, the part about machine-readable results: a failing phone test fails every row its
+/// comments name and the run, on both lanes, and the failure is counted against the row rather than
+/// lost. Not shown here: contract changes mapped to acceptance IDs, and a CI run.
 #[test]
 fn a_failing_case_fails_every_row_its_comments_name_for_it_and_the_run() {
     let map = map_of(&fixtures().join("lanes"));
