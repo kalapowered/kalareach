@@ -1,14 +1,16 @@
 //! The Windows terminal, run on Windows.
 //!
 //! Everything here needs a real pseudo-console, a real PowerShell and a real job object, so it
-//! exists only on that platform. What it covers, row by row:
+//! exists only on that platform. What it covers:
 //!
-//! | Row | What is checked here |
-//! | --- | --- |
-//! | KR-REQ-07.63 | A process started outside the job is not held by it and survives its closure; the broker that records it as an external resource is not in this build |
-//! | KR-ACC-010 | Resize, draining, the text the console carries, the interrupt, the process tree, and PowerShell itself |
-//! | KR-REQ-02.04, KR-REQ-05.02 | Each worker keeps a write-ahead-logged SQLite journal of its own and is reached on a named pipe of its own, whose list is protected and its owner's |
-//! | KR-REQ-02.07 | A local caller on a worker's pipe is served as the owner the pipe admits, and the worker still holds it to its own session |
+//! - A process started outside the job is not held by it and survives its closure; the broker
+//!   that records it as an external resource is not in this build.
+//! - Resize, draining, the text the console carries, the interrupt, the process tree, and
+//!   PowerShell itself.
+//! - Each worker keeps a write-ahead-logged SQLite journal of its own and is reached on a named
+//!   pipe of its own, whose list is protected and its owner's.
+//! - A local caller on a worker's pipe is served as the owner the pipe admits, and the worker
+//!   still holds it to its own session.
 //!
 //! Most of these drive the terminal directly rather than through a session, because what is under
 //! test is the platform half: the console, the job and the interrupt. The session's own behaviour on
@@ -169,6 +171,11 @@ fn powershell_in_a_console(command: &str) -> (Pty, Box<dyn Read + Send>, RootShe
 /// the shell started in it reports the Core edition at major version 7, and it ends of its own
 /// accord. Not shown here: which shell a session that names none starts, since this case starts
 /// PowerShell 7 directly and no session is made.
+///
+/// KR-ACC-010, the part about PowerShell itself: PowerShell 7 starts inside the console, reports
+/// its edition and version, and ends of its own accord. Not shown here: the PowerShell module of
+/// the shell integration, which the shell integration's own Windows cases run, and the other parts
+/// of the row.
 #[test]
 fn powershell_seven_is_the_shell_that_runs_inside_the_console() {
     // KR-REQ-04.01: the worker's terminal is `portable-pty`'s native backend, which on Windows is
@@ -198,8 +205,11 @@ fn powershell_seven_is_the_shell_that_runs_inside_the_console() {
     assert_eq!(exit.code, 0, "and it ended of its own accord");
 }
 
+/// KR-ACC-010, the part about resize: a shell in a real pseudo-console reads its width, the console
+/// is resized, and the width the shell reads next is the new one. Not shown here: a resize through
+/// a session, and the other parts of the row (the cases beside it).
 #[test]
-fn the_console_resizes_and_the_application_reads_the_new_geometry(/* KR-ACC-010 */) {
+fn the_console_resizes_and_the_application_reads_the_new_geometry() {
     // The shell prints its width, waits, and prints it again. Between the two the console is
     // resized, so what the second line says is what the resize actually did to the application's
     // view rather than to this host's record of it.
@@ -222,8 +232,11 @@ fn the_console_resizes_and_the_application_reads_the_new_geometry(/* KR-ACC-010 
     drain_until_it_ends(&pty, &mut reader, &mut shell);
 }
 
+/// KR-ACC-010, the part about draining: a shell that writes two hundred lines and exits at once
+/// leaves every line to be read after it has gone, the first and the last included. Not shown here:
+/// the other parts of the row.
 #[test]
-fn everything_the_application_wrote_is_still_there_to_read_after_it_has_gone(/* KR-ACC-010 */) {
+fn everything_the_application_wrote_is_still_there_to_read_after_it_has_gone() {
     // The shell writes a lot and exits at once. Draining after its exit has to produce every line:
     // a console whose output was lost with the process would lose a command's last screen every
     // time, which is exactly the failure a person notices.
@@ -248,8 +261,12 @@ fn everything_the_application_wrote_is_still_there_to_read_after_it_has_gone(/* 
 /// One of every encoded length UTF-8 has beyond the single byte: three, two, two and four.
 const SCALARS: &str = "中éλ🙂";
 
+/// KR-ACC-010, the part about the text the console carries when it is drained: eighty lines of
+/// multi-byte characters written in one run all arrive whole, with no replacement character
+/// anywhere in the stream. Not shown here: where the console's reads break the stream, which the
+/// pipe decides, and the other parts of the row.
 #[test]
-fn text_that_needs_more_than_one_byte_a_character_survives_the_console(/* KR-ACC-010 */) {
+fn text_that_needs_more_than_one_byte_a_character_survives_the_console() {
     // A console read ends where the pipe ends it, which is nowhere near where a scalar ends, and
     // the run written here is long enough to be read in several pieces. What a person would see if
     // any part of that path decoded a piece on its own is a line of replacement characters, so the
@@ -278,8 +295,12 @@ fn text_that_needs_more_than_one_byte_a_character_survives_the_console(/* KR-ACC
     }
 }
 
+/// KR-ACC-010, the part about interrupts: the worker's interrupt reaches an application in the
+/// console as the control event it asked to be told about, and the shell then ends. Not shown here:
+/// the exit code the interrupted shell reports, which the case leaves unchecked, and the other
+/// parts of the row.
 #[test]
-fn an_interrupt_reaches_the_application_in_the_console(/* KR-ACC-010 */) {
+fn an_interrupt_reaches_the_application_in_the_console() {
     // A console has no foreground process group and no signal. What it has is the byte the console
     // turns into a control event, and this checks that the worker's interrupt reaches an
     // application that is asked to report it.
@@ -448,8 +469,12 @@ fn a_new_shell_owns_its_terminal_before_it_starts_a_child() {
 /// shell started and hid are both in the job, the session records that tree, and closing the
 /// boundary empties the job. Not shown here: the job's kill-on-close and breakaway limits, which
 /// the cases beside it read back and run.
+///
+/// KR-ACC-010, the part about the process tree: the root shell and a hidden process it started are
+/// both in the session's job, the session records that tree by identity, and closing the boundary
+/// empties the job. Not shown here: the other parts of the row.
 #[test]
-fn the_job_holds_the_shell_and_every_process_it_starts(/* KR-ACC-010 */) {
+fn the_job_holds_the_shell_and_every_process_it_starts() {
     // The shell starts a grandchild that detaches itself from its parent as far as this platform
     // allows, then reports both identifiers. Neither may be outside the job: that is what makes
     // the boundary a boundary rather than a parent chain.
@@ -585,8 +610,13 @@ fn closing_the_last_handle_ends_what_the_job_holds() {
     panic!("process {child} is still running after the last handle to its job was closed");
 }
 
+/// KR-REQ-07.63, the part about a resource created outside the job: a process started as a plain
+/// child of the test, not through the job, is not among the job's processes, and ending the job
+/// does not end it. Not shown here: that a desktop broker creates the resource and records it as an
+/// external resource in the closure receipt, since nothing in this build creates a resource through
+/// a broker.
 #[test]
-fn a_resource_started_outside_the_job_is_not_held_by_it(/* KR-REQ-07.63 */) {
+fn a_resource_started_outside_the_job_is_not_held_by_it() {
     // A GUI resource with a lifetime of its own is created through the desktop broker, outside the
     // session's job. This starts one the same way the broker does - as a plain child of this test
     // process, which is not in the job - and checks the two halves of the promise the *job* makes:
