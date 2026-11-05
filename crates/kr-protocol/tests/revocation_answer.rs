@@ -240,13 +240,13 @@ fn a_worker_list_larger_than_a_frame_keeps_every_worker_whose_barrier_has_not_he
 }
 
 /// Whatever is cut, the barrier reads the way the whole one would: it holds on the cut list exactly
-/// when it holds on the whole one, and a pending worker is never the one left out.
+/// when it holds on the whole one.
 ///
 /// KR-REQ-09.12, the part about pending status until every barrier holds: a barrier cut to fit a
 /// frame holds on the cut list exactly when it holds on the whole one. With none pending it still
 /// holds, with only the last worker pending that worker is kept and it does not hold, and with
-/// every worker pending it does not hold, though the cut list omits workers. Not shown here: the
-/// per-worker dispatch barrier itself.
+/// every worker pending it does not hold. Not shown here: the per-worker dispatch barrier
+/// itself.
 #[test]
 fn a_cut_barrier_reads_as_the_whole_one_would() {
     let workers = Limits::DEFAULT.max_collection_len as u128 + 100;
