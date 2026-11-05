@@ -262,9 +262,12 @@ screen shifted to where the waiting moves will put the window, so a move shows a
 follows the pointer to the pixel. The footer says where the window is.
 
 A size counts as sent only once the host has answered it, by accepting it or by a definite refusal.
-When the host refuses it for now, or cannot say what became of it, the size goes again with the
-host's next word, up to three times in a row, and then with the page's next measure or move. A move
-the host refuses for now is settled as not taken, like a refused one, and is not made later.
+When the host refuses it for now, or cannot say what became of it, the newest size is said again,
+even if the page has measured back to the size that was sent before. It goes at once when the page
+measured or moved while the report was on its way. Otherwise it goes with the host's next word, up
+to three times in a row, and then with the page's next measure or move. A move the host refuses for
+now, or cannot say what became of, is settled as not taken and is not made again: the window is
+where the next screen puts it.
 
 A session fits a window as narrow as 320 px. Its actions move below its title, in the same order
 and at the same size, a long name or directory wraps whole, and the terminal's badges and footer
