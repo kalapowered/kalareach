@@ -1100,8 +1100,9 @@ impl PairedLinks {
         self.rechecks.load(Ordering::SeqCst)
     }
 
-    /// How many actions the opened link of a session still counts as unresolved, or none when the
-    /// opening holds no link. For a test of what the link's book keeps.
+    /// How many actions the opened link of a session keeps on its book, or none when the opening
+    /// holds no link: the sends not yet settled, and the sends the host refused for now, which the
+    /// book marks and a reconnect does not ask about. For a test of what the link's book keeps.
     #[doc(hidden)]
     pub async fn unresolved(&self, session_id: SessionId, opening: &str) -> Option<usize> {
         let link = self.opened_link(session_id, opening).ok()?;
