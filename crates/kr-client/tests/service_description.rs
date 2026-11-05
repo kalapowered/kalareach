@@ -1,11 +1,11 @@
 //! The service description from the client's side: what a build accepts of what a service says of
 //! itself, what vouches for it, and what it never acts on.
 //!
-//! KR-REQ-10.02, KR-REQ-17.12: discovery and relays are selected separately and each service is
-//! selected independently, and a service names its own selection over a documented boundary. The
-//! description is that boundary for a host's network. The vector is made by the Worker's own
-//! encoder and `node:crypto` (`tests/fixtures/service-description/make-vector.mjs`), not by this
-//! crate, and the service is the stand-in, held to the Worker's source, over loopback.
+//! Discovery and relays are selected separately and each service is selected independently, and a
+//! service names its own selection over a documented boundary. The description is that boundary for
+//! a host's network. The vector is made by the Worker's own encoder and `node:crypto`
+//! (`tests/fixtures/service-description/make-vector.mjs`), not by this crate, and the service is
+//! the stand-in, held to the Worker's source, over loopback.
 
 use kr_client::services::description::{
     Description, Refusal, Trust, Unread, fetch, is_managed, read,
@@ -281,6 +281,11 @@ mod what_a_description_must_hold {
         );
     }
 
+    /// KR-REQ-10.02, the part about discovery and relays chosen separately: a description that
+    /// names a set of relays and no discovery service selects no discovery publisher or DNS origin.
+    /// KR-REQ-17.12, the part about each service chosen independently: that description selects no
+    /// authority, mailbox or relay origin either. Not shown here: a proxy, a blocked upgrade and
+    /// altered trust paths.
     #[test]
     fn a_service_the_description_does_not_name_is_not_selected() {
         let description = tls_only(&json!({
