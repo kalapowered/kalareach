@@ -1,9 +1,8 @@
 //! `changeset.materialize`: the independent copy, what a result may attest, and the retention
 //! accounting that has to happen before a version goes.
 //!
-//! Requirement rows closed here: KR-REQ-14.34 (independent materialisations; a modified
-//! materialisation recorded as a derived version) and KR-REQ-14.36 (retention accounts for every
-//! materialisation and evidence reference before deletion).
+//! Materialisations are independent, and a modified materialisation is recorded as a derived
+//! version; retention accounts for every materialisation and evidence reference before deletion.
 
 #![cfg(not(windows))]
 
