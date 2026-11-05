@@ -2758,11 +2758,27 @@ impl Journal {
         Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
 
+    /// Orders the receipts selected as `r` with the state `?3` newest first: the receipt whose
+    /// outcome the journal recorded last comes first.
+    ///
+    /// Last is the journal's own order of events and nothing else. A clock reading does not say,
+    /// because two outcomes can be recorded in one millisecond and the wall clock can step back; an
+    /// identifier does not say, and neither does the order the actions were admitted in. Every state
+    /// change appends an event whose sequence only increases, so the receipt whose event for the
+    /// state has the highest sequence is the newest. A receipt with no such event (a journal an
+    /// earlier build wrote has rows and no event history) comes after every receipt that has one,
+    /// in the order it was admitted.
+    const NEWEST_RECORDED_FIRST: &'static str =
+        "ORDER BY (SELECT e.sequence FROM receipt_events AS e
+                    WHERE e.actor_id = r.actor_id AND e.action_id = r.action_id AND e.state = ?3
+                    ORDER BY e.sequence DESC LIMIT 1) DESC,
+                r.rowid DESC";
+
     /// Returns this actor's most recent uncertain outcome for a subject, if it has one.
     ///
     /// The subject rather than the action: section 23's rule is about a *new* identifier asking
     /// for the same thing, so what has to be found is the earlier ask rather than the earlier
-    /// identifier.
+    /// identifier. The most recent is the one the journal recorded last, whatever the clock says.
     ///
     /// # Errors
     ///
@@ -2775,9 +2791,12 @@ impl Journal {
         let row: Option<(Vec<u8>, i64)> = self
             .connection
             .query_row(
-                "SELECT action_id, revision FROM receipts
-                 WHERE actor_id = ?1 AND subject_digest = ?2 AND state = ?3
-                 ORDER BY updated_at_ms DESC, action_id DESC LIMIT 1",
+                &format!(
+                    "SELECT r.action_id, r.revision FROM receipts AS r
+                     WHERE r.actor_id = ?1 AND r.subject_digest = ?2 AND r.state = ?3
+                     {} LIMIT 1",
+                    Self::NEWEST_RECORDED_FIRST
+                ),
                 params![
                     actor_id.as_str(),
                     subject_digest.as_bytes().as_slice(),
@@ -2801,7 +2820,8 @@ impl Journal {
     ///
     /// For a method whose subject is shared by requests that ask for different things, such as the
     /// answers to the several questions of one session: the envelope each receipt kept says which
-    /// of them it was. `matches` is given that envelope, or `None` where the receipt kept none.
+    /// of them it was. `matches` is given that envelope, or `None` where the receipt kept none. The
+    /// receipts are taken in the order the journal recorded their outcomes, the last first.
     ///
     /// # Errors
     ///
@@ -2814,11 +2834,12 @@ impl Journal {
     ) -> Result<Option<(ActionId, u64)>> {
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT action_id, revision, intent FROM receipts
-                 WHERE actor_id = ?1 AND subject_digest = ?2 AND state = ?3
-                 ORDER BY updated_at_ms DESC, action_id DESC",
-            )
+            .prepare(&format!(
+                "SELECT r.action_id, r.revision, r.intent FROM receipts AS r
+                 WHERE r.actor_id = ?1 AND r.subject_digest = ?2 AND r.state = ?3
+                 {}",
+                Self::NEWEST_RECORDED_FIRST
+            ))
             .map_err(|error| faulted(&self.health, error))?;
         let mut rows = statement
             .query(params![
