@@ -31,7 +31,7 @@ use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::gateway::PendingResource;
 use kr_protocol::ids::{
-    AgentBindingRevision, ApplicationInstanceId, CapabilityId, EnvironmentId, GrantId,
+    ActionId, AgentBindingRevision, ApplicationInstanceId, CapabilityId, EnvironmentId, GrantId,
     SessionEpoch, SessionId,
 };
 use kr_protocol::local::LocalBuild;
@@ -473,6 +473,16 @@ impl WorkerLinks {
             .values()
             .filter(|slot| slot.try_lock().is_ok_and(|held| held.is_some()))
             .count()
+    }
+
+    /// The actions the link held for `session_id` still counts as unresolved, or none when no link
+    /// is held. For a test of what the link's book keeps.
+    #[doc(hidden)]
+    pub async fn unsettled(&self, session_id: SessionId) -> Option<Vec<ActionId>> {
+        let slot = self.lock().get(&session_id).cloned()?;
+        let link = slot.lock().await.clone()?;
+        let held = link.session.submitted_actions().await;
+        Some(held.into_iter().map(|each| each.action_id).collect())
     }
 
     /// The link to `session_id`'s worker: the one held, or a new one.

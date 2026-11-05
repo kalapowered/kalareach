@@ -1129,6 +1129,129 @@ async fn an_uncertain_send_is_held_back_until_the_press_that_names_it() {
     assert_eq!(kept_files(&page, &worker, "send"), 0);
 }
 
+/// A page whose first answer to the question went out on a link that stays up, and whose worker
+/// said it could not establish what became of it: the answer is kept, and the link holds the send.
+/// Returns the identifier of that send and the time the kept answer carries.
+async fn with_an_uncertain_send_on_a_live_link(
+    worker: &mut ScriptedWorker,
+    page: &Page,
+) -> (
+    scripted_worker::Link,
+    kr_protocol::ids::ActionId,
+    serde_json::Value,
+) {
+    let read = page.call("question_read", read_params(worker));
+    let mut link = worker.link().await;
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(worker, vec![question(worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    answered(read).await.expect("the questions");
+
+    let asked = page.call(
+        "question_answer",
+        answer_params(worker, 2, &choice("release")),
+    );
+    let call = link.expect(Method::QuestionAnswer).await;
+    let older = call.action_id.expect("an identifier");
+    link.refuse_with(
+        &call,
+        ErrorCode::OutcomeUnknown,
+        "the outcome cannot be established",
+    )
+    .await;
+    let kept = answered(asked).await.expect("the answer is kept");
+    assert_eq!(
+        page.unsettled(worker.session_id).await,
+        Some(vec![older]),
+        "the link holds the send whose outcome the worker could not establish"
+    );
+    (link, older, kept["draft"]["drafted_at_ms"].clone())
+}
+
+/// KR-REQ-11.63: when the worker takes the send of a kept answer, the link stops holding the earlier
+/// send of it whose outcome the worker could not establish, which no reading will settle.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_send_of_a_kept_answer_the_worker_takes_frees_the_link_of_the_earlier_send() {
+    use kr_protocol::receipt::ReceiptState;
+
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let (mut link, older, drafted_at) =
+        with_an_uncertain_send_on_a_live_link(&mut worker, &page).await;
+
+    let right = page.call(
+        "question_send_kept",
+        json!({ "params": {
+            "questionId": question_id().to_string(),
+            "draftedAtMs": drafted_at,
+            "acknowledged": older.to_string()
+        } }),
+    );
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    let call = link.expect(Method::ActionRead).await;
+    link.answer(&call, &receipt_at(older, ReceiptState::Unknown, 5_000))
+        .await;
+    let call = link.expect(Method::QuestionAnswer).await;
+    link.answer(&call, &resolution(&worker, QuestionState::Answered))
+        .await;
+    let told = answered(right).await.expect("the worker took it");
+    assert_eq!(told["outcome"], "taken", "{told}");
+    assert_eq!(
+        page.unsettled(worker.session_id).await,
+        Some(vec![]),
+        "the link no longer holds the earlier send"
+    );
+}
+
+/// KR-REQ-11.63: so does a new answer that names the earlier send after it was shown.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_answer_the_worker_takes_frees_the_link_of_the_earlier_send() {
+    use kr_protocol::receipt::ReceiptState;
+
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let (mut link, older, _) = with_an_uncertain_send_on_a_live_link(&mut worker, &page).await;
+
+    // The earlier send is shown first, and the press that names it goes out.
+    let held = page.call(
+        "question_answer",
+        answer_params(&worker, 2, &choice("main")),
+    );
+    let call = link.expect(Method::ActionRead).await;
+    link.answer(&call, &receipt_at(older, ReceiptState::Unknown, 5_000))
+        .await;
+    let held = answered(held).await.expect("held, not refused");
+    assert_eq!(held["outcome"], "held", "{held}");
+    let again = page.call(
+        "question_answer",
+        json!({
+            "params": answer_params(&worker, 2, &choice("main"))["params"].clone(),
+            "acknowledged": older.to_string()
+        }),
+    );
+    let call = link.expect(Method::ActionRead).await;
+    link.answer(&call, &receipt_at(older, ReceiptState::Unknown, 5_000))
+        .await;
+    let call = link.expect(Method::QuestionAnswer).await;
+    link.answer(&call, &resolution(&worker, QuestionState::Answered))
+        .await;
+    let told = answered(again).await.expect("the worker took it");
+    assert_eq!(told["outcome"], "taken", "{told}");
+    assert_eq!(
+        page.unsettled(worker.session_id).await,
+        Some(vec![]),
+        "the link no longer holds the earlier send"
+    );
+}
+
 /// KR-REQ-11.63: an earlier send that lands while a later one is on its way is reported as the one
 /// the host took, and the press says that its own send went out and was refused. The pair is
 /// retired with the answer the host took.

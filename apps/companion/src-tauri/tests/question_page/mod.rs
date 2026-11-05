@@ -85,6 +85,17 @@ impl Page {
         })
     }
 
+    /// The actions the link held for `session_id` still counts as unresolved, when it holds one.
+    pub async fn unsettled(
+        &self,
+        session_id: kr_protocol::ids::SessionId,
+    ) -> Option<Vec<kr_protocol::ids::ActionId>> {
+        self.app
+            .state::<companion_tauri::agent::WorkerLinks>()
+            .unsettled(session_id)
+            .await
+    }
+
     pub fn links(&self) -> usize {
         self.app
             .state::<companion_tauri::agent::WorkerLinks>()
