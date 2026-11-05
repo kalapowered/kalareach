@@ -664,11 +664,11 @@ pub fn bytes_the_runtime_has_read_from_the_terminal_are_input_the_reader_has_not
 /// An application asked the terminal something and ended before the answer came, so the host's
 /// answer lands in the terminal of a shell that is at its prompt with nothing typed. The answer is
 /// not the person's input, and a line editor that takes its bytes as keys puts part of them in the
-/// line, draws what it put there, and asks the terminal where the cursor is from the same input
-/// the rest of the answer is still in. The case writes a primary device-attributes answer into the
+/// line and draws what it put there. The case writes a primary device-attributes answer into the
 /// terminal in one piece, as the host does, and asks the reader for its state until the terminal
-/// holds nothing it has not taken. It expects the line empty, a line typed afterwards to run, and a
-/// return that follows an Escape and a bracket in one write to end the line, as it does for a person.
+/// holds nothing it has not taken. It expects the line empty, a line typed afterwards to run, a
+/// return that follows an Escape and a bracket in one write to end the line, as it does for a person,
+/// and a letter typed behind the start of an answer to be in the line.
 ///
 /// # Panics
 ///
@@ -711,18 +711,7 @@ pub fn a_hosts_answer_to_a_terminal_query_never_reaches_the_line_the_editor_read
 
     session.type_bytes(b"\x1b[?62;22c");
 
-    // The reader answers at its next boundary, which is after it has acted on the answer, and the
-    // exchange gives it the step that reaches one. The loop asks again while the terminal still
-    // holds what the reader has not taken.
-    let deadline = session.deadline_for(REPLY);
-    let mut entry = first;
-    let mut latest = session.fence_exchange_before(&entry, fence_id(41), deadline.0);
-    while !latest.queues.tty_typeahead_drained && !deadline.passed() {
-        std::thread::sleep(Duration::from_millis(20));
-        entry.prompt_generation = latest.prompt_generation;
-        entry.reader_revision = latest.reader_revision;
-        latest = session.fence_exchange_before(&entry, fence_id(42), deadline.0);
-    }
+    let latest = the_reader_once_it_has_taken_what_the_terminal_holds(&mut session, first);
     assert!(
         latest.queues.tty_typeahead_drained,
         "the reader still reports typeahead after it has had the answer: {:?}\n{}",
@@ -752,6 +741,12 @@ pub fn a_hosts_answer_to_a_terminal_query_never_reaches_the_line_the_editor_read
         "the shell drew no prompt to type behind:\n{}",
         session.terminal_output()
     );
+    // From here to the last exchange the reader is given no step. A step is a key: it would end the
+    // wait of a read that waited for the rest of an answer, and it makes the reader report idle
+    // again, which the report the case waits for after the start of an answer could not then be
+    // told from.
+    session.stepping = false;
+    session.forget_events();
     session.mark = session.written();
     session.type_bytes(b"\x1b[\r");
     assert!(
@@ -759,6 +754,69 @@ pub fn a_hosts_answer_to_a_terminal_query_never_reaches_the_line_the_editor_read
         "a return typed behind an Escape and a bracket was taken for part of an answer:\n{}",
         session.terminal_output()
     );
+
+    // An answer the terminal has delivered only the start of is not waited for. The editor reads
+    // the keys of an answer only while the terminal has delivered them, so an Escape, a bracket and
+    // a semicolon end with the reader idle again, and the next key the person types is theirs: a
+    // letter typed behind them is in the line. A read that waited for the final character of the
+    // answer would report nothing until a key came, and would take that key for the answer's end.
+    let entry = session.next_prompt();
+    assert!(
+        session.wait_for_prompt() && session.wait_for_editor_reading(),
+        "the shell drew no prompt to type an unfinished answer behind:\n{}",
+        session.terminal_output()
+    );
+    session.expect_event(
+        "the idle report of the read the answer is typed into",
+        |event| {
+            matches!(
+                event,
+                BridgeEvent::ReaderIdle(idle) if idle.prompt_generation == entry.prompt_generation
+            )
+        },
+    );
+    session.type_bytes(b"\x1b[;");
+    session.expect_event(
+        "an idle report once the editor has taken the start of an answer",
+        |event| {
+            matches!(
+                event,
+                BridgeEvent::ReaderIdle(idle)
+                    if idle.prompt_generation == entry.prompt_generation
+                        && idle.editor.buffer_empty
+            )
+        },
+    );
+    session.type_bytes(b"x");
+    session.stepping = true;
+    let latest = the_reader_once_it_has_taken_what_the_terminal_holds(&mut session, entry);
+    assert!(
+        !latest.editor.buffer_empty,
+        "a letter typed behind the start of an answer was taken for its end:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// Asks the reader for its state until the terminal holds nothing it has not taken, and returns
+/// the last answer.
+///
+/// The reader answers at its next boundary, which is after it has acted on what it was given, and
+/// the exchange gives it the step that reaches one. The loop asks again while the terminal still
+/// holds what the reader has not taken.
+#[cfg(unix)]
+fn the_reader_once_it_has_taken_what_the_terminal_holds(
+    session: &mut Session,
+    mut entry: RootEditorEnterParams,
+) -> kr_protocol::root::FenceAcknowledgement {
+    let deadline = session.deadline_for(REPLY);
+    let mut latest = session.fence_exchange_before(&entry, fence_id(41), deadline.0);
+    while !latest.queues.tty_typeahead_drained && !deadline.passed() {
+        std::thread::sleep(Duration::from_millis(20));
+        entry.prompt_generation = latest.prompt_generation;
+        entry.reader_revision = latest.reader_revision;
+        latest = session.fence_exchange_before(&entry, fence_id(42), deadline.0);
+    }
+    latest
 }
 
 /// KR-REQ-08.49: a reader whose editor has not yet asked the terminal where the cursor is has not
