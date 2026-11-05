@@ -1796,7 +1796,8 @@ fn without_display(command: &str) -> String {
 
 /// KR-REQ-29.01, the part about reproducible commands: the test steps the report plans for Windows
 /// are the tests the landing workflow's Windows job runs, its build steps are builds that job also
-/// runs, and the steps it plans for macOS leave out the cases that job leaves out.
+/// runs, and the workspace step it plans for macOS leaves out, by name, the cases the macOS job's
+/// workspace run leaves out.
 #[test]
 fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
     // Windows: every `cargo test` of the workflow's Windows job is a step, and every test step is

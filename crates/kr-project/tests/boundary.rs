@@ -158,7 +158,7 @@ fn racing_repository(work: &Path, name: &str) -> PathBuf {
     );
     git_raw(&path, ["add", "-A"]);
     git_raw(&path, ["commit", "-m", "the attributes and what they name"]);
-    // Something uncommitted, so a status has working-tree content to read through a filter.
+    // Something uncommitted, so a review refresh has working-tree content to read through a filter.
     write(&path, "one.inside", "changed after the commit\n");
     write(&path, "two.temporary", "changed after the commit\n");
     path
@@ -217,11 +217,12 @@ fn planting_before(before: &'static [&'static str]) -> (Interposition, Planting)
 // invocation is the refusal and there is nothing here to observe.
 /// KR-ACC-030, KR-REQ-14.23 and KR-REQ-14.24, the part about helpers planted after the repository's
 /// configuration was audited: the clean filters written into the repository and into the
-/// invocation's temporary directory between the audit and the spawn do not run during a status or a
-/// review refresh, and installed Git run over the same repository afterwards does run the planted
-/// clean filter. The smudge filters, the text conversion and the four hooks are planted as well
-/// and none ran, though neither command calls a smudge filter or a text conversion. Not shown
-/// here: a planted external diff program, file system monitor or pager.
+/// invocation's temporary directory between the audit and the spawn do not run during a review
+/// refresh, which can read the changed files through them, and installed Git run over the same
+/// repository afterwards does run the planted clean filter. The smudge filters, the text
+/// conversion and the four hooks are planted as well and none ran, though the refresh calls no
+/// smudge filter or text conversion. The status over these changes calls none of the planted
+/// programs. Not shown here: a planted external diff program, file system monitor or pager.
 #[cfg(unix)]
 #[test]
 fn a_driver_planted_after_the_audit_never_runs_during_a_status_or_a_review_refresh() {
@@ -298,9 +299,9 @@ fn a_driver_planted_after_the_audit_never_runs_during_a_status_or_a_review_refre
 // invocation is the refusal and there is nothing here to observe.
 /// KR-REQ-14.23, the part about a worktree: the filters, the text conversion and the hooks planted
 /// after the audit do not run while a worktree is made for an isolated workspace, whether it lands
-/// or is refused. Of the planted programs a checkout calls the smudge filters and the
-/// post-checkout hook. Not shown here: a planted external diff program, file system monitor or
-/// pager.
+/// or is refused. Of the planted programs a checkout calls the smudge filters, the post-checkout
+/// hook and the post-index-change hook. Not shown here: a planted external diff program, file
+/// system monitor or pager.
 #[cfg(unix)]
 #[test]
 fn a_driver_planted_after_the_audit_never_runs_during_a_worktree() {
@@ -328,8 +329,8 @@ fn a_driver_planted_after_the_audit_never_runs_during_a_worktree() {
         .project
         .project_repository_id;
 
-    // The worktree either lands or is refused because the configuration changed under it. Both are
-    // this host's declared answers; what neither may be is a planted driver that ran.
+    // The worktree either lands or is refused. Both are this host's declared answers; what neither
+    // may be is a planted driver that ran.
     let _ = fixture.service().workspace_create(
         &actor(),
         &WorkspaceCreateParams {
@@ -366,9 +367,9 @@ fn a_driver_planted_after_the_audit_never_runs_during_a_worktree() {
 // invocation is the refusal and there is nothing here to observe.
 /// KR-REQ-14.23, the part about a clone: the filters, the text conversion and the hooks planted into
 /// the clone's own destination immediately before the checkout that populates it do not run during
-/// that checkout, which calls the smudge filters and the post-checkout hook of them, and the same
-/// planting at the published name does make installed Git run the clean filter. Not shown here: a
-/// planted external diff program, file system monitor or pager.
+/// that checkout, which calls the smudge filters, the post-checkout hook and the post-index-change
+/// hook of them, and the same planting at the published name does make installed Git run the clean
+/// filter. Not shown here: a planted external diff program, file system monitor or pager.
 #[cfg(unix)]
 #[test]
 fn a_driver_planted_into_a_clones_own_destination_never_runs_during_its_checkout() {
