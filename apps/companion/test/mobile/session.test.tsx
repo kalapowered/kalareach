@@ -1636,6 +1636,27 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     expect(reason.compareDocumentPosition(field) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 
+  it('says a send the host cannot take now was not taken, and keeps what was typed', async () => {
+    const { port } = fakeHost()
+    // A transient code is the host saying it cannot take the send now; it is not a refusal.
+    const forNow = {
+      ...port,
+      composerSubmit: () =>
+        Promise.reject({
+          code: 'RESOURCE_UNAVAILABLE',
+          message: 'The host cannot take that now.',
+          user_action: 'retry',
+          retry: 'transient'
+        })
+    }
+    const person = await onTerminal(forNow)
+    const field = screen.getByLabelText('Message this session')
+    await person.type(field, 'ls')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    expect(await screen.findByText('Not taken for now')).toBeInTheDocument()
+    expect(field).toHaveValue('ls')
+  })
+
   it('lets the bar yield while a keyboard covers part of the session, and not for what lies under it', async () => {
     const { port } = fakeHost()
     // jsdom lays nothing out: a window 800 pixels high, and a session that ends 90 pixels above its
