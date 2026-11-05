@@ -32,7 +32,8 @@ const VIEWING: [ActionRight; 2] = [ActionRight::SessionView, ActionRight::Questi
 /// The refusal cuts the connection from its worker, and the host ends the connection as soon as it
 /// has answered the request in flight, closing it under an answer the device has not yet read. The
 /// connection is held after that answer until the call has returned, so that the device always
-/// reads what the host wrote.
+/// reads what the host wrote. The hold is armed once the call is at its pause, when the request in
+/// flight is the one it is meant for and any earlier frame has been answered.
 async fn refused_at_its_pause<T>(
     environment: &Environment,
     pause: (
@@ -42,12 +43,12 @@ async fn refused_at_its_pause<T>(
     call: impl Future<Output = T>,
 ) -> T {
     let (arrived, go) = pause;
-    let (_, hold) = environment.host.pause_after_a_frame_is_answered();
     tokio::pin!(call);
     tokio::select! {
         arrived = arrived => arrived.expect("the call arrives at its pause"),
         _ = &mut call => panic!("the call was answered before it reached its pause"),
     }
+    let (_, hold) = environment.host.pause_after_a_frame_is_answered();
     environment
         .host
         .controller()
