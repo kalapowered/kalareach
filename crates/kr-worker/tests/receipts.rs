@@ -30,8 +30,8 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
-    ActionId, ActionWindowId, ActorId, BuildId, ControllerGeneration, RequestId, SessionEpoch,
-    SessionId,
+    ActionId, ActionWindowId, ActorId, ApplicationInstanceId, BuildId, ControllerGeneration,
+    RequestId, SessionEpoch, SessionId,
 };
 use kr_protocol::limits::{
     DEDUPLICATION_RETENTION, DEFAULT_MUTATION_TTL, MAX_ACTION_WINDOW, MAX_CONCURRENT_ATTACHMENTS,
@@ -1699,6 +1699,17 @@ fn an_uncertain_outcome_of_at(
 
 /// A question that the agent `kr-test-agent` asks in the host's session under `request`.
 fn asked(host: &Host, request: &str) -> kr_protocol::question::Question {
+    asked_with_token(host, request).0
+}
+
+/// As [`asked`], with the token the source is given to cancel its own question.
+fn asked_with_token(
+    host: &Host,
+    request: &str,
+) -> (
+    kr_protocol::question::Question,
+    kr_protocol::question::CallerToken,
+) {
     let source = kr_worker::questions::binding::VerifiedSource {
         process: kr_ipc::identity::current_process_start_identity().expect("a process identity"),
         executable: Some("kr-test-agent".to_owned()),
@@ -1727,7 +1738,7 @@ fn asked(host: &Host, request: &str) -> kr_protocol::question::Question {
         .questions()
         .create(&source, &params, now)
         .expect("the agent asks");
-    created.question
+    (created.question, created.caller_token)
 }
 
 /// A `question.answer` for `question`, under a fresh identifier and the preconditions `expected`.
@@ -2318,6 +2329,661 @@ async fn a_malformed_cancellation_is_refused_and_leaves_a_rejected_receipt() {
         ReceiptState::Rejected,
         "the refusal is recorded"
     );
+}
+
+/// The requests a question's source sends whose subject is the target alone, and what tells two
+/// requests of one kind apart: the question a cancellation names, the request identifier a question
+/// is asked under, and the de-duplication identifier an alert is raised under.
+#[derive(Clone, Copy, Debug)]
+enum Sourced {
+    OwnCancellation,
+    Question,
+    Alert,
+}
+
+/// One identity of a source's requests. `label` is the request identifier of a question and the
+/// de-duplication identifier of an alert; the question and its token are what a cancellation of the
+/// source's own names.
+struct Identity {
+    label: &'static str,
+    question: kr_protocol::question::Question,
+    token: kr_protocol::question::CallerToken,
+}
+
+fn identity(host: &Host, label: &'static str) -> Identity {
+    let (question, token) = asked_with_token(host, &format!("of-{label}"));
+    Identity {
+        label,
+        question,
+        token,
+    }
+}
+
+/// Registers this test process with the worker's broker as an agent the worker launched. The worker
+/// then binds what the process sends to the session, as it binds a helper that runs under an agent.
+fn bound_to_the_session(host: &Host) {
+    let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+    let instance = ApplicationInstanceId::new(Uuid::from_bytes([9; 16]));
+    host.service
+        .broker()
+        .register_instance(
+            instance,
+            kr_protocol::broker::IntegrationMode::Gateway,
+            None,
+            Some(kr_worker::broker::ManagedProcess::new(
+                instance,
+                process.clone(),
+                kr_worker::broker::TransportHandle {
+                    transport: kr_worker::broker::BrokerTransport::PrivateSocket,
+                    application_instance_id: instance,
+                    executable_digest: Digest256::from_bytes([1; 32]),
+                    process,
+                },
+                kr_worker::broker::Credential::generate().expect("a launch credential"),
+                TimestampMs::new(1),
+            )),
+        )
+        .expect("the instance is registered");
+}
+
+impl Sourced {
+    const ALL: [Self; 3] = [Self::OwnCancellation, Self::Question, Self::Alert];
+
+    /// The request of this kind for `identity`, under a fresh action identifier and the
+    /// preconditions `expected`.
+    fn request(
+        self,
+        client: &Client<impl Codec>,
+        host: &Host,
+        identity: &Identity,
+        expected: ParamsValue,
+    ) -> MutationRequest {
+        let (method, params) = match self {
+            Self::OwnCancellation => (
+                Method::QuestionCancelOwn,
+                ParamsValue::from_typed(&kr_protocol::question::QuestionCancelOwnParams {
+                    session_id: host.session_id,
+                    question_id: identity.question.question_id,
+                    caller_token: identity.token.clone(),
+                }),
+            ),
+            Self::Question => (
+                Method::QuestionCreate,
+                ParamsValue::from_typed(&kr_protocol::question::QuestionCreateParams {
+                    session_id: host.session_id,
+                    request_id: identity.label.to_owned(),
+                    agent_name: Nullable::some("kr-test-agent".to_owned()),
+                    context: "The build finished.".to_owned(),
+                    question: "What should the release be called?".to_owned(),
+                    kind: kr_protocol::question::QuestionKind::Input,
+                    choices: Vec::new(),
+                    requested_expiry_ms: Nullable::some(DurationMs::new(600_000)),
+                    wait_ms: Nullable::null(),
+                }),
+            ),
+            Self::Alert => (
+                Method::AlertCreate,
+                ParamsValue::from_typed(&kr_protocol::question::AlertCreateParams {
+                    session_id: host.session_id,
+                    dedup_id: identity.label.to_owned(),
+                    agent_name: Nullable::some("kr-test-agent".to_owned()),
+                    text: "The build finished.".to_owned(),
+                    severity: kr_protocol::question::AlertSeverity::Info,
+                    safe_session_link: Nullable::null(),
+                }),
+            ),
+        };
+        MutationRequest {
+            method: method.into(),
+            params: params.expect("encodes"),
+            ..close_mutation(client, host, DEFAULT_MUTATION_TTL.get(), expected)
+        }
+    }
+
+    /// The envelope the worker keeps of `request`: the whole request, except that a cancellation
+    /// from the question's source keeps no caller token.
+    fn kept(self, request: &MutationRequest) -> Vec<u8> {
+        let kept = match self {
+            Self::OwnCancellation => {
+                let params: kr_protocol::question::QuestionCancelOwnParams =
+                    request.params.to_typed().expect("decodes");
+                MutationRequest {
+                    params: ParamsValue::from_typed(
+                        &kr_protocol::question::QuestionCancelOwnParams {
+                            caller_token: kr_protocol::question::CallerToken::new(Vec::new()),
+                            ..params
+                        },
+                    )
+                    .expect("encodes"),
+                    ..request.clone()
+                }
+            }
+            Self::Question | Self::Alert => request.clone(),
+        };
+        kr_cbor::to_canonical_vec(&kept).expect("encodes")
+    }
+
+    /// Puts an uncertain outcome of `request` into the journal as `actor_id`'s, kept as the worker
+    /// keeps it and recorded at `recorded_at`, and returns the revision its receipt stands at.
+    fn lost(
+        self,
+        host: &Host,
+        actor_id: &ActorId,
+        request: &MutationRequest,
+        recorded_at: TimestampMs,
+    ) -> u64 {
+        an_uncertain_outcome_kept_as_at(
+            host,
+            actor_id,
+            request.action_id,
+            request,
+            self.kept(request),
+            recorded_at,
+        )
+    }
+
+    /// Checks that the worker took `outcome` as a request of this kind for `identity`.
+    fn assert_taken(self, outcome: Outcome, identity: &Identity) {
+        let Outcome::Ok(value) = outcome else {
+            panic!("{self:?}: the worker took the request: {outcome:?}");
+        };
+        match self {
+            Self::OwnCancellation => {
+                let own: kr_protocol::question::QuestionOwnResult =
+                    value.to_typed().expect("decodes");
+                assert_eq!(own.question.question_id, identity.question.question_id);
+                assert_eq!(
+                    own.question.state,
+                    kr_protocol::question::QuestionState::Cancelled
+                );
+            }
+            Self::Question => {
+                let created: kr_protocol::question::QuestionCreateResult =
+                    value.to_typed().expect("decodes");
+                assert_eq!(
+                    created.question.state,
+                    kr_protocol::question::QuestionState::Pending
+                );
+                assert_ne!(created.question.question_id, identity.question.question_id);
+                assert!(!created.deduplicated);
+            }
+            Self::Alert => {
+                let raised: kr_protocol::question::AlertCreateResult =
+                    value.to_typed().expect("decodes");
+                assert_eq!(raised.alert.dedup_id, identity.label);
+                assert!(!raised.deduplicated);
+            }
+        }
+    }
+}
+
+/// Checks that `outcome` is the refusal that names `action_id`: a request that shows nothing of the
+/// uncertain outcome of that action, or one that quotes an action that is not uncertain for it.
+fn assert_refused_naming(outcome: Outcome, action_id: ActionId, context: &str) {
+    let Outcome::Error(error) = outcome else {
+        panic!("{context}: the request is refused: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict, "{context}");
+    assert!(
+        error.message.contains(&action_id.to_string()),
+        "{context}: the refusal names {action_id}: {}",
+        error.message
+    );
+}
+
+/// KR-REQ-11.63: a question's source whose request has an uncertain outcome is held back in nothing
+/// it asks of another identity. The host used to refuse every later cancellation, question and alert
+/// of the actor in the session, so one lost reply stopped the source asking or reporting anything
+/// else until the receipt was pruned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows session places a helper by the job object it was started in, which this test process is not in"
+)]
+async fn an_uncertain_request_of_a_source_does_not_hold_back_a_request_of_another_identity() {
+    for kind in Sourced::ALL {
+        let host = host().await;
+        bound_to_the_session(&host);
+        let mut client = cli(&host).await;
+        let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+        let (first, second) = (identity(&host, "first"), identity(&host, "second"));
+        let lost = MutationRequest {
+            action_id: action(81),
+            ..kind.request(&client, &host, &first, ParamsValue::empty())
+        };
+        kind.lost(&host, &caller, &lost, kr_ipc::now_ms());
+
+        let request = kind.request(&client, &host, &second, ParamsValue::empty());
+        let (kept, action_id) = (kind.kept(&request), request.action_id);
+        kind.assert_taken(send_mutation(&mut client, request).await, &second);
+
+        // The envelope the cases plant for an uncertain request is the one the worker keeps of a real
+        // one: the whole request, the identity it carries included.
+        assert_eq!(
+            host.service
+                .runtime()
+                .session()
+                .journal_mut()
+                .expect("a journal")
+                .read_intent(&caller, action_id)
+                .expect("readable"),
+            Some(kept),
+            "{kind:?}: the envelope kept of the request"
+        );
+    }
+}
+
+/// KR-REQ-11.63: an uncertain request of one identity is not an outcome of another identity, so a
+/// request of the other identity that names it quotes an outcome its subject does not have, which is
+/// refused as a quote of any action that is not uncertain for the subject is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows session places a helper by the job object it was started in, which this test process is not in"
+)]
+async fn a_quote_of_an_uncertain_request_of_another_identity_shows_nothing() {
+    for kind in Sourced::ALL {
+        let host = host().await;
+        bound_to_the_session(&host);
+        let mut client = cli(&host).await;
+        let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+        let (first, second) = (identity(&host, "first"), identity(&host, "second"));
+        let lost = MutationRequest {
+            action_id: action(82),
+            ..kind.request(&client, &host, &first, ParamsValue::empty())
+        };
+        kind.lost(&host, &caller, &lost, kr_ipc::now_ms());
+        let shown = revision_shown_for(&mut client, action(82)).await;
+
+        let other = kind.request(&client, &host, &second, superseding(action(82), shown));
+        assert_refused_naming(
+            send_mutation(&mut client, other).await,
+            action(82),
+            &format!("{kind:?}"),
+        );
+    }
+}
+
+/// KR-REQ-11.63: of several uncertain requests, the one a request has to quote is the newest of its
+/// own identity, whether or not a request of another identity is newer still.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows session places a helper by the job object it was started in, which this test process is not in"
+)]
+async fn a_request_has_to_quote_the_newest_uncertain_request_of_its_own_identity() {
+    for kind in Sourced::ALL {
+        let host = host().await;
+        bound_to_the_session(&host);
+        let mut client = cli(&host).await;
+        let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+        let (first, second) = (identity(&host, "first"), identity(&host, "second"));
+        // Oldest first, one millisecond apart: a request of the first identity, one of the second,
+        // and a newer one of the first.
+        let begun = kr_ipc::now_ms().get();
+        for (at, (id, whose)) in [(83, &first), (84, &second), (85, &first)]
+            .into_iter()
+            .enumerate()
+        {
+            let lost = MutationRequest {
+                action_id: action(id),
+                ..kind.request(&client, &host, whose, ParamsValue::empty())
+            };
+            kind.lost(&host, &caller, &lost, TimestampMs::new(begun + at as u64));
+        }
+
+        let unquoted = kind.request(&client, &host, &second, ParamsValue::empty());
+        assert_refused_naming(
+            send_mutation(&mut client, unquoted).await,
+            action(84),
+            &format!("{kind:?}: the second identity's own request"),
+        );
+        let unquoted = kind.request(&client, &host, &first, ParamsValue::empty());
+        assert_refused_naming(
+            send_mutation(&mut client, unquoted).await,
+            action(85),
+            &format!("{kind:?}: the first identity's newest request"),
+        );
+
+        let shown = revision_shown_for(&mut client, action(85)).await;
+        let quoting = kind.request(&client, &host, &first, superseding(action(85), shown));
+        kind.assert_taken(send_mutation(&mut client, quoting).await, &first);
+    }
+}
+
+/// KR-REQ-11.63: an uncertain request still holds back a second request of the same identity, which
+/// has to name the first and the revision its sender was shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows session places a helper by the job object it was started in, which this test process is not in"
+)]
+async fn a_second_request_of_an_identity_with_an_uncertain_request_has_to_quote_it() {
+    for kind in Sourced::ALL {
+        let host = host().await;
+        bound_to_the_session(&host);
+        let mut client = cli(&host).await;
+        let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+        let first = identity(&host, "first");
+        let lost = MutationRequest {
+            action_id: action(86),
+            ..kind.request(&client, &host, &first, ParamsValue::empty())
+        };
+        let revision = kind.lost(&host, &caller, &lost, kr_ipc::now_ms());
+
+        let again = kind.request(&client, &host, &first, ParamsValue::empty());
+        assert_refused_naming(
+            send_mutation(&mut client, again).await,
+            action(86),
+            &format!("{kind:?}"),
+        );
+
+        let shown = revision_shown_for(&mut client, action(86)).await;
+        assert_eq!(shown, revision);
+        let quoting = kind.request(&client, &host, &first, superseding(action(86), shown));
+        kind.assert_taken(send_mutation(&mut client, quoting).await, &first);
+    }
+}
+
+/// KR-REQ-11.63: where the worker cannot read which identity an uncertain request had, it holds back
+/// every request of that kind by the actor in the session, as it always did. Privacy mode withholds
+/// the envelope a settled receipt kept, an envelope may not decode, and one may decode and not be a
+/// request of the kind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows session places a helper by the job object it was started in, which this test process is not in"
+)]
+async fn an_uncertain_request_whose_identity_cannot_be_read_holds_back_every_request_of_its_kind() {
+    for kind in Sourced::ALL {
+        for unreadable in [
+            "withheld by privacy mode",
+            "not decodable",
+            "not a request of the kind",
+        ] {
+            let host = host().await;
+            bound_to_the_session(&host);
+            let mut client = cli(&host).await;
+            let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+            let (first, second) = (identity(&host, "first"), identity(&host, "second"));
+            let lost = MutationRequest {
+                action_id: action(87),
+                ..kind.request(&client, &host, &first, ParamsValue::empty())
+            };
+            match unreadable {
+                "withheld by privacy mode" => {
+                    host.service
+                        .runtime()
+                        .session()
+                        .enable_privacy(kr_worker::privacy::PrivacyGeneration::new(1), &mut [])
+                        .expect("privacy mode is turned on");
+                    kind.lost(&host, &caller, &lost, kr_ipc::now_ms());
+                    assert_eq!(
+                        host.service
+                            .runtime()
+                            .session()
+                            .journal_mut()
+                            .expect("a journal")
+                            .read_intent(&caller, action(87))
+                            .expect("readable"),
+                        None,
+                        "{kind:?}: privacy mode kept no envelope of the uncertain request"
+                    );
+                }
+                "not decodable" => {
+                    an_uncertain_outcome_kept_as(
+                        &host,
+                        &caller,
+                        action(87),
+                        &lost,
+                        vec![0xff, 0x00],
+                    );
+                }
+                _ => {
+                    let close = close_mutation(
+                        &client,
+                        &host,
+                        DEFAULT_MUTATION_TTL.get(),
+                        ParamsValue::empty(),
+                    );
+                    an_uncertain_outcome_kept_as(
+                        &host,
+                        &caller,
+                        action(87),
+                        &lost,
+                        kr_cbor::to_canonical_vec(&close).expect("encodes"),
+                    );
+                }
+            }
+
+            let request = kind.request(&client, &host, &second, ParamsValue::empty());
+            assert_refused_naming(
+                send_mutation(&mut client, request).await,
+                action(87),
+                &format!("{kind:?}, {unreadable}"),
+            );
+        }
+    }
+}
+
+/// KR-REQ-11.63: a question or an alert whose parameters do not parse is refused in validation,
+/// after its receipt is written, as it was before a request was told apart by its identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_question_or_alert_is_refused_and_leaves_a_rejected_receipt() {
+    for method in [Method::QuestionCreate, Method::AlertCreate] {
+        let host = host().await;
+        let mut client = cli(&host).await;
+        let malformed = MutationRequest {
+            method: method.into(),
+            params: ParamsValue::empty(),
+            ..close_mutation(
+                &client,
+                &host,
+                DEFAULT_MUTATION_TTL.get(),
+                ParamsValue::empty(),
+            )
+        };
+        let action_id = malformed.action_id;
+        let Outcome::Error(error) = send_mutation(&mut client, malformed).await else {
+            panic!("{method:?} with no parameters is refused");
+        };
+        assert_eq!(error.code, ErrorCode::InvalidArgument, "{method:?}");
+        assert_eq!(
+            receipt_read_for(&mut client, action_id).await.state,
+            ReceiptState::Rejected,
+            "{method:?}: the refusal is recorded"
+        );
+    }
+}
+
+/// An uncertain outcome to put into the journal: the request, the envelope kept of it, and the clock
+/// reading its outcome is recorded at.
+struct Lost<'a> {
+    mutation: &'a MutationRequest,
+    kept: Vec<u8>,
+    recorded_at: TimestampMs,
+}
+
+/// Puts two uncertain outcomes of `actor_id` into the journal that were admitted in one order and
+/// recorded in the other: `admitted_first` is admitted first and its outcome is recorded last.
+fn outcomes_recorded_against_their_admission(
+    host: &Host,
+    actor_id: &ActorId,
+    admitted_first: &Lost<'_>,
+    admitted_second: &Lost<'_>,
+) {
+    let mut session = host.service.runtime().session();
+    let journal = session.journal_mut().expect("a journal");
+    for lost in [admitted_first, admitted_second] {
+        let mut intent = fresh(0, 50, 50);
+        intent.actor_id = actor_id.clone();
+        intent.action_id = lost.mutation.action_id;
+        intent.subject_digest =
+            kr_protocol::action::subject_digest(lost.mutation).expect("a subject digest");
+        intent.method = lost.mutation.method.clone();
+        intent.intent = lost.kept.clone();
+        journal.accept(&intent).expect("the intent");
+        journal
+            .mark_dispatching(actor_id.clone(), lost.mutation.action_id, lost.recorded_at)
+            .expect("a marker");
+    }
+    for lost in [admitted_second, admitted_first] {
+        journal
+            .settle(
+                actor_id.clone(),
+                lost.mutation.action_id,
+                ReceiptState::Unknown,
+                None,
+                None,
+                lost.recorded_at,
+            )
+            .expect("an uncertain outcome");
+    }
+}
+
+/// The clock readings the outcomes of the two cases below are recorded at: the one recorded first
+/// and the one recorded last, as milliseconds after the case began.
+const CLOCK_READINGS: [(&str, u64, u64); 2] = [
+    ("at one millisecond", 0, 0),
+    ("on a clock that moved back", 5, 0),
+];
+
+/// KR-REQ-23.24: of several uncertain outcomes of one subject, a request has to show the one recorded
+/// last. The clock does not say which that is (two outcomes can be recorded in one millisecond, and
+/// the wall clock can step back), neither does the order the actions were admitted in or the order of
+/// their identifiers: the order the journal recorded the outcomes in does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_has_to_show_the_uncertain_outcome_recorded_last() {
+    for (clock, older_at, newer_at) in CLOCK_READINGS {
+        let host = host().await;
+        let mut client = cli(&host).await;
+        let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+        let begun = kr_ipc::now_ms().get();
+        let close = close_mutation(
+            &client,
+            &host,
+            DEFAULT_MUTATION_TTL.get(),
+            ParamsValue::empty(),
+        );
+        // Admitted first, recorded last, and the lower identifier; and the other way round.
+        let newer = MutationRequest {
+            action_id: action(0x20),
+            ..close.clone()
+        };
+        let older = MutationRequest {
+            action_id: action(0x80),
+            ..close.clone()
+        };
+        outcomes_recorded_against_their_admission(
+            &host,
+            &caller,
+            &Lost {
+                mutation: &newer,
+                kept: vec![0xa0],
+                recorded_at: TimestampMs::new(begun + newer_at),
+            },
+            &Lost {
+                mutation: &older,
+                kept: vec![0xa0],
+                recorded_at: TimestampMs::new(begun + older_at),
+            },
+        );
+
+        let unquoted = MutationRequest {
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            ..close.clone()
+        };
+        assert_refused_naming(
+            send_mutation(&mut client, unquoted).await,
+            action(0x20),
+            &format!("{clock}: a request that shows nothing"),
+        );
+
+        let shown = revision_shown_for(&mut client, action(0x80)).await;
+        let quoting_older = MutationRequest {
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            expected: superseding(action(0x80), shown),
+            ..close.clone()
+        };
+        assert_refused_naming(
+            send_mutation(&mut client, quoting_older).await,
+            action(0x20),
+            &format!("{clock}: a request that shows the outcome recorded first"),
+        );
+
+        let shown = revision_shown_for(&mut client, action(0x20)).await;
+        let quoting_newer = MutationRequest {
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            expected: superseding(action(0x20), shown),
+            ..close
+        };
+        let admitted = send_mutation(&mut client, quoting_newer).await;
+        assert!(
+            matches!(admitted, Outcome::Ok(_)),
+            "{clock}: a request that shows the outcome recorded last is admitted: {admitted:?}"
+        );
+    }
+}
+
+/// KR-REQ-23.24: the same for the outcomes an answer has to show, which are told apart by their
+/// question: of several uncertain answers to one question, an answer has to show the one recorded
+/// last, whatever the clock and the identifiers say.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_has_to_show_the_uncertain_answer_recorded_last() {
+    for (clock, older_at, newer_at) in CLOCK_READINGS {
+        let host = host().await;
+        let mut client = cli(&host).await;
+        let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+        let begun = kr_ipc::now_ms().get();
+        let question = asked(&host, "first");
+        let newer = MutationRequest {
+            action_id: action(0x21),
+            ..answering(&client, &host, &question, ParamsValue::empty())
+        };
+        let older = MutationRequest {
+            action_id: action(0x81),
+            ..answering(&client, &host, &question, ParamsValue::empty())
+        };
+        outcomes_recorded_against_their_admission(
+            &host,
+            &caller,
+            &Lost {
+                mutation: &newer,
+                kept: kr_cbor::to_canonical_vec(&newer).expect("encodes"),
+                recorded_at: TimestampMs::new(begun + newer_at),
+            },
+            &Lost {
+                mutation: &older,
+                kept: kr_cbor::to_canonical_vec(&older).expect("encodes"),
+                recorded_at: TimestampMs::new(begun + older_at),
+            },
+        );
+
+        let unquoted = answering(&client, &host, &question, ParamsValue::empty());
+        assert_refused_naming(
+            send_mutation(&mut client, unquoted).await,
+            action(0x21),
+            &format!("{clock}: an answer that shows nothing"),
+        );
+
+        let shown = revision_shown_for(&mut client, action(0x81)).await;
+        let quoting_older = answering(&client, &host, &question, superseding(action(0x81), shown));
+        assert_refused_naming(
+            send_mutation(&mut client, quoting_older).await,
+            action(0x21),
+            &format!("{clock}: an answer that shows the outcome recorded first"),
+        );
+
+        let shown = revision_shown_for(&mut client, action(0x21)).await;
+        let quoting_newer = answering(&client, &host, &question, superseding(action(0x21), shown));
+        let taken = resolved(send_mutation(&mut client, quoting_newer).await);
+        assert_eq!(taken.question_id, question.question_id, "{clock}");
+        assert_eq!(
+            taken.state,
+            kr_protocol::question::QuestionState::Answered,
+            "{clock}"
+        );
+    }
 }
 
 /// KR-REQ-23.24: a workflow's close cannot supersede an uncertain outcome. No person is shown the
