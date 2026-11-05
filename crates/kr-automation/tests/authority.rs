@@ -1,9 +1,9 @@
 //! The grant a workflow acts under: read from the host, checked again before every node.
 //!
-//! Requirement rows exercised here: KR-REQ-19.04 (a workflow carries a declared grant, cannot
-//! give an actor a right the granting actor lacks, and cannot turn a view-only invitation into
-//! terminal input) and KR-REQ-25.14 (a shell node is reachable only under an explicit broad shell
-//! grant and a declared execution environment, at dispatch and not only at install).
+//! A workflow carries a declared grant, cannot give an actor a right the granting actor lacks,
+//! and cannot turn a view-only invitation into terminal input; a shell node is reachable only
+//! under an explicit broad shell grant and a declared execution environment, at dispatch and not
+//! only at install.
 
 use std::sync::Arc;
 
