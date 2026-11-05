@@ -411,6 +411,73 @@ fn a_program_started_from_the_release_current_names_runs_that_release_through_sw
     }
 }
 
+/// KR-REQ-26.09: the release a command reads from `current` for a start stays on disk until its
+/// program has the hold of its own, though two updates, and the removal of every release they leave
+/// unneeded, fall between the read and the start. Nothing but the command's own hold keeps it: once
+/// that is let go, and the program has ended, the release is removed.
+#[cfg(unix)]
+#[test]
+fn the_release_a_command_reads_for_a_start_is_there_to_start_after_two_updates_collect_it() {
+    let test = TestStore::create();
+    let one = release("0.1.0+aaaaaaaaaaaa");
+    let two = release("0.2.0+bbbbbbbbbbbb");
+    let three = release("0.3.0+cccccccccccc");
+    for name in [&one, &two, &three] {
+        test.install(name);
+    }
+    test.switch(&one);
+
+    // The command reads `current` for its start.
+    let program = test
+        .store
+        .current_program(Program::Kr)
+        .expect("current is readable")
+        .expect("a release is current");
+    assert_eq!(program, test.store.release_program(&one, Program::Kr));
+
+    // It is paused. Two updates fall, and the second removes the release that is no longer needed.
+    test.switch(&two);
+    test.switch(&three);
+    let update = test
+        .store
+        .try_lock_update()
+        .expect("locks")
+        .expect("nothing else updates");
+    assert!(
+        !test.store.retire(&one, &update).expect("asks"),
+        "the release the command read is not removed before its start"
+    );
+
+    // The start is made: the program is there and runs the release the read named.
+    let talk = test.root.join("talk");
+    std::fs::create_dir(&talk).expect("a directory to talk through");
+    let mut child = std::process::Command::new(&program)
+        .args(["--exact", "helper", "--nocapture", "--test-threads", "1"])
+        .env(HELPER, &talk)
+        .current_dir(&test.root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the program of the release the read named starts");
+    wait_for_unless_ended(&talk.join("started"), &mut child);
+    std::fs::write(talk.join("go"), b"").expect("go");
+    wait_for_unless_ended(&talk.join("said"), &mut child);
+    let said = std::fs::read_to_string(talk.join("said")).expect("what it found");
+    assert_eq!(
+        said.lines().nth(1),
+        Some(one.as_str()),
+        "it holds the release the read named"
+    );
+
+    // Once the program has ended and the command has let go, nothing holds the release.
+    std::fs::write(talk.join("end"), b"").expect("end");
+    assert!(child.wait().expect("the program ends").success());
+    assert!(
+        test.store.retire(&one, &update).expect("removes"),
+        "nothing holds the release now, so it goes"
+    );
+}
+
 /// A build outside a store is what it always was: its programs are the ones beside it, and it
 /// holds nothing.
 #[test]

@@ -1271,6 +1271,129 @@ mod tests {
         );
     }
 
+    /// A forwarder registered through the store's `current` is whichever release's `kr-hook`
+    /// `current` named when the application started it, so a switch between that start and the
+    /// bridge's hello does not refuse a bridge that runs the forwarder of a release the store keeps.
+    /// The link is not read for it: a walk through a link that is being replaced can answer that
+    /// the path is missing. A program that is not the forwarder of a kept release is refused, and
+    /// so is a registration that names one release's forwarder, whichever releases the store keeps.
+    #[cfg(unix)]
+    #[test]
+    fn a_switch_between_the_start_of_the_forwarder_and_its_hello_refuses_no_kept_release_s_forwarder()
+     {
+        use kr_ipc::install::{Program, Running, Store};
+        use kr_protocol::update::ReleaseName;
+
+        fn switch_to(store: &Store, release: &ReleaseName) {
+            let update = store
+                .try_lock_update()
+                .expect("the update lock")
+                .expect("nothing else updates");
+            let install = store
+                .try_lock_install()
+                .expect("the install lock")
+                .expect("nothing starts a daemon");
+            let writers = store
+                .try_lock_writers()
+                .expect("the writers' lock")
+                .expect("no command is writing");
+            store
+                .switch(release, &update, &install, &writers)
+                .expect("the release is current");
+        }
+
+        let host = kr_ipc::testing::TempHost::create();
+        let store = Store::at(host.root().join("store"));
+        store.create_directories().expect("the store's directories");
+        std::fs::write(store.record(), b"{}\n").expect("the store's record");
+        let this_exe = std::env::current_exe().expect("this test's executable");
+        let names = [
+            "0.1.0+aaaaaaaaaaaa",
+            "0.2.0+bbbbbbbbbbbb",
+            "0.3.0+cccccccccccc",
+        ];
+        let [one, two, three] = names.map(|name| ReleaseName::new(name).expect("a release"));
+        for release in [&one, &two, &three] {
+            std::fs::create_dir_all(store.release_directory(release).join("bin"))
+                .expect("the release's bin");
+            std::fs::write(store.manifest(release), manifest_of(release)).expect("a manifest");
+            for program in [Program::Worker, Program::Hook, Program::Kr] {
+                kr_ipc::testing::place_program(&this_exe, &store.release_program(release, program));
+            }
+        }
+        // The worker runs the oldest release; the registration names the forwarder through `current`.
+        let worker = Running::of_image(&store.release_program(&one, Program::Worker))
+            .expect("a worker of the first release");
+        let bridge = installed(store.stable(Program::Hook));
+        let declaration = declared("claude-code", BridgeSurface::Hook);
+
+        // The application starts the forwarder through `current` while the second release is
+        // current: that release's `kr-hook` runs.
+        switch_to(&store, &two);
+        let started = store.release_program(&two, Program::Hook);
+        assert_eq!(
+            std::fs::canonicalize(store.stable(Program::Hook)).expect("current resolves"),
+            std::fs::canonicalize(&started).expect("the forwarder resolves"),
+            "current names the release the forwarder was started from"
+        );
+        // A switch falls before the bridge's hello: `current` names the third release.
+        switch_to(&store, &three);
+        bridge
+            .validate_as(&declaration, Some(&started), Some(&worker))
+            .expect("the forwarder of a release the store keeps");
+        // And the link is not what decides: it is not read for a forwarder of a kept release.
+        std::fs::remove_file(store.current_link()).expect("current goes");
+        bridge
+            .validate_as(&declaration, Some(&started), Some(&worker))
+            .expect("the forwarder of a release the store keeps, with current not there");
+        switch_to(&store, &three);
+
+        // What is not the forwarder of a release the store keeps is refused.
+        let outside = host
+            .root()
+            .join("elsewhere")
+            .join(Program::Hook.file_name());
+        std::fs::create_dir_all(outside.parent().expect("a directory")).expect("a directory");
+        kr_ipc::testing::place_program(&this_exe, &outside);
+        let staged = store
+            .staging()
+            .join("unpacking")
+            .join("bin")
+            .join(Program::Hook.file_name());
+        std::fs::create_dir_all(staged.parent().expect("a directory")).expect("a directory");
+        kr_ipc::testing::place_program(&this_exe, &staged);
+        for (what, image) in [
+            (
+                "another program of a kept release",
+                store.release_program(&two, Program::Kr),
+            ),
+            ("a forwarder outside the store", outside),
+            ("a forwarder of a release being installed", staged),
+        ] {
+            assert!(
+                bridge
+                    .validate_as(&declaration, Some(&image), Some(&worker))
+                    .is_err(),
+                "{what}"
+            );
+        }
+        // A registration that names one release's forwarder, and not `current`, names that one.
+        let pinned = installed(store.release_program(&three, Program::Hook));
+        pinned
+            .validate_as(
+                &declaration,
+                Some(&store.release_program(&three, Program::Hook)),
+                Some(&worker),
+            )
+            .expect("the forwarder the registration names");
+        assert!(
+            pinned
+                .validate_as(&declaration, Some(&started), Some(&worker))
+                .is_err(),
+            "another release's forwarder, for a registration that names one release's"
+        );
+    }
+
     #[cfg(unix)]
     fn manifest_of(release: &kr_protocol::update::ReleaseName) -> String {
         serde_json::json!({

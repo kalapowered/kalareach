@@ -435,6 +435,184 @@ fn a_package_managers_release_without_its_manifest_is_refused() {
     assert!(!home.store.is_store(), "nothing was admitted");
 }
 
+/// The words a program was started with, as the kernel records them.
+#[cfg(target_os = "linux")]
+fn words_of(pid: u32) -> Vec<String> {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|bytes| {
+            bytes
+                .split(|byte| *byte == 0)
+                .filter(|word| !word.is_empty())
+                .map(|word| String::from_utf8_lossy(word).into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The programs `parent` started and still has.
+#[cfg(target_os = "linux")]
+fn children_of(parent: u32) -> Vec<u32> {
+    let Ok(processes) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    processes
+        .flatten()
+        .filter_map(|process| {
+            let pid: u32 = process.file_name().to_str()?.parse().ok()?;
+            let stat = std::fs::read_to_string(process.path().join("stat")).ok()?;
+            // `pid (name) state parent ...`: the name may hold spaces and brackets, so the fields
+            // are those after the last bracket.
+            let after = stat.rsplit_once(')')?.1;
+            let started_by: u32 = after.split_whitespace().nth(1)?.parse().ok()?;
+            (started_by == parent).then_some(pid)
+        })
+        .collect()
+}
+
+/// Asks until it answers. The wait is for a state of the program the case started, and ends the
+/// case with `what` when the program never gets there; it measures nothing.
+#[cfg(target_os = "linux")]
+fn until<T>(what: &str, mut ask: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Some(found) = ask() {
+            return found;
+        }
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A program the case started and must not leave behind: ended, by the file its stand-in waits for
+/// and then by its process number, when the case leaves.
+#[cfg(target_os = "linux")]
+struct Started {
+    child: std::process::Child,
+    end: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Started {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.end, b"");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Makes the `kr` the store keeps for `release` a program that stays alive until the file `end`
+/// exists, as a command that takes its time does, so that a case can read how it was started.
+#[cfg(target_os = "linux")]
+fn make_the_stores_kr_wait(home: &Home, release: &Assembled, end: &Path) {
+    let directory = home.store.release_directory(release.name());
+    writable(&directory);
+    let program = home.store.release_program(release.name(), Program::Kr);
+    std::fs::remove_file(&program).expect("the release's kr goes");
+    kr_ipc::testing::place_script(
+        &program,
+        format!(
+            "#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 1; done\n",
+            end.display()
+        ),
+    );
+}
+
+/// KR-REQ-26.09: a package manager's `kr` hands its command to the `kr` of the release `current`
+/// names by that release's own path, with no link in it. The command stays alive, so the case reads
+/// the words it was started with: the shell that runs the stand-in's text is the first, and the
+/// path the store's `kr` was started by is the second.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_package_managers_kr_hands_its_command_to_the_store_s_kr_by_the_release_s_own_path() {
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let first = home.prefix("Cellar", &one);
+    assert!(home.first_command(&kr(&first)).0.status.success());
+    let end = home.host.scratch("ends").join("end");
+    make_the_stores_kr_wait(&home, &one, &end);
+
+    let started = Started {
+        child: home
+            .command(&kr(&first), &["host", "paths"])
+            .spawn()
+            .expect("the package manager's kr starts"),
+        end,
+    };
+    let pid = started.child.id();
+    let words = until("the command never became the store's kr", || {
+        Some(words_of(pid)).filter(|words| words.first().map(String::as_str) == Some("/bin/sh"))
+    });
+    let path = PathBuf::from(&words[1]);
+    assert_eq!(
+        path,
+        home.store.release_program(one.name(), Program::Kr),
+        "the store's kr was started by the release's own path"
+    );
+    assert!(
+        !path.starts_with(home.store.current_link()),
+        "and not through the link"
+    );
+}
+
+/// KR-REQ-26.09: a package manager's `kr` that hands its release to the current release as an
+/// update starts that release's `kr` by its own path, with no link in it. The update takes its
+/// time, so the case reads the words the store's `kr` was started with.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_package_managers_kr_starts_the_current_release_s_kr_for_an_update_by_its_own_path() {
+    let home = Home::new();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    let first = home.prefix("Cellar", &one);
+    assert!(home.first_command(&kr(&first)).0.status.success());
+    let end = home.host.scratch("ends").join("end");
+    make_the_stores_kr_wait(&home, &one, &end);
+
+    let second = home.prefix("Cellar", &two);
+    let mut started = Started {
+        child: home
+            .command(&kr(&second), &["host", "paths"])
+            .spawn()
+            .expect("the package manager's kr starts"),
+        end: end.clone(),
+    };
+    let pid = started.child.id();
+    let words = until(
+        "the current release's kr was never started for the update",
+        || {
+            children_of(pid)
+                .into_iter()
+                .map(words_of)
+                .find(|words| words.first().map(String::as_str) == Some("/bin/sh"))
+        },
+    );
+    let path = PathBuf::from(&words[1]);
+    assert_eq!(
+        path,
+        home.store.release_program(one.name(), Program::Kr),
+        "the current release's kr was started by the release's own path"
+    );
+    assert!(
+        !path.starts_with(home.store.current_link()),
+        "and not through the link"
+    );
+    assert_eq!(
+        words.get(2..5),
+        Some(
+            &[
+                "host".to_owned(),
+                "update".to_owned(),
+                "--archive".to_owned()
+            ][..]
+        ),
+        "for an update from the archive"
+    );
+    // The update ends, and the command goes on as the release that is current.
+    std::fs::write(&end, b"").expect("the stand-in ends");
+    let status = started.child.wait().expect("the command ends");
+    assert!(status.success(), "{status}");
+}
+
 /// KR-REQ-26.03: a release older than the one the host runs is not put in the store, and the
 /// command runs as the release that is current.
 #[test]
