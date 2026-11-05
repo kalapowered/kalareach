@@ -174,6 +174,54 @@ function Restore-KrKeys {
     foreach ($key in $rest) { $queue.Enqueue($key) }
 }
 
+# The chord of the key the module queues for itself ahead of every read, and the key the editor makes
+# of it. No terminal sends such a key, and the module binds the chord only where nothing is bound.
+$script:StartChord = 'Ctrl+Alt+F24'
+$script:StartKey = $null
+
+# The editor's key for that chord, made the way the editor makes the key of a chord it binds, or
+# nothing when the editor does not say.
+function Get-KrStartKey {
+    if ($null -ne $script:StartKey) { return $script:StartKey }
+    try {
+        $assembly = $script:Rl.Assembly
+        $keys = $assembly.GetType('Microsoft.PowerShell.ConsoleKeyChordConverter').GetMethod(
+            'Convert', [type[]]@([string])).Invoke($null, @($script:StartChord))
+        $key = $assembly.GetType('Microsoft.PowerShell.PSKeyInfo').GetMethod(
+            'FromConsoleKeyInfo', [type[]]@([System.ConsoleKeyInfo])).Invoke($null, @(@($keys)[0]))
+        $script:StartKey = $key
+        $key
+    } catch {
+        $null
+    }
+}
+
+# Queues the module's own key for the read that is about to start, and says whether it did.
+#
+# The key is the first thing the editor runs once it has started: it asks the terminal where the
+# cursor is, from the same input as every other byte, and then reads its first key. Until the module's
+# handler for the key runs, the queue is not empty, so no fence is proved over a reader whose editor
+# has not asked yet, and the reader reports itself idle from the handler, which is where the worker
+# asks for a fence again. Where the key cannot be queued the caller reports idle at once, as it always
+# did.
+function Add-KrStartKey {
+    if ($IsWindows -or -not $script:Hooks.Start) { return $false }
+    try {
+        $key = Get-KrStartKey
+        $queue = Get-KrKeyQueue
+        if ($null -eq $key -or $null -eq $queue) { return $false }
+        # The editor starts every read in its insert mode, which is the table the key is bound in.
+        $table = (Get-KrBindingTables).Keys
+        if (-not $table.ContainsKey($key) -or "$($table[$key].LongDescription)" -cne $script:StartDescription) {
+            return $false
+        }
+        $queue.Enqueue($key)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 # What each reply to a question of the terminal's opens with, after its Escape: a control sequence
 # (`CSI ? 62 ; 22 c`, the terminal's attributes), an operating system command (`OSC 11 ; rgb:... ST`,
 # a colour) and a device control string (`DCS > | name ST`, the terminal's version).

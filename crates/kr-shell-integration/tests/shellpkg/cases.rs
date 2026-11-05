@@ -761,6 +761,63 @@ pub fn a_hosts_answer_to_a_terminal_query_never_reaches_the_line_the_editor_read
     );
 }
 
+/// KR-REQ-08.49: a reader whose editor has not yet asked the terminal where the cursor is has not
+/// reported itself idle, and does once the terminal has answered and the editor has started.
+///
+/// The first idle report with clear queues is where a worker proves a fence, and what the host
+/// writes behind a fence is behind the reader's claim. The editor reads the reply to its question
+/// about the cursor from the same input as every other byte, so an answer written behind a fence
+/// proved before the question is read as part of the reply. The terminal here is made slow to
+/// answer, so that at the prompt after an empty line the editor is waiting for its reply, and the
+/// bridge is read for everything the reader has sent: a report of the reader being idle is the
+/// reader claiming the editor is clear when it has not started. The terminal then answers, and the
+/// report comes with the editor's line empty.
+///
+/// # Panics
+///
+/// Panics when the reader has reported itself idle at a prompt whose editor is still waiting for
+/// the terminal, or when it never reports once the editor has the answer.
+#[cfg(unix)]
+pub fn a_reader_reports_itself_idle_only_once_its_editor_has_the_cursors_reply(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+
+    session.hold_terminal_answers();
+    session.type_line("");
+    let enter = session.next_prompt();
+    assert!(
+        session.wait_for_prompt() && session.wait_for_editor_reading(),
+        "the editor asked the terminal nothing at its next prompt:\n{}",
+        session.terminal_output()
+    );
+
+    // A frame the reader wrote before the question is on the endpoint already.
+    session.take_in_what_has_arrived();
+    assert!(
+        !session.events.waiting().contains(&"reader_idle"),
+        "the reader reported itself idle while its editor waited for the terminal to say where the \
+         cursor was: {:?}\n{}",
+        session.events.waiting(),
+        session.terminal_output()
+    );
+
+    session.release_terminal_answers();
+    session.expect_event(
+        "an idle report from this reader once its editor has the reply",
+        |event| {
+            matches!(
+                event,
+                BridgeEvent::ReaderIdle(idle)
+                    if idle.prompt_generation == enter.prompt_generation
+                        && idle.reader_revision == enter.reader_revision
+                        && idle.editor.buffer_empty
+            )
+        },
+    );
+}
+
 /// Types `unread` into the terminal of an idle reader that is stopped, asks it for its queues, and
 /// expects it to say they are not drained. Then types `completion`, which the reader needs to take
 /// what it has, and expects it to say they are.

@@ -75,6 +75,14 @@ fn a_hosts_answer_to_a_terminal_query_never_reaches_the_line_the_editor_reads() 
     shellpkg::a_hosts_answer_to_a_terminal_query_never_reaches_the_line_the_editor_reads(PWSH);
 }
 
+/// KR-REQ-08.49: the reader does not report itself idle, which is where a fence is first proved,
+/// before its editor has the terminal's reply to the question where the cursor is.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn the_reader_reports_itself_idle_only_once_its_editor_has_the_cursors_reply() {
+    shellpkg::a_reader_reports_itself_idle_only_once_its_editor_has_the_cursors_reply(PWSH);
+}
+
 /// KR-REQ-07.40: the module holds no secret bytes once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
@@ -1021,6 +1029,97 @@ fn the_chords_that_drop_a_hosts_answer_are_bound_in_the_emacs_mode_and_never_ove
             "Escape alone is no longer the {mode} edit mode's own operation:\n{other}"
         );
     }
+}
+
+/// KR-REQ-08.49: the key the module queues for itself when a read starts is bound in every edit mode,
+/// where nothing is bound on it, and it is queued once for the read; where the person has bound it the
+/// module binds nothing and queues nothing.
+///
+/// The key is what keeps the editor's queue from being clear until the editor has started, so a read
+/// that cannot queue it reports itself idle at once, as the module did before. A person's binding of
+/// the key is theirs, whether it stood there before the module's or came after it, and stays when the
+/// module's goes.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_key_the_module_queues_when_a_read_starts_is_bound_in_every_edit_mode_and_never_over_the_persons()
+ {
+    for mode in ["Emacs", "Vi", "Windows"] {
+        let own = in_the_package_host(&format!(
+            r#"Set-PSReadLineOption -EditMode {mode};
+               function Show-KrStart {{ Get-PSReadLineKeyHandler -Bound | Where-Object {{ $_.Key -ceq 'Ctrl+Alt+F24' }} }};
+               $bound = & $module {{ $script:Hooks.Start = Install-KrStartHandler; $script:Hooks.Start }};
+               $held = Show-KrStart;
+               $before = & $module {{ Get-KrQueuedKeys }};
+               $queued = & $module {{ Add-KrStartKey }};
+               $after = & $module {{ Get-KrQueuedKeys }};
+               & $module {{ Restore-KrStartHandler }};
+               Write-Output "kr-key[bound]=[$bound]";
+               Write-Output "kr-key[held]=[$($held.Function)]";
+               Write-Output "kr-key[queued]=[$queued $($after - $before)]";
+               Write-Output "kr-key[after]=[$(@(Show-KrStart).Count)]""#
+        ));
+        assert_eq!(
+            said(&own, "bound"),
+            "True",
+            "the module bound nothing on the key in the {mode} edit mode:\n{own}"
+        );
+        assert_eq!(
+            said(&own, "held"),
+            "KalaReachStart",
+            "the editor does not hold the module's binding of the key in the {mode} edit mode:\n{own}"
+        );
+        assert_eq!(
+            said(&own, "queued"),
+            "True 1",
+            "the module did not queue the key once in the {mode} edit mode:\n{own}"
+        );
+        assert_eq!(
+            said(&own, "after"),
+            "0",
+            "the module's binding of the key stayed when the module went in the {mode} edit mode:\n{own}"
+        );
+    }
+
+    let before = in_the_package_host(
+        r#"Set-PSReadLineKeyHandler -Chord 'Ctrl+Alt+F24' -ScriptBlock { 'theirs' };
+           $bound = & $module { $script:Hooks.Start = Install-KrStartHandler; $script:Hooks.Start };
+           $queued = & $module { Add-KrStartKey };
+           & $module { Restore-KrStartHandler };
+           $held = Get-PSReadLineKeyHandler -Bound | Where-Object { $_.Key -ceq 'Ctrl+Alt+F24' };
+           Write-Output "kr-key[bound]=[$bound]";
+           Write-Output "kr-key[queued]=[$queued]";
+           Write-Output "kr-key[held]=[$($held.Function)]""#,
+    );
+    assert_eq!(
+        (said(&before, "bound"), said(&before, "queued")),
+        ("False".to_owned(), "False".to_owned()),
+        "the module bound or queued a key the person had bound:\n{before}"
+    );
+    assert_eq!(
+        said(&before, "held"),
+        "CustomAction",
+        "the person's binding of the key did not stay:\n{before}"
+    );
+
+    let after = in_the_package_host(
+        r#"$bound = & $module { $script:Hooks.Start = Install-KrStartHandler; $script:Hooks.Start };
+           Set-PSReadLineKeyHandler -Chord 'Ctrl+Alt+F24' -ScriptBlock { 'theirs since' };
+           $queued = & $module { Add-KrStartKey };
+           & $module { Restore-KrStartHandler };
+           $held = Get-PSReadLineKeyHandler -Bound | Where-Object { $_.Key -ceq 'Ctrl+Alt+F24' };
+           Write-Output "kr-key[queued]=[$queued]";
+           Write-Output "kr-key[held]=[$($held.Function)]""#,
+    );
+    assert_eq!(
+        said(&after, "queued"),
+        "False",
+        "the module queued a key whose binding is the person's since:\n{after}"
+    );
+    assert_eq!(
+        said(&after, "held"),
+        "CustomAction",
+        "taking the module's binding off took off the person's:\n{after}"
+    );
 }
 
 /// KR-REQ-12.07: when the hooks go, the handler the person had before the module's still runs
