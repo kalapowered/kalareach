@@ -1,8 +1,7 @@
 //! Volatile-native mode as a component and its runtime meet it.
 //!
-//! Requirement rows closed here: KR-REQ-11.35 and KR-REQ-11.36 for the component side. The
-//! worker's own fence, its in-memory arbitration, the evidence gap and the recovery that commits
-//! it are `crates/kr-worker/tests/gateway.rs`.
+//! The worker's own fence, its in-memory arbitration, the evidence gap and the recovery that
+//! commits it are `crates/kr-worker/tests/gateway.rs`.
 //!
 //! The rule this side has to keep is short and is the one that is easy to get wrong: the fence
 //! stops rich work and reaches nothing the native forwarding path uses. A component that is
