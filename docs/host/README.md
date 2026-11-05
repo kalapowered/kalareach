@@ -4102,8 +4102,8 @@ observed.
 
 A new action identifier cannot silently take an uncertain outcome's place. The journal stores a
 **subject digest** beside the payload digest: the method and version, the complete target and the
-parameters, and nothing that differs between a first attempt and the later request that supersedes
-it. So a fresh identifier for a subject that already carries an uncertain outcome is refused unless
+parameters that select the resource, and nothing that differs between a first attempt and the later
+request that supersedes it. So a fresh identifier for a subject that already carries an uncertain outcome is refused unless
 its preconditions name that action and the receipt revision the caller read it at. A service that
 wanted to hide the uncertainty would have to name the receipt it was hiding.
 
@@ -4111,10 +4111,10 @@ The subject of every `question.answer` in a session is the target alone, so its 
 the answers to two questions apart. The worker reads the envelope the receipt kept instead: an
 answer to a question is refused for an uncertain answer to that same question, and an answer to
 another question of the session is admitted. A request that names an uncertain answer to another
-question names nothing this answer has to show, and is refused. A receipt whose envelope is gone or
-does not decode, which privacy mode causes once an action settles, holds back every answer of the
-actor in the session, as the rule above does. `question.cancel` and every other method keep the
-rule above.
+question names nothing this answer has to show, and is refused. A receipt whose question the worker
+cannot read holds back every answer of the actor in the session, as the rule above does: its
+envelope is gone (privacy mode removes it once an action settles), does not decode, or is not an
+answer. `question.cancel` and every other method keep the rule above.
 
 The revision has to be one the caller was shown. The worker remembers, in memory and for a bounded
 number of receipts, the revision of each receipt that `action.read` answered to each actor, and a
