@@ -607,6 +607,78 @@ describe('on the desktop', () => {
       expect(quotes[2]).toEqual({ action_id: ACTION, revision: '4' })
     })
 
+    it('names the action the host named when it refused the quote of another that the page picked', async () => {
+      // Two earlier prompts have no confirmed outcome, and both records read alike, so the page
+      // picks the later identifier. The host's newest is the other, and its refusal says so.
+      const unconfirmed = (action: string): Settled<AgentMutationResult> => ({
+        receipt: null,
+        value: null,
+        action_id: action
+      })
+      const refused = Object.assign(new Error('the quote was not the newest'), {
+        code: 'DRAFT_CONFLICT',
+        message: `DRAFT_CONFLICT: the uncertain outcome of this subject is action ${ACTION}, not ${ANOTHER_ACTION}`,
+        user_action: 'retry'
+      })
+      const recorded: Recorded = { state: 'unknown', revision: '3' }
+      const reads: string[] = []
+      const quotes: (Supersession | undefined)[] = []
+      const { person } = await sentOnce(
+        (attempt) =>
+          attempt === 1
+            ? unconfirmed(ACTION)
+            : attempt === 2
+              ? unconfirmed(ANOTHER_ACTION)
+              : attempt === 3
+                ? refused
+                : unconfirmed(ACTION),
+        recorded,
+        reads,
+        [],
+        quotes
+      )
+      await waitFor(
+        () => {
+          expect(reads).toContain(ACTION)
+        },
+        { timeout: 3_000 }
+      )
+      await flush()
+      await person.click(await screen.findByTestId('composer-send-anyway'))
+      await waitFor(() => {
+        expect(quotes).toHaveLength(2)
+      })
+      await waitFor(
+        () => {
+          expect(reads).toContain(ANOTHER_ACTION)
+        },
+        { timeout: 3_000 }
+      )
+      await flush()
+
+      // The page quotes the later identifier, and the host refuses it, naming the other. An
+      // outcome nobody knows leaves the words in the composer, and a refusal leaves them there too.
+      await waitFor(() => {
+        expect(screen.getByTestId('composer-send-anyway')).toBeEnabled()
+      })
+      await person.click(screen.getByTestId('composer-send-anyway'))
+      await waitFor(() => {
+        expect(quotes).toHaveLength(3)
+      })
+      expect(quotes[2]).toEqual({ action_id: ANOTHER_ACTION, revision: '3' })
+      await screen.findAllByText(/the uncertain outcome of this subject is action/)
+
+      // The next press quotes the action the refusal named.
+      await waitFor(() => {
+        expect(screen.getByTestId('composer-send-anyway')).toBeEnabled()
+      })
+      await person.click(screen.getByTestId('composer-send-anyway'))
+      await waitFor(() => {
+        expect(quotes).toHaveLength(4)
+      })
+      expect(quotes[3]).toEqual({ action_id: ACTION, revision: '3' })
+    })
+
     it('is not offered a way past while the host merely has the action', async () => {
       const recorded = { state: 'dispatching' as Receipt['state'] }
       await sentOnce(WITH_THE_HOST, recorded)
@@ -916,6 +988,75 @@ describe('on the phone', () => {
       expect(quotes).toHaveLength(2)
     })
     expect(quotes[1]).toBeUndefined()
+  })
+
+  it('names the action the host named when it refused the quote of another that the page picked', async () => {
+    const unconfirmed = (action: string): Settled<AgentMutationResult> => ({
+      receipt: null,
+      value: null,
+      action_id: action
+    })
+    const refused = Object.assign(new Error('the quote was not the newest'), {
+      code: 'DRAFT_CONFLICT',
+      message: `DRAFT_CONFLICT: the uncertain outcome of this subject is action ${ACTION}, not ${ANOTHER_ACTION}`,
+      user_action: 'retry'
+    })
+    const recorded: Recorded = { state: 'unknown', revision: '3' }
+    const reads: string[] = []
+    const quotes: (Supersession | undefined)[] = []
+    const { person } = await sentOnce(
+      (attempt) =>
+        attempt === 1
+          ? unconfirmed(ACTION)
+          : attempt === 2
+            ? unconfirmed(ANOTHER_ACTION)
+            : attempt === 3
+              ? refused
+              : unconfirmed(ACTION),
+      recorded,
+      reads,
+      [],
+      quotes
+    )
+    await waitFor(
+      () => {
+        expect(reads).toContain(ACTION)
+      },
+      { timeout: 3_000 }
+    )
+    await flush()
+    await person.click(await screen.findByRole('button', { name: 'I checked; send anyway' }))
+    await waitFor(() => {
+      expect(quotes).toHaveLength(2)
+    })
+    await waitFor(
+      () => {
+        expect(reads).toContain(ANOTHER_ACTION)
+      },
+      { timeout: 3_000 }
+    )
+    await flush()
+
+    // The page quotes the later identifier, and the host refuses it, naming the other.
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'I checked; send anyway' })).toBeEnabled()
+    })
+    await person.click(screen.getByRole('button', { name: 'I checked; send anyway' }))
+    await waitFor(() => {
+      expect(quotes).toHaveLength(3)
+    })
+    expect(quotes[2]).toEqual({ action_id: ANOTHER_ACTION, revision: '3' })
+    await screen.findAllByText(/the uncertain outcome of this subject is action/)
+
+    // The next press quotes the action the refusal named.
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'I checked; send anyway' })).toBeEnabled()
+    })
+    await person.click(screen.getByRole('button', { name: 'I checked; send anyway' }))
+    await waitFor(() => {
+      expect(quotes).toHaveLength(4)
+    })
+    expect(quotes[3]).toEqual({ action_id: ACTION, revision: '3' })
   })
 
   it('is not offered a way past while the host merely has the action', async () => {

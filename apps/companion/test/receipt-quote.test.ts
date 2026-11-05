@@ -50,6 +50,10 @@ function record(
 
 const TO = { applicationInstanceId: INSTANCE, agentBindingRevision: '1' }
 
+/** Two actions of one conversation, whose records the page cannot tell the order of. */
+const OLDER = 'c2000000-0000-4000-8000-000000000001'
+const LATER = 'c2000000-0000-4000-8000-000000000002'
+
 describe('the action a later prompt names', () => {
   it('is the prompt to this conversation whose newest read said unknown, with the revision read', () => {
     const reads = new ReceiptReads()
@@ -81,6 +85,35 @@ describe('the action a later prompt names', () => {
     expect(supersessionFor([unknown('a')], reads, TO)).toBeNull()
     reads.note(record('a'))
     expect(supersessionFor([unknown('a', '1')], reads, { ...TO, agentBindingRevision: '2' })).toBeNull()
+  })
+
+  it('is the action the host named when it refused a quote, though the page would pick the other', () => {
+    const reads = new ReceiptReads()
+    // Written in the same millisecond, so the page falls back on the identifier and picks the later.
+    reads.note(record(OLDER, { revision: '3' }))
+    reads.note(record(LATER, { revision: '4' }))
+    const submissions = [unknown(OLDER), unknown(LATER)]
+    expect(supersessionFor(submissions, reads, TO)?.action_id).toBe(LATER)
+
+    // The host's newest is the other: its refusal names it, first.
+    reads.noteRefusal(`the uncertain outcome of this subject is action ${OLDER}, not ${LATER}`)
+    expect(supersessionFor(submissions, reads, TO)).toEqual({ action_id: OLDER, revision: '3' })
+    // And it names the one now in the way, when the host's newest has moved on.
+    reads.noteRefusal(`the uncertain outcome of this subject is action ${LATER}, not ${OLDER}`)
+    expect(supersessionFor(submissions, reads, TO)).toEqual({ action_id: LATER, revision: '4' })
+  })
+
+  it('keeps its own order for a refusal that names no action it could quote', () => {
+    const reads = new ReceiptReads()
+    reads.note(record(OLDER))
+    reads.note(record(LATER))
+    reads.note(record('a'))
+    const submissions = [unknown(OLDER), unknown(LATER)]
+    reads.noteRefusal('the earlier result has not been shown')
+    // An action this window sent and read as something else, and one it never heard of.
+    reads.noteRefusal('action a is not an uncertain outcome of this subject')
+    reads.noteRefusal(`the uncertain outcome of this subject is action ${'c2000000-0000-4000-8000-0000000000ff'}`)
+    expect(supersessionFor(submissions, reads, TO)?.action_id).toBe(LATER)
   })
 
   it('keeps the newest revision read, whatever order the reads arrive in', () => {
