@@ -40,7 +40,7 @@ import { entryLabel, nodeKindLabel } from '../../model/entry-label'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
 import { StandingBanner } from '../../components/StandingBanner'
 import { isOver, rightsOf } from '../../model/openings'
-import { failureCode, failureMessage, type SessionSubject } from '../../host/port'
+import { failureCode, failureMessage, failureRetry, type SessionSubject } from '../../host/port'
 import {
   adoptFirstTarget,
   againstCurrent,
@@ -782,7 +782,8 @@ export function MobileSession({
                   // be rounded up to a refusal, and rewriting the code would round it up.
                   failed(each, {
                     code: failureCode(failure) ?? 'REQUEST_FAILED',
-                    message: failureMessage(failure)
+                    message: failureMessage(failure),
+                    retry: failureRetry(failure)
                   })
                 : each
             )

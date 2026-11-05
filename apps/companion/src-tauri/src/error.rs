@@ -4,7 +4,7 @@
 //! can translate the code into a direct action rather than showing an internal message. Section 23
 //! fixes that vocabulary; nothing here invents a code of its own.
 
-use kr_protocol::error::ErrorCode;
+use kr_protocol::error::{ErrorCode, RetryCategory};
 use serde::Serialize;
 
 /// A failure the WebView receives.
@@ -16,6 +16,10 @@ pub struct CommandError {
     pub message: String,
     /// What the person can do about it, where the client knows.
     pub user_action: String,
+    /// The retry category of the code, so the interface tells a host's definite refusal from one
+    /// for now (`transient`: nothing took effect, and the same send may be tried again) and from an
+    /// outcome the host could not establish (`outcome_unknown`).
+    pub retry: RetryCategory,
 }
 
 impl CommandError {
@@ -31,6 +35,7 @@ impl CommandError {
             code,
             message: message.into(),
             user_action: kr_client::retry::user_action(code).as_str().into(),
+            retry: code.retry_category(),
         }
     }
 
@@ -47,6 +52,7 @@ impl CommandError {
             code,
             message: message.into(),
             user_action: kr_client::retry::UserAction::Nothing.as_str().into(),
+            retry: code.retry_category(),
         }
     }
 
@@ -122,6 +128,7 @@ impl From<kr_client::ClientError> for CommandError {
             code,
             message: error.to_string(),
             user_action: error.user_action().as_str().into(),
+            retry: code.retry_category(),
         }
     }
 }
@@ -144,6 +151,44 @@ mod tests {
         let error = CommandError::refused("that scheme is not approved");
         assert_eq!(error.code, ErrorCode::PermissionDenied);
         assert!(!error.user_action.is_empty());
+    }
+
+    /// The page tells a host's definite refusal from one for now and from an outcome the host
+    /// could not establish by the category native code hands it, as the protocol sorts the code.
+    #[test]
+    fn a_failure_carries_the_retry_category_of_its_code() {
+        use kr_client::ClientError;
+        use kr_protocol::error::ProtocolError;
+
+        for (code, category, word) in [
+            (
+                ErrorCode::ResourceUnavailable,
+                RetryCategory::Transient,
+                "transient",
+            ),
+            (
+                ErrorCode::StorageUnavailable,
+                RetryCategory::Transient,
+                "transient",
+            ),
+            (
+                ErrorCode::PermissionDenied,
+                RetryCategory::ConfigurationChange,
+                "configuration_change",
+            ),
+            (
+                ErrorCode::OutcomeUnknown,
+                RetryCategory::OutcomeUnknown,
+                "outcome_unknown",
+            ),
+        ] {
+            let failure =
+                CommandError::from(ClientError::Host(ProtocolError::new(code, "the host said")));
+            assert_eq!(failure.retry, category, "{code:?}");
+            let sent = serde_json::to_value(&failure).expect("serialises");
+            assert_eq!(sent["retry"], word, "{code:?}");
+            assert_eq!(CommandError::new(code, "said").retry, category, "{code:?}");
+        }
     }
 
     #[test]

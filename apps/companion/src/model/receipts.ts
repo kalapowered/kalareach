@@ -12,8 +12,21 @@
 
 import type { Receipt } from '@kalareach/protocol'
 
-/** What has happened to one thing the person sent. */
-export type InputState = 'queued' | 'sent' | 'applied' | 'refused' | 'rejected' | 'unknown'
+/**
+ * What has happened to one thing the person sent.
+ *
+ * `refused` is the host's definite word that it did not happen. `not_taken` is the host saying it
+ * cannot take it now: nothing took effect, and the same thing may be sent again. `unknown` is the
+ * host saying it cannot establish whether it happened.
+ */
+export type InputState =
+  | 'queued'
+  | 'sent'
+  | 'applied'
+  | 'refused'
+  | 'rejected'
+  | 'not_taken'
+  | 'unknown'
 
 /** One submission the interface is tracking. */
 export interface Submission {
@@ -96,6 +109,8 @@ export function describeState(state: InputState): string {
       return 'Refused by the host'
     case 'rejected':
       return 'Rejected'
+    case 'not_taken':
+      return 'Not taken for now'
     case 'unknown':
       return 'Outcome unknown'
   }
@@ -113,7 +128,7 @@ export function queued(
 
 /** Whether an outcome means the submission did not happen and its text should come back. */
 export function wasRefused(state: InputState): boolean {
-  return state === 'refused' || state === 'rejected'
+  return state === 'refused' || state === 'rejected' || state === 'not_taken'
 }
 
 /** Records that the request has been made. */
@@ -151,6 +166,7 @@ export function sendOutcomeOf(state: InputState): 'taken' | 'refused' | 'unknown
       return 'taken'
     case 'refused':
     case 'rejected':
+    case 'not_taken':
       return 'refused'
     case 'unknown':
       return 'unknown'
@@ -221,15 +237,26 @@ export function applyReceipt(submission: Submission, receipt: Receipt): Submissi
     : next
 }
 
-/** Records a failure the request itself produced. */
+/**
+ * Records a failure the request itself produced.
+ *
+ * `retry` is the retry category of the host's code, as native code hands it over. Only a definite
+ * word is a refusal. A submission whose outcome the host could not confirm stays unknown: the
+ * interface asks what became of it rather than telling the person it failed. One the host cannot
+ * take for now is not taken, and is not called refused: it may be sent again. Without a category,
+ * a code other than `OUTCOME_UNKNOWN` is read as a definite word.
+ */
 export function failed(
   submission: Submission,
-  error: { code: string; message: string }
+  error: { code: string; message: string; retry?: string | null }
 ): Submission {
-  // A submission whose outcome the host could not confirm stays unknown: the interface asks what
-  // became of it rather than telling the person it failed.
-  const state: InputState = error.code === 'OUTCOME_UNKNOWN' ? 'unknown' : 'refused'
-  return { ...submission, state, error }
+  const state: InputState =
+    error.code === 'OUTCOME_UNKNOWN' || error.retry === 'outcome_unknown'
+      ? 'unknown'
+      : error.retry === 'transient'
+        ? 'not_taken'
+        : 'refused'
+  return { ...submission, state, error: { code: error.code, message: error.message } }
 }
 
 /** The submissions that are not finished, which is what the reconnect banner lists. */
@@ -312,6 +339,8 @@ export function outcomeMessage(done: string, answer: Answer): string {
       return 'The host refused that.'
     case 'rejected':
       return 'The host rejected that.'
+    case 'not_taken':
+      return 'The host could not take that now.'
     case 'unknown':
       return 'The host could not confirm what became of that.'
     case 'queued':
@@ -334,6 +363,7 @@ export function outcomeTone(answer: Answer): 'success' | 'danger' | 'pending' {
       return 'pending'
     case 'refused':
     case 'rejected':
+    case 'not_taken':
     case 'unknown':
       return 'danger'
   }
