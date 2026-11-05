@@ -639,7 +639,8 @@ jobs:
           echo "directory=$temp/release" >> "$GITHUB_OUTPUT"
 
       # What is kept and published is the archives, so they are read member by member as well, before
-      # the sums are checked, kept or uploaded.
+      # the sums and signature records are held to what their checkers read and before anything is
+      # kept or uploaded.
       - name: Refuse a private key in the signed archives
         shell: bash
         run: python scripts/check-release-secrets.py scan "$(cygpath -m "$RUNNER_TEMP")/release"

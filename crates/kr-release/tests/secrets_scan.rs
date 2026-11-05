@@ -611,12 +611,16 @@ enum Holds {
     Path(&'static str),
     /// A command of the step, as a whole.
     Command(&'static str),
+    /// A line of the step, as a whole: a value of its `env`.
+    Line(&'static str),
 }
 
 /// The steps that keep, and what each keeps: the path or the command that the file holds today,
 /// which the scan of its job read or is taken to have read. A path is not derived from the scan's:
-/// the Windows tree upload keeps `tree`, the directory above the scanned `tree/$TOP`.
-static HOLDS: [(&str, &str, Holds); 18] = [
+/// the Windows tree upload keeps `tree`, the directory above the scanned `tree/$TOP`. The publish
+/// step of the Windows `release` job is held where it takes its folder (the `env` value and the
+/// command that makes it a path); the commands further down that read the folder are not looked at.
+static HOLDS: [(&str, &str, Holds); 20] = [
     (
         "release-tree.yml",
         "Keep the tree for a release",
@@ -714,6 +718,16 @@ static HOLDS: [(&str, &str, Holds); 18] = [
         "release-windows.yml",
         "Keep the signed archives",
         Holds::Path("${{ runner.temp }}/release"),
+    ),
+    (
+        "release-windows.yml",
+        "Publish the release",
+        Holds::Line("KR_RELEASE_DIR: ${{ steps.pack.outputs.directory }}"),
+    ),
+    (
+        "release-windows.yml",
+        "Publish the release",
+        Holds::Command(r#"release_dir="$(cygpath -u "$KR_RELEASE_DIR")""#),
     ),
 ];
 
@@ -1399,6 +1413,13 @@ fn problems_in(name: &str, text: &str) -> Vec<Problem> {
                     commands.iter().any(|c| c.text == *command),
                 )
             }
+            Holds::Line(line) => (
+                step.range.start,
+                workflow
+                    .code(&step.range)
+                    .iter()
+                    .any(|code| code.trim() == *line),
+            ),
         };
         if !held {
             refuse(&mut found, Refusal::KeptPath, at, workflow.lines[at]);
@@ -1803,13 +1824,20 @@ fn a_step_that_keeps_more_than_its_scan_read_is_refused() {
                 mutant.replace_in_step(step, &format!("path: {path}"), "path: ${{ runner.temp }}");
             }
             Holds::Command(command) => {
-                // The temporary folder, named as the step names it, is put somewhere else.
-                let variable = if command.contains("$RUNNER_TEMP") {
-                    "$RUNNER_TEMP"
-                } else {
-                    "$temp"
-                };
+                // The folder the command names, as the step names it, is put somewhere else.
+                let variable = ["$RUNNER_TEMP", "$temp", "$KR_RELEASE_DIR"]
+                    .into_iter()
+                    .find(|variable| command.contains(variable))
+                    .expect("a command that names a folder");
                 mutant.replace_in_step(step, command, &command.replacen(variable, "$HOME", 1));
+            }
+            Holds::Line(line) => {
+                let (key, _) = line.split_once(": ").expect("a key and a value");
+                mutant.replace_in_step(
+                    step,
+                    line,
+                    &format!("{key}: ${{{{ runner.temp }}}}/staging"),
+                );
             }
         }
         mutant.is_refused_as(Refusal::KeptPath);
