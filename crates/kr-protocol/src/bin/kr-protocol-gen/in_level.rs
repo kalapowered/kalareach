@@ -25,8 +25,8 @@
 //!   member added to an object the earlier release marked read-only metadata are not, nor is a new
 //!   section of the host configuration document, a stored file read by level, which the build
 //!   lists above the level the earlier release's stored-format lock records (the run says each
-//!   section it passes, because the comparison cannot tell a section from a restriction). A new method
-//!   is a variant added to `Method` that is one plain string constant, whose name no variant of
+//!   section it passes, because the comparison cannot tell a section from a restriction). A new
+//!   method is a variant added to `Method` that is one plain string constant, whose name no variant of
 //!   the earlier release had and no other variant has (a host of the same level answers a method
 //!   it does not list with `PERMISSION_DENIED`, and a client that meets that refusal for a method
 //!   that is new asks the host a method its level has before it takes the refusal for a lack of
@@ -315,6 +315,8 @@ pub fn check(repository: &Path, head: &Head, inventory: &[Release]) -> Result<Ou
     }
     let mut problems = Vec::new();
     let mut notes = Vec::new();
+    // Each section of the configuration document that passed, with the releases it is new to.
+    let mut sections: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for release in &peers {
         let stated = package_version_at(repository, &release.commit)?;
         if stated != release.version {
@@ -323,7 +325,7 @@ pub fn check(repository: &Path, head: &Head, inventory: &[Release]) -> Result<Ou
                 release.tag, release.version
             ));
         }
-        let found = compare(repository, head, release, &mut notes)?;
+        let found = compare(repository, head, release, &mut notes, &mut sections)?;
         if !found.is_empty() {
             problems.push(format!(
                 "{} speaks another surface than this commit at level {}:\n  {}",
@@ -334,6 +336,23 @@ pub fn check(repository: &Path, head: &Head, inventory: &[Release]) -> Result<Ou
         }
     }
     if problems.is_empty() {
+        // The comparison cannot tell a section from a restriction filed as one, so each section it
+        // passes is said once, with its level and the releases it is new to, for the review of the
+        // change that adds it.
+        for (section, releases) in sections {
+            let level = head
+                .sections
+                .iter()
+                .find(|(member, _)| *member == section)
+                .map_or(0, |(_, level)| *level);
+            notes.push(format!(
+                "the section {section} of the configuration document, level {level}, is new to {} \
+                 and passes as a section an earlier release ignores and counts; the comparison \
+                 cannot tell it from a restriction, and the review of the change that adds it must \
+                 (docs/releases/packages.md, \"A level is one surface\")",
+                releases.join(", ")
+            ));
+        }
         return Ok(Outcome::Held {
             releases: peers.into_iter().map(|release| release.tag).collect(),
             notes,
@@ -354,6 +373,7 @@ fn compare(
     head: &Head,
     release: &Release,
     notes: &mut Vec<String>,
+    sections_passed: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<Vec<String>, String> {
     let tag = &release.tag;
     let schema_text = git_in(
@@ -418,15 +438,11 @@ fn compare(
             found.push(line);
         }
     }
-    // The comparison cannot tell a section from a restriction filed as one, so each section it
-    // passes is said, for the review of the change that adds it.
     for section in passed {
-        notes.push(format!(
-            "{tag}: the section {section} of the configuration document is new to it, and passes as \
-             a section an earlier release ignores and counts; the comparison cannot tell it from a \
-             restriction, and the review of the change that adds it must (docs/releases/packages.md, \
-             \"A level is one surface\")"
-        ));
+        sections_passed
+            .entry(section)
+            .or_default()
+            .push(tag.clone());
     }
     let sdk_text = file_at(repository, &release.commit, SDK_SCHEMA_PATH)
         .map_err(|error| format!("{SDK_SCHEMA_PATH} of {tag} cannot be read: {error}"))?

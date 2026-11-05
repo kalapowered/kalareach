@@ -1529,10 +1529,9 @@ fn a_new_section_of_the_configuration_document_passes_and_nothing_else_about_it_
         panic!("the level holds");
     };
     assert!(
-        notes.iter().any(
-            |note| note.contains("the section push of the configuration document")
-                && note.contains("cannot tell it from a restriction")
-        ),
+        notes.iter().any(|note| note
+            .contains("the section push of the configuration document, level 7,")
+            && note.contains("cannot tell it from a restriction")),
         "each section passed is said, for the review that adds it: {notes:?}"
     );
 

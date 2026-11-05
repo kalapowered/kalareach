@@ -62,12 +62,15 @@ pub fn recorded(document: Option<&configuration::ConfigurationDocument>) -> Opti
 /// The record decides the restrictions in force from the first request, before any acceptance. A
 /// record this build cannot read is therefore not read as none, which would lift the rights
 /// ceiling, the enrolment budgets and the disable policy the owner accepted: it is an error, and
-/// the daemon does not start over it.
+/// the daemon does not start over it. A release that comes to refuse a record an earlier release
+/// accepted (a raised oldest version, or a rule the validation gained) rewrites the registry's
+/// record first, in a step of the registry's own chain.
 ///
 /// # Errors
 ///
 /// Returns the state the record is in when this build cannot use it: a version it does not read, a
-/// member it does not know, or text that is no document.
+/// member it does not know, a value the validation refuses, a level it does not read, or text that
+/// is no document.
 pub fn from_record(
     recorded: Option<&str>,
 ) -> std::result::Result<Option<configuration::ConfigurationDocument>, configuration::DocumentState>

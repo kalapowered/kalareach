@@ -349,9 +349,9 @@ impl Controller {
         let mut lock = SingletonLock::acquire(&setup.paths.singleton_lock(), setup.environment_id)?;
         let mut registry = Registry::open(setup.paths.registry_database(), setup.environment_id)?;
         // The copy of the document this environment last accepted decides the restrictions in force
-        // from the first request, so it is read before anything is changed: a copy this build
-        // cannot read would lift the rights ceiling, the enrolment budgets and the disable policy
-        // the owner accepted, and the daemon does not start over it.
+        // from the first request, so it is read before the generation moves and before anything is
+        // accepted: a copy this build cannot read would lift the rights ceiling, the enrolment
+        // budgets and the disable policy the owner accepted, and the daemon does not start over it.
         let durably_accepted = registry.accepted_configuration()?;
         let accepted_document = crate::config::from_record(durably_accepted.document.as_deref())
             .map_err(|state| ControllerError::RegistryUnavailable {

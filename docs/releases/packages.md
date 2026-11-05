@@ -218,7 +218,7 @@ says each section it passes. Three limits hold.
    a level. Only the review of the change that adds the section sees that it is not one. That review
    checks that a release which ignores the section does less than the owner asked and never more
    than the owner allowed (what narrows a host stays in the ceilings and raises the version);
-   that no check in code narrows what the section holds; that the section has the form
+   that nothing the code does with the section's values narrows what a host may do; that the section has the form
    `LEVELLED` states (`crates/kr-protocol/src/hostinfo/configuration/levels.rs`), with a test of
    the downgrade and a round trip of an active value through the file and the registry's copy; and
    that `LEVELLED`, the level and the stored-format lock change in the same commit.
@@ -234,9 +234,9 @@ definition a root, and the plugin SDK schema
 (`packages/plugin-sdk/schema/kalareach-plugin-sdk.schema.json`, read from the committed file of the
 commit and of each release) with the same rule as the public contract below, and fails on each
 difference except a new method, a definition that is new, an optional member added to an object
-the earlier release marked read-only metadata, and a new section of the configuration document. A new method is a variant added to `Method` that is
-one plain string constant, whose name no variant of the earlier release had and no other variant
-has. Descriptions and titles are ignored. A release from before `worker-surface.json` has no table
+the earlier release marked read-only metadata, and a new section of the configuration document. A
+new method is a variant added to `Method` that is one plain string constant, whose name no variant
+of the earlier release had and no other variant has. Descriptions and titles are ignored. A release from before `worker-surface.json` has no table
 to compare, so its tables are left out and its schema, plugin host protocol and table of public
 majors are compared. A release of the level without the SDK schema file, or whose file does not
 read, fails the check. When no release is at the commit's level, the commit moves it, and the check

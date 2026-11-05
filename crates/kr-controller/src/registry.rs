@@ -72,7 +72,8 @@ pub const SCHEMA_VERSION: i64 = 15;
 ///
 /// A registry at that version has the tables of [`SCHEMA_VERSION`] and records the configuration
 /// document it accepted at the next version of the document. This build opens it as it finds it:
-/// it brings nothing forward and writes no version, and the reader of an update reads it. A copy of the accepted document that this build cannot read stops the daemon's start
+/// it brings nothing forward and writes no version, and the reader of an update reads it. A copy
+/// of the accepted document that this build cannot read stops the daemon's start
 /// ([`crate::config::from_record`]).
 pub const READS_THROUGH_SCHEMA_VERSION: i64 = 16;
 
@@ -559,7 +560,7 @@ impl Registry {
     ///
     /// For an update, which carries the registry of an environment whose daemon has not run since
     /// an earlier schema step to the schema its own release reads, so that it can be classed by
-    /// [`Registry::open_to_read`], which reads exactly one. The caller holds the environment's
+    /// [`Registry::open_to_read`], which reads that schema and the next one as it finds it. The caller holds the environment's
     /// singleton lock, so no daemon writes meanwhile and none can start. It is the one migration
     /// chain of [`Registry::open`]: nothing here migrates by itself.
     ///
@@ -568,7 +569,7 @@ impl Registry {
     /// registry whose log or journal holds writes, and no other), so the version is read from what
     /// the registry holds. Only a regular file with exactly one version row, from 1 up to below
     /// this build's, and every table in `EVIDENCE_TABLES`, is migrated. A registry already at this
-    /// build's version is not migrated, and neither is one at a later version, one with no version
+    /// build's version is not migrated, and neither is one past the version this build reads through, one with no version
     /// or several, an empty file, a link or what is not a file: they are left, `None`, for
     /// [`Registry::open_to_read`] to refuse in its own words. A registry that lost an evidence table
     /// is refused here, by the table's name, because opening it would make that table again,
@@ -741,8 +742,9 @@ impl Registry {
     /// before them. So is a registry reached through a link at its own name: SQLite follows the
     /// link and keeps the log beside the file it reaches, where a log looked for beside the link
     /// would not be. (A link among the directories above it changes nothing: the log is beside the
-    /// file either way.) The registry is refused, too, unless it records exactly the schema version
-    /// this build reads and holds the tables the workers and the closures are read from: one that
+    /// file either way.) The registry is refused, too, unless it records the schema version this
+    /// build writes or the next one it reads through and holds the tables the workers and the
+    /// closures are read from: one that
     /// lost either would otherwise read as recording no worker at all, and that is the one answer a
     /// question about who may still hold a session's stores must never get by accident. The
     /// explicit journal import reads its evidence through this, while it holds the environment's
@@ -752,8 +754,8 @@ impl Registry {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the file is not there, is not a file
     /// or cannot be opened, when a write-ahead log or a rollback journal beside it holds anything,
-    /// when it records another schema version or none, and when a table it is read from is
-    /// missing.
+    /// when it records a schema version this build does not read or none, and when a table it is
+    /// read from is missing.
     pub fn open_to_read(
         path: impl AsRef<std::path::Path>,
         environment_id: EnvironmentId,
@@ -948,8 +950,9 @@ impl Registry {
             .optional()
             .map_err(ControllerError::registry)?;
         // The other writers first and the version last: a file this brought to a version has all
-        // four writers at least at the shape that version stands for. A file of a later version is
-        // refused below as it is, without a table of theirs being made in it; a file an earlier
+        // four writers at least at the shape that version stands for. A file past the version this
+        // build reads through is refused below as it is, without a table of theirs being made in
+        // it; a file an earlier
         // build recorded at the current version before the others had opened it is not brought
         // here, and each writer brings its own tables the next time it opens the file.
         if recorded.is_none_or(|version| version < SCHEMA_VERSION) {
@@ -4876,9 +4879,9 @@ mod tests {
     }
 
     /// A registry one schema version past the one this build writes is what the release after this
-    /// one leaves. Both openers take it as it is: the daemon's open writes no version and changes
-    /// no row, the reader reads it, and nothing carries it. A registry two versions past is
-    /// refused by both, and nothing in it changes.
+    /// one leaves. Both openers take it as it is: the daemon's open writes no version and migrates
+    /// nothing, the reader reads it, and nothing carries it. A registry two versions past is
+    /// refused by both, and its version is as it was found.
     #[test]
     fn a_registry_one_schema_version_ahead_is_opened_and_read_as_it_is() {
         let directory = tempfile::tempdir().expect("a directory");

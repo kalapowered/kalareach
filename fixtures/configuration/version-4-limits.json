@@ -29,7 +29,7 @@
       "full_offline_mirror": null
     },
     "limits": {
-      "control_frame_bytes": 262144,
+      "control_frame_bytes": 917504,
       "input_frame_bytes": 16384,
       "outstanding_mutations": 4,
       "attachments_per_host": 16,
