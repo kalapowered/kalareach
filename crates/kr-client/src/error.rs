@@ -1,6 +1,6 @@
 //! What can go wrong for a client.
 
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::{ErrorCode, ProtocolError, RetryCategory};
 use kr_protocol::method::{Method, MethodVersion};
 
 use crate::retry::{Decision, Failure, RequestClass, UserAction};
@@ -339,6 +339,51 @@ crate::debug_as_display!(ClientError);
 /// out of a log.
 impl std::error::Error for ClientError {}
 
+/// What a host's refusal says of the action it answers.
+///
+/// The protocol sorts every code into a retry category, and a host's answer to a send falls into
+/// three kinds by it. A client settles a send, drops it from what it keeps to retry or ask about,
+/// and tells a person it was refused, only on a definite word. It keeps the send of a transient
+/// refusal for a retry under the same action identifier, and keeps an unknown outcome as unknown.
+/// Every place that decides this asks here, so the three kinds are told apart by one rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostWord {
+    /// The host's own refusal outside the `Transient` and `OutcomeUnknown` categories: the action
+    /// did not happen and will not.
+    Definite,
+    /// A transient refusal: nothing took effect now, and the same send may be tried again and may
+    /// yet land.
+    Transient,
+    /// The host cannot establish whether the action happened.
+    Unknown,
+}
+
+impl HostWord {
+    /// What a refusal under `code` says.
+    #[must_use]
+    pub const fn of(code: ErrorCode) -> Self {
+        match code.retry_category() {
+            RetryCategory::Transient => Self::Transient,
+            RetryCategory::OutcomeUnknown => Self::Unknown,
+            RetryCategory::NoRetry | RetryCategory::Resync | RetryCategory::ConfigurationChange => {
+                Self::Definite
+            }
+        }
+    }
+
+    /// Whether this is the host's definite word that the action did not happen.
+    #[must_use]
+    pub const fn is_definite(self) -> bool {
+        matches!(self, Self::Definite)
+    }
+}
+
+/// Whether a host's refusal under `code` is its definite word that the action did not happen.
+#[must_use]
+pub const fn is_definite(code: ErrorCode) -> bool {
+    HostWord::of(code).is_definite()
+}
+
 /// A refusal this library makes itself, with the code a caller reacts to and what it says.
 ///
 /// The one place a protocol error is built from text in this library and the command line, so the
@@ -358,3 +403,50 @@ impl ClientError {
 
 /// The result of a client operation.
 pub type Result<T> = std::result::Result<T, ClientError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host's answer to a send is told apart by the retry category of its code, whatever the
+    /// code: the three kinds are the categories, and nothing else is a definite word.
+    #[test]
+    fn every_code_is_told_by_its_category() {
+        for code in ErrorCode::ALL {
+            let word = HostWord::of(*code);
+            match code.retry_category() {
+                RetryCategory::Transient => assert_eq!(word, HostWord::Transient, "{code:?}"),
+                RetryCategory::OutcomeUnknown => assert_eq!(word, HostWord::Unknown, "{code:?}"),
+                _ => assert_eq!(word, HostWord::Definite, "{code:?}"),
+            }
+            assert_eq!(is_definite(*code), word == HostWord::Definite, "{code:?}");
+        }
+    }
+
+    /// The codes a host answers a send with when it cannot take it now are not definite, among
+    /// them the one it uses when the authority a request was decided under kept moving; its own
+    /// refusals of a request are.
+    #[test]
+    fn the_codes_a_host_refuses_for_now_with_are_not_definite() {
+        for code in [
+            ErrorCode::ResourceUnavailable,
+            ErrorCode::StorageUnavailable,
+            ErrorCode::EditorBusy,
+            ErrorCode::UpstreamUnavailable,
+            ErrorCode::RateLimited,
+            ErrorCode::EnvironmentUnavailable,
+        ] {
+            assert_eq!(HostWord::of(code), HostWord::Transient, "{code:?}");
+        }
+        assert_eq!(HostWord::of(ErrorCode::OutcomeUnknown), HostWord::Unknown);
+        for code in [
+            ErrorCode::PermissionDenied,
+            ErrorCode::InvalidArgument,
+            ErrorCode::DraftConflict,
+            ErrorCode::IdConflict,
+            ErrorCode::QuestionResolved,
+        ] {
+            assert!(is_definite(code), "{code:?}");
+        }
+    }
+}

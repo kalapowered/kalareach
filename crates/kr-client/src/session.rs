@@ -15,7 +15,7 @@
 //! * the current action window is whatever the host last issued, and the host renews it on the live
 //!   connection without being asked.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -36,7 +36,7 @@ use serde::Serialize;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::cursors::{Delivery, ReceiptTracker, StreamCursors};
-use crate::error::{ClientError, Result};
+use crate::error::{ClientError, HostWord, Result};
 use crate::retry::{Attempts, Failure, Recovery, RequestClass};
 use crate::transport::{ControlTransport, Reach};
 
@@ -330,6 +330,9 @@ struct Outcomes {
     receipts: ReceiptTracker,
     submitted: BTreeMap<ActionId, SubmittedAction>,
     correlations: HashMap<RequestId, ActionId>,
+    /// The actions its caller does not hold that the host last refused for now, oldest first. They
+    /// stay in `submitted`, and this is what bounds them.
+    refused_for_now: VecDeque<ActionId>,
 }
 
 impl Outcomes {
@@ -343,13 +346,45 @@ impl Outcomes {
                 .get(&action_id)
                 .is_some_and(|action| action.held)
         {
-            self.submitted.remove(&action_id);
+            self.forget(action_id);
         }
+    }
+
+    /// Leaves the action one correlated answer belongs to on the book, as the host refused it for
+    /// now: nothing took effect, and the same send may be tried again and may yet land.
+    ///
+    /// An action its caller does not hold is not listed for ever on this account. The host recorded
+    /// nothing of it, so past [`MAX_REFUSED_FOR_NOW`] the oldest of them leaves the book, and a
+    /// client that keeps refusing for now cannot fill the book with them.
+    fn refuse_for_now(&mut self, request_id: RequestId) {
+        let Some(action_id) = self.correlations.remove(&request_id) else {
+            return;
+        };
+        if !self
+            .submitted
+            .get(&action_id)
+            .is_some_and(|action| !action.held)
+        {
+            return;
+        }
+        self.refused_for_now.retain(|listed| *listed != action_id);
+        self.refused_for_now.push_back(action_id);
+        while self.refused_for_now.len() > MAX_REFUSED_FOR_NOW {
+            if let Some(oldest) = self.refused_for_now.pop_front() {
+                self.submitted.remove(&oldest);
+            }
+        }
+    }
+
+    /// Takes one action off the book.
+    fn forget(&mut self, action_id: ActionId) {
+        self.submitted.remove(&action_id);
+        self.refused_for_now.retain(|listed| *listed != action_id);
     }
 
     /// Settles one action by the caller's word, whatever its answer was.
     fn settle_action(&mut self, action_id: ActionId) {
-        self.submitted.remove(&action_id);
+        self.forget(action_id);
         self.correlations.retain(|_, held| *held != action_id);
     }
 
@@ -361,7 +396,10 @@ impl Outcomes {
     /// the other's submission as well. Section 9 forbids forgetting an action, and an action whose
     /// outcome is unknown or whose receipt has not finished is exactly one that must not be lost.
     fn refuse_replacement(&self, action_id: ActionId) -> Result<()> {
-        let unknown = self.submitted.contains_key(&action_id);
+        // An action the host refused for now stays the client's to send again under its own
+        // identifier: it is what the next send of it replaces.
+        let unknown =
+            self.submitted.contains_key(&action_id) && !self.refused_for_now.contains(&action_id);
         let receipted = self.receipts.get(&action_id).is_some();
         if unknown || receipted {
             return Err(ClientError::refusal(
@@ -386,6 +424,8 @@ impl Outcomes {
         }
         self.correlations
             .insert(action.request_id, action.action_id);
+        self.refused_for_now
+            .retain(|listed| *listed != action.action_id);
         self.submitted.insert(action.action_id, action);
         Ok(())
     }
@@ -398,6 +438,10 @@ impl Outcomes {
 /// accepted actions whose receipts have not settled as much as through a host it cannot reach, and
 /// either way submitting more would only add to the pile.
 pub const MAX_UNRESOLVED_ACTIONS: usize = 1024;
+
+/// How many of the actions the host refused for now stay on the book beside the ones it could not
+/// establish. The host recorded nothing of them, so the oldest are let go past this.
+const MAX_REFUSED_FOR_NOW: usize = 64;
 
 /// The shared state of one connection.
 struct SessionState {
@@ -789,6 +833,12 @@ impl Session {
     /// first ([`Session::compose`]) and repeats exactly that request ([`Session::repeat`]); an
     /// exact repeat is a question, answered from the host's record, and not a retry.
     ///
+    /// A host that refuses the mutation for now (a transient code) has decided nothing: the action
+    /// stays on the unresolved list, with the others the host refused for now, of which the
+    /// newest 64 are kept. A caller that wants the same send tried again
+    /// composes it and sends it ([`Session::send`]) rather than calling this again, which is a new
+    /// intent under a new identifier; the host performs the identifier it is sent at most once.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError::WrongEffect`] for a read method,
@@ -838,7 +888,10 @@ impl Session {
     /// must be able to ask about, and replacing it with a second set of parameters would lose that
     /// intent while leaving two requests correlated to one action, either of whose answers would
     /// then settle the other. One whose receipt this client already holds is refused for the same
-    /// reason. Section 9 forbids forgetting an action, and this is where that would happen.
+    /// reason. Section 9 forbids forgetting an action, and this is where that would happen. An
+    /// action the host refused for now ([`Session::mutate`]) is the exception: the host decided
+    /// nothing of it, and sending it again under its own identifier is how a client tries the
+    /// same send again, which the host performs at most once.
     ///
     /// In every other respect this is [`Session::mutate`], including the outstanding bound and the
     /// uncertainty an interrupted send leaves behind.
@@ -1492,16 +1545,16 @@ fn refused_or_unknown(
     }
 }
 
-/// Returns whether one response settled what it answered.
+/// Returns what one response says of the action it answered.
 ///
-/// An error whose retry category is an unknown outcome has settled nothing: the host is saying it
-/// does not know whether the action happened. Everything else is a decision, including a refusal.
-fn definite(response: &Response) -> bool {
+/// A result, and a refusal outside the transient and unknown-outcome categories, is the host's
+/// definite word. An error whose retry category is an unknown outcome has settled nothing: the host
+/// is saying it does not know whether the action happened. A transient one has not either: nothing
+/// took effect now, and the same send may be tried again and may yet land.
+fn word_of(response: &Response) -> HostWord {
     match &response.outcome {
-        Outcome::Ok(_) => true,
-        Outcome::Error(error) => {
-            error.code.retry_category() != kr_protocol::error::RetryCategory::OutcomeUnknown
-        }
+        Outcome::Ok(_) => HostWord::Definite,
+        Outcome::Error(error) => HostWord::of(error.code),
     }
 }
 
@@ -1532,11 +1585,14 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
             // than in the caller means a caller that has gone away does not leave its action
             // pending for ever. An answer that says the outcome is unknown is not a decision, and
             // section 9 forbids forgetting one: the action stays on the unresolved list so the
-            // client can ask what became of it rather than assume.
-            if definite(&response) {
-                state.outcomes.lock().await.settle(request_id);
-            } else {
-                state.outcomes.lock().await.correlations.remove(&request_id);
+            // client can ask what became of it rather than assume. A transient refusal is not a
+            // decision either: the action stays, to be sent again under the same identifier.
+            match word_of(&response) {
+                HostWord::Definite => state.outcomes.lock().await.settle(request_id),
+                HostWord::Transient => state.outcomes.lock().await.refuse_for_now(request_id),
+                HostWord::Unknown => {
+                    state.outcomes.lock().await.correlations.remove(&request_id);
+                }
             }
             state.answer(request_id, Answer::Response(response));
         }
@@ -1553,7 +1609,7 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
                         .get(&receipt.action_id)
                         .is_some_and(|action| action.held)
                 {
-                    outcomes.submitted.remove(&receipt.action_id);
+                    outcomes.forget(receipt.action_id);
                 }
             }
             state.answer(request_id, Answer::Receipt(Box::new(receipt)));

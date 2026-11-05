@@ -221,12 +221,15 @@ pub struct Upload {
     phase: Phase,
     /// Where the reservation stands while this plan holds no transfer.
     reservation: Reservation,
+    /// The action the reservation is asked under, from the first ask until the host's definite
+    /// word. A reservation the host refused for now is asked again under it.
+    begin_action: Option<ActionId>,
 }
 
 /// Where a plan's reservation stands while the plan holds no transfer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reservation {
-    /// None has been asked for, or the host refused the last one asked for.
+    /// None has been asked for, or the host refused the last one asked for, definitely or for now.
     NotAsked,
     /// One has been asked for and has had no definite answer, so whether the host holds it is
     /// unknown. The action that asked, once the session has named it.
@@ -250,6 +253,7 @@ impl Upload {
             handle: None,
             phase: Phase::Reserving,
             reservation: Reservation::NotAsked,
+            begin_action: None,
         }
     }
 
@@ -276,9 +280,33 @@ impl Upload {
         }
     }
 
-    /// Records that the host refused the reservation, or that the request never left this client,
-    /// so the plan may ask again.
+    /// The action the reservation is asked under: a new one, or the one the host last refused for
+    /// now ([`Upload::reservation_refused_for_now`]), so that asking again is the same send.
+    ///
+    /// # Errors
+    ///
+    /// Returns a failure when the system cannot supply the randomness a new identifier needs.
+    pub fn begin_action(&mut self) -> Result<ActionId> {
+        if let Some(action_id) = self.begin_action {
+            return Ok(action_id);
+        }
+        let action_id = ActionId::new(kr_transport::random::fresh_uuid_v4()?);
+        self.begin_action = Some(action_id);
+        Ok(action_id)
+    }
+
+    /// Records that the host refused the reservation in its definite word, or that the request
+    /// never left this client, so the plan may ask again as a new send.
     pub fn reservation_refused(&mut self) {
+        if self.phase == Phase::Reserving {
+            self.reservation = Reservation::NotAsked;
+            self.begin_action = None;
+        }
+    }
+
+    /// Records that the host refused the reservation for now (a transient refusal), so the plan may
+    /// ask again, under the same action: the host took nothing, and may yet.
+    pub fn reservation_refused_for_now(&mut self) {
         if self.phase == Phase::Reserving {
             self.reservation = Reservation::NotAsked;
         }
@@ -623,8 +651,10 @@ struct Unconditional {}
 ///   second such refusal in a row is the host's answer and ends the upload.
 /// * The plan records a reservation as asked for before `upload.begin` leaves
 ///   ([`Upload::reserving`]), and only a definite answer clears that: the host's result, or its
-///   refusal. A reply that was lost, a refusal saying the outcome is unknown, a receipt with no
-///   result and a call abandoned part way all leave the plan refusing to reserve again.
+///   definite refusal. A reply that was lost, a refusal saying the outcome is unknown, a receipt
+///   with no result and a call abandoned part way all leave the plan refusing to reserve again. A
+///   refusal for now (a transient code) leaves it free to ask again, as the same send under the
+///   same action ([`Upload::begin_action`]), which the host performs at most once.
 ///
 /// # Errors
 ///
@@ -652,9 +682,11 @@ pub async fn send(
             Step::Begin(params) => {
                 // Recorded before the request can leave: a caller that abandons this call part way
                 // leaves a plan that knows a reservation may exist.
+                let action_id = plan.begin_action()?;
                 plan.reserving();
                 let answered = session
-                    .mutate(
+                    .mutate_continuing(
+                        action_id,
                         Method::UploadBegin,
                         target.clone(),
                         None,
@@ -702,6 +734,14 @@ pub async fn send(
                     }
                     // The host could not say what became of it, so the reservation may exist.
                     Err(error) if error.code() == kr_protocol::error::ErrorCode::OutcomeUnknown => {
+                        return Err(error);
+                    }
+                    // A refusal for now: the host took nothing, and the next ask is this send again.
+                    Err(error @ (ClientError::Host(_) | ClientError::Refused { .. }))
+                        if error.code().retry_category()
+                            == kr_protocol::error::RetryCategory::Transient =>
+                    {
+                        plan.reservation_refused_for_now();
                         return Err(error);
                     }
                     // A refusal the host decided, or a request that never left this client.

@@ -1264,10 +1264,11 @@ impl OwnerConfirmations {
         let sent = tokio::time::timeout(ANSWER_WITHIN, self.channel.complete(&params)).await;
         match sent {
             Ok(Ok(())) => ReviewOutcome::Confirmed,
-            // The host's own refusal: it did not take the answer. A host that says it does not
-            // know what came of the answer has refused nothing.
+            // The host's definite refusal: it did not take the answer. A host that says it does
+            // not know what came of the answer has refused nothing, and one that says it cannot
+            // take it now has not decided: the answer may yet be taken.
             Ok(Err(ClientError::Host(error) | ClientError::Refused { error, .. }))
-                if error.code != ErrorCode::OutcomeUnknown =>
+                if crate::error::is_definite(error.code) =>
             {
                 if error.code == ErrorCode::OwnerConfirmationRequired
                     && self.clock.wall_clock_ms() >= expires_at_ms
@@ -1277,8 +1278,8 @@ impl OwnerConfirmations {
                     ReviewOutcome::NotConfirmed
                 }
             }
-            // No reply, one that does not know, or none from the host: it may have taken the
-            // answer all the same.
+            // No reply, one that does not know, a transient refusal, or none from the host: it may
+            // have taken the answer all the same.
             Ok(Err(_)) | Err(_) => self.settled(&listed.request).await,
         }
     }
@@ -2810,6 +2811,10 @@ mod tests {
         Nothing,
         /// That it does not know what came of it.
         OutcomeUnknown,
+        /// That it cannot take it now.
+        ForNow,
+        /// That it refuses it, for good.
+        Refuses,
     }
 
     impl OwnerChannel for Listing {
@@ -2836,6 +2841,14 @@ mod tests {
                     Reply::OutcomeUnknown => Err(ClientError::Host(ProtocolError::new(
                         ErrorCode::OutcomeUnknown,
                         "the host could not tell whether the answer took effect",
+                    ))),
+                    Reply::ForNow => Err(ClientError::Host(ProtocolError::new(
+                        ErrorCode::ResourceUnavailable,
+                        "the host cannot take the answer now",
+                    ))),
+                    Reply::Refuses => Err(ClientError::Host(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "the host refuses the answer",
                     ))),
                 }
             })
@@ -3057,6 +3070,44 @@ mod tests {
                 .expect("the review ends");
         assert_eq!(outcome, ReviewOutcome::Confirmed);
         assert_eq!(listing.completions.load(Ordering::SeqCst), 1);
+    }
+
+    /// KR-REQ-10.06: a host that replies that it cannot take an answer now has not refused it
+    /// either: the answer may yet be taken. The review asks what the host lists, as it does for a
+    /// reply that does not know, and only the host's definite refusal is "not confirmed".
+    #[tokio::test]
+    async fn an_answer_the_host_cannot_take_now_is_settled_from_what_it_lists() {
+        for (takes, settled) in [
+            (true, ReviewOutcome::Confirmed),
+            (false, ReviewOutcome::Unknown),
+        ] {
+            let (confirmations, listing) = listed_device(
+                candidate("Pixel 8"),
+                grant(&[ActionRight::SessionView], an_hour()),
+            );
+            listing.takes.store(takes, Ordering::SeqCst);
+            *listing.reply.lock().expect("the reply") = Reply::ForNow;
+            let listed = confirmations.pending().await.expect("the listing");
+            let asked = Asked(Mutex::new(Vec::new()));
+            assert_eq!(
+                confirmations.review(&listed[0], &asked).await,
+                settled,
+                "the host took it: {takes}"
+            );
+        }
+
+        let (confirmations, listing) = listed_device(
+            candidate("Pixel 8"),
+            grant(&[ActionRight::SessionView], an_hour()),
+        );
+        *listing.reply.lock().expect("the reply") = Reply::Refuses;
+        let listed = confirmations.pending().await.expect("the listing");
+        let asked = Asked(Mutex::new(Vec::new()));
+        assert_eq!(
+            confirmations.review(&listed[0], &asked).await,
+            ReviewOutcome::NotConfirmed,
+            "a definite refusal is the host's word that it did not take it"
+        );
     }
 
     /// KR-REQ-10.06: a host that replies that it does not know what came of an answer has not

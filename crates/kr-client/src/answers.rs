@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use kr_ipc::install::{Permit, Written};
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
-use kr_protocol::error::{ErrorCode, RetryCategory};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, QuestionId, QuestionRevision, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::question::{
@@ -1492,10 +1492,7 @@ fn keeps_the_answer(error: &ClientError) -> bool {
             kr_ipc::IpcError::TruncatedFrame { .. }
             | kr_ipc::IpcError::Frame(kr_protocol::frame::FrameError::Incomplete { .. }),
         ) => true,
-        other => matches!(
-            other.code().retry_category(),
-            RetryCategory::Transient | RetryCategory::OutcomeUnknown
-        ),
+        other => !crate::error::is_definite(other.code()),
     }
 }
 
