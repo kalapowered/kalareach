@@ -883,7 +883,7 @@ impl Store {
         // identifier: a second copy of one action would otherwise be refused for a unique-key
         // collision rather than told that its action is already claimed.
         if let Some(action) = performed.action() {
-            claim_for(&transaction, &performed, action, Some(row.action_id.get()))?;
+            claim_action(&transaction, action, Some(row.action_id.get()))?;
         }
         insert_operation(&transaction, row)?;
         announce(
@@ -892,7 +892,7 @@ impl Store {
             &row.action_id.to_string(),
             row.started_at_ms,
         )?;
-        transaction.commit().map_err(ProjectError::store)
+        commit_holding_the_claim(transaction, &performed)
     }
 
     /// Moves an operation to a new state, recording what is known about it.
@@ -1265,12 +1265,7 @@ impl Store {
         let transaction = self.transaction()?;
         performed.admit()?;
         if let Some(action) = performed.action() {
-            claim_for(
-                &transaction,
-                &performed,
-                action,
-                Some(row.workspace_id.get()),
-            )?;
+            claim_action(&transaction, action, Some(row.workspace_id.get()))?;
         }
         insert_workspace(&transaction, row)?;
         announce(
@@ -1279,7 +1274,7 @@ impl Store {
             &row.workspace_id.to_string(),
             row.created_at_ms,
         )?;
-        transaction.commit().map_err(ProjectError::store)
+        commit_holding_the_claim(transaction, &performed)
     }
 
     /// Moves a workspace to a new state, recording what a removal decided.
@@ -1396,9 +1391,9 @@ impl Store {
         let transaction = self.transaction()?;
         performed.admit()?;
         if let Some(action) = performed.action() {
-            claim_for(&transaction, &performed, action, Some(operation.get()))?;
+            claim_action(&transaction, action, Some(operation.get()))?;
         }
-        transaction.commit().map_err(ProjectError::store)
+        commit_holding_the_claim(transaction, &performed)
     }
 
     /// Reserves a workspace for removal, in one transaction with everything the decision needs.
@@ -1429,7 +1424,7 @@ impl Store {
         let transaction = self.transaction()?;
         performed.admit()?;
         if let Some(action) = performed.action() {
-            claim_for(&transaction, &performed, action, Some(workspace_id.get()))?;
+            claim_action(&transaction, action, Some(workspace_id.get()))?;
         }
         let row = transaction
             .query_row(
@@ -1518,7 +1513,7 @@ impl Store {
             &workspace_id.to_string(),
             now,
         )?;
-        transaction.commit().map_err(ProjectError::store)?;
+        commit_holding_the_claim(transaction, &performed)?;
         Ok(Reservation { row, token })
     }
 
@@ -2521,16 +2516,14 @@ pub fn outcome_of(record: &RetainedAction) -> RetainedOutcome {
     }
 }
 
-/// Claims the action of a mutation as [`claim_action`] does, and notes on `performed` that this
-/// attempt holds the claim, because every record the action then has is this attempt's own.
-fn claim_for(
-    transaction: &Transaction<'_>,
-    performed: &Performed<'_>,
-    action: &Action,
-    subject: Option<Uuid>,
-) -> Result<()> {
-    claim_action(transaction, action, subject)?;
-    performed.note_claimed();
+/// Commits the transaction that wrote the claim for the action of `performed`, and notes on it that
+/// this attempt holds the claim: every record the action then has is this attempt's own. A claim
+/// the transaction rolls back is nobody's, so the note follows the commit and not the claim.
+fn commit_holding_the_claim(transaction: Transaction<'_>, performed: &Performed<'_>) -> Result<()> {
+    transaction.commit().map_err(ProjectError::store)?;
+    if performed.action().is_some() {
+        performed.note_claimed();
+    }
     Ok(())
 }
 
@@ -4547,6 +4540,61 @@ mod tests {
             )
             .expect_err("the second copy does not");
         assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
+    }
+
+    #[test]
+    fn a_claim_is_noted_as_held_only_once_the_transaction_that_wrote_it_commits() {
+        let mut store = Store::in_memory(environment()).expect("a store opens");
+        let workspace = workspace_row(51);
+        let workspace_id = workspace.workspace_id;
+        store
+            .begin_workspace(&workspace, Performed::default())
+            .expect("it begins");
+        let reserved = store
+            .begin_removal(
+                workspace_id,
+                RetentionPolicy::KeepEverything,
+                Performed::default(),
+            )
+            .expect("the removal is reserved");
+        let held = std::sync::atomic::AtomicBool::new(false);
+        let removal = action(52, "workspace.remove");
+        // Beside the reservation another removal is refused after it wrote its claim, and the
+        // refusal rolls the claim back: nobody holds it.
+        let refusal = store
+            .begin_removal(
+                workspace_id,
+                RetentionPolicy::KeepEverything,
+                Performed::from(Some(&removal)).holding(&held),
+            )
+            .expect_err("a second removal does not begin beside the first");
+        assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+        assert!(
+            !held.load(std::sync::atomic::Ordering::SeqCst),
+            "a claim the refusal rolled back is nobody's"
+        );
+        assert!(
+            store
+                .retained_action(&removal.actor_id, removal.action_id)
+                .expect("read")
+                .is_none(),
+            "and no row of it is left"
+        );
+        // Once the reservation is released the same action claims, and its commit is noted.
+        store
+            .release_removal(workspace_id, reserved.token)
+            .expect("the reservation is released");
+        store
+            .begin_removal(
+                workspace_id,
+                RetentionPolicy::KeepEverything,
+                Performed::from(Some(&removal)).holding(&held),
+            )
+            .expect("the removal is reserved");
+        assert!(
+            held.load(std::sync::atomic::Ordering::SeqCst),
+            "the attempt that commits its claim holds it"
+        );
     }
 
     #[test]

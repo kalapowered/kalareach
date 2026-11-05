@@ -1432,10 +1432,12 @@ impl ProjectService {
         };
         if let Some(action) = performed.action() {
             settle_answer(&transaction, action, row.location_id.get(), &answer, false)?;
-            // The claim was written here, in the transaction that settles it.
-            performed.note_claimed();
         }
         transaction.commit().map_err(ProjectError::store)?;
+        // The claim was written in the transaction that settled it, and holds now it has committed.
+        if performed.action().is_some() {
+            performed.note_claimed();
+        }
         held.remove(&row.location_id);
         Ok(answer)
     }
