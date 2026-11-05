@@ -20,6 +20,11 @@ use kr_protocol::ids::RequestId;
 use kr_protocol::scalars::U64;
 use kr_protocol::session::Dimensions;
 
+/// How many times in a row a size the host did not take for now goes again with the host's next
+/// word. After that it waits for the page to measure or move, so a host that keeps refusing is not
+/// asked once for every word it says.
+const RETRIES: u8 = 3;
+
 /// One move the page made, numbered in the order it made them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Move {
@@ -111,8 +116,12 @@ pub struct Sending {
 /// How the host answered one viewport report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Answer {
-    /// Refused: nothing changed.
+    /// Refused in the host's definite word: nothing changed, and the report is settled.
     Refused,
+    /// Not settled: the host refused for now, or could not say what became of the report. A size
+    /// is owed again, since a report states the size and place, and sending it again changes
+    /// nothing a first one did not. A move is the person's gesture: it is settled as not taken.
+    NotSettled,
     /// Accepted.
     Accepted {
         /// The revision the report left the window at.
@@ -129,6 +138,9 @@ struct InFlight {
     awaiting: Option<u64>,
     /// The number of the last move it carries, when it carries any.
     carries: Option<u64>,
+    /// The size last sent before this report, when it carries a new size: what the view owes again
+    /// if the host does not take the report.
+    size_before: Option<Dimensions>,
 }
 
 /// A move that has settled inside the view, waiting to be told to the page.
@@ -175,6 +187,11 @@ pub struct WindowReports {
     untold: VecDeque<Untold>,
     /// The newest move the page has been told is settled.
     told: u64,
+    /// Whether a size the host did not take for now waits for something to arrive before it goes
+    /// again, so that a host that keeps saying so is not asked in a loop.
+    resting: bool,
+    /// How many size reports in a row the host did not take for now.
+    not_taken_in_a_row: u8,
 }
 
 impl WindowReports {
@@ -193,12 +210,30 @@ impl WindowReports {
             taken: 0,
             untold: VecDeque::new(),
             told: 0,
+            resting: false,
+            not_taken_in_a_row: 0,
         }
     }
 
-    /// The page measured its grid at this size.
+    /// The page measured its grid at this size. Whatever the host did not take for now goes again
+    /// with the next report chosen.
     pub const fn measured(&mut self, size: Dimensions) {
         self.size = size;
+        self.page_spoke();
+    }
+
+    /// The host said something. A size it did not take for now goes again, as long as it has not
+    /// failed to take it more than [`RETRIES`] times in a row since the page last spoke.
+    pub const fn heard(&mut self) {
+        if self.not_taken_in_a_row <= RETRIES {
+            self.resting = false;
+        }
+    }
+
+    /// The page spoke: a new start for whatever waits.
+    const fn page_spoke(&mut self) {
+        self.resting = false;
+        self.not_taken_in_a_row = 0;
     }
 
     /// The page moved the window. A move whose number is not above the last one taken is not one
@@ -211,6 +246,7 @@ impl WindowReports {
             return;
         }
         self.taken = number;
+        self.page_spoke();
         match asked {
             Move::Pan { across, down, .. } => {
                 if let Some(Run::Pan {
@@ -282,7 +318,7 @@ impl WindowReports {
     /// The report to send now, if any, measured against `screen`, the newest the view holds. It is
     /// in flight from here until it settles.
     pub fn next(&mut self, screen: Option<&Screen>) -> Option<Sending> {
-        if self.recovering || self.in_flight.is_some() {
+        if self.recovering || self.in_flight.is_some() || self.resting {
             return None;
         }
         let record = self.record?;
@@ -291,7 +327,7 @@ impl WindowReports {
         if screen.is_none() && self.installed.is_some() {
             return None;
         }
-        let (sending, carries) = if self.size == self.size_sent {
+        let (sending, carries, size_before) = if self.size == self.size_sent {
             let screen = screen?;
             loop {
                 let run = self.runs.front().copied()?;
@@ -306,6 +342,7 @@ impl WindowReports {
                                     column: record.column,
                                 },
                                 Some(number),
+                                None,
                             );
                         }
                         // A window on the live screen stays where it is.
@@ -326,6 +363,7 @@ impl WindowReports {
                                         column,
                                     },
                                     Some(last),
+                                    None,
                                 );
                             }
                             None => self.untold.push_back(Untold {
@@ -344,6 +382,7 @@ impl WindowReports {
                     column: record.column,
                 },
                 None,
+                Some(self.size_sent),
             )
         };
         self.size_sent = sending.dimensions;
@@ -351,6 +390,7 @@ impl WindowReports {
             request: None,
             awaiting: None,
             carries,
+            size_before,
         });
         Some(sending)
     }
@@ -371,13 +411,20 @@ impl WindowReports {
 
     /// The session answered the report in flight.
     ///
-    /// A refusal settles it and changes nothing. An acceptance settles it once a screen naming its
-    /// revision, or a later one, has arrived, whether that screen came before the answer or comes
-    /// after it.
+    /// A definite refusal settles it and changes nothing. An answer that is neither that nor an
+    /// acceptance settles a move the same way, but not a size: that is not marked sent, and goes
+    /// again with the next word from the host or the page. An acceptance settles it once a screen
+    /// naming its revision, or a later one, has arrived, whether that screen came before the answer
+    /// or comes after it.
     pub fn answered(&mut self, answer: Answer) {
         match answer {
-            Answer::Refused => self.settle(None),
+            Answer::Refused => {
+                self.not_taken_in_a_row = 0;
+                self.settle(None);
+            }
+            Answer::NotSettled => self.not_taken(),
             Answer::Accepted { window_revision } => {
+                self.not_taken_in_a_row = 0;
                 self.answered = self.answered.max(window_revision);
                 if self
                     .installed
@@ -389,6 +436,26 @@ impl WindowReports {
                 }
             }
         }
+    }
+
+    /// The host did not take the report in flight for now, or could not say what became of it.
+    fn not_taken(&mut self) {
+        let Some(InFlight {
+            size_before: Some(before),
+            ..
+        }) = self.in_flight
+        else {
+            // A move is the person's gesture, and is not made later on their behalf: it is settled
+            // as not taken, and they move again.
+            self.not_taken_in_a_row = 0;
+            self.settle(None);
+            return;
+        };
+        // The size was not taken, so it was not sent: it is owed again, after something arrives.
+        self.in_flight = None;
+        self.size_sent = before;
+        self.not_taken_in_a_row = self.not_taken_in_a_row.saturating_add(1);
+        self.resting = true;
     }
 
     /// The report in flight settled: the moves it carried changed the window to `revision`, or
