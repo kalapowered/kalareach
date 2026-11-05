@@ -1556,6 +1556,17 @@ fn an_uncertain_outcome_for(
     action_id: ActionId,
     mutation: &MutationRequest,
 ) -> u64 {
+    an_uncertain_outcome_kept_as(host, actor_id, action_id, mutation, vec![0xa0])
+}
+
+/// As [`an_uncertain_outcome_for`], for a receipt whose kept envelope is `intent`.
+fn an_uncertain_outcome_kept_as(
+    host: &Host,
+    actor_id: &ActorId,
+    action_id: ActionId,
+    mutation: &MutationRequest,
+    intent: Vec<u8>,
+) -> u64 {
     let subject = kr_protocol::action::subject_digest(mutation).expect("a subject digest");
     let mut session = host.service.runtime().session();
     let journal = session.journal_mut().expect("a journal");
@@ -1564,6 +1575,7 @@ fn an_uncertain_outcome_for(
     earlier.action_id = action_id;
     earlier.subject_digest = subject;
     earlier.method = mutation.method.clone();
+    earlier.intent = intent;
     journal.accept(&earlier).expect("the earlier intent");
     journal
         .mark_dispatching(actor_id.clone(), action_id, kr_ipc::now_ms())
@@ -1639,6 +1651,351 @@ async fn a_quote_of_a_revision_the_caller_was_not_shown_is_refused_until_it_has_
     assert!(
         matches!(admitted, Outcome::Ok(_)),
         "a caller that has read the receipt may quote its revision: {admitted:?}"
+    );
+}
+
+/// Puts the receipt of exactly `mutation`, with the envelope the worker keeps of it, into the
+/// journal as an uncertain outcome of `actor_id`, and returns the revision it stands at.
+fn an_uncertain_outcome_of(host: &Host, actor_id: &ActorId, mutation: &MutationRequest) -> u64 {
+    an_uncertain_outcome_kept_as(
+        host,
+        actor_id,
+        mutation.action_id,
+        mutation,
+        kr_cbor::to_canonical_vec(mutation).expect("encodes"),
+    )
+}
+
+/// A question that the agent `kr-test-agent` asks in the host's session under `request`.
+fn asked(host: &Host, request: &str) -> kr_protocol::question::Question {
+    let source = kr_worker::questions::binding::VerifiedSource {
+        process: kr_ipc::identity::current_process_start_identity().expect("a process identity"),
+        executable: Some("kr-test-agent".to_owned()),
+        session_member: true,
+        ancestry: true,
+        launch_channel: true,
+        connection_id: kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([7; 16])),
+    };
+    let params = kr_protocol::question::QuestionCreateParams {
+        session_id: host.session_id,
+        request_id: request.to_owned(),
+        kind: kr_protocol::question::QuestionKind::Input,
+        context: "The build finished.".to_owned(),
+        question: "What should the release be called?".to_owned(),
+        choices: Vec::new(),
+        agent_name: Nullable::some("kr-test-agent".to_owned()),
+        requested_expiry_ms: Nullable::some(DurationMs::new(600_000)),
+        wait_ms: Nullable::null(),
+    };
+    let now = kr_worker::questions::Now {
+        utc_ms: kr_ipc::now_ms(),
+        boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+    };
+    let (created, _) = host
+        .service
+        .questions()
+        .create(&source, &params, now)
+        .expect("the agent asks");
+    created.question
+}
+
+/// A `question.answer` for `question`, under a fresh identifier and the preconditions `expected`.
+fn answering(
+    client: &Client<impl Codec>,
+    host: &Host,
+    question: &kr_protocol::question::Question,
+    expected: ParamsValue,
+) -> MutationRequest {
+    MutationRequest {
+        method: Method::QuestionAnswer.into(),
+        params: ParamsValue::from_typed(&kr_protocol::question::QuestionAnswerParams {
+            session_id: host.session_id,
+            question_id: question.question_id,
+            expected_revision: question.revision,
+            answer: kr_protocol::question::QuestionAnswer::Input {
+                text: "orchid".to_owned(),
+            },
+        })
+        .expect("encodes"),
+        ..close_mutation(client, host, DEFAULT_MUTATION_TTL.get(), expected)
+    }
+}
+
+/// A `question.cancel` for `question`, under a fresh identifier and no preconditions.
+fn cancelling(
+    client: &Client<impl Codec>,
+    host: &Host,
+    question: &kr_protocol::question::Question,
+) -> MutationRequest {
+    MutationRequest {
+        method: Method::QuestionCancel.into(),
+        params: ParamsValue::from_typed(&kr_protocol::question::QuestionCancelParams {
+            session_id: host.session_id,
+            question_id: question.question_id,
+            expected_revision: question.revision,
+        })
+        .expect("encodes"),
+        ..close_mutation(
+            client,
+            host,
+            DEFAULT_MUTATION_TTL.get(),
+            ParamsValue::empty(),
+        )
+    }
+}
+
+/// Reads the receipt of `action_id` over the wire, as a person's client does, and returns the
+/// revision it was shown.
+async fn revision_shown_for(client: &mut Client<impl Codec>, action_id: ActionId) -> u64 {
+    let read = send_request(
+        client,
+        Request {
+            request_id: RequestId::new(4),
+            method: Method::ActionRead.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            })
+            .expect("encodes"),
+        },
+    )
+    .await;
+    let Outcome::Ok(value) = read else {
+        panic!("the receipt is readable: {read:?}");
+    };
+    let shown: kr_protocol::receipt::ActionReadResult = value.to_typed().expect("decodes");
+    shown.receipt.revision.get()
+}
+
+/// The question an answer or a cancellation that the worker took is recorded against, and where
+/// it stands.
+fn resolved(outcome: Outcome) -> kr_protocol::question::QuestionResolveResult {
+    let Outcome::Ok(value) = outcome else {
+        panic!("the worker took it: {outcome:?}");
+    };
+    value.to_typed().expect("decodes")
+}
+
+/// KR-REQ-11.63: an answer whose outcome is uncertain holds back no answer to another question of
+/// the session. The host used to refuse every later answer of the actor in the session, so one lost
+/// reply stopped the person answering anything else until the receipt was pruned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uncertain_answer_to_one_question_does_not_hold_back_the_answer_to_another() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+    let first = asked(&host, "first");
+    let second = asked(&host, "second");
+    let lost = MutationRequest {
+        action_id: action(61),
+        ..answering(&client, &host, &first, ParamsValue::empty())
+    };
+    an_uncertain_outcome_of(&host, &caller, &lost);
+
+    let answer = answering(&client, &host, &second, ParamsValue::empty());
+    let taken = resolved(send_mutation(&mut client, answer).await);
+    assert_eq!(taken.question_id, second.question_id);
+    assert_eq!(taken.state, kr_protocol::question::QuestionState::Answered);
+}
+
+/// KR-REQ-11.63: an answer whose outcome is uncertain still holds back a second answer to the same
+/// question, which has to name the first and the revision its sender was shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_answer_to_a_question_with_an_uncertain_answer_has_to_quote_it() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+    let first = asked(&host, "first");
+    let lost = MutationRequest {
+        action_id: action(62),
+        ..answering(&client, &host, &first, ParamsValue::empty())
+    };
+    let revision = an_uncertain_outcome_of(&host, &caller, &lost);
+
+    let again = answering(&client, &host, &first, ParamsValue::empty());
+    let Outcome::Error(error) = send_mutation(&mut client, again).await else {
+        panic!("a new identifier does not take the uncertain answer's place");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict);
+    assert!(
+        error.message.contains(&action(62).to_string()),
+        "the refusal names the answer to show: {}",
+        error.message
+    );
+
+    let shown = revision_shown_for(&mut client, action(62)).await;
+    assert_eq!(shown, revision);
+    let quoting = answering(&client, &host, &first, superseding(action(62), shown));
+    let taken = resolved(send_mutation(&mut client, quoting).await);
+    assert_eq!(taken.question_id, first.question_id);
+    assert_eq!(taken.state, kr_protocol::question::QuestionState::Answered);
+}
+
+/// KR-REQ-11.63: an uncertain answer to one question is not an outcome of another question, so an
+/// answer to the other question that names it quotes an outcome its subject does not have, which is
+/// refused as a quote of any action that is not uncertain for the subject is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quote_of_an_uncertain_answer_to_another_question_shows_nothing() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+    let first = asked(&host, "first");
+    let second = asked(&host, "second");
+    let lost = MutationRequest {
+        action_id: action(65),
+        ..answering(&client, &host, &first, ParamsValue::empty())
+    };
+    an_uncertain_outcome_of(&host, &caller, &lost);
+    let shown = revision_shown_for(&mut client, action(65)).await;
+
+    let other = answering(&client, &host, &second, superseding(action(65), shown));
+    let Outcome::Error(error) = send_mutation(&mut client, other).await else {
+        panic!("the uncertain answer is not an outcome of the other question");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict);
+    assert!(
+        error.message.contains(&action(65).to_string()),
+        "the refusal names the quoted answer: {}",
+        error.message
+    );
+}
+
+/// KR-REQ-11.63: where the worker cannot read which question an uncertain answer was for, it holds
+/// back every answer of the actor in the session, as it always did. Privacy mode withholds the
+/// envelope a settled receipt kept, an envelope may not decode, and one may decode and not be an
+/// answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uncertain_answer_whose_question_cannot_be_read_holds_back_every_answer() {
+    for unreadable in ["withheld by privacy mode", "not decodable", "not an answer"] {
+        let host = host().await;
+        let mut client = cli(&host).await;
+        let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+        let first = asked(&host, "first");
+        let second = asked(&host, "second");
+        let lost = MutationRequest {
+            action_id: action(63),
+            ..answering(&client, &host, &first, ParamsValue::empty())
+        };
+        match unreadable {
+            "withheld by privacy mode" => {
+                host.service
+                    .runtime()
+                    .session()
+                    .enable_privacy(kr_worker::privacy::PrivacyGeneration::new(1), &mut [])
+                    .expect("privacy mode is turned on");
+                an_uncertain_outcome_of(&host, &caller, &lost);
+                assert_eq!(
+                    host.service
+                        .runtime()
+                        .session()
+                        .journal_mut()
+                        .expect("a journal")
+                        .read_intent(&caller, action(63))
+                        .expect("readable"),
+                    None,
+                    "privacy mode kept no envelope of the uncertain answer"
+                );
+            }
+            "not decodable" => {
+                an_uncertain_outcome_kept_as(&host, &caller, action(63), &lost, vec![0xff, 0x00]);
+            }
+            _ => {
+                let cancellation = cancelling(&client, &host, &first);
+                an_uncertain_outcome_kept_as(
+                    &host,
+                    &caller,
+                    action(63),
+                    &lost,
+                    kr_cbor::to_canonical_vec(&cancellation).expect("encodes"),
+                );
+            }
+        }
+
+        let answer = answering(&client, &host, &second, ParamsValue::empty());
+        let Outcome::Error(error) = send_mutation(&mut client, answer).await else {
+            panic!("an answer that cannot be told apart from the uncertain one is held back");
+        };
+        assert_eq!(error.code, ErrorCode::DraftConflict, "{unreadable}");
+        assert!(
+            error.message.contains(&action(63).to_string()),
+            "the refusal names the answer to show ({unreadable}): {}",
+            error.message
+        );
+    }
+}
+
+/// KR-REQ-11.63: of several uncertain answers, the one an answer has to quote is the newest to its
+/// own question, whether or not an answer to another question is newer still.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_has_to_quote_the_newest_uncertain_answer_to_its_own_question() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+    let first = asked(&host, "first");
+    let second = asked(&host, "second");
+    // Oldest first: an answer to the first question, one to the second, and a newer one to the first.
+    for (id, question) in [(66, &first), (67, &second), (68, &first)] {
+        let lost = MutationRequest {
+            action_id: action(id),
+            ..answering(&client, &host, question, ParamsValue::empty())
+        };
+        an_uncertain_outcome_of(&host, &caller, &lost);
+    }
+
+    let unquoted = answering(&client, &host, &second, ParamsValue::empty());
+    let Outcome::Error(error) = send_mutation(&mut client, unquoted).await else {
+        panic!("the uncertain answer to the second question is not shown");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict);
+    assert!(
+        error.message.contains(&action(67).to_string()),
+        "the second question's refusal names its own answer: {}",
+        error.message
+    );
+
+    let unquoted = answering(&client, &host, &first, ParamsValue::empty());
+    let Outcome::Error(error) = send_mutation(&mut client, unquoted).await else {
+        panic!("the uncertain answer to the first question is not shown");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict);
+    assert!(
+        error.message.contains(&action(68).to_string()),
+        "the first question's refusal names its newest answer: {}",
+        error.message
+    );
+
+    let shown = revision_shown_for(&mut client, action(68)).await;
+    let quoting = answering(&client, &host, &first, superseding(action(68), shown));
+    let taken = resolved(send_mutation(&mut client, quoting).await);
+    assert_eq!(taken.question_id, first.question_id);
+    assert_eq!(taken.state, kr_protocol::question::QuestionState::Answered);
+}
+
+/// KR-REQ-23.24: the narrowing is the answer's alone. An uncertain cancellation of one question
+/// still holds back the cancellation of every other question of the session until it is quoted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uncertain_cancellation_still_holds_back_the_cancellation_of_another_question() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+    let first = asked(&host, "first");
+    let second = asked(&host, "second");
+    let lost = MutationRequest {
+        action_id: action(64),
+        ..cancelling(&client, &host, &first)
+    };
+    an_uncertain_outcome_of(&host, &caller, &lost);
+
+    let cancel = cancelling(&client, &host, &second);
+    let Outcome::Error(error) = send_mutation(&mut client, cancel).await else {
+        panic!("a cancellation of another question is held back by the uncertain one");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict);
+    assert!(
+        error.message.contains(&action(64).to_string()),
+        "the refusal names the cancellation to show: {}",
+        error.message
     );
 }
 
