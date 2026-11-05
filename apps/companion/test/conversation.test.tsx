@@ -11,7 +11,7 @@
  * What the person writes goes to the conversation they wrote it for, or nowhere until they choose.
  */
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi, type MockInstance } from 'vitest'
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
@@ -22,6 +22,7 @@ import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { fakeHost, type HeldReads } from '../src/host/fake'
 import type { HostEvent, HostPort } from '../src/host/port'
+import { DraftBook } from '../src/model/draft-book'
 import { animationFrame } from '../src/model/frame'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
@@ -51,6 +52,11 @@ function shown(): string[] {
   return [
     ...document.querySelectorAll<HTMLElement>('[data-testid="conversation-scroll"] [data-node-id]')
   ].map((node) => node.dataset.nodeId ?? '')
+}
+
+/** How the sends the conversation made ended for the draft book, in the order they ended. */
+function endings(ends: MockInstance<DraftBook['endSend']>): string[] {
+  return ends.mock.calls.map((call) => call[1])
 }
 
 /** What each send the conversation tracks has come to, in the order it shows them. */
@@ -506,6 +512,7 @@ describe('what the person writes goes where they wrote it (KR-REQ-13.12)', () =>
         retry: 'configuration_change'
       }
     ]
+    const ends = vi.spyOn(DraftBook.prototype, 'endSend')
     openConversation({ ...port, composerSubmit: () => Promise.reject(answers.shift()) })
     await waitFor(() => {
       expect(shown()).toEqual(HISTORY)
@@ -523,6 +530,51 @@ describe('what the person writes goes where they wrote it (KR-REQ-13.12)', () =>
       expect(pendingStates()).toEqual(['not_taken', 'refused'])
     })
     expect(screen.getByTestId('composer-input')).toHaveValue('Run the tests')
+    // Both end the send as one the host did not take, whose text is the person's again.
+    expect(endings(ends)).toEqual(['refused', 'refused'])
+  })
+
+  it('ends a send the host could not say the outcome of as unknown, and offers no plain resend', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    const sent: string[] = []
+    const ends = vi.spyOn(DraftBook.prototype, 'endSend')
+    openConversation({
+      ...port,
+      composerSubmit: (params) => {
+        sent.push(params.text)
+        // The host's word that dispatch may have happened: its category is the protocol's own.
+        return Promise.reject({
+          code: 'OUTCOME_UNKNOWN',
+          message: 'The host did not say what became of it.',
+          user_action: 'ask',
+          retry: 'outcome_unknown'
+        })
+      }
+    })
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    await person.type(screen.getByTestId('composer-input'), 'Run the tests')
+    await person.click(screen.getByTestId('composer-send'))
+    await waitFor(() => {
+      expect(pendingStates()).toEqual(['unknown'])
+    })
+    expect(screen.getByTestId('pending-actions')).toHaveTextContent('Outcome unknown')
+
+    // The text stays with the person, but sending it again is held back: the host may have acted,
+    // and the way past is the person saying they checked.
+    expect(screen.getByTestId('composer-input')).toHaveValue('Run the tests')
+    expect(screen.getByTestId('composer-reason')).toHaveTextContent(/no confirmed outcome yet/)
+    expect(screen.getByTestId('composer-send')).toBeDisabled()
+    expect(screen.getByTestId('composer-send-anyway')).toBeEnabled()
+    expect(sent).toEqual(['Run the tests'])
+
+    // The draft keeps its uncertain-send state: the book is told the send ended as unknown, so it
+    // goes on answering for it until the host says what became of it.
+    await waitFor(() => {
+      expect(endings(ends)).toEqual(['unknown'])
+    })
   })
 })
 
