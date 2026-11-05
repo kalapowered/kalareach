@@ -1567,6 +1567,11 @@ async fn a_generation_deleted_under_privacy_mode_is_one_a_fresh_host_can_no_long
 ///
 /// It packs, encrypts, uploads and restores more than a gigabyte, so it runs on the build box and
 /// only when asked: `cargo test -p kr-cli --test backup_setup -- --ignored the_bounds_hold`.
+///
+/// KR-ACC-033, the part about a restore with only the kit and the ciphertext the service holds: a
+/// fresh host given the kit file previews the restore of what the set-up host uploaded, confirms
+/// the digest it was shown, and restores the newest sessions that fit the total. Not shown here:
+/// writer and locator substitution, and privacy mode fencing an export.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "packs, uploads and restores about 1.5 GiB at the convention's real sizes; run it on the build box with --ignored"]
 async fn the_bounds_hold_at_the_real_scale_and_a_restore_accepts_what_the_producer_packed() {
