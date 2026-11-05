@@ -1,13 +1,6 @@
 //! `changeset.capture`: the immutable version, the consistency classes, the grants and the
 //! secrets.
 //!
-//! Requirement rows closed here: KR-REQ-01.27 (versioned change sets with explicit workspaces),
-//! KR-REQ-14.31 (`changeset.capture` produces an immutable identified version), KR-REQ-14.32 (the
-//! consistency class is recorded; a concurrent change is retried or rejected), KR-REQ-14.33
-//! (inclusion rules and file grants apply before capture and secrets are excluded) and KR-ACC-031
-//! (the exact captured version is delivered while the source keeps changing, and later revisions
-//! stay visible).
-//!
 //! Every test here asks the project service to run Git, which it does not do on Windows: an
 //! application container there cannot keep a repository from being executed from, so the service
 //! refuses rather than claiming a boundary it does not have.
