@@ -4251,6 +4251,99 @@ fn a_journal_an_earlier_build_wrote_opens_and_keeps_its_receipts() {
     }
 }
 
+/// Creates, at `path`, the journal an earlier build wrote in the second format: the payload digest
+/// and the retained intent, and no subject digest. The connection is returned for the records that
+/// build kept.
+fn version_2_journal(path: &std::path::Path) -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open(path).expect("a database");
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             CREATE TABLE receipts (
+                 actor_id             TEXT    NOT NULL,
+                 action_id            BLOB    NOT NULL,
+                 method               TEXT    NOT NULL,
+                 method_version       INTEGER NOT NULL,
+                 revision             INTEGER NOT NULL,
+                 state                TEXT    NOT NULL,
+                 reason               TEXT,
+                 payload_digest       BLOB    NOT NULL,
+                 intent               BLOB,
+                 accepted_deadline_ms INTEGER,
+                 error_code           TEXT,
+                 error_message        TEXT,
+                 created_at_ms        INTEGER NOT NULL,
+                 updated_at_ms        INTEGER NOT NULL,
+                 PRIMARY KEY (actor_id, action_id)
+             );
+             CREATE INDEX receipts_created_at ON receipts (created_at_ms);
+             CREATE TABLE results (
+                 actor_id  TEXT NOT NULL,
+                 action_id BLOB NOT NULL,
+                 result    BLOB NOT NULL,
+                 PRIMARY KEY (actor_id, action_id)
+             );
+             CREATE TABLE receipt_events (
+                 sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 actor_id       TEXT    NOT NULL,
+                 action_id      BLOB    NOT NULL,
+                 revision       INTEGER NOT NULL,
+                 state          TEXT    NOT NULL,
+                 recorded_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE closure (
+                 session_id BLOB PRIMARY KEY,
+                 record     BLOB NOT NULL
+             );
+             CREATE TABLE session (
+                 session_id BLOB PRIMARY KEY,
+                 summary    BLOB NOT NULL
+             );
+             CREATE TABLE host_events (
+                 sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 kind           TEXT    NOT NULL,
+                 detail         TEXT    NOT NULL,
+                 output_cursor  INTEGER NOT NULL,
+                 recorded_at_ms INTEGER NOT NULL
+             );",
+        )
+        .expect("the earlier schema");
+    connection
+        .execute(
+            "INSERT INTO schema_version (version) VALUES (2)",
+            rusqlite::params![],
+        )
+        .expect("the recorded version");
+    connection
+}
+
+/// Records, in a journal of the second format, an action of `actor_id` for `method` whose outcome
+/// nobody could establish, retaining `intent`.
+fn version_2_unknown(
+    connection: &rusqlite::Connection,
+    actor_id: &str,
+    action_id: ActionId,
+    method: &str,
+    intent: &[u8],
+) {
+    let now = i64::try_from(kr_ipc::now_ms().get()).expect("a timestamp");
+    connection
+        .execute(
+            "INSERT INTO receipts (actor_id, action_id, method, method_version, revision,
+                 state, payload_digest, intent, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, 1, 2, 'unknown', ?4, ?5, ?6, ?6)",
+            rusqlite::params![
+                actor_id,
+                action_id.get().as_bytes().as_slice(),
+                method,
+                [action_id.get().as_bytes()[0]; 32].as_slice(),
+                intent,
+                now
+            ],
+        )
+        .expect("a receipt with an uncertain outcome");
+}
+
 /// KR-REQ-09.07, KR-REQ-23.24: the subject of a migrated record is derived from the intent that
 /// build retained, so a fresh identifier cannot quietly take an uncertain outcome's place across
 /// an update.
@@ -4285,96 +4378,22 @@ fn a_migrated_record_keeps_the_subject_its_retained_intent_describes() {
     };
     let intent = kr_cbor::to_canonical_vec(&mutation).expect("the intent encodes");
     {
-        // Version 2's schema: the payload digest and the retained intent, and no subject digest.
-        let connection = rusqlite::Connection::open(&path).expect("a database");
-        connection
-            .execute_batch(
-                "CREATE TABLE schema_version (version INTEGER NOT NULL);
-                 CREATE TABLE receipts (
-                     actor_id             TEXT    NOT NULL,
-                     action_id            BLOB    NOT NULL,
-                     method               TEXT    NOT NULL,
-                     method_version       INTEGER NOT NULL,
-                     revision             INTEGER NOT NULL,
-                     state                TEXT    NOT NULL,
-                     reason               TEXT,
-                     payload_digest       BLOB    NOT NULL,
-                     intent               BLOB,
-                     accepted_deadline_ms INTEGER,
-                     error_code           TEXT,
-                     error_message        TEXT,
-                     created_at_ms        INTEGER NOT NULL,
-                     updated_at_ms        INTEGER NOT NULL,
-                     PRIMARY KEY (actor_id, action_id)
-                 );
-                 CREATE INDEX receipts_created_at ON receipts (created_at_ms);
-                 CREATE TABLE results (
-                     actor_id  TEXT NOT NULL,
-                     action_id BLOB NOT NULL,
-                     result    BLOB NOT NULL,
-                     PRIMARY KEY (actor_id, action_id)
-                 );
-                 CREATE TABLE receipt_events (
-                     sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
-                     actor_id       TEXT    NOT NULL,
-                     action_id      BLOB    NOT NULL,
-                     revision       INTEGER NOT NULL,
-                     state          TEXT    NOT NULL,
-                     recorded_at_ms INTEGER NOT NULL
-                 );
-                 CREATE TABLE closure (
-                     session_id BLOB PRIMARY KEY,
-                     record     BLOB NOT NULL
-                 );
-                 CREATE TABLE session (
-                     session_id BLOB PRIMARY KEY,
-                     summary    BLOB NOT NULL
-                 );
-                 CREATE TABLE host_events (
-                     sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
-                     kind           TEXT    NOT NULL,
-                     detail         TEXT    NOT NULL,
-                     output_cursor  INTEGER NOT NULL,
-                     recorded_at_ms INTEGER NOT NULL
-                 );",
-            )
-            .expect("the earlier schema");
-        connection
-            .execute(
-                "INSERT INTO schema_version (version) VALUES (2)",
-                rusqlite::params![],
-            )
-            .expect("the recorded version");
-        let now = i64::try_from(kr_ipc::now_ms().get()).expect("a timestamp");
-        connection
-            .execute(
-                "INSERT INTO receipts (actor_id, action_id, method, method_version, revision,
-                     state, payload_digest, intent, created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, 'session.close', 1, 2, 'unknown', ?3, ?4, ?5, ?5)",
-                rusqlite::params![
-                    "device:phone",
-                    crate::action(5).get().as_bytes().as_slice(),
-                    [5_u8; 32].as_slice(),
-                    intent,
-                    now
-                ],
-            )
-            .expect("a receipt with an uncertain outcome");
+        let connection = version_2_journal(&path);
+        version_2_unknown(
+            &connection,
+            "device:phone",
+            crate::action(5),
+            "session.close",
+            &intent,
+        );
         // And one whose intent this build cannot read, which keeps no subject at all.
-        connection
-            .execute(
-                "INSERT INTO receipts (actor_id, action_id, method, method_version, revision,
-                     state, payload_digest, intent, created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, 'session.close', 1, 2, 'unknown', ?3, ?4, ?5, ?5)",
-                rusqlite::params![
-                    "device:phone",
-                    crate::action(6).get().as_bytes().as_slice(),
-                    [6_u8; 32].as_slice(),
-                    [0xa0_u8].as_slice(),
-                    now
-                ],
-            )
-            .expect("a receipt whose intent this build cannot read");
+        version_2_unknown(
+            &connection,
+            "device:phone",
+            crate::action(6),
+            "session.close",
+            &[0xa0],
+        );
     }
 
     let journal = Journal::open(&path).expect("the earlier journal opens");
@@ -4394,6 +4413,87 @@ fn a_migrated_record_keeps_the_subject_its_retained_intent_describes() {
             .uncertain_for_subject(&caller, Digest256::from_bytes([0; 32]))
             .expect("reads"),
         None
+    );
+}
+
+/// KR-REQ-11.63, KR-REQ-23.24: an uncertain answer a migration left with no subject, because its
+/// envelope could not be read, cannot be told from an answer to any question, so it holds back
+/// every answer of its actor, and no other method. An answer that names it after it was read is
+/// admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uncertain_answer_a_migration_left_without_a_subject_holds_back_every_answer() {
+    let name = format!("local:{}", kr_ipc::paths::current_uid());
+    let host = host_prepared(|path| {
+        let connection = version_2_journal(path);
+        version_2_unknown(&connection, &name, action(64), "question.answer", &[0xa0]);
+    })
+    .await;
+    let mut client = cli(&host).await;
+    let first = asked(&host, "first");
+    let second = asked(&host, "second");
+
+    let answer = answering(&client, &host, &second, ParamsValue::empty());
+    let Outcome::Error(error) = send_mutation(&mut client, answer).await else {
+        panic!("an answer that cannot be told apart from the uncertain one is held back");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict);
+    assert!(
+        error.message.contains(&action(64).to_string()),
+        "the refusal names the answer to show: {}",
+        error.message
+    );
+
+    // It was an answer: a cancellation is another method, and nothing holds it back.
+    let cancel = cancelling(&client, &host, &second);
+    let cancelled = resolved(send_mutation(&mut client, cancel).await);
+    assert_eq!(cancelled.question_id, second.question_id);
+
+    let shown = revision_shown_for(&mut client, action(64)).await;
+    let quoting = answering(&client, &host, &first, superseding(action(64), shown));
+    let taken = resolved(send_mutation(&mut client, quoting).await);
+    assert_eq!(taken.question_id, first.question_id);
+    assert_eq!(taken.state, kr_protocol::question::QuestionState::Answered);
+}
+
+/// KR-REQ-23.24: an uncertain close a migration left with no subject holds back every close of its
+/// actor, as an uncertain close whose subject is known holds back the closes for that subject.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uncertain_close_a_migration_left_without_a_subject_holds_back_every_close() {
+    let name = format!("local:{}", kr_ipc::paths::current_uid());
+    let host = host_prepared(|path| {
+        let connection = version_2_journal(path);
+        version_2_unknown(&connection, &name, action(65), "session.close", &[0xa0]);
+    })
+    .await;
+    let mut client = cli(&host).await;
+    let close = close_mutation(
+        &client,
+        &host,
+        DEFAULT_MUTATION_TTL.get(),
+        ParamsValue::empty(),
+    );
+
+    let Outcome::Error(error) = send_mutation(&mut client, close.clone()).await else {
+        panic!("a close that cannot be told apart from the uncertain one is held back");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict);
+    assert!(
+        error.message.contains(&action(65).to_string()),
+        "the refusal names the close to show: {}",
+        error.message
+    );
+    assert_eq!(host.service.runtime().state().as_str(), "live");
+
+    let shown = revision_shown_for(&mut client, action(65)).await;
+    let quoting = MutationRequest {
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        expected: superseding(action(65), shown),
+        ..close
+    };
+    let admitted = send_mutation(&mut client, quoting).await;
+    assert!(
+        matches!(admitted, Outcome::Ok(_)),
+        "a close that names the uncertain one after it was read is admitted: {admitted:?}"
     );
 }
 
