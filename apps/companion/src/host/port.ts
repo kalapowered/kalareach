@@ -75,6 +75,7 @@ import type {
   PrivacyExported,
   PrivacyReport,
   ProjectedHyperlink,
+  ProtocolError,
   Question,
   QuestionAnswer,
   QuestionAnswerParams,
@@ -126,11 +127,11 @@ export interface HostError {
   /** What the person can do about it, where the client knows. */
   readonly user_action: string
   /**
-   * The retry category of the code: `transient` is the host saying it cannot take the request now,
-   * `outcome_unknown` that it cannot establish what became of it. Absent where native code names
-   * none, which reads as a definite word.
+   * The retry category of the code, as the protocol sorts it: `transient` is the host saying it
+   * cannot take the request now, `outcome_unknown` that it cannot establish what became of it,
+   * and any other category is its definite word.
    */
-  readonly retry?: string
+  readonly retry: ProtocolError['retry']
 }
 
 /**
@@ -2845,7 +2846,7 @@ export function failureCode(value: unknown): string | null {
   return isHostError(value) ? value.code : null
 }
 
-/** The retry category of a failure, or null when it did not carry one. */
+/** The retry category of a failure, or null when the value is not a host's failure. */
 export function failureRetry(value: unknown): string | null {
   return isHostError(value) && typeof value.retry === 'string' ? value.retry : null
 }

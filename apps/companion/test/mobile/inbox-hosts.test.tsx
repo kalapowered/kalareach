@@ -202,7 +202,8 @@ describe('the inbox of a phone paired with two hosts', () => {
       refusingLaptop({
         code: 'PERMISSION_DENIED',
         message: 'this device may not read this host',
-        user_action: 'fix_configuration'
+        user_action: 'fix_configuration',
+        retry: 'configuration_change'
       })
     ])
     readNow()
@@ -232,7 +233,12 @@ describe('the inbox of a phone paired with two hosts', () => {
       expect(rowsOf('laptop')).toHaveLength(2)
     })
     controls.setInboxHosts([
-      refusingLaptop({ code: 'PERMISSION_DENIED', message: 'not for this device', user_action: 'nothing' })
+      refusingLaptop({
+        code: 'PERMISSION_DENIED',
+        message: 'not for this device',
+        user_action: 'nothing',
+        retry: 'configuration_change'
+      })
     ])
     readNow()
     // The host's words run into the next sentence only after a full stop.
@@ -329,7 +335,8 @@ describe('the inbox of a phone paired with two hosts', () => {
       refusingLaptop({
         code: 'PERMISSION_DENIED',
         message: 'this device may not read this host',
-        user_action: 'fix_configuration'
+        user_action: 'fix_configuration',
+        retry: 'configuration_change'
       }),
       laptopRead()
     ]) {

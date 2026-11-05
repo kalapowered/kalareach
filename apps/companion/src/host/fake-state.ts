@@ -84,12 +84,13 @@ import {
   ROLE_SELECTION,
   decodeParams
 } from './fake-decode'
+import { fakeRetryOf } from './fake-retry'
 import type { GrantNotices, SessionAgents, Settled } from './port'
 
 /** A refusal in the form a command's refusal arrives: data rather than an Error. */
 function refuse(code: string, message: string): never {
   // eslint-disable-next-line @typescript-eslint/only-throw-error -- a command's failure crosses as data
-  throw { code, message, user_action: 'nothing' }
+  throw { code, message, user_action: 'nothing', retry: fakeRetryOf(code) }
 }
 
 /** The identities and the clock the records are written against. */

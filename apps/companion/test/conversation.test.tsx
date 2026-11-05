@@ -53,6 +53,13 @@ function shown(): string[] {
   ].map((node) => node.dataset.nodeId ?? '')
 }
 
+/** What each send the conversation tracks has come to, in the order it shows them. */
+function pendingStates(): string[] {
+  return [...document.querySelectorAll('[data-testid="pending-actions"] li')].map(
+    (item) => item.getAttribute('data-state') ?? ''
+  )
+}
+
 /** What one shown item says. */
 function said(id: string): string {
   return (
@@ -503,22 +510,17 @@ describe('what the person writes goes where they wrote it (KR-REQ-13.12)', () =>
     await waitFor(() => {
       expect(shown()).toEqual(HISTORY)
     })
-    const states = () =>
-      [...document.querySelectorAll('[data-testid="pending-actions"] li')].map(
-        (item) => item.getAttribute('data-state') ?? ''
-      )
-
     await person.type(screen.getByTestId('composer-input'), 'Run the tests')
     await person.click(screen.getByTestId('composer-send'))
     await waitFor(() => {
-      expect(states()).toEqual(['not_taken'])
+      expect(pendingStates()).toEqual(['not_taken'])
     })
     expect(screen.getByTestId('pending-actions')).toHaveTextContent('Not taken for now')
     expect(screen.getByTestId('composer-input')).toHaveValue('Run the tests')
 
     await person.click(screen.getByTestId('composer-send'))
     await waitFor(() => {
-      expect(states()).toEqual(['not_taken', 'refused'])
+      expect(pendingStates()).toEqual(['not_taken', 'refused'])
     })
     expect(screen.getByTestId('composer-input')).toHaveValue('Run the tests')
   })

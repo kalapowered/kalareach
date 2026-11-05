@@ -252,7 +252,8 @@ describe('what the person sent', () => {
   it('leaves an unconfirmed outcome unknown rather than calling it a failure', () => {
     const submission = failed(queued('s1', 'hello', 0), {
       code: 'OUTCOME_UNKNOWN',
-      message: 'the connection ended after the request was sent'
+      message: 'the connection ended after the request was sent',
+      retry: 'outcome_unknown'
     })
     expect(submission.state).toBe('unknown')
     expect(unresolved([submission])).toHaveLength(1)
@@ -280,8 +281,10 @@ describe('what the person sent', () => {
       retry: 'configuration_change'
     })
     expect(definite.state).toBe('refused')
-    // A failure that names no category is read as a definite word, as every code but one was.
-    expect(failed(base, { code: 'PERMISSION_DENIED', message: 'no' }).state).toBe('refused')
+    // A failure that is not a host's names no category, and is read as a definite word.
+    expect(failed(base, { code: 'REQUEST_FAILED', message: 'no', retry: null }).state).toBe(
+      'refused'
+    )
 
     const unknown = failed(base, {
       code: 'OUTCOME_UNKNOWN',
