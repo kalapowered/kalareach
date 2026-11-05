@@ -723,10 +723,10 @@ impl Drop for Waiting {
     }
 }
 
-/// KR-REQ-07.61 and KR-REQ-12.02: the kernel's record of when a process started is believed on this
-/// machine, and a process created between two readings of the clock it is recorded on started
-/// between them. This is the check the worker makes before it orders anything by that clock, run
-/// again here so that a Windows build that changes the class fails in the job that runs it.
+/// KR-REQ-07.61: the kernel's record of when a process started is believed on this machine, and a
+/// process created between two readings of the clock it is recorded on started between them. This
+/// is the check the worker makes before it orders anything by that clock, run again here so that a
+/// Windows build that changes the class fails in the job that runs it.
 #[test]
 fn the_kernels_record_of_a_start_lies_between_the_readings_around_the_creation() {
     kr_worker::windows::lineage::start_clock().expect("the kernel's record of a start is believed");
@@ -743,8 +743,8 @@ fn the_kernels_record_of_a_start_lies_between_the_readings_around_the_creation()
     }
 }
 
-/// KR-REQ-07.61 and KR-REQ-12.02: processes created one after another start in that order on the
-/// clock every launch is placed by, and the start of a process that has ended is not a start at all.
+/// KR-REQ-07.61: processes created one after another start in that order on the clock every launch
+/// is placed by, and the start of a process that has ended is not a start at all.
 #[test]
 fn processes_created_in_turn_start_in_turn_and_an_ended_one_has_no_start() {
     let children: Vec<Waiting> = (0..10).map(|_| Waiting::start()).collect();
@@ -770,9 +770,9 @@ fn processes_created_in_turn_start_in_turn_and_an_ended_one_has_no_start() {
     );
 }
 
-/// KR-REQ-12.02: a process is started by the process the kernel's record names when that process
-/// was running first, and by nobody else. A parent that has ended is still named by Windows and is
-/// refused here.
+/// A process is started by the process the kernel's record names when that process was running
+/// first, and by nobody else. A parent that has ended is still named by Windows and is refused
+/// here.
 #[test]
 fn a_child_is_started_by_its_running_parent_and_by_no_other_process() {
     let me = kr_ipc::identity::current_process_start_identity().expect("this process's identity");
@@ -798,8 +798,8 @@ fn a_child_is_started_by_its_running_parent_and_by_no_other_process() {
     assert!(kr_worker::windows::lineage::started_by(&child_identity, &replaced).is_err());
 }
 
-/// KR-REQ-12.02 and KR-REQ-07.61: a process whose parent has ended names that parent still, and is
-/// not started by anything this host can show.
+/// KR-REQ-07.61: a process whose parent has ended names that parent still, and is not started by
+/// anything this host can show.
 #[test]
 fn a_process_whose_parent_has_ended_is_started_by_nobody_the_host_can_show() {
     let job = kr_worker::windows::job::AgentJob::create().expect("a job");

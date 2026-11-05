@@ -11,9 +11,9 @@
 //! inherited it. The control in each test is a process started without the rule, which does hold it,
 //! so a count of one means something.
 //!
-//! | Row | What is checked here |
-//! | --- | --- |
-//! | KR-REQ-12.02 | An agent holds the handles its launch lists and no other handle of the worker; a launch waits for a window another start holds; a start made by another part of the worker, the desktop reading and the time reading, waits for a launch's window |
+//! What is checked here: an agent holds the handles its launch lists and no other handle of the
+//! worker; a launch waits for a window another start holds; a start made by another part of the
+//! worker, the desktop reading and the time reading, waits for a launch's window.
 //!
 //! These tests run one at a time in a process of their own: a process any other test started while
 //! an event was inheritable would hold it too.
@@ -211,11 +211,10 @@ fn most_holders_while_a_window_is_open(site: impl FnOnce() + Send + 'static) -> 
     most
 }
 
-/// KR-REQ-12.02: a launch gives its agent the handles it lists and no other handle of the worker.
-/// Control: a process started the plain way holds a handle that is inheritable, so the count sees
-/// one.
+/// A launch gives its agent the handles it lists and no other handle of the worker. Control: a
+/// process started the plain way holds a handle that is inheritable, so the count sees one.
 #[test]
-fn kr_req_12_02_a_launch_gives_its_agent_only_the_handles_it_lists() {
+fn a_launch_gives_its_agent_only_the_handles_it_lists() {
     let _alone = alone();
     let event = Event::new();
     event.inheritable(true);
@@ -239,11 +238,11 @@ fn kr_req_12_02_a_launch_gives_its_agent_only_the_handles_it_lists() {
     drop(agent);
 }
 
-/// KR-REQ-12.02: a launch does not create its agent while another start holds the window, so what
-/// it makes inheritable is never inherited by two starts at once. Control: it goes on and starts
-/// the agent once the window is closed.
+/// A launch does not create its agent while another start holds the window, so what it makes
+/// inheritable is never inherited by two starts at once. Control: it goes on and starts the agent
+/// once the window is closed.
 #[test]
-fn kr_req_12_02_a_launch_waits_while_another_start_holds_the_window() {
+fn a_launch_waits_while_another_start_holds_the_window() {
     let _alone = alone();
     let jobs = Arc::new(Jobs::new());
     let window = inheriting();
@@ -273,14 +272,14 @@ fn kr_req_12_02_a_launch_waits_while_another_start_holds_the_window() {
     );
 }
 
-/// KR-REQ-12.02: the desktop reading starts no program, so while a launch's window is open it holds
-/// nothing a launch made inheritable. Control: a start with no lock holds the event.
+/// The desktop reading starts no program, so while a launch's window is open it holds nothing a
+/// launch made inheritable. Control: a start with no lock holds the event.
 ///
 /// The reading asks Terminal Services about the session and runs nothing, so there is no start of
 /// its own for the launch's window to hold back. What the window does to a start that does run a
 /// program is shown by the launch and time-reading cases around this one.
 #[test]
-fn kr_req_12_02_the_desktop_reading_starts_no_program_that_could_hold_a_launchs_handles() {
+fn the_desktop_reading_starts_no_program_that_could_hold_a_launchs_handles() {
     let _alone = alone();
     let plain = most_holders_while_a_window_is_open(|| {
         let _ = ping_the_plain_way("2").wait();
@@ -295,10 +294,10 @@ fn kr_req_12_02_the_desktop_reading_starts_no_program_that_could_hold_a_launchs_
     );
 }
 
-/// KR-REQ-12.02: the time reading starts its program in a launch's window only after the window is
-/// closed. Control: as above.
+/// The time reading starts its program in a launch's window only after the window is closed.
+/// Control: as above.
 #[test]
-fn kr_req_12_02_the_time_reading_waits_for_a_launchs_window() {
+fn the_time_reading_waits_for_a_launchs_window() {
     use kr_worker::action::adapter::{PlatformTimeAdapter, TimeAdapter as _};
     let _alone = alone();
     let plain = most_holders_while_a_window_is_open(|| {
