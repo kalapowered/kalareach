@@ -1203,10 +1203,6 @@ fn refused_with(frame: ControlFrame) -> ErrorCode {
 /// under another method, one that carries a grant, and a run named by an ingress that is not a
 /// workflow's. None of them closes the session; the close of the right run does, and the same
 /// close sent again before its delivery is confirmed is answered from the first one's receipt.
-///
-/// KR-REQ-23.24, the retained answer to a duplicate only: the close sent again under the
-/// workflow's ingress is answered with what the first one produced. Not shown here: the check of
-/// current authority before it is returned, or an uncertain result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
     let host = host().await;
@@ -1873,8 +1869,8 @@ async fn an_uncertain_answer_to_one_question_does_not_hold_back_the_answer_to_an
     );
 }
 
-/// KR-REQ-11.63: a `question.answer` whose parameters do not parse is refused in validation, after
-/// its receipt is written, as it was before an answer was told apart by its question.
+/// A `question.answer` whose parameters do not parse is refused in validation, after its receipt is
+/// written, as it was before an answer was told apart by its question.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_malformed_answer_is_refused_and_leaves_a_rejected_receipt() {
     let host = host().await;
@@ -1941,11 +1937,6 @@ async fn a_second_answer_to_a_question_with_an_uncertain_answer_has_to_quote_it(
 /// KR-REQ-11.63: an uncertain answer to one question is not an outcome of another question, so an
 /// answer to the other question that names it quotes an outcome its subject does not have, which is
 /// refused as a quote of any action that is not uncertain for the subject is.
-///
-/// KR-REQ-23.24, for `question.answer`, the result a later request has to show: an uncertain answer
-/// to another question shows nothing of this one's, and the quote is refused naming it. Not shown
-/// here: a quote that is admitted, the retained receipt of a duplicate, or the check of current
-/// authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_quote_of_an_uncertain_answer_to_another_question_shows_nothing() {
     let host = host().await;
@@ -2181,11 +2172,6 @@ async fn a_second_cancellation_of_a_question_with_an_uncertain_cancellation_has_
 /// KR-REQ-11.63: an uncertain cancellation of one question is not an outcome of another question,
 /// so a cancellation of the other question that names it quotes an outcome its subject does not
 /// have, which is refused as a quote of any action that is not uncertain for the subject is.
-///
-/// KR-REQ-23.24, for `question.cancel`, the result a later request has to show: an uncertain
-/// cancellation of another question shows nothing of this one's, and the quote is refused naming
-/// it. Not shown here: a quote that is admitted, the retained receipt of a duplicate, or the check
-/// of current authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_quote_of_an_uncertain_cancellation_of_another_question_shows_nothing() {
     let host = host().await;
@@ -2349,8 +2335,8 @@ async fn an_uncertain_cancellation_whose_question_cannot_be_read_holds_back_ever
     }
 }
 
-/// KR-REQ-11.63: a `question.cancel` whose parameters do not parse is refused in validation, after
-/// its receipt is written, as it was before a cancellation was told apart by its question.
+/// A `question.cancel` whose parameters do not parse is refused in validation, after its receipt is
+/// written, as it was before a cancellation was told apart by its question.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_malformed_cancellation_is_refused_and_leaves_a_rejected_receipt() {
     let host = host().await;
@@ -2621,11 +2607,6 @@ async fn an_uncertain_request_of_a_source_does_not_hold_back_a_request_of_anothe
 /// KR-REQ-11.63: an uncertain request of one identity is not an outcome of another identity, so a
 /// request of the other identity that names it quotes an outcome its subject does not have, which is
 /// refused as a quote of any action that is not uncertain for the subject is.
-///
-/// KR-REQ-23.24, for `question.cancel_own`, `question.create` and `alert.create`, the result a later
-/// request has to show: an uncertain request of another identity shows nothing of this one's, and
-/// the quote is refused naming it. Not shown here: a quote that is admitted, the retained receipt of
-/// a duplicate, or the check of current authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_quote_of_an_uncertain_request_of_another_identity_shows_nothing() {
     for kind in Sourced::ALL {
@@ -2794,10 +2775,10 @@ fn malformed_request(client: &Client<impl Codec>, host: &Host, method: Method) -
     }
 }
 
-/// KR-REQ-11.63: a question or an alert whose parameters do not parse is refused in validation,
-/// after its receipt is written, as it was before a request was told apart by its identity. Where
-/// an uncertain request of its method stands, no identity can be read from it, and it is held back
-/// by that request as it always was.
+/// A question or an alert whose parameters do not parse is refused in validation, after its
+/// receipt is written, as it was before a request was told apart by its identity. Where an
+/// uncertain request of its method stands, no identity can be read from it, and it is held back by
+/// that request as it always was.
 ///
 /// KR-REQ-23.24, for `question.create` and `alert.create`, in the part that follows the first
 /// refusal only: with an uncertain request standing, a request whose identity cannot be read is
