@@ -1,8 +1,4 @@
 //! The answer to a revocation stays inside what one control frame decodes.
-//!
-//! | Requirement | Tests |
-//! | --- | --- |
-//! | KR-REQ-09.12 | `the_answer_to_a_transfer_is_cut_around_the_grant_it_carries`, `an_answer_inside_the_limits_is_kept_whole`, `an_answer_past_the_collection_bound_is_cut_to_what_decodes_and_counts_what_it_cut`, `every_list_is_cut_to_a_prefix_in_identity_order`, `a_worker_list_larger_than_a_frame_keeps_every_worker_whose_barrier_has_not_held`, `a_cut_barrier_reads_as_the_whole_one_would`, `a_cut_takes_the_workers_that_have_not_held_before_any_that_has`, `a_total_below_its_list_is_raised_to_it_and_the_answer_still_fits`, `totals_raised_to_their_lists_are_measured_where_the_frame_is_nearly_full`, `names_that_alone_fill_a_frame_are_cut_to_what_one_frame_carries` |
 
 use kr_cbor::Limits;
 use kr_protocol::action::{
@@ -192,6 +188,10 @@ fn every_list_is_cut_to_a_prefix_in_identity_order() {
 
 /// A host that holds more workers than a frame carries still answers: the workers whose barrier has
 /// not held are kept before any that has, so the caller reads what it would of the whole.
+///
+/// KR-REQ-09.12, the part about pending status until every barrier holds: a host that holds more
+/// workers than a frame carries still answers, with every worker whose barrier has not held kept
+/// before any that has. Not shown here: the per-worker dispatch barrier itself.
 #[test]
 fn a_worker_list_larger_than_a_frame_keeps_every_worker_whose_barrier_has_not_held() {
     let workers = Limits::DEFAULT.max_collection_len as u128 * 3;
@@ -240,6 +240,10 @@ fn a_worker_list_larger_than_a_frame_keeps_every_worker_whose_barrier_has_not_he
 
 /// Whatever is cut, the barrier reads the way the whole one would: it holds on the cut list exactly
 /// when it holds on the whole one, and a pending worker is never the one left out.
+///
+/// KR-REQ-09.12, the part about pending status until every barrier holds: a barrier cut to fit a
+/// frame holds on the cut list exactly when it holds on the whole one, and a pending worker is
+/// never the one left out. Not shown here: the per-worker dispatch barrier itself.
 #[test]
 fn a_cut_barrier_reads_as_the_whole_one_would() {
     let workers = Limits::DEFAULT.max_collection_len as u128 + 100;
@@ -282,6 +286,10 @@ fn a_cut_barrier_reads_as_the_whole_one_would() {
 /// The workers kept are a prefix of the order the cut takes them in: those whose barrier has not
 /// held first, then the rest, each in session order. A worker that does not fit ends the cut, and
 /// no smaller one behind it takes its room, whether it waits or not.
+///
+/// KR-REQ-09.12, the part about pending status until every barrier holds: the workers kept are a
+/// prefix of the order the cut takes them in, those whose barrier has not held first. Not shown
+/// here: the per-worker dispatch barrier itself.
 #[test]
 fn a_cut_takes_the_workers_that_have_not_held_before_any_that_has() {
     // One waiting worker whose detail alone is larger than a frame can spare, among small ones.

@@ -1,4 +1,4 @@
-//! The support window of the public majors (KR-REQ-20.24, KR-REQ-26.07).
+//! The support window of the public majors.
 //!
 //! `PUBLIC_MAJORS` says which majors this build lists, and where each stands: when a later major
 //! replaced it, until when it is supported, and whether this build has stopped negotiating it. The
