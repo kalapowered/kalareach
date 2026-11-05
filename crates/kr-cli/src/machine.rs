@@ -54,6 +54,7 @@
 
 use std::path::PathBuf;
 
+use kr_client::error::is_definite;
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_controller::bridge::invoke::{self, Invocation, Refusal};
@@ -1334,6 +1335,9 @@ fn judge(
                 | ErrorCode::OutcomeUnknown
                 | ErrorCode::DraftConflict,
             ) => Verdict::Pending,
+            // Any other transient refusal is the environment saying it cannot take the step now,
+            // which is not its word that it never will.
+            (true, other) if !is_definite(other) => Verdict::Pending,
             (true, other) => Verdict::Refused(other, Why::Environment),
         };
     }
@@ -1833,11 +1837,16 @@ mod tests {
             "the first action is still running, and a second identity would race it"
         );
         for sent in [Sent::First, Sent::Anew] {
+            // Every transient code is the environment saying it cannot take the step now, and not
+            // that it never will.
             for code in [
                 ErrorCode::ResourceUnavailable,
                 ErrorCode::StorageUnavailable,
                 ErrorCode::OutcomeUnknown,
                 ErrorCode::DraftConflict,
+                ErrorCode::EditorBusy,
+                ErrorCode::RateLimited,
+                ErrorCode::EnvironmentUnavailable,
             ] {
                 assert_eq!(
                     judge(&step, Some(&at), code, sent),

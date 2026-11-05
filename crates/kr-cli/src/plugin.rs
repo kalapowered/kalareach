@@ -20,7 +20,7 @@
 //! device to ask, and says so.
 
 use base64::Engine as _;
-use kr_client::error::refusal;
+use kr_client::error::{is_definite, refusal};
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_ipc::paths::HostPaths;
@@ -346,7 +346,17 @@ async fn wait_for_an_owner_device<T>(
                     )));
                 }
             }
-            // The host's own refusal is its answer, passed on as itself. Anything else, a
+            // A refusal for now says the host cannot take the request at this moment, and not that
+            // it never will: it is asked again at the next poll, until the challenge ends, and the
+            // last refusal is the command's end then.
+            Ok(Err(CliError::Refused(refused))) if !is_definite(refused.code) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(CliError::Refused(refused));
+                }
+                tokio::time::sleep(poll.min(deadline - now)).await;
+            }
+            // The host's definite refusal is its answer, passed on as itself. Anything else, a
             // connection that ended or an answer that cannot be read, may have come after the host
             // performed the request.
             Ok(Err(error @ CliError::Refused(_))) => return Err(error),
@@ -1000,6 +1010,76 @@ mod tests {
         .await;
         assert!(matches!(ended, Err(CliError::Refused(_))));
         assert_eq!(asks.count(), 1);
+    }
+
+    /// KR-REQ-07.47: a host that cannot take the request now has not refused it. The request is
+    /// asked again at the next poll and lands when the host can take it; at the challenge's end the
+    /// last refusal is the command's, and no request is made after it. The control is a definite
+    /// refusal, which ends the wait at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_for_now_is_asked_again_and_a_definite_one_ends_the_wait() {
+        let for_now = || {
+            CliError::Refused(refusal(
+                ErrorCode::StorageUnavailable,
+                Shown::said("the host cannot record it now"),
+            ))
+        };
+        let asks = Asks::default();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+        let done: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
+            asks.note();
+            if asks.count() < 3 {
+                Err(for_now())
+            } else {
+                Ok(7)
+            }
+        })
+        .await;
+        assert!(matches!(done, Ok(7)));
+        assert_eq!(asks.count(), 3, "asked again until the host could take it");
+
+        let asks = Asks::default();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(60);
+        let ended: Result<u32> = wait_for_an_owner_device(deadline, short(), short(), async || {
+            asks.note();
+            Err(for_now())
+        })
+        .await;
+        let Err(CliError::Refused(last)) = ended else {
+            panic!("the last refusal ends the wait");
+        };
+        assert_eq!(last.code, ErrorCode::StorageUnavailable);
+        assert!(
+            asks.at
+                .lock()
+                .expect("the record")
+                .iter()
+                .all(|moment| *moment < deadline),
+            "no request was made after the deadline"
+        );
+        assert!(
+            asks.count() > 3,
+            "it asked at every poll until the deadline"
+        );
+
+        let asks = Asks::default();
+        let definite: Result<u32> = wait_for_an_owner_device(
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(60),
+            short(),
+            short(),
+            async || {
+                asks.note();
+                Err(CliError::Refused(refusal(
+                    ErrorCode::PermissionDenied,
+                    Shown::said("this device may not"),
+                )))
+            },
+        )
+        .await;
+        assert!(
+            matches!(definite, Err(CliError::Refused(refused)) if refused.code == ErrorCode::PermissionDenied)
+        );
+        assert_eq!(asks.count(), 1, "a definite refusal is not asked again");
     }
 
     /// KR-REQ-07.47: a host that is sent the request and does not answer it ends the wait at the
