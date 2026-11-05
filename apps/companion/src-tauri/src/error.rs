@@ -191,6 +191,23 @@ mod tests {
         }
     }
 
+    /// The scripted hosts the page is tested against call a code transient exactly when the
+    /// protocol does, so a screen under test reads a failure as it reads one from the application.
+    #[test]
+    fn the_scripted_hosts_call_the_codes_transient_that_the_protocol_does() {
+        let scripted: std::collections::BTreeSet<&str> =
+            include_str!("../../src/host/fake-retry.ts")
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix('\'')?.split('\'').next())
+                .collect();
+        let protocol: std::collections::BTreeSet<&str> = ErrorCode::ALL
+            .iter()
+            .filter(|code| code.retry_category() == RetryCategory::Transient)
+            .map(|code| code.as_str())
+            .collect();
+        assert_eq!(scripted, protocol);
+    }
+
     #[test]
     fn a_size_refusal_is_an_exhausted_allowance_rather_than_an_internal_failure() {
         let error = CommandError::too_large("the image exceeds the import limit");
