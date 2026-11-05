@@ -6,8 +6,7 @@
 //! record does and does not cover, what a token binds, and that an external fixture binds and runs
 //! under this host's own bounds.
 //!
-//! Rows: KR-REQ-11.24, KR-REQ-11.25, KR-REQ-11.28 for the contract, and the external-fixture half
-//! of KR-ACC-016. The worker's arbitration, its durable ledger and the live enforcement are
+//! The worker's arbitration, its durable ledger and the live enforcement are
 //! `crates/kr-worker/tests/{broker,gateway}.rs`.
 
 mod components;
@@ -78,6 +77,11 @@ fn token() -> ActionToken {
 }
 
 /// KR-REQ-11.24: the three grants are separate, and holding one is never holding another.
+///
+/// KR-REQ-11.25, the part about display-only components: a grant set that holds observation alone
+/// is display-only, is refused the upstream-action and interpreter requirements, and observation
+/// does not create an approval. Not shown here: the broker's decoding trust, and the live gate that
+/// applies these rules to a binding.
 #[test]
 fn kr_req_11_24_the_three_grants_are_separate() {
     let display_only = BrokerGrants::granted([BrokerGrant::Observation]);

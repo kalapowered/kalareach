@@ -754,6 +754,12 @@ fn kr_req_11_23_a_handle_names_the_executable_and_both_halves_authenticate() {
 
 /// KR-REQ-11.24: observation, upstream action and approval interpretation are three grants, and
 /// holding one is never holding another.
+///
+/// KR-REQ-11.25, the part about observation-only components: a binding that holds observation alone
+/// holds neither the upstream-action nor the interpreter grant, and the action token for an
+/// upstream action it is asked to prepare is refused with a grant error. Not shown here: the token
+/// a binding that holds the upstream-action grant is given, which is bound to one invocation, and
+/// what the component world imports.
 #[test]
 fn kr_req_11_24_the_three_grants_are_held_separately() {
     let broker = broker_with(BrokerGrants::granted([BrokerGrant::Observation]), None);
@@ -1773,6 +1779,11 @@ fn component_decoded(
 /// submission. An answer labelled as a read registers as the answer it declares. A binding that
 /// holds observation alone is refused the prompt whose label reads as a read, and a read is refused
 /// on the write path whatever its own label says.
+///
+/// KR-REQ-11.25, the part about observation-only components: a binding that holds observation alone
+/// is refused the registered prompt action on the plugin-action path with a grant error, whatever
+/// the action's label says. Not shown here: the refusal of a binding that holds the grant, and the
+/// token an action is given.
 #[test]
 fn kr_req_11_47_a_label_that_reads_as_a_read_registers_as_its_declared_class() {
     let previewing = declaration(
