@@ -476,8 +476,9 @@ fn a_successful_confirmation_locks_the_invitation_before_any_bundle() {
 /// as it falls.
 ///
 /// KR-ACC-015, the part about the five-attempt limit: five failed confirmation tags consume the
-/// invitation, and the count is persisted as it falls and survives a restart. Not shown here: the
-/// other conditions of the row.
+/// invitation, and the count is in the store after each failure. Not shown here: the count
+/// surviving a restart (the case reads the store's snapshot on one host), and the other conditions
+/// of the row.
 #[test]
 fn a_wrong_code_exhausts_five_guesses_and_the_count_survives_a_restart() {
     assert_eq!(MAX_CONFIRMATION_FAILURES, 5, "section 10 allows five");
@@ -581,6 +582,10 @@ fn candidate_with_tag(
 /// are in flight at once: the first two failures spend the last two guesses and consume the
 /// invitation, and the third, still waiting to be checked, is cancelled with it rather than given a
 /// sixth guess. The right code is refused afterwards.
+///
+/// KR-ACC-015, the part about the five-attempt limit: every candidate draws on the invitation's one
+/// allowance of five, including candidates whose exchanges overlap. Not shown here: the other
+/// conditions of the row.
 #[test]
 fn concurrent_candidates_share_one_allowance() {
     let harness = Harness::new();
@@ -1003,6 +1008,10 @@ fn a_host_restart_cancels_unfinished_invitations_and_keeps_consumed_state() {
 }
 
 /// KR-REQ-10.33: a restart cancels a locked invitation too, and nothing resumes it.
+///
+/// KR-ACC-015, the part about consumed-invitation persistence across a host restart: a restart
+/// cancels a locked invitation too, and nothing resumes it. Not shown here: the other conditions of
+/// the row.
 #[test]
 fn a_locked_candidate_is_swept_by_a_restart_like_any_other() {
     let harness = Harness::new();
@@ -2290,6 +2299,10 @@ fn no_bundle_moves_before_both_confirmation_tags_are_verified() {
 /// KR-REQ-10.33: an invitation nobody used is consumed as expired once its deadline passes, when
 /// the host asks before offering another, and not a moment before. Its reservation still names the
 /// locator and origin, so the host can release it.
+///
+/// KR-ACC-015, the part about the expiry limit: an invitation nobody used is consumed as expired
+/// once its deadline passes, when the host asks before offering another, and not a moment before.
+/// Not shown here: the other conditions of the row.
 #[test]
 fn an_unused_code_invitation_is_consumed_as_expired_once_its_deadline_passes() {
     let harness = Harness::new();
