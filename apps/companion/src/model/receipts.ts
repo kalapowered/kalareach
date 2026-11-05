@@ -240,15 +240,15 @@ export function applyReceipt(submission: Submission, receipt: Receipt): Submissi
 /**
  * Records a failure the request itself produced.
  *
- * `retry` is the retry category of the host's code, as native code hands it over. Only a definite
- * word is a refusal. A submission whose outcome the host could not confirm stays unknown: the
- * interface asks what became of it rather than telling the person it failed. One the host cannot
- * take for now is not taken, and is not called refused: it may be sent again. Without a category,
- * a code other than `OUTCOME_UNKNOWN` is read as a definite word.
+ * `retry` is the retry category of the host's code, as native code hands it over, or null for a
+ * failure that is not a host's. Only a definite word is a refusal. A submission whose outcome the
+ * host could not confirm stays unknown: the interface asks what became of it rather than telling
+ * the person it failed. One the host cannot take for now is not taken, and is not called refused:
+ * it may be sent again.
  */
 export function failed(
   submission: Submission,
-  error: { code: string; message: string; retry?: string | null }
+  error: { code: string; message: string; retry: string | null }
 ): Submission {
   const state: InputState =
     error.code === 'OUTCOME_UNKNOWN' || error.retry === 'outcome_unknown'

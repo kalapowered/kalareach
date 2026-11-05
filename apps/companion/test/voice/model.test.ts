@@ -439,7 +439,12 @@ describe('what the screen says when it ends a call', () => {
     const words = closureWords(
       none({
         fence: null,
-        host_failure: { code: 'RESOURCE_UNAVAILABLE', message: 'RESOURCE_UNAVAILABLE: No answer.', user_action: 'wait' }
+        host_failure: {
+          code: 'RESOURCE_UNAVAILABLE',
+          message: 'RESOURCE_UNAVAILABLE: No answer.',
+          user_action: 'wait',
+          retry: 'transient'
+        }
       })
     )
     expect(words).toContain("This device's call is closed.")

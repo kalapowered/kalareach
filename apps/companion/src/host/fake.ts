@@ -62,6 +62,7 @@ import type {
   DroppedFile,
   HostEvent,
   HostInbox,
+  HostError,
   HostPort,
   ImportedImage,
   KeyAction,
@@ -120,6 +121,7 @@ import { MAX_HANDED_BYTES, receivedConnection, viewMoveArguments, viewSizeArgume
 import { codeComplete } from '../pairing/words'
 import { openedMode } from '../theme-init'
 import { scriptedHostDrafts, type BindParams, type FakeHostDrafts } from './fake-host-drafts'
+import { fakeRetryOf } from './fake-retry'
 import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, DRAFT_CREATE_PARAMS, decodeParams } from './fake-decode'
 import { FakeDraftStore } from './fake-drafts'
 import { ScriptedLaunching, type InstalledLaunch, type LaunchScenario } from './fake-launch'
@@ -154,8 +156,13 @@ export class FakeHostError extends Error {
   }
 
   /** The object a rejected command actually carries, which is data rather than an Error. */
-  toPayload(): { code: string; message: string; user_action: string } {
-    return { code: this.code, message: this.message, user_action: this.user_action }
+  toPayload(): HostError {
+    return {
+      code: this.code,
+      message: this.message,
+      user_action: this.user_action,
+      retry: fakeRetryOf(this.code)
+    }
   }
 }
 
@@ -2730,7 +2737,8 @@ export function fakeHost(
             code: 'RESOURCE_UNAVAILABLE',
             message:
               'RESOURCE_UNAVAILABLE: The host has not said whether it made the call. This device is still asking it, and ends the call if it did.',
-            user_action: 'wait'
+            user_action: 'wait',
+            retry: 'transient'
           },
           not_held: false
         })
@@ -2754,7 +2762,8 @@ export function fakeHost(
             code: 'RESOURCE_UNAVAILABLE',
             // Native code sends a host's refusal as its code, a colon and the host's words.
             message: 'RESOURCE_UNAVAILABLE: This host cannot be contacted right now.',
-            user_action: 'wait'
+            user_action: 'wait',
+            retry: 'transient'
           },
           not_held: false
         })
