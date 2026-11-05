@@ -32,7 +32,6 @@ use kr_client::pairing::owner::{
 };
 use kr_client::pairing::paired::{AttemptMode, PairedHost, PairedHosts};
 use kr_client::pairing::room::{RoomError, RoomSocket};
-use kr_client::services::ManagedService;
 use kr_client::transport::ControlTransport;
 use kr_controller::service::net::config::NetworkSettings;
 use kr_crypto::keys::DeviceKeys;
@@ -48,7 +47,6 @@ use kr_protocol::confirmation::{
 use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::GrantExpiry;
 use kr_protocol::hello::HostSelection;
-use kr_protocol::hostinfo::DoctorStatus;
 use kr_protocol::hostinfo::configuration::ConfigurationDocument;
 use kr_protocol::ids::{BuildId, DeviceKeyRevision, EnvironmentId};
 use kr_protocol::invitation::{
@@ -1695,46 +1693,69 @@ async fn a_device_pairs_directly_through_the_product_client() {
 /// without, as optional and not as a fault.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_26_42_a_device_pairs_with_a_host_that_has_no_account_and_no_managed_service() {
-    use kr_protocol::host_account::{AccountState, SignInUnavailable};
+    use kr_protocol::host_account::SignInUnavailable;
 
     let owner_keys = keys();
     let mut document = ConfigurationDocument::empty();
     document.revision = 1;
     let host = Host::start_with_document(&owner_keys, &document).await;
-    let signed_out = |report: &kr_protocol::host_account::AccountReport| {
-        report.state == AccountState::SignedOut
-            && report.unavailable.as_ref() == Some(&SignInUnavailable::NoManagedService)
-    };
     let before = host.account().await;
-    assert!(signed_out(&before), "{before:?}");
+    assert_eq!(
+        before.unavailable.as_ref(),
+        Some(&SignInUnavailable::NoManagedService),
+        "{before:?}"
+    );
+    host.assert_it_needs_no_account().await;
 
     let paired = pairs_directly(&host, &owner_keys).await;
     assert_eq!(paired.host_endpoint_id, host.network().endpoint_id());
 
-    let after = host.account().await;
-    assert!(signed_out(&after), "{after:?}");
-    let check = host.managed_services().await;
-    assert_eq!(
-        check.status,
-        DoctorStatus::NotApplicable,
-        "{}",
-        check.detail()
-    );
-    for service in [
-        ManagedService::AccountLogin,
-        ManagedService::RelayLeases,
-        ManagedService::SyncBackup,
-        ManagedService::ManagedInference,
-    ] {
-        assert!(
-            check
-                .detail()
-                .contains(&format!("{}: not configured", service.as_str())),
-            "{} is named as not configured: {}",
-            service.as_str(),
-            check.detail()
-        );
-    }
+    host.assert_it_needs_no_account().await;
+}
+
+/// A device running the product client enters a code the host's owner issued, shows the value the
+/// host locked it with, and pairs once the owner approves.
+async fn pairs_by_code(host: &Host, owner_keys: &DeviceKeys) -> PairedHost {
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(owner_keys);
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
+    let (origin, code, _) = code_of(&invited);
+    let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
+    let (attempt, mut shown) = device.enter(&origin, &code);
+    let value = awaiting_value(&mut shown).await;
+    let PairStatus::AwaitingApproval {
+        verification_value, ..
+    } = owner_status(&mut client, &invited).await
+    else {
+        panic!("the owner is asked to approve the device");
+    };
+    assert_eq!(value, group_verification_value(&verification_value));
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+            .await
+            .expect("the owner approves");
+    let paired = outcome(attempt).await.expect("paired");
+    assert_eq!(paired.device_id, confirmed.device_id);
+    paired
+}
+
+/// KR-REQ-26.42: a person pairs a device by a code with a host that has no account and selects no
+/// managed service. The code goes through the rendezvous room, which this suite runs in process; the
+/// host holds no account and names each managed integration as one it does without, before and
+/// after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_26_42_a_device_pairs_by_code_with_a_host_that_has_no_account() {
+    let owner_keys = keys();
+    let mut document = ConfigurationDocument::empty();
+    document.revision = 1;
+    let host = Host::start_with_document(&owner_keys, &document).await;
+    host.assert_it_needs_no_account().await;
+
+    let paired = pairs_by_code(&host, &owner_keys).await;
+    assert_eq!(paired.host_endpoint_id, host.network().endpoint_id());
+
+    host.assert_it_needs_no_account().await;
 }
 
 /// KR-REQ-10.36, KR-REQ-10.23: a person takes their time to approve. A host answers an unpaired

@@ -1829,6 +1829,64 @@ async fn a_device_that_registers_again_with_previews_off_is_delivered_no_preview
     assert_eq!(without.sender_record_id, sender);
 }
 
+/// KR-REQ-26.42: a person who pairs a phone with a host that has no account is told of a question
+/// through the free gateway, and chooses whether the alert carries a preview. The host holds no
+/// account before the phone registers and none after the preview choice, and names each managed
+/// integration as one it does without. The gateway here is the stand-in that answers as the Worker
+/// does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_26_42_a_phone_paired_with_a_host_that_has_no_account_is_told_through_the_gateway() {
+    const WORDS: &str = "Deploy the release to production?";
+    let environment = Environment::start().await;
+    environment.host.assert_it_needs_no_account().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x53));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register_choosing(&environment, &credential, true)
+        .await
+        .expect("the daemon registers a credential its gateway confirms");
+
+    environment._worker.ask("deploy-1", WORDS);
+    until("the first question being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+    assert!(
+        environment
+            .gateway
+            .delivered()
+            .remove(0)
+            .preview
+            .is_present(),
+        "previews on: a sealed preview"
+    );
+
+    phone
+        .register_choosing(&environment, &credential, false)
+        .await
+        .expect("the daemon takes the choice with the registration");
+    environment._worker.ask("deploy-2", WORDS);
+    until("the second question being delivered", || {
+        environment.gateway.delivered().len() == 2
+    })
+    .await;
+    assert!(
+        !environment
+            .gateway
+            .delivered()
+            .remove(1)
+            .preview
+            .is_present(),
+        "previews off: nothing sealed"
+    );
+
+    environment.host.assert_it_needs_no_account().await;
+}
+
 /// KR-REQ-16.08: a daemon takes a credential only from the gateway its managed service stands at.
 /// Where a suite has stood that service up on this machine, a credential naming the official
 /// gateway is refused, as one naming any other origin is, and the same credential naming the

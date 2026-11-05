@@ -662,13 +662,14 @@ async fn an_update_replaces_the_daemon_and_a_live_session_keeps_its_release() {
     );
 }
 
-/// KR-REQ-26.42: an ordinary user installs a host, runs it and updates it by an explicit command
-/// with no account of any kind and no managed service. Before the update and after it the daemon
-/// says that no account is signed in and that the host names no managed service, and names each
-/// managed integration as one the host does without.
+/// KR-REQ-26.42: an ordinary user installs a host, runs it, updates it and goes back by explicit
+/// commands, with no account of any kind and no managed service. After the install, the update and
+/// the rollback the daemon says that no account is signed in and that the host names no managed
+/// service, and names each managed integration as one the host does without.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn kr_req_26_42_a_host_installs_and_updates_with_no_account_and_no_managed_service() {
+async fn kr_req_26_42_a_host_installs_updates_and_rolls_back_with_no_account_and_no_managed_service()
+ {
     let mut host = Host::bare();
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
@@ -708,6 +709,21 @@ async fn kr_req_26_42_a_host_installs_and_updates_with_no_account_and_no_managed
         "the daemon was started again, of the new release"
     );
     standing(&host, "after the update");
+
+    // Going back to the release the host was on is as much an explicit command as the update.
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["target"], one.name().as_str(), "{said}");
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name()),
+        "the daemon was started again, of the older release"
+    );
+    standing(&host, "after the rollback");
 }
 
 /// KR-REQ-26.08: an update to a release whose daemon does not retain a live session's level waits,

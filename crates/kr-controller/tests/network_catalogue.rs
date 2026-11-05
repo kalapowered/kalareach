@@ -579,6 +579,52 @@ async fn kr_req_23_28_and_23_29_a_paired_device_reaches_every_catalogue_and_plug
     host.stop().await;
 }
 
+/// KR-REQ-26.42: an owner adds a private plugin repository, by its address and its own trust root, to
+/// a host that has no account and selects no managed service, and the host trusts and reads it. The
+/// repository is a directory on the machine, as a person's own is; before and after, the host
+/// holds no account and names each managed integration as one it does without.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_26_42_an_owner_adds_a_private_plugin_repository_to_a_host_with_no_account() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.revision = 1;
+    let host = Host::start_with_document(&owner, &document).await;
+    host.assert_it_needs_no_account().await;
+    let (_device, session) = net_support::paired_device(&host, &owner, CATALOGUE_RIGHTS).await;
+    let published = Published::create();
+    let environment_id = host.environment_id;
+
+    let added: wire::CatalogueAddResult = typed(
+        &remote_mutation(
+            &session,
+            environment_id,
+            Method::CatalogueAdd,
+            &add_params(&host, &owner, &published),
+        )
+        .await
+        .expect("catalogue.add answers a device"),
+    );
+    assert_eq!(added.catalogue.catalogue_id, "development");
+    let synced: wire::CatalogueSyncResult = typed(
+        &remote_mutation(
+            &session,
+            environment_id,
+            Method::CatalogueSync,
+            &wire::CatalogueSyncParams {
+                environment_id,
+                catalogue_id: "development".to_owned(),
+            },
+        )
+        .await
+        .expect("catalogue.sync answers a device"),
+    );
+    assert_eq!(synced.generation.get(), 1);
+
+    host.assert_it_needs_no_account().await;
+    session.close();
+    host.stop().await;
+}
+
 /// A device's catalogue mutation is held to the subject rule the owner's own door applies.
 ///
 /// A target naming a session would produce a receipt against something the effect never touched,

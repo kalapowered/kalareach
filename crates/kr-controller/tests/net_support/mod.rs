@@ -1170,6 +1170,40 @@ impl Host {
         .expect("the host's account report")
     }
 
+    /// Asserts that no account is signed in on this daemon and that its diagnostics name each
+    /// managed integration a host can do without as one that is not configured, as something that
+    /// does not apply and not as a fault.
+    pub async fn assert_it_needs_no_account(&self) {
+        use kr_client::services::ManagedService;
+        use kr_protocol::host_account::AccountState;
+        use kr_protocol::hostinfo::DoctorStatus;
+
+        let account = self.account().await;
+        assert_eq!(account.state, AccountState::SignedOut, "{account:?}");
+        let check = self.managed_services().await;
+        assert_eq!(
+            check.status,
+            DoctorStatus::NotApplicable,
+            "{}",
+            check.detail()
+        );
+        for service in [
+            ManagedService::AccountLogin,
+            ManagedService::RelayLeases,
+            ManagedService::SyncBackup,
+            ManagedService::ManagedInference,
+        ] {
+            assert!(
+                check
+                    .detail()
+                    .contains(&format!("{}: not configured", service.as_str())),
+                "{} is named as not configured: {}",
+                service.as_str(),
+                check.detail()
+            );
+        }
+    }
+
     /// Returns the directory a project test builds its repositories in.
     #[must_use]
     pub fn work(&self) -> &Path {

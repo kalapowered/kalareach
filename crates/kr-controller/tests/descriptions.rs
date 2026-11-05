@@ -3183,6 +3183,37 @@ async fn a_daemon_started_over_a_document_it_cannot_use_fetches_no_model_file() 
     assert!(!environment.marker() && environment.partials().is_empty());
 }
 
+/// KR-REQ-26.42: the default local model downloads at host setup on a host that has no account and
+/// no managed service: setup says no hosted account is needed, the owner asks, and the files arrive
+/// and are kept with a marker. The address is the fixture's, a server of this test's own; before
+/// and after, the host holds no account and names each managed integration as one it does without.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_26_42_the_local_model_downloads_at_setup_with_no_account_and_no_managed_service() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::Body(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        ..Setup::new()
+    })
+    .await;
+    environment.host.assert_it_needs_no_account().await;
+
+    let shown = environment.setup().await;
+    assert!(shown.offered && shown.enabled);
+    assert!(!shown.needs_hosted_account);
+    environment.download(DescriptionDownloadAction::Start).await;
+    let done = environment
+        .setup_until("the fetch verified", |shown| {
+            shown.download == DescriptionDownload::Verified
+        })
+        .await;
+    assert_eq!(done.fetched_bytes.get(), 27);
+    assert!(environment.marker(), "the files are marked held");
+
+    environment.host.assert_it_needs_no_account().await;
+}
+
 /// KR-REQ-22.01: nothing is fetched until the owner asks, and setup shows the exact size and the
 /// address first. A session is shown its title from metadata while the files are not here. The
 /// fetch writes the file, has the description process check it, keeps it with a marker and no

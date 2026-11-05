@@ -1916,8 +1916,8 @@ fn kr_host_shell_mode_chooses_and_clears_the_default_for_new_sessions() {
 /// KR-REQ-26.42: an ordinary user needs no account of any kind. On a host with no account that
 /// selects no managed service, the first run starts the daemon and a session in it, the host's
 /// configuration is chosen and read back, and `kr doctor` names each managed integration the host
-/// does without as optional, never as a fault. The one command that needs a service,
-/// `kr account sign-in`, is refused by what is missing, and the session is live before and after.
+/// does without as optional, never as a fault. `kr account sign-in`, which needs a managed service,
+/// is refused by what is missing, and the session is live before and after.
 #[test]
 fn kr_req_26_42_an_ordinary_user_with_no_account_and_no_managed_service_runs_a_host_and_its_sessions()
  {
@@ -1970,10 +1970,17 @@ fn kr_req_26_42_an_ordinary_user_with_no_account_and_no_managed_service_runs_a_h
     assert_eq!(account["state"], "signed_out", "{account}");
     assert_eq!(account["unavailable"], "no_managed_service", "{account}");
 
-    // The one optional add that needs a service is refused by what is missing.
+    // An optional add that needs a service is refused by what is missing.
     let output = start(host.kr(&["--json", "account", "sign-in"])).finish("kr account sign-in");
     let refused = document(&output, "kr account sign-in");
     assert!(!output.status.success(), "{refused}");
+    assert_eq!(refused["code"], "HOST_NOT_CONFIGURED", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|said| said.contains("names no managed service")),
+        "the refusal says what is missing: {refused}"
+    );
 
     // None of it touched the session.
     live("kr list after the refusal");

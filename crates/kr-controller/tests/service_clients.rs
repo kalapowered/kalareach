@@ -9,7 +9,6 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-17.14 | the `kr_req_17_14_` tests here |
-//! | KR-REQ-26.42 | `kr_req_17_14_a_host_that_selects_nothing_says_what_to_do_instead`, which names each managed integration as one the host does without |
 
 mod net_support;
 
@@ -71,10 +70,9 @@ async fn kr_req_17_14_a_host_that_selects_every_service_says_each_is_configured(
     host.stop().await;
 }
 
-/// KR-REQ-17.14, KR-REQ-26.42: a host that selects nothing holds no managed client, says so for
-/// each service with what to do instead, and the check is not a warning or a failure: the host is
-/// complete without them, and its owner needs no account of any kind. A host that cannot sign in
-/// anywhere has no account login to name either.
+/// KR-REQ-17.14: a host that selects nothing holds no managed client, says so for each service with
+/// what to do instead, and the check is not a warning or a failure: the host is complete without
+/// them. A host that cannot sign in anywhere has no account login to name either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_17_14_a_host_that_selects_nothing_says_what_to_do_instead() {
     let mut document = ConfigurationDocument::empty();
