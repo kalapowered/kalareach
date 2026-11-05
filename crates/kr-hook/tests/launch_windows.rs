@@ -957,12 +957,12 @@ fn kr_req_07_64_a_launcher_in_a_job_that_restricts_desktops_declines_and_the_typ
     shell.commits_after_a_refusal(&answer);
 }
 
-/// KR-REQ-12.02: a launch the backend does not commit leaves nothing of the launcher's running: the
-/// program it created was never started and it is ended before the typed command runs. Here the
-/// line ends while the launch waits at its commit, so the backend is retired and the commit is
-/// refused. Control: the same launch, committed, is the program the other tests run.
+/// A launch the backend does not commit leaves nothing of the launcher's running: the program it
+/// created was never started and it is ended before the typed command runs. Here the line ends
+/// while the launch waits at its commit, so the backend is retired and the commit is refused.
+/// Control: the same launch, committed, is the program the other tests run.
 #[test]
-fn kr_req_12_02_a_program_the_backend_does_not_commit_is_ended_and_the_typed_command_runs() {
+fn a_program_the_backend_does_not_commit_is_ended_and_the_typed_command_runs() {
     let shell = Shell::new();
     let answer = shell.establish();
     let (arrived, release) = shell.backends.pause_before_committing();
@@ -986,11 +986,11 @@ fn kr_req_12_02_a_program_the_backend_does_not_commit_is_ended_and_the_typed_com
     });
 }
 
-/// KR-REQ-12.02: a launcher that is gone between the commit and the confirmation leaves no program
-/// suspended: the worker ends the program it was shown when the confirmation cannot be written.
-/// Control: a launcher that is not gone is confirmed, and its program runs (every other test here).
+/// A launcher that is gone between the commit and the confirmation leaves no program suspended: the
+/// worker ends the program it was shown when the confirmation cannot be written. Control: a
+/// launcher that is not gone is confirmed, and its program runs (every other test here).
 #[test]
-fn kr_req_12_02_a_launcher_gone_before_it_is_confirmed_leaves_no_suspended_program() {
+fn a_launcher_gone_before_it_is_confirmed_leaves_no_suspended_program() {
     let shell = Shell::new();
     let answer = shell.establish();
     let (arrived, release) = shell.backends.pause_before_confirming();
