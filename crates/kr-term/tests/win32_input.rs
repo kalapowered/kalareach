@@ -328,10 +328,9 @@ fn a_repeat_and_a_key_up_keep_their_own_order_and_their_own_counts() {
     assert_eq!(decode(sequences[0]).expect("down").repeat, 4);
 }
 
-/// KR-REQ-08.56, the part about paste and mouse: with win32 input mode on, bracketed paste and
-/// mouse reporting are set beside it and stay set when the keyboard encoding is turned off. Not
-/// shown here: the record path's own qualification for an IME, dead keys and restored modes, which
-/// nothing here drives.
+/// With win32 input mode on, bracketed paste and mouse reporting are set beside it and stay set
+/// when the keyboard encoding is turned off. The case sends no paste data and no mouse event, and
+/// drives no console, IME or keyboard.
 #[test]
 fn paste_and_mouse_stay_the_separate_operations_they_are() {
     // Section 8 keeps paste and mouse as their own VT operations whatever the keyboard encoding
