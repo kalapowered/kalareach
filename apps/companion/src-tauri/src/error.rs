@@ -191,21 +191,35 @@ mod tests {
         }
     }
 
-    /// The scripted hosts the page is tested against call a code transient exactly when the
-    /// protocol does, so a screen under test reads a failure as it reads one from the application.
+    /// The scripted hosts the page is tested against give every code the retry category the
+    /// protocol gives it, whichever it is, so a screen under test reads a failure as it reads one
+    /// from the application. The table names every code, so that no category stands on a fallback.
     #[test]
-    fn the_scripted_hosts_call_the_codes_transient_that_the_protocol_does() {
-        let scripted: std::collections::BTreeSet<&str> =
+    fn the_scripted_hosts_give_every_code_the_category_the_protocol_does() {
+        let scripted: std::collections::BTreeMap<&str, &str> =
             include_str!("../../src/host/fake-retry.ts")
                 .lines()
-                .filter_map(|line| line.trim().strip_prefix('\'')?.split('\'').next())
+                .filter_map(|line| {
+                    let mut quoted = line.trim().strip_prefix("['")?.split('\'');
+                    let code = quoted.next()?;
+                    let category = quoted.nth(1)?;
+                    Some((code, category))
+                })
                 .collect();
-        let protocol: std::collections::BTreeSet<&str> = ErrorCode::ALL
-            .iter()
-            .filter(|code| code.retry_category() == RetryCategory::Transient)
-            .map(|code| code.as_str())
-            .collect();
-        assert_eq!(scripted, protocol);
+        let known: std::collections::BTreeSet<&str> =
+            ErrorCode::ALL.iter().map(|code| code.as_str()).collect();
+        assert_eq!(
+            scripted
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            known,
+            "the scripted hosts name every code the protocol has, and no other"
+        );
+        for code in ErrorCode::ALL {
+            let protocol = serde_json::to_value(code.retry_category()).expect("serialises");
+            assert_eq!(protocol, scripted[code.as_str()], "{code:?}");
+        }
     }
 
     #[test]

@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use kr_client::ClientError;
+use kr_client::error::is_definite;
 use kr_client::recovery::{
     BundleWrite, BundleWriter, BundleWritten, CandidateState, CheckpointRecorded, ExportSource,
     FilesRestore, MemberRefusal, MemberRole, MemberVerdict, OfflineExport, PublicationRefusal,
@@ -1002,6 +1003,8 @@ struct Bundle {
     meanwhile: Mutex<Option<Vec<u8>>>,
     /// Whether the next write that applies is answered at all.
     loses_the_answer: Mutex<bool>,
+    /// The code the next write that applies is refused with, before the service applies it.
+    refuses_with: Mutex<Option<ErrorCode>>,
     /// How many writes met the service.
     writes: Mutex<usize>,
 }
@@ -1012,6 +1015,7 @@ impl Bundle {
             source: Arc::clone(source),
             meanwhile: Mutex::new(None),
             loses_the_answer: Mutex::new(false),
+            refuses_with: Mutex::new(None),
             writes: Mutex::new(0),
         }
     }
@@ -1026,6 +1030,12 @@ impl BundleWriter for Bundle {
             }
             if write.expected != self.source.position() {
                 return Ok(BundleWritten::Conflict);
+            }
+            if let Some(code) = self.refuses_with.lock().expect("refuses").take() {
+                return Err(ClientError::Host(ProtocolError::new(
+                    code,
+                    "the service refused it".to_owned(),
+                )));
             }
             let placed = self.source.replace_bundle(write.sealed.to_vec());
             if std::mem::take(&mut *self.loses_the_answer.lock().expect("loses")) {
@@ -1119,6 +1129,42 @@ async fn recording_the_checkpoint_keeps_what_another_device_wrote_to_the_bundle_
     assert!(matches!(recorded, CheckpointRecorded::AlreadyThere));
     assert_eq!(*bundle.writes.lock().expect("writes"), 1);
     assert_eq!(bundle_held(&world, &source).checkpoints.len(), 1);
+}
+
+/// KR-REQ-24.16: a checkpoint write the service refuses for now, or cannot say the outcome of, is
+/// made again after the bundle is read again, and the service's definite word ends the call. The
+/// two are told apart by the retry category of the code, every code, as every other place that
+/// settles a send tells them.
+#[tokio::test]
+async fn a_checkpoint_write_the_service_does_not_take_for_now_is_made_again() {
+    let world = World::new();
+    let sealed = world.seal(4, &honest_members());
+    for code in ErrorCode::ALL {
+        let source = Arc::new(
+            Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed),
+        );
+        let prepared = restore(&world, &source, None).await.expect("a restore");
+        let bundle = Bundle::over(&source);
+        *bundle.refuses_with.lock().expect("refuses") = Some(*code);
+        let recorded = prepared
+            .record_checkpoint(&bundle, TimestampMs::new(9_000))
+            .await;
+        if is_definite(*code) {
+            assert!(
+                matches!(&recorded, Err(RestoreError::Read(error)) if error.code() == *code),
+                "{code:?}: a definite word ends the call"
+            );
+            assert_eq!(*bundle.writes.lock().expect("writes"), 1, "{code:?}");
+            assert!(bundle_held(&world, &source).checkpoints.is_empty());
+        } else {
+            assert!(
+                matches!(recorded, Ok(CheckpointRecorded::Written { .. })),
+                "{code:?}: the write is made again"
+            );
+            assert_eq!(*bundle.writes.lock().expect("writes"), 2, "{code:?}");
+            assert_eq!(bundle_held(&world, &source).checkpoints.len(), 1);
+        }
+    }
 }
 
 /// KR-REQ-24.16: a checkpoint is never lowered and never recorded over another manifest of the
