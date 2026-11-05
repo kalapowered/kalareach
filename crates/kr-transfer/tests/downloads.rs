@@ -1,6 +1,4 @@
 //! Verified downloads: immutable sources, bounded snapshots, resumption and the client's publish.
-//!
-//! Requirement rows closed here: KR-REQ-14.14, KR-REQ-14.15 and KR-REQ-14.16.
 
 mod support;
 
@@ -769,6 +767,11 @@ fn another_principal_cannot_read_or_release_a_transfer() {
 
 /// KR-REQ-14.16: the client verifies every chunk, the total size and the whole-file digest, writes
 /// through a temporary file, and never overwrites its destination without an explicit action.
+///
+/// KR-REQ-14.14, the part about the client's overwrite: publishing a download onto a destination
+/// that exists is refused with a permission error and leaves nothing partial, and with the explicit
+/// overwrite action it replaces the destination. Not shown here: uploads staying outside the
+/// repository, and the narrow read grant for an adapter, which the upload case shows.
 #[test]
 fn a_client_publishes_through_a_temporary_file_and_never_overwrites_by_default() {
     let harness = Harness::create();
