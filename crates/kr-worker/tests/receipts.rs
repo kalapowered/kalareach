@@ -1591,10 +1591,33 @@ fn an_uncertain_outcome_kept_as_at(
     intent: Vec<u8>,
     settled_at: TimestampMs,
 ) -> u64 {
+    an_uncertain_outcome_holding(
+        host,
+        actor_id,
+        action_id,
+        mutation,
+        intent,
+        Digest256::from_bytes([50; 32]),
+        settled_at,
+    )
+}
+
+/// As [`an_uncertain_outcome_kept_as_at`], for a receipt that holds the payload digest `payload`,
+/// which is what makes a request sent again under the same identifier the same request.
+fn an_uncertain_outcome_holding(
+    host: &Host,
+    actor_id: &ActorId,
+    action_id: ActionId,
+    mutation: &MutationRequest,
+    intent: Vec<u8>,
+    payload: Digest256,
+    settled_at: TimestampMs,
+) -> u64 {
     let subject = kr_protocol::action::subject_digest(mutation).expect("a subject digest");
     let mut session = host.service.runtime().session();
     let journal = session.journal_mut().expect("a journal");
     let mut earlier = fresh(0, 50, 50);
+    earlier.payload_digest = payload;
     earlier.actor_id = actor_id.clone();
     earlier.action_id = action_id;
     earlier.subject_digest = subject;
@@ -2088,6 +2111,202 @@ async fn an_answer_has_to_quote_the_newest_uncertain_answer_to_its_own_question(
     let taken = resolved(send_mutation(&mut client, quoting).await);
     assert_eq!(taken.question_id, first.question_id);
     assert_eq!(taken.state, kr_protocol::question::QuestionState::Answered);
+}
+
+/// The client library on the worker's own socket, as a person's client has it.
+async fn session_over(host: &Host) -> kr_client::Session {
+    let transport = kr_client::ipc::IpcTransport::connect(&host.endpoint, build())
+        .await
+        .expect("a local connection");
+    kr_client::Session::start(transport.shared()).expect("a session")
+}
+
+/// The leave to write the kept answers, the way a client outside a store has it.
+struct Leaving;
+
+impl kr_client::answers::Keeper for Leaving {
+    fn keep<R>(
+        &self,
+        work: impl FnOnce(&kr_client::answers::Leave<'_>) -> R,
+    ) -> Result<R, kr_client::Shown> {
+        let writers = kr_ipc::install::hold_writers(
+            &kr_ipc::install::Writing::in_roots(std::env::temp_dir(), std::env::temp_dir()),
+            &mut || {},
+        )
+        .expect("a client outside a store holds nothing");
+        let leave = kr_client::answers::Leave {
+            answers: writers
+                .permit(&kr_client::answers::WRITTEN)
+                .expect("permitted"),
+            sends: writers
+                .permit(&kr_client::sends::WRITTEN)
+                .expect("permitted"),
+        };
+        Ok(work(&leave))
+    }
+}
+
+/// A send of the answer to `question` under `id` whose outcome the worker could not establish, and
+/// that `session` still holds unsettled: what a send leaves when its caller gave up on it.
+async fn an_older_send(
+    host: &Host,
+    session: &kr_client::Session,
+    caller: &ActorId,
+    question: &kr_protocol::question::Question,
+    id: ActionId,
+    settled_at: TimestampMs,
+) {
+    let composed = session
+        .compose(
+            Method::QuestionAnswer,
+            id,
+            target(host),
+            None,
+            &ParamsValue::empty(),
+            &kr_protocol::question::QuestionAnswerParams {
+                session_id: host.session_id,
+                question_id: question.question_id,
+                expected_revision: question.revision,
+                answer: kr_protocol::question::QuestionAnswer::Input {
+                    text: "orchid".to_owned(),
+                },
+            },
+            kr_client::answers::ANSWER_TTL,
+        )
+        .await
+        .expect("composes");
+    let request = composed.request();
+    an_uncertain_outcome_holding(
+        host,
+        caller,
+        id,
+        request,
+        kr_cbor::to_canonical_vec(request).expect("encodes"),
+        kr_protocol::digest::mutation_digest(request, caller).expect("a digest"),
+        settled_at,
+    );
+    // The same request again is answered from what the worker kept of it, and the connection
+    // holds it until its caller says what it came to.
+    session
+        .send(&composed)
+        .await
+        .expect("the worker answers from the receipt it kept");
+}
+
+/// How the person's send of an answer whose older sends are recorded goes: the send of the kept
+/// answer, or a new answer to the question.
+#[derive(Clone, Copy)]
+enum Sending {
+    Kept,
+    New,
+}
+
+/// KR-REQ-11.63: a send of a kept answer that the worker takes lets the connection forget the older
+/// sends of that answer, which no reading of the worker will ever settle, and leaves the older sends
+/// of another answer as they are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_the_worker_takes_lets_the_connection_forget_the_older_sends_of_that_answer() {
+    the_connection_after_a_taken_send(Sending::Kept).await;
+}
+
+/// KR-REQ-11.63: so does a new answer to the question that the worker takes, when older sends of an
+/// answer to it are recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_answer_the_worker_takes_lets_the_connection_forget_the_older_sends_of_that_answer() {
+    the_connection_after_a_taken_send(Sending::New).await;
+}
+
+async fn the_connection_after_a_taken_send(sending: Sending) {
+    use kr_client::answers::{self, AnswerDraft, AnswerDrafts, Answered, Keeper as _, Quoting};
+    let host = host().await;
+    let session = session_over(&host).await;
+    let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+    let first = asked(&host, "first");
+    let other = asked(&host, "other");
+
+    let begun = kr_ipc::now_ms().get();
+    for (at, (id, question)) in [(81, &first), (82, &first), (83, &other)]
+        .into_iter()
+        .enumerate()
+    {
+        let settled = TimestampMs::new(begun + at as u64);
+        an_older_send(&host, &session, &caller, question, action(id), settled).await;
+    }
+    assert_eq!(
+        session.submitted_actions().await.len(),
+        3,
+        "the connection holds the three older sends"
+    );
+
+    // The answer is kept on this device with the two older sends of it recorded.
+    let directory = tempfile::TempDir::new().expect("a directory");
+    let drafts = AnswerDrafts::open(directory.path().join("answers")).expect("the store opens");
+    let draft = AnswerDraft {
+        version: answers::ANSWER_FORMAT,
+        target: target(&host),
+        session_id: host.session_id,
+        question_id: first.question_id,
+        question_revision: first.revision,
+        answer: kr_protocol::question::QuestionAnswer::Input {
+            text: "orchid".to_owned(),
+        },
+        drafted_at_ms: kr_ipc::now_ms(),
+    };
+    let basis = drafts.basis(first.question_id).expect("the pair reads");
+    Leaving
+        .keep(|leave| drafts.begin(&draft, &basis, &[], action(81), leave))
+        .expect("the leave")
+        .expect("recorded");
+    let basis = drafts.basis(first.question_id).expect("the pair reads");
+    Leaving
+        .keep(|leave| {
+            drafts.record_send(first.question_id, &basis, &[action(81)], action(82), leave)
+        })
+        .expect("the leave")
+        .expect("recorded");
+
+    // The person sends it: the worker shows the older sends, takes the new one, and the connection
+    // lets go of the two older sends of this answer.
+    let (kept, basis) = drafts
+        .entry(first.question_id)
+        .expect("reads")
+        .expect("the answer is kept");
+    let attempt = match sending {
+        Sending::Kept => {
+            answers::send(&session, &Leaving, &drafts, &kept, &basis, Quoting::Sending).await
+        }
+        Sending::New => {
+            answers::answer(
+                &session,
+                &Leaving,
+                &drafts,
+                target(&host),
+                &first,
+                kept.answer.clone(),
+                kr_ipc::now_ms(),
+                Quoting::Sending,
+            )
+            .await
+        }
+    };
+    let Ok(Answered::Sent(resolved)) = attempt.outcome else {
+        panic!("the worker takes the send: {:?}", attempt.outcome);
+    };
+    assert_eq!(
+        resolved.state,
+        kr_protocol::question::QuestionState::Answered
+    );
+    let held: Vec<ActionId> = session
+        .submitted_actions()
+        .await
+        .iter()
+        .map(|each| each.action_id)
+        .collect();
+    assert_eq!(
+        held,
+        vec![action(83)],
+        "only the older send of the other answer is held"
+    );
 }
 
 /// KR-REQ-11.63: a cancellation whose outcome is uncertain holds back no cancellation of another
