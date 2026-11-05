@@ -33,16 +33,18 @@ use support::{
 ///
 /// KR-REQ-14.24, KR-REQ-14.23 and KR-ACC-030, the part about status and review refresh: with the
 /// fixture's helpers planted and a changed file for a filter to read, the status and the review
-/// refresh leave no sentinel. Of the planted helpers these two commands can call the clean and
-/// process filters and the fsmonitor hook. Not shown here: an external diff program, a text
-/// conversion or a pager. The refresh is a names-only diff asked not to run the first two, and the
-/// child has no terminal to page to, so neither command calls any of the three.
+/// refresh leave no sentinel. Of the planted helpers, installed Git would call the fsmonitor hook
+/// and the driver's process filter in these two commands, and the post-index-change hook in a
+/// status that writes the index. Not shown here: an external diff program, a text conversion, a
+/// pager, or the driver's clean and smudge filters, which its process filter takes the place of.
+/// The refresh is a names-only diff asked not to run the first two, and the child has no terminal
+/// to page to.
 #[test]
 fn no_planted_helper_runs_during_a_status_or_a_review_refresh() {
     let fixture = Fixture::create();
     let planted = planted_repository(fixture.work(), "planted", false);
-    // Something for a filter to be invoked on: a tracked file with an uncommitted change, an
-    // untracked file and an ignored one.
+    // A tracked file with an uncommitted change for a filter to read, and an untracked file and an
+    // ignored one for the status to report.
     write(&planted.path, "README.md", "changed after the commit\n");
     write(&planted.path, "new.txt", "untracked\n");
     write(&planted.path, ".gitignore", "generated/\n");
@@ -55,8 +57,8 @@ fn no_planted_helper_runs_during_a_status_or_a_review_refresh() {
     )
     .expect("a planted repository still opens: its helpers are neutralised, not fatal");
 
-    // The status a reviewer's inclusion preview is taken from. A clean or a process filter would
-    // run here, and an fsmonitor hook would run here.
+    // The status a reviewer's inclusion preview is taken from. An fsmonitor hook would run here,
+    // and a process filter, which Git prefers to the driver's clean and smudge filters.
     let surveyed = survey(
         fixture.service().profile(),
         &repository,
@@ -79,9 +81,9 @@ fn no_planted_helper_runs_during_a_status_or_a_review_refresh() {
     );
 
     // The review refresh: a diff of the working tree against HEAD for names only, asked with
-    // `--no-ext-diff` and `--no-textconv`. It reads the changed file through its clean filter and
-    // asks the fsmonitor hook; it calls no external diff program and no text conversion, planted or
-    // not.
+    // `--no-ext-diff` and `--no-textconv`. Installed Git would read the changed file through the
+    // driver's process filter and ask the fsmonitor hook here; it would call no external diff
+    // program and no text conversion, planted or not.
     let arguments: [&OsStr; 5] = [
         OsStr::new("diff"),
         OsStr::new("--no-ext-diff"),
