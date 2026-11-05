@@ -2763,14 +2763,14 @@ fn assert_no_wait_for_the_next_job(service: &mut DescriptionService, answered: R
     );
 }
 
-/// KR-REQ-22.21: a cancellation that a caller is told stopped a job is never counted as a job that
-/// passed its deadline, whichever way the job comes to be judged past its deadline: the process
-/// answers that it stopped after the daemon's request, the process answers on its own that the
-/// deadline passed, the process answers with a description after the deadline, or the daemon ends
-/// the process for it. The service closes the running job's handle at the moment it decides, and a
-/// cancellation accepted until then ends the job cancelled and leaves the next job no deadline
-/// wait. One that arrives after finds nothing running, and the job is counted past its deadline,
-/// so a cancellation is honoured or refused, never both.
+/// A cancellation that a caller is told stopped a job is never counted as a job that passed its
+/// deadline, whichever way the job comes to be judged past its deadline: the process answers that
+/// it stopped after the daemon's request, the process answers on its own that the deadline passed,
+/// the process answers with a description after the deadline, or the daemon ends the process for
+/// it. The service closes the running job's handle at the moment it decides, and a cancellation
+/// accepted until then ends the job cancelled and leaves the next job no deadline wait. One that
+/// arrives after finds nothing running, and the job is counted past its deadline, so a
+/// cancellation is honoured or refused, never both.
 #[test]
 fn a_cancellation_accepted_before_the_handle_closes_is_never_a_missed_deadline() {
     let stopped = Answered::Ended {
