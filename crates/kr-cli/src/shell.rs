@@ -94,17 +94,17 @@ fn installed_store() -> Option<kr_ipc::install::Store> {
 ///
 /// # Errors
 ///
-/// Returns a configuration failure when a package's manifest cannot be read, and when the store's
-/// `current` cannot be read.
+/// Returns a configuration failure when a package's manifest cannot be read, when the store's
+/// `current` cannot be read, and when no release is current.
 pub fn packages() -> Result<PackageSet> {
     if let Some(store) = installed_store() {
         let root = match store.current_shells() {
             Ok(Some(root)) => root,
-            // No release is current, so the store holds no package: the link is not walked to
+            // No release is current, so there are no packages to read: the link is not walked to
             // find that out, since a first installation could publish it meanwhile.
             Ok(None) => {
                 return Err(CliError::ShellIntegrationUnsupported(shown!(
-                    "the store at {} names no current release, so it holds no shell package",
+                    "the store at {} names no current release, so kr shell has no packages to read",
                     Shown::root(store.root())
                 )));
             }
@@ -167,7 +167,7 @@ pub fn selected<'a>(set: &'a PackageSet, shell: Option<&str>) -> Result<Vec<&'a 
 /// # Errors
 ///
 /// Returns a configuration failure when the current release has no such file, which would leave
-/// the entry sourcing nothing.
+/// the entry sourcing nothing, and when the store's `current` cannot be read.
 fn stable_entry(package: &ShellPackage) -> Result<Option<std::path::PathBuf>> {
     let Some(store) = installed_store() else {
         return Ok(None);
