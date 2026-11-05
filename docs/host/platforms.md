@@ -123,8 +123,9 @@ Then `kr doctor` reports `survives_logout` for the headless profile instead of
 service manager when it started. A daemon that started its workers as detached processes goes on
 reporting `no_service_manager` after lingering is enabled, and enabling it moves no running worker
 into the service manager: stop that daemon and start it again where the service manager answers.
-Turning lingering off again is `loginctl disable-linger "$USER"`, and any headless session still
-running then ends with the next logout.
+A session created after that runs under the service manager, and one already running stays a
+detached process. Turning lingering off again is `loginctl disable-linger "$USER"`, and a headless
+session that the service manager runs then ends when the user's last login session ends.
 
 ## What a reboot does
 
