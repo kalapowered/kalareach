@@ -87,10 +87,11 @@ fn installed_store() -> Option<kr_ipc::install::Store> {
 ///
 /// A kr of an installed release reads the current release's packages: those are the packages a new
 /// session is started with, whichever release this kr is. The release `current` names is read
-/// once and every file of the set is then read in that release, so a switch while the set is read
-/// cannot give it a shell of one release and a shell of another, or a package that looks missing;
-/// the executable a package names is a path with no link in it too. Anywhere else, the packages
-/// the build writes, or those [`PACKAGE_ROOT_VARIABLE`] names.
+/// once and held while the set is read, and every file of the set is read in that release, so a
+/// switch while the set is read cannot give it a shell of one release and a shell of another, or a
+/// package that looks missing, and an update that removes releases cannot take that release from
+/// under the read; the executable a package names is a path with no link in it too. Anywhere else,
+/// the packages the build writes, or those [`PACKAGE_ROOT_VARIABLE`] names.
 ///
 /// # Errors
 ///
@@ -98,8 +99,8 @@ fn installed_store() -> Option<kr_ipc::install::Store> {
 /// `current` cannot be read, and when no release is current.
 pub fn packages() -> Result<PackageSet> {
     if let Some(store) = installed_store() {
-        let root = match store.current_shells() {
-            Ok(Some(root)) => root,
+        let current = match store.hold_current() {
+            Ok(Some(current)) => current,
             // No release is current, so there are no packages to read: the link is not walked to
             // find that out, since a first installation could publish it meanwhile.
             Ok(None) => {
@@ -114,6 +115,7 @@ pub fn packages() -> Result<PackageSet> {
                 )));
             }
         };
+        let root = current.shells();
         return PackageSet::discover(&root).map_err(|fault| {
             CliError::ShellIntegrationUnsupported(crate::shown::package_fault(&fault, &root))
         });
@@ -180,15 +182,20 @@ fn stable_entry(package: &ShellPackage) -> Result<Option<std::path::PathBuf>> {
         .stable_shells()
         .join(package.kind().as_str())
         .join(name);
-    // The file is looked for in the release `current` names, read once, so a switch under way
-    // cannot make a file every release carries look absent. The path written is the one through
-    // `current`, which follows every update.
-    let shells = store
-        .current_shells()
+    // The file is looked for in the release `current` names, read once and held, so a switch under
+    // way cannot make a file every release carries look absent. The path written is the one
+    // through `current`, which follows every update.
+    let current = store
+        .hold_current()
         .map_err(|error| CliError::ShellIntegrationUnsupported(crate::update::said(&error)))?;
     // With no release current nothing carries the file.
-    let carried =
-        shells.is_some_and(|shells| shells.join(package.kind().as_str()).join(name).is_file());
+    let carried = current.is_some_and(|current| {
+        current
+            .shells()
+            .join(package.kind().as_str())
+            .join(name)
+            .is_file()
+    });
     if !carried {
         return Err(CliError::ShellIntegrationUnsupported(shown!(
             "the current release has no {} startup entry at {}, which the startup file of an \

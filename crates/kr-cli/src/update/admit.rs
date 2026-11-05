@@ -36,14 +36,13 @@
 //! is current ([`run_as_current`]). A refusal names that copy, which takes every command.
 
 use std::convert::Infallible;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use kr_client::shown;
 use kr_client::shown::Shown;
-use kr_ipc::install::{Program, Running, Store};
+use kr_ipc::install::{CurrentRelease, Program, Running, Store};
 use kr_protocol::update::ReleaseName;
 
 use super::{install, release, said};
@@ -96,11 +95,12 @@ pub fn run_as_current() -> Result<()> {
     Err(start_stores_kr(&store))
 }
 
-/// The `kr` of the release `current` names, with the link read once. The path has no link in it,
-/// so the start that follows walks nothing a switch replaces and runs the release that was read.
-fn current_kr(store: &Store) -> std::result::Result<PathBuf, Shown> {
-    match store.current_program(Program::Kr) {
-        Ok(Some(program)) => Ok(program),
+/// The release `current` names, read once and held. Its `kr` has no link in its path, so the start
+/// that follows walks nothing a switch replaces and runs the release that was read, and the release
+/// stays on disk until that `kr` holds it itself, though updates collect releases meanwhile.
+fn current_release(store: &Store) -> std::result::Result<CurrentRelease, Shown> {
+    match store.hold_current() {
+        Ok(Some(current)) => Ok(current),
         Ok(None) => Err(shown!(
             "the store at {} names no current release",
             Shown::root(store.root())
@@ -112,8 +112,8 @@ fn current_kr(store: &Store) -> std::result::Result<PathBuf, Shown> {
 /// Starts the store's `kr` on this command's arguments, in place of this process. It returns only
 /// the failure to do so.
 fn start_stores_kr(store: &Store) -> CliError {
-    let program = match current_kr(store) {
-        Ok(program) => program,
+    let current = match current_release(store) {
+        Ok(current) => current,
         Err(why) => {
             return CliError::Other(shown!(
                 "the release this host keeps could not be started: {}",
@@ -125,9 +125,10 @@ fn start_stores_kr(store: &Store) -> CliError {
     // offered as an update, or the reason an update waits) is lost: the program that replaces this
     // process knows nothing of it, and the command goes on in that program, as it does after any
     // line that standard error refuses.
-    let error = std::process::Command::new(program)
-        .args(std::env::args_os().skip(1))
-        .exec();
+    let mut command = std::process::Command::new(current.program(Program::Kr));
+    command.args(std::env::args_os().skip(1));
+    // The program starts already holding the release.
+    let error = current.into_pin().exec(&mut command);
     CliError::Other(shown!(
         "the release this host keeps could not be started: {}",
         Shown::io(&error)
@@ -338,14 +339,16 @@ fn pack_and_hand(
     let top = format!("kalareach-{}-{release}", release::this_target());
     let archive = staging.join(format!("{top}.tar.gz"));
     release::pack_tree(tree, &top, &archive)?;
-    let program = current_kr(store).map_err(|why| {
+    // Held until the update has ended, which is longer than the start needs: the update's own `kr`
+    // holds the release from its first moment.
+    let current = current_release(store).map_err(|why| {
         CliError::Other(shown!(
             "the current release's kr could not be started to take in the release at {}: {}",
             Shown::root(tree),
             why
         ))
     })?;
-    std::process::Command::new(program)
+    std::process::Command::new(current.program(Program::Kr))
         .args(["host", "update", "--archive"])
         .arg(&archive)
         .stdin(Stdio::null())

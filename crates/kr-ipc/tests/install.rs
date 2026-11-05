@@ -288,16 +288,12 @@ fn what_the_host_reads_from_current_once_is_of_one_release_though_a_switch_falls
 
     // The control: the host's two looks through the link, with a switch between them.
     let first = marker(&test.store.stable_shells(), "zsh");
-    let program = test
+    let current = test
         .store
-        .current_program(Program::Kr)
+        .hold_current()
         .expect("current is readable")
         .expect("a release is current");
-    let shells = test
-        .store
-        .current_shells()
-        .expect("current is readable")
-        .expect("a release is current");
+    let (program, shells) = (current.program(Program::Kr), current.shells());
     test.switch(&two);
     let second = marker(&test.store.stable_shells(), "bash");
     assert_eq!(
@@ -321,10 +317,8 @@ fn what_the_host_reads_from_current_once_is_of_one_release_though_a_switch_falls
         "neither path has the link in it"
     );
     // A read after the switch names the other release.
-    assert_eq!(
-        test.store.current_program(Program::Kr).expect("reads"),
-        Some(test.store.release_program(&two, Program::Kr))
-    );
+    let after = test.store.hold_current().expect("reads");
+    assert_eq!(after.as_ref().map(|after| after.release()), Some(&two));
 }
 
 /// KR-REQ-26.09: a program the host starts from the release `current` names runs that release,
@@ -350,11 +344,12 @@ fn a_program_started_from_the_release_current_names_runs_that_release_through_sw
     test.install(&two);
     test.switch(&one);
     for start in 0..STARTS {
-        let program = test
+        let current = test
             .store
-            .current_program(Program::Kr)
+            .hold_current()
             .expect("current is readable")
             .expect("a release is current");
+        let program = current.program(Program::Kr);
         // The release the read named, from the path it returned.
         let named = program
             .parent()
@@ -428,11 +423,12 @@ fn the_release_a_command_reads_for_a_start_is_there_to_start_after_two_updates_c
     test.switch(&one);
 
     // The command reads `current` for its start.
-    let program = test
+    let current = test
         .store
-        .current_program(Program::Kr)
+        .hold_current()
         .expect("current is readable")
         .expect("a release is current");
+    let program = current.program(Program::Kr);
     assert_eq!(program, test.store.release_program(&one, Program::Kr));
 
     // It is paused. Two updates fall, and the second removes the release that is no longer needed.
@@ -472,6 +468,11 @@ fn the_release_a_command_reads_for_a_start_is_there_to_start_after_two_updates_c
     // Once the program has ended and the command has let go, nothing holds the release.
     std::fs::write(talk.join("end"), b"").expect("end");
     assert!(child.wait().expect("the program ends").success());
+    assert!(
+        !test.store.retire(&one, &update).expect("asks"),
+        "the command still holds the release it read"
+    );
+    drop(current);
     assert!(
         test.store.retire(&one, &update).expect("removes"),
         "nothing holds the release now, so it goes"

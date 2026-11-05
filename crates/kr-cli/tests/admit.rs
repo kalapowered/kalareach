@@ -530,6 +530,10 @@ fn a_package_managers_kr_hands_its_command_to_the_store_s_kr_by_the_release_s_ow
     assert!(home.first_command(&kr(&first)).0.status.success());
     let end = home.host.scratch("ends").join("end");
     make_the_stores_kr_wait(&home, &one, &end);
+    assert!(
+        !home.store.held(one.name()).expect("asks"),
+        "nothing holds the release before the command starts"
+    );
 
     let started = Started {
         child: home
@@ -552,6 +556,11 @@ fn a_package_managers_kr_hands_its_command_to_the_store_s_kr_by_the_release_s_ow
         !path.starts_with(home.store.current_link()),
         "and not through the link"
     );
+    // The stand-in holds nothing of its own, so the release is held by what the command handed on.
+    assert!(
+        home.store.held(one.name()).expect("asks"),
+        "the store's kr starts already holding its release"
+    );
 }
 
 /// KR-REQ-26.09: a package manager's `kr` that hands its release to the current release as an
@@ -568,6 +577,10 @@ fn a_package_managers_kr_starts_the_current_release_s_kr_for_an_update_by_its_ow
     let end = home.host.scratch("ends").join("end");
     make_the_stores_kr_wait(&home, &one, &end);
 
+    assert!(
+        !home.store.held(one.name()).expect("asks"),
+        "nothing holds the release before the command starts"
+    );
     let second = home.prefix("Cellar", &two);
     let mut started = Started {
         child: home
@@ -606,6 +619,11 @@ fn a_package_managers_kr_starts_the_current_release_s_kr_for_an_update_by_its_ow
             ][..]
         ),
         "for an update from the archive"
+    );
+    // The stand-in holds nothing of its own, so the command holds the release while it waits.
+    assert!(
+        home.store.held(one.name()).expect("asks"),
+        "the release is held until the update has ended"
     );
     // The update ends, and the command goes on as the release that is current.
     std::fs::write(&end, b"").expect("the stand-in ends");

@@ -780,7 +780,8 @@ pub fn daemon_program() -> Result<PathBuf> {
 }
 
 /// The control daemon to start now: [`daemon_program`], except that a command of an installed
-/// release starts the daemon of the release `current` names, with the link read once.
+/// release starts the daemon of the release `current` names, with the link read once, and the hold
+/// that keeps that release on disk until the daemon has a hold of its own.
 ///
 /// The path has no link in it, so the start walks nothing a switch replaces, and it starts the one
 /// release that was read. A daemon of a release that is not current when it takes its environment
@@ -791,16 +792,19 @@ pub fn daemon_program() -> Result<PathBuf> {
 /// Returns [`CliError::HostUnavailable`] when where this command is installed cannot be read, or
 /// when the store has no current release to start the daemon of.
 #[cfg(unix)]
-fn daemon_program_now() -> Result<PathBuf> {
+fn daemon_program_now() -> Result<(PathBuf, Option<kr_ipc::install::CurrentRelease>)> {
     let recorded = daemon_program()?;
     let Some(store) = kr_ipc::install::this_process()
         .ok()
         .and_then(kr_ipc::install::Running::store)
     else {
-        return Ok(recorded);
+        return Ok((recorded, None));
     };
-    match store.current_program(kr_ipc::install::Program::Controller) {
-        Ok(Some(program)) => Ok(program),
+    match store.hold_current() {
+        Ok(Some(current)) => Ok((
+            current.program(kr_ipc::install::Program::Controller),
+            Some(current),
+        )),
         Ok(None) => Err(CliError::HostUnavailable(shown!(
             "the standalone start runs the control daemon of the current release, and the store \
              at {} names none",
@@ -824,7 +828,8 @@ async fn standalone(
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
 ) -> Result<(LocalClient, Option<Started>)> {
-    let program = daemon_program_now()?;
+    // Held until the daemon answers or the start fails; the daemon takes its own hold on starting.
+    let (program, _held) = daemon_program_now()?;
     if !program.is_file() {
         return Err(CliError::HostUnavailable(shown!(
             "the standalone start runs the control daemon installed beside this command, {}, and \

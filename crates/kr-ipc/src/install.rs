@@ -25,10 +25,12 @@
 //! and holding nothing, until the next switch takes it away.
 //!
 //! A path through `current` is for what is written down for something else to start later. A
-//! program the host starts itself, now, from the release `current` names reads the link once
-//! ([`Store::current_program`], [`Store::current_shells`]) and uses the path of the release it
-//! read, which has no link in it: a path walk through a link that a rename replaces rarely answers
-//! that the path is missing, on Linux, and two walks through it can name two releases.
+//! program the host starts itself, now, from the release `current` names reads the link once and
+//! holds the release it read ([`Store::hold_current`]), and uses the path of that release, which has
+//! no link in it: a path walk through a link that a rename replaces rarely answers that the path is
+//! missing, on Linux, and two walks through it can name two releases. The hold keeps the release on
+//! disk from the read until the program started has a hold of its own, however many updates fall
+//! between the two.
 //!
 //! # Which release a process runs
 //!
@@ -447,7 +449,7 @@ impl Running {
     /// records for later names, such as the service definition that starts the control daemon.
     ///
     /// Outside a store it is the program beside this one, as before. A start the host makes itself,
-    /// now, does not use it: see [`Store::current_program`].
+    /// now, does not use it: see [`Store::hold_current`].
     #[must_use]
     pub fn stable(&self, program: Program) -> PathBuf {
         match self {
@@ -1009,7 +1011,7 @@ impl Store {
     ///
     /// This is the path to write down for a program that will be started later, by something that
     /// is not this host: it follows every update. A start the host makes itself, now, uses
-    /// [`Store::current_program`] instead.
+    /// [`Store::hold_current`] instead.
     #[must_use]
     pub fn stable(&self, program: Program) -> PathBuf {
         self.current_link().join("bin").join(program.file_name())
@@ -1018,7 +1020,7 @@ impl Store {
     /// The current release's qualified shell packages, through `current`.
     ///
     /// Like [`Store::stable`], this is a path to write down. Reading the packages now uses
-    /// [`Store::current_shells`].
+    /// [`Store::hold_current`].
     #[must_use]
     pub fn stable_shells(&self) -> PathBuf {
         self.current_link().join("shells")
@@ -1032,44 +1034,57 @@ impl Store {
             .join(program.file_name())
     }
 
-    /// The program of the release `current` names, for a start the host makes itself.
+    /// Reads `current` once and holds the release it names, for a command that starts a program of
+    /// that release or reads its files.
     ///
-    /// The link is read once and the path returned has none in it, so the start walks a path that
-    /// no switch replaces and runs the one release the read named. A path through `current`
-    /// (`stable`) is resolved again at every step of a walk: on Linux a walk through a link that a
-    /// rename replaces rarely answers that a path is missing, and two walks through it, such as
-    /// the programs of one start, can name two releases. `None` when no release is current.
+    /// The paths of the release come from the value returned ([`CurrentRelease::program`],
+    /// [`CurrentRelease::shells`]) and have no link in them, so the start or the read walks nothing
+    /// a switch replaces and meets the one release that was read. On Linux a walk through a link
+    /// that a rename replaces rarely answers that a path is missing, and two walks through it, such
+    /// as the programs of one start, can name two releases. The release stays on disk for as long as
+    /// the value lives, though updates switch and remove releases meanwhile: a start that waits
+    /// for two updates to collect its release would otherwise find nothing to start. A start that
+    /// replaces the process hands the hold to the program ([`CurrentRelease::into_pin`], then
+    /// [`Pin::exec`]).
     ///
-    /// # Errors
-    ///
-    /// Returns what [`Store::current`] returns.
-    pub fn current_program(&self, program: Program) -> Result<Option<PathBuf>> {
-        Ok(self
-            .current()?
-            .map(|release| self.release_program(&release, program)))
-    }
-
-    /// The qualified shell packages of the release `current` names, read once like
-    /// [`Store::current_program`]: every file of one package set is then in one release.
+    /// A release that is removed between the read and the hold was not current any more, and the
+    /// link is read again. `None` when no release is current.
     ///
     /// # Errors
     ///
-    /// Returns what [`Store::current`] returns.
-    pub fn current_shells(&self) -> Result<Option<PathBuf>> {
-        Ok(self
-            .current()?
-            .map(|release| self.release_directory(&release).join("shells")))
+    /// Returns what [`Store::current`] and [`Store::pin`] return, and [`InstallError::Replaced`]
+    /// when every release the link was read to name was gone or being removed before it could be
+    /// held.
+    pub fn hold_current(&self) -> Result<Option<CurrentRelease>> {
+        for _ in 0..HOLD_CURRENT_ATTEMPTS {
+            let Some(release) = self.current()? else {
+                return Ok(None);
+            };
+            if let Some(pin) = self.pin(&release)? {
+                return Ok(Some(CurrentRelease {
+                    store: self.clone(),
+                    release,
+                    pin,
+                }));
+            }
+        }
+        Err(InstallError::Replaced {
+            path: self.current_link(),
+            reason: "names a release that is gone or being removed",
+        })
     }
 
     /// The path [`Store::stable`] names, where the program is there.
     ///
     /// Whether it is there is asked of the release `current` names, read once, so a switch under
     /// way never makes a program every release carries look absent. What is written down stays the
-    /// stable path.
+    /// stable path. The answer is for what is written down; a start uses [`Store::hold_current`].
     #[must_use]
     pub fn stable_if_present(&self, program: Program) -> Option<PathBuf> {
-        let there = self.current_program(program).ok().flatten()?.is_file();
-        there.then(|| self.stable(program))
+        let release = self.current().ok().flatten()?;
+        self.release_program(&release, program)
+            .is_file()
+            .then(|| self.stable(program))
     }
 
     /// The store a path written down for a program through `current` ([`Store::stable`]) belongs
@@ -1865,6 +1880,48 @@ pub struct RecordedDocument {
     pub path: PathBuf,
     /// The record that says so.
     pub record: PathBuf,
+}
+
+/// How many times [`Store::hold_current`] reads `current` again for a release that was removed
+/// before it could be held. A release goes only once it is not current, so a second read finds
+/// another; the count only keeps a store whose current release cannot be held from being read for
+/// ever.
+const HOLD_CURRENT_ATTEMPTS: usize = 3;
+
+/// The release `current` named when it was read, held for as long as this value lives.
+///
+/// The paths it gives have no link in them: see [`Store::hold_current`].
+#[derive(Debug)]
+pub struct CurrentRelease {
+    store: Store,
+    release: ReleaseName,
+    pin: Pin,
+}
+
+impl CurrentRelease {
+    /// The release `current` named.
+    #[must_use]
+    pub const fn release(&self) -> &ReleaseName {
+        &self.release
+    }
+
+    /// The release's own copy of a program.
+    #[must_use]
+    pub fn program(&self, program: Program) -> PathBuf {
+        self.store.release_program(&self.release, program)
+    }
+
+    /// The release's qualified shell packages.
+    #[must_use]
+    pub fn shells(&self) -> PathBuf {
+        self.store.release_directory(&self.release).join("shells")
+    }
+
+    /// The hold, to hand to the program that takes this process's place ([`Pin::exec`]).
+    #[must_use]
+    pub fn into_pin(self) -> Pin {
+        self.pin
+    }
 }
 
 /// A shared hold on a release of a store, taken for a program that is about to start from it.
