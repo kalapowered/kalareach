@@ -462,14 +462,15 @@ async fn kr_req_25_10_an_invitation_of_a_session_that_has_ended_activates_nothin
 /// all: the order of events decides the case, and no limit on how long the close takes. The share
 /// ends because the host's clocks are moved past its end, and not by the case waiting for it. The
 /// clocks are moved in two steps, and after the first, which leaves the share standing, the
-/// connection still answers a read. A host that closed a connection because its clocks moved is
-/// caught there when its look at the grants comes before the case goes on; the case cannot see
-/// that the look has come, so a host whose look comes later is not caught by it. The
-/// host looks at the grants a connection stands on again at least once every 15 seconds, so the
-/// close can come that long after the move. [`RawDevice::answered_before_closing`] is given a
-/// guard for a case that went wrong and decides nothing for a run that closes the connection.
-/// (The end of the device's own pairing grant is a day away, so nothing but the share's end can
-/// end the connection here.)
+/// connection still answers a read: the case reads until the host has looked at the grants twice
+/// since the move (the first look counted can have been under way as the clocks moved; the second
+/// began after it), and a host that closed the connection because its clocks moved is caught at
+/// the look that does. The count is the host's, and the device's connection is the only one the
+/// host watches here. The host looks at the grants a connection stands on again at least once
+/// every 15 seconds, so the case waits for the looks as long as that takes, with a guard for a
+/// case that went wrong. [`RawDevice::answered_before_closing`] is given a guard too and decides
+/// nothing for a run that closes the connection. (The end of the device's own pairing grant is a
+/// day away, so nothing but the share's end can end the connection here.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_pending() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -525,21 +526,35 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
             &kr_protocol::session::SessionReadParams { session_id },
         )
         .await;
-    // The clocks move, short of the share's end, and the connection goes on: it answers a read. A
-    // host that closed a connection because its clocks moved would close it at its next look at the
-    // grants, which this does not wait for. (The close carries one code and reason whatever ended
-    // the connection, so the device cannot read the cause from it.)
+    // The clocks move, short of the share's end, and the connection goes on: it answers a read, and
+    // goes on answering until the host has looked at the grants it stands on twice since the move,
+    // which a host that closed a connection because its clocks moved would do at its next look.
+    // (The close carries one code and reason whatever ended the connection, so the device cannot
+    // read the cause from it.)
     moved.advance(CLOCK_STEP);
-    assert!(
-        connection
-            .try_read(
-                Method::SessionRead,
-                &kr_protocol::session::SessionReadParams { session_id },
-            )
-            .await
-            .is_some(),
-        "the connection was closed by a move of the clocks that left its share standing"
-    );
+    let looks_at_the_move = host.controller().grant_watch_looks();
+    within(
+        "the host's looks at the grants after the clocks moved",
+        async {
+            loop {
+                assert!(
+                    connection
+                        .try_read(
+                            Method::SessionRead,
+                            &kr_protocol::session::SessionReadParams { session_id },
+                        )
+                        .await
+                        .is_some(),
+                    "the connection was closed by a move of the clocks that left its share standing"
+                );
+                if host.controller().grant_watch_looks() >= looks_at_the_move + 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        },
+    )
+    .await;
 
     let (arrived, go) = host.controller().sharing().grants().pause_before_effect();
     let held = connection

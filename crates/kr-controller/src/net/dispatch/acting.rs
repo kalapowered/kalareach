@@ -329,6 +329,9 @@ impl RemoteConnection {
                 .flatten()
             }))
             .min();
+            // The grants stand: this look is done, and the wait for the next begins.
+            #[cfg(feature = "testing")]
+            self.controller.note_grant_watch_look();
             match soonest {
                 // A clock can step forward and end a grant sooner than the time it has left, so
                 // the wait is bounded and the grants are looked at again.

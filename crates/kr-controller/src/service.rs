@@ -509,6 +509,10 @@ pub struct Controller {
     /// build.
     #[cfg(feature = "testing")]
     device_watch_looks: std::sync::atomic::AtomicU64,
+    /// How many looks at the grants a connection stands on have found them standing, counted over
+    /// every connection. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    grant_watch_looks: std::sync::atomic::AtomicU64,
     /// How many passes privacy mode's tick has finished. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     privacy_passes: Arc<std::sync::atomic::AtomicU64>,

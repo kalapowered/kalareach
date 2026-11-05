@@ -1137,6 +1137,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             device_watch_looks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
+            grant_watch_looks: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
             privacy_passes: Arc::default(),
             #[cfg(feature = "testing")]
             privacy_tick_waiting: Arc::default(),
@@ -1660,6 +1662,22 @@ impl Controller {
     pub fn device_watch_looks(&self) -> u64 {
         self.device_watch_looks
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many looks at the grants a connection stands on have found them standing, counted over
+    /// every connection: one is counted when a connection has looked and goes on to wait for the
+    /// next. For this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn grant_watch_looks(&self) -> u64 {
+        self.grant_watch_looks
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Counts a look at the grants a connection stands on that found them standing.
+    #[cfg(feature = "testing")]
+    pub(crate) fn note_grant_watch_look(&self) {
+        self.grant_watch_looks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Starts privacy mode's tick, which runs until the daemon goes.
