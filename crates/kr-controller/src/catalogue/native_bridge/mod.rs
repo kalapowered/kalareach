@@ -841,8 +841,8 @@ impl NativeBridges {
             .filter(|path| path.is_absolute())
             .ok_or_else(|| {
                 format!(
-                    "this installation has no {FORWARDER} beside its daemon, so the registration \
-                     would start a forwarder this host cannot name"
+                    "this installation has no {FORWARDER} to start, so the registration would \
+                     start a forwarder this host cannot name"
                 )
             })?;
         let mut removal = removal_of(recipe)?;

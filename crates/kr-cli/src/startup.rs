@@ -1060,12 +1060,13 @@ async fn managed(
 /// definition: one that is missing, that is not this environment's own, or that is not the one
 /// this installation registers is `HOST_NOT_CONFIGURED` with the setup action, and nothing is
 /// claimed or run. Then a request to start the daemon is left for the task's starter, and the task
-/// is run. The starter takes the request and starts the daemon [`daemon_program`] names, with its
-/// output appended to the log; the Task Scheduler, not this command, is its creator, so it is in
-/// none of this command's jobs. For a command of an installed release that path goes through the
-/// store's `current` junction, which the starter walks as it starts the daemon; a start at the
-/// moment a switch replaces the junction has not been measured on Windows. The daemon inherits the
-/// environment the Task Scheduler gives the user, as every process a task starts does.
+/// is run. The starter takes the request and starts the daemon, with its output appended to the log;
+/// the Task Scheduler, not this command, is its creator, so it is in none of this command's jobs.
+/// For a command of an installed release the task's program goes through the store's `current`
+/// junction, which the Task Scheduler walks as it starts the starter; a start at the moment a switch
+/// replaces the junction has not been measured on Windows. The starter starts the daemon by its own
+/// image path. The daemon inherits the environment the Task Scheduler gives the user, as every
+/// process a task starts does.
 ///
 /// The start has one deadline: the request lapses when this command stops waiting, and the command
 /// withdraws it before it says why no daemon answered, so no daemon is started for it after the

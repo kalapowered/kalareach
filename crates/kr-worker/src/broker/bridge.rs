@@ -140,8 +140,8 @@ impl InstalledBridge {
     ///
     /// The process must run the installed forwarder. Where that is registered through a store's
     /// `current`, the `kr-hook` of any release the store keeps is it, since an update can switch
-    /// between the application's start of the forwarder and its hello; the forwarder of the
-    /// worker's own release is admitted beside the installed one in every case.
+    /// between the application's start of the forwarder and its hello. The forwarder of the
+    /// worker's own release is admitted beside the installed one.
     ///
     /// # Errors
     ///
@@ -213,7 +213,7 @@ impl InstalledBridge {
 ///
 /// What the check protects is that the connecting process is the host's own forwarder: a program the
 /// host installed, whichever release it is of. A forwarder registered by one release's own path
-/// names that one, and only the comparison with it admits a process.
+/// names that one, and this rule admits none for it.
 fn running_is_a_forwarder_the_store_keeps(forwarder: &Path, running: &Path) -> bool {
     kr_ipc::install::Store::of_stable_path(forwarder, kr_ipc::install::Program::Hook)
         .is_some_and(|store| store.keeps_program(running, kr_ipc::install::Program::Hook))
