@@ -7860,6 +7860,112 @@ async fn a_setup_whose_answer_was_lost_is_found_by_the_next_try_which_sends_noth
     assert_eq!(web.bundle_write(&computer.context.bundle_locator), written);
 }
 
+/// A host that refuses the setup for now has recorded nothing and may yet: the entry the bundle
+/// makes for its archive stays, as it does for an answer that was lost, and the next try finds the
+/// host as it is. A host that refuses it in its definite word has recorded nothing and will not, so
+/// the entry is taken out again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_setup_the_host_refuses_for_now_keeps_the_archive_the_bundle_names() {
+    use kr_client::recovery::{
+        HostBackups, HostCover, RecoveryError, SessionHost, cover_host_archive,
+    };
+
+    /// A host that answers the setup with this refusal and does nothing.
+    #[derive(Debug)]
+    struct Refusing(SessionHost, ErrorCode);
+
+    impl HostBackups for Refusing {
+        fn status(&self) -> ServiceFuture<'_, BackupStatusResult> {
+            self.0.status()
+        }
+
+        fn enable<'a>(
+            &'a self,
+            _params: &'a BackupEnableParams,
+        ) -> ServiceFuture<'a, BackupEnableResult> {
+            let code = self.1;
+            Box::pin(async move {
+                Err(kr_client::ClientError::Host(ProtocolError::new(
+                    code,
+                    "the host answered".to_owned(),
+                )))
+            })
+        }
+    }
+
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let mut computer = Computer::with_recovery_on(&rig).await;
+    let before = computer.bundle_at(&rig).collections.len();
+
+    let definite = Refusing(
+        the_host_as_the_application_reaches_it(&rig).await,
+        ErrorCode::PermissionDenied,
+    );
+    let refused = cover_host_archive(
+        &definite,
+        &mut computer.bundles,
+        &computer.seed,
+        false,
+        kr_ipc::now_ms(),
+    )
+    .await
+    .expect_err("the host refuses the setup");
+    assert!(matches!(refused, RecoveryError::Service(_)), "{refused:?}");
+    assert_eq!(
+        computer.bundle_at(&rig).collections.len(),
+        before,
+        "a definite refusal takes the entry out again"
+    );
+
+    let for_now = Refusing(
+        the_host_as_the_application_reaches_it(&rig).await,
+        ErrorCode::RateLimited,
+    );
+    let unsettled = cover_host_archive(
+        &for_now,
+        &mut computer.bundles,
+        &computer.seed,
+        false,
+        kr_ipc::now_ms(),
+    )
+    .await
+    .expect_err("the host cannot take the setup now");
+    assert!(
+        matches!(unsettled, RecoveryError::HostOutcomeUnknown { .. }),
+        "{unsettled:?}"
+    );
+    assert_eq!(
+        computer.bundle_at(&rig).collections.len(),
+        before + 1,
+        "a refusal for now leaves the entry, as a lost answer does"
+    );
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+
+    // The next try, on the host as it is, sets it up.
+    let host = the_host_as_the_application_reaches_it(&rig).await;
+    let covered = cover_host_archive(
+        &host,
+        &mut computer.bundles,
+        &computer.seed,
+        false,
+        kr_ipc::now_ms(),
+    )
+    .await
+    .expect("the host is covered");
+    let HostCover::Covered(covered) = covered else {
+        panic!("the host was left: {covered:?}");
+    };
+    assert!(!covered.already);
+    let row = rig
+        .controller
+        .backup()
+        .setup()
+        .expect("a read")
+        .expect("a setup");
+    assert_eq!(row.record.archive_id, covered.archive_id);
+}
+
 /// KR-REQ-20.18: an archive the host made exports as one file of ciphertext that this computer
 /// writes after reading the service with its account, and a host that holds nothing but the kit and
 /// that file restores the session the host backed up, byte for byte.
