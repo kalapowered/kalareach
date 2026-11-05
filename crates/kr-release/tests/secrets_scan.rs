@@ -613,14 +613,17 @@ enum Holds {
     Command(&'static str),
     /// A line of the step, as a whole: a value of its `env`.
     Line(&'static str),
+    /// A command of the step, as a whole, that the step has this many times.
+    Every(&'static str, usize),
 }
 
 /// The steps that keep, and what each keeps: the path or the command that the file holds today,
 /// which the scan of its job read or is taken to have read. A path is not derived from the scan's:
 /// the Windows tree upload keeps `tree`, the directory above the scanned `tree/$TOP`. The publish
 /// step of the Windows `release` job is held where it takes its folder (the `env` value and the
-/// command that makes it a path); the commands further down that read the folder are not looked at.
-static HOLDS: [(&str, &str, Holds); 20] = [
+/// command that makes it a path) and in the two loops that read the folder; its other commands that
+/// name the folder are not looked at.
+static HOLDS: [(&str, &str, Holds); 21] = [
     (
         "release-tree.yml",
         "Keep the tree for a release",
@@ -728,6 +731,11 @@ static HOLDS: [(&str, &str, Holds); 20] = [
         "release-windows.yml",
         "Publish the release",
         Holds::Command(r#"release_dir="$(cygpath -u "$KR_RELEASE_DIR")""#),
+    ),
+    (
+        "release-windows.yml",
+        "Publish the release",
+        Holds::Every(r#"for file in "$release_dir"/*; do"#, 2),
     ),
 ];
 
@@ -1420,6 +1428,13 @@ fn problems_in(name: &str, text: &str) -> Vec<Problem> {
                     .iter()
                     .any(|code| code.trim() == *line),
             ),
+            Holds::Every(command, times) => {
+                let commands = workflow.run(&step.range);
+                (
+                    step.range.start,
+                    commands.iter().filter(|c| c.text == *command).count() == *times,
+                )
+            }
         };
         if !held {
             refuse(&mut found, Refusal::KeptPath, at, workflow.lines[at]);
@@ -1582,6 +1597,16 @@ impl Mutant {
         let hits: Vec<usize> = range.filter(|&at| self.lines[at].contains(old)).collect();
         assert_eq!(hits.len(), 1, "{old:?} in {name:?}");
         self.lines[hits[0]] = self.lines[hits[0]].replacen(old, new, 1);
+    }
+
+    /// Changes the `copy`th line of a step that holds `old`, counting from the first.
+    fn replace_copy_in_step(&mut self, name: &str, old: &str, copy: usize, new: &str) {
+        self.changes
+            .push(format!("copy {copy} of {old:?} is {new:?} in {name:?}"));
+        let (range, _) = self.step(name);
+        let hits: Vec<usize> = range.filter(|&at| self.lines[at].contains(old)).collect();
+        let at = *hits.get(copy).expect("a copy of the command");
+        self.lines[at] = self.lines[at].replacen(old, new, 1);
     }
 
     fn remove_step(&mut self, name: &str) {
@@ -1814,7 +1839,8 @@ fn a_workflow_that_keeps_what_a_failed_scan_refused_is_refused() {
 }
 
 /// KR-REQ-26.41: a step that keeps more than its scan read is refused: an upload from a wider path,
-/// and the command that packs the tree from another place.
+/// the command that packs the tree from another place, the value of a step's `env` that names the
+/// folder it publishes, and either of the loops that read that folder.
 #[test]
 fn a_step_that_keeps_more_than_its_scan_read_is_refused() {
     for (workflow, step, holds) in &HOLDS {
@@ -1838,6 +1864,20 @@ fn a_step_that_keeps_more_than_its_scan_read_is_refused() {
                     line,
                     &format!("{key}: ${{{{ runner.temp }}}}/staging"),
                 );
+            }
+            Holds::Every(command, times) => {
+                // Each copy in turn reads another folder; the others stay as they are.
+                for copy in 0..*times {
+                    let mut mutant = Mutant::of(workflow);
+                    mutant.replace_copy_in_step(
+                        step,
+                        command,
+                        copy,
+                        &command.replacen("$release_dir", "$HOME", 1),
+                    );
+                    mutant.is_refused_as(Refusal::KeptPath);
+                }
+                continue;
             }
         }
         mutant.is_refused_as(Refusal::KeptPath);
