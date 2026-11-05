@@ -7066,9 +7066,10 @@ impl WorkerService {
     ///   request names that outcome and the revision it was read at. That is what stops a service
     ///   from choosing a fresh identifier to evade de-duplication. An answer to a question is
     ///   held back by an uncertain answer to that question alone, not by one to another question
-    ///   of the session, and a cancellation of a question likewise by an uncertain cancellation
-    ///   of it, except that an uncertain request whose question cannot be read holds back every
-    ///   request of its kind ([`Self::uncertain_outcome_in_the_way`]).
+    ///   of the session, and a cancellation, a question and an alert likewise by an uncertain
+    ///   request of the same method with the same identity, except that an uncertain request whose
+    ///   identity cannot be read holds back every request of its method
+    ///   ([`Self::uncertain_outcome_in_the_way`]).
     /// * An actor holds at most eight admitted, unsettled mutations at once, lowered by whatever
     ///   the connection negotiated.
     fn check_admission_limits(
@@ -7137,14 +7138,13 @@ impl WorkerService {
     /// Returns the actor's uncertain outcome that a fresh `mutation` for `subject` has to show, if
     /// there is one.
     ///
-    /// It is the newest uncertain outcome of the subject, except for an answer to a question and a
-    /// cancellation of one: the subject of every answer in a session is the same, and so is the
-    /// subject of every cancellation, and a request about one question asks for something else than
-    /// a request about another. Only an uncertain request of the same kind about the question this
-    /// request names stands in its way. An uncertain request whose question cannot be read stands in
-    /// the way of every request of its kind. A request whose parameters do not parse is held back by
-    /// the newest uncertain outcome of its subject, as it always was, and where nothing holds it back
-    /// validation refuses it and leaves its receipt.
+    /// It is the newest uncertain outcome of the subject, except for the methods whose subject is
+    /// shared by requests that ask for different things: an answer to a question, a cancellation of
+    /// one, a cancellation by the question's source, a question and an alert. A request about one
+    /// question, one request identifier or one alert asks for something else than a request about
+    /// another, so only an uncertain request of the same method with the same identity stands in its
+    /// way ([`Self::uncertain_with_identity`]). An uncertain request whose identity cannot be read
+    /// stands in the way of every request of its method.
     fn uncertain_outcome_in_the_way(
         journal: &crate::journal::Journal,
         actor_id: &ActorId,
@@ -7152,29 +7152,70 @@ impl WorkerService {
         mutation: &MutationRequest,
         method: Method,
     ) -> Result<Option<(kr_protocol::ids::ActionId, u64)>> {
+        use kr_protocol::question::{
+            AlertCreateParams, QuestionAnswerParams, QuestionCancelOwnParams, QuestionCancelParams,
+            QuestionCreateParams,
+        };
         match method {
-            Method::QuestionAnswer => {
-                let Ok(params) =
-                    parse::<kr_protocol::question::QuestionAnswerParams>(&mutation.params)
-                else {
-                    return journal.uncertain_for_subject(actor_id, subject);
-                };
-                journal.uncertain_for_subject_matching(actor_id, subject, |intent| {
-                    crate::action::dedup::holds_back_an_answer_to(intent, params.question_id)
-                })
-            }
-            Method::QuestionCancel => {
-                let Ok(params) =
-                    parse::<kr_protocol::question::QuestionCancelParams>(&mutation.params)
-                else {
-                    return journal.uncertain_for_subject(actor_id, subject);
-                };
-                journal.uncertain_for_subject_matching(actor_id, subject, |intent| {
-                    crate::action::dedup::holds_back_a_cancellation_of(intent, params.question_id)
-                })
-            }
+            Method::QuestionAnswer => Self::uncertain_with_identity(
+                journal,
+                actor_id,
+                subject,
+                mutation,
+                |params: &QuestionAnswerParams| params.question_id,
+            ),
+            Method::QuestionCancel => Self::uncertain_with_identity(
+                journal,
+                actor_id,
+                subject,
+                mutation,
+                |params: &QuestionCancelParams| params.question_id,
+            ),
+            Method::QuestionCancelOwn => Self::uncertain_with_identity(
+                journal,
+                actor_id,
+                subject,
+                mutation,
+                |params: &QuestionCancelOwnParams| params.question_id,
+            ),
+            Method::QuestionCreate => Self::uncertain_with_identity(
+                journal,
+                actor_id,
+                subject,
+                mutation,
+                |params: &QuestionCreateParams| params.request_id.clone(),
+            ),
+            Method::AlertCreate => Self::uncertain_with_identity(
+                journal,
+                actor_id,
+                subject,
+                mutation,
+                |params: &AlertCreateParams| params.dedup_id.clone(),
+            ),
             _ => journal.uncertain_for_subject(actor_id, subject),
         }
+    }
+
+    /// Returns the actor's newest uncertain outcome of `subject` whose request has the identity
+    /// `identity_of` reads from the parameters of `mutation`, or whose identity cannot be read.
+    ///
+    /// A request whose parameters do not parse is held back by the newest uncertain outcome of its
+    /// subject, as it always was, and where nothing holds it back validation refuses it and leaves
+    /// its receipt.
+    fn uncertain_with_identity<P: kr_protocol::wire::WireMessage, I: PartialEq>(
+        journal: &crate::journal::Journal,
+        actor_id: &ActorId,
+        subject: kr_protocol::scalars::Digest256,
+        mutation: &MutationRequest,
+        identity_of: impl Fn(&P) -> I,
+    ) -> Result<Option<(kr_protocol::ids::ActionId, u64)>> {
+        let Ok(params) = parse::<P>(&mutation.params) else {
+            return journal.uncertain_for_subject(actor_id, subject);
+        };
+        let identity = identity_of(&params);
+        journal.uncertain_for_subject_matching(actor_id, subject, |intent| {
+            crate::action::dedup::holds_back(intent, &identity, &identity_of)
+        })
     }
 
     /// Refuses an attach by a caller whose grant does not reach the live screen.

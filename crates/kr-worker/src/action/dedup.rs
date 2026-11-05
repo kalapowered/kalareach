@@ -18,9 +18,8 @@
 use std::collections::{HashMap, VecDeque};
 
 use kr_protocol::envelope::MutationRequest;
-use kr_protocol::ids::{ActionId, ActorId, QuestionId};
+use kr_protocol::ids::{ActionId, ActorId};
 use kr_protocol::limits::MAX_OUTSTANDING_MUTATIONS;
-use kr_protocol::question::{QuestionAnswerParams, QuestionCancelParams};
 use kr_protocol::wire::WireMessage;
 
 use crate::error::{Result, WorkerError};
@@ -117,38 +116,25 @@ impl ShownReceipts {
     }
 }
 
-/// Tells whether an uncertain `question.answer` receipt holds back an answer to `question_id`.
+/// Tells whether an uncertain receipt holds back a request that is `identity` among the requests of
+/// its method.
 ///
-/// A `question.answer` shares its subject with every other answer of the session, because the
-/// subject is the target alone. What it answers is in the envelope the receipt kept, and an answer
-/// to another question is not a new identifier for the same ask, so only an uncertain answer to
-/// the same question stands in its way.
+/// The subject of some methods is the target alone, so every request of such a method in a session
+/// has the digest of every other: the answers to two questions, the cancellations of two questions,
+/// and the questions or alerts of one source. What tells them apart is in the envelope the receipt
+/// kept, and a request for something else is not a new identifier for the same ask. So only an
+/// uncertain request with the same identity stands in the way: the question an answer or a
+/// cancellation names, the request identifier a question is asked under, the de-duplication
+/// identifier an alert is raised under. `identity_of` reads it from the parameters `P` of the method.
 ///
 /// `intent` is that envelope, when the receipt still has one. A receipt that has none (privacy mode
-/// withholds it once an action settles) or whose envelope does not decode names no question, and
-/// holds the answer back: this rule refuses where it cannot tell.
+/// withholds it once an action settles), whose envelope does not decode, or whose parameters are not
+/// `P` names no identity, and holds the request back: this rule refuses where it cannot tell.
 #[must_use]
-pub fn holds_back_an_answer_to(intent: Option<&[u8]>, question_id: QuestionId) -> bool {
-    names_or_hides_question(intent, question_id, |params: &QuestionAnswerParams| {
-        params.question_id
-    })
-}
-
-/// Tells whether an uncertain `question.cancel` receipt holds back a cancellation of `question_id`,
-/// by the rule [`holds_back_an_answer_to`] states for answers.
-#[must_use]
-pub fn holds_back_a_cancellation_of(intent: Option<&[u8]>, question_id: QuestionId) -> bool {
-    names_or_hides_question(intent, question_id, |params: &QuestionCancelParams| {
-        params.question_id
-    })
-}
-
-/// Tells whether the envelope `intent` is a request for `question_id`, or names no question at all:
-/// it is absent, does not decode, or is not a request whose parameters are `P`.
-fn names_or_hides_question<P: WireMessage>(
+pub fn holds_back<P: WireMessage, I: PartialEq>(
     intent: Option<&[u8]>,
-    question_id: QuestionId,
-    question_of: impl Fn(&P) -> QuestionId,
+    identity: &I,
+    identity_of: impl Fn(&P) -> I,
 ) -> bool {
     let Some(intent) = intent else {
         return true;
@@ -159,7 +145,7 @@ fn names_or_hides_question<P: WireMessage>(
         return true;
     };
     match earlier.params.to_typed::<P>() {
-        Ok(params) => question_of(&params) == question_id,
+        Ok(params) => identity_of(&params) == *identity,
         Err(_) => true,
     }
 }
