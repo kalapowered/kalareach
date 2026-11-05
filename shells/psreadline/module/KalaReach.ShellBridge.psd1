@@ -19,6 +19,7 @@
         'Invoke-KalaReachService'
         'Invoke-KalaReachPending'
         'Invoke-KalaReachReply'
+        'Invoke-KalaReachStart'
         'Invoke-KalaReachGesture'
         'Test-KalaReachBridge'
         'Test-KalaReachCommand'

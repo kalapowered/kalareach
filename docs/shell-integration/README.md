@@ -871,7 +871,10 @@ method, and that is exactly what it cannot do:
   `not_primary_reader` when its fence or the reader no longer fits it, and otherwise with
   `editor_left`, because a line installed before the read would never run. A launch quotes the
   fence of the read it was made for, and the worker publishes this read's fence only after the
-  reader has acknowledged one, so what the module reads there is a launch for the read before. A key the person bound to a script of their own is theirs and carries no boundary, and an ordinary
+  reader has acknowledged one, so what the module reads there is a launch for the read before.
+  Outside Windows the entry does not report the reader idle. The first idle report of a read comes
+  from the handler of a key the module has queued for the editor, which runs once the editor has
+  started (see the cursor reply, below). A key the person bound to a script of their own is theirs and carries no boundary, and an ordinary
   character goes straight to the editor's own insertion, so a request that arrives at a parked
   reader is answered after its next bound key that leaves the editor's queue empty rather than
   immediately; in the Vi command table that is a bound key of the insert table or the next read-line
@@ -920,11 +923,22 @@ method, and that is exactly what it cannot do:
   as the answer to a query of a program that ended before it read it, and one still waiting in the
   lane. The host cannot take back the first, and holding the second behind the cursor reply would
   write replies out of the order of their queries. The module does not drop either: it meets an
-  answer only as keys, after the editor has read it from the terminal's input (the next item). The
-  reader proves its first fence at the entry of its read, before the editor asks that question for
-  the first time, so an answer the host writes between the two is read as part of the reply: the
-  runtime takes the answer's `ESC [` and its first `;` for the start of the reply and its digits
-  for the position, and gives the other bytes back as keys, so some of the answer reaches the line.
+  answer only as keys, after the editor has read it from the terminal's input (the next item). What
+  the module controls is when the reader first reports its queues clear. A fence proved before the
+  editor has asked its question comes before the reply, and an answer the host writes behind that
+  fence lands ahead of the reply and joins it: the runtime takes the answer's `ESC [` and its first
+  `;` for the start of the reply and its digits for the position, and gives the other bytes back as
+  keys. Some of the answer then reaches the line, and the fence the reader proves next is over a line
+  that is not empty. So outside Windows the read-line entry queues a key of the module's own in the
+  editor's key queue (`Ctrl+Alt+F24`, which no terminal sends and which the module binds where
+  nothing is bound), and the reader reports itself idle from that key's handler. The queue is not
+  clear until the editor has run the key, which it does after it has asked where the cursor is and
+  read the reply, and before it reads any other key. No fence is proved before then, so an answer
+  written behind a fence is behind the reply. An answer already in the terminal's input when the
+  editor asks, or one the host writes before the first fence, still joins the reply; the module
+  only keeps a fence from being proved over it. The Windows console has no cursor question in its
+  input, and an editor that cannot have the key bound or queued keeps the entry's own idle report,
+  as before.
 - **A host's answer is dropped before the editor puts it in the line.** The host answers a question
   an application asked the terminal (its attributes, a colour, its version) in the terminal's input,
   and the answer can reach a prompt with nothing typed at it. The runtime has no key for the
