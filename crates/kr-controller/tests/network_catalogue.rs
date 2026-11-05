@@ -1,9 +1,9 @@
 //! The two plugin method groups over the network path.
 //!
-//! What these demonstrate, towards KR-REQ-23.28 and KR-REQ-23.29 for the paired-device ingress.
-//! The registry admits a device to all thirteen methods; until now the network dispatcher refused
-//! the three reads as unsupported and sent the ten mutations to the worker proxy, which wants a
-//! session a catalogue mutation does not name.
+//! What these demonstrate, for the paired-device ingress of the plugin catalogue and plugin method
+//! groups. The registry admits a device to all thirteen methods; until now the network dispatcher
+//! refused the three reads as unsupported and sent the ten mutations to the worker proxy, which
+//! wants a session a catalogue mutation does not name.
 //!
 //! A catalogue and an installed package belong to the environment, so the daemon answers all
 //! thirteen itself and a device is given what the owner's own socket is given. What is additionally
@@ -265,13 +265,21 @@ fn grant_params(
 }
 
 // ---------------------------------------------------------------------------------------------
-// KR-REQ-23.28 and KR-REQ-23.29 at the paired-device ingress
+// The plugin catalogue and plugin method groups at the paired-device ingress
 // ---------------------------------------------------------------------------------------------
 
-/// Every one of the thirteen methods answers a paired device, and answers it about this host.
+/// KR-REQ-23.28 and KR-REQ-23.29: every one of the thirteen methods answers a paired device whose
+/// grant carries `host.manage`, and answers it about this host.
 ///
 /// The order is the product order: trust a root, synchronise a generation, install a package from
 /// it, enable it, read what it can do, and take all of it away again.
+///
+/// Shown here: a root is added under the owner's confirmation and its generation is synchronised,
+/// listed and pinned; an install is on the hash the verified generation declares, and the
+/// capability evidence names that hash; a grant is refused for a capability the package does not
+/// ask for and for a confirmation of another action. Not shown here: a root added under a
+/// confirmation that is no owner device's, the repository's budget, or a grant above the
+/// repository's ceiling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_23_28_and_23_29_a_paired_device_reaches_every_catalogue_and_plugin_method() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -667,11 +675,17 @@ async fn a_catalogue_mutation_from_a_device_names_an_environment_and_never_a_ses
     host.stop().await;
 }
 
-/// The registry decides what a device without `host.manage` reaches, and the daemon holds it there.
+/// KR-REQ-23.28 and KR-REQ-23.29: the registry decides what a device without `host.manage`
+/// reaches, and the daemon holds it there.
 ///
 /// Both groups are admitted at this ingress, so what keeps a device out of them is the rights its
 /// grant carries. Every mutation and `catalogue.list` require `host.manage`; `plugin.list` and
 /// `plugin.capabilities` require no right at all, and a device that holds none still reads them.
+///
+/// Shown here: `catalogue.list`, `catalogue.sync`, `catalogue.remove` and `plugin.enable` refuse a
+/// device without `host.manage`, and `plugin.list` answers it but refuses an environment this
+/// daemon does not own. Not shown here: the other catalogue and plugin mutations, or
+/// `plugin.capabilities`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_a_device_without_host_manage_reaches_is_what_the_registry_lists() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -849,6 +863,10 @@ async fn a_resubmitted_catalogue_action_is_answered_from_its_own_record() {
 /// KR-REQ-10.05: the catalogue's confirmed decisions are this host's owner's, confirmed on its owner
 /// devices and on nothing else. A proof of exactly this enrolment signed with a key that is not an
 /// owner device's is refused and trusts nothing; the owner device's own proof then trusts it.
+///
+/// KR-REQ-23.28, the owner's confirmation of a new root only: `catalogue.add` by a device holding
+/// `host.manage` is refused under a proof of a key that is no owner device's, and the catalogue
+/// list stays empty. Not shown here: the other catalogue methods, or enlarged trust.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_catalogue_decision_is_confirmed_by_an_owner_device_and_by_nothing_else() {
     let owner = DeviceKeys::generate().expect("owner keys");
