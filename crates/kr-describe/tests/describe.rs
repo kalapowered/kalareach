@@ -494,6 +494,10 @@ fn the_process_memory_ceiling_is_four_gibibytes_to_the_byte() {
 }
 
 /// KR-REQ-22.11: a cancelled job publishes nothing and the session keeps the title it had.
+///
+/// KR-REQ-22.21, the part about a cancellation: after a cancelled job the session's label is still
+/// its metadata title. Not shown here: missing weights, a load failure, an inference crash or
+/// verified state.
 #[test]
 fn a_cancelled_job_publishes_nothing_and_keeps_the_title_it_had() {
     let mut service = service();
