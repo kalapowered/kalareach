@@ -2592,8 +2592,26 @@ mod tests {
             .root()
             .join("current/bin")
             .join(Program::Hook.file_name());
-        assert_eq!(registered_forwarder_of(&running), Some(through_current));
+        assert_eq!(
+            registered_forwarder_of(&running),
+            Some(through_current.clone())
+        );
         assert_ne!(registered_forwarder_of(&running), Some(own));
+
+        // A `current` that no switch made, an absolute link to the same release: the file is there
+        // through it, which is all the path walk asks, and it is not a link the store reads as
+        // naming a release, so no release is asked and no forwarder is registered.
+        std::fs::remove_file(test.store.current_link()).expect("current goes");
+        std::os::unix::fs::symlink(
+            test.store.release_directory(&one),
+            test.store.current_link(),
+        )
+        .expect("an absolute link");
+        assert!(
+            through_current.is_file(),
+            "the file is there through the link"
+        );
+        assert_eq!(registered_forwarder_of(&running), None);
     }
 
     fn release(name: &str) -> ReleaseName {

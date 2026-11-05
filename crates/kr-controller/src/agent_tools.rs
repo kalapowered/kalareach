@@ -2026,8 +2026,12 @@ fn entry_key(entry: &str) -> &str {
 /// Whether the `kr` is there is asked of the release `current` names, read once, so a switch under
 /// way cannot make the command fall back to the plain name in a configuration written for good.
 fn entry_command() -> String {
-    kr_ipc::install::this_process()
-        .ok()
+    entry_command_of(kr_ipc::install::this_process().ok())
+}
+
+/// [`entry_command`] for the process `running`.
+fn entry_command_of(running: Option<&kr_ipc::install::Running>) -> String {
+    running
         .and_then(|running| running.stable_if_present(kr_ipc::install::Program::Kr))
         .map_or_else(|| "kr".to_owned(), |path| display(&path))
 }
@@ -2069,6 +2073,86 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// The command an agent runs is the `kr` through the store's `current` where the release
+    /// `current` names carries one, and the plain name where it does not, or where `current` is
+    /// not a link the store makes: that one is not asked, though the file is there through it.
+    #[cfg(unix)]
+    #[test]
+    fn the_command_an_agent_runs_is_the_current_release_s_kr_where_a_switch_made_current() {
+        use kr_ipc::install::{Program, Running, Store};
+        use kr_protocol::update::ReleaseName;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let store = Store::at(host.root().join("store"));
+        store.create_directories().expect("the store's directories");
+        std::fs::write(store.record(), b"{}\n").expect("the store's record");
+        let release = ReleaseName::new("0.1.0+aaaaaaaaaaaa").expect("a release");
+        std::fs::create_dir_all(store.release_directory(&release).join("bin"))
+            .expect("the release's bin");
+        std::fs::write(
+            store.manifest(&release),
+            serde_json::json!({
+                "signed": {
+                    "_type": "kalareach-release",
+                    "release": release,
+                    "sequence": "1",
+                    "commit": "4254aa6e62e585478ff8dcff5518f23c7263f4ce",
+                    "target": "aarch64-apple-darwin",
+                    "os_floor": { "system": "macos", "version": "14.0" },
+                    "protocol_version": { "major": 0, "minor": 48, "patch": 0 },
+                    "public_majors": [1],
+                    "retained_levels": ["0.48"],
+                    "shells": [],
+                    "agents": [],
+                    "dependencies": {
+                        "lock_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        "pinned": [],
+                        "vectors": []
+                    },
+                    "stores": [{
+                        "store": "registry",
+                        "scope": "environment",
+                        "path": "registry.sqlite",
+                        "recording": { "kind": "sqlite_table", "table": "schema_version" },
+                        "version": 7,
+                        "migrates_from": 1,
+                    }],
+                    "files": [],
+                },
+                "signatures": [],
+            })
+            .to_string(),
+        )
+        .expect("a manifest");
+        let kr = store.release_program(&release, Program::Kr);
+        kr_ipc::testing::place_program(&std::env::current_exe().expect("a program"), &kr);
+        let running = Running::of_image(&kr).expect("a release of the store");
+
+        assert_eq!(
+            entry_command_of(Some(&running)),
+            "kr",
+            "no release is current"
+        );
+        std::os::unix::fs::symlink(
+            std::path::Path::new(kr_ipc::install::VERSIONS).join(release.as_str()),
+            store.current_link(),
+        )
+        .expect("current names the release");
+        assert_eq!(
+            entry_command_of(Some(&running)),
+            display(&store.stable(Program::Kr))
+        );
+
+        std::fs::remove_file(store.current_link()).expect("current goes");
+        std::os::unix::fs::symlink(store.release_directory(&release), store.current_link())
+            .expect("an absolute link");
+        assert!(
+            store.stable(Program::Kr).is_file(),
+            "the file is there through the link"
+        );
+        assert_eq!(entry_command_of(Some(&running)), "kr");
     }
 
     /// A user record installed and then given the name an earlier build gave it, with the name
