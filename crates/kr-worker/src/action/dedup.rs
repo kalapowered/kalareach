@@ -129,8 +129,9 @@ impl ShownReceipts {
 /// identifier an alert is raised under. `identity_of` reads it from the parameters `P` of the method.
 ///
 /// `intent` is that envelope, when the receipt still has one. A receipt that has none (privacy mode
-/// withholds it once an action settles), whose envelope does not decode, or whose parameters are not
-/// `P` names no identity, and holds the request back: this rule refuses where it cannot tell.
+/// withholds it once an action settles), whose envelope does not decode, that is not a request for
+/// `method`, or whose parameters are not `P` names no identity, and holds the request back: this
+/// rule refuses where it cannot tell.
 #[must_use]
 pub fn holds_back<P: WireMessage, I: PartialEq>(
     method: Method,
@@ -138,7 +139,6 @@ pub fn holds_back<P: WireMessage, I: PartialEq>(
     identity: &I,
     identity_of: impl Fn(&P) -> I,
 ) -> bool {
-    let _ = method;
     let Some(intent) = intent else {
         return true;
     };
@@ -147,6 +147,10 @@ pub fn holds_back<P: WireMessage, I: PartialEq>(
     else {
         return true;
     };
+    // The parameters of another method's request are not this method's, however they read.
+    if earlier.method.method() != Some(method) {
+        return true;
+    }
     match earlier.params.to_typed::<P>() {
         Ok(params) => identity_of(&params) == *identity,
         Err(_) => true,
