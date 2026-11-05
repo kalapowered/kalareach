@@ -136,6 +136,11 @@ struct HostScript {
     refuse_method_with: Mutex<Option<(kr_protocol::method::Method, ErrorCode)>>,
     /// Answer every mutation with a correlated protocol error instead of a receipt.
     refuse_mutations_with: Mutex<Option<ErrorCode>>,
+    /// Every mutation the client sent, whole, in order.
+    requests: Mutex<Vec<kr_protocol::envelope::MutationRequest>>,
+    /// The window the host renews to, on the same stream and right after the answer, the next time
+    /// it refuses a mutation.
+    renew_after_refusing: Mutex<Option<kr_protocol::hello::ActionWindow>>,
     /// Answer this many of the next mutations with the method's own result instead of a receipt.
     ///
     /// That is what a host does when it will not act until it has more: it answers the request it
@@ -307,6 +312,7 @@ fn spawn_host(
                         }
                         ControlFrame::Mutation(mutation) => {
                             script.actions.lock().await.push(mutation.action_id);
+                            script.requests.lock().await.push((*mutation).clone());
                             if let Some(code) = *script.refuse_mutations_with.lock().await {
                                 let answer = ControlFrame::Response(Response {
                                     request_id: mutation.request_id,
@@ -314,6 +320,16 @@ fn spawn_host(
                                 });
                                 if writer.lock().await.write_message(&answer).await.is_err() {
                                     return;
+                                }
+                                if let Some(window) =
+                                    script.renew_after_refusing.lock().await.take()
+                                {
+                                    let renewed = ControlFrame::Event(
+                                        ControlEvent::ActionWindowRenewed(window),
+                                    );
+                                    if writer.lock().await.write_message(&renewed).await.is_err() {
+                                        return;
+                                    }
                                 }
                                 continue;
                             }
@@ -1741,6 +1757,150 @@ async fn sends_refused_for_now_do_not_use_up_the_bound_on_unresolved_actions() {
         KEPT_FOR_NOW,
         "the refused send stays marked"
     );
+
+    session.close();
+    serving.abort();
+}
+
+/// A send the host refused for now is sent again as it first went, window included. The host
+/// keys its record of an action by the request, so the same send under the window it has issued
+/// since is another request under the identifier, and the host refuses it. The renewal is read by
+/// the client before the send goes again: the host writes it behind the refusal, and a read made
+/// afterwards is answered behind it on the same stream.
+#[tokio::test]
+async fn a_send_refused_for_now_goes_again_with_the_window_it_first_carried() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+
+    let first = session.action_window().await;
+    *script.renew_after_refusing.lock().await = Some(kr_protocol::hello::ActionWindow {
+        action_window_id: kr_protocol::ids::ActionWindowId::new("renewed").expect("an identifier"),
+        connection_id: first.connection_id,
+        boot_epoch: first.boot_epoch,
+        issued_at_ms: TimestampMs::new(1),
+        valid_for_ms: DurationMs::new(300_000),
+    });
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::StorageUnavailable);
+    let refused = session
+        .mutate(
+            Method::SessionCreate,
+            target.clone(),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("the host cannot take the send now");
+    assert_eq!(refused.code(), ErrorCode::StorageUnavailable);
+    let kept = session.submitted_actions().await;
+    assert_eq!(kept.len(), 1);
+    assert!(kept[0].refused_for_now);
+
+    session
+        .read::<_, SessionList>(Method::SessionList, &Empty {})
+        .await
+        .expect("a read behind the renewal");
+    assert_eq!(
+        session.action_window().await.action_window_id.as_str(),
+        "renewed",
+        "the client holds the renewed window when it sends again"
+    );
+
+    *script.refuse_mutations_with.lock().await = None;
+    session
+        .mutate_continuing(
+            kept[0].action_id,
+            Method::SessionCreate,
+            target,
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the same send lands");
+
+    let requests = script.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].action_id, requests[0].action_id);
+    assert_ne!(
+        requests[1].request_id, requests[0].request_id,
+        "it correlates its own answer"
+    );
+    let mut again = requests[1].clone();
+    again.request_id = requests[0].request_id;
+    assert_eq!(
+        again, requests[0],
+        "the request is the one the host refused, window included"
+    );
+    assert_ne!(requests[1].action_window_id.as_str(), "renewed");
+
+    session.close();
+    serving.abort();
+}
+
+/// A request under the identifier of a send refused for now that differs from it in more than the
+/// window is another send, composed now and carrying the window the host has issued since: the
+/// evidence a host asked for is one.
+#[tokio::test]
+async fn another_send_under_the_identifier_of_one_refused_for_now_is_composed_now() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+
+    let first = session.action_window().await;
+    *script.renew_after_refusing.lock().await = Some(kr_protocol::hello::ActionWindow {
+        action_window_id: kr_protocol::ids::ActionWindowId::new("renewed").expect("an identifier"),
+        connection_id: first.connection_id,
+        boot_epoch: first.boot_epoch,
+        issued_at_ms: TimestampMs::new(1),
+        valid_for_ms: DurationMs::new(300_000),
+    });
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::StorageUnavailable);
+    session
+        .mutate(
+            Method::SessionCreate,
+            target.clone(),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("the host cannot take the send now");
+    let action_id = session.submitted_actions().await[0].action_id;
+    session
+        .read::<_, SessionList>(Method::SessionList, &Empty {})
+        .await
+        .expect("a read behind the renewal");
+
+    *script.refuse_mutations_with.lock().await = None;
+    session
+        .mutate_continuing(
+            action_id,
+            Method::SessionCreate,
+            target,
+            None,
+            &Empty {},
+            &SessionList { count: 7 },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the other send lands");
+
+    let requests = script.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].action_id, action_id);
+    assert_eq!(requests[1].action_window_id.as_str(), "renewed");
+    assert_ne!(requests[1].params, requests[0].params);
 
     session.close();
     serving.abort();
