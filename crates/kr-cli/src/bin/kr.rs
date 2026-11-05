@@ -2311,7 +2311,8 @@ async fn question(
 ///
 /// A kept answer is a failure, because its session's worker did not take it or whether it did is
 /// not known, and its document says it was kept, so a script can tell it from an answer that was
-/// refused.
+/// refused. The same document answers a command that sent nothing because the worker has an earlier
+/// send it has not finished with: it then says an answer kept earlier, if any, is still kept.
 fn report_answered(
     question_id: kr_protocol::ids::QuestionId,
     reported: kr_cli::question::Reported,

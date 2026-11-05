@@ -178,6 +178,9 @@ impl Reported {
 /// command did not read, [`CliError::Unfinished`] when the worker took the answer and its reply
 /// cannot be read, or took an earlier send of it, and [`CliError::UpdateDeferred`] when nothing
 /// could be sent because an update of this host held one of its locks for the whole wait.
+/// [`CliError::AnswerKept`] is also the outcome when the host has an earlier send of an answer that
+/// it has not finished with: then this answer is neither sent nor kept, and only an answer kept
+/// earlier can be.
 pub async fn answer(
     paths: &HostPaths,
     question_id: QuestionId,

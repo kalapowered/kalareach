@@ -1592,7 +1592,7 @@ fn settle_own<K: Keeper>(
 /// A host that cannot be reached, and a lost, uncertain or transient failure, keep the answer and
 /// its record on this device ([`Answered::Kept`]); the host's own word that it did not take the
 /// answer settles the send, and removes the pair unless an earlier send is still unsettled, or the
-/// host took a send another command recorded, which the next reading names.
+/// host took a send another command recorded meanwhile, which the next reading names.
 ///
 /// # Errors
 ///
@@ -1876,8 +1876,8 @@ pub async fn reconcile<H: QuestionHost>(
 /// read of the host failed; and an uncertain outcome is named by the send, or shown first for a
 /// caller that asked [`Quoting::AfterShown`]. The send is recorded before it goes. A draft that is
 /// sent, or that the host refuses because its question ended once every send was read, is no longer
-/// kept, unless the host took a send another command recorded, which the next reading names; any
-/// other refusal settles this send and keeps the draft.
+/// kept, unless the host took a send another command recorded meanwhile, which the next reading
+/// names; any other refusal settles this send and keeps the draft.
 ///
 /// # Errors
 ///
