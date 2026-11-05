@@ -1,6 +1,6 @@
 //! The project and workspace methods over the network path.
 //!
-//! What these demonstrate, towards KR-REQ-23.42 and KR-REQ-23.43 for the paired-device ingress.
+//! What these demonstrate, for the paired-device ingress.
 //! The registry admits a device to all ten methods, and the grant is what it is additionally held
 //! to.
 //!

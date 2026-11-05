@@ -1,15 +1,14 @@
 //! The configuration this daemon answers with, over the paired-device path.
 //!
-//! What these demonstrate. KR-REQ-26.13: `host.doctor` reports the schema version, the OS
-//! appropriate locations, the precedence order and each effective value with its source.
-//! KR-REQ-26.14: only the documented allowlist participates, at the position it declares, and an
-//! inherited variable outside it changes nothing; the network and the voice broker are the
-//! document's selections, and a daemon started with every variable that used to select them
-//! selects nothing from them. KR-REQ-26.15: the configured ceilings intersect
-//! and a more permissive one is refused; a secret is a named reference and no value is exported.
-//! KR-REQ-26.16: an edit is validated before a revision is applied, and a change that affects
-//! authority advances the revision before the caller is told it is in force. KR-REQ-01.23: every
-//! existing check id is still there, with the configuration's own checks beside them.
+//! What these demonstrate. `host.doctor` reports the schema version, the OS appropriate locations,
+//! the precedence order and each effective value with its source. Only the documented allowlist
+//! participates, at the position it declares, and an inherited variable outside it changes nothing;
+//! the network and the voice broker are the document's selections, and a daemon started with every
+//! variable that used to select them selects nothing from them. The configured ceilings intersect
+//! and a more permissive one is refused; a secret is a named reference and no value is exported. An
+//! edit is validated before a revision is applied, and a change that affects authority advances the
+//! revision before the caller is told it is in force. Every existing check id is still there, with
+//! the configuration's own checks beside them.
 //!
 //! The diagnostics are a read the daemon answers itself, so no worker is started here.
 

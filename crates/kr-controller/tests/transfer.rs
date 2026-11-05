@@ -1,9 +1,8 @@
 //! The transfer methods through the real control daemon, on both of its endpoints.
 //!
-//! Requirement rows closed here: KR-REQ-14.07 (the seven methods, dispatched through the daemon's
-//! own admission path), KR-REQ-14.12 (a lost reply resolved from the retained record),
-//! KR-REQ-23.41 (draft and media methods under the daemon's authority) and KR-REQ-24.09 (resumable
-//! by identifier).
+//! The seven methods are dispatched through the daemon's own admission path, a lost reply is
+//! resolved from the retained record, the draft and media methods run under the daemon's authority,
+//! and an upload is resumable by identifier.
 //!
 //! These run the real endpoints, the real handshake, the real envelope checks and the real store.
 //! A 1 MiB chunk does not fit a control frame, so the chunk traffic runs on the attachment-chunk

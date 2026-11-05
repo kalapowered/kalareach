@@ -1,10 +1,9 @@
 //! The "Automation" method group through the real control daemon.
 //!
-//! Requirement rows exercised here: KR-REQ-18.04 (a workflow node that is a real host action,
-//! carried out and bound to the run that asked for it) and KR-REQ-25.19 (a redelivered trigger
-//! produces one run, not two). The cases that show a workflow method's management-grant and
-//! revision rules, or a workflow's versioned definition and declared grant, carry the keys of
-//! those rows themselves, each in its own comment.
+//! A workflow node that is a real host action is carried out and bound to the run that asked
+//! for it, and a redelivered trigger produces one run, not two. The cases that show a workflow
+//! method's management-grant and revision rules, or a workflow's versioned definition and
+//! declared grant, carry their own keys, each in its own comment.
 //!
 //! These run the real endpoint, the real handshake, the real envelope checks and real
 //! repositories built with installed Git. The daemon starts on an environment under the

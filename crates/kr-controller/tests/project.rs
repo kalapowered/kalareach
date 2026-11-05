@@ -1,10 +1,9 @@
 //! The project and workspace methods through the real control daemon.
 //!
-//! Requirement rows closed here: KR-REQ-14.17 (selecting, creating and cloning repositories
-//! through the daemon's own admission path), KR-REQ-14.18 (an idempotent creation and a crash
-//! reconciled against the create token), KR-REQ-14.20 (the explicit workspace choice and its
-//! inclusion preview), KR-REQ-23.42 and KR-REQ-23.43 (the ten methods under the daemon's
-//! authority) and KR-REQ-24.08 (a workspace and its pins surviving the daemon's death).
+//! Selecting, creating and cloning repositories go through the daemon's own admission path; a
+//! creation is idempotent and a crash is reconciled against the create token; the explicit
+//! workspace choice and its inclusion preview; the ten methods run under the daemon's authority;
+//! and a workspace and its pins survive the daemon's death.
 //!
 //! These run the real endpoint, the real handshake, the real envelope checks, real repositories
 //! built with installed Git, and — for the kill test — a separate `kr-controller` process copied
