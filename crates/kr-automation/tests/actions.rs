@@ -7,8 +7,8 @@
 //! still dispatching, an admission that lapses before the first write, a refusal repeated after the
 //! world changed, and a cancellation that lands while an action is running.
 //!
-//! Requirement rows: KR-REQ-25.19 (a run is persisted before it dispatches, and cancellation stops
-//! undispatched work without claiming anything about what already ran).
+//! A run is persisted before it dispatches, and cancellation stops undispatched work without
+//! claiming anything about what already ran.
 
 use std::sync::{Arc, OnceLock};
 
@@ -103,6 +103,11 @@ impl ActionRunner for Held {
 /// A repeat of a `workflow.run` action that arrives while its run is still dispatching is told
 /// where that run stands. It is neither reported as an outcome nobody can establish nor started a
 /// second time.
+///
+/// KR-REQ-25.19, the part about the dedup key: a repeat of a `workflow.run` action that arrives
+/// while its run is still dispatching is told where that run stands and starts no second run. Not
+/// shown here: the run being persisted before its first dispatch, and an unknown outcome pausing
+/// dependants.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_repeat_during_its_run_is_told_where_the_run_stands_and_starts_nothing() {
     let runner = Arc::new(Held::default());
