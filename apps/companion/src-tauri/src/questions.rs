@@ -555,6 +555,14 @@ impl QuestionHost for Host<'_> {
         self.settle(session_id, link.link(), answer)
     }
 
+    /// Lets the session's link stop holding the earlier sends of an answer the host took, on the
+    /// link the answer went over. A link that cannot be had holds no book to settle.
+    async fn settle_earlier(&self, session_id: SessionId, sends: &[ActionId]) {
+        if let Ok(link) = self.link(session_id).await {
+            <Session as QuestionHost>::settle_earlier(&link.session, session_id, sends).await;
+        }
+    }
+
     /// Whether the host's record of the session says it ended.
     ///
     /// On this machine, the worker is gone for a session whose descriptor is not published, and that
