@@ -5524,7 +5524,7 @@ already removed or swept. This host takes any of those as the gateway holding no
 reports the deletion as done. That reading has one limit, which the host does not close.
 Registration asks the gateway whether it takes the bearer and holds the authorisation for this
 host's key, and the identifier, installation and expiry that go with it are the device's word, so
-registration does not bind the bearer to the installation. A device with `host.manage` that
+registration does not bind the bearer to the installation. A paired device that
 registers another installation's bearer under its own metadata can make a deletion report deleted
 while the gateway keeps the record, because the gateway answers that bearer with nothing held. The
 host records nothing of its own, so the list goes on showing the notification and a second call asks

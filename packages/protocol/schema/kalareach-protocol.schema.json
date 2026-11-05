@@ -6764,7 +6764,7 @@
         },
         {
           "const": "desktop_generation",
-          "description": "The desktop generation changed. A new login moves it wherever the platform's generation\nmoves with a new login: a new process to own the login session on macOS and Linux, a later\nlogon time on Windows.",
+          "description": "The desktop generation changed. A new login moves it where the platform gives a new login\na new value: a new process that owns the login session on macOS and Linux, a later logon\ntime on Windows.",
           "type": "string"
         },
         {
@@ -12956,7 +12956,7 @@
       "type": "object"
     },
     "DesktopGenerationSource": {
-      "description": "What the login-session generation was read from.\n\nThe generation is the part of a desktop identity that tells two logins apart when they share a\nplatform session number. macOS and Linux answer it through the kernel's start value for the\nprocess that owns the login session, and each names a different process. Windows has no such\nprocess that an account without administrative rights can read, so it answers with the time at\nwhich the session's user logged on, which the account reads for its own session. How\ncompletely that distinguishes one login from another follows from what each platform names,\nwhich is why the source is part of the record; the value is also only ever comparable with\nanother value from the same source on the same host.",
+      "description": "What the login-session generation was read from.\n\nThe generation is the part of a desktop identity that tells two logins apart when they share a\nplatform session number. macOS and Linux answer it through the kernel's start value for the\nprocess that owns the login session, and each names a different process. Windows has no such\nprocess that an account can read unless it holds an elevated administrator's token, so it\nanswers with the time at which the session's user logged on, which the account reads for its\nown session. How completely that distinguishes one login from another follows from what each\nplatform names, which is why the source is part of the record; the value is also only ever\ncomparable with another value from the same source on the same host.",
       "oneOf": [
         {
           "const": "macos_session_creator",
@@ -12970,7 +12970,7 @@
         },
         {
           "const": "windows_session_logon",
-          "description": "Windows: the time the system records for the interactive session's user to have logged on,\nin 100 ns ticks since 1601, which the account reads for its own session. A host of an\nearlier release at this level sends the start value of the session's logon process under\nthis source instead, so compare the value and do not read it as a logon time.",
+          "description": "Windows: the time the system records for the interactive session's user to have logged on,\nin 100 ns ticks since 1601, which the account reads for its own session. A host of some\nearlier releases at this level sends the start value of the session's logon process under\nthis source instead, so compare the value and do not read it as a logon time.",
           "type": "string"
         },
         {
@@ -29121,7 +29121,7 @@
       "description": "The result of `privacy.retained.delete`.",
       "properties": {
         "deleted": {
-          "description": "True when the service holding the copy has said it no longer holds it.\n\nFor a backup generation, false while the request has been made and the service has not\nconfirmed every object: the host asks again when it is asked to delete the same copy again,\nand the report shows the copy as one whose deletion was asked.\n\nFor a notification the gateway was given, true when the gateway answered for that\nnotification. Its answer names what it held: a queued notification, which is then not\nsent; the record of a decision, which is then gone; or nothing, which is also what it\nanswers for a notification it never saw, one of another authorisation and one already\nremoved or swept. The host takes each answer as the gateway holding nothing for the\nnotification now. That says nothing of a copy a provider accepted or a device holds, and a\ndevice with `host.manage` that registers another installation's bearer can make the host\nreport a deletion while the gateway keeps the record. A gateway that does not answer, or\nthat refuses the request, fails the call and no result is given. The host records nothing\nof a deletion the gateway confirmed, so the report goes on listing the notification and a\nsecond call asks the gateway again.",
+          "description": "True when the service holding the copy has said it no longer holds it.\n\nFor a backup generation, false while the request has been made and the service has not\nconfirmed every object: the host asks again when it is asked to delete the same copy again,\nand the report shows the copy as one whose deletion was asked.\n\nFor a notification the gateway was given, true when the gateway answered for that\nnotification. Its answer names what it held: a queued notification, which is then not\nsent; the record of a decision, which is then gone; or nothing, which is also what it\nanswers for a notification it never saw, one of another authorisation and one already\nremoved or swept. The host takes each answer as the gateway holding nothing for the\nnotification now. That says nothing of a copy a provider accepted or a device holds, and a\npaired device that registers another installation's bearer under its own metadata can make\nthe host report a deletion while the gateway keeps the record. A gateway that does not\nanswer, or\nthat refuses the request, fails the call and no result is given. The host records nothing\nof a deletion the gateway confirmed, so the report goes on listing the notification and a\nsecond call asks the gateway again.",
           "type": "boolean"
         },
         "report": {

@@ -93,11 +93,11 @@ impl DesktopSessionKind {
 /// The generation is the part of a desktop identity that tells two logins apart when they share a
 /// platform session number. macOS and Linux answer it through the kernel's start value for the
 /// process that owns the login session, and each names a different process. Windows has no such
-/// process that an account without administrative rights can read, so it answers with the time at
-/// which the session's user logged on, which the account reads for its own session. How
-/// completely that distinguishes one login from another follows from what each platform names,
-/// which is why the source is part of the record; the value is also only ever comparable with
-/// another value from the same source on the same host.
+/// process that an account can read unless it holds an elevated administrator's token, so it
+/// answers with the time at which the session's user logged on, which the account reads for its
+/// own session. How completely that distinguishes one login from another follows from what each
+/// platform names, which is why the source is part of the record; the value is also only ever
+/// comparable with another value from the same source on the same host.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
@@ -108,8 +108,8 @@ pub enum DesktopGenerationSource {
     /// Linux: the kernel's start value for the login session's leader process.
     LinuxSessionLeader,
     /// Windows: the time the system records for the interactive session's user to have logged on,
-    /// in 100 ns ticks since 1601, which the account reads for its own session. A host of an
-    /// earlier release at this level sends the start value of the session's logon process under
+    /// in 100 ns ticks since 1601, which the account reads for its own session. A host of some
+    /// earlier releases at this level sends the start value of the session's logon process under
     /// this source instead, so compare the value and do not read it as a logon time.
     WindowsSessionLogon,
     /// The platform offered no generation. The identifier and the boot identity carry the identity
@@ -405,9 +405,9 @@ pub enum CapabilityInvalidation {
     PackageSchema,
     /// An operating-system permission changed.
     OsPermission,
-    /// The desktop generation changed. A new login moves it wherever the platform's generation
-    /// moves with a new login: a new process to own the login session on macOS and Linux, a later
-    /// logon time on Windows.
+    /// The desktop generation changed. A new login moves it where the platform gives a new login
+    /// a new value: a new process that owns the login session on macOS and Linux, a later logon
+    /// time on Windows.
     DesktopGeneration,
     /// The execution profile changed.
     WorkerProfile,

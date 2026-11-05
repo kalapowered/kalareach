@@ -2062,8 +2062,8 @@ impl crate::service::Controller {
     /// one or had already swept it, and it is taken as the deletion. It says nothing of a copy a
     /// provider accepted or a device holds, and the list keeps showing the notification as one
     /// that may have left. Registration does not bind a bearer to the installation it names, so a
-    /// device with `host.manage` that registers another installation's bearer under its own
-    /// metadata can make this report a deletion while the gateway keeps the record.
+    /// paired device that registers another installation's bearer under its own metadata can make
+    /// this report a deletion while the gateway keeps the record.
     ///
     /// Nothing is recorded here. A gateway that does not answer, or refuses the credential, leaves
     /// the copy listed as it was and the error says why; the person asks again.

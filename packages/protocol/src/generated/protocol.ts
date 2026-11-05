@@ -22630,8 +22630,9 @@ export interface PrivacyRetainedDeleteResult {
    * answers for a notification it never saw, one of another authorisation and one already
    * removed or swept. The host takes each answer as the gateway holding nothing for the
    * notification now. That says nothing of a copy a provider accepted or a device holds, and a
-   * device with `host.manage` that registers another installation's bearer can make the host
-   * report a deletion while the gateway keeps the record. A gateway that does not answer, or
+   * paired device that registers another installation's bearer under its own metadata can make
+   * the host report a deletion while the gateway keeps the record. A gateway that does not
+   * answer, or
    * that refuses the request, fails the call and no result is given. The host records nothing
    * of a deletion the gateway confirmed, so the report goes on listing the notification and a
    * second call asks the gateway again.
