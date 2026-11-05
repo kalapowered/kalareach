@@ -31,7 +31,9 @@ pub struct ClientState {
     /// uncertain rather than which identifier is. The next connection asks the host what became of
     /// them; it never submits them again. Asking is a repeat of the exact request the action was
     /// sent as ([`Session::repeat`]): the host answers it from the record it kept, never by doing
-    /// the action again, and the library makes none by itself.
+    /// the action again, and the library makes none by itself. Those marked
+    /// [`SubmittedAction::refused_for_now`](crate::session::SubmittedAction::refused_for_now) were
+    /// refused with a transient code, and their caller may send them again under their identifier.
     pub submitted: Vec<crate::session::SubmittedAction>,
     /// What the ended connection left uncertain, when it had an input lane.
     pub interruption: Option<InputInterruption>,

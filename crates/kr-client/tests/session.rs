@@ -33,7 +33,7 @@ fn at(write_sequence: u64) -> SyncPosition {
         None,
     )
 }
-use kr_client::session::Session;
+use kr_client::session::{MAX_UNRESOLVED_ACTIONS, Session};
 use kr_client::transport::NetworkTransport;
 use kr_crypto::connect::{ChallengeLedger, PairedPeer};
 use kr_crypto::keys::DeviceKeys;
@@ -1650,6 +1650,57 @@ async fn a_host_that_keeps_refusing_for_now_does_not_fill_the_book() {
     assert!(
         kept.iter().any(|action| action.action_id == unknown),
         "an unknown outcome is never let go to make room"
+    );
+
+    session.close();
+    serving.abort();
+}
+
+/// The bound on unresolved actions is for the sends nobody could establish: the ones the host
+/// refused for now have a bound of their own and do not use it up, and the book marks them so a
+/// caller can tell which it may send again.
+#[tokio::test]
+async fn sends_refused_for_now_do_not_use_up_the_bound_on_unresolved_actions() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+    let send = || async {
+        session
+            .mutate(
+                Method::SessionCreate,
+                target.clone(),
+                None,
+                &Empty {},
+                &Empty {},
+                DurationMs::new(120_000),
+            )
+            .await
+            .expect_err("the host refuses every send")
+    };
+
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::ResourceUnavailable);
+    for _ in 0..KEPT_FOR_NOW {
+        send().await;
+    }
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::OutcomeUnknown);
+    for _ in 0..MAX_UNRESOLVED_ACTIONS {
+        let unknown = send().await;
+        assert_eq!(unknown.code(), ErrorCode::OutcomeUnknown, "{unknown:?}");
+    }
+    let refused = send().await;
+    assert!(
+        matches!(refused, ClientError::TooManyUnresolvedActions { .. }),
+        "the bound is reached by the sends nobody could establish: {refused:?}"
+    );
+    let kept = session.submitted_actions().await;
+    assert_eq!(kept.len(), MAX_UNRESOLVED_ACTIONS + KEPT_FOR_NOW);
+    assert_eq!(
+        kept.iter().filter(|action| action.refused_for_now).count(),
+        KEPT_FOR_NOW,
+        "the sends refused for now are marked"
     );
 
     session.close();

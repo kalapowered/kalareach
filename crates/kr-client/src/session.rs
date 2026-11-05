@@ -179,7 +179,8 @@ struct Waiters {
 ///
 /// The identifier alone is not enough to act on: a person asking what happened needs to know which
 /// intent is uncertain, and two cancelled calls leave two identifiers that would otherwise be
-/// indistinguishable. The record is immutable, and it is what a reconnect carries.
+/// indistinguishable. The record is what a reconnect carries. It does not change, except that the book
+/// marks an action the host refused for now ([`SubmittedAction::refused_for_now`]).
 #[derive(Clone, PartialEq, Eq)]
 pub struct SubmittedAction {
     /// The durable operation identity.
@@ -203,13 +204,21 @@ pub struct SubmittedAction {
     /// answer came to ([`Session::settle`]), whatever the answer was: a refusal of any code is not
     /// a decision about an action whose outcome is being asked after.
     pub held: bool,
+    /// Whether the host last refused this action for now, with a transient code.
+    ///
+    /// It recorded nothing of it, so the caller may send it again under this identifier
+    /// ([`Session::mutate_continuing`]), and the host performs an identifier at most once. A
+    /// service that keeps the refusals it decides answers the same refusal again. Only the newest
+    /// 64 such actions stay on the book, and they do not count toward [`MAX_UNRESOLVED_ACTIONS`].
+    pub refused_for_now: bool,
 }
 
 crate::debug_fields!(SubmittedAction {
     action_id,
     method,
     request_id,
-    held
+    held,
+    refused_for_now
 });
 
 /// Whose identity a mutation is submitted under.
@@ -360,13 +369,14 @@ impl Outcomes {
         let Some(action_id) = self.correlations.remove(&request_id) else {
             return;
         };
-        if !self
+        let Some(action) = self
             .submitted
-            .get(&action_id)
-            .is_some_and(|action| !action.held)
-        {
+            .get_mut(&action_id)
+            .filter(|action| !action.held)
+        else {
             return;
-        }
+        };
+        action.refused_for_now = true;
         self.refused_for_now.retain(|listed| *listed != action_id);
         self.refused_for_now.push_back(action_id);
         while self.refused_for_now.len() > MAX_REFUSED_FOR_NOW {
@@ -398,8 +408,10 @@ impl Outcomes {
     fn refuse_replacement(&self, action_id: ActionId) -> Result<()> {
         // An action the host refused for now stays the client's to send again under its own
         // identifier: it is what the next send of it replaces.
-        let unknown =
-            self.submitted.contains_key(&action_id) && !self.refused_for_now.contains(&action_id);
+        let unknown = self
+            .submitted
+            .get(&action_id)
+            .is_some_and(|action| !action.refused_for_now);
         let receipted = self.receipts.get(&action_id).is_some();
         if unknown || receipted {
             return Err(ClientError::refusal(
@@ -415,9 +427,13 @@ impl Outcomes {
 
     /// Records one submission, or refuses when too many are already unresolved.
     fn submit(&mut self, action: SubmittedAction) -> Result<()> {
-        if self.submitted.len() >= MAX_UNRESOLVED_ACTIONS
-            && !self.submitted.contains_key(&action.action_id)
-        {
+        // The actions the host refused for now are let go past their own bound, so they are not
+        // the ones that fill the book.
+        let unresolved = self
+            .submitted
+            .len()
+            .saturating_sub(self.refused_for_now.len());
+        if unresolved >= MAX_UNRESOLVED_ACTIONS && !self.submitted.contains_key(&action.action_id) {
             return Err(ClientError::TooManyUnresolvedActions {
                 limit: MAX_UNRESOLVED_ACTIONS,
             });
@@ -436,7 +452,8 @@ impl Outcomes {
 /// An unresolved action is one whose outcome nobody knows, and section 9 forbids forgetting one.
 /// The bound is what stops "never forget" becoming "grow for ever". A client reaches it through
 /// accepted actions whose receipts have not settled as much as through a host it cannot reach, and
-/// either way submitting more would only add to the pile.
+/// either way submitting more would only add to the pile. The actions the host refused for now
+/// ([`SubmittedAction::refused_for_now`]) are not among those, and have a bound of their own.
 pub const MAX_UNRESOLVED_ACTIONS: usize = 1024;
 
 /// How many of the actions the host refused for now stay on the book beside the ones it could not
@@ -604,7 +621,9 @@ impl Session {
     /// Returns the actions this client submitted whose outcome it has not seen settled.
     ///
     /// A reconnecting client asks the host about these. It never resubmits one: section 9 forbids
-    /// dispatching an identifier again because its receipt is incomplete.
+    /// dispatching an identifier again because its receipt is incomplete. The exception is an
+    /// action marked [`SubmittedAction::refused_for_now`]: the host decided nothing of it, and its
+    /// caller may send it again under its identifier ([`Session::mutate_continuing`]).
     pub async fn submitted_actions(&self) -> Vec<SubmittedAction> {
         self.state
             .outcomes
@@ -1021,6 +1040,7 @@ impl Session {
                 params: params_record,
                 request_id,
                 held: false,
+                refused_for_now: false,
             })?;
         }
         if self.transport.send(&frame).await.is_err() {
@@ -1261,6 +1281,7 @@ impl Session {
                 params: composed.request.params.clone(),
                 request_id,
                 held: true,
+                refused_for_now: false,
             })?;
         }
         if self.transport.send(&frame).await.is_err() {
