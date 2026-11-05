@@ -1,5 +1,5 @@
-//! KR-REQ-11.42: a package's native bridge recipe applied in an application's own directory, and
-//! exactly what it applied taken out again.
+//! A package's native bridge recipe applied in an application's own directory, and exactly what it
+//! applied taken out again.
 //!
 //! The recipe is the Claude Code package's, release 0.3.0, built here from the three registration
 //! files this repository pins in `fixtures/bridges/claude-code/`, which carry the digests that
