@@ -2901,8 +2901,12 @@ fn kr_req_12_05_a_claims_directory_that_cannot_be_used_refuses_the_launch_and_th
 /// One identifier names one instance, and the path that holds it owns it: an executed launch's
 /// reservation, a registration or an adoption. No other path can take it, so no path can later
 /// give back what another one took.
+///
+/// KR-REQ-12.02, in part: after the competing claims fail, the launch's recorded profile still
+/// reads its version and the adoption's still reads its mode. Not shown here: the executable, the
+/// distribution, the arguments and the authentication state.
 #[test]
-fn an_instance_one_path_holds_cannot_be_taken_by_another() {
+fn kr_req_12_02_an_instance_one_path_holds_cannot_be_taken_by_another() {
     let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     let intent = broker
         .prepare_launch(
