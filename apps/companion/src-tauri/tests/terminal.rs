@@ -960,47 +960,45 @@ async fn a_size_the_session_did_not_take_for_now_goes_again_with_its_next_word()
 }
 
 /// A session that keeps refusing a size for now is not asked once for every word it says: the size
-/// goes again with its next word three times, and after that waits for the page to measure again.
+/// goes again with its next word three times, and after that waits for the page to measure again or
+/// to move, which sends the size first.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_size_the_session_keeps_refusing_for_now_waits_for_the_page_after_three_tries() {
-    let mut worker = ScriptedWorker::start(Challenge::Answered);
-    let page_view = Page::new(worker.paths());
-    let (view, mut link) = showing(&page_view, &mut worker, 3).await;
-    page_view.resize(&view, 12, 3);
-    let mut call = link.expect(Method::AttachmentViewport).await;
-    for round in 1..=3_u64 {
-        link.refuse_with(&call, ErrorCode::ResourceUnavailable, "not now")
-            .await;
-        screen(
-            &mut link,
-            1 + round,
-            40 + 20 * round,
-            vec![row(0, "first"), row(1, "second")],
-            0,
-        )
-        .await;
-        call = link.expect(Method::AttachmentViewport).await;
+    for page_moves in [false, true] {
+        let mut worker = ScriptedWorker::start(Challenge::Answered);
+        let page_view = Page::new(worker.paths());
+        let at = wide_session();
+        let (view, mut link) = panned(&page_view, &mut worker, 3, &at).await;
+        page_view.resize(&view, 12, 2);
+        let mut call = link.expect(Method::AttachmentViewport).await;
+        let mut repaint = at;
+        for round in 1..=4_u64 {
+            link.refuse_with(&call, ErrorCode::ResourceUnavailable, "not now")
+                .await;
+            repaint.generation = 1 + round;
+            repaint.cursor = 40 + 20 * round;
+            frame(&mut link, &repaint).await;
+            if round < 4 {
+                call = link.expect(Method::AttachmentViewport).await;
+            }
+        }
+        assert!(
+            link.quiet_for(QUIET).await,
+            "after three tries it waits for the page, whatever the session says"
+        );
+        if page_moves {
+            page_view.pan(&view, 1, 1, 0);
+        } else {
+            page_view.resize(&view, 12, 2);
+        }
+        let (after, asked) = report(&mut link).await;
+        assert_eq!(
+            asked.dimensions,
+            Dimensions::new(12, 2),
+            "the size that is owed goes first (the page moves: {page_moves})"
+        );
+        link.answer(&after, &viewport_answer(1)).await;
     }
-    link.refuse_with(&call, ErrorCode::ResourceUnavailable, "not now")
-        .await;
-    screen(
-        &mut link,
-        5,
-        120,
-        vec![row(0, "first"), row(1, "second")],
-        0,
-    )
-    .await;
-    assert!(
-        link.quiet_for(QUIET).await,
-        "after three tries it waits for the page, whatever the session says"
-    );
-    page_view.resize(&view, 12, 3);
-    let after = link.expect(Method::AttachmentViewport).await;
-    let asked: AttachmentViewportParams = after.params();
-    assert_eq!(asked.dimensions, Dimensions::new(12, 3));
-    link.answer(&after, &viewport_answer(1)).await;
-    assert!(link.quiet_for(QUIET).await);
 }
 
 /// A size measured before the subscription answers waits for it, and is compared with the size the
