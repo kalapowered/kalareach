@@ -46,12 +46,17 @@ pub struct PrivacyRetainedDeleteResult {
     /// confirmed every object: the host asks again when it is asked to delete the same copy again,
     /// and the report shows the copy as one whose deletion was asked.
     ///
-    /// For a notification the gateway was given, true when the gateway answered the request. It
-    /// answers the same whether it removed a record, never had one or had already swept it, so
-    /// the answer says the gateway holds nothing for that notification now; a gateway that does
-    /// not answer, or that refuses the request, fails the call and no result is given. The host
-    /// records nothing of a deletion the gateway confirmed, so the report goes on listing the
-    /// notification and a second call asks the gateway again.
+    /// For a notification the gateway was given, true when the gateway answered for that
+    /// notification. Its answer names what it held: a queued notification, which is then not
+    /// sent; the record of a decision, which is then gone; or nothing, which is also what it
+    /// answers for a notification it never saw, one of another authorisation and one already
+    /// removed or swept. The host takes each answer as the gateway holding nothing for the
+    /// notification now. That says nothing of a copy a provider accepted or a device holds, and a
+    /// device with `host.manage` that registers another installation's bearer can make the host
+    /// report a deletion while the gateway keeps the record. A gateway that does not answer, or
+    /// that refuses the request, fails the call and no result is given. The host records nothing
+    /// of a deletion the gateway confirmed, so the report goes on listing the notification and a
+    /// second call asks the gateway again.
     pub deleted: bool,
     /// Where privacy mode stands after the request.
     pub report: PrivacyReport,

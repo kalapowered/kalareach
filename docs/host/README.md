@@ -5737,7 +5737,7 @@ So every wait in a worker is on something that happens rather than on a clock.
 | room for the application's input | the same descriptor | nothing; a write with no room waits on it |
 | the root shell's exit | the child signal the kernel sends the worker | a thirty-second sweep, in case a signal is lost. Windows reports a process ending on its handle rather than by a signal, so there a hundred-millisecond check is the whole answer |
 | the processes the session owns | input the session accepted and output it produced, which is where a new process usually comes from | the same sweep, for everything that comes from neither |
-| the login a desktop-bound session is tied to | nothing this host can subscribe to, so it is asked on every wake: one kernel query about the process that owns the login session, at most once a second | the same sweep |
+| the login a desktop-bound session is tied to | nothing this host can subscribe to, so it is asked: on macOS and Linux on every wake, one kernel query about the process that owns the login session, at most once a second; on Windows the system's record of the session is read again, no more often than every 30 seconds | the same sweep |
 | a held paste prefix | its own deadline, which exists only while a prefix is held | nothing |
 | an attached view | the frames its connection carries | every view has a window renewal at least every 150 seconds; a connection a process bridge made also gets a keepalive every ten seconds, which its invoker reads for silence |
 
