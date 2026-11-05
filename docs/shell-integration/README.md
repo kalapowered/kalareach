@@ -917,39 +917,47 @@ method, and that is exactly what it cannot do:
   joins every digit up to the `R` into the column, so bytes that come ahead of the reply change the
   number: three answers to a device-attributes query (`CSI ? 62 ; 22 c`) ahead of a reply give a
   column of 226222621, and the editor then throws `ArgumentOutOfRangeException` when it places the
-  cursor and stops answering. The host holds no answer back for this. The broker is the only
-  responder and answers the cursor question itself, and the response lane writes replies in the
-  order of their queries, so the reply to a query asked after the cursor question never goes ahead
-  of the cursor reply. The reply to an earlier query can: one already in the terminal's input, such
-  as the answer to a query of a program that ended before it read it, and one still waiting in the
-  lane. The host cannot take back the first, and holding the second behind the cursor reply would
-  write replies out of the order of their queries. The module does not drop either: it meets an
-  answer only as keys, after the editor has read it from the terminal's input (the next item). What
-  the module controls is when the reader first reports its queues clear. A fence proved before the
-  editor has asked its question comes before the reply, and an answer the host writes behind that
-  fence lands ahead of the reply and joins it: the runtime takes the answer's `ESC [` and its first
-  `;` for the start of the reply and its digits for the position, and gives the other bytes back as
-  keys. Some of the answer then reaches the line, and the fence the reader proves next is over a line
-  that is not empty. So outside Windows the read-line entry queues a key of the module's own in the
-  editor's key queue (`Ctrl+Alt+F24`, which no terminal sends and which the module binds where
-  nothing is bound), and the reader reports itself idle from that key's handler. The queue is not
-  clear until the editor has run the key, which it does after it has asked where the cursor is and
-  read the reply, and before it reads a key from the terminal. No fence is proved before then, so an
-  answer written behind a fence is behind the reply. An answer already in the terminal's input when
-  the editor asks, or one still in the lane when the editor asks, still joins the reply; the module
-  only keeps a fence from being proved over it. The Windows console has no cursor question in its
-  input. The module queues the key only where that cannot change what the person's keys do. It
-  queues none into a queue that already holds keys: a key the person typed ahead is first in it,
-  and the module's key behind it could be taken as the second key of a chord they began with an
-  Escape. It queues none for a read that starts in the Vi command table, which happens after a line
-  cancelled from that table and has nothing bound on the key. It queues none for the read after a
-  line accepted with accept-and-get-next: the editor loads the next history entry into that read
-  and carries the person's history search over to it, and any key it runs ahead of the person's
-  ends the search. In those reads, and where the key cannot be bound or queued, the entry keeps
-  its own idle report, as before. A queue that holds keys is not clear either, and the editor asks
-  where the cursor is before it runs them, so a fence can be proved before the editor has asked
-  only in the reads that keep the entry's own idle report. The module takes its own key out of the
-  queue when it goes.
+  cursor and stops answering. The broker is the only responder and answers the cursor question
+  itself, and the response lane writes replies in the order of their queries, so the reply to a
+  query asked after the cursor question never goes ahead of the cursor reply. The reply to an
+  earlier query can, and the host holds it: from the moment the worker registers a read of a
+  PowerShell root off Windows until a cursor report is queued for the terminal, the lane lets the
+  cursor report out first and every other reply waits behind it, in the order of the queries,
+  without being dropped (the terminal document, "The cursor report a root editor waits for", has
+  the rule and what it does to a reply's deadline). The hold ends at the first cursor report, at
+  the reader's idle report, when the editor leaves and when the session closes. Nothing is held on
+  Windows or for the other readers, which ask no cursor question. What the host does not reach: a reply already in the terminal's input when the editor
+  asks, such as the answer to a query of a program that ended before it read it, which the host
+  cannot take back; a reply that has left the writer's queue; an answer the host writes between
+  the worker applying the read's registration and the editor asking, when the question is parsed
+  first (the registration and the question are handled by two tasks in no fixed order, and the
+  hold then covers the replies from the registration to the start key's idle report, with no
+  question left to wait for); and the reads that keep the entry's own idle report, listed below,
+  where the hold ends at the entry. Each of these still joins the reply. The module does not drop
+  them: it meets an answer only as keys, after the editor has read it from the terminal's input
+  (the next item). What the module controls is when the reader first reports its queues clear. A
+  fence proved before the editor has asked its question comes before the reply, and an answer the
+  host writes behind that fence lands ahead of the reply and joins it: the runtime takes the
+  answer's `ESC [` and its first `;` for the start of the reply and its digits for the position, and
+  gives the other bytes back as keys. Some of the answer then reaches the line, and the fence the
+  reader proves next is over a line that is not empty. So outside Windows the read-line entry
+  queues a key of the module's own in the editor's key queue (`Ctrl+Alt+F24`, which no terminal
+  sends and which the module binds where nothing is bound), and the reader reports itself idle
+  from that key's handler. The queue is not clear until the editor has run the key, which it does
+  after it has asked where the cursor is and read the reply, and before it reads a key from the
+  terminal. No fence is proved before then, so an answer written behind a fence is behind the
+  reply. The Windows console has no cursor question in its input. The module queues the key only
+  where that cannot change what the person's keys do. It queues none into a queue that already
+  holds keys: a key the person typed ahead is first in it, and the module's key behind it could be
+  taken as the second key of a chord they began with an Escape. It queues none for a read that
+  starts in the Vi command table, which happens after a line cancelled from that table and has
+  nothing bound on the key. It queues none for the read after a line accepted with
+  accept-and-get-next: the editor loads the next history entry into that read and carries the
+  person's history search over to it, and any key it runs ahead of the person's ends the search. In
+  those reads, and where the key cannot be bound or queued, the entry keeps its own idle report, as
+  before. A queue that holds keys is not clear either, and the editor asks where the cursor is
+  before it runs them, so a fence can be proved before the editor has asked only in the reads that
+  keep the entry's own idle report. The module takes its own key out of the queue when it goes.
 - **A host's answer is dropped before the editor puts it in the line.** The host answers a question
   an application asked the terminal (its attributes, a colour, its version) in the terminal's input,
   and the answer can reach a prompt with nothing typed at it. The runtime has no key for the
