@@ -1,7 +1,7 @@
 //! Signing in hands the ceremony to the system browser at the fixed origin, through the commands
 //! the page calls.
 //!
-//! KR-REQ-17.19: the native application hands the passkey ceremony to the system browser on the
+//! The native application hands the passkey ceremony to the system browser on the
 //! website's fixed HTTPS origin, whose host is the passkey relying party. These tests call the
 //! account commands the way the page calls them, through Tauri's invoke path on the mock runtime,
 //! with a browser that records what it is asked to open and answers as the service would, and a
