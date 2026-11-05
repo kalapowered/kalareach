@@ -726,6 +726,11 @@ fn lower_priority() -> BackgroundPriority {
 mod tests {
     use super::*;
 
+    /// How long a case waits for a pool thread to run a job it queued. A case decides by the job
+    /// running and by what it finds then, never by this: it ends only a pool that never runs the
+    /// job, so that the case fails instead of holding its run.
+    const POOL_WAIT: core::time::Duration = core::time::Duration::from_secs(60 * 60);
+
     #[test]
     fn the_size_bound_refuses_an_oversized_component_before_any_work() {
         let pool = CompilePool::with_threads(1, 1);
@@ -762,6 +767,9 @@ mod tests {
     // whose threads asked for nothing, or whose request was made on another thread, fails here.
     // A sandbox that refuses a thread the change of its own priority makes the pool report
     // `Declined`, which the pool allows; this case is for a host that does not refuse it.
+    //
+    // The case waits for the job to run, however long that takes. A pool that lost its thread drops
+    // the job and with it the sender, so the wait ends in an error then.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_compile_runs_on_a_pool_thread_the_kernel_holds_at_the_lowest_ordinary_priority() {
@@ -773,7 +781,7 @@ mod tests {
             })))
             .expect("the job is queued");
         let held_at = nice
-            .recv_timeout(core::time::Duration::from_secs(60))
+            .recv_timeout(POOL_WAIT)
             .expect("the pool thread ran the job");
         assert_eq!(
             pool.background_priority(),
@@ -788,17 +796,21 @@ mod tests {
     }
 
     // KR-REQ-11.41: a pool thread reports the priority its request for background priority came to.
+    //
+    // A pool thread reports before it takes its first job, so a job that has run on it is the
+    // sign that the report is there, and the case waits for that.
     #[test]
     fn a_pool_thread_asks_for_background_priority() {
         let pool = CompilePool::with_threads(1, 1);
-        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
-        while pool.background_priority().is_none() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "no pool thread reported its priority"
-            );
-            std::thread::sleep(core::time::Duration::from_millis(5));
-        }
+        let (ran, started) = mpsc::channel::<()>();
+        pool.sender
+            .try_send(Job(Box::new(move || {
+                let _ = ran.send(());
+            })))
+            .expect("the job is queued");
+        started
+            .recv_timeout(POOL_WAIT)
+            .expect("the pool thread ran the job");
         // What the platform gave is the platform's answer; that it was asked for is this crate's.
         assert!(matches!(
             pool.background_priority(),
@@ -856,15 +868,16 @@ mod tests {
         let panicked = pool
             .submit_work(|| panic!("the compiler fell over"))
             .expect("the work is queued");
-        // Behind it on the pool's only thread: it runs only if that thread is still there. The wait
-        // is a bound so that a lost thread fails the case rather than holding it.
+        // Behind it on the pool's only thread: it runs only if that thread is still there. A lost
+        // thread drops the queue, and this job and its sender with it, so the wait ends in an
+        // error and the case fails instead of being held.
         let (ran, next) = mpsc::channel::<()>();
         pool.sender
             .try_send(Job(Box::new(move || {
                 let _ = ran.send(());
             })))
             .expect("the next job is queued");
-        next.recv_timeout(core::time::Duration::from_secs(5))
+        next.recv_timeout(POOL_WAIT)
             .expect("the pool thread survived the panic");
         match panicked.blocking_recv().expect("the caller is answered") {
             Err(RuntimeError::InvalidComponent { detail }) => {
@@ -885,12 +898,16 @@ mod tests {
         let held = Arc::new(Mutex::new(held));
         let (started, running) = mpsc::channel::<()>();
 
-        let fill = || {
+        // Queues jobs until the queue is full. A job tells `report` that it started, if there is
+        // one, and then blocks.
+        let fill = |report: Option<mpsc::Sender<()>>| {
             loop {
                 let held = Arc::clone(&held);
-                let started = started.clone();
+                let report = report.clone();
                 let job = Job(Box::new(move || {
-                    let _ = started.send(());
+                    if let Some(report) = report {
+                        let _ = report.send(());
+                    }
                     if let Ok(guard) = held.lock() {
                         let _ = guard.recv();
                     }
@@ -901,13 +918,16 @@ mod tests {
             }
         };
 
-        fill();
+        fill(Some(started));
+        // The case waits for the thread to be inside a job, however long that takes. The only
+        // senders left are the queued jobs', so a pool that has no thread drops them and the wait
+        // ends in an error.
         running
-            .recv_timeout(core::time::Duration::from_secs(5))
+            .recv_timeout(POOL_WAIT)
             .expect("the pool thread starts a job");
         // The thread is now blocked in that job and will take no other. Filling again leaves the
         // queue full with nothing to drain it.
-        fill();
+        fill(None);
 
         let engine = RuntimeEngine::new().expect("an engine");
         let directory = tempfile::tempdir().expect("a temporary directory");
