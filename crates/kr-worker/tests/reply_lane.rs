@@ -14,10 +14,21 @@ use std::time::{Duration, Instant};
 use kr_ipc::clock::ManualSharedClock;
 use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
-use kr_protocol::ids::{AttachmentId, ConnectionId, EnvironmentId, SessionEpoch, SessionId};
+use kr_protocol::ids::{
+    AttachmentId, ConnectionId, EnvironmentId, InputLeaseEpoch, RequestId, SessionEpoch, SessionId,
+};
+use kr_protocol::root::{
+    CwdRevision, EditorBufferRevision, EditorKeymap, EditorLeaveReason, EditorState,
+    KeyQueueSnapshot, PendingReaderInput, PromptGeneration, ReaderContext, ReaderRevision,
+    RootEditorEnterParams, RootEditorLeaveParams,
+};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
+use kr_shell_integration::contract::events::{BridgeEvent, HooksActivated, ReaderIdle};
+use kr_shell_integration::contract::fence::LeaseView;
+use kr_shell_integration::contract::qualification::ShellKind;
 use kr_worker::action::time::{ManualWallClock, TimeSources};
+use kr_worker::fence::FenceDriver;
 use kr_worker::session::{InputBatch, Session, SessionConfig};
 
 /// The person's bracketed paste, begun and not ended.
@@ -41,6 +52,16 @@ struct Fixture {
 
 impl Fixture {
     fn new(time: TimeSources) -> Self {
+        Self::built(time, None)
+    }
+
+    /// A managed session whose root integration is registered and qualified as `kind`, with no
+    /// bridge behind it: the fence machine is driven by the events the case sends it.
+    fn managed(time: TimeSources, kind: ShellKind) -> Self {
+        Self::built(time, Some(kind))
+    }
+
+    fn built(time: TimeSources, root: Option<ShellKind>) -> Self {
         let host = kr_ipc::testing::TempHost::create();
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let config = SessionConfig {
@@ -49,7 +70,11 @@ impl Fixture {
             environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
             display_number: DisplayNumber::new(1),
             shell: kr_worker::testing::posix_script("sleep 120"),
-            shell_mode: ShellMode::NativeCompat,
+            shell_mode: if root.is_some() {
+                ShellMode::Managed
+            } else {
+                ShellMode::NativeCompat
+            },
             worker_profile: WorkerProfile::HeadlessUser,
             desktop: DesktopBinding::none(),
             dimensions: Dimensions::new(80, 24),
@@ -63,6 +88,24 @@ impl Fixture {
         };
         let mut session = Session::open(config).expect("opens");
         session.launch().expect("launches");
+        if let Some(kind) = root {
+            session.install_fence(FenceDriver::new(
+                session_id,
+                LeaseView::unheld(InputLeaseEpoch::new(0)),
+                Arc::new(kr_transport::clock::ManualClock::new()),
+            ));
+            let mut driver = session.fence_mut().expect("a driver");
+            assert!(driver.registered(kind, "psreadline-2.3"));
+            let _ = driver.bridge_event(
+                RequestId::new(1),
+                &BridgeEvent::HooksActivated(HooksActivated {
+                    session_id,
+                    prompt_generation: PromptGeneration::new(1),
+                    modules: Vec::new(),
+                }),
+            );
+            assert!(driver.phase().reports_ready());
+        }
         let mut requested = CanonicalSet::new();
         requested.insert(AttachmentCapability::ObserveTerminal);
         requested.insert(AttachmentCapability::Input);
@@ -267,5 +310,245 @@ async fn a_takeover_counts_the_holders_keystrokes_and_leaves_the_hosts_answer_al
         fixture.replies(),
         vec![b"\x1b[1;1R".to_vec()],
         "the answer is still queued for the application"
+    );
+}
+
+// --------------------------------------------------------------------------------------------
+// The root editor's cursor question.
+// --------------------------------------------------------------------------------------------
+
+/// The application asks for its primary device attributes.
+const DEVICE_ATTRIBUTES: &[u8] = b"\x1b[c";
+
+/// And for its secondary ones.
+const SECONDARY_ATTRIBUTES: &[u8] = b"\x1b[>c";
+
+/// The host's answer to the first, and to the second.
+const DEVICE_ATTRIBUTES_REPLY: &[u8] = b"\x1b[?62;22c";
+const SECONDARY_ATTRIBUTES_REPLY: &[u8] = b"\x1b[>41;1;0c";
+
+/// The host's answer to a question about the cursor of a screen nothing has drawn on.
+const CURSOR_REPORT: &[u8] = b"\x1b[1;1R";
+
+fn editor_state() -> EditorState {
+    EditorState {
+        buffer_empty: true,
+        buffer_revision: EditorBufferRevision::new(1),
+        keymap: EditorKeymap::Emacs,
+        pending: PendingReaderInput::NONE,
+    }
+}
+
+impl Fixture {
+    /// The root editor reports one of its events, and the session carries out what comes of it.
+    fn editor_reports(&mut self, event: BridgeEvent) {
+        let _ = self
+            .session
+            .stimulate_fence(|driver| driver.bridge_event(RequestId::new(2), &event))
+            .expect("a driver");
+    }
+
+    /// The root editor starts a read.
+    fn editor_enters(&mut self) {
+        self.editor_reports(BridgeEvent::EditorEnter(RootEditorEnterParams {
+            session_id: self.session_id,
+            root_process: kr_ipc::identity::current_process_start_identity().expect("this process"),
+            prompt_generation: PromptGeneration::new(1),
+            reader_revision: ReaderRevision::new(1),
+            reader_context: ReaderContext::Primary,
+            editor: editor_state(),
+            cwd_revision: CwdRevision::new(1),
+        }));
+    }
+
+    /// The root editor reports itself idle, which it does once it is reading keys.
+    #[cfg(not(windows))]
+    fn editor_idles(&mut self) {
+        self.editor_reports(BridgeEvent::ReaderIdle(ReaderIdle {
+            session_id: self.session_id,
+            prompt_generation: PromptGeneration::new(1),
+            reader_revision: ReaderRevision::new(1),
+            reader_context: ReaderContext::Primary,
+            snapshot: KeyQueueSnapshot::drained(),
+            editor: editor_state(),
+            cwd_revision: CwdRevision::new(1),
+        }));
+    }
+
+    /// The root editor returns a line.
+    fn editor_leaves(&mut self) {
+        self.editor_reports(BridgeEvent::EditorLeave(RootEditorLeaveParams {
+            session_id: self.session_id,
+            prompt_generation: PromptGeneration::new(1),
+            reader_revision: ReaderRevision::new(1),
+            reason: EditorLeaveReason::CommandAccepted,
+        }));
+    }
+
+    /// The application writes `output`, which asks the questions in it.
+    fn application_writes(&mut self, output: &[u8]) {
+        let _ = self.session.ingest_output(output);
+    }
+}
+
+/// A fixture with a root PowerShell editor at a prompt, on a clock the case moves.
+fn at_a_powershell_prompt() -> (ManualSharedClock, Fixture) {
+    let (clock, time) = manual();
+    let mut fixture = Fixture::managed(time, ShellKind::PowerShell);
+    fixture.editor_enters();
+    (clock, fixture)
+}
+
+/// KR-REQ-08.48, KR-REQ-08.49: the PowerShell editor reads the reply to its question about the
+/// cursor from the same input as every other byte, and joins into it any byte that comes ahead of
+/// it. So when answers to earlier questions are waiting with the cursor report, the cursor report is
+/// written first and the others follow it, in the order of their questions. A program that asks
+/// nothing of the kind sees no change: once the report is written the order is the questions'.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cursor_report_is_written_ahead_of_the_answers_to_the_questions_before_it() {
+    let (_clock, mut fixture) = at_a_powershell_prompt();
+    fixture.application_writes(&[DEVICE_ATTRIBUTES, SECONDARY_ATTRIBUTES, b"\x1b[6n"].concat());
+    assert_eq!(
+        fixture.replies(),
+        vec![
+            CURSOR_REPORT.to_vec(),
+            DEVICE_ATTRIBUTES_REPLY.to_vec(),
+            SECONDARY_ATTRIBUTES_REPLY.to_vec()
+        ]
+    );
+
+    fixture.application_writes(&[DEVICE_ATTRIBUTES, b"\x1b[6n"].concat());
+    assert_eq!(
+        fixture.replies(),
+        vec![DEVICE_ATTRIBUTES_REPLY.to_vec(), CURSOR_REPORT.to_vec()],
+        "the editor has its report, and the answers keep the order of their questions again"
+    );
+}
+
+/// KR-REQ-08.48, KR-REQ-08.49: an answer the host owes after the editor began its read waits for the
+/// editor's cursor report however long that takes, and is then written, not dropped.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_produced_before_the_cursor_question_waits_for_its_report() {
+    let (clock, mut fixture) = at_a_powershell_prompt();
+    fixture.application_writes(DEVICE_ATTRIBUTES);
+    assert!(
+        fixture.replies().is_empty(),
+        "the answer would land ahead of the report the editor is waiting for"
+    );
+    assert_eq!(
+        fixture
+            .session
+            .fence()
+            .expect("a driver")
+            .host_reply_bytes(),
+        0
+    );
+
+    // The editor's question is asked long after, as it is on a machine that is busy.
+    clock.advance(Duration::from_secs(10));
+    fixture.application_writes(b"\x1b[6n");
+    assert_eq!(
+        fixture.replies(),
+        vec![CURSOR_REPORT.to_vec(), DEVICE_ATTRIBUTES_REPLY.to_vec()],
+        "the report first, and the answer it kept behind it, which did not age while it waited"
+    );
+}
+
+/// KR-REQ-08.49: a hold that ends because the editor is reading keys, or has left, writes what it
+/// kept; and what it kept has not been given the time it waited back, so an answer that is by then
+/// older than the lane's limit is dropped, as one is behind a paste: it would reach a program that
+/// did not ask.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hold_that_ends_without_the_cursor_report_writes_what_is_young_and_drops_what_is_old() {
+    let (_clock, mut fixture) = at_a_powershell_prompt();
+    fixture.application_writes(DEVICE_ATTRIBUTES);
+    assert!(fixture.replies().is_empty());
+    fixture.editor_idles();
+    assert_eq!(
+        fixture.replies(),
+        vec![DEVICE_ATTRIBUTES_REPLY.to_vec()],
+        "the editor is reading keys, so nothing is owed a report any more"
+    );
+
+    let (_clock, mut fixture) = at_a_powershell_prompt();
+    fixture.application_writes(DEVICE_ATTRIBUTES);
+    assert!(fixture.replies().is_empty());
+    fixture.editor_leaves();
+    assert_eq!(fixture.replies(), vec![DEVICE_ATTRIBUTES_REPLY.to_vec()]);
+
+    let (clock, mut fixture) = at_a_powershell_prompt();
+    fixture.application_writes(DEVICE_ATTRIBUTES);
+    assert!(fixture.replies().is_empty());
+    clock.advance(Duration::from_millis(2_100));
+    fixture.editor_idles();
+    assert!(
+        fixture.replies().is_empty(),
+        "an answer that old is not handed to whatever reads next"
+    );
+}
+
+/// KR-REQ-08.48: the cursor report is also written ahead of an answer that already left the lane
+/// and waits for the terminal's writer, which the person's keys behind it do not change.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cursor_report_is_written_ahead_of_an_answer_still_waiting_for_the_writer() {
+    let (_clock, time) = manual();
+    let mut fixture = Fixture::managed(time, ShellKind::PowerShell);
+    // Asked before the editor began its read, and queued for the writer, which has not taken it.
+    fixture.application_writes(DEVICE_ATTRIBUTES);
+    fixture.editor_enters();
+    fixture.application_writes(b"\x1b[6n");
+    assert_eq!(
+        fixture.replies(),
+        vec![CURSOR_REPORT.to_vec(), DEVICE_ATTRIBUTES_REPLY.to_vec()]
+    );
+}
+
+/// The rule is the PowerShell editor's alone. A Zsh, Bash or Fish editor asks the terminal nothing
+/// about the cursor, and an answer it is sent is read as keys whenever it arrives, so nothing is
+/// held for it; and no session holds an answer while no editor reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn answers_keep_the_order_of_their_questions_wherever_no_cursor_report_is_owed() {
+    let (_clock, time) = manual();
+    let mut zsh = Fixture::managed(time, ShellKind::Zsh);
+    zsh.editor_enters();
+    zsh.application_writes(&[DEVICE_ATTRIBUTES, b"\x1b[6n"].concat());
+    assert_eq!(
+        zsh.replies(),
+        vec![DEVICE_ATTRIBUTES_REPLY.to_vec(), CURSOR_REPORT.to_vec()]
+    );
+
+    let (_clock, time) = manual();
+    let mut powershell = Fixture::managed(time, ShellKind::PowerShell);
+    powershell.application_writes(&[DEVICE_ATTRIBUTES, b"\x1b[6n"].concat());
+    assert_eq!(
+        powershell.replies(),
+        vec![DEVICE_ATTRIBUTES_REPLY.to_vec(), CURSOR_REPORT.to_vec()],
+        "no editor reads, so a program that asks both is answered in order"
+    );
+
+    powershell.editor_enters();
+    powershell.editor_leaves();
+    powershell.application_writes(&[SECONDARY_ATTRIBUTES, b"\x1b[6n"].concat());
+    assert_eq!(
+        powershell.replies(),
+        vec![SECONDARY_ATTRIBUTES_REPLY.to_vec(), CURSOR_REPORT.to_vec()],
+        "the editor has left, so a program the line started is answered in order"
+    );
+}
+
+/// The Windows console has no cursor question in its input, so a PowerShell root there holds
+/// nothing.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_powershell_root_on_windows_holds_no_answer_for_a_cursor_report() {
+    let (_clock, mut fixture) = at_a_powershell_prompt();
+    fixture.application_writes(&[DEVICE_ATTRIBUTES, b"\x1b[6n"].concat());
+    assert_eq!(
+        fixture.replies(),
+        vec![DEVICE_ATTRIBUTES_REPLY.to_vec(), CURSOR_REPORT.to_vec()]
     );
 }

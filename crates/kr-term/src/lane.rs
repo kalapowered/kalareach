@@ -2,7 +2,8 @@
 //!
 //! A reply the engine writes back to the application is not input. It needs no human lease, it
 //! never acquires one, and it never looks like a device, a paste or a root command. Only the query
-//! broker can put anything here, and the lane keeps replies in the order their queries arrived.
+//! broker can put anything here, and the lane keeps replies in the order their queries arrived,
+//! except that a cursor report goes ahead of the others while the root editor is owed one.
 //!
 //! The lane is bounded four ways at once, because a query flood is an ordinary thing for a
 //! misbehaving program to do: one reply has a maximum size, the queue has a maximum size, there is
@@ -124,6 +125,8 @@ pub struct Response {
     kind: ResponseKind,
     query_at: u64,
     expires_at_ms: u64,
+    /// When a drain first kept this reply behind a cursor report, while it is being kept.
+    held_since: Option<u64>,
 }
 
 impl Response {
@@ -134,7 +137,13 @@ impl Response {
             kind,
             query_at,
             expires_at_ms: 0,
+            held_since: None,
         }
+    }
+
+    /// Whether this reply has waited past its deadline at `now_ms`.
+    const fn lapsed(&self, now_ms: u64) -> bool {
+        self.expires_at_ms != 0 && now_ms > self.expires_at_ms
     }
 
     /// The exact bytes to write.
@@ -201,6 +210,12 @@ pub struct LaneGate {
     pub backend_handles_paste_interleave: bool,
     /// Whether a recognised human input frame is part way through being delivered.
     pub human_frame_open: bool,
+    /// Whether the root editor is owed the reply to its cursor question.
+    ///
+    /// The editor reads that reply from the same input as everything else the terminal sends, and
+    /// bytes that come ahead of it are read as part of it. While this is set a cursor report goes
+    /// out ahead of every other reply, and no other reply goes out until one has.
+    pub cursor_report_first: bool,
 }
 
 impl LaneGate {
@@ -259,6 +274,8 @@ pub struct ResponseLane {
     last_refill_ms: u64,
     degradation: LaneDegradation,
     delivered: u64,
+    /// Whether any waiting reply carries a `held_since`.
+    holding: bool,
 }
 
 impl ResponseLane {
@@ -279,6 +296,7 @@ impl ResponseLane {
             limits,
             degradation: LaneDegradation::default(),
             delivered: 0,
+            holding: false,
         }
     }
 
@@ -350,14 +368,32 @@ impl ResponseLane {
     /// A reply that has waited past its deadline is dropped here rather than written, and the drop
     /// shows up in the degradation record. `now_ms` is a reading of the same continuous clock the
     /// replies were offered on.
+    ///
+    /// With [`LaneGate::cursor_report_first`] set, the cursor reports go first, in their order, and
+    /// nothing else is taken until one has been: the other replies are held, not dropped. A reply
+    /// the hold kept does not age while it is kept, so when a cursor report ends the hold each of
+    /// them has the time it had left when it was first kept. When the hold ends any other way the
+    /// flag is simply not set again, no time is given back, and a reply that has by then waited
+    /// past its deadline is dropped as it would be behind a paste: an answer that old would reach
+    /// whatever reads next, which did not ask.
     pub fn drain(&mut self, gate: LaneGate, max_bytes: usize, now_ms: u64) -> Vec<Response> {
         if !gate.allows_write() {
             return Vec::new();
         }
         let mut out = Vec::new();
         let mut taken = 0usize;
+        if gate.cursor_report_first {
+            self.hold_behind_cursor_report(now_ms);
+            self.take_cursor_reports(max_bytes, now_ms, &mut taken, &mut out);
+            if out.is_empty() {
+                return out;
+            }
+            self.release_held(now_ms, true);
+        } else if self.holding {
+            self.release_held(now_ms, false);
+        }
         while let Some(front) = self.queue.front() {
-            if front.expires_at_ms != 0 && now_ms > front.expires_at_ms {
+            if front.lapsed(now_ms) {
                 let Some(expired) = self.queue.pop_front() else {
                     break;
                 };
@@ -379,6 +415,71 @@ impl ResponseLane {
         out
     }
 
+    /// Marks the replies that wait behind a cursor report, from now on, and drops one that had
+    /// already waited past its deadline before it was first kept.
+    fn hold_behind_cursor_report(&mut self, now_ms: u64) {
+        self.holding = true;
+        let mut index = 0;
+        while index < self.queue.len() {
+            let reply = &mut self.queue[index];
+            if matches!(reply.kind, ResponseKind::CursorPosition) || reply.held_since.is_some() {
+                index += 1;
+            } else if reply.lapsed(now_ms) {
+                if let Some(expired) = self.queue.remove(index) {
+                    self.queued_bytes -= expired.bytes.len();
+                    self.degradation.expired += 1;
+                }
+            } else {
+                reply.held_since = Some(now_ms);
+                index += 1;
+            }
+        }
+    }
+
+    /// Takes the cursor reports in the order they were offered.
+    fn take_cursor_reports(
+        &mut self,
+        max_bytes: usize,
+        now_ms: u64,
+        taken: &mut usize,
+        out: &mut Vec<Response>,
+    ) {
+        let mut index = 0;
+        while index < self.queue.len() {
+            let reply = &self.queue[index];
+            if !matches!(reply.kind, ResponseKind::CursorPosition) {
+                index += 1;
+            } else if reply.lapsed(now_ms) {
+                if let Some(expired) = self.queue.remove(index) {
+                    self.queued_bytes -= expired.bytes.len();
+                    self.degradation.expired += 1;
+                }
+            } else if *taken + reply.bytes.len() > max_bytes {
+                break;
+            } else if let Some(report) = self.queue.remove(index) {
+                self.queued_bytes -= report.bytes.len();
+                *taken += report.bytes.len();
+                self.delivered += 1;
+                out.push(report);
+            }
+        }
+    }
+
+    /// Ends the hold on the replies it kept. `given_back` says whether the time they were kept is
+    /// added to their deadlines, which is so only when a cursor report ended the hold.
+    fn release_held(&mut self, now_ms: u64, given_back: bool) {
+        self.holding = false;
+        for reply in &mut self.queue {
+            if let Some(since) = reply.held_since.take()
+                && given_back
+            {
+                reply.expires_at_ms = reply
+                    .expires_at_ms
+                    .saturating_add(now_ms.saturating_sub(since));
+            }
+        }
+    }
+
     /// Drops everything waiting.
     ///
     /// Source loss and reconnection both use this: an undelivered reply from before a disconnect is
@@ -386,6 +487,7 @@ impl ResponseLane {
     pub fn reset(&mut self) {
         self.queue.clear();
         self.queued_bytes = 0;
+        self.holding = false;
     }
 
     /// Clears the recorded degradation once the status has been published.

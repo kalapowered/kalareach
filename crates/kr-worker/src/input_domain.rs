@@ -892,13 +892,19 @@ impl InputDomain {
     /// the same counter: charging only some of them would make the count drift down until it
     /// stopped bounding anything.
     pub(crate) fn queue_input(&mut self, batch: InputBatch) {
+        self.queue_input_at(self.pending.len(), batch);
+    }
+
+    /// Queues one batch at a place in the queue for the terminal, counted as [`Self::queue_input`]
+    /// counts it.
+    fn queue_input_at(&mut self, at: usize, batch: InputBatch) {
         self.writer
             .queued_input_bytes
             .fetch_add(batch.len(), Ordering::AcqRel);
         if let InputBatch::Lease { epoch, .. } = batch {
             self.writer.queued_lease_bytes.add(epoch, batch.len());
         }
-        self.pending.push_back(Queued::Batch(batch));
+        self.pending.insert(at, Queued::Batch(batch));
     }
 
     /// Takes the batches that may be written to the pseudo-terminal now, in the order they were
@@ -973,6 +979,20 @@ impl InputDomain {
         replies: Vec<crate::projection::LaneReply>,
     ) -> Option<Applied> {
         let mut queued_bytes = 0_u64;
+        // Where the editor's cursor report goes: ahead of the replies that still wait here for the
+        // writer, which were queued before the report and are not the person's keys. The lane
+        // lets the report out first, and this keeps it first all the way to the terminal.
+        let mut ahead_of_replies = self
+            .fence
+            .as_ref()
+            .is_some_and(FenceDriver::cursor_report_owed)
+            .then(|| {
+                self.pending
+                    .iter()
+                    .position(|queued| matches!(queued, Queued::Batch(InputBatch::Reply { .. })))
+            })
+            .flatten();
+        let mut cursor_reported = false;
         for reply in replies {
             let queued = self.writer.queued_input_bytes.load(Ordering::Acquire);
             // What the replies themselves hold: queued and neither written nor dropped. The queue
@@ -996,10 +1016,22 @@ impl InputDomain {
             self.writer
                 .unwritten_replies
                 .fetch_add(reply.bytes.len(), Ordering::AcqRel);
-            self.queue_input(InputBatch::Reply {
+            let cursor_report = reply.cursor_report;
+            let batch = InputBatch::Reply {
                 bytes: reply.bytes,
                 expires_at_ms: reply.expires_at_ms,
-            });
+            };
+            match ahead_of_replies {
+                Some(at) if cursor_report => {
+                    self.queue_input_at(at, batch);
+                    ahead_of_replies = Some(at + 1);
+                }
+                _ => self.queue_input(batch),
+            }
+            cursor_reported |= cursor_report;
+        }
+        if cursor_reported && let Some(driver) = self.fence.as_mut() {
+            driver.cursor_report_queued();
         }
         if queued_bytes > 0
             && let Some(driver) = self.fence.as_mut()
@@ -1018,8 +1050,13 @@ impl InputDomain {
     ///
     /// A reply must not land in the middle of a bracketed paste or a recognised human input frame,
     /// because the application would read it as part of what the person was typing.
+    ///
+    /// While the root editor is owed the reply to its cursor question the gate also says so: the
+    /// editor reads that reply from the same input as everything else the terminal sends, and
+    /// bytes that come ahead of it are read as part of it, so the lane lets the cursor report out
+    /// first and holds every other reply behind it.
     #[must_use]
-    pub const fn lane_gate(&self) -> kr_term::lane::LaneGate {
+    pub fn lane_gate(&self) -> kr_term::lane::LaneGate {
         kr_term::lane::LaneGate {
             paste_open: self.framer.paste_open(),
             // No backend this host drives is qualified to take a reply inside an open paste.
@@ -1028,6 +1065,10 @@ impl InputDomain {
             // part way through sending. A reply written in the middle of it would arrive inside
             // what the application reads as one key.
             human_frame_open: self.framer.held_len() > 0,
+            cursor_report_first: self
+                .fence
+                .as_ref()
+                .is_some_and(FenceDriver::cursor_report_owed),
         }
     }
 
@@ -1038,6 +1079,7 @@ impl InputDomain {
             paste_open: true,
             backend_handles_paste_interleave: false,
             human_frame_open: true,
+            cursor_report_first: false,
         }
     }
 
@@ -1688,6 +1730,7 @@ mod tests {
 
         let answer = b"\x1b[0n".to_vec();
         let _ = input.queue_replies(vec![crate::projection::LaneReply {
+            cursor_report: false,
             bytes: answer.clone(),
             expires_at_ms: None,
         }]);
@@ -1710,6 +1753,7 @@ mod tests {
         // reply past it is refused.
         let room = MAX_PENDING_REPLY_BYTES - b"\x1b[0n".len();
         let reply = |len: usize| crate::projection::LaneReply {
+            cursor_report: false,
             bytes: vec![b'r'; len],
             expires_at_ms: None,
         };
@@ -1739,6 +1783,7 @@ mod tests {
             let _ = input.set_bracketed_paste(true);
 
             let _ = input.queue_replies(vec![crate::projection::LaneReply {
+                cursor_report: false,
                 bytes: text.to_vec(),
                 expires_at_ms: None,
             }]);
