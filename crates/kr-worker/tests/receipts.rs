@@ -2389,6 +2389,14 @@ fn bound_to_the_session(host: &Host) {
 impl Sourced {
     const ALL: [Self; 3] = [Self::OwnCancellation, Self::Question, Self::Alert];
 
+    fn method(self) -> Method {
+        match self {
+            Self::OwnCancellation => Method::QuestionCancelOwn,
+            Self::Question => Method::QuestionCreate,
+            Self::Alert => Method::AlertCreate,
+        }
+    }
+
     /// The request of this kind for `identity`, under a fresh action identifier and the
     /// preconditions `expected`.
     fn request(
@@ -2398,17 +2406,15 @@ impl Sourced {
         identity: &Identity,
         expected: ParamsValue,
     ) -> MutationRequest {
-        let (method, params) = match self {
-            Self::OwnCancellation => (
-                Method::QuestionCancelOwn,
+        let params = match self {
+            Self::OwnCancellation => {
                 ParamsValue::from_typed(&kr_protocol::question::QuestionCancelOwnParams {
                     session_id: host.session_id,
                     question_id: identity.question.question_id,
                     caller_token: identity.token.clone(),
-                }),
-            ),
-            Self::Question => (
-                Method::QuestionCreate,
+                })
+            }
+            Self::Question => {
                 ParamsValue::from_typed(&kr_protocol::question::QuestionCreateParams {
                     session_id: host.session_id,
                     request_id: identity.label.to_owned(),
@@ -2419,22 +2425,19 @@ impl Sourced {
                     choices: Vec::new(),
                     requested_expiry_ms: Nullable::some(DurationMs::new(600_000)),
                     wait_ms: Nullable::null(),
-                }),
-            ),
-            Self::Alert => (
-                Method::AlertCreate,
-                ParamsValue::from_typed(&kr_protocol::question::AlertCreateParams {
-                    session_id: host.session_id,
-                    dedup_id: identity.label.to_owned(),
-                    agent_name: Nullable::some("kr-test-agent".to_owned()),
-                    text: "The build finished.".to_owned(),
-                    severity: kr_protocol::question::AlertSeverity::Info,
-                    safe_session_link: Nullable::null(),
-                }),
-            ),
+                })
+            }
+            Self::Alert => ParamsValue::from_typed(&kr_protocol::question::AlertCreateParams {
+                session_id: host.session_id,
+                dedup_id: identity.label.to_owned(),
+                agent_name: Nullable::some("kr-test-agent".to_owned()),
+                text: "The build finished.".to_owned(),
+                severity: kr_protocol::question::AlertSeverity::Info,
+                safe_session_link: Nullable::null(),
+            }),
         };
         MutationRequest {
-            method: method.into(),
+            method: self.method().into(),
             params: params.expect("encodes"),
             ..close_mutation(client, host, DEFAULT_MUTATION_TTL.get(), expected)
         }
@@ -2766,32 +2769,57 @@ async fn an_uncertain_request_whose_identity_cannot_be_read_holds_back_every_req
     }
 }
 
+/// A request of `method` that carries no parameters.
+fn malformed_request(client: &Client<impl Codec>, host: &Host, method: Method) -> MutationRequest {
+    MutationRequest {
+        method: method.into(),
+        params: ParamsValue::empty(),
+        ..close_mutation(
+            client,
+            host,
+            DEFAULT_MUTATION_TTL.get(),
+            ParamsValue::empty(),
+        )
+    }
+}
+
 /// KR-REQ-11.63: a question or an alert whose parameters do not parse is refused in validation,
-/// after its receipt is written, as it was before a request was told apart by its identity.
+/// after its receipt is written, as it was before a request was told apart by its identity. Where
+/// an uncertain request of its method stands, no identity can be read from it, and it is held back
+/// by that request as it always was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_malformed_question_or_alert_is_refused_and_leaves_a_rejected_receipt() {
-    for method in [Method::QuestionCreate, Method::AlertCreate] {
+    for kind in [Sourced::Question, Sourced::Alert] {
         let host = host().await;
         let mut client = cli(&host).await;
-        let malformed = MutationRequest {
-            method: method.into(),
-            params: ParamsValue::empty(),
-            ..close_mutation(
-                &client,
-                &host,
-                DEFAULT_MUTATION_TTL.get(),
-                ParamsValue::empty(),
-            )
+        let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+        let request = malformed_request(&client, &host, kind.method());
+        let action_id = request.action_id;
+        let Outcome::Error(error) = send_mutation(&mut client, request).await else {
+            panic!("{kind:?} with no parameters is refused");
         };
-        let action_id = malformed.action_id;
-        let Outcome::Error(error) = send_mutation(&mut client, malformed).await else {
-            panic!("{method:?} with no parameters is refused");
-        };
-        assert_eq!(error.code, ErrorCode::InvalidArgument, "{method:?}");
+        assert_eq!(error.code, ErrorCode::InvalidArgument, "{kind:?}");
         assert_eq!(
             receipt_read_for(&mut client, action_id).await.state,
             ReceiptState::Rejected,
-            "{method:?}: the refusal is recorded"
+            "{kind:?}: the refusal is recorded"
+        );
+
+        let lost = MutationRequest {
+            action_id: action(88),
+            ..kind.request(
+                &client,
+                &host,
+                &identity(&host, "first"),
+                ParamsValue::empty(),
+            )
+        };
+        kind.lost(&host, &caller, &lost, kr_ipc::now_ms());
+        let held = malformed_request(&client, &host, kind.method());
+        assert_refused_naming(
+            send_mutation(&mut client, held).await,
+            action(88),
+            &format!("{kind:?}: with an uncertain request standing"),
         );
     }
 }
@@ -2982,6 +3010,78 @@ async fn an_answer_has_to_show_the_uncertain_answer_recorded_last() {
             taken.state,
             kr_protocol::question::QuestionState::Answered,
             "{clock}"
+        );
+    }
+}
+
+/// The uncertain outcomes of a case in the order they were admitted in, each with whether the journal
+/// still holds its events.
+type Outcomes = &'static [(u8, bool)];
+
+/// KR-REQ-23.24: an uncertain outcome that has no event in the journal's record, as the receipts of
+/// a journal an earlier build wrote have none, comes after every outcome that has one, and such
+/// outcomes come in the order they were admitted in. An identifier or a clock reading says nothing
+/// of either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uncertain_outcome_with_no_recorded_event_comes_after_the_outcomes_that_have_one() {
+    // The outcomes, and the one a request has to show.
+    let cases: [(&str, Outcomes, u8); 2] = [
+        (
+            "an outcome with events comes first",
+            &[(0x50, true), (0x90, false), (0x30, false)],
+            0x50,
+        ),
+        (
+            "outcomes with none come in the order they were admitted in",
+            &[(0x90, false), (0x30, false)],
+            0x30,
+        ),
+    ];
+    for (what, outcomes, newest) in cases {
+        let host = host().await;
+        let mut client = cli(&host).await;
+        let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+        let close = close_mutation(
+            &client,
+            &host,
+            DEFAULT_MUTATION_TTL.get(),
+            ParamsValue::empty(),
+        );
+        let recorded_at = kr_ipc::now_ms();
+        for (byte, _) in outcomes {
+            let lost = MutationRequest {
+                action_id: action(*byte),
+                ..close.clone()
+            };
+            an_uncertain_outcome_kept_as_at(
+                &host,
+                &caller,
+                lost.action_id,
+                &lost,
+                vec![0xa0],
+                recorded_at,
+            );
+        }
+        let database = rusqlite::Connection::open(&host.journal_path).expect("the same database");
+        for (byte, has_events) in outcomes {
+            if !has_events {
+                database
+                    .execute(
+                        "DELETE FROM receipt_events WHERE action_id = ?1",
+                        [action(*byte).get().as_bytes().as_slice()],
+                    )
+                    .expect("the receipt reads as one an earlier build wrote");
+            }
+        }
+
+        let unquoted = MutationRequest {
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            ..close
+        };
+        assert_refused_naming(
+            send_mutation(&mut client, unquoted).await,
+            action(newest),
+            what,
         );
     }
 }
