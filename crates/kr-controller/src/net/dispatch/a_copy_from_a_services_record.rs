@@ -139,6 +139,17 @@ async fn a_refusal_copied_from_the_record_is_told_as_unknown(
 ) {
     let world = fake::fake_worker(None).await;
     let controller = &world.controller;
+    if method == Method::ProjectInit && !controller.qualification().qualifies() {
+        // The door refuses a repository operation to a device before the project service is
+        // asked, on a host that has not proved Git's reads confined, so there is no record for a
+        // service to copy from.
+        println!(
+            "not exercised: {method:?} needs a host that proves Git's reads confined, and this one \
+             does not"
+        );
+        world.serving.abort();
+        return;
+    }
     let (connection, recording) = paired_connection(controller, byte, EVERY_RIGHT);
     let mutation = mutation_of(&world, &connection, method, 91, params(&world));
 
