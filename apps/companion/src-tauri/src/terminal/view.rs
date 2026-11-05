@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 
+use kr_client::error::HostWord;
 use kr_client::projection::{Applied, Projection, decode, is_projection_event};
 use kr_client::shown::Shown;
 use kr_keys::{KeyEventKind, Modifiers};
@@ -742,6 +743,10 @@ impl View {
                 command = commands.recv() => Next::Command(command),
                 frame = self.wire.recv() => Next::Frame(frame),
             };
+            // Whatever the session says lets a size it did not take for now go again.
+            if matches!(next, Next::Frame(Ok(_))) {
+                self.window.heard();
+            }
             let ended = match next {
                 Next::Command(Some(Command::Resize(size))) => {
                     self.window.measured(size);
@@ -863,9 +868,11 @@ impl View {
             return None;
         }
         if self.window.is_in_flight(response.request_id) {
-            // A refusal settles the report and changes nothing; an acceptance settles it once a
-            // screen naming its revision has arrived, whichever came first. A screen that waited
-            // for this answer is drawn now, with what the answer settled.
+            // A definite refusal settles the report and changes nothing; an acceptance settles it
+            // once a screen naming its revision has arrived, whichever came first. A refusal for
+            // now, or an answer that cannot say what became of the report, settles no size: it is
+            // owed again. A screen that waited for this answer is drawn now, with what the answer
+            // settled.
             let answer = match response.outcome {
                 Outcome::Ok(value) => match value.to_typed::<AttachmentViewportResult>() {
                     Ok(result) => {
@@ -879,7 +886,10 @@ impl View {
                     }
                     Err(_) => Answer::Refused,
                 },
-                Outcome::Error(_) => Answer::Refused,
+                Outcome::Error(refusal) if HostWord::of(refusal.code).is_definite() => {
+                    Answer::Refused
+                }
+                Outcome::Error(_) => Answer::NotSettled,
             };
             self.window.answered(answer);
             if self.held {
