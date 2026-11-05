@@ -45,8 +45,8 @@ use kr_plugin_service::vocabulary::{
 };
 
 use crate::runtime::binding::{
-    BindingEvent, BindingHandle, BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE, Runtime,
-    RuntimeConfig, Unbound, remaining_of,
+    BindingEvent, BindingHandle, BindingOwner, BindingRequest, Compilation, DEFAULT_EVENT_QUEUE,
+    Runtime, RuntimeConfig, Unbound, remaining_of,
 };
 use crate::runtime::budget::CallKind;
 use crate::runtime::compile::CompileOrigin;
@@ -111,14 +111,16 @@ const NOTICE_DRAIN: core::time::Duration = core::time::Duration::from_secs(2);
 /// peer.
 const WRITE_DEADLINE: core::time::Duration = core::time::Duration::from_secs(10);
 
-/// How many payload reads this host will have outstanding at once.
+/// How many payloads this host will have in hand at once, from the read of one to the queueing of
+/// its compile.
 ///
-/// A read is blocking work on a thread of its own, and a caller that stopped waiting for one does
-/// not stop it: the file is still being read. Without a bound, a worker that registered, gave up,
-/// and registered again could leave a growing number of reads behind it. The permit is held inside
-/// the read rather than by the caller, so it is released when the read ends rather than when the
-/// caller does.
-const MAX_CONCURRENT_READS: usize = 8;
+/// A read, and then the digest the compile is keyed by, are blocking work on a thread of their own,
+/// and a caller that stopped waiting for one does not stop it: the file is still being read, or the
+/// payload is still being digested. Without a bound, a worker that registered, gave up, and
+/// registered again could leave a growing number of them behind it. The permit is held inside the
+/// blocking work rather than by the caller, so it is released when the work ends rather than when
+/// the caller does.
+const MAX_CONCURRENT_PAYLOADS: usize = 8;
 
 /// How much of a refusal is carried back to the worker.
 ///
@@ -142,8 +144,8 @@ pub struct PluginHost {
     identity: HostIdentity,
     runtime: Arc<Runtime>,
     config: HostConfig,
-    /// How many payload reads may be under way at once, across every connection.
-    reads: Arc<tokio::sync::Semaphore>,
+    /// How many payloads may be in hand at once, across every connection.
+    payloads: Arc<tokio::sync::Semaphore>,
     /// The packages directory, opened once. Every payload is opened relative to this handle, which
     /// is what keeps a component's location inside it a property of the open rather than of a
     /// comparison made before it.
@@ -238,7 +240,7 @@ impl PluginHost {
             identity,
             runtime: Arc::new(runtime),
             config,
-            reads: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_READS)),
+            payloads: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PAYLOADS)),
             packages: Arc::new(packages),
             started: std::time::Instant::now(),
             #[cfg(feature = "testing")]
@@ -828,6 +830,7 @@ impl PluginHost {
         #[cfg(feature = "testing")]
         self.hold_at_the_registration_gate().await;
         let started = std::time::Instant::now();
+        let deadline = REGISTER_DEADLINE;
         let BindingRegistration {
             binding_id,
             identity,
@@ -841,66 +844,43 @@ impl PluginHost {
         // Reading a file is blocking work, and a payload is up to sixteen mebibytes. Neither
         // belongs on the executor that is reading this connection's next request.
         //
-        // A place among the reads this host will have under way is taken first, and the read holds
-        // it rather than this caller: a caller whose deadline ran out does not stop the read, so a
-        // place released here would let abandoned reads accumulate behind the ones this host is
-        // still waiting for.
-        let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
-        let reads = Arc::clone(&self.reads);
-        let permit = tokio::time::timeout(remaining, reads.acquire_owned())
+        // A place among the payloads this host will have in hand is taken first, and the blocking
+        // work holds it rather than this caller: a caller whose deadline ran out does not stop the
+        // read, so a place released here would let abandoned reads accumulate behind the ones this
+        // host is still waiting for. The read gives the place on to the work that queues the
+        // compile, so the payload is in hand under one place from the read to the queueing.
+        let remaining = remaining_of(started, deadline).map_err(refusal)?;
+        let payloads = Arc::clone(&self.payloads);
+        let place = tokio::time::timeout(remaining, payloads.acquire_owned())
             .await
-            .map_err(|_elapsed| {
-                (
-                    RuntimeError::CallerDeadline {
-                        deadline_ms: u64::try_from(REGISTER_DEADLINE.as_millis())
-                            .unwrap_or(u64::MAX),
-                    }
-                    .to_string(),
-                    false,
-                )
-            })?
+            .map_err(|_elapsed| caller_deadline(deadline))?
             .map_err(|_closed| ("this host is no longer reading payloads".to_owned(), false))?;
         let packages = Arc::clone(&self.packages);
         let root = self.config.packages_root.clone();
         let reading = tokio::task::spawn_blocking(move || {
-            let _place = permit;
-            read_component(&packages, &root, &component)
+            (read_component(&packages, &root, &component), place)
         });
         // Inside the registration's own deadline, like every other stage: a read that is somehow
         // still going when the worker has stopped waiting is not one this host keeps waiting for.
-        let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
-        let wasm = tokio::time::timeout(remaining, reading)
+        let remaining = remaining_of(started, deadline).map_err(refusal)?;
+        let (read, place) = tokio::time::timeout(remaining, reading)
             .await
-            .map_err(|_elapsed| {
-                (
-                    RuntimeError::CallerDeadline {
-                        deadline_ms: u64::try_from(REGISTER_DEADLINE.as_millis())
-                            .unwrap_or(u64::MAX),
-                    }
-                    .to_string(),
-                    false,
-                )
-            })?
-            .map_err(|error| (format!("the payload could not be read: {error}"), false))?
-            .map_err(|detail| (detail, false))?;
+            .map_err(|_elapsed| caller_deadline(deadline))?
+            .map_err(|error| (format!("the payload could not be read: {error}"), false))?;
+        let wasm = read.map_err(refused)?;
 
         // Two steps rather than one, because they are two steps: the compile happens on a
         // background thread under its own budget, and only once an instance exists does any
-        // call budget start. Queueing it makes the component's key, a digest of up to sixteen
-        // mebibytes, so it is done where a read is done and not on the executor.
-        remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
+        // call budget start.
+        let remaining = remaining_of(started, deadline).map_err(refusal)?;
         #[cfg(feature = "testing")]
         let held = self.hold_compiles_at_the_gate();
-        let runtime = Arc::clone(&self.runtime);
-        let compilation = tokio::task::spawn_blocking(move || runtime.compile(wasm))
-            .await
-            .map_err(|error| (format!("the compile could not be queued: {error}"), false))?
-            .map_err(refusal)?;
+        let compilation = queue_compile(&self.runtime, wasm, place, remaining, deadline).await?;
         #[cfg(feature = "testing")]
         if let Some(held) = held {
             held.queued();
         }
-        let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
+        let remaining = remaining_of(started, deadline).map_err(refusal)?;
         let compiled = compilation.wait(remaining).await.map_err(refusal)?;
         let binding = BindingId::new(binding_id);
         let request = BindingRequest {
@@ -928,7 +908,7 @@ impl PluginHost {
             served.notices.clone(),
             Arc::clone(&served.conversation),
         );
-        let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
+        let remaining = remaining_of(started, deadline).map_err(refusal)?;
         let bound = self
             .runtime
             .instantiate(served.owner, request, &compiled, events, remaining)
@@ -1424,6 +1404,46 @@ fn refused(detail: String) -> (String, bool) {
     (detail, false)
 }
 
+/// The refusal for a registration that has run out of the time it was given.
+fn caller_deadline(deadline: core::time::Duration) -> (String, bool) {
+    (
+        RuntimeError::CallerDeadline {
+            deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+        }
+        .to_string(),
+        false,
+    )
+}
+
+/// Queues a component's compile from a thread of the blocking pool, and gives the refusal for a
+/// registration whose time (`deadline` in all, `remaining` of it now) runs out first.
+///
+/// The compile's key is a digest of up to sixteen mebibytes, so the queueing is done where a read is
+/// done and not on the executor. A blocking pool that other work keeps busy can leave the task
+/// waiting for a thread for longer than the registration has, so the wait is held to the time left.
+/// A registration that gives up does not take the task back: it runs when it gets a thread, hands
+/// the compile to the pool, and the compile files its result as it would for a caller that waited,
+/// so the next registration of the component finds it. The place among the payloads this host has
+/// in hand is the task's own, and is given up when the task ends and not when the caller does.
+async fn queue_compile(
+    runtime: &Arc<Runtime>,
+    wasm: Arc<[u8]>,
+    place: tokio::sync::OwnedSemaphorePermit,
+    remaining: core::time::Duration,
+    deadline: core::time::Duration,
+) -> Result<Compilation, (String, bool)> {
+    let runtime = Arc::clone(runtime);
+    let queueing = tokio::task::spawn_blocking(move || {
+        let _place = place;
+        runtime.compile(wasm)
+    });
+    tokio::time::timeout(remaining, queueing)
+        .await
+        .map_err(|_elapsed| caller_deadline(deadline))?
+        .map_err(|error| (format!("the compile could not be queued: {error}"), false))?
+        .map_err(refusal)
+}
+
 /// Returns true for the requests this host answers without entering a component.
 ///
 /// An observation is one of them: it is a queue push, and answering it on the reading task is what
@@ -1744,6 +1764,83 @@ mod tests {
     fn a_registration_is_given_longer_by_the_client_than_the_host_gives_itself() {
         // A client that gave up first would report its own patience as the host's failure.
         assert!(kr_plugin_service::client::REGISTER_DEADLINE > REGISTER_DEADLINE);
+    }
+
+    /// How long the case below lets an answer take before it calls the registration unanswered. The
+    /// answer is due after a tenth of a second; this ends only one that is not given.
+    const UNANSWERED: core::time::Duration = core::time::Duration::from_secs(20);
+
+    /// How long the case below waits for the pool's thread to be held, and to run the task it has
+    /// been waiting for once it is let go. Neither is decided by it: it ends only a thread that
+    /// never gets there.
+    const POOL_THREAD: core::time::Duration = core::time::Duration::from_secs(60 * 60);
+
+    // A blocking pool that other work keeps busy leaves a compile that is to be queued waiting for a
+    // thread. The registration is answered at its deadline all the same, and the place among the
+    // payloads the host has in hand stays with the task that will queue the compile, which the pool
+    // runs once it has a thread, and is given up when that task ends.
+    #[test]
+    fn a_compile_waiting_for_the_blocking_pool_is_refused_at_the_registration_deadline() {
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("an executor with one blocking thread");
+        executor.block_on(async {
+            let directory = tempfile::tempdir().expect("a temporary directory");
+            let runtime = Arc::new(
+                Runtime::new(RuntimeConfig::new(directory.path().join("plugin-cache")))
+                    .expect("a runtime"),
+            );
+            // The pool's only thread is held by work that ends when the case drops `release`.
+            let (running, occupied) = tokio::sync::oneshot::channel::<()>();
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = running.send(());
+                let _ = held.recv();
+            });
+            tokio::time::timeout(POOL_THREAD, occupied)
+                .await
+                .expect("the pool's thread was held")
+                .expect("the held work started");
+
+            let places = Arc::new(tokio::sync::Semaphore::new(1));
+            let place = Arc::clone(&places)
+                .acquire_owned()
+                .await
+                .expect("a place among the payloads in hand");
+            let deadline = core::time::Duration::from_secs(30);
+            let answered = tokio::time::timeout(
+                UNANSWERED,
+                queue_compile(
+                    &runtime,
+                    Arc::from(&b"\0asm\x0d\0\x01\0"[..]),
+                    place,
+                    core::time::Duration::from_millis(100),
+                    deadline,
+                ),
+            )
+            .await
+            .expect("the registration was answered, and not left waiting for the pool");
+            let (refusal, disabled) =
+                answered.expect_err("no thread ran the task, so it is refused");
+            assert!(refusal.contains("30000 ms"), "{refusal}");
+            assert!(!disabled);
+
+            // The caller has given up and the task has not run: the place is the task's, still held.
+            assert_eq!(places.available_permits(), 0);
+
+            // The pool gets a thread again. The task runs, hands the compile on, and lets the place
+            // go.
+            drop(release);
+            let _back = tokio::time::timeout(POOL_THREAD, places.acquire())
+                .await
+                .expect("the place was given up when the task ended")
+                .expect("the places are open");
+            blocker.await.expect("the held work ended");
+        });
+        executor.shutdown_timeout(UNANSWERED);
     }
 
     #[test]
