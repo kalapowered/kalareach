@@ -309,7 +309,9 @@ Compiled machine code is filed under three things, all three necessary:
 
 A component this process compiled or loaded once is kept in memory, up to thirty-two of them, so a
 second binding of the same package neither compiles nor reads a file. For those, no question of
-provenance arises at all.
+provenance arises at all. A component belongs to the engine that holds it and is served from memory
+to that engine alone; an engine built the same way that asks for the same bytes loads the artefact
+from disk instead.
 
 For the rest, a serialised component is machine code. Reading one back is equivalent to loading a
 shared library, and it is worth being exact about which question the manifest beside it answers.

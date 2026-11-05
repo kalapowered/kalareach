@@ -282,7 +282,7 @@ fn kr_req_11_40_an_ambient_import_is_refused_and_named() {
         cache.verify(&key).ok().flatten().is_none(),
         "a refused component was cached"
     );
-    assert!(cache.resident_component(&key).is_none());
+    assert!(cache.resident_component(engine.engine(), &key).is_none());
 }
 
 // KR-REQ-11.40: instructions are bounded with fuel, elapsed execution with deadlines, and neither
@@ -1620,7 +1620,9 @@ fn kr_req_11_41_a_load_that_used_more_than_the_bound_is_refused() {
     compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
         .expect("the component compiles");
     assert!(
-        cache.resident_component(&key_for(&engine, &wasm)).is_some(),
+        cache
+            .resident_component(engine.engine(), &key_for(&engine, &wasm))
+            .is_some(),
         "the compile was not filed, so the call below would not be a load"
     );
 
@@ -2210,7 +2212,11 @@ fn a_component_this_process_compiled_is_served_from_memory() {
         .expect("the component compiles");
     assert_eq!(first.origin, CompileOrigin::Compiled);
     assert_eq!(cache.resident(), 1);
-    assert!(cache.resident_component(&first.key).is_some());
+    assert!(
+        cache
+            .resident_component(engine.engine(), &first.key)
+            .is_some()
+    );
 
     // Removing the files leaves the one in memory, which is the one this process produced: no
     // question of provenance arises for it, because no file is read.
@@ -2226,6 +2232,68 @@ fn a_component_this_process_compiled_is_served_from_memory() {
     let third = compile_or_load(&engine, &cache, &wasm, no_compile_work_bound())
         .expect("the component compiles again");
     assert_eq!(third.origin, CompileOrigin::Compiled);
+}
+
+// KR-REQ-11.41: a component held in memory is served only to the engine that holds it. A component
+// belongs to the engine that compiled or loaded it and no other engine can instantiate it, and two
+// engines built alike share one compatibility identity, so the cache cannot tell them apart by key:
+// the engine that asks second is given a component of its own, loaded from the artefact the first
+// filed.
+#[test]
+fn kr_req_11_41_a_component_in_one_engines_memory_is_not_served_to_another_engine() {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let first = engine();
+    let second = engine();
+    assert_eq!(
+        key_for(&first, &wasm),
+        key_for(&second, &wasm),
+        "two engines built alike are told apart by the key"
+    );
+    let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(
+        directory.path().join("plugin-cache"),
+    )
+    .expect("a cache");
+
+    let filed = compile_or_load(&first, &cache, &wasm, no_compile_work_bound())
+        .expect("the component compiles");
+    assert_eq!(filed.origin, CompileOrigin::Compiled);
+    assert!(wasmtime::Engine::same(
+        filed.component.engine(),
+        first.engine()
+    ));
+
+    let served = compile_or_load(&second, &cache, &wasm, no_compile_work_bound())
+        .expect("the component loads");
+    assert_eq!(served.origin, CompileOrigin::Cached);
+    assert!(
+        wasmtime::Engine::same(served.component.engine(), second.engine()),
+        "the engine that asked was given a component another engine holds"
+    );
+    Instance::new(
+        &second,
+        &served.component,
+        components::facts("well-behaved"),
+        InstanceLimiter::defaults(),
+        kr_plugin_runtime::runtime::budget::FUEL_PER_DEADLINE_MS,
+    )
+    .expect("the component instantiates on the engine that asked for it");
+
+    // What the cache holds in memory under the key is the component of the engine that loaded last,
+    // and the first engine is not served the second's.
+    assert_eq!(cache.resident(), 1);
+    assert!(
+        cache
+            .resident_component(second.engine(), &served.key)
+            .is_some()
+    );
+    assert!(
+        cache
+            .resident_component(first.engine(), &served.key)
+            .is_none()
+    );
 }
 
 // A replaced instance is told what the host holds now, not what it held when the binding was made.

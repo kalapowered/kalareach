@@ -18,6 +18,12 @@
 //! hash, so an engine that changes anything about how it compiles misses the cache rather than
 //! loading something it cannot run.
 //!
+//! The key names what a build of an engine produces, and two engines built alike produce the same.
+//! A component in memory is more than that: it belongs to the one engine that compiled or loaded it,
+//! and no other engine can instantiate it. So the copy this process holds is served only to the
+//! engine that holds it, and an engine of the same build that asks for the same bytes loads the
+//! artefact from disk instead.
+//!
 //! # What is never deserialised
 //!
 //! A serialised component is machine code. Deserialising one is equivalent to loading a shared
@@ -228,17 +234,27 @@ impl CompiledCache {
         format!("{}/{}", key.engine_directory(), key.entry_name())
     }
 
-    /// Returns the component for a key if this process already has it in memory.
+    /// Returns the component for a key if this process already has it in memory for `engine`.
+    ///
+    /// A component held for another engine is not returned, whatever the key says: it cannot be
+    /// instantiated on this one.
     #[must_use]
-    pub fn resident_component(&self, key: &CacheKey) -> Option<wasmtime::component::Component> {
+    pub fn resident_component(
+        &self,
+        engine: &wasmtime::Engine,
+        key: &CacheKey,
+    ) -> Option<wasmtime::component::Component> {
         self.resident.lock().ok().and_then(|resident| {
             resident
                 .get(&Self::resident_name(key))
+                .filter(|held| wasmtime::Engine::same(held.component.engine(), engine))
                 .map(|held| held.component.clone())
         })
     }
 
-    /// Keeps a component in memory, up to the resident bound.
+    /// Keeps a component in memory, up to the resident bound. Below it, a component already held
+    /// under the key is replaced, so the engine that compiled or loaded a component last is the one
+    /// the entry is served to.
     fn keep(&self, key: &CacheKey, component: &wasmtime::component::Component, bytes: u64) {
         if let Ok(mut resident) = self.resident.lock()
             && resident.len() < MAX_RESIDENT
@@ -376,7 +392,7 @@ impl CompiledCache {
     ) -> RuntimeResult<Option<wasmtime::component::Component>> {
         // What this process compiled or loaded already. Serving it from here is not only quicker:
         // it is a component whose provenance is this process's own, with no file in the question.
-        if let Some(component) = self.resident_component(key) {
+        if let Some(component) = self.resident_component(engine, key) {
             return Ok(Some(component));
         }
         let Some((_manifest, artefact)) = self.verify(key)? else {
