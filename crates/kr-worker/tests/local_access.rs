@@ -1,5 +1,5 @@
 //! What a session's worker lets its local owner do on a host that holds the owner to a membership
-//! lease (KR-REQ-17.54, the exclusive clause).
+//! lease, the exclusive clause.
 //!
 //! The worker serves a local caller directly, so the hold is the worker's own as well as the
 //! control daemon's. These tests use a real worker service on its real endpoint, a real shell, the
