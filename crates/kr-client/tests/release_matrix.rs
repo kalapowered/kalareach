@@ -1,10 +1,10 @@
 //! The signed release matrix, from the client's side: what a build accepts, which tier serves it,
 //! what it is told when none does, and what it never acts on.
 //!
-//! KR-REQ-17.46: client, relay and discovery compatibility are explicit in the signed release
-//! matrix, the backward-compatible tier is first, and unsupported skew returns a route error with
-//! the configured alternatives. The service is the stand-in held to the Worker's source, over
-//! loopback, signing with a key the test makes; the vector is made by the Worker's own encoder and
+//! Client, relay and discovery compatibility are explicit in the signed release matrix, the
+//! backward-compatible tier is first, and unsupported skew returns a route error with the
+//! configured alternatives. The service is the stand-in held to the Worker's source, over loopback,
+//! signing with a key the test makes; the vector is made by the Worker's own encoder and
 //! `node:crypto` (`tests/fixtures/release-matrix/make-vector.mjs`), not by this crate.
 
 use kr_client::error::ClientError;
@@ -197,6 +197,10 @@ mod the_deployed_document {
 
     const DEPLOYED: &[u8] = include_bytes!("fixtures/release-matrix/deployed-revision-2.json");
 
+    /// KR-REQ-17.46, the part about the signed release matrix: the deployed matrix verifies under
+    /// the pin this build carries, serves the release it was published for the compatible tier,
+    /// includes both ends of the signed range and puts the versions outside it in no tier. Not
+    /// shown here: relay and discovery compatibility, and a live service.
     #[test]
     fn verifies_under_the_pin_and_serves_the_release_the_compatible_tier() {
         let document =
@@ -313,6 +317,9 @@ mod the_choice {
         }
     }
 
+    /// KR-REQ-17.46, the part about the backward-compatible tier first: a build in both tiers is
+    /// served the compatible one, and a build only in a later tier is served that tier and told so.
+    /// Not shown here: relay and discovery compatibility, and a live service.
     #[tokio::test]
     async fn a_supported_build_is_served_the_compatible_tier_first() {
         let reader = reader().await;
@@ -358,6 +365,10 @@ mod the_choice {
         );
     }
 
+    /// KR-REQ-17.46, the part about unsupported skew: a build in no tier gets a route error that
+    /// names the matrix's revision and its alternatives, leaves out the direct route for a host
+    /// that uses relays only, and reaches a caller as a refusal that asks for an update. Not shown
+    /// here: relay and discovery compatibility, and a live service.
     #[tokio::test]
     async fn a_build_in_no_tier_gets_the_route_error_with_the_alternatives() {
         let reader = reader().await;
