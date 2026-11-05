@@ -119,8 +119,12 @@ loginctl enable-linger "$USER"
 ```
 
 Then `kr doctor` reports `survives_logout` for the headless profile instead of
-`available_by_choice`. Turning it off again is `loginctl disable-linger "$USER"`, and any headless
-session still running then ends with the next logout.
+`available_by_choice`, the next time it is asked. That holds for a daemon that found the user's
+service manager when it started. A daemon that started its workers as detached processes goes on
+reporting `no_service_manager` after lingering is enabled, and enabling it moves no running worker
+into the service manager: stop that daemon and start it again where the service manager answers.
+Turning lingering off again is `loginctl disable-linger "$USER"`, and any headless session still
+running then ends with the next logout.
 
 ## What a reboot does
 
