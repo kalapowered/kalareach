@@ -4648,10 +4648,19 @@ fn a_migrated_record_keeps_the_subject_its_retained_intent_describes() {
     );
     assert_eq!(
         journal
-            .uncertain_for_subject(&caller, Method::SessionClose, nowhere)
+            .uncertain_for_subject(&actor("device:watch"), Method::SessionClose, nowhere)
             .expect("reads"),
         None,
         "another actor"
+    );
+    // The first record kept the subject its intent describes, so no other subject is in its way: a
+    // record the migration left without one would be.
+    assert_eq!(
+        journal
+            .uncertain_for_subject(&caller, Method::SessionClose, nowhere)
+            .expect("reads"),
+        None,
+        "a subject the record of the phone does not have"
     );
 }
 

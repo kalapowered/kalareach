@@ -828,8 +828,9 @@ impl Journal {
     /// nothing's way, so leaving the column empty would let a fresh identifier quietly take the
     /// place of an uncertain outcome admitted by the previous build. A record whose intent cannot
     /// be decoded keeps an empty subject, because there is nothing to derive one from, and that is
-    /// recorded here rather than guessed at. An uncertain outcome with no subject stands in the way
-    /// of every request of its actor and its method, as the queries for one say.
+    /// recorded here rather than guessed at. An uncertain outcome with no subject holds back every
+    /// request of its actor and its method; for a method whose envelope says which ask a request
+    /// is, an envelope that can be read still decides, as the queries for one say.
     ///
     /// This migration goes when there can no longer be a version 2 journal to read, which is the
     /// first release.
@@ -2759,6 +2760,22 @@ impl Journal {
         Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
 
+    /// The uncertain receipts of an actor (`?1`) that stand in the way of a request for the subject
+    /// `?2` of the method `?4`, as the table `r` with the row number `rid`: the receipts of that
+    /// subject in the state `?3`, and the receipts of that method in that state that a migration
+    /// left with no subject, which cannot be told from the request.
+    ///
+    /// Two lookups and not one condition joined by `OR`, so that each uses the index on actor,
+    /// subject and state: with the `OR` every first admission reads every receipt of the actor.
+    const IN_THE_WAY: &'static str = "(SELECT actor_id, action_id, revision, intent, rowid AS rid
+                FROM receipts
+                WHERE actor_id = ?1 AND subject_digest = ?2 AND state = ?3
+              UNION ALL
+              SELECT actor_id, action_id, revision, intent, rowid AS rid
+                FROM receipts
+                WHERE actor_id = ?1 AND subject_digest IS NULL AND state = ?3 AND method = ?4
+             ) AS r";
+
     /// Orders the receipts selected as `r` with the state `?3` newest first: the receipt whose
     /// outcome the journal recorded last comes first.
     ///
@@ -2768,13 +2785,13 @@ impl Journal {
     /// change appends an event whose sequence only increases, so the receipt whose event for the
     /// state has the highest sequence is the newest. A receipt with no such event (a journal an
     /// earlier build wrote has rows and no event history) comes after every receipt that has one,
-    /// in the order it was admitted, which is the row number of the table: a compaction that
-    /// renumbers the rows must keep that order, or this fallback has to change.
+    /// in the order it was admitted, which is the row number of the table (`r.rid`): a compaction
+    /// that renumbers the rows must keep that order, or this fallback has to change.
     const NEWEST_RECORDED_FIRST: &'static str =
         "ORDER BY (SELECT e.sequence FROM receipt_events AS e
                     WHERE e.actor_id = r.actor_id AND e.action_id = r.action_id AND e.state = ?3
                     ORDER BY e.sequence DESC LIMIT 1) DESC,
-                r.rowid DESC";
+                r.rid DESC";
 
     /// Returns this actor's most recent uncertain outcome for a subject of `method`, if it has one.
     ///
@@ -2799,11 +2816,8 @@ impl Journal {
             .connection
             .query_row(
                 &format!(
-                    "SELECT r.action_id, r.revision FROM receipts AS r
-                     WHERE r.actor_id = ?1 AND r.state = ?3
-                       AND (r.subject_digest = ?2
-                            OR (r.subject_digest IS NULL AND r.method = ?4))
-                     {} LIMIT 1",
+                    "SELECT r.action_id, r.revision FROM {} {} LIMIT 1",
+                    Self::IN_THE_WAY,
                     Self::NEWEST_RECORDED_FIRST
                 ),
                 params![
@@ -2850,11 +2864,8 @@ impl Journal {
         let mut statement = self
             .connection
             .prepare(&format!(
-                "SELECT r.action_id, r.revision, r.intent FROM receipts AS r
-                 WHERE r.actor_id = ?1 AND r.state = ?3
-                   AND (r.subject_digest = ?2
-                        OR (r.subject_digest IS NULL AND r.method = ?4))
-                 {}",
+                "SELECT r.action_id, r.revision, r.intent FROM {} {}",
+                Self::IN_THE_WAY,
                 Self::NEWEST_RECORDED_FIRST
             ))
             .map_err(|error| faulted(&self.health, error))?;
