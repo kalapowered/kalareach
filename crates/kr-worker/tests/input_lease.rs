@@ -1204,9 +1204,9 @@ async fn a_delimiter_split_across_frames_reaches_the_application_once_with_its_p
 /// is tracked while canonical paste mode is enabled *and* until an already-open paste is safely
 /// terminated, so turning the mode off mid-paste does not abandon the framing.
 ///
-/// KR-REQ-08.49, the new-actor half of its source-loss clause only: the lease the paste was open
-/// under is taken over by another, and the application receives the paste's end once, ahead of the
-/// new lease's first byte. Not shown here: a held terminal reply written after a source loss, or a
+/// KR-REQ-08.49, the part about a new actor after a source loss: the lease the paste was open under
+/// is taken over by another, and the application receives the paste's end once, ahead of the new
+/// lease's first byte. Not shown here: a held terminal reply written after a source loss, or a
 /// source lost by anything but a takeover.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_paste_open_when_the_mode_was_turned_off_is_still_closed_before_the_new_lease_writes() {
