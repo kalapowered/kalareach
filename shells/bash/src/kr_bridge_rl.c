@@ -32,6 +32,7 @@
 #include "rlprivate.h"
 
 #include "kr_bridge.h"
+#include "kr_bridge_reply.h"
 #include "kr_bridge_rl.h"
 
 /*
@@ -400,6 +401,46 @@ void
 kr_rl_source (int source)
 {
   kr_last_source = source;
+}
+
+int
+kr_rl_host_reply_dropped (void)
+{
+  unsigned char held[KR_REPLY_MAX];
+  size_t length = 1;
+  int verdict, byte;
+
+  /* Only the root shell of a session is answered for, and only at the prompts the shell draws: a
+     `read -e' is a program's own read, and a program that asks the terminal something there has
+     asked for its answer. A quoted insertion and a bracketed paste take the terminal's bytes as
+     they come. */
+  if (kr_bridge_managed () == 0 || kr_context () == KR_CONTEXT_READ_BUILTIN
+      || kr_pending_quoted || kr_pending_paste_open)
+    return 0;
+  held[0] = ESC;
+  for (;;)
+    {
+      verdict = kr_reply_classify (held, length);
+      if (verdict != KR_REPLY_MORE || length == sizeof (held))
+	break;
+      byte = _rl_kr_delivered_byte ();
+      if (byte < 0)
+	break;
+      held[length++] = (unsigned char) byte;
+    }
+  if (verdict == KR_REPLY_WHOLE)
+    {
+      /* The reader's queues have changed, so the next wait reports itself idle again and the
+	 worker gets its retry point. */
+      kr_idle_reported = 0;
+      return 1;
+    }
+  /* Not an answer, or not all of one yet: the key lookup gets every byte but the Escape back. The
+     typeahead holds more than a run is allowed to be, and a byte comes from the terminal only once
+     the typeahead is empty, so they all fit. */
+  while (length > 1)
+    _rl_unget_char (held[--length]);
+  return 0;
 }
 
 void

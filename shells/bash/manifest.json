@@ -231,6 +231,12 @@
       "file": "patches/0004-bash-command-resolve.patch",
       "revision": "1",
       "purpose": "The executor asks the integration before it forks a command of the accepted line that the root shell starts itself, in the foreground and with no pipe, and the forked child starts the launcher the answer names in its place, with the backend's variables added; any other answer, and a launcher that cannot be started, leave the command exactly as it was typed."
+    },
+    {
+      "name": "readline-host-replies",
+      "file": "patches/0005-readline-host-replies.patch",
+      "revision": "1",
+      "purpose": "Where the reader takes a key from the typeahead or the terminal, an Escape that begins a host's answer to a terminal query, delivered whole, is taken with the rest of the answer and left out of the keys, so none of it is typed into the line; any other run of bytes goes back to the typeahead untouched and in order, and the reader never waits for a byte the terminal has not delivered."
     }
   ],
   "sources": [
@@ -257,6 +263,14 @@
     {
       "file": "src/kr_bridge_crypto.c",
       "install": "lib/readline/kr_bridge_crypto.c"
+    },
+    {
+      "file": "src/kr_bridge_reply.h",
+      "install": "lib/readline/kr_bridge_reply.h"
+    },
+    {
+      "file": "src/kr_bridge_reply.c",
+      "install": "lib/readline/kr_bridge_reply.c"
     },
     {
       "file": "src/kr_bridge_rl.h",

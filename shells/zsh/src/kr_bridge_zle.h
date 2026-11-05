@@ -48,6 +48,16 @@ int kr_zle_fd(void);
 void kr_zle_source_pushed_back(void);
 void kr_zle_source_terminal(void);
 
+/*
+ * Called with an Escape the reader has just taken from the terminal as the first byte of a key.
+ *
+ * When the terminal has already delivered the rest of a host's answer to a question an
+ * application asked, the whole answer is taken here, so no part of it is a key, and the call
+ * returns non-zero. Otherwise it returns zero with every byte it looked at back in the reader's
+ * input, in order, for the key lookup. It never waits for a byte the terminal has not delivered.
+ */
+int kr_zle_host_reply_dropped(void);
+
 /* The operations whose key wait a takeover has to be able to end. */
 void kr_zle_pending_quoted_insertion(int active);
 void kr_zle_pending_numeric_argument(int active);

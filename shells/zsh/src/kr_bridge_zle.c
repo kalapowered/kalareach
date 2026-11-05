@@ -37,6 +37,7 @@
 #include "zle.mdh"
 
 #include "kr_bridge.h"
+#include "kr_bridge_reply.h"
 #include "kr_bridge_zle.h"
 
 #include <stdio.h>
@@ -1432,6 +1433,73 @@ void
 kr_zle_source_terminal(void)
 {
     kr_source_is_pushed_back = 0;
+}
+
+/*
+ * The next byte the terminal has already delivered, as the reader's own read would hand it on, or
+ * -1 when it holds none. It never waits.
+ */
+static int
+kr_zle_delivered_byte(void)
+{
+    char byte;
+
+    if (noquery(0) <= 0 || read(SHTTY, &byte, 1) != 1) {
+        return -1;
+    }
+    /* The terminal is set to exchange the two line ends, and the reader undoes it on every read. */
+    if (byte == '\r') {
+        byte = '\n';
+    } else if (byte == '\n') {
+        byte = '\r';
+    }
+    return (unsigned char)byte;
+}
+
+int
+kr_zle_host_reply_dropped(void)
+{
+    unsigned char held[KR_REPLY_MAX];
+    size_t length = 1;
+    int verdict;
+    int byte;
+
+    /*
+     * Only the root shell of a session is answered for, and only at the prompts the shell draws:
+     * a `vared` or a `select` is a program's own read, and a program that asks the terminal
+     * something there has asked for its answer.
+     */
+    if (!kr_bridge_managed() || kr_source_is_pushed_back ||
+        kr_reader_context() == KR_CONTEXT_READ_BUILTIN) {
+        return 0;
+    }
+    held[0] = '\033';
+    for (;;) {
+        verdict = kr_reply_classify(held, length);
+        if (verdict != KR_REPLY_MORE || length == sizeof(held)) {
+            break;
+        }
+        byte = kr_zle_delivered_byte();
+        if (byte < 0) {
+            break;
+        }
+        held[length++] = (unsigned char)byte;
+    }
+    if (verdict == KR_REPLY_WHOLE) {
+        /* The Escape was recorded for a repeat of a vi change like every byte the reader takes. */
+        if (vichgflag && curvichg.bufptr > 0) {
+            curvichg.bufptr--;
+        }
+        /* The reader's queues have changed, so the next wait reports itself idle again and the
+         * worker gets its retry point. */
+        kr_idle_reported = 0;
+        return 1;
+    }
+    /* Not an answer, or not all of one yet: the key lookup gets every byte but the Escape back. */
+    while (length > 1) {
+        ungetbyte(held[--length]);
+    }
+    return 0;
 }
 
 void

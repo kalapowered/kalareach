@@ -59,6 +59,16 @@ int kr_shell_prompt_context (void);
 /* Where the character the reader has just taken came from. */
 void kr_rl_source (int source);
 
+/*
+ * Called with an Escape the reader has just taken from the terminal or its typeahead as a key.
+ *
+ * When the rest of a host's answer to a question an application asked has already been delivered,
+ * the whole answer is taken here, so no part of it is a key, and the call returns non-zero.
+ * Otherwise it returns zero with every byte it looked at back in the reader's typeahead, in order,
+ * for the key lookup. It never waits for a byte the terminal has not delivered.
+ */
+int kr_rl_host_reply_dropped (void);
+
 /* The operations whose key wait a takeover has to be able to end. */
 void kr_rl_pending_quoted_insertion (int active);
 void kr_rl_pending_paste (int active);
@@ -102,6 +112,9 @@ void kr_bash_launch (char **launch, char **environment, char **base);
 
 /* Counts Readline holds privately, for the fence proof. */
 int _rl_kr_buffered (void);
+
+/* The next byte already delivered, from the typeahead and then the terminal's queue, or -1. */
+int _rl_kr_delivered_byte (void);
 int _rl_kr_macro_remaining (void);
 
 #endif /* KR_BRIDGE_RL_H */

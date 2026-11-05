@@ -55,6 +55,12 @@
       "file": "patches/0005-module-paths-from-executable.patch",
       "revision": "1",
       "purpose": "The default module path and the default function path are read from the executable's own place, so a tree that is installed under a directory of its own and moved still loads its editor and its modules from where it is; a tree that is not in a bin directory, or whose modules are where the build put them, keeps the paths it was built with, and what a person sets in their startup files still wins."
+    },
+    {
+      "name": "zle-host-replies",
+      "file": "patches/0006-zle-host-replies.patch",
+      "revision": "1",
+      "purpose": "Where the line editor reads the first byte of a key, an Escape that begins a host's answer to a terminal query, delivered whole, is taken with the rest of the answer and left out of the keys, so none of it is typed into the line; any other run of bytes goes back to the key lookup untouched and in order, and the reader never waits for a byte the terminal has not delivered."
     }
   ],
   "sources": [
@@ -81,6 +87,14 @@
     {
       "file": "src/kr_bridge_crypto.c",
       "install": "Src/Zle/kr_bridge_crypto.c"
+    },
+    {
+      "file": "src/kr_bridge_reply.h",
+      "install": "Src/Zle/kr_bridge_reply.h"
+    },
+    {
+      "file": "src/kr_bridge_reply.c",
+      "install": "Src/Zle/kr_bridge_reply.c"
     },
     {
       "file": "src/kr_bridge_zle.h",

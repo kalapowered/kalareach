@@ -1,0 +1,93 @@
+Subject: [PATCH 5/5] readline: leave a host's answer to a terminal query out of the keys
+
+A program that asks the terminal something and ends before it reads the answer, or never reads
+it, leaves the host's answer in the terminal's input, and Readline finds it at its prompt.
+Readline decodes it as keys: an unbound sequence beeps and the rest of the answer is typed into the
+line. The reader takes the answer out where it reads a key from the typeahead or the terminal,
+before the key lookup sees it: when the byte is an Escape and the rest of an answer the host's
+query broker builds has already been delivered, the whole answer is taken and dropped; anything
+else is given back to the typeahead untouched and in order. Nothing waits for a byte the terminal
+has not delivered, so no key a person presses is held back, and a program's own read (`read -e`),
+a quoted insertion and a bracketed paste are left alone.
+
+This patch is a derivative work of GNU Readline as bundled with GNU Bash and carries the GNU
+General Public Licence, version 3 or later; see shells/bash/LICENSE.
+
+--- a/lib/readline/Makefile.in
++++ b/lib/readline/Makefile.in
+@@ -92,7 +92,8 @@
+ 	   $(srcdir)/colors.c $(srcdir)/parse-colors.c \
+ 	   $(srcdir)/mbutil.c $(srcdir)/xfree.c \
+ 	   $(srcdir)/kr_bridge.c $(srcdir)/kr_bridge_cbor.c \
+-	   $(srcdir)/kr_bridge_crypto.c $(srcdir)/kr_bridge_rl.c
++	   $(srcdir)/kr_bridge_crypto.c $(srcdir)/kr_bridge_reply.c \
++	   $(srcdir)/kr_bridge_rl.c
+ 
+ # The header files for this library.
+ HSOURCES = readline.h rldefs.h chardefs.h keymaps.h history.h histlib.h \
+@@ -109,7 +110,7 @@
+ 	  util.o kill.o undo.o macro.o input.o callback.o terminal.o \
+ 	  text.o nls.o misc.o $(HISTOBJ) $(TILDEOBJ) $(COLORSOBJ) \
+ 	  xmalloc.o xfree.o compat.o \
+-	  kr_bridge.o kr_bridge_cbor.o kr_bridge_crypto.o kr_bridge_rl.o 
++	  kr_bridge.o kr_bridge_cbor.o kr_bridge_crypto.o kr_bridge_reply.o kr_bridge_rl.o 
+ 
+ # The texinfo files which document this library.
+ DOCSOURCE = doc/rlman.texinfo doc/rltech.texinfo doc/rluser.texinfo
+--- a/lib/readline/input.c
++++ b/lib/readline/input.c
+@@ -207,6 +207,25 @@
+   if (held < 0)
+     held += ibuffer_len;
+   return held;
++}
++
++/* The next byte already delivered, or -1 when there is none: the typeahead this reader holds
++   first, then the terminal's own queue, one byte at a time.  It never waits.  A reader that
++   would tell a host's answer to an application's question from the keys a person presses reads
++   ahead with it, and gives back with `_rl_unget_char' what it finds is not an answer. */
++int
++_rl_kr_delivered_byte (void)
++{
++  int key;
++  unsigned char c;
++
++  if (rl_get_char (&key))
++    return key;
++#if defined (FIONREAD)
++  if (_rl_nchars_available () > 0 && read (fileno (rl_instream), &c, sizeof (c)) == sizeof (c))
++    return c;
++#endif
++  return -1;
+ }
+ 
+ /* Return the amount of space available in the buffer for stuffing
+@@ -841,15 +860,21 @@
+ 	}
+       else
+ 	{
+-	  if (rl_get_char (&c) == 0)
++	  /* A host's answer to a terminal query is no key: when an Escape begins one, the reader
++	     takes the whole answer here and reads on. */
++	  do
+ 	    {
+-	      c = (*rl_getc_function) (rl_instream);
+-	      kr_rl_source (KR_SOURCE_TERMINAL);
++	      if (rl_get_char (&c) == 0)
++		{
++		  c = (*rl_getc_function) (rl_instream);
++		  kr_rl_source (KR_SOURCE_TERMINAL);
++		}
++	      else
++		kr_rl_source (KR_SOURCE_TYPEAHEAD);
++/* fprintf(stderr, "rl_read_key: calling RL_CHECK_SIGNALS: _rl_caught_signal = %d\r\n", _rl_caught_signal); */
++	      RL_CHECK_SIGNALS ();
+ 	    }
+-	  else
+-	    kr_rl_source (KR_SOURCE_TYPEAHEAD);
+-/* fprintf(stderr, "rl_read_key: calling RL_CHECK_SIGNALS: _rl_caught_signal = %d\r\n", _rl_caught_signal); */
+-	  RL_CHECK_SIGNALS ();
++	  while (c == ESC && kr_rl_host_reply_dropped ());
+ 	}
+     }
+ 
