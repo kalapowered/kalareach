@@ -155,11 +155,10 @@ async fn a_daemon_starts_over_the_next_registry_version_and_the_document_it_acce
         .expect("a trigger that counts");
 
     let controller = start(&temp).await.expect("the daemon starts");
-    let effective = controller.effective_configuration().await;
-    assert_eq!(effective.status.state, DocumentState::Loaded);
-    drop(controller);
 
-    // The generation moves at every start; the version and the accepted copy do not.
+    // Read before anything asks the daemon what is in force: every such question puts the document
+    // through acceptance again and records it, as it is read, at the version this build writes. The
+    // generation moves at every start; the version and the accepted copy do not.
     let after = recorded(&temp);
     assert_eq!(
         (after.0, &after.1),
@@ -174,6 +173,15 @@ async fn a_daemon_starts_over_the_next_registry_version_and_the_document_it_acce
         })
         .expect("the count");
     assert_eq!(writes, 0, "the start accepted a document it had accepted");
+
+    let effective = controller.effective_configuration().await;
+    assert_eq!(effective.status.state, DocumentState::Loaded);
+    drop(controller);
+    assert_eq!(
+        recorded(&temp).0,
+        16,
+        "and no acceptance writes the registry's version"
+    );
     assert_eq!(
         std::fs::read_to_string(document_path(&temp)).expect("the document"),
         golden,
