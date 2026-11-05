@@ -2103,16 +2103,18 @@ impl Session {
 
     /// Asks the reader for the launch `request` and returns what it decided.
     ///
-    /// A reader that answers at its next step is given a key behind every frame the harness
-    /// writes. One that is slower to act on a key than the harness is to type the next judges a
-    /// launch with a key still unread in the terminal's queue, and refuses it as queued prior
-    /// input: keys typed first go first, as the contract says. A case that is about that refusal
-    /// asks for it with [`Session::ask`] and says what the keys were. A case that can meet it
-    /// without being about it asks here, and on such a reader a launch so refused is asked again,
-    /// as a new transaction, until the reader judges it with its keys taken or the window of one
-    /// reply ends; a reader that never takes its keys is refused for that long. A reader that is
-    /// given no keys is not asked again, and its decision is returned as it comes. An accepted
-    /// launch is checked to be the transaction that was asked.
+    /// A reader judges a launch on its own thread, when it takes the request off its mailbox. One
+    /// that is slower to take a key than the harness is to type the next judges the launch with a
+    /// key still unread in the terminal's queue, and refuses it as queued prior input: keys typed
+    /// first go first, as the contract says. Every reader can meet that, whether the key is the
+    /// step the harness gives a reader that answers at its next step behind every frame, or the
+    /// text a case typed before it asked. A case that is about that refusal asks for it with
+    /// [`Session::ask`] and says what the keys were. A case that can meet it without being about
+    /// it asks here, and a launch so refused is asked again, as a new transaction, until the
+    /// reader judges it with its keys taken, the window of one reply ends, or 256 launches have
+    /// been asked (the transactions differ only in their first byte); a reader that never takes its
+    /// keys is refused until then, and its last decision is returned. Any other decision is
+    /// returned as it comes. An accepted launch is checked to be the transaction that was asked.
     ///
     /// # Panics
     ///
@@ -2120,7 +2122,6 @@ impl Session {
     /// after the window, or accepts a transaction other than the one it was asked.
     pub fn launched(&mut self, request: LaunchMailboxRequest) -> LaunchDecision {
         let until = self.deadline_for(REPLY);
-        let may_ask_again = dialect(self.package_kind).answers_at_the_next_step;
         let mut asked = 0_u8;
         loop {
             let mut again = request.clone();
@@ -2138,8 +2139,7 @@ impl Session {
                     "the reader accepted another launch than the one it was asked"
                 );
             }
-            if !may_ask_again
-                || decision.rejection() != Some(LaunchRejectionReason::QueuedPriorInput)
+            if decision.rejection() != Some(LaunchRejectionReason::QueuedPriorInput)
                 || until.passed()
                 || asked == u8::MAX
             {
