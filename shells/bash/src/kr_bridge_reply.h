@@ -55,7 +55,7 @@ int kr_reply_classify(const unsigned char *bytes, size_t length);
  * Returns KR_REPLY_WHOLE when an answer is complete: it begins at `held[*start]` and ends with the
  * last byte held, and `held[0..*start)` is what came before it. Returns KR_REPLY_MORE when the run
  * is the start of an answer and `next` has no more, and KR_REPLY_NOT when no answer is in it. In
- * both of those `*length` is the number of bytes the caller has to give back.
+ * every case `*length` is the number of bytes held, the Escape the caller passed in among them.
  */
 int kr_reply_follow(unsigned char *held, size_t *length, size_t capacity, int (*next)(void),
                     size_t *start);

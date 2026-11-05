@@ -256,8 +256,8 @@ kr_reply_follow(unsigned char *held, size_t *length, size_t capacity, int (*next
             held[(*length)++] = (unsigned char)byte;
             continue;
         }
-        /* No answer begins at this Escape, or the run has filled the buffer and is too long to be
-         * one. An Escape later in the run can begin one. */
+        /* No answer begins at this Escape, or what is held from it has filled the buffer. An Escape
+         * later in the run can begin one. */
         for (scan = at + 1; scan < *length && held[scan] != KR_ESCAPE; scan++) {
         }
         if (scan == *length) {

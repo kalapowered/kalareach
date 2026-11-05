@@ -80,16 +80,33 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  {
  #if defined (HAVE_PSELECT) || defined (HAVE_SELECT)
    fd_set readfds, exceptfds;
-@@ -449,6 +468,36 @@
+@@ -449,6 +468,55 @@
    return 0;
  }
  
++/* The time now, from a clock that does not go backwards where there is one. */
++static void
++_rl_kr_now (struct timeval *now)
++{
++#if defined (HAVE_CLOCK_GETTIME) && defined (CLOCK_MONOTONIC)
++  struct timespec ts;
++
++  if (clock_gettime (CLOCK_MONOTONIC, &ts) == 0)
++    {
++      now->tv_sec = ts.tv_sec;
++      now->tv_usec = ts.tv_nsec / 1000;
++      return;
++    }
++#endif
++  gettimeofday (now, 0);
++}
++
 +/* Is there input available to be read on the readline input file descriptor, once a host's
 +   answer to a terminal query is left out?  A caller that asks first reads a key next and waits for
 +   it, so a check must not report an answer as one: when the terminal's front byte begins an
 +   answer that has been delivered whole, it is taken and dropped here, and the check asks again for
-+   what is left of the time it was given.  Keys the person typed before the answer are taken into
-+   the typeahead, which is input too. */
++   what is left of the time it was given, never more than that time.  Keys the person typed before
++   the answer are taken into the typeahead, which is input too. */
 +int
 +_rl_input_available (void)
 +{
@@ -97,15 +114,17 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
 +  long used;
 +  int r, timeout;
 +
-+  gettimeofday (&began, 0);
++  _rl_kr_now (&began);
 +  r = _rl_kr_tty_input_available ();
 +  while (r > 0 && rl_input_available_hook == 0 && _rl_pushed_input_available () == 0
 +	 && kr_rl_drop_delivered_replies ())
 +    {
 +      if (_rl_pushed_input_available ())
 +	return 1;
-+      gettimeofday (&now, 0);
++      _rl_kr_now (&now);
 +      used = (long)(now.tv_sec - began.tv_sec) * 1000000L + (long)(now.tv_usec - began.tv_usec);
++      if (used < 0)
++	used = 0;
 +      timeout = _keyboard_input_timeout;
 +      _keyboard_input_timeout = (used >= timeout) ? 0 : (int)(timeout - used);
 +      r = _rl_kr_tty_input_available ();
@@ -117,7 +136,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  int
  _rl_nchars_available ()
  {
-@@ -464,7 +513,9 @@
+@@ -464,7 +532,9 @@
      return -1;    
  #endif
  
@@ -128,7 +147,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  }
  
  int
-@@ -841,15 +892,21 @@
+@@ -841,15 +911,21 @@
  	}
        else
  	{

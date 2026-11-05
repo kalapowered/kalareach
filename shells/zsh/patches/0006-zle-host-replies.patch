@@ -8,13 +8,27 @@ lookup sees it: when the byte is an Escape and the terminal has already delivere
 answer the host's query broker builds, the whole answer is taken and dropped; anything else is given
 back to the key lookup untouched and in order. The bytes given back are still the person's, and the
 bridge reports them as the terminal's, not as keys a widget pushed back. A read that waits for the
-rest of a key keeps its one KEYTIMEOUT limit however many answers it takes out of the way. Nothing
-waits for a byte the terminal has not delivered, so no key a person presses is held back. A widget's
-own one-key read, `read -k`, never goes through this read, and `vared`, `select`, a quoted insertion
-and a bracketed paste are left alone.
+rest of a key keeps the one KEYTIMEOUT limit ZLE took when the line began, however many answers it
+takes out of the way. Nothing waits for a byte the terminal has not delivered, so no key a person
+presses is held back. A widget's own one-key read, `read -k`, never goes through this read, and
+`vared`, `select`, a quoted insertion and a bracketed paste are left alone.
 
 This patch is a derivative work of Zsh and carries the Zsh licence; see shells/zsh/LICENSE.
 
+--- a/Src/Zle/zle_main.c
++++ b/Src/Zle/zle_main.c
+@@ -135,8 +135,10 @@
+ /*
+  * Key timeout in hundredths of a second:  we use time_t so
+  * that we only have the limits on one integer type to worry about.
++ * The bridge reads it to keep one limit across the answers it takes out of a key wait.
+  */
+-static time_t keytimeout;
++/**/
++time_t keytimeout;
+ 
+ #if defined(HAVE_SELECT) || defined(HAVE_POLL)
+ /* Terminal baud rate */
 --- a/Src/Zle/zle.mdd
 +++ b/Src/Zle/zle.mdd
 @@ -9,7 +9,7 @@

@@ -70,6 +70,15 @@ static int kr_lookahead_held;
 /* True when the byte just taken is one of those. */
 static int kr_source_is_lookahead;
 
+/* The stack of pushed-back bytes has been emptied, or a new read begins: none of what is on it is
+ * the reader's lookahead. */
+static void
+kr_forget_lookahead(void)
+{
+    kr_lookahead_held = 0;
+    kr_source_is_lookahead = 0;
+}
+
 /* A takeover's cancellation: requested inside the wait, consumed at the next boundary. */
 static int kr_cancel_requested;
 static int kr_cancel_consumed;
@@ -280,6 +289,7 @@ kr_shell_cancel_key_wait(kr_cancellation *out)
         out->discarded_bytes = (unsigned long)kungetct + (unsigned long)keybuflen;
         /* The old lease's undelivered input goes, the edit buffer stays. */
         kungetct = 0;
+        kr_forget_lookahead();
         /* The reader is inside something, so it is brought out of it: the wait ends and the
          * part-read sequence is dropped at the boundary that follows. */
         kr_cancel_requested = 1;
@@ -1255,6 +1265,7 @@ kr_zle_finish(void)
 void
 kr_zle_enter(void)
 {
+    kr_forget_lookahead();
     /* The line before this prompt has run: its block ends with the shell's own status for it, and
      * its capability leaves the environment with it. That holds whether or not the bridge is still
      * there, because a capability the worker has ended must not outlive its line. */
@@ -1291,6 +1302,7 @@ kr_zle_leave(int eof_sent)
 {
     int reason;
 
+    kr_forget_lookahead();
     if (!kr_bridge_registered() || !kr_inside_reader) {
         kr_inside_reader = 0;
         return;
@@ -1449,8 +1461,7 @@ void
 kr_zle_source_terminal(void)
 {
     kr_source_is_pushed_back = 0;
-    kr_source_is_lookahead = 0;
-    kr_lookahead_held = 0;
+    kr_forget_lookahead();
 }
 
 /*
@@ -1523,6 +1534,9 @@ kr_zle_host_reply_dropped(void)
     return dropped;
 }
 
+/* The longest key limit ZLE honours, in hundredths of a second: the same cap its own read applies. */
+#define KR_KEY_TIMEOUT_CAP (((time_t)1 << (sizeof(time_t) * 8 - 11)) * 100)
+
 int
 kr_zle_key_byte(long timed)
 {
@@ -1533,12 +1547,11 @@ kr_zle_key_byte(long timed)
     long wait = timed;
     int c;
 
-    /* A read that waits for the rest of a key has one limit, KEYTIMEOUT, and an answer taken out of
-     * the way does not start it again. */
-    if (timed && (total = (long)getiparam("KEYTIMEOUT")) > 0) {
+    /* A read that waits for the rest of a key has one limit, the KEYTIMEOUT ZLE took when the line
+     * began, and an answer taken out of the way does not start it again. */
+    if (timed && keytimeout > 0) {
+        total = (long)(keytimeout > KR_KEY_TIMEOUT_CAP ? KR_KEY_TIMEOUT_CAP : keytimeout);
         zgettime_monotonic_if_available(&began);
-    } else {
-        total = 0;
     }
     for (;;) {
         c = getbyte(wait, NULL, 1);
