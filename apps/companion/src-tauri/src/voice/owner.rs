@@ -638,13 +638,6 @@ impl Owner {
             Err(ClientError::SubmissionUncertain { .. } | ClientError::OutcomeUnknown { .. }) => {
                 self.reconcile(&composed, &host, action_id).await
             }
-            // A refusal for now is not the host's word that it made no call: it may yet, so the
-            // start is asked about under the action it was sent under, as a lost answer is.
-            Err(ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. })
-                if !kr_client::error::is_definite(refusal.code) =>
-            {
-                self.reconcile(&composed, &host, action_id).await
-            }
             Err(error) => {
                 host.session.settle(action_id).await;
                 self.shared.answered(self.id);
