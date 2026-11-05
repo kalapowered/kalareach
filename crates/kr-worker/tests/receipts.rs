@@ -968,7 +968,7 @@ fn a_restart_turns_a_dispatch_marker_without_an_outcome_into_unknown_and_never_r
 }
 
 // ---------------------------------------------------------------------------------------------
-// KR-REQ-23.24: retained receipts, and superseding an uncertain outcome
+// Retained receipts, and superseding an uncertain outcome
 // ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-23.24: a duplicate from a still-authorised actor returns the retained receipt without
@@ -1011,6 +1011,10 @@ async fn a_duplicate_returns_the_retained_receipt_and_lost_authority_returns_not
 /// KR-REQ-07.55: a worker's acceptance of a close carries its own description of the session,
 /// taken as the close is admitted, and an exact retry is answered from the journal with that same
 /// acceptance, the description included, after the session has moved on to its closure.
+///
+/// KR-REQ-23.24, the retained answer to a duplicate only: an exact retry is answered with the
+/// acceptance the journal kept. Not shown here: the check of current authority before it is
+/// returned, or an uncertain result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_close_is_accepted_with_the_sessions_own_description_and_a_retry_returns_it() {
     let host = host().await;
@@ -1199,6 +1203,10 @@ fn refused_with(frame: ControlFrame) -> ErrorCode {
 /// under another method, one that carries a grant, and a run named by an ingress that is not a
 /// workflow's. None of them closes the session; the close of the right run does, and the same
 /// close sent again before its delivery is confirmed is answered from the first one's receipt.
+///
+/// KR-REQ-23.24, the retained answer to a duplicate only: the close sent again under the
+/// workflow's ingress is answered with what the first one produced. Not shown here: the check of
+/// current authority before it is returned, or an uncertain result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
     let host = host().await;
@@ -1895,6 +1903,10 @@ async fn a_malformed_answer_is_refused_and_leaves_a_rejected_receipt() {
 
 /// KR-REQ-11.63: an answer whose outcome is uncertain still holds back a second answer to the same
 /// question, which has to name the first and the revision its sender was shown.
+///
+/// KR-REQ-23.24, for `question.answer`: a second answer under a fresh identifier is refused naming
+/// the earlier one, and is admitted once it quotes the revision its sender read. Not shown here:
+/// the retained receipt of a duplicate, or the check of current authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_answer_to_a_question_with_an_uncertain_answer_has_to_quote_it() {
     let host = host().await;
@@ -1929,6 +1941,11 @@ async fn a_second_answer_to_a_question_with_an_uncertain_answer_has_to_quote_it(
 /// KR-REQ-11.63: an uncertain answer to one question is not an outcome of another question, so an
 /// answer to the other question that names it quotes an outcome its subject does not have, which is
 /// refused as a quote of any action that is not uncertain for the subject is.
+///
+/// KR-REQ-23.24, for `question.answer`, the result a later request has to show: an uncertain answer
+/// to another question shows nothing of this one's, and the quote is refused naming it. Not shown
+/// here: a quote that is admitted, the retained receipt of a duplicate, or the check of current
+/// authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_quote_of_an_uncertain_answer_to_another_question_shows_nothing() {
     let host = host().await;
@@ -1959,6 +1976,11 @@ async fn a_quote_of_an_uncertain_answer_to_another_question_shows_nothing() {
 /// back every answer of the actor in the session, as it always did. Privacy mode withholds the
 /// envelope a settled receipt kept, an envelope may not decode, and one may decode and not be an
 /// answer.
+///
+/// KR-REQ-23.24, for `question.answer`: where the question an earlier uncertain answer was for
+/// cannot be read, a later answer under a fresh identifier is refused naming it. Not shown here: a
+/// quote that is admitted, the retained receipt of a duplicate, or the check of current
+/// authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_uncertain_answer_whose_question_cannot_be_read_holds_back_every_answer() {
     for unreadable in ["withheld by privacy mode", "not decodable", "not an answer"] {
@@ -2021,6 +2043,11 @@ async fn an_uncertain_answer_whose_question_cannot_be_read_holds_back_every_answ
 
 /// KR-REQ-11.63: of several uncertain answers, the one an answer has to quote is the newest to its
 /// own question, whether or not an answer to another question is newer still.
+///
+/// KR-REQ-23.24, for `question.answer`, which earlier result a later request has to show: the
+/// newest uncertain answer to its own question, refused naming it until it is quoted at the
+/// revision its sender read. Not shown here: the retained receipt of a duplicate, or the check of
+/// current authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_answer_has_to_quote_the_newest_uncertain_answer_to_its_own_question() {
     let host = host().await;
@@ -2113,6 +2140,10 @@ async fn an_uncertain_cancellation_of_one_question_does_not_hold_back_the_cancel
 
 /// KR-REQ-11.63: a cancellation whose outcome is uncertain still holds back a second cancellation of
 /// the same question, which has to name the first and the revision its sender was shown.
+///
+/// KR-REQ-23.24, for `question.cancel`: a second cancellation under a fresh identifier is refused
+/// naming the earlier one, and is admitted once it quotes the revision its sender read. Not shown
+/// here: the retained receipt of a duplicate, or the check of current authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_cancellation_of_a_question_with_an_uncertain_cancellation_has_to_quote_it() {
     let host = host().await;
@@ -2150,6 +2181,11 @@ async fn a_second_cancellation_of_a_question_with_an_uncertain_cancellation_has_
 /// KR-REQ-11.63: an uncertain cancellation of one question is not an outcome of another question,
 /// so a cancellation of the other question that names it quotes an outcome its subject does not
 /// have, which is refused as a quote of any action that is not uncertain for the subject is.
+///
+/// KR-REQ-23.24, for `question.cancel`, the result a later request has to show: an uncertain
+/// cancellation of another question shows nothing of this one's, and the quote is refused naming
+/// it. Not shown here: a quote that is admitted, the retained receipt of a duplicate, or the check
+/// of current authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_quote_of_an_uncertain_cancellation_of_another_question_shows_nothing() {
     let host = host().await;
@@ -2181,6 +2217,11 @@ async fn a_quote_of_an_uncertain_cancellation_of_another_question_shows_nothing(
 
 /// KR-REQ-11.63: of several uncertain cancellations, the one a cancellation has to quote is the
 /// newest of its own question, whether or not a cancellation of another question is newer still.
+///
+/// KR-REQ-23.24, for `question.cancel`, which earlier result a later request has to show: the
+/// newest uncertain cancellation of its own question, refused naming it until it is quoted at the
+/// revision its sender read. Not shown here: the retained receipt of a duplicate, or the check of
+/// current authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancellation_has_to_quote_the_newest_uncertain_cancellation_of_its_own_question() {
     let host = host().await;
@@ -2239,6 +2280,11 @@ async fn a_cancellation_has_to_quote_the_newest_uncertain_cancellation_of_its_ow
 /// holds back every cancellation of the actor in the session, as it always did. Privacy mode
 /// withholds the envelope a settled receipt kept, an envelope may not decode, and one may decode
 /// and not be a cancellation.
+///
+/// KR-REQ-23.24, for `question.cancel`: where the question an earlier uncertain cancellation was
+/// for cannot be read, a later cancellation under a fresh identifier is refused naming it. Not
+/// shown here: a quote that is admitted, the retained receipt of a duplicate, or the check of
+/// current authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_uncertain_cancellation_whose_question_cannot_be_read_holds_back_every_cancellation() {
     for unreadable in [
@@ -2575,6 +2621,11 @@ async fn an_uncertain_request_of_a_source_does_not_hold_back_a_request_of_anothe
 /// KR-REQ-11.63: an uncertain request of one identity is not an outcome of another identity, so a
 /// request of the other identity that names it quotes an outcome its subject does not have, which is
 /// refused as a quote of any action that is not uncertain for the subject is.
+///
+/// KR-REQ-23.24, for `question.cancel_own`, `question.create` and `alert.create`, the result a later
+/// request has to show: an uncertain request of another identity shows nothing of this one's, and
+/// the quote is refused naming it. Not shown here: a quote that is admitted, the retained receipt of
+/// a duplicate, or the check of current authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_quote_of_an_uncertain_request_of_another_identity_shows_nothing() {
     for kind in Sourced::ALL {
@@ -2601,6 +2652,11 @@ async fn a_quote_of_an_uncertain_request_of_another_identity_shows_nothing() {
 
 /// KR-REQ-11.63: of several uncertain requests, the one a request has to quote is the newest of its
 /// own identity, whether or not a request of another identity is newer still.
+///
+/// KR-REQ-23.24, for `question.cancel_own`, `question.create` and `alert.create`, which earlier
+/// result a later request has to show: the newest uncertain request of its own identity, refused
+/// naming it until it is quoted at the revision its sender read. Not shown here: the retained
+/// receipt of a duplicate, or the check of current authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_has_to_quote_the_newest_uncertain_request_of_its_own_identity() {
     for kind in Sourced::ALL {
@@ -2646,6 +2702,11 @@ async fn a_request_has_to_quote_the_newest_uncertain_request_of_its_own_identity
 /// every request of that kind by the actor in the session, as it always did. Privacy mode withholds
 /// the envelope a settled receipt kept, an envelope may not decode, and one may decode and not be a
 /// request of the kind.
+///
+/// KR-REQ-23.24, for `question.cancel_own`, `question.create` and `alert.create`: where the identity
+/// an earlier uncertain request had cannot be read, a later request of the kind under a fresh
+/// identifier is refused naming it. Not shown here: a quote that is admitted, the retained receipt
+/// of a duplicate, or the check of current authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_uncertain_request_whose_identity_cannot_be_read_holds_back_every_request_of_its_kind() {
     for kind in Sourced::ALL {
@@ -2737,6 +2798,11 @@ fn malformed_request(client: &Client<impl Codec>, host: &Host, method: Method) -
 /// after its receipt is written, as it was before a request was told apart by its identity. Where
 /// an uncertain request of its method stands, no identity can be read from it, and it is held back
 /// by that request as it always was.
+///
+/// KR-REQ-23.24, for `question.create` and `alert.create`, in the part that follows the first
+/// refusal only: with an uncertain request standing, a request whose identity cannot be read is
+/// refused naming it. Not shown here: a quote that is admitted, the retained receipt of a duplicate,
+/// or the check of current authority.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_malformed_question_or_alert_is_refused_and_leaves_a_rejected_receipt() {
     for kind in [Sourced::Question, Sourced::Alert] {
