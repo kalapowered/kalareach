@@ -75,6 +75,14 @@ fn a_hosts_answer_to_a_terminal_query_never_reaches_the_line_the_editor_reads() 
     shellpkg::a_hosts_answer_to_a_terminal_query_never_reaches_the_line_the_editor_reads(PWSH);
 }
 
+/// KR-REQ-08.48, KR-REQ-08.49: taking a host's answer out of the editor's keys does not wait for the
+/// terminal to send the rest of a character it has half delivered.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_dropped_answer_does_not_hold_the_reader_while_the_terminal_has_half_a_character() {
+    shellpkg::a_dropped_answer_does_not_wait_for_the_rest_of_a_character_the_terminal_has_half_delivered(PWSH);
+}
+
 /// KR-REQ-08.49: the reader does not report itself idle, which is where a fence is first proved,
 /// before its editor has the terminal's reply to the question where the cursor is.
 #[test]
