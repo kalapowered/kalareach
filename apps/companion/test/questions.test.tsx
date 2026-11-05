@@ -603,7 +603,22 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
   })
 
   it('names the action the host took when the send of a kept answer finds it', async () => {
-    const { controls } = start()
+    const { port, controls } = fakeHost()
+    let taken = ''
+    // The host takes the earlier send as the press reaches it, so nothing the page reads on its own
+    // can show it first.
+    const taking: HostPort = {
+      ...port,
+      questionSendKept: async (which) => {
+        taken = controls.questions.leaveTaken(QUESTION_SELECT)
+        return port.questionSendKept(which)
+      }
+    }
+    render(
+      <AppProvider port={taking} initialPlace={{ view: 'attention' }}>
+        <App />
+      </AppProvider>
+    )
     const question = await questionAbout(WHICH_BRANCH)
     const person = userEvent.setup()
     await person.click(within(question).getByRole('radio', { name: 'main' }))
@@ -618,8 +633,6 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
     await waitFor(() => {
       expect(screen.getByTestId('kept-answer')).toHaveAttribute('data-standing', 'offered')
     })
-    // The host takes the earlier send after the page has read the kept answer's standing.
-    const taken = controls.questions.leaveTaken(QUESTION_SELECT)
     await person.click(screen.getByRole('button', { name: 'Send it now' }))
     const notice = new RegExp(
       `while its reply was lost \\(action ${taken}\\)\\. Nothing was sent again\\.`
