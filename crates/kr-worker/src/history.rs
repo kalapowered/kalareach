@@ -4402,8 +4402,10 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// KR-REQ-20.20: a pass that cannot take the lock at all says so beside the reason its own
+    /// KR-REQ-20.20, the part about the host's cap when a session's own cap has left output behind
+    /// too: a pass that cannot take the host-cap lock at all says so beside the reason its own
     /// bounds already left output behind for, and does not leave it unsaid because another stands.
+    /// Not shown here: which cap applies first, and the seven-day retention.
     #[test]
     fn a_lock_that_cannot_be_taken_is_said_beside_a_reason_that_already_stands() {
         let root = spool_directory("host-cap-unavailable-beside");

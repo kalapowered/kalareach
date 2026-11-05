@@ -2173,8 +2173,11 @@ async fn kr_req_11_35_a_committed_marker_followed_by_a_failed_transmission_leave
     );
 }
 
-/// KR-REQ-12.06: a steer admitted before the terminal asked to change its conversation is stopped
-/// when its permit is taken: nothing is written and the refusal is proven.
+/// KR-REQ-12.06, the part about a thread mutation submitted under an earlier selection: a steer
+/// admitted before the terminal asked to change its conversation is stopped when its permit is
+/// taken: nothing is written and the refusal is proven unsent. Only a steer is admitted here; the
+/// declared cancellation is the case below. Not shown here: the `DRAFT_CONFLICT` or `STALE_SESSION`
+/// code, which the case does not read.
 ///
 /// Not claimed: Windows, where no gateway runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

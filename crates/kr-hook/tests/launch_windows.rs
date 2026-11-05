@@ -888,10 +888,10 @@ fn kr_req_05_09_a_launcher_started_before_the_backend_was_established_is_not_adm
     shell.commits_after_a_refusal(&answer);
 }
 
-/// KR-REQ-12.02: a launcher that cannot create its program says so, the backend records why on the
-/// launch attempt, and the invocation can be launched again.
+/// A launcher that cannot create its program says so, the backend records why on the launch
+/// attempt, and the invocation can be launched again.
 #[test]
-fn kr_req_12_02_a_launcher_that_declines_leaves_its_reason_and_no_instance() {
+fn a_launcher_that_declines_leaves_its_reason_and_no_instance() {
     let shell = Shell::new();
     let answer = shell.establish();
     let mut scripted = shell.admitted_launcher(&answer);
@@ -914,9 +914,6 @@ fn kr_req_12_02_a_launcher_that_declines_leaves_its_reason_and_no_instance() {
 /// the reason on the launch attempt, and runs the typed command as typed, as the shell does without
 /// the integration. The control is the same invocation launched again under a job with no
 /// restriction, which is committed.
-///
-/// KR-REQ-12.02, the part about a launcher that declines: the backend keeps the reason on the launch
-/// attempt, nothing is registered, and the invocation can be launched again.
 ///
 /// KR-REQ-12.07, the part about a launch that does not go through: the typed command runs as typed,
 /// in the person's own environment, and ends with its own exit code.

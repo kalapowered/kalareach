@@ -1730,9 +1730,9 @@ async fn a_bundle_the_seed_does_not_open_is_neither_adopted_nor_written_over() {
     assert!(!path.exists());
 }
 
-/// KR-REQ-20.18: a step holds the lock a second companion on this machine would wait on, for as
-/// long as it runs and no longer, so two companions never each draw a locator and commit a bundle
-/// of their own.
+/// A step holds the lock a second companion on this machine would wait on, for as long as it runs
+/// and no longer. The lock is what keeps two companions from each drawing a locator and committing
+/// a bundle of their own; this case asserts who holds it and when, and runs no second companion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_step_holds_the_lock_another_companion_waits_on_while_it_runs() {
     let computer = Computer::new().await;
