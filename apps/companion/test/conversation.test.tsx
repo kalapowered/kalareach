@@ -479,6 +479,49 @@ describe('what the person writes goes where they wrote it (KR-REQ-13.12)', () =>
       expect(sent).toEqual(['4'])
     })
   })
+
+  it('calls a send the host cannot take now not taken, and one it refused refused, and keeps the text of both', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    // The category native code hands over with the code: a transient code is the host saying it
+    // cannot take the send now, and any other refusal is its definite word.
+    const answers = [
+      {
+        code: 'RESOURCE_UNAVAILABLE',
+        message: 'The host cannot take that now.',
+        user_action: 'retry',
+        retry: 'transient'
+      },
+      {
+        code: 'PERMISSION_DENIED',
+        message: 'This device may not send there.',
+        user_action: 'nothing',
+        retry: 'configuration_change'
+      }
+    ]
+    openConversation({ ...port, composerSubmit: () => Promise.reject(answers.shift()) })
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    const states = () =>
+      [...document.querySelectorAll('[data-testid="pending-actions"] li')].map(
+        (item) => item.getAttribute('data-state') ?? ''
+      )
+
+    await person.type(screen.getByTestId('composer-input'), 'Run the tests')
+    await person.click(screen.getByTestId('composer-send'))
+    await waitFor(() => {
+      expect(states()).toEqual(['not_taken'])
+    })
+    expect(screen.getByTestId('pending-actions')).toHaveTextContent('Not taken for now')
+    expect(screen.getByTestId('composer-input')).toHaveValue('Run the tests')
+
+    await person.click(screen.getByTestId('composer-send'))
+    await waitFor(() => {
+      expect(states()).toEqual(['not_taken', 'refused'])
+    })
+    expect(screen.getByTestId('composer-input')).toHaveValue('Run the tests')
+  })
 })
 
 describe('what packages show arrives on the stream (KR-REQ-11.48)', () => {
