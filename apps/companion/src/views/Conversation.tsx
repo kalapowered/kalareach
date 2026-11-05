@@ -106,6 +106,7 @@ import {
   applyReceipt,
   describeState,
   failed,
+  leavesOutcomeUnknown,
   outcomeMessage,
   outcomeTone,
   queued,
@@ -498,21 +499,20 @@ export function Conversation({
           // A refusal of the earlier result's quote says the host's record is not what was shown:
           // it is read again at once, so the person sees what it says now.
           if (anyway && code === 'DRAFT_CONFLICT') receiptReads.askAgain(sessionId)
+          const failure = { code, message: failureMessage(error), retry: failureRetry(error) }
           update((current) => ({
             ...current,
             submissions: current.submissions.map((submission) =>
-              submission.localId === local.localId
-                ? failed(submission, {
-                    code,
-                    message: failureMessage(error),
-                    retry: failureRetry(error)
-                  })
-                : submission
+              submission.localId === local.localId ? failed(submission, failure) : submission
             )
           }))
-          returnRefusedText(local.localId, sending)
+          // An outcome the host could not establish is never given back as a refusal: the prompt
+          // ends as unknown, as one answered with only its identity does, and its text stays held
+          // until the person has checked what became of it.
+          const unknown = leavesOutcomeUnknown(failure)
+          if (!unknown) returnRefusedText(local.localId, sending)
           say(failureMessage(error), 'danger')
-          end('refused')
+          end(unknown ? 'unknown' : 'refused')
         })
         .finally(refresh)
     },

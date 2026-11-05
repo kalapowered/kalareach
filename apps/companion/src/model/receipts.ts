@@ -250,13 +250,21 @@ export function failed(
   submission: Submission,
   error: { code: string; message: string; retry: string | null }
 ): Submission {
-  const state: InputState =
-    error.code === 'OUTCOME_UNKNOWN' || error.retry === 'outcome_unknown'
-      ? 'unknown'
-      : error.retry === 'transient'
-        ? 'not_taken'
-        : 'refused'
+  const state: InputState = leavesOutcomeUnknown(error)
+    ? 'unknown'
+    : error.retry === 'transient'
+      ? 'not_taken'
+      : 'refused'
   return { ...submission, state, error: { code: error.code, message: error.message } }
+}
+
+/**
+ * Whether a failure the request itself produced says the host could not establish what became of
+ * it. The prompt that failed so ends as unknown, not as refused: its text is not handed back for a
+ * plain resend, which could make the work happen twice.
+ */
+export function leavesOutcomeUnknown(error: { code: string; retry: string | null }): boolean {
+  return error.code === 'OUTCOME_UNKNOWN' || error.retry === 'outcome_unknown'
 }
 
 /** The submissions that are not finished, which is what the reconnect banner lists. */
