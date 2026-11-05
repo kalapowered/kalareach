@@ -298,6 +298,44 @@ async fn a_daemon_of_a_release_starts_its_own_release_s_worker_and_holds_the_rel
     host.close(&kr, &display);
 }
 
+/// KR-REQ-26.09: a command that finds no daemon starts the daemon of the release `current` names
+/// by that release's own program, a path with no link in it, and not through `current`: the first
+/// word of the daemon's command line is the path it was started with.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_that_finds_no_daemon_starts_the_daemon_of_the_release_current_names() {
+    let host = Host::create();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    host.put(&one);
+    host.switch(one.name());
+    let (chosen, said) = host.kr_json(&["host", "startup", "--set", "standalone", "--json"]);
+    assert!(
+        chosen.status.success(),
+        "kr host startup said {}: {said}{}",
+        chosen.status,
+        String::from_utf8_lossy(&chosen.stderr)
+    );
+    // No daemon runs: this command starts one.
+    let kr = host.store.stable(Program::Kr);
+    let (display, _) = host.new_session(&kr);
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", one.name())
+    );
+    let pid = host.daemon_process().await.pid.get();
+    let command = std::fs::read(format!("/proc/{pid}/cmdline")).expect("the daemon's command");
+    let started_as = command.split(|byte| *byte == 0).next().expect("a program");
+    assert_eq!(
+        String::from_utf8_lossy(started_as),
+        host.store
+            .release_program(one.name(), Program::Controller)
+            .display()
+            .to_string(),
+        "the daemon was started from the release's own program"
+    );
+    host.close(&kr, &display);
+}
+
 /// A daemon of a release starts its own release's worker with its own release's packages, and
 /// takes no other: a session it launched with another would run what the store does not hold.
 #[test]
