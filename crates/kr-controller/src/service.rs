@@ -758,6 +758,10 @@ pub struct Controller {
     /// device records in, so the two see one set of devices whether or not this host is on a
     /// network.
     devices: Arc<net::devices::DeviceDirectory>,
+    /// The mutations paired devices have sent that are being served and have not yet claimed the
+    /// route of their action, which is what tells a refused repeat that its first copy has not
+    /// left a route yet. In memory only.
+    arrivals: Arc<net::arrivals::Arrivals>,
     /// Every grant's lifetime on this host, measured on this daemon's clocks.
     lifetimes: Arc<net::lifetimes::GrantLifetimes>,
     /// The owner confirmations this host asks for, has answered and has spent, whether or not it
@@ -955,6 +959,11 @@ impl Controller {
     #[must_use]
     pub fn devices(&self) -> &Arc<net::devices::DeviceDirectory> {
         &self.devices
+    }
+
+    /// The mutations paired devices have sent that have not yet claimed their action's route.
+    pub(crate) const fn arrivals(&self) -> &Arc<net::arrivals::Arrivals> {
+        &self.arrivals
     }
 
     /// The environment's grants and invitations.
