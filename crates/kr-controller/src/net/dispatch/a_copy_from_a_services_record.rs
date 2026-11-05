@@ -65,7 +65,18 @@ async fn two_copies(
     connection: &super::RemoteConnection,
     mutation: &MutationRequest,
 ) -> (Answered, Answered) {
-    let (arrived, go) = controller.before_the_effect.arm();
+    two_copies_stopped_at(controller.before_the_effect.arm(), connection, mutation).await
+}
+
+/// As [`two_copies`], the first copy stopped at the place `armed` names.
+async fn two_copies_stopped_at(
+    (arrived, go): (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
+    connection: &super::RemoteConnection,
+    mutation: &MutationRequest,
+) -> (Answered, Answered) {
     let first = connection.answer_now(ControlFrame::Mutation(Box::new(mutation.clone())));
     tokio::pin!(first);
     tokio::select! {
@@ -102,7 +113,7 @@ pub(super) fn refusal_of(answered: &Answered) -> ProtocolError {
 }
 
 /// What the device is written for `answered`, once the connection has been asked to write it.
-async fn written(
+pub(super) async fn written(
     connection: &super::RemoteConnection,
     recording: &Recording,
     answered: Answered,
@@ -165,6 +176,25 @@ async fn a_refusal_copied_from_the_record_is_told_as_unknown(
     byte: u8,
     params: impl FnOnce(&fake::Silent) -> ParamsValue,
 ) {
+    a_refusal_copied_where_the_first_copy_is_stopped(method, byte, params, |controller| {
+        controller.before_the_effect.arm()
+    })
+    .await;
+}
+
+/// As [`a_refusal_copied_from_the_record_is_told_as_unknown`], the first copy stopped at the place
+/// `stop` arms: the door, before the service is asked, or a place inside the service.
+async fn a_refusal_copied_where_the_first_copy_is_stopped(
+    method: Method,
+    byte: u8,
+    params: impl FnOnce(&fake::Silent) -> ParamsValue,
+    stop: impl FnOnce(
+        &Controller,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
+) {
     let world = fake::fake_worker(None).await;
     let controller = &world.controller;
     if method == Method::ProjectInit && !controller.qualification().qualifies() {
@@ -179,9 +209,12 @@ async fn a_refusal_copied_from_the_record_is_told_as_unknown(
         return;
     }
     let (connection, recording) = paired_connection(controller, byte, EVERY_RIGHT);
+    if method == Method::VoiceStop {
+        with_a_voice_grant(controller, &connection);
+    }
     let mutation = mutation_of(&world, &connection, method, 91, params(&world));
 
-    let (copied, fresh) = two_copies(controller, &connection, &mutation).await;
+    let (copied, fresh) = two_copies_stopped_at(stop(controller), &connection, &mutation).await;
     let recorded = refusal_of(&fresh);
     assert!(
         super::is_definite(&recorded),
@@ -204,6 +237,170 @@ async fn a_refusal_copied_from_the_record_is_told_as_unknown(
         "a fresh refusal is told as ever: {told:?}"
     );
     world.serving.abort();
+}
+
+/// A mutation of `method` that a service of the host performs and records is served twice at once
+/// (see [`two_copies`]). Both copies are given the result the one that performed recorded, and the
+/// door holds only the copy that read it from the record as a kept answer, which a device that may
+/// not read the record is told as unknown; the copy that performed is a fresh answer.
+async fn a_result_copied_from_the_record_is_held_as_kept(
+    method: Method,
+    byte: u8,
+    params: impl FnOnce(&fake::Silent) -> ParamsValue,
+) {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let (connection, _) = paired_connection(controller, byte, EVERY_RIGHT);
+    let mutation = mutation_of(&world, &connection, method, 91, params(&world));
+
+    let (copied, fresh) = two_copies(controller, &connection, &mutation).await;
+    for answered in [&copied, &fresh] {
+        assert!(
+            matches!(
+                answered.frame(),
+                ControlFrame::Response(Response {
+                    outcome: Outcome::Ok(_),
+                    ..
+                })
+            ),
+            "{method:?} is performed once and answered to both copies: {:?}",
+            answered.frame()
+        );
+    }
+    assert!(
+        copied
+            .asked
+            .as_ref()
+            .is_some_and(super::decision::Asked::is_kept),
+        "{method:?}: the copy that read the result from the record is held as a kept answer"
+    );
+    assert!(
+        fresh.asked.as_ref().is_some_and(|asked| !asked.is_kept()),
+        "{method:?}: the copy that performed is a fresh answer"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-09.09: the attention group's mutations: clearing the quiet hours.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_result_the_attention_store_copies_from_its_record_is_held_as_kept() {
+    a_result_copied_from_the_record_is_held_as_kept(Method::AttentionQuietHours, 84, |_| {
+        ParamsValue::from_typed(&kr_protocol::attention::AttentionQuietHoursParams {
+            quiet_hours: Nullable::null(),
+        })
+        .expect("encodes")
+    })
+    .await;
+}
+
+/// KR-REQ-09.09: a create the daemon answers from the reservation another copy of it made is an
+/// answer read from a record, like any other, and goes under the checks every such answer goes
+/// under before it is written. The copy is stopped before its effect, and meanwhile another copy
+/// has made the session and the session has closed: the reservation under the create token and the
+/// closure record stand, so the create is answered from them as one already made. With nothing
+/// owed, the device is given the answer, held as a kept answer. When the host owes a fence it could
+/// not raise, the answer is not shown and the device is told the outcome is unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deduplicated_create_is_told_as_a_kept_answer() {
+    for owed in [false, true] {
+        let world = fake::fake_worker(None).await;
+        let controller = &world.controller;
+        let (connection, _) = paired_connection(controller, 85, EVERY_RIGHT);
+        let create =
+            crate::service::a_create_that_launches_nothing::create_params(world.environment_id);
+        let mutation = mutation_of(
+            &world,
+            &connection,
+            Method::SessionCreate,
+            91,
+            ParamsValue::from_typed(&create).expect("encodes"),
+        );
+
+        let (arrived, go) = controller.before_the_effect.arm();
+        let (answered, ()) = tokio::join!(
+            connection.answer_now(ControlFrame::Mutation(Box::new(mutation.clone()))),
+            async {
+                tokio::time::timeout(WAIT_BOUND, arrived)
+                    .await
+                    .expect("the copy reaches the place it is stopped at")
+                    .expect("the pause is armed");
+                let actor = connection.device.principal();
+                let digest =
+                    kr_protocol::digest::mutation_digest(&mutation, &actor).expect("a digest");
+                let intent = kr_cbor::to_canonical_vec(&create).expect("encodes");
+                let reserved = {
+                    let mut registry = controller.registry.lock().await;
+                    let admitted = registry
+                        .reserve(
+                            &actor,
+                            mutation.action_id.get(),
+                            digest,
+                            &intent,
+                            kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+                        )
+                        .expect("the other copy's reservation");
+                    registry
+                        .set_phase(
+                            admitted.reservation.reservation_id,
+                            crate::registry::LaunchPhase::Closed,
+                        )
+                        .expect("the session has closed");
+                    admitted.reservation
+                };
+                controller
+                    .retire(
+                        &crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of(
+                            reserved.session_id,
+                        ),
+                    )
+                    .await
+                    .expect("the closure is recorded");
+                controller.hold_fence(owed);
+                go.send(()).expect("the copy goes on");
+            }
+        );
+        let answered = answered.expect("the copy is answered");
+        if owed {
+            let told = refusal_of(&answered);
+            assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+        } else {
+            let ControlFrame::Response(Response {
+                outcome: Outcome::Ok(value),
+                ..
+            }) = answered.frame()
+            else {
+                panic!(
+                    "the create was answered from the record: {:?}",
+                    answered.frame()
+                );
+            };
+            let created: kr_protocol::session::SessionCreateResult =
+                value.to_typed().expect("a create result");
+            assert!(created.deduplicated, "an answer read from the record");
+            assert!(
+                answered
+                    .asked
+                    .as_ref()
+                    .is_some_and(super::decision::Asked::is_kept),
+                "and held as a kept answer"
+            );
+        }
+        world.serving.abort();
+    }
+}
+
+/// KR-REQ-09.09: an owner device's request for the confirmation that establishes the host's clock.
+/// The challenge is recorded with the action, and a copy of the request is given the challenge the
+/// first recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_challenge_the_owner_authority_copies_from_its_record_is_held_as_kept() {
+    a_result_copied_from_the_record_is_held_as_kept(Method::OwnerConfirmationRequest, 83, |_| {
+        ParamsValue::from_typed(&kr_protocol::confirmation::OwnerConfirmationRequestParams {
+            subject: kr_protocol::confirmation::ConfirmationSubject::EstablishClock,
+        })
+        .expect("encodes")
+    })
+    .await;
 }
 
 /// KR-REQ-09.09: the authority changes (`grant.create`, `grant.revoke`, `grant.redeem`).
@@ -237,6 +434,53 @@ async fn a_refusal_a_key_declaration_copies_from_its_record_is_told_as_unknown()
         })
         .expect("encodes")
     })
+    .await;
+}
+
+/// KR-REQ-09.09: a device's registration of its push destination, refused for a device that has
+/// declared no notification-preview key. Its service claims the action and records the refusal under
+/// the claim, and answers a copy from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_a_push_registration_copies_from_its_record_is_told_as_unknown() {
+    a_refusal_copied_from_the_record_is_told_as_unknown(Method::DevicePushRegister, 87, |_| {
+        ParamsValue::from_typed(&kr_protocol::push::DevicePushRegisterParams {
+            credential: kr_protocol::push::PushDeliveryCredential {
+                expires_at_ms: kr_protocol::scalars::TimestampMs::new(2_000_000_000_000),
+                gateway_origin: kr_protocol::service::GatewayOrigin::new("https://reach.invalid")
+                    .expect("an origin"),
+                installation_id: kr_protocol::ids::InstallationId::new(
+                    kr_protocol::scalars::Uuid::from_bytes([2; 16]),
+                ),
+                issued_at_ms: kr_protocol::scalars::TimestampMs::new(1_999_000_000_000),
+                revision: kr_protocol::ids::PushSenderRevision::new(1),
+                secret: kr_protocol::scalars::SecretBytes32::from_bytes([9; 32]),
+                sender_record_id: kr_protocol::ids::PushSenderRecordId::new(
+                    kr_protocol::scalars::Uuid::from_bytes([3; 16]),
+                ),
+            },
+            previews_enabled: true,
+        })
+        .expect("encodes")
+    })
+    .await;
+}
+
+/// KR-REQ-09.09: a voice change refused for a voice session that does not exist. Two copies pass the
+/// early look for a record before either has claimed the action; the copy that claims second finds
+/// the claim of the first, and the service answers it from the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_a_voice_change_copies_from_its_claim_is_told_as_unknown() {
+    a_refusal_copied_where_the_first_copy_is_stopped(
+        Method::VoiceStop,
+        86,
+        |_| {
+            ParamsValue::from_typed(&kr_protocol::voice::VoiceStopParams {
+                voice_session_id: kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid()),
+            })
+            .expect("encodes")
+        },
+        |controller| controller.before_a_voice_change_claims.arm(),
+    )
     .await;
 }
 

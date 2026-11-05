@@ -409,6 +409,8 @@ impl Controller {
         if method != Method::VoiceStop {
             admission.check()?;
         }
+        #[cfg(test)]
+        self.before_a_voice_change_claims.wait().await;
         let hold = match self.claim_voice_action(&actor_id, mutation)? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {

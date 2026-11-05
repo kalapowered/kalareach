@@ -660,6 +660,11 @@ pub struct Controller {
     /// every shipped build.
     #[cfg(test)]
     before_the_effect: ReadPause,
+    /// Where this host's own tests stop a voice change that found no record of its action, once the
+    /// early look is over and before it claims the action, so that a copy of it can claim and
+    /// record the action in between. Compiled away in every shipped build.
+    #[cfg(test)]
+    before_a_voice_change_claims: ReadPause,
     /// Where this host's own tests stop a close asked for by voice once it is held against its
     /// grant and before the revision and the authority are read, so that a withdrawal of the grant
     /// can land in between. Compiled away in every shipped build.

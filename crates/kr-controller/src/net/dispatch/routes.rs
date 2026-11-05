@@ -842,17 +842,9 @@ impl RemoteConnection {
                 );
                 // A create the daemon answered from the reservation an earlier submission made is
                 // the same read of somebody's result as a retained answer anywhere else, and it
-                // says so: `deduplicated` is what distinguishes it from a session made now.
-                if deduplicated(&answer) {
-                    match self.may_read_receipts(
-                        answered_session(&answer),
-                        Method::SessionCreate,
-                        &decided.acting,
-                    ) {
-                        Ok(read) => *asked = Some(read),
-                        Err(_) => return Err(outcome_not_shown()),
-                    }
-                }
+                // says so: `deduplicated` is what distinguishes it from a session made now. It is
+                // told as any answer read from a record is.
+                copied |= deduplicated(&answer);
                 answer
             }
             // A close is dispatched to the worker, so it goes over a bounded link of its own
