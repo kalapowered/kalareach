@@ -132,7 +132,9 @@ export function earlierWords(earlier: readonly EarlierSend[]): string {
         case 'unknown':
           return ' An earlier send of this answer ended with an outcome the host could not establish; sending it now is a new send that names it.'
         case 'refused':
-          return ' The host refused an earlier send of this answer.'
+          return each.code === null
+            ? ' The host refused an earlier send of this answer.'
+            : ` The host refused an earlier send of this answer (${each.code}).`
         case 'no_record':
           return ' The host has no record of an earlier send of this answer.'
         case 'unreadable':
@@ -144,13 +146,16 @@ export function earlierWords(earlier: readonly EarlierSend[]): string {
 
 /**
  * What the page says when the host took an earlier send of an answer to a question while its reply
- * was lost: that nothing was sent now, or that this press's own send was refused because of it. It
- * names no text of the answer, since the answer kept may differ from the one the host took.
+ * was lost: the action it took, and that nothing was sent now or that this press's own send was
+ * refused because of it. The notice is the one place that action is named once the kept answer is
+ * retired. It names no text of the answer, since the answer kept may differ from the one the host
+ * took.
  */
-export function landedWords(refused: string | null): string {
+export function landedWords(taken: string, refused: string | null): string {
+  const host = `The host took an earlier send of an answer to this question while its reply was lost (action ${taken}).`
   return refused === null
-    ? 'The host took an earlier send of an answer to this question while its reply was lost. Nothing was sent again.'
-    : 'The host took an earlier send of an answer to this question while its reply was lost. This press sent an answer too, and the host refused it because the question was answered.'
+    ? `${host} Nothing was sent again.`
+    : `${host} This press sent an answer too, and the host refused it because the question was answered.`
 }
 
 /** What the page says when an answer is held back because an earlier send's outcome is not yet shown. */

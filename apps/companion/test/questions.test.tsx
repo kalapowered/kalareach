@@ -16,7 +16,7 @@ import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
 import { QUESTION_CONFIRM, QUESTION_SELECT } from '../src/host/fake-questions'
-import { keptRefusalWords, landedWords, refusalWords } from '../src/model/questions'
+import { earlierWords, keptRefusalWords, landedWords, refusalWords } from '../src/model/questions'
 
 const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
 
@@ -298,11 +298,22 @@ describe('what a refusal or an earlier send means for the person (KR-REQ-11.63)'
     expect(keptRefusalWords(resolved, 'x')).toBe(refusalWords(resolved, 'x'))
   })
 
-  it('says whether the press sent an answer of its own when the host took an earlier send', () => {
-    expect(landedWords(null)).toContain('Nothing was sent')
-    const refused = landedWords('c2000000-0000-4000-8000-000000000002')
+  it('names the action the host took, and says whether the press sent an answer of its own', () => {
+    const taken = 'c2000000-0000-4000-8000-000000000001'
+    expect(landedWords(taken, null)).toContain(taken)
+    expect(landedWords(taken, null)).toContain('Nothing was sent')
+    const refused = landedWords(taken, 'c2000000-0000-4000-8000-000000000002')
+    expect(refused).toContain(taken)
     expect(refused).toContain('refused')
     expect(refused).not.toContain('Nothing was sent')
+  })
+
+  it('gives the code of an earlier send the host refused, when it gave one', () => {
+    const send = 'c2000000-0000-4000-8000-000000000003'
+    expect(
+      earlierWords([{ action_id: send, state: 'refused', code: 'PERMISSION_DENIED' }])
+    ).toContain('PERMISSION_DENIED')
+    expect(earlierWords([{ action_id: send, state: 'refused', code: null }])).toContain('refused')
   })
 })
 
@@ -574,6 +585,46 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
       'The host took an earlier send of an answer to this question while its reply was lost'
     )
     expect(within(row).queryByRole('button', { name: 'Send it now' })).toBeNull()
+    expect(controls.questions.sent).toHaveLength(0)
+  })
+
+  it('names the action the host took when a new answer finds it', async () => {
+    const { controls } = start()
+    const question = await questionAbout(WHICH_BRANCH)
+    const person = userEvent.setup()
+    await person.click(within(question).getByRole('radio', { name: 'main' }))
+    const taken = controls.questions.leaveTaken(QUESTION_SELECT)
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    const notice = new RegExp(
+      `while its reply was lost \\(action ${taken}\\)\\. Nothing was sent again\\.`
+    )
+    expect(await screen.findByText(notice)).toBeInTheDocument()
+    expect(controls.questions.sent).toHaveLength(0)
+  })
+
+  it('names the action the host took when the send of a kept answer finds it', async () => {
+    const { controls } = start()
+    const question = await questionAbout(WHICH_BRANCH)
+    const person = userEvent.setup()
+    await person.click(within(question).getByRole('radio', { name: 'main' }))
+    act(() => {
+      controls.questions.setReachable(false)
+    })
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    await screen.findByTestId('kept-answer')
+    act(() => {
+      controls.questions.setReachable(true)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('kept-answer')).toHaveAttribute('data-standing', 'offered')
+    })
+    // The host takes the earlier send after the page has read the kept answer's standing.
+    const taken = controls.questions.leaveTaken(QUESTION_SELECT)
+    await person.click(screen.getByRole('button', { name: 'Send it now' }))
+    const notice = new RegExp(
+      `while its reply was lost \\(action ${taken}\\)\\. Nothing was sent again\\.`
+    )
+    expect(await screen.findByText(notice)).toBeInTheDocument()
     expect(controls.questions.sent).toHaveLength(0)
   })
 

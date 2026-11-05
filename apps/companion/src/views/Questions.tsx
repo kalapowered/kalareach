@@ -291,7 +291,7 @@ export function QuestionRequests({
               : 'Your answer was recorded.'
           )
         } else if (outcome.outcome === 'landed') {
-          say(landedWords(outcome.refused))
+          say(landedWords(outcome.action_id, outcome.refused))
         } else {
           say(
             'The host did not confirm that. A copy of your answer is kept on this device, and it is sent again only if you send it.',
@@ -723,7 +723,7 @@ export function KeptAnswers({ sessionId }: { readonly sessionId?: string }): Rea
             )
               .then((outcome) => {
                 if (outcome.outcome === 'landed') {
-                  say(landedWords(outcome.refused))
+                  say(landedWords(outcome.action_id, outcome.refused))
                 } else if (outcome.outcome === 'waiting') {
                   say(
                     'The host has an earlier send of your answer and has not finished with it. Nothing was sent now.',
