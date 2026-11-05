@@ -370,12 +370,13 @@ impl ResponseLane {
     /// replies were offered on.
     ///
     /// With [`LaneGate::cursor_report_first`] set, the cursor reports go first, in their order, and
-    /// nothing else is taken until one has been: the other replies are held, not dropped. A reply
-    /// the hold kept does not age while it is kept, so when a cursor report ends the hold each of
-    /// them has the time it had left when it was first kept. When the hold ends any other way the
-    /// flag is simply not set again, no time is given back, and a reply that has by then waited
-    /// past its deadline is dropped as it would be behind a paste: an answer that old would reach
-    /// whatever reads next, which did not ask.
+    /// nothing else is taken until one has been: the other replies are held, not dropped, except
+    /// that one which had already waited past its deadline when the hold first kept it is dropped
+    /// then. A reply the hold kept does not age while it is kept, so when a cursor report ends the
+    /// hold each of them has the time it had left when it was first kept. A hold that ends any
+    /// other way is ended by [`Self::end_hold`], which gives no time back: a reply that has by then
+    /// waited past its deadline is dropped as it would be behind a paste, because an answer that
+    /// old would reach whatever reads next, which did not ask.
     pub fn drain(&mut self, gate: LaneGate, max_bytes: usize, now_ms: u64) -> Vec<Response> {
         if !gate.allows_write() {
             return Vec::new();
@@ -388,9 +389,7 @@ impl ResponseLane {
             if out.is_empty() {
                 return out;
             }
-            self.release_held(now_ms, true);
-        } else if self.holding {
-            self.release_held(now_ms, false);
+            self.release_held(now_ms);
         }
         while let Some(front) = self.queue.front() {
             if front.lapsed(now_ms) {
@@ -465,18 +464,33 @@ impl ResponseLane {
         }
     }
 
-    /// Ends the hold on the replies it kept. `given_back` says whether the time they were kept is
-    /// added to their deadlines, which is so only when a cursor report ended the hold.
-    fn release_held(&mut self, now_ms: u64, given_back: bool) {
+    /// Gives the replies a hold kept the time they had left when it first kept them, now that a
+    /// cursor report has ended it.
+    fn release_held(&mut self, now_ms: u64) {
         self.holding = false;
         for reply in &mut self.queue {
-            if let Some(since) = reply.held_since.take()
-                && given_back
-            {
+            if let Some(since) = reply.held_since.take() {
                 reply.expires_at_ms = reply
                     .expires_at_ms
                     .saturating_add(now_ms.saturating_sub(since));
             }
+        }
+    }
+
+    /// Ends a hold that no cursor report ended: the root editor is no longer owed one, because it
+    /// is reading keys, has left, or the session is going.
+    ///
+    /// No time is given back, so the replies the hold kept are judged by the deadline they had.
+    /// The caller says so when the editor stops being owed its report, with the gate open or shut,
+    /// because a hold that the lane is never told of would carry its start into the next one. A
+    /// gate that only parses and answers nothing is not such a moment, and does not call this.
+    pub fn end_hold(&mut self) {
+        if !self.holding {
+            return;
+        }
+        self.holding = false;
+        for reply in &mut self.queue {
+            reply.held_since = None;
         }
     }
 

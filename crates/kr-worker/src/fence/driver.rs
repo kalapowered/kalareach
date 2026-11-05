@@ -782,9 +782,10 @@ impl FenceDriver {
     /// Returns whether the root editor is owed the reply to its cursor question.
     ///
     /// The editor reads that reply from the same input as everything else the terminal sends, so
-    /// no other answer may go in ahead of it. Only a PowerShell root off Windows asks one of its
-    /// own: the Windows console has no cursor question in its input, and the other readers ask
-    /// none, so an answer they are sent is read as keys whenever it arrives.
+    /// no other answer may go in ahead of it. Only a PowerShell root off Windows is held to this:
+    /// the Windows console has no cursor question in its input, Zsh and Bash ask none, so an answer
+    /// they are sent is read as keys whenever it arrives, and Fish asks in one write with two other
+    /// questions and reads the three answers in the order of the questions.
     #[must_use]
     pub const fn cursor_report_owed(&self) -> bool {
         self.cursor_report_owed
@@ -2176,9 +2177,9 @@ mod tests {
         );
     }
 
-    /// The other readers ask the terminal nothing about the cursor, and a session below a
-    /// qualified phase reads its startup files' questions in their own context: neither is ever
-    /// owed a report.
+    /// No other reader's editor is held to a cursor report (Zsh and Bash ask none, Fish reads its
+    /// answers in order), and a session below a qualified phase reads its startup files' questions
+    /// in their own context: neither is ever owed one.
     #[test]
     fn no_other_editor_and_no_unqualified_session_is_owed_a_cursor_report() {
         for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
@@ -2187,7 +2188,7 @@ mod tests {
             let _ = driver.bridge_event(RequestId::new(2), &entered(1, 1));
             assert!(
                 !driver.cursor_report_owed(),
-                "{kind:?} asks no cursor question"
+                "{kind:?} is never held for a cursor report"
             );
         }
 

@@ -411,11 +411,40 @@ fn a_reply_the_hold_ends_without_a_cursor_report_keeps_its_deadline() {
     let deadline = LaneLimits::DEFAULT.reply_deadline_ms;
     engine.feed(b"\x1b[c", 0);
     assert!(engine.lane_mut().drain(owed(), 4096, 0).is_empty());
+    engine.lane_mut().end_hold();
     let drained = engine
         .lane_mut()
         .drain(LaneGate::default(), 4096, 5 * deadline);
     assert!(drained.is_empty(), "no answer that old is written");
     assert_eq!(engine.lane().degradation().expired, 1);
+    assert_eq!(engine.lane().queued_bytes(), 0);
+}
+
+/// KR-REQ-08.49: a hold that ended without a cursor report is over, even when no look at the lane
+/// with the gate open came between it and the next hold. The time between the two is not time the
+/// next report gives back: the reply the first hold kept has waited past its deadline by then and
+/// is dropped when the second hold looks at it.
+#[test]
+fn the_time_between_two_holds_is_not_given_back_to_a_reply_the_first_kept() {
+    let mut engine = engine();
+    let deadline = LaneLimits::DEFAULT.reply_deadline_ms;
+    engine.feed(b"\x1b[c", 0);
+    assert!(engine.lane_mut().drain(owed(), 4096, 0).is_empty());
+
+    // The editor stops being owed its report while the gate is shut, and is owed one again.
+    engine.lane_mut().end_hold();
+    let shut = LaneGate {
+        paste_open: true,
+        ..owed()
+    };
+    assert!(engine.lane_mut().drain(shut, 4096, 5 * deadline).is_empty());
+    engine.feed(b"\x1b[6n", 6 * deadline);
+    let drained = engine.lane_mut().drain(owed(), 4096, 6 * deadline);
+    let bytes: Vec<&[u8]> = drained.iter().map(|reply| reply.bytes()).collect();
+    assert_eq!(bytes.len(), 1, "only the report: {bytes:?}");
+    assert!(is_a_cursor_report(bytes[0]));
+    assert_eq!(engine.lane().degradation().expired, 1);
+    assert_eq!(engine.lane().queued_bytes(), 0);
 }
 
 /// KR-REQ-08.49: a reply that had already waited past its deadline when the hold first kept it is
@@ -433,6 +462,31 @@ fn a_reply_already_past_its_deadline_is_not_kept_by_the_hold() {
     );
     assert_eq!(engine.lane().pending(), 0);
     assert_eq!(engine.lane().degradation().expired, 1);
+    assert_eq!(engine.lane().queued_bytes(), 0);
+}
+
+/// KR-REQ-08.49: a cursor report that has waited past its deadline is dropped, as any reply is, and
+/// does not carry the replies held behind it out with it.
+#[test]
+fn a_cursor_report_past_its_deadline_is_dropped_and_releases_nothing() {
+    let mut engine = engine();
+    let deadline = LaneLimits::DEFAULT.reply_deadline_ms;
+    engine.feed(b"\x1b[c", 0);
+    assert!(engine.lane_mut().drain(owed(), 4096, 0).is_empty());
+    engine.feed(b"\x1b[6n", 1);
+    assert!(
+        engine
+            .lane_mut()
+            .drain(owed(), 4096, deadline + 2)
+            .is_empty()
+    );
+    assert_eq!(engine.lane().degradation().expired, 1, "the report lapsed");
+    assert_eq!(engine.lane().pending(), 1, "the answer is still kept");
+    assert_eq!(
+        engine.lane().queued_bytes(),
+        b"\x1b[?62;22c".len(),
+        "and counted"
+    );
 }
 
 /// KR-REQ-08.50: a cursor report the caller's byte budget cannot take yet does not let another

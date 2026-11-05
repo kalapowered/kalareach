@@ -521,8 +521,14 @@ impl TerminalEngine {
     ///
     /// The lane holds a reply back while a bracketed paste or a human input frame is open, so the
     /// moment one of those closes is a moment to look again. Nothing else in the engine changes.
+    ///
+    /// This is the look the session makes with the gate as it really stands, so it is also where the
+    /// lane learns that the root editor is no longer owed the reply to its cursor question.
     pub fn drain_replies(&mut self, gate: LaneGate) -> Vec<LaneReply> {
         let now_ms = self.now_ms();
+        if !gate.cursor_report_first {
+            self.engine.lane_mut().end_hold();
+        }
         self.engine
             .lane_mut()
             .drain(gate, MAX_REPLY_BYTES, now_ms)
