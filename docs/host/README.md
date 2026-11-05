@@ -3500,17 +3500,22 @@ it must ask about.
 A refusal that the daemon makes after it holds the outcome of an action is not told as a refusal of
 the action. A client takes any refusal but a transient failure or `OUTCOME_UNKNOWN` for the host's
 word that nothing was done, so one that followed an action the worker carried out would have the
-client drop an action that landed. This reaches the refusals the daemon makes on its own account:
-the device's grant refused by the authority feed, or a lease that ended, between the worker's
-carrying the action out and the writing of the answer; a registration found withdrawn or a fence
-owed once a retained answer is found; a device that may not read the session's receipts, or whose
-grant no longer reaches what the action produced, presenting the action again; an answer the
-daemon cannot read in the worker's level; and an answer its edits make larger than the device said
-it can receive. The device is told `OUTCOME_UNKNOWN`, in a sentence that names nothing of the host,
-and nothing of the answer is shown. A fresh answer that is the worker's own refusal of the action,
-or a receipt that says the action was refused or rejected, stays a refusal, because the action did
-not happen. An answer kept from an earlier submission is told as unknown whatever it was, so that a
-device that may not read it cannot tell a name from a refusal.
+client drop an action that landed. At the door a paired device reaches, this covers the refusals
+the daemon makes on its own account: the device's grant refused by the authority feed, or a lease
+that ended, between the worker's carrying the action out and the writing of the answer; a
+registration found withdrawn or a fence owed once a retained answer is found; a device that may not
+read the session's receipts, or whose grant no longer reaches what the action produced, presenting
+the action again; an answer the daemon cannot read in the worker's level, a close's included; and a
+response that its edits make larger than the device said it can receive. The device is told
+`OUTCOME_UNKNOWN`, in a sentence that names nothing of the host, and nothing of the answer is shown.
+A fresh answer that is the worker's own refusal of the action, or a receipt that says the action was
+refused or rejected, stays a refusal, because the action did not happen. An answer kept from an
+earlier submission is told as unknown whatever it was, so that a device that may not read it cannot
+tell a name from a refusal. A repeat that fails a check made before the daemon looks for the
+action's record, such as a window that belongs to another connection or a connection scoped to
+another session, is refused as any request is, and so is one whose worker the daemon cannot reach
+to ask for the receipt. The services behind the door check the registration again where they write,
+and a copy of an action that meets a fence owed there is refused in their words.
 
 A device that falls behind is told rather than waited for. What the daemon holds for one device is
 bounded in bytes, not in messages, at section 9's send queue per peer; a device that reaches that

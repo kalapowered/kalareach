@@ -11,6 +11,8 @@
 
 mod net_support;
 
+use std::future::Future;
+
 use kr_protocol::error::{ErrorCode, RetryCategory};
 use kr_protocol::ids::{ActionId, QuestionRevision};
 use kr_protocol::method::Method;
@@ -21,20 +23,32 @@ use net_support::environment::{Environment, from, resolved, yes};
 
 const VIEWING: [ActionRight; 2] = [ActionRight::SessionView, ActionRight::QuestionRespond];
 
-/// Raises the refusal the authority feed puts on remote grants once the call has stopped at the
-/// pause it was armed for, and lets the call go.
-async fn refuse_then_release(
+/// Runs `call` to the pause it was armed for, raises the refusal the authority feed puts on remote
+/// grants there, lets the call go, and returns what it answered.
+///
+/// A call that is answered before it reaches its pause fails the case at once, instead of leaving
+/// it to wait for a pause that cannot come.
+async fn refused_at_its_pause<T>(
     environment: &Environment,
-    arrived: tokio::sync::oneshot::Receiver<()>,
-    go: tokio::sync::oneshot::Sender<()>,
-) {
-    arrived.await.expect("the call arrives at its pause");
+    pause: (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
+    call: impl Future<Output = T>,
+) -> T {
+    let (arrived, go) = pause;
+    tokio::pin!(call);
+    tokio::select! {
+        arrived = arrived => arrived.expect("the call arrives at its pause"),
+        _ = &mut call => panic!("the call was answered before it reached its pause"),
+    }
     environment
         .host
         .controller()
         .raise_the_unverified_withdrawal_refusal()
         .await;
     go.send(()).expect("the call waits at its pause");
+    call.await
 }
 
 /// An answer the worker took, whose grant the authority feed refuses before the reply is written,
@@ -44,18 +58,19 @@ async fn an_answer_the_worker_took_is_not_refused_when_the_grant_is_refused_befo
     let environment = Environment::start().await;
     let question = environment.worker.ask("taken");
     let device = environment.device(from(&VIEWING, 1)).await;
-
     let params = yes(&environment, &question);
-    let (arrived, go) = environment.host.pause_after_the_worker_answered();
-    let (told, ()) = tokio::join!(
+
+    let told = refused_at_its_pause(
+        &environment,
+        environment.host.pause_after_the_worker_answered(),
         device.connection.mutate(
             Method::QuestionAnswer,
             ActionId::new(kr_ipc::new_uuid()),
             environment.target(),
             &params,
         ),
-        refuse_then_release(&environment, arrived, go),
-    );
+    )
+    .await;
 
     assert_eq!(
         environment.worker.held(&question).state,
@@ -64,6 +79,10 @@ async fn an_answer_the_worker_took_is_not_refused_when_the_grant_is_refused_befo
     );
     let told = net_support::refusal(told);
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert!(
+        told.message.contains("may have been carried out"),
+        "{told:?}"
+    );
     device.connection.close();
     environment.stop().await;
 }
@@ -81,16 +100,17 @@ async fn an_answer_the_worker_refused_is_still_refused_when_the_grant_is_refused
         ..yes(&environment, &question)
     };
 
-    let (arrived, go) = environment.host.pause_after_the_worker_answered();
-    let (told, ()) = tokio::join!(
+    let told = refused_at_its_pause(
+        &environment,
+        environment.host.pause_after_the_worker_answered(),
         device.connection.mutate(
             Method::QuestionAnswer,
             ActionId::new(kr_ipc::new_uuid()),
             environment.target(),
             &stale,
         ),
-        refuse_then_release(&environment, arrived, go),
-    );
+    )
+    .await;
 
     assert_eq!(
         environment.worker.held(&question).state,
@@ -119,11 +139,15 @@ async fn a_repeat_the_worker_answers_from_its_receipt_is_not_refused_when_the_gr
     let device = environment.device(from(&VIEWING, 1)).await;
     let action = ActionId::new(kr_ipc::new_uuid());
     let params = yes(&environment, &question);
+    // The host renews the window a connection holds, and a repeat under another window is another
+    // request, so both presentations go under the one the first was made under.
+    let window = device.connection.action_window_id();
 
     let first = resolved(
         device
             .connection
-            .mutate(
+            .mutate_in(
+                window.clone(),
                 Method::QuestionAnswer,
                 action,
                 environment.target(),
@@ -134,16 +158,18 @@ async fn a_repeat_the_worker_answers_from_its_receipt_is_not_refused_when_the_gr
     );
     assert_eq!(first.state, QuestionState::Answered);
 
-    let (arrived, go) = environment.host.pause_retained_lookup();
-    let (told, ()) = tokio::join!(
-        device.connection.mutate(
+    let told = refused_at_its_pause(
+        &environment,
+        environment.host.pause_retained_lookup(),
+        device.connection.mutate_in(
+            window,
             Method::QuestionAnswer,
             action,
             environment.target(),
             &params,
         ),
-        refuse_then_release(&environment, arrived, go),
-    );
+    )
+    .await;
 
     assert_eq!(
         environment.worker.held(&question).state,
@@ -151,6 +177,10 @@ async fn a_repeat_the_worker_answers_from_its_receipt_is_not_refused_when_the_gr
     );
     let told = net_support::refusal(told);
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert!(
+        told.message.contains("may have been carried out"),
+        "{told:?}"
+    );
     device.connection.close();
     environment.stop().await;
 }

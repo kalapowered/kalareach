@@ -707,6 +707,7 @@ impl RemoteConnection {
                 });
         }
         if let Some(retained) = held {
+            *asked = Some(decided.clone().kept());
             #[cfg(feature = "testing")]
             self.controller.after_the_retained_lookup.wait().await;
             // What this host holds is the outcome of an action. When it will not show the device
@@ -1477,6 +1478,7 @@ impl RemoteConnection {
                     .controller
                     .retained_authority_change(&actor_id, mutation)
                 {
+                    *asked = Some(decided.clone().kept());
                     #[cfg(feature = "testing")]
                     self.controller.after_the_retained_lookup.wait().await;
                     return match self.admitted_to_answer(validated) {

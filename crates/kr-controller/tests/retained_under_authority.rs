@@ -205,6 +205,10 @@ async fn kr_req_23_34_an_action_is_read_by_its_identifier_only_under_view_author
             assert_eq!(denied.code, ErrorCode::PermissionDenied, "{denied}");
             let unknown = retried.expect_err("nor by presenting it again");
             assert_eq!(unknown.code, ErrorCode::OutcomeUnknown, "{unknown}");
+            assert!(
+                unknown.message.contains("may have been carried out"),
+                "{unknown}"
+            );
         }
         device.connection.close();
     }

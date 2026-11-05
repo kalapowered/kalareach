@@ -1332,6 +1332,21 @@ async fn a_refusal_made_after_an_answer_is_told_by_what_the_answer_leaves_open()
             ErrorCode::PermissionDenied,
         ),
         (
+            receipt(ReceiptState::Received),
+            To::Action,
+            ErrorCode::OutcomeUnknown,
+        ),
+        (
+            receipt(ReceiptState::Accepted),
+            To::Action,
+            ErrorCode::OutcomeUnknown,
+        ),
+        (
+            receipt(ReceiptState::Dispatching),
+            To::Action,
+            ErrorCode::OutcomeUnknown,
+        ),
+        (
             receipt(ReceiptState::Applied),
             To::Action,
             ErrorCode::OutcomeUnknown,
@@ -1412,6 +1427,9 @@ async fn a_refusal_made_after_an_answer_is_told_by_what_the_answer_leaves_open()
             panic!("the answer was written past the refusal: {frames:?}");
         };
         assert_eq!(refusal.code, told, "{answer:?}");
+        if told == ErrorCode::OutcomeUnknown {
+            assert_eq!(refusal.message, super::outcome_not_shown().message);
+        }
     }
     drop(controller);
 }
@@ -2474,6 +2492,7 @@ async fn a_retained_answer_written_under_a_replacement_lease_without_view_is_not
                     panic!("the lease no longer admits the read: {outcome:?}");
                 };
                 assert_eq!(error.code, kr_protocol::error::ErrorCode::OutcomeUnknown);
+                assert_eq!(error.message, super::outcome_not_shown().message);
             }
             // A fresh answer decided under `question.respond` alone still goes, and without the
             // question.
@@ -3215,6 +3234,7 @@ async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written(
         panic!("the answer was written although it no longer fits");
     };
     assert_eq!(unknown.code, kr_protocol::error::ErrorCode::OutcomeUnknown);
+    assert_eq!(unknown.message, super::outcome_not_shown().message);
     // A notification has no request to refuse, so the connection ends with nothing written.
     let limited = output_receiving(&controller, &stream, &receiving(notice_before));
     assert!(!limited.send(&notice).await);
