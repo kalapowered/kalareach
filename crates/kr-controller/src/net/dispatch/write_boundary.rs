@@ -3132,8 +3132,9 @@ fn a_share_issued_under(
 
 /// An answer that fitted the frame a device can receive, until what names this host was taken out
 /// of it, is refused as too large and not written in a size the stream would end the connection
-/// for, unless it answers an action, which is told as an outcome that is unknown; a notification in
-/// the same case is not written, and the connection ends.
+/// for, unless it answers an action or is kept from an earlier submission of one, which is told as
+/// an outcome that is unknown; a notification in the same case is not written, and the connection
+/// ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written() {
     use kr_protocol::envelope::{Notification, Outcome, ParamsValue, Response};
@@ -3232,6 +3233,25 @@ async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written(
     }) = stream.frames().remove(0)
     else {
         panic!("the answer was written although it no longer fits");
+    };
+    assert_eq!(unknown.code, kr_protocol::error::ErrorCode::OutcomeUnknown);
+    assert_eq!(unknown.message, super::outcome_not_shown().message);
+    // So does an answer kept from an earlier submission of the action, whatever it was.
+    let stream = HeldStream::new(false);
+    stream.writer.add_permits(2);
+    let limited = output_receiving(&controller, &stream, &receiving(answer_before));
+    assert_eq!(
+        limited
+            .write_held(&answer, &[], None, Answers::Kept, None)
+            .await,
+        Written::Sent
+    );
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Error(unknown),
+        ..
+    }) = stream.frames().remove(0)
+    else {
+        panic!("the kept answer was written although it no longer fits");
     };
     assert_eq!(unknown.code, kr_protocol::error::ErrorCode::OutcomeUnknown);
     assert_eq!(unknown.message, super::outcome_not_shown().message);
