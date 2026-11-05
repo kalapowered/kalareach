@@ -476,9 +476,9 @@ fn a_successful_confirmation_locks_the_invitation_before_any_bundle() {
 /// as it falls.
 ///
 /// KR-ACC-015, the part about the five-attempt limit: five failed confirmation tags consume the
-/// invitation, and the count is in the store after each failure. Not shown here: the count
-/// surviving a restart (the case reads the store's snapshot on one host), and the other conditions
-/// of the row.
+/// invitation, and the count is in the store after each of the first four failures. Not shown
+/// here: the count surviving a restart (the case reads the store's snapshot on one host), and the
+/// other conditions of the row.
 #[test]
 fn a_wrong_code_exhausts_five_guesses_and_the_count_survives_a_restart() {
     assert_eq!(MAX_CONFIRMATION_FAILURES, 5, "section 10 allows five");
@@ -2301,8 +2301,8 @@ fn no_bundle_moves_before_both_confirmation_tags_are_verified() {
 /// locator and origin, so the host can release it.
 ///
 /// KR-ACC-015, the part about the expiry limit: an invitation nobody used is consumed as expired
-/// once its deadline passes, when the host asks before offering another, and not a moment before.
-/// Not shown here: the other conditions of the row.
+/// once its deadline passes, when the host asks before offering another. Not shown here: that it
+/// is still open just before the deadline, and the other conditions of the row.
 #[test]
 fn an_unused_code_invitation_is_consumed_as_expired_once_its_deadline_passes() {
     let harness = Harness::new();
