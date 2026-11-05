@@ -365,6 +365,11 @@ pub struct FenceDriver {
     reader: Option<(PromptGeneration, ReaderRevision)>,
     /// Whether the last stimulus was one the machine ignored as belonging to something that ended.
     ignored: bool,
+    /// Whether the registered root editor is owed the reply to its cursor question, which it reads
+    /// from the same input as every other byte. Set by an entry of an editor that asks one, and
+    /// ended by a cursor report queued for the terminal, by the reader's idle report, and by the
+    /// editor leaving or the session closing.
+    cursor_report_owed: bool,
     /// The prompt generation of the acceptance being applied, while one is.
     ///
     /// The machine's record-acceptance action carries the origin alone, and a capability is about
@@ -428,6 +433,7 @@ impl FenceDriver {
             answering: None,
             reader: None,
             ignored: false,
+            cursor_report_owed: false,
             accepting: None,
             line_token: None,
             waker: std::sync::Arc::new(tokio::sync::Notify::new()),
@@ -773,6 +779,23 @@ impl FenceDriver {
         )
     }
 
+    /// Returns whether the root editor is owed the reply to its cursor question.
+    ///
+    /// The editor reads that reply from the same input as everything else the terminal sends, so
+    /// no other answer may go in ahead of it. Only a PowerShell root off Windows asks one of its
+    /// own: the Windows console has no cursor question in its input, and the other readers ask
+    /// none, so an answer they are sent is read as keys whenever it arrives.
+    #[must_use]
+    pub const fn cursor_report_owed(&self) -> bool {
+        self.cursor_report_owed
+    }
+
+    /// Reports that the host queued a cursor report for the terminal, which is the reply the
+    /// editor was owed.
+    pub fn cursor_report_queued(&mut self) {
+        self.cursor_report_owed = false;
+    }
+
     /// Reads the count of the host's answers the terminal's writer has yet to write from the
     /// session's writer, in place of the driver's own.
     pub fn watch_unwritten_replies(
@@ -1057,6 +1080,8 @@ impl FenceDriver {
         // reader it deregisters. An event the machine ignored as stale leaves it alone.
         if !self.ignored {
             self.reader = Some((params.prompt_generation, params.reader_revision));
+            self.cursor_report_owed =
+                cfg!(not(windows)) && self.phase.shell() == Some(ShellKind::PowerShell);
         }
         // The exchange the entry started, when the machine started one: a fence a client is told
         // about is one the reader has actually been asked for.
@@ -1104,6 +1129,9 @@ impl FenceDriver {
         );
         if !self.ignored {
             self.reader = Some((idle.prompt_generation, idle.reader_revision));
+            // The editor is reading keys, so a reply the host writes now reaches it as keys and no
+            // longer joins the reply to its question.
+            self.cursor_report_owed = false;
         }
         self.answer(&mut effects, EventOutcome::Received);
         effects
@@ -1164,6 +1192,10 @@ impl FenceDriver {
         for action in &outcome.actions {
             let produced = self.carry_out(action, context, outcome.state);
             effects.merge(produced);
+        }
+        if matches!(outcome.state, FenceState::Outside | FenceState::Closing) {
+            // No editor is registered, or the session is going: nothing is owed a reply.
+            self.cursor_report_owed = false;
         }
         // An exchange that begins while an answer the host queued earlier is still on its way to
         // the terminal has the same flaw as one the answer arrived in the middle of: the reader
@@ -2064,5 +2096,118 @@ mod tests {
                 input_epoch: InputLeaseEpoch::new(1),
             })
         );
+    }
+    /// A driver of `kind` whose bridge has registered and whose hooks are live.
+    fn qualified_as(kind: ShellKind, clock: &Arc<ManualClock>) -> FenceDriver {
+        let mut driver = FenceDriver::new(session(), lease(), Arc::clone(clock) as Arc<_>);
+        assert!(driver.registered(kind, "psreadline-2.3"));
+        let _ = driver.bridge_event(
+            RequestId::new(1),
+            &BridgeEvent::HooksActivated(HooksActivated {
+                session_id: session(),
+                prompt_generation: PromptGeneration::new(1),
+                modules: Vec::new(),
+            }),
+        );
+        assert!(driver.phase().retains_fence());
+        driver
+    }
+
+    /// KR-REQ-08.48, KR-REQ-08.49: a PowerShell editor that has begun a read is owed the reply to its
+    /// question about the cursor, until the host has queued a cursor report or the editor is
+    /// reading keys, has left, or the session is closing.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_powershell_editor_is_owed_its_cursor_report_until_one_is_queued_or_it_reads_keys() {
+        let clock = Arc::new(ManualClock::new());
+        let mut driver = qualified_as(ShellKind::PowerShell, &clock);
+        assert!(!driver.cursor_report_owed(), "no editor reads yet");
+
+        let _ = driver.bridge_event(RequestId::new(2), &entered(1, 1));
+        assert!(driver.cursor_report_owed());
+        driver.cursor_report_queued();
+        assert!(!driver.cursor_report_owed(), "the report is queued");
+
+        let _ = driver.bridge_event(RequestId::new(3), &entered(2, 1));
+        assert!(
+            driver.cursor_report_owed(),
+            "every read asks its own question"
+        );
+        let _ = driver.bridge_event(RequestId::new(4), &idled(2, 1));
+        assert!(!driver.cursor_report_owed(), "the editor reads keys");
+
+        let _ = driver.bridge_event(RequestId::new(5), &entered(3, 1));
+        assert!(driver.cursor_report_owed());
+        let _ = driver.bridge_event(RequestId::new(6), &left(3, 1));
+        assert!(!driver.cursor_report_owed(), "the editor left");
+
+        let _ = driver.bridge_event(RequestId::new(7), &entered(4, 1));
+        assert!(driver.cursor_report_owed());
+        let _ = driver.session_closing();
+        assert!(!driver.cursor_report_owed(), "the session is going");
+        let _ = driver.bridge_event(RequestId::new(8), &entered(5, 1));
+        assert!(
+            !driver.cursor_report_owed(),
+            "a session that is closing registers no read"
+        );
+    }
+
+    /// KR-REQ-08.49: a report from a reader the machine has already left behind does not change
+    /// what the current one is owed: an idle report or a leave it ignored as stale is no event of
+    /// this read.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_stale_report_from_an_earlier_reader_changes_nothing_the_editor_is_owed() {
+        let clock = Arc::new(ManualClock::new());
+        let mut driver = qualified_as(ShellKind::PowerShell, &clock);
+        let _ = driver.bridge_event(RequestId::new(2), &entered(5, 1));
+        assert!(driver.cursor_report_owed());
+        let _ = driver.bridge_event(RequestId::new(3), &idled(4, 1));
+        assert!(
+            driver.cursor_report_owed(),
+            "an idle report of the prompt before this one says nothing about this read"
+        );
+        let _ = driver.bridge_event(RequestId::new(4), &left(4, 1));
+        assert!(driver.cursor_report_owed());
+        let _ = driver.bridge_event(RequestId::new(5), &idled(5, 1));
+        assert!(
+            !driver.cursor_report_owed(),
+            "this read's editor reads keys"
+        );
+    }
+
+    /// The other readers ask the terminal nothing about the cursor, and a session below a
+    /// qualified phase reads its startup files' questions in their own context: neither is ever
+    /// owed a report.
+    #[test]
+    fn no_other_editor_and_no_unqualified_session_is_owed_a_cursor_report() {
+        for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+            let clock = Arc::new(ManualClock::new());
+            let mut driver = qualified_as(kind, &clock);
+            let _ = driver.bridge_event(RequestId::new(2), &entered(1, 1));
+            assert!(
+                !driver.cursor_report_owed(),
+                "{kind:?} asks no cursor question"
+            );
+        }
+
+        let mut driver =
+            FenceDriver::new(session(), lease(), Arc::new(ManualClock::new()) as Arc<_>);
+        assert!(driver.registered(ShellKind::PowerShell, "psreadline-2.3"));
+        let _ = driver.bridge_event(RequestId::new(2), &entered(1, 1));
+        assert!(
+            !driver.cursor_report_owed(),
+            "the startup files have not finished, so nothing holds a fence"
+        );
+    }
+
+    /// The Windows console has no cursor question in its input.
+    #[cfg(windows)]
+    #[test]
+    fn a_powershell_editor_on_windows_is_owed_no_cursor_report() {
+        let clock = Arc::new(ManualClock::new());
+        let mut driver = qualified_as(ShellKind::PowerShell, &clock);
+        let _ = driver.bridge_event(RequestId::new(2), &entered(1, 1));
+        assert!(!driver.cursor_report_owed());
     }
 }

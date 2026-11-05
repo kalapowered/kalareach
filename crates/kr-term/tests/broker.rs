@@ -276,6 +276,7 @@ fn a_reply_waits_for_the_session_loop() {
         paste_open: true,
         backend_handles_paste_interleave: false,
         human_frame_open: false,
+        cursor_report_first: false,
     };
     assert!(engine.lane_mut().drain(paste_open, 4096, 0).is_empty());
 
@@ -289,6 +290,7 @@ fn a_reply_waits_for_the_session_loop() {
         paste_open: true,
         backend_handles_paste_interleave: true,
         human_frame_open: false,
+        cursor_report_first: false,
     };
     assert_eq!(engine.lane_mut().drain(qualified, 4096, 0).len(), 1);
 }
@@ -322,6 +324,121 @@ fn a_stale_reply_is_dropped_rather_than_written() {
         .drain(LaneGate::default(), 4096, deadline + 1);
     assert!(replies.is_empty(), "the answer is no longer worth writing");
     assert!(engine.lane().degradation().expired > 0);
+}
+
+/// The gate of a session whose root editor is owed the reply to its cursor question.
+fn owed() -> LaneGate {
+    LaneGate {
+        cursor_report_first: true,
+        ..LaneGate::default()
+    }
+}
+
+fn is_a_cursor_report(reply: &[u8]) -> bool {
+    reply.starts_with(b"\x1b[") && reply.ends_with(b"R")
+}
+
+/// KR-REQ-08.48, KR-REQ-08.49: the root editor reads the reply to its cursor question from the same
+/// input as everything else the terminal sends, and bytes that come ahead of it are read as part of
+/// it. While the editor is owed that reply the lane lets the cursor report out first, and the
+/// replies to the queries that came before it follow in their own order.
+#[test]
+fn a_cursor_report_goes_ahead_of_the_replies_that_came_before_it() {
+    let mut engine = engine();
+    engine.feed(b"\x1b[c\x1b[>c\x1b[6n", 0);
+    let drained = engine.lane_mut().drain(owed(), 1 << 20, 0);
+    let bytes: Vec<&[u8]> = drained.iter().map(|reply| reply.bytes()).collect();
+    assert_eq!(bytes.len(), 3);
+    assert!(
+        is_a_cursor_report(bytes[0]),
+        "the report is first: {bytes:?}"
+    );
+    assert_eq!(&bytes[1..], [&b"\x1b[?62;22c"[..], b"\x1b[>41;1;0c"]);
+
+    // A session whose editor is owed nothing keeps the order of the queries.
+    let mut engine = self::engine();
+    engine.feed(b"\x1b[c\x1b[>c\x1b[6n", 0);
+    let drained = engine.lane_mut().drain(LaneGate::default(), 1 << 20, 0);
+    let bytes: Vec<&[u8]> = drained.iter().map(|reply| reply.bytes()).collect();
+    assert_eq!(bytes[0], b"\x1b[?62;22c");
+    assert!(
+        is_a_cursor_report(bytes[2]),
+        "the report is last: {bytes:?}"
+    );
+}
+
+/// KR-REQ-08.48: a reply the hold keeps waits for the cursor report however long that takes, and is
+/// then written, not dropped: it did not age while it was kept.
+#[test]
+fn a_reply_kept_for_the_cursor_report_is_written_after_it_whatever_it_waited() {
+    let mut engine = engine();
+    let deadline = LaneLimits::DEFAULT.reply_deadline_ms;
+    engine.feed(b"\x1b[c", 0);
+    assert!(engine.lane_mut().drain(owed(), 4096, 0).is_empty());
+    assert!(
+        engine
+            .lane_mut()
+            .drain(owed(), 4096, 5 * deadline)
+            .is_empty()
+    );
+    assert_eq!(engine.lane().pending(), 1, "kept, not dropped");
+    assert_eq!(engine.lane().degradation().expired, 0);
+
+    // The editor's question arrives long after the answer was kept.
+    engine.feed(b"\x1b[6n", 5 * deadline);
+    let drained = engine.lane_mut().drain(owed(), 4096, 5 * deadline);
+    let bytes: Vec<&[u8]> = drained.iter().map(|reply| reply.bytes()).collect();
+    assert_eq!(bytes.len(), 2);
+    assert!(is_a_cursor_report(bytes[0]));
+    assert_eq!(bytes[1], b"\x1b[?62;22c");
+    assert_eq!(engine.lane().degradation().expired, 0);
+}
+
+/// KR-REQ-08.49: the hold does not lengthen a reply's life when no cursor report ends it. A reply
+/// kept while the editor was owed one and still unwritten when the editor is not owed it any more
+/// has waited past its deadline, and is dropped as one is behind a paste: an answer that old would
+/// reach whatever reads next, which did not ask.
+#[test]
+fn a_reply_the_hold_ends_without_a_cursor_report_keeps_its_deadline() {
+    let mut engine = engine();
+    let deadline = LaneLimits::DEFAULT.reply_deadline_ms;
+    engine.feed(b"\x1b[c", 0);
+    assert!(engine.lane_mut().drain(owed(), 4096, 0).is_empty());
+    let drained = engine
+        .lane_mut()
+        .drain(LaneGate::default(), 4096, 5 * deadline);
+    assert!(drained.is_empty(), "no answer that old is written");
+    assert_eq!(engine.lane().degradation().expired, 1);
+}
+
+/// KR-REQ-08.49: a reply that had already waited past its deadline when the hold first kept it is
+/// dropped then, as it is at any other look.
+#[test]
+fn a_reply_already_past_its_deadline_is_not_kept_by_the_hold() {
+    let mut engine = engine();
+    let deadline = LaneLimits::DEFAULT.reply_deadline_ms;
+    engine.feed(b"\x1b[c", 0);
+    assert!(
+        engine
+            .lane_mut()
+            .drain(owed(), 4096, deadline + 1)
+            .is_empty()
+    );
+    assert_eq!(engine.lane().pending(), 0);
+    assert_eq!(engine.lane().degradation().expired, 1);
+}
+
+/// KR-REQ-08.50: a cursor report the caller's byte budget cannot take yet does not let another
+/// reply go ahead of it.
+#[test]
+fn nothing_goes_ahead_of_a_cursor_report_that_does_not_fit_the_budget_yet() {
+    let mut engine = engine();
+    engine.feed(b"\x1b[c\x1b[6n", 0);
+    assert!(engine.lane_mut().drain(owed(), 1, 0).is_empty());
+    assert_eq!(engine.lane().pending(), 2);
+    let drained = engine.lane_mut().drain(owed(), 4096, 0);
+    assert_eq!(drained.len(), 2);
+    assert!(is_a_cursor_report(drained[0].bytes()));
 }
 
 /// KR-REQ-08.50: the burst budget refills over time rather than granting one burst for the life of

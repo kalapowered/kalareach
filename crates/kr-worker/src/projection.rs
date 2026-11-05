@@ -77,6 +77,9 @@ pub struct LaneReply {
     /// When the lane stops thinking the answer worth writing, on the lane's own clock, in
     /// milliseconds. Nothing when the lane set no deadline.
     pub expires_at_ms: Option<u64>,
+    /// Whether the answer is a cursor position report, the one reply a root editor waits for
+    /// ahead of the rest.
+    pub cursor_report: bool,
 }
 
 impl LaneReply {
@@ -84,6 +87,7 @@ impl LaneReply {
         Self {
             bytes: reply.bytes().to_vec(),
             expires_at_ms: (reply.expires_at_ms() != 0).then_some(reply.expires_at_ms()),
+            cursor_report: matches!(reply.kind(), kr_term::lane::ResponseKind::CursorPosition),
         }
     }
 }
