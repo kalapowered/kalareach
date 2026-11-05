@@ -9,14 +9,14 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-17.14 | the `kr_req_17_14_` tests here |
+//! | KR-REQ-26.42 | `kr_req_17_14_a_host_that_selects_nothing_says_what_to_do_instead`, which names each managed integration as one the host does without |
 
 mod net_support;
 
 use kr_client::services::ManagedService;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::hostinfo::configuration::ConfigurationDocument;
-use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus, HostDoctorResult};
-use kr_protocol::method::Method;
+use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
 use kr_protocol::scalars::Nullable;
 use kr_service_stand_in::serve;
 use net_support::{AccountAt, Host};
@@ -28,19 +28,6 @@ const A_HOST_HOLDS: [ManagedService; 4] = [
     ManagedService::SyncBackup,
     ManagedService::ManagedInference,
 ];
-
-/// What the daemon says of its managed services.
-async fn managed_services(host: &Host) -> DoctorCheck {
-    let mut local = host.client().await;
-    let doctor: HostDoctorResult = net_support::pairing::read(&mut local, Method::HostDoctor, &())
-        .await
-        .expect("the host's diagnostics");
-    doctor
-        .checks
-        .into_iter()
-        .find(|check| check.id() == "managed-services")
-        .expect("the managed-services check")
-}
 
 /// Whether the check says `service` is configured.
 fn says_configured(check: &DoctorCheck, service: ManagedService) -> bool {
@@ -71,7 +58,7 @@ async fn kr_req_17_14_a_host_that_selects_every_service_says_each_is_configured(
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start_with_document_at(&owner, &document, AccountAt::Origin(origin)).await;
 
-    let check = managed_services(&host).await;
+    let check = host.managed_services().await;
     assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail());
     for service in A_HOST_HOLDS {
         assert!(
@@ -84,9 +71,10 @@ async fn kr_req_17_14_a_host_that_selects_every_service_says_each_is_configured(
     host.stop().await;
 }
 
-/// KR-REQ-17.14: a host that selects nothing holds no managed client, says so for each service with
-/// what to do instead, and the check is not a warning or a failure: the host is complete without
-/// them. A host that cannot sign in anywhere has no account login to name either.
+/// KR-REQ-17.14, KR-REQ-26.42: a host that selects nothing holds no managed client, says so for
+/// each service with what to do instead, and the check is not a warning or a failure: the host is
+/// complete without them, and its owner needs no account of any kind. A host that cannot sign in
+/// anywhere has no account login to name either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_17_14_a_host_that_selects_nothing_says_what_to_do_instead() {
     let mut document = ConfigurationDocument::empty();
@@ -94,7 +82,7 @@ async fn kr_req_17_14_a_host_that_selects_nothing_says_what_to_do_instead() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start_with_document(&owner, &document).await;
 
-    let check = managed_services(&host).await;
+    let check = host.managed_services().await;
     assert_eq!(
         check.status,
         DoctorStatus::NotApplicable,
@@ -124,7 +112,7 @@ async fn kr_req_17_14_a_host_that_selects_one_service_says_which_it_holds() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start_with_document_at(&owner, &document, AccountAt::Origin(origin)).await;
 
-    let check = managed_services(&host).await;
+    let check = host.managed_services().await;
     assert_eq!(
         check.status,
         DoctorStatus::NotApplicable,

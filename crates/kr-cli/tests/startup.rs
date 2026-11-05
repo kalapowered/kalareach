@@ -1913,6 +1913,73 @@ fn kr_host_shell_mode_chooses_and_clears_the_default_for_new_sessions() {
     host.close(&created);
 }
 
+/// KR-REQ-26.42: an ordinary user needs no account of any kind. On a host with no account that
+/// selects no managed service, the first run starts the daemon and a session in it, the host's
+/// configuration is chosen and read back, and `kr doctor` names each managed integration the host
+/// does without as optional, never as a fault. The one command that needs a service,
+/// `kr account sign-in`, is refused by what is missing, and the session is live before and after.
+#[test]
+fn kr_req_26_42_an_ordinary_user_with_no_account_and_no_managed_service_runs_a_host_and_its_sessions()
+ {
+    let host = Standalone::create();
+    assert!(
+        !host.document().exists(),
+        "a first run: the host has no configuration"
+    );
+
+    // Setup chooses how the daemon starts, and names no service.
+    let selected = start(host.kr(&["--json", "host", "startup", "--set", "standalone"]))
+        .finish("kr host startup");
+    let chosen = document(&selected, "kr host startup");
+    assert!(selected.status.success(), "{chosen}");
+
+    // The first session starts the daemon.
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(output.status.success(), "{created}");
+    assert_eq!(created["state"], "live", "{created}");
+    let session = created["session_id"]
+        .as_str()
+        .expect("a session identifier");
+    let live = |what: &str| {
+        let output = start(host.kr(&["--json", "list"])).finish(what);
+        let listed = document(&output, what);
+        assert!(output.status.success(), "{listed}");
+        assert!(listed.to_string().contains(session), "{what}: {listed}");
+    };
+    live("kr list");
+
+    // The host's configuration is chosen as one validated edit and read back with its source.
+    let output = start(host.kr(&["--json", "host", "shell-mode", "--set", "native_compat"]))
+        .finish("kr host shell-mode");
+    let mode = document(&output, "kr host shell-mode");
+    assert!(output.status.success(), "{mode}");
+    let row = host.doctor_row("shell.mode");
+    assert_eq!(row["value"], "native_compat", "{row}");
+    assert_eq!(row["source"], "host_configuration", "{row}");
+
+    // The managed integrations are named, each as one the host does without.
+    let output = start(host.kr(&["--json", "doctor"])).finish("kr doctor");
+    let report = document(&output, "kr doctor");
+    support::the_managed_integrations_are_named_as_ones_the_host_does_without(&report);
+
+    // No account is signed in, and the host says it names no managed service.
+    let output = start(host.kr(&["--json", "account", "show"])).finish("kr account show");
+    let account = document(&output, "kr account show");
+    assert!(output.status.success(), "{account}");
+    assert_eq!(account["state"], "signed_out", "{account}");
+    assert_eq!(account["unavailable"], "no_managed_service", "{account}");
+
+    // The one optional add that needs a service is refused by what is missing.
+    let output = start(host.kr(&["--json", "account", "sign-in"])).finish("kr account sign-in");
+    let refused = document(&output, "kr account sign-in");
+    assert!(!output.status.success(), "{refused}");
+
+    // None of it touched the session.
+    live("kr list after the refusal");
+    host.close(&created);
+}
+
 /// KR-REQ-08.02: `kr status` reports each terminal attachment's presentation and the reason for it.
 ///
 /// Two terminals attach to a session the started daemon holds: one at the session's own size that

@@ -32,6 +32,7 @@ use kr_client::pairing::owner::{
 };
 use kr_client::pairing::paired::{AttemptMode, PairedHost, PairedHosts};
 use kr_client::pairing::room::{RoomError, RoomSocket};
+use kr_client::services::ManagedService;
 use kr_client::transport::ControlTransport;
 use kr_controller::service::net::config::NetworkSettings;
 use kr_crypto::keys::DeviceKeys;
@@ -47,6 +48,8 @@ use kr_protocol::confirmation::{
 use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::GrantExpiry;
 use kr_protocol::hello::HostSelection;
+use kr_protocol::hostinfo::DoctorStatus;
+use kr_protocol::hostinfo::configuration::ConfigurationDocument;
 use kr_protocol::ids::{BuildId, DeviceKeyRevision, EnvironmentId};
 use kr_protocol::invitation::{
     InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairInviteParams, PairInviteResult,
@@ -1639,16 +1642,13 @@ async fn a_device_pairs_through_a_room_behind_tls() {
     assert_eq!(paired.device_id, confirmed.device_id);
 }
 
-/// KR-REQ-10.36, KR-REQ-10.37: a device running the product client redeems a direct invitation,
-/// shows the value the host locked it with, which is the one the owner sees, and pairs once the
-/// owner approves.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_pairs_directly_through_the_product_client() {
-    let owner_keys = keys();
-    let host = Host::start(&owner_keys).await;
+/// A device running the product client redeems a direct invitation the host's owner issued, shows
+/// the value the host locked it with, which is the one the owner sees, and pairs once the owner
+/// approves.
+async fn pairs_directly(host: &Host, owner_keys: &DeviceKeys) -> PairedHost {
     let environment = host.environment_id;
     let mut client = host.client().await;
-    let owner = Signer::OwnerDevice(&owner_keys);
+    let owner = Signer::OwnerDevice(owner_keys);
     let invited = calls::invite_direct(
         environment,
         &mut client,
@@ -1675,7 +1675,66 @@ async fn a_device_pairs_directly_through_the_product_client() {
             .expect("the owner approves");
     let paired = outcome(attempt).await.expect("paired");
     assert_eq!(paired.device_id, confirmed.device_id);
+    paired
+}
+
+/// KR-REQ-10.36, KR-REQ-10.37: a device running the product client redeems a direct invitation,
+/// shows the value the host locked it with, which is the one the owner sees, and pairs once the
+/// owner approves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_pairs_directly_through_the_product_client() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let paired = pairs_directly(&host, &owner_keys).await;
     assert_eq!(paired.host_endpoint_id, host.network().endpoint_id());
+}
+
+/// KR-REQ-26.42: a person pairs a device with a host that has no account and selects no managed
+/// service, and needs neither to do it. Before and after, the host says that no account is signed
+/// in and that it names no managed service, and it names each managed integration as one it does
+/// without, as optional and not as a fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_26_42_a_device_pairs_with_a_host_that_has_no_account_and_no_managed_service() {
+    use kr_protocol::host_account::{AccountState, SignInUnavailable};
+
+    let owner_keys = keys();
+    let mut document = ConfigurationDocument::empty();
+    document.revision = 1;
+    let host = Host::start_with_document(&owner_keys, &document).await;
+    let signed_out = |report: &kr_protocol::host_account::AccountReport| {
+        report.state == AccountState::SignedOut
+            && report.unavailable.as_ref() == Some(&SignInUnavailable::NoManagedService)
+    };
+    let before = host.account().await;
+    assert!(signed_out(&before), "{before:?}");
+
+    let paired = pairs_directly(&host, &owner_keys).await;
+    assert_eq!(paired.host_endpoint_id, host.network().endpoint_id());
+
+    let after = host.account().await;
+    assert!(signed_out(&after), "{after:?}");
+    let check = host.managed_services().await;
+    assert_eq!(
+        check.status,
+        DoctorStatus::NotApplicable,
+        "{}",
+        check.detail()
+    );
+    for service in [
+        ManagedService::AccountLogin,
+        ManagedService::RelayLeases,
+        ManagedService::SyncBackup,
+        ManagedService::ManagedInference,
+    ] {
+        assert!(
+            check
+                .detail()
+                .contains(&format!("{}: not configured", service.as_str())),
+            "{} is named as not configured: {}",
+            service.as_str(),
+            check.detail()
+        );
+    }
 }
 
 /// KR-REQ-10.36, KR-REQ-10.23: a person takes their time to approve. A host answers an unpaired

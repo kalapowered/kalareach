@@ -551,3 +551,37 @@ pub fn kr() -> PathBuf {
 pub fn kr_attach_guard() -> PathBuf {
     command_binaries().join(format!("kr-attach-guard{}", std::env::consts::EXE_SUFFIX))
 }
+
+/// Asserts that a `kr doctor` report, read as JSON, names each managed integration a host can do
+/// without as one it does not have configured, and that the check says so as a thing that does not
+/// apply and not as a warning or a failure: a host is complete without them.
+pub fn the_managed_integrations_are_named_as_ones_the_host_does_without(
+    report: &serde_json::Value,
+) {
+    use kr_client::services::ManagedService;
+
+    let check = report["doctor"]["checks"]
+        .as_array()
+        .and_then(|checks| {
+            checks
+                .iter()
+                .find(|check| check["id"] == "managed-services")
+        })
+        .unwrap_or_else(|| panic!("kr doctor reports the managed services: {report}"));
+    assert_eq!(check["status"], "not_applicable", "{check}");
+    let detail = check["detail"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the check says what it found: {check}"));
+    for service in [
+        ManagedService::AccountLogin,
+        ManagedService::RelayLeases,
+        ManagedService::SyncBackup,
+        ManagedService::ManagedInference,
+    ] {
+        assert!(
+            detail.contains(&format!("{}: not configured", service.as_str())),
+            "{} is named as not configured: {check}",
+            service.as_str()
+        );
+    }
+}

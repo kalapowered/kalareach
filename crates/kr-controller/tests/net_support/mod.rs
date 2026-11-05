@@ -1143,6 +1143,33 @@ impl Host {
             .expect("connects to the control endpoint")
     }
 
+    /// What the daemon says of the managed services it holds, in the `managed-services` check of
+    /// the diagnostics it answers.
+    pub async fn managed_services(&self) -> kr_protocol::hostinfo::DoctorCheck {
+        let mut local = self.client().await;
+        let doctor: kr_protocol::hostinfo::HostDoctorResult =
+            pairing::read(&mut local, Method::HostDoctor, &())
+                .await
+                .expect("the host's diagnostics");
+        doctor
+            .checks
+            .into_iter()
+            .find(|check| check.id() == "managed-services")
+            .expect("the managed-services check")
+    }
+
+    /// Where the daemon says its account stands.
+    pub async fn account(&self) -> kr_protocol::host_account::AccountReport {
+        let mut local = self.client().await;
+        pairing::read(
+            &mut local,
+            Method::AccountStatus,
+            &kr_protocol::host_account::AccountStatusParams {},
+        )
+        .await
+        .expect("the host's account report")
+    }
+
     /// Returns the directory a project test builds its repositories in.
     #[must_use]
     pub fn work(&self) -> &Path {

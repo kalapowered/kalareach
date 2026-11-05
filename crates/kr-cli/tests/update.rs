@@ -662,6 +662,54 @@ async fn an_update_replaces_the_daemon_and_a_live_session_keeps_its_release() {
     );
 }
 
+/// KR-REQ-26.42: an ordinary user installs a host, runs it and updates it by an explicit command
+/// with no account of any kind and no managed service. Before the update and after it the daemon
+/// says that no account is signed in and that the host names no managed service, and names each
+/// managed integration as one the host does without.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn kr_req_26_42_a_host_installs_and_updates_with_no_account_and_no_managed_service() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let started_through_current = host.store.stable(Program::Controller);
+    host.start_daemon(&started_through_current).await;
+    let standing = |host: &Host, when: &str| {
+        let (output, account) = host.kr_json(&["--json", "account", "show"]);
+        assert!(output.status.success(), "{when}: {account}");
+        assert_eq!(account["state"], "signed_out", "{when}: {account}");
+        assert_eq!(
+            account["unavailable"], "no_managed_service",
+            "{when}: {account}"
+        );
+        let (_, report) = host.kr_json(&["--json", "doctor"]);
+        support::the_managed_integrations_are_named_as_ones_the_host_does_without(&report);
+    };
+    standing(&host, "after the install");
+
+    let archive_two = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive_two);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive_two.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "the daemon was started again, of the new release"
+    );
+    standing(&host, "after the update");
+}
+
 /// KR-REQ-26.08: an update to a release whose daemon does not retain a live session's level waits,
 /// exit 9, naming the session and its protocol, with nothing stopped and the release staged.
 #[tokio::test(flavor = "multi_thread")]
