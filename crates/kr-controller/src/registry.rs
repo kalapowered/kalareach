@@ -72,8 +72,7 @@ pub const SCHEMA_VERSION: i64 = 15;
 ///
 /// A registry at that version has the tables of [`SCHEMA_VERSION`] and records the configuration
 /// document it accepted at the next version of the document. This build opens it as it finds it:
-/// it brings nothing forward, writes no version and changes no row, and the reader of an update
-/// reads it. A copy of the accepted document that this build cannot read stops the daemon's start
+/// it brings nothing forward and writes no version, and the reader of an update reads it. A copy of the accepted document that this build cannot read stops the daemon's start
 /// ([`crate::config::from_record`]).
 pub const READS_THROUGH_SCHEMA_VERSION: i64 = 16;
 

@@ -166,7 +166,7 @@ configuration file this host reads.
 
 | Rule | What it means |
 | --- | --- |
-| `version` | The schema version, 3. A document at version 1 or 2 is read as one at version 3 with the sections it lacks left out, and the next edit writes it at version 3. A document at version 4 is read the same way when it holds no ceiling this build lacks, and one that holds a ceiling this build lacks is refused whole, as a document with a misspelled key is. A document declaring any other version is left exactly as it is, nothing is read out of it, the host fails closed until it is put right, and `kr doctor` reports the version it found and what to do |
+| `version` | The schema version, 3. A document at version 1 or 2 is read as one at version 3 with the sections it lacks left out, and the next edit writes it at version 3. A document at version 4 is read the same way, and edited under the rules of its level, when it holds no member of `ceilings` this build lacks, in any form; one that holds such a member is refused whole, as a document with a misspelled key is. A document declaring any other version is left exactly as it is, nothing is read out of it, the host fails closed until it is put right, and `kr doctor` reports the version it found and what to do |
 | `level` | The highest level among the sections the document holds that arrived with a level. A writer sets it, and a document that states none is at level 1. See "Levels" below |
 | `revision` | Rises by one with each validated edit. An edit names the revision it was built on and is refused if another writer moved it first, so no edit silently erases another |
 | 64 KiB | The most of the document that is ever read. A larger file is not one of ours and is refused rather than parsed |

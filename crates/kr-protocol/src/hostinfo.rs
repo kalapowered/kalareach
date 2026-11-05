@@ -1797,14 +1797,15 @@ pub mod configuration {
 
     /// The newest version above [`VERSION`] that this build reads without writing it.
     ///
-    /// A document at that version is read strictly, as one at [`VERSION`]: every member this build
-    /// knows is read as it is, and a document that holds a member this build does not know, at any
-    /// depth, is refused whole and left as it is, as it is at any version. The release that writes
-    /// that version adds members that narrow what a host may do, so this build never reads past
-    /// one: a document it cannot read is not read as no document, and the copy of the accepted
-    /// document that the registry keeps is held to the same rule (a daemon does not start over a
-    /// copy it cannot read). A document that holds none of those members is the document this build
-    /// writes, and the next edit writes it at [`VERSION`].
+    /// A document at that version is read strictly, as one at [`VERSION`]: a member this build
+    /// does not know inside a member it reads, at any depth, makes the document unusable whole and
+    /// leaves it as it is, as it does at every version, and nothing is read out of it. (A document
+    /// above this build's level has its unknown top-level sections ignored and counted before that
+    /// read.) The release that writes that version adds members that narrow what a host may do,
+    /// so this build never reads past one: a document it cannot read is not read as no document,
+    /// and the copy of the accepted document that the registry keeps is held to the same rule (a
+    /// daemon does not start over a copy it cannot read). A document that holds none of those
+    /// members is the document this build writes, and the next edit writes it at [`VERSION`].
     pub const READS_THROUGH: u64 = 4;
 
     /// The oldest version this build reads and brings forward.
