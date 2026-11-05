@@ -511,11 +511,12 @@ impl RemoteConnection {
                         outcome: answered.response.outcome,
                     }),
                 );
-                // A worker checks a request (its authority, envelope, window and deadline) before
-                // it looks for the receipt of an action it was sent before, and a lookup that finds
-                // none shows only that the worker holds no receipt now: a dispatch of an earlier
-                // copy can still be waiting in its queue. So a refusal it makes that is not read
-                // from a receipt says nothing of an earlier copy. It is the host's word to give as
+                // A worker checks the authority a request stands on before it looks for the
+                // receipt of an action it was sent before, and its envelope, limits, window and
+                // deadline after a lookup that finds none. A lookup that finds none shows only
+                // that the worker holds no receipt now: a dispatch of an earlier copy can still
+                // be waiting in its queue. So a refusal it makes that is not read from a receipt
+                // says nothing of an earlier copy. It is the host's word to give as
                 // such, and a repeat is not told it.
                 match told {
                     ControlFrame::Response(Response {

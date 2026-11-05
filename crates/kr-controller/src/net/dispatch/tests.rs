@@ -6204,6 +6204,9 @@ enum Stopped {
     AtTheWorkersLink,
     /// While the dispatch lease for it is being taken, after the route is claimed.
     AtTheLease,
+    /// While it waits for the write half of its link to the worker, after its lease is taken and
+    /// its receipt lookup, if it has one, is over.
+    AtTheWriter,
     /// After the door has refused it and before the refusal is worded for the device.
     BeforeTheRefusalIsWorded,
 }
@@ -6277,7 +6280,7 @@ async fn a_mutation_refused(
     let pause = match stopped {
         Stopped::Never => None,
         Stopped::AtTheWorkersLink => Some(controller.before_a_proxy_is_opened.arm()),
-        Stopped::AtTheLease => Some(controller.before_the_lease.arm()),
+        Stopped::AtTheLease | Stopped::AtTheWriter => Some(controller.before_the_lease.arm()),
         Stopped::BeforeTheRefusalIsWorded => Some(controller.before_a_refusal_is_worded.arm()),
     };
     let sent = mutation.clone();
@@ -6293,8 +6296,31 @@ async fn a_mutation_refused(
                     .await
                     .expect("the call reaches the place it is stopped at")
                     .expect("the pause is armed");
-                change(&world, &connection, &*script, &sent).await;
-                go.send(()).expect("the call is waiting");
+                if matches!(stopped, Stopped::AtTheWriter) {
+                    // The link is open, and a receipt lookup is over, so the writer is free to
+                    // take. The call goes on to wait for it, and the world changes then.
+                    let proxy = connection
+                        .proxy
+                        .lock()
+                        .await
+                        .clone()
+                        .expect("the call opened the link");
+                    let waiting = proxy.calls_at_the_writer() + 1;
+                    let held = proxy.hold_the_writer().await;
+                    go.send(()).expect("the call is waiting");
+                    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                        while proxy.calls_at_the_writer() < waiting {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the call waits for the writer");
+                    change(&world, &connection, &*script, &sent).await;
+                    drop(held);
+                } else {
+                    change(&world, &connection, &*script, &sent).await;
+                    go.send(()).expect("the call is waiting");
+                }
             });
             answered
         }
@@ -6613,10 +6639,10 @@ async fn a_request_refused_after_a_copy_of_it_claimed_the_route_is_told_the_outc
     }
 }
 
-/// The authority feed raises a refusal on remote grants after a mutation has its lease and before
-/// it is written to its worker. For a repeat that refusal says nothing of the copy that went
-/// before, so it is told as an unknown outcome; the same request never routed is refused for the
-/// feed.
+/// The authority feed raises a refusal on remote grants while a mutation, which has its lease,
+/// waits for the write half of its link to the worker. For a repeat that refusal says nothing of
+/// the copy that went before, so it is told as an unknown outcome; the same request never routed is
+/// refused for the feed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repeat_the_feed_refuses_before_it_is_sent_is_told_the_outcome_is_unknown() {
     use kr_protocol::error::ErrorCode;
@@ -6630,7 +6656,7 @@ async fn a_repeat_the_feed_refuses_before_it_is_sent_is_told_the_outcome_is_unkn
             routed,
             81,
             |_| {},
-            Stopped::AtTheLease,
+            Stopped::AtTheWriter,
             async |world, _, _, _| {
                 world
                     .controller
