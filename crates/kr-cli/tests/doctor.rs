@@ -1,12 +1,12 @@
 //! `kr doctor`, run as the command a person types.
 //!
-//! What these establish, with the real binary on a real environment tree. KR-REQ-01.23: the
-//! command documents the two things it can do beyond reporting, and the flag that used to be
-//! reserved for a repair now says what it prints. KR-REQ-26.13 and 26.16: `kr host power` writes
-//! the one versioned configuration document through the validated edit, at a new revision, and a
-//! document this build must not rewrite is refused with nothing written. KR-REQ-26.44: the bundle
-//! is refused without a host rather than written half-empty, and `--include-content` without
-//! `--bundle` is a usage error rather than a silent no-op.
+//! What these establish, with the real binary on a real environment tree. The command documents
+//! the two things it can do beyond reporting, and the flag that used to be reserved for a repair
+//! now says what it prints. `kr host power` writes the one versioned configuration document
+//! through the validated edit, at a new revision, and a document this build must not rewrite is
+//! refused with nothing written. The bundle is refused without a host rather than written
+//! half-empty, and `--include-content` without `--bundle` is a usage error rather than a silent
+//! no-op.
 //!
 //! Every binary is launched from the copy on the internal disk, and every run is given a tree of
 //! its own through the two documented environment overrides, so nothing here reads or writes the
