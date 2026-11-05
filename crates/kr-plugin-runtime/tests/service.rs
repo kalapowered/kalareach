@@ -4,8 +4,6 @@
 //! conversation: the handshake, the challenge, a registration, a delivery, a call, a refusal and a
 //! health report. The separate process, its supervision and its death are in
 //! `crates/kr-plugin-host/tests/service.rs`, where there is a real one to kill.
-//!
-//! Requirement rows touched here: KR-REQ-04.07, KR-REQ-06.06, KR-REQ-11.38, KR-REQ-11.40.
 
 mod components;
 

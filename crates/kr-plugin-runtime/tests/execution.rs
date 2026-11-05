@@ -3,9 +3,6 @@
 //! Every test here compiles and instantiates an actual component and calls into it. That is the
 //! point: a limiter that is never asked, a deadline that is never reached and an import list that
 //! is never inspected all look correct in a unit test.
-//!
-//! Requirement rows closed here: KR-REQ-04.07, KR-REQ-06.06, KR-REQ-06.07, KR-REQ-11.01,
-//! KR-REQ-11.02, KR-REQ-11.21, KR-REQ-11.38, KR-REQ-11.40, KR-REQ-11.41.
 
 mod components;
 
