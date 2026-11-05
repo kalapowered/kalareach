@@ -1,13 +1,12 @@
 //! `kr host network`: a host joins the service it uses, or leaves it, as one validated edit of its
 //! configuration document.
 //!
-//! KR-REQ-26.16, KR-REQ-10.02, KR-REQ-17.12: edits are validated, the effective value and its
-//! source are shown, discovery and relays are selected separately, and a service names its own
-//! selection. The command is the real `kr` on a real host tree. The service is the stand-in held
-//! to the Worker's source, over loopback, signing with a key the test makes and giving the command
-//! its public half, as a person who runs a service does. Nothing here reaches a real service:
-//! every case names `--service`, and the managed origin the command starts from is read in the
-//! deployed run.
+//! Edits are validated, the effective value and its source are shown, discovery and relays are
+//! selected separately, and a service names its own selection. The command is the real `kr` on a
+//! real host tree. The service is the stand-in held to the Worker's source, over loopback, signing
+//! with a key the test makes and giving the command its public half, as a person who runs a service
+//! does. Nothing here reaches a real service: every case names `--service`, and the managed origin
+//! the command starts from is read in the deployed run.
 //!
 //! The first case is the whole of it. A host that joined starts its real control daemon over the
 //! document the command wrote, and the diagnostics report the endpoint built with the relay and
@@ -260,6 +259,11 @@ fn build() -> BuildId {
 /// wrote, and the diagnostics report each setting with the source `host_configuration` and the
 /// endpoint built with the relay and the discovery servers the service described; the same daemon
 /// over a document that never joined is on no network.
+///
+/// KR-REQ-10.02, the part about discovery and relays chosen separately: the daemon over the
+/// document the command wrote builds its endpoint with the relay and the discovery servers the
+/// service described, as selected in the document. Not shown here: a proxy, a blocked upgrade and
+/// altered trust paths.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_joined_runs_on_what_the_command_wrote() {
     let controller = beside_this_test("kr-controller").unwrap_or_else(|| {
@@ -742,6 +746,11 @@ async fn a_value_the_person_wrote_is_replaced_only_when_they_say_so() {
 /// with the setting named and the value withheld: it is not shown beside the person's own, and
 /// `--replace` is not suggested for an edit that would fail. What a service says is text from
 /// outside, and a terminal reads an escape sequence in it as a command.
+///
+/// KR-REQ-26.16, the part about validated edits: a value the service plants that the document would
+/// refuse is refused as the document refuses it, with the setting named and the value withheld,
+/// with or without `--replace`, and the document is left as it was. Not shown here: authority
+/// changes fencing dispatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_value_the_service_plants_is_refused_as_the_document_refuses_it_and_never_shown() {
     let planted = format!("https://{PLANTED}.example.test\u{1b}[2K\u{7} not an origin");
@@ -1053,6 +1062,11 @@ async fn a_document_that_cannot_be_edited_ends_the_command_before_any_request() 
 
 /// The request goes through the proxy the document names and never round it: a proxy that refuses
 /// connections ends the command, and the service itself is not reached.
+///
+/// KR-REQ-10.02, the part about the proxy: the command's request goes through the proxy the
+/// document names and never round it, and a proxy that refuses connections ends the command without
+/// the service being reached. Not shown here: a blocked upgrade and altered trust paths, and
+/// discovery and relays chosen separately.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_request_goes_through_the_proxy_the_document_names_and_never_round_it() {
     let service = Counting::start();

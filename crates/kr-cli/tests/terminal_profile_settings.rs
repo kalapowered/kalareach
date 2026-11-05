@@ -1,4 +1,4 @@
-//! The terminal profile of GNOME Terminal and Ptyxis, KR-REQ-01.21 and KR-REQ-07.42: keys in the
+//! The terminal profile of GNOME Terminal and Ptyxis: keys in the
 //! settings database, and a place in a list that the application's own preferences window shares.
 //!
 //! These run the real `gsettings` against the schemas installed on the machine, with a keyfile of
@@ -296,6 +296,10 @@ fn for_each_application(case: impl Fn(&Person)) {
 /// KR-REQ-01.21: an install writes the profile's keys and one place in the list, leaves the
 /// person's own profiles and the default as they were, and records what it wrote; a removal takes
 /// it out and leaves the settings as they were.
+///
+/// KR-REQ-07.42, the part about the optional profile: an install adds one profile and one place in
+/// the application's own list, leaves the person's own profiles and the default as they were, and a
+/// removal takes it out. Not shown here: a window of the profile starting a session.
 #[test]
 fn an_install_adds_a_profile_and_a_place_in_the_list_and_a_removal_takes_them_out() {
     for_each_application(|person| {

@@ -1,4 +1,4 @@
-//! The optional terminal profile, KR-REQ-01.21 and KR-REQ-07.42: one profile named `KalaReach`
+//! The optional terminal profile: one profile named `KalaReach`
 //! in one terminal application's own profile mechanism, whose command is `kr new --attach
 //! --hold-on-failure`, written without touching the person's other profiles or their shell startup
 //! files, and taken out again by the record alone.
@@ -1217,6 +1217,11 @@ mod command {
     /// KR-REQ-01.21, KR-REQ-26.04: the command installs the profile and writes nothing else of its
     /// own: no shell startup file, no record of startup entries, no service definition. Status
     /// reads it, a dry run writes nothing, and the removal puts the home back.
+    ///
+    /// KR-REQ-07.42, the part about no shell-wide replacement: the command installs the profile and
+    /// writes nothing else of its own, no shell startup file, no record of startup entries and no
+    /// service definition, and the removal puts the home back. Not shown here: a window of the
+    /// profile starting a session.
     #[test]
     fn the_command_installs_reads_and_removes_the_profile_alone() {
         let Some(application) = application() else {
