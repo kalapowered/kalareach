@@ -2,11 +2,10 @@
 //!
 //! A session shared with a device is a grant written beside an invitation, and the grant
 //! authorises nothing until the device the invitation names redeems it. What these demonstrate,
-//! for the paired-device ingress: KR-REQ-25.10 (single-use, expiring invitations), KR-REQ-18.03
-//! (scoped invitations) and KR-REQ-25.28 (a guest pairing shares nothing until a session is shared
-//! with the device). The session itself, the worker that serves it and what a redeemed share
-//! lets a device read are the end-to-end suite's (`network.rs`); nothing here starts a worker, so
-//! every answer below is the daemon's own.
+//! for the paired-device ingress: single-use, expiring invitations, scoped invitations, and a guest
+//! pairing that shares nothing until a session is shared with the device. The session itself, the
+//! worker that serves it and what a redeemed share lets a device read are the end-to-end suite's
+//! (`network.rs`); nothing here starts a worker, so every answer below is the daemon's own.
 
 mod net_support;
 
