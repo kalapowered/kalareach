@@ -1983,21 +1983,12 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         package: "kr-cli",
         target: "--test startup_windows",
         cases: &[
-            "a_cleanup_that_cannot_withdraw_a_request_fails_the_test_that_left_it",
             "the_daemon_the_task_starts_is_in_none_of_the_callers_jobs",
             "three_first_invocations_at_once_leave_one_daemon_that_serves_every_caller",
         ],
         runs: Runs::Command {
             file: ".github/workflows/core-ci.yml",
             line: "run: cargo test --locked -p kr-cli --test startup_windows -- --ignored --skip a_task_the_task_scheduler_does_not_start",
-        },
-    },
-    IgnoredRun {
-        package: "kr-cli",
-        target: "--test startup_windows",
-        cases: &["a_kr_new_in_the_job_its_parent_built"],
-        runs: Runs::Helper {
-            file: "crates/kr-cli/tests/startup_windows.rs",
         },
     },
     IgnoredRun {
@@ -2140,14 +2131,6 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         ],
         runs: Runs::ByHand {
             why: "it needs a user service manager for the account (`systemctl --user`), which a hosted runner's account does not have; it runs with `--include-ignored` on a Linux host whose account has one",
-        },
-    },
-    IgnoredRun {
-        package: "kr-worker",
-        target: "--test windows_endpoint",
-        cases: &["a_bridge_helper", "agent_runs_a_helper"],
-        runs: Runs::Helper {
-            file: "crates/kr-worker/tests/windows_endpoint.rs",
         },
     },
     IgnoredRun {

@@ -10,14 +10,14 @@
 //! its own. Every task a test registers, or has `kr` register, is removed when the test ends, and
 //! only while it is still that environment's own.
 //!
-//! What these establish. KR-REQ-07.12: `kr host startup --set standalone` registers the task to log
-//! on where the user is signed in, repairs the environment's own task when an earlier installation
-//! left it stale, refuses a task under the name that is not the environment's own with nothing
-//! changed, and writes the choice after the task; a choice that cannot be written leaves the task
-//! and the choice exactly as they were. `--clear` removes only the environment's own task and
-//! reports one it left. `kr host startup` reports whose the task is, whether it is the one this
-//! installation registers, and whether a start can use it, apart. KR-REQ-07.13: nothing is
-//! registered but by that explicit step.
+//! What these establish. `kr host startup --set standalone` registers the task to log on where the
+//! user is signed in, repairs the environment's own task when an earlier installation left it
+//! stale, refuses a task under the name that is not the environment's own with nothing changed,
+//! and writes the choice after the task; a choice that cannot be written leaves the task and the
+//! choice exactly as they were. `--clear` removes only the environment's own task and reports one
+//! it left. `kr host startup` reports whose the task is, whether it is the one this installation
+//! registers, and whether a start can use it, apart. Nothing is registered but by that explicit
+//! step.
 
 #![cfg(windows)]
 

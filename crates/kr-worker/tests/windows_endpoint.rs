@@ -4,13 +4,17 @@
 //! access list, and the credential it presents is published as a file the host proves is closed to
 //! other accounts. Everything here runs a real pipe, real files with real access-control lists and
 //! real processes started the way a launch starts them, so it exists only on that platform. What it
-//! covers, row by row:
+//! covers:
 //!
-//! | Row | What is checked here |
-//! | --- | --- |
-//! | KR-REQ-11.32, KR-REQ-12.14 | The endpoint a launch binds is a named pipe in the local namespace; the kernel names the process that connects to it; the owner arriving over the network is refused |
-//! | KR-REQ-11.43, KR-REQ-05.09 | A bridge the launched application started, presenting the launch's registration and credential, is admitted and named by the kernel; a wrong credential, an environment session identifier alone, a presented identity the kernel did not name, a browser's headers, a process outside every job and a process in another launch's job are each refused |
-//! | KR-REQ-11.23, KR-REQ-12.14 | The registration directory and the credential file are read back by their access-control lists, from the opened object: an ordinary directory, a widened one and a link are refused, and so is a credential file another account was granted |
+//! - The endpoint a launch binds is a named pipe in the local namespace; the kernel names the
+//!   process that connects to it; the owner arriving over the network is refused.
+//! - A bridge the launched application started, presenting the launch's registration and
+//!   credential, is admitted and named by the kernel; a wrong credential, an environment session
+//!   identifier alone, a presented identity the kernel did not name, a browser's headers, a process
+//!   outside every job and a process in another launch's job are each refused.
+//! - The registration directory and the credential file are read back by their access-control
+//!   lists, from the opened object: an ordinary directory, a widened one and a link are refused,
+//!   and so is a credential file another account was granted.
 //!
 //! The pipe's own refusal of another account and of a restricted token is the pipe's list, which
 //! `kr-ipc`'s own suite runs against the listener this endpoint binds.
