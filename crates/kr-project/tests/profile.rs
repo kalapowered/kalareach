@@ -31,15 +31,18 @@ use support::{
 /// KR-REQ-19.05: a repository's own configuration is untrusted data: every helper it plants is
 /// neutralised, and none runs while the host reads the repository's status or refreshes a review.
 ///
-/// KR-REQ-14.24, KR-REQ-14.23 and KR-ACC-030, the part about status and review refresh: with a
-/// filter, a textconv driver, an external diff and an fsmonitor planted and changes for them to run
-/// on, the status and the diff of the working tree leave no sentinel.
+/// KR-REQ-14.24, KR-REQ-14.23 and KR-ACC-030, the part about status and review refresh: with the
+/// fixture's helpers planted and a changed file for a filter to read, the status and the review
+/// refresh leave no sentinel. Of the planted helpers these two commands can call the clean and
+/// process filters and the fsmonitor hook. Not shown here: an external diff program, a text
+/// conversion or a pager. The refresh is a names-only diff asked not to run the first two, and the
+/// child has no terminal to page to, so neither command calls any of the three.
 #[test]
 fn no_planted_helper_runs_during_a_status_or_a_review_refresh() {
     let fixture = Fixture::create();
     let planted = planted_repository(fixture.work(), "planted", false);
-    // Something for a filter and a textconv to be invoked on: a tracked file with an uncommitted
-    // change, an untracked file and an ignored one.
+    // Something for a filter to be invoked on: a tracked file with an uncommitted change, an
+    // untracked file and an ignored one.
     write(&planted.path, "README.md", "changed after the commit\n");
     write(&planted.path, "new.txt", "untracked\n");
     write(&planted.path, ".gitignore", "generated/\n");
@@ -75,8 +78,10 @@ fn no_planted_helper_runs_during_a_status_or_a_review_refresh() {
         "the status found the changes this test made"
     );
 
-    // The review refresh: a diff of the working tree against HEAD. An external diff program and a
-    // textconv driver would both run here.
+    // The review refresh: a diff of the working tree against HEAD for names only, asked with
+    // `--no-ext-diff` and `--no-textconv`. It reads the changed file through its clean filter and
+    // asks the fsmonitor hook; it calls no external diff program and no text conversion, planted or
+    // not.
     let arguments: [&OsStr; 5] = [
         OsStr::new("diff"),
         OsStr::new("--no-ext-diff"),
