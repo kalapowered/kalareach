@@ -1111,12 +1111,14 @@ impl SessionRuntime {
                     // that has run out, so it is not written. What was delivered is what the
                     // application has, and a takeover reports the remainder as discarded.
                     let remainder = bytes.len().saturating_sub(delivered);
+                    // Counted before the bytes stop being owed: a reader of the two counts that
+                    // sees nothing owed has to see the drop that settled it.
+                    if lane_deadline.is_some() && delivered == 0 {
+                        writer_dropped_replies.fetch_add(1, Ordering::AcqRel);
+                    }
                     release(&writer_queued, remainder);
                     if is_reply {
                         release(&writer_unwritten_replies, remainder);
-                    }
-                    if lane_deadline.is_some() && delivered == 0 {
-                        writer_dropped_replies.fetch_add(1, Ordering::AcqRel);
                     }
                     // The lease's own share comes back only while the lease is still the one that
                     // queued these bytes: a lease change has already taken its count, and the
