@@ -34,11 +34,11 @@ use support::{
 /// KR-REQ-14.24, KR-REQ-14.23 and KR-ACC-030, the part about status and review refresh: with the
 /// fixture's helpers planted and a changed file for a filter to read, the status and the review
 /// refresh leave no sentinel. Of the planted helpers, installed Git would call the fsmonitor hook
-/// and the driver's process filter in these two commands, and the post-index-change hook in a
-/// status that writes the index. Not shown here: an external diff program, a text conversion, a
-/// pager, or the driver's clean and smudge filters, which its process filter takes the place of.
-/// The refresh is a names-only diff asked not to run the first two, and the child has no terminal
-/// to page to.
+/// and the driver's process filter in these two commands (in the status, for the entries as new as
+/// the index), and the post-index-change hook in a status that writes the index. Not shown here:
+/// an external diff program, a text conversion, a pager, or the driver's clean and smudge filters,
+/// which its process filter takes the place of. The refresh is a names-only diff asked not to run
+/// the first two, and the child has no terminal to page to.
 #[test]
 fn no_planted_helper_runs_during_a_status_or_a_review_refresh() {
     let fixture = Fixture::create();
@@ -57,8 +57,10 @@ fn no_planted_helper_runs_during_a_status_or_a_review_refresh() {
     )
     .expect("a planted repository still opens: its helpers are neutralised, not fatal");
 
-    // The status a reviewer's inclusion preview is taken from. An fsmonitor hook would run here,
-    // and a process filter, which Git prefers to the driver's clean and smudge filters.
+    // The status a reviewer's inclusion preview is taken from. An fsmonitor hook would run here;
+    // so would a process filter, which Git prefers to the driver's clean and smudge filters, on the
+    // entries as new as the index, and the post-index-change hook, because installed Git writes
+    // the index here.
     let surveyed = survey(
         fixture.service().profile(),
         &repository,
