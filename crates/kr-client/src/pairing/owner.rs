@@ -1157,7 +1157,8 @@ pub enum ReviewOutcome {
     /// This device has no ceremony, so it signs nothing.
     NoCeremony,
     /// The answer was sent, and the host has not said whether it took it: it did not reply in
-    /// time, or the connection ended first. What the host lists next shows whether it did.
+    /// time, it said it could not tell or could not take it now, or the connection ended first.
+    /// What the host lists next shows whether it did.
     Unknown,
 }
 
