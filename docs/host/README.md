@@ -3517,11 +3517,17 @@ A fresh answer that is the worker's own refusal of the action, or a receipt that
 refused or rejected, stays a refusal, because the action did not happen. An answer kept from an
 earlier submission, which the daemon finds in a record or the worker gives from a receipt it held,
 is told as unknown whatever it was, so that a device that may not read it cannot tell a result from
-a refusal. A repeat that fails a check made before the daemon looks for the action's record, such
-as a connection scoped to another session, is refused as any request is. So is one for which that
-lookup finds nothing, because the daemon cannot reach the worker to ask for the receipt or the
-worker does not give it, and which then meets the window check: a window that belongs to another
-connection. The services behind the door check the registration again where they write, and a copy
+a refusal. A repeat is an action the daemon has already routed for the device, asked again with the
+same request. The daemon writes the route before it dispatches the action and keeps no word of
+whether a dispatch followed, so it cannot show that the earlier copy did not run. A refusal it makes
+of a repeat on its own account is therefore told as unknown too, wherever the check sits: a
+registration withdrawn, a grant gone or narrowed, a connection opened for the host or for another
+session or grant, a window that belongs to another connection, a session whose worker has ended, or
+a worker that refuses before it looks for the receipt. A repeated close is the one the daemon can
+still answer without its worker: the closure record answers it for a device that may read the
+session's receipts, as it answers a close made after the closure. A request the daemon never routed
+is refused as any request is, and so is a reused identifier that carries another request. The
+services behind the door check the registration again where they write, and a copy
 of an action that meets a fence owed there is refused in their words. A service that answers a
 copy of an action from its own record while it carries the action out, because the first copy
 finished meanwhile, hands the door an answer the door does not know to be kept, and it is told as
@@ -3624,9 +3630,9 @@ There is one further limit.
   journal of the session an action was performed on, and a create or a repository mutation belongs
   to no session. What such an action leaves is kept by the service, which is not a receipt in the
   shape that method answers with, so the request is refused and the refusal says how the outcome is
-  obtained: submit the action again under the same identifier. That is the recovery section 9 puts
-  first, and it works: the service answers the repeat from its own record without performing
-  anything twice. The plugin catalogue is the exception, because it keeps its actions' receipts in
+  obtained: submit the same request again, exactly as it was sent. That is the recovery section 9
+  puts first, and it works when the service holds a record: it answers the repeat from that record
+  without performing anything twice. The plugin catalogue is the exception, because it keeps its actions' receipts in
   that shape, and `action.read` answers them.
 
 The admission a project mutation carries is asked about three times, and the third is the one
