@@ -23,7 +23,8 @@ function bridge(): void {
   const refusal = {
     code: 'RESOURCE_UNAVAILABLE',
     message: 'no host on this machine',
-    user_action: 'retry'
+    user_action: 'retry',
+    retry: 'transient'
   }
   let nextListener = 0
   // Removing a listener goes through the event plugin's own internals before it reaches a command,
