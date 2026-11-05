@@ -3187,6 +3187,7 @@ async fn a_daemon_started_over_a_document_it_cannot_use_fetches_no_model_file() 
 /// no managed service: setup says no hosted account is needed, the owner asks, and the files arrive
 /// and are kept with a marker. The address is the fixture's, a server of this test's own; before
 /// and after, the host holds no account and names each managed integration as one it does without.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_26_42_the_local_model_downloads_at_setup_with_no_account_and_no_managed_service() {
     let fixture = Fixture::start().await;
@@ -3212,6 +3213,7 @@ async fn kr_req_26_42_the_local_model_downloads_at_setup_with_no_account_and_no_
     assert!(environment.marker(), "the files are marked held");
 
     environment.host.assert_it_needs_no_account().await;
+    environment.stop().await;
 }
 
 /// KR-REQ-22.01: nothing is fetched until the owner asks, and setup shows the exact size and the

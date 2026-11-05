@@ -1699,18 +1699,21 @@ async fn kr_req_26_42_a_device_pairs_with_a_host_that_has_no_account_and_no_mana
     let mut document = ConfigurationDocument::empty();
     document.revision = 1;
     let host = Host::start_with_document(&owner_keys, &document).await;
-    let before = host.account().await;
-    assert_eq!(
-        before.unavailable.as_ref(),
-        Some(&SignInUnavailable::NoManagedService),
-        "{before:?}"
-    );
-    host.assert_it_needs_no_account().await;
+    let names_no_service = async |host: &Host| {
+        let report = host.account().await;
+        assert_eq!(
+            report.unavailable.as_ref(),
+            Some(&SignInUnavailable::NoManagedService),
+            "{report:?}"
+        );
+        host.assert_it_needs_no_account().await;
+    };
+    names_no_service(&host).await;
 
     let paired = pairs_directly(&host, &owner_keys).await;
     assert_eq!(paired.host_endpoint_id, host.network().endpoint_id());
 
-    host.assert_it_needs_no_account().await;
+    names_no_service(&host).await;
 }
 
 /// A device running the product client enters a code the host's owner issued, shows the value the
