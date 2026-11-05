@@ -920,21 +920,23 @@ method, and that is exactly what it cannot do:
   cursor and stops answering. The broker is the only responder and answers the cursor question
   itself, and the response lane writes replies in the order of their queries, so the reply to a
   query asked after the cursor question never goes ahead of the cursor reply. The reply to an
-  earlier query can, and the host holds it: from the moment the worker registers a read of a
-  PowerShell root off Windows until a cursor report is queued for the terminal, the lane lets the
-  cursor report out first and every other reply waits behind it, in the order of the queries,
-  without being dropped (the terminal document, "The cursor report a root editor waits for", has
-  the rule and what it does to a reply's deadline). The hold ends at the first cursor report, at
-  the reader's idle report, when the editor leaves and when the session closes. Nothing is held on
-  Windows or for the other readers, which ask no cursor question. What the host does not reach: a reply already in the terminal's input when the editor
+  earlier query can, and the host holds it: from the moment the worker applies the registration of
+  a read of a PowerShell root off Windows until a cursor report is queued for the terminal, the lane
+  lets the cursor report out first and every other reply waits behind it, in the order of the
+  queries, without being dropped (the terminal document, "The cursor report a root editor waits
+  for", has the rule and what it does to a reply's deadline). The hold ends at the first cursor
+  report, at the reader's idle report, when the editor leaves, when the integration is lost and when
+  the session closes. Nothing is held on Windows, or for Zsh and Bash, which ask no cursor question,
+  or for Fish, which asks one in a write with two other questions and reads the three answers in
+  order. What the host does not reach: a reply already in the terminal's input when the editor
   asks, such as the answer to a query of a program that ended before it read it, which the host
-  cannot take back; a reply that has left the writer's queue; an answer the host writes between
-  the worker applying the read's registration and the editor asking, when the question is parsed
-  first (the registration and the question are handled by two tasks in no fixed order, and the
-  hold then covers the replies from the registration to the start key's idle report, with no
-  question left to wait for); and the reads that keep the entry's own idle report, listed below,
-  where the hold ends at the entry. Each of these still joins the reply. The module does not drop
-  them: it meets an answer only as keys, after the editor has read it from the terminal's input
+  cannot take back; a reply that has left the lane for the writer; an answer the host writes
+  between the module reporting the start of the read and the worker applying that report (the
+  report and the editor's question are handled by two tasks in no fixed order, and when the
+  question is parsed first its report goes out before the hold begins, which then lasts only until
+  the start key's idle report); and the reads that keep the entry's own idle report, listed below,
+  where the hold ends at the entry. An answer written in one of these ways ahead of the report still
+  joins it. The module does not drop them: it meets an answer only as keys, after the editor has read it from the terminal's input
   (the next item). What the module controls is when the reader first reports its queues clear. A
   fence proved before the editor has asked its question comes before the reply, and an answer the
   host writes behind that fence lands ahead of the reply and joins it: the runtime takes the
