@@ -1,4 +1,4 @@
-//! KR-REQ-26.05: installing onto a home that already holds a plugin stack.
+//! Installing onto a home that already holds a plugin stack.
 //!
 //! The installer adds one marked entry to each startup file the shell reads and nothing else, adds
 //! no shell-wide `exec kr` hook, and takes exactly what it added out again. This drives the real
