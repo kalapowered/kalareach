@@ -204,10 +204,10 @@ async fn a_device_lists_the_grants_it_issued_and_what_was_delegated_from_them() 
 /// message. A device whose grant does not reach the subject or carry the right is refused first,
 /// as it always was.
 ///
-/// KR-REQ-23.41, the part about the media methods a paired device is admitted to: `upload.status`,
-/// `download.begin` and `download.chunk` are each refused by name as `UNSUPPORTED_CAPABILITY` with
-/// the method in the message, and a device without `files.read` is refused a download. Not shown
-/// here: the draft methods, owner revision, environment handles and the file grants of an upload.
+/// KR-REQ-23.41, the part about file grants: a device without `files.read` is refused
+/// `download.begin` with a permission error. Not shown here: the draft methods, owner revision,
+/// environment handles and the upload methods' own rights; that the three media reads this host
+/// does not serve a device are refused by name is not a clause of the row.
 ///
 /// KR-REQ-23.34, the part about describe as a rights-bound read: a device whose grant sees another
 /// session is refused the description of this one with a permission error. Not shown here: the

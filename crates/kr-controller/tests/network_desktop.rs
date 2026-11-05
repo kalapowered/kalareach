@@ -4,11 +4,11 @@
 //! for a device to call, `automation.manage` covers workflow definitions, and the capability
 //! records reach a device unchanged, the display server they are about included. Which display
 //! server that is depends on the machine, so this shows the distinction travelling rather than any
-//! particular one being told apart. In part: a fresh host reports the setting off and holds
+//! particular one being told apart. A fresh host reports the host sleep setting off and holds
 //! nothing, a stored choice reaches a device with the reason nothing is held under it, and the only
 //! methods the registry admits a device to that write anything in the host-and-environment group
 //! are the three machine group steps and the presentation of the device's own organisation lease.
-//! And, in part, for `environment.capabilities`.
+//! `environment.capabilities` is among the methods exercised.
 //!
 //! Most of these start no worker, so no session has work outstanding and they observe no assertion
 //! held; they are reads the daemon answers itself. The last starts a daemon that has adopted a
