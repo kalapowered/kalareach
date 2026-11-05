@@ -1,6 +1,6 @@
 //! What `kr` does when a stream it writes to has no room left.
 //!
-//! KR-REQ-27.05, full disks: `/dev/full` answers every write with ENOSPC, the error a full
+//! Full disks: `/dev/full` answers every write with ENOSPC, the error a full
 //! filesystem gives, so a command whose standard output or standard error is that device meets the
 //! refusal at the write it makes. Each case runs the built `kr` as a process, once with room as the
 //! control and once with the stream on the device.
@@ -101,6 +101,11 @@ fn text(bytes: &[u8]) -> String {
 /// standard error and ends with the failure for the terminal, whichever of the program's three ways
 /// of writing a line the answer takes: `--version` is a word of the program's own, `shell remove
 /// --dry-run` is a set of composed lines and `--json` writes a document.
+///
+/// KR-REQ-27.05, the part about full disks: a command that has succeeded and cannot write its
+/// answer to a full standard output says so on standard error and ends with the failure for the
+/// terminal, for each of the program's three ways of writing a line. Not shown here: a full disk
+/// under the journal, the output spool or an export, and the other faults of the row.
 #[test]
 fn a_command_whose_standard_output_has_no_room_says_so_on_standard_error_and_fails() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -138,6 +143,11 @@ fn a_command_whose_standard_output_has_no_room_says_so_on_standard_error_and_fai
 
 /// A command that has failed and cannot write the document that says so to a full standard output
 /// says what it could not write on standard error and ends with its own failure.
+///
+/// KR-REQ-27.05, the part about full disks: a command that has failed and cannot write the document
+/// that says so to a full standard output says what it could not write on standard error and ends
+/// with its own failure. Not shown here: a full disk under the journal, the output spool or an
+/// export, and the other faults of the row.
 #[test]
 fn a_failure_document_that_a_full_standard_output_refuses_is_said_on_standard_error() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -166,6 +176,10 @@ fn a_failure_document_that_a_full_standard_output_refuses_is_said_on_standard_er
 
 /// A command that fails and cannot write its failure to a full standard error says so on standard
 /// output, where it still can, and ends with its own failure.
+///
+/// KR-REQ-27.05, the part about full disks: a command that fails and cannot write its failure to a
+/// full standard error says so on standard output and ends with its own failure. Not shown here: a
+/// full disk under the journal, the output spool or an export, and the other faults of the row.
 #[test]
 fn a_failure_that_a_full_standard_error_refuses_is_said_on_standard_output() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -196,6 +210,11 @@ fn a_failure_that_a_full_standard_error_refuses_is_said_on_standard_output() {
 /// says why on standard error, and with standard error full there is nowhere to say that, so the
 /// invoker reads exactly the frame it read with room and the command ends with the status it
 /// ended with then.
+///
+/// KR-REQ-27.05, the part about full disks: a bridge whose standard error has no room writes no
+/// text among the frames on its standard output, and the invoker reads the frame it read with room.
+/// Not shown here: a full disk under the journal, the output spool or an export, and the other
+/// faults of the row.
 #[test]
 fn a_bridge_whose_standard_error_has_no_room_writes_no_text_among_its_frames() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -238,6 +257,11 @@ fn a_bridge_whose_standard_error_has_no_room_writes_no_text_among_its_frames() {
 /// The same holds for a command line that is a mistake: the tool server and the bridge name the
 /// stream they own before the line is read, so a usage failure whose diagnostic standard error
 /// refuses leaves the stream with nothing on it, and the status is the usage failure's.
+///
+/// KR-REQ-27.05, the part about full disks: a usage mistake on a protocol line leaves the stream
+/// with nothing on it when standard error has no room, and the status is the usage failure's. Not
+/// shown here: a full disk under the journal, the output spool or an export, and the other faults
+/// of the row.
 #[test]
 fn a_usage_mistake_on_a_protocol_line_writes_no_text_when_standard_error_has_no_room() {
     let temp = kr_ipc::testing::TempHost::create();
