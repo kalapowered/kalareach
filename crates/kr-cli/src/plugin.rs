@@ -20,7 +20,7 @@
 //! device to ask, and says so.
 
 use base64::Engine as _;
-use kr_client::error::{is_definite, refusal};
+use kr_client::error::{HostWord, refusal};
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_ipc::paths::HostPaths;
@@ -291,8 +291,9 @@ const fn time_left(expires_at_ms: u64, now_ms: u64) -> tokio::time::Duration {
 }
 
 /// Repeats `ask` every `poll` until the host spends an owner device's answer, the challenge's
-/// `deadline` passes, the host refuses for another reason, or a request is not answered within
-/// `grace` past the deadline.
+/// `deadline` passes, the host refuses in its definite word or says it cannot tell what became of
+/// the request, or a request is not answered within `grace` past the deadline. A refusal for now
+/// is asked again.
 ///
 /// The deadline is a point on this process's own monotonic clock, fixed when the challenge
 /// arrived, so nothing that happens to the wall clock afterwards moves it. A request is made
@@ -348,8 +349,12 @@ async fn wait_for_an_owner_device<T>(
             }
             // A refusal for now says the host cannot take the request at this moment, and not that
             // it never will: it is asked again at the next poll, until the challenge ends, and the
-            // last refusal is the command's end then.
-            Ok(Err(CliError::Refused(refused))) if !is_definite(refused.code) => {
+            // last refusal is the command's end then. An answer that the host cannot say what
+            // became of the request is not that: the request may have been performed, and it is
+            // not made again.
+            Ok(Err(CliError::Refused(refused)))
+                if HostWord::of(refused.code) == HostWord::Transient =>
+            {
                 let now = tokio::time::Instant::now();
                 if now >= deadline {
                     return Err(CliError::Refused(refused));
@@ -384,7 +389,8 @@ async fn wait_for_an_owner_device<T>(
 ///
 /// Nothing here signs anything: an owner device answers with its own key, on its own screen, and
 /// the host spends that answer once. What the request does is the host's own, so a request that
-/// the host refuses for another reason ends the wait with that refusal.
+/// the host refuses in its definite word, or answers that it cannot tell what became of it, ends the
+/// wait with that answer.
 pub(crate) async fn confirmed_on_an_owner_device<P, T>(
     daemon: &mut Daemon,
     subject: ConfirmationSubject,
@@ -1017,10 +1023,11 @@ mod tests {
 
     /// KR-REQ-07.47: a host that cannot take the request now has not refused it. The request is
     /// asked again at the next poll and lands when the host can take it; at the challenge's end the
-    /// last refusal is the command's, and no request is made after it. The control is a definite
-    /// refusal, which ends the wait at once.
+    /// last refusal is the command's, and no request is made after it. The controls are a definite
+    /// refusal and an answer that the host cannot tell what became of the request, each of which
+    /// ends the wait at once: the request may have been performed, and is not made again.
     #[tokio::test(start_paused = true)]
-    async fn a_refusal_for_now_is_asked_again_and_a_definite_one_ends_the_wait() {
+    async fn a_refusal_for_now_is_asked_again_and_a_definite_or_unknown_one_ends_the_wait() {
         let for_now = || {
             CliError::Refused(refusal(
                 ErrorCode::StorageUnavailable,
@@ -1083,6 +1090,29 @@ mod tests {
             matches!(definite, Err(CliError::Refused(refused)) if refused.code == ErrorCode::PermissionDenied)
         );
         assert_eq!(asks.count(), 1, "a definite refusal is not asked again");
+
+        let asks = Asks::default();
+        let unknown: Result<u32> = wait_for_an_owner_device(
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(60),
+            short(),
+            short(),
+            async || {
+                asks.note();
+                Err(CliError::Refused(refusal(
+                    ErrorCode::OutcomeUnknown,
+                    Shown::said("the host cannot tell whether it performed the request"),
+                )))
+            },
+        )
+        .await;
+        assert!(
+            matches!(unknown, Err(CliError::Refused(refused)) if refused.code == ErrorCode::OutcomeUnknown)
+        );
+        assert_eq!(
+            asks.count(),
+            1,
+            "a request that may have been performed is not made again"
+        );
     }
 
     /// KR-REQ-07.47: a host that is sent the request and does not answer it ends the wait at the
