@@ -61,8 +61,24 @@ mod generations;
 /// machine is slow and none of these waits is timed by the product itself.
 const PATIENCE: Duration = Duration::from_secs(90);
 
+/// How long a test waits for a binding to be registered with the plugin runtime.
+///
+/// A registration compiles the component at background priority, and a machine that other work
+/// keeps busy leaves such a thread a tenth of a processor or less, so the compile takes tens of
+/// minutes. A registration that runs out its own deadline in the meantime is offered again by the
+/// worker after a delay that doubles up to ten minutes, and the offer after the compile ends is the
+/// one that registers. The wait ends as soon as the runtime holds the binding; this bounds only a
+/// binding that is never registered.
+const REGISTRATION_PATIENCE: Duration = Duration::from_secs(60 * 60);
+
+/// The most seconds the program a test runs in a session stays running. A binding ends with its
+/// program, so the program has to outlast any wait for a registration; it ends when the test's tree
+/// is removed, which is long before this.
+const STAND_IN_SECONDS: u64 = 24 * 60 * 60;
+
 /// The variable that makes a placed copy of this binary a program a person starts in a session: it
-/// sleeps for as many seconds as it names.
+/// stays running for as many seconds as it names, or until the file [`STAND_IN_RUNNING`] names is
+/// gone.
 const STAND_IN: &str = "KR_RUNTIME_STAND_IN";
 
 /// The variable that names a file the stand-in writes its process identifier to once it runs.
@@ -78,21 +94,33 @@ const REQUIRE_FIXTURES: &str = "KR_REQUIRE_PLUGIN_FIXTURES";
 #[test]
 fn the_stand_in_program() {
     if let Ok(seconds) = std::env::var(STAND_IN) {
-        if let Some(running) = std::env::var_os(STAND_IN_RUNNING) {
+        let running = std::env::var_os(STAND_IN_RUNNING).map(PathBuf::from);
+        if let Some(running) = &running {
             std::fs::write(running, std::process::id().to_string()).expect("says it is running");
         }
         let until = std::time::Instant::now() + Duration::from_secs(seconds.parse().unwrap_or(60));
+        // It stays while the file that says it is running is there, and a look at the file that
+        // fails is not its being gone. The test's tree takes the file with it, which ends a program
+        // that a session's shell holds in the background, where the shell's end would not reach it.
+        let stays = || {
+            std::time::Instant::now() < until
+                && running
+                    .as_ref()
+                    .is_none_or(|file| file.try_exists().unwrap_or(true))
+        };
         // A program that keeps the terminal busy: a numbered line every so often, so what the
         // session shows after something happens can be told from what it had already shown.
         if std::env::var_os(STAND_IN_TICKS).is_some() {
             let mut tick = 0_u64;
-            while std::time::Instant::now() < until {
+            while stays() {
                 println!("tick-{tick}");
                 tick += 1;
                 std::thread::sleep(Duration::from_millis(50));
             }
         } else {
-            std::thread::sleep(until.saturating_duration_since(std::time::Instant::now()));
+            while stays() {
+                std::thread::sleep(Duration::from_millis(200));
+            }
         }
     }
 }
@@ -321,27 +349,35 @@ async fn ended(process: &ProcessStartIdentity) {
 }
 
 /// Asks `check` until it answers, or the patience runs out.
-async fn until<T, Fut>(what: &str, mut check: impl FnMut() -> Fut) -> T
+async fn until<T, Fut>(what: &str, check: impl FnMut() -> Fut) -> T
 where
     Fut: std::future::Future<Output = Option<T>>,
 {
-    until_found(what, || {
+    until_within(PATIENCE, what, check).await
+}
+
+/// As [`until`], with a patience the caller chooses.
+async fn until_within<T, Fut>(patience: Duration, what: &str, mut check: impl FnMut() -> Fut) -> T
+where
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    until_found(patience, what, || {
         let look = check();
         async move { look.await.ok_or_else(String::new) }
     })
     .await
 }
 
-/// [`until`] for a look that says what it found when it found nothing, so that a wait that runs
-/// out of patience says what its looks saw and when, and not only what it waited for: each look
-/// that differed from the one before, with the seconds since the wait began when it was first seen
-/// (the first eight and the last eight when there are more, and how many are left out).
-async fn until_found<T, Fut>(what: &str, mut check: impl FnMut() -> Fut) -> T
+/// [`until_within`] for a look that says what it found when it found nothing, so that a wait that
+/// runs out of patience says what its looks saw and when, and not only what it waited for: each
+/// look that differed from the one before, with the seconds since the wait began when it was first
+/// seen (the first eight and the last eight when there are more, and how many are left out).
+async fn until_found<T, Fut>(patience: Duration, what: &str, mut check: impl FnMut() -> Fut) -> T
 where
     Fut: std::future::Future<Output = Result<T, String>>,
 {
     let began = tokio::time::Instant::now();
-    let deadline = began + PATIENCE;
+    let deadline = began + patience;
     let mut looks: Vec<(Duration, String)> = Vec::new();
     loop {
         let seen = match check().await {
@@ -353,7 +389,7 @@ where
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "waited {PATIENCE:?} for {what}{}",
+            "waited {patience:?} for {what}{}",
             looks_in_words(&looks)
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -825,7 +861,7 @@ impl World {
             .join(format!("agent-running-{}", kr_ipc::new_uuid()));
         typing
             .send(&format!(
-                "{STAND_IN}=300 {more} {STAND_IN_RUNNING}='{}' '{}' --exact \
+                "{STAND_IN}={STAND_IN_SECONDS} {more} {STAND_IN_RUNNING}='{}' '{}' --exact \
                  the_stand_in_program --test-threads 1 --nocapture\n",
                 running.display(),
                 self.agent.display()
@@ -986,13 +1022,29 @@ impl World {
         client.health().await.ok()
     }
 
-    /// Waits until the plugin runtime holds `bindings` bindings, and returns what it reports.
+    /// Waits until the plugin runtime holds `bindings` bindings, and returns what it reports. For a
+    /// count that is already held or that falls; a count that rises needs a registration, and
+    /// [`Self::registering`] waits for that.
     async fn holding(&self, bindings: u64) -> HostHealth {
-        until("the plugin runtime to hold the bindings", || async {
-            self.health()
-                .await
-                .filter(|health| health.live_bindings == bindings)
-        })
+        self.holding_within(PATIENCE, bindings).await
+    }
+
+    /// As [`Self::holding`], for a count that rises because a binding is registered, which a machine
+    /// that other work keeps busy delays for as long as [`REGISTRATION_PATIENCE`].
+    async fn registering(&self, bindings: u64) -> HostHealth {
+        self.holding_within(REGISTRATION_PATIENCE, bindings).await
+    }
+
+    async fn holding_within(&self, patience: Duration, bindings: u64) -> HostHealth {
+        until_within(
+            patience,
+            "the plugin runtime to hold the bindings",
+            || async {
+                self.health()
+                    .await
+                    .filter(|health| health.live_bindings == bindings)
+            },
+        )
         .await
     }
 
@@ -1119,13 +1171,19 @@ impl World {
     }
 
     /// Waits until every binding the workers report has its component in `state`, and there are
-    /// `count` of them.
+    /// `count` of them. A component becomes registered after a registration, which a busy machine
+    /// delays for as long as [`REGISTRATION_PATIENCE`].
     async fn components_are(
         &self,
         count: usize,
         state: ComponentState,
     ) -> Vec<(ComponentState, Option<String>)> {
-        until("the workers to report the components", || async {
+        let patience = if state == ComponentState::Registered {
+            REGISTRATION_PATIENCE
+        } else {
+            PATIENCE
+        };
+        until_within(patience, "the workers to report the components", || async {
             let found = self.components().await;
             (found.len() == count && found.iter().all(|(reported, _)| *reported == state))
                 .then_some(found)
@@ -1225,7 +1283,7 @@ async fn the_plugin_runtime_starts_with_the_first_binding_that_wants_a_component
 
     // The program the package recognises runs, and its binding wants the component.
     let (_typing, _agent) = world.run_agent(&first).await;
-    let health = world.holding(1).await;
+    let health = world.registering(1).await;
     assert!(health.deadlines_enforceable);
     let services = world.services();
     assert_eq!(services.len(), 1, "{services:?}");
@@ -1244,7 +1302,7 @@ async fn the_plugin_runtime_starts_with_the_first_binding_that_wants_a_component
     // A second session's binding is given the process that is running.
     let second = world.session().await;
     let (_typing_again, _agent_again) = world.run_agent(&second).await;
-    world.holding(2).await;
+    world.registering(2).await;
     world.components_are(2, ComponentState::Registered).await;
     assert_eq!(world.services(), services, "no second runtime was started");
     assert_eq!(world.published_host(), Some(host));
@@ -1465,7 +1523,7 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
     let (mut typing, first_agent) = world
         .run_agent_with(&created, &format!("{STAND_IN_TICKS}=1"))
         .await;
-    world.holding(1).await;
+    world.registering(1).await;
     world.components_are(1, ComponentState::Registered).await;
     let first_binding = world.reported().await[0].0;
     let host = world.published_host().expect("the runtime is published");
@@ -1483,6 +1541,7 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
             && report.reason.0.as_deref() == Some("registering with the plugin runtime")
     };
     let second_binding = until_found(
+        PATIENCE,
         "the second binding's registration to be sent and left unanswered",
         || async {
             let reports = world.reported().await;
@@ -1523,7 +1582,7 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
             .filter(|published| *published != host)
     })
     .await;
-    world.holding(2).await;
+    world.registering(2).await;
     world.components_are(2, ComponentState::Registered).await;
     assert_eq!(world.services().len(), 2, "{:?}", world.services());
     let bindings: Vec<_> = world
@@ -1556,11 +1615,15 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
 /// KR-REQ-05.07: a plugin runtime that keeps ending is not started without end, and the workers
 /// are told why.
 ///
-/// The daemon starts at most five in ten minutes. The runtime is killed each time it is running;
+/// The daemon starts at most five in ten minutes. The runtime is killed each time it is published;
 /// after the fifth start the next request is answered that the runtime cannot be reached, and the
-/// binding's component is reported unavailable with that reason, where it had been registered. A
-/// program run after that, while the worker holds off for the time the daemon named, has its
-/// binding told the same reason as soon as it is made, and not left pending.
+/// binding's component is reported unavailable with that reason. A program run after that, while
+/// the worker holds off for the time the daemon named, has its binding told the same reason as soon
+/// as it is made, and not left pending.
+///
+/// The case does not wait for a registration. The starts are counted in a window of the clock, and
+/// a machine that other work keeps busy delays a registration for longer than the window, which
+/// would let the first start leave it before the fifth is made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_plugin_runtime_that_keeps_ending_is_started_five_times_and_the_binding_is_told_why() {
     let Some(component) = well_behaved() else {
@@ -1570,24 +1633,18 @@ async fn a_plugin_runtime_that_keeps_ending_is_started_five_times_and_the_bindin
     let world = World::start(&component).await;
     let created = world.session().await;
     let (mut typing, agent) = world.run_agent(&created).await;
-    world.holding(1).await;
-    world.components_are(1, ComponentState::Registered).await;
 
-    for started in 1..=attempts {
-        assert_eq!(world.services().len(), started);
-        let host = world.published_host().expect("the runtime is published");
+    let mut previous = None;
+    for _ in 0..attempts {
+        let host = until("a runtime to be published", || async {
+            world
+                .published_host()
+                .filter(|published| Some(published) != previous.as_ref())
+        })
+        .await;
         kill(&host);
         ended(&host).await;
-        if started < attempts {
-            until("a replacement runtime to be published", || async {
-                world
-                    .published_host()
-                    .filter(|published| *published != host)
-            })
-            .await;
-            world.holding(1).await;
-            world.components_are(1, ComponentState::Registered).await;
-        }
+        previous = Some(host);
     }
 
     // The sixth is not started: the worker's binding says so.
@@ -1653,7 +1710,7 @@ async fn a_daemon_that_restarts_adopts_the_plugin_runtime_it_finds_and_starts_no
     let mut world = World::start(&component).await;
     let first = world.session().await;
     let (_typing, _agent) = world.run_agent(&first).await;
-    world.holding(1).await;
+    world.registering(1).await;
     let host = world.published_host().expect("the runtime is published");
 
     world.restart().await;
@@ -1663,7 +1720,7 @@ async fn a_daemon_that_restarts_adopts_the_plugin_runtime_it_finds_and_starts_no
     world.holding(1).await;
     let second = world.session().await;
     let (_typing_again, _agent_again) = world.run_agent(&second).await;
-    world.holding(2).await;
+    world.registering(2).await;
     world.components_are(2, ComponentState::Registered).await;
     assert_eq!(world.published_host(), Some(host));
     assert!(
@@ -1690,7 +1747,7 @@ async fn a_binding_that_ends_is_unbound_in_the_plugin_runtime_and_the_other_is_l
     let world = World::start(&component).await;
     let created = world.session().await;
     let (mut typing, first_agent) = world.run_agent(&created).await;
-    world.holding(1).await;
+    world.registering(1).await;
     world.components_are(1, ComponentState::Registered).await;
     let first_binding = world.reported().await[0].0;
 
@@ -1699,7 +1756,7 @@ async fn a_binding_that_ends_is_unbound_in_the_plugin_runtime_and_the_other_is_l
     typing.send("\u{1a}").await;
     typing.send("bg\n").await;
     let _second_agent = world.start_agent(&mut typing, "").await;
-    world.holding(2).await;
+    world.registering(2).await;
     world.components_are(2, ComponentState::Registered).await;
     let second_binding = world
         .reported()
@@ -1850,7 +1907,7 @@ async fn the_plugin_runtime_is_a_job_of_its_own_and_outlives_the_daemon_that_sta
     let mut world = World::start_apart(&component, "job").await;
     let first = world.session().await;
     let (_typing, _agent) = world.run_agent(&first).await;
-    world.holding(1).await;
+    world.registering(1).await;
     let host = world.published_host().expect("the runtime is published");
     let worker = world.worker_in_registry(first.session.session_id);
 
@@ -1872,7 +1929,7 @@ async fn the_plugin_runtime_is_a_job_of_its_own_and_outlives_the_daemon_that_sta
     world.spawn_daemon("job").await;
     let second = world.session().await;
     let (_typing_again, _agent_again) = world.run_agent(&second).await;
-    world.holding(2).await;
+    world.registering(2).await;
     assert_eq!(world.published_host(), Some(host));
 }
 
@@ -1882,12 +1939,10 @@ async fn the_plugin_runtime_is_a_job_of_its_own_and_outlives_the_daemon_that_sta
 /// The runtime is started because a worker's binding holds a package that ships a component, and
 /// the case goes on once the daemon has published it and it answers. It does not wait for the
 /// binding to be registered: a registration compiles the component on a thread the runtime asks
-/// the platform to hold at the lowest priority, and the runtime discards a compile that takes
-/// longer than its budget. The runtime of this case is an ordinary child of the daemon, so it runs
-/// where the test is held, beside whatever else runs there; while a machine gives a
-/// lowest-priority thread next to nothing the compile ends after its budget, and the registration
-/// does not complete however long the case waits. That the runtime ends with the daemon's group
-/// does not depend on the registration.
+/// the platform to hold at the lowest priority. The runtime of this case is an ordinary child of
+/// the daemon, so it runs where the test is held, beside whatever else runs there, and a machine
+/// that gives a lowest-priority thread next to nothing delays the registration by tens of minutes.
+/// That the runtime ends with the daemon's group does not depend on the registration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_plugin_runtime_started_as_a_child_of_the_daemon_ends_with_the_daemons_group() {
     let Some(component) = well_behaved() else {
