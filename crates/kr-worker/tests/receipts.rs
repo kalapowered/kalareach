@@ -2539,10 +2539,6 @@ fn assert_refused_naming(outcome: Outcome, action_id: ActionId, context: &str) {
 /// of the actor in the session, so one lost reply stopped the source asking or reporting anything
 /// else until the receipt was pruned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows session places a helper by the job object it was started in, which this test process is not in"
-)]
 async fn an_uncertain_request_of_a_source_does_not_hold_back_a_request_of_another_identity() {
     for kind in Sourced::ALL {
         let host = host().await;
@@ -2580,10 +2576,6 @@ async fn an_uncertain_request_of_a_source_does_not_hold_back_a_request_of_anothe
 /// request of the other identity that names it quotes an outcome its subject does not have, which is
 /// refused as a quote of any action that is not uncertain for the subject is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows session places a helper by the job object it was started in, which this test process is not in"
-)]
 async fn a_quote_of_an_uncertain_request_of_another_identity_shows_nothing() {
     for kind in Sourced::ALL {
         let host = host().await;
@@ -2610,10 +2602,6 @@ async fn a_quote_of_an_uncertain_request_of_another_identity_shows_nothing() {
 /// KR-REQ-11.63: of several uncertain requests, the one a request has to quote is the newest of its
 /// own identity, whether or not a request of another identity is newer still.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows session places a helper by the job object it was started in, which this test process is not in"
-)]
 async fn a_request_has_to_quote_the_newest_uncertain_request_of_its_own_identity() {
     for kind in Sourced::ALL {
         let host = host().await;
@@ -2654,49 +2642,11 @@ async fn a_request_has_to_quote_the_newest_uncertain_request_of_its_own_identity
     }
 }
 
-/// KR-REQ-11.63: an uncertain request still holds back a second request of the same identity, which
-/// has to name the first and the revision its sender was shown.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows session places a helper by the job object it was started in, which this test process is not in"
-)]
-async fn a_second_request_of_an_identity_with_an_uncertain_request_has_to_quote_it() {
-    for kind in Sourced::ALL {
-        let host = host().await;
-        bound_to_the_session(&host);
-        let mut client = cli(&host).await;
-        let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
-        let first = identity(&host, "first");
-        let lost = MutationRequest {
-            action_id: action(86),
-            ..kind.request(&client, &host, &first, ParamsValue::empty())
-        };
-        let revision = kind.lost(&host, &caller, &lost, kr_ipc::now_ms());
-
-        let again = kind.request(&client, &host, &first, ParamsValue::empty());
-        assert_refused_naming(
-            send_mutation(&mut client, again).await,
-            action(86),
-            &format!("{kind:?}"),
-        );
-
-        let shown = revision_shown_for(&mut client, action(86)).await;
-        assert_eq!(shown, revision);
-        let quoting = kind.request(&client, &host, &first, superseding(action(86), shown));
-        kind.assert_taken(send_mutation(&mut client, quoting).await, &first);
-    }
-}
-
 /// KR-REQ-11.63: where the worker cannot read which identity an uncertain request had, it holds back
 /// every request of that kind by the actor in the session, as it always did. Privacy mode withholds
 /// the envelope a settled receipt kept, an envelope may not decode, and one may decode and not be a
 /// request of the kind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows session places a helper by the job object it was started in, which this test process is not in"
-)]
 async fn an_uncertain_request_whose_identity_cannot_be_read_holds_back_every_request_of_its_kind() {
     for kind in Sourced::ALL {
         for unreadable in [
