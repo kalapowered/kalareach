@@ -1,0 +1,60 @@
+{
+  "version": 4,
+  "level": 1,
+  "revision": 3,
+  "preferences": {
+    "sleep_inhibition": null,
+    "worker_profile": null,
+    "command_integrations": null,
+    "environment_additions": null
+  },
+  "profiles": {},
+  "default_profile": null,
+  "ceilings": {
+    "session_limit": 16,
+    "grant_rights": [
+      "session.view"
+    ],
+    "enrolment": {
+      "metadata_bytes": 1048576,
+      "metadata_entries": null,
+      "retained_generations": null,
+      "retained_metadata_bytes": null,
+      "cached_payload_bytes": null,
+      "package_bytes": null,
+      "object_count": null,
+      "expanded_pack_bytes": null,
+      "transfer_bytes": null,
+      "compilation_ms": null,
+      "full_offline_mirror": null
+    }
+  },
+  "secrets": [],
+  "network": {
+    "enabled": null,
+    "bind_address": null,
+    "relay_urls": null,
+    "pkarr_publisher_url": null,
+    "pkarr_resolver_url": null,
+    "dns_origin": null,
+    "relay_trust_anchors": null,
+    "relay_only": null,
+    "local_discovery": null,
+    "mainline_dht": null,
+    "proxy_url": null
+  },
+  "voice": {
+    "broker_origin": null
+  },
+  "storage": {
+    "origin": null
+  },
+  "startup": {
+    "controller": null
+  },
+  "descriptions": {
+    "enabled": null,
+    "on_battery": null
+  },
+  "agents": {}
+}

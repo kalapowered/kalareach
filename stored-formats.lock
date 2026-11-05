@@ -178,7 +178,8 @@
           "absent": 1
         },
         "version": 3,
-        "migrates_from": 1
+        "migrates_from": 1,
+        "reads_through": 4
       },
       "digest": "c342cb3cc4391e4029491a3f300190ea752edc941bf351d199d400da21c8865d",
       "kept": [
@@ -522,7 +523,8 @@
           "table": "schema_version"
         },
         "version": 15,
-        "migrates_from": 1
+        "migrates_from": 1,
+        "reads_through": 16
       },
       "digest": "f8de9f5850a777557cabce2cdf924857af45baeca98b6affcf1f23d78507cf9a",
       "kept": [

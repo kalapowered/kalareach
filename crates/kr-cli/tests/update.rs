@@ -3811,19 +3811,14 @@ impl Idle {
 
     /// The schema version the registry records, read as the file alone.
     fn version(&self) -> i64 {
-        kr_controller::registry::Registry::open_to_read(self.registry(), self.temp.environment_id())
-            .map(|_| kr_controller::registry::SCHEMA_VERSION)
-            .unwrap_or_else(|_| {
-                let uri = format!("file:{}?immutable=1", self.registry().display());
-                rusqlite::Connection::open_with_flags(
-                    uri,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-                )
-                .expect("reads")
-                .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-                .expect("a version")
-            })
+        let uri = format!("file:{}?immutable=1", self.registry().display());
+        rusqlite::Connection::open_with_flags(
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .expect("reads")
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .expect("a version")
     }
 
     /// Every file in the environment's directories whose name says a database's log or journal.
@@ -3912,9 +3907,13 @@ fn recorded_create(secret: &str) -> Vec<u8> {
 
 /// A host with a release installed and its daemon serving, and a newer release archived.
 async fn host_to_update() -> (Host, Assembled, Assembled, String) {
+    host_to_update_to(Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)).await
+}
+
+/// As [`host_to_update`], with `two` as the newer release.
+async fn host_to_update_to(two: Assembled) -> (Host, Assembled, Assembled, String) {
     let mut host = Host::bare();
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
-    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
     host.install(&one);
     let controller = host.store.stable(Program::Controller);
     host.start_daemon(&controller).await;
@@ -4311,7 +4310,7 @@ async fn a_registry_that_lost_a_table_is_not_carried_and_holds_the_update() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_registry_of_a_later_schema_holds_the_update_and_is_left() {
     let (host, one, _two, archive) = host_to_update().await;
-    let later = kr_controller::registry::SCHEMA_VERSION + 1;
+    let later = kr_controller::registry::READS_THROUGH_SCHEMA_VERSION + 1;
     let idle = Idle::new(&host.store).labelled(later);
 
     let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
@@ -4332,6 +4331,168 @@ async fn a_registry_of_a_later_schema_holds_the_update_and_is_left() {
         host.store.current().expect("reads"),
         Some(one.name().clone())
     );
+}
+
+/// The stores of a release that writes the registry and the configuration document one version
+/// past what this build writes, as the release after this one lists them.
+fn writing_the_next_versions() -> Vec<ReleaseStore> {
+    release_stores()
+        .into_iter()
+        .map(|store| match store.store.as_str() {
+            "registry" => ReleaseStore {
+                version: store.version + 1,
+                reads_through: None,
+                ..store
+            },
+            "configuration" => ReleaseStore {
+                version: store.version + 1,
+                reads_through: None,
+                ..store
+            },
+            _ => store,
+        })
+        .collect()
+}
+
+/// The stores of a release that reads the registry and the configuration document no further than
+/// it writes them: the release before this one lists them so.
+fn not_reading_through() -> Vec<ReleaseStore> {
+    release_stores()
+        .into_iter()
+        .map(|store| ReleaseStore {
+            reads_through: None,
+            ..store
+        })
+        .collect()
+}
+
+/// The configuration document at the version after the one this build writes, as the release after
+/// this one writes it with no new ceiling set: the golden file the document's own cases read.
+fn the_document_one_version_ahead() -> String {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/configuration/version-4.json");
+    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
+impl Idle {
+    /// The environment as a release one version ahead of this build leaves it: the registry
+    /// labelled with the schema after this build's, and the configuration document at the version
+    /// after this build's. Returns where the document is.
+    fn as_the_next_release_left_it(self) -> (Self, PathBuf) {
+        let document = kr_cli::doctor::configuration::document_path(&self.temp.environment());
+        kr_ipc::paths::write_owner_only_file(
+            &document,
+            the_document_one_version_ahead().as_bytes(),
+        )
+        .expect("writes the document");
+        (
+            self.labelled(kr_controller::registry::SCHEMA_VERSION + 1),
+            document,
+        )
+    }
+}
+
+/// KR-REQ-26.10, KR-REQ-26.13: an update to the release that writes the next versions goes ahead over
+/// an environment the release after this one left: its registry is at the schema after this build's
+/// and its configuration document at the version after this build's. Neither is carried or rewritten,
+/// and the registry is read as it is to class its workers, as the release before reads it on the
+/// way back.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_back_to_the_release_that_wrote_the_next_versions_reads_them_as_they_are() {
+    let two =
+        Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).reading(writing_the_next_versions());
+    let (host, _one, two, archive) = host_to_update_to(two).await;
+    let (idle, document) = Idle::new(&host.store).as_the_next_release_left_it();
+    let before = idle.records();
+
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["carried"], serde_json::json!([]), "{said}");
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+    assert_eq!(
+        idle.version(),
+        kr_controller::registry::SCHEMA_VERSION + 1,
+        "the registry stays at the version it was found at"
+    );
+    assert_eq!(idle.records(), before, "and what it records is as it was");
+    assert_eq!(
+        std::fs::read_to_string(&document).expect("the document"),
+        the_document_one_version_ahead(),
+        "the document is the owner's"
+    );
+}
+
+/// KR-REQ-26.10, KR-REQ-26.13: a rollback over an environment left by the release after this one is
+/// refused by a release that lists the registry and the document at the versions it writes, naming
+/// both and the versions they are at, and nothing is switched; a release that lists the next
+/// versions as read through goes ahead, and the environment is read as it is and left as it is.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_over_the_next_versions_is_refused_unless_the_release_reads_through() {
+    for reads_through in [false, true] {
+        let host = Host::bare();
+        let one = if reads_through {
+            Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1)
+        } else {
+            Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(not_reading_through())
+        };
+        let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+        host.install(&two);
+        host.put(&one);
+        let (idle, document) = Idle::new(&host.store).as_the_next_release_left_it();
+        let before = idle.records();
+
+        let (output, said) = host.roll_back_to(&one);
+        if reads_through {
+            assert!(
+                output.status.success(),
+                "a release that reads them through goes back: {said} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                host.store.current().expect("reads"),
+                Some(one.name().clone())
+            );
+        } else {
+            assert_eq!(output.status.code(), Some(1), "{said}");
+            let message = said["message"].as_str().unwrap_or_default();
+            let registry = kr_controller::registry::SCHEMA_VERSION + 1;
+            assert!(
+                message.contains(&idle.environment_id())
+                    && message.contains(&format!("schema version {registry}"))
+                    && message.contains(&document.display().to_string())
+                    && message.contains(&format!(
+                        "records version {}",
+                        kr_protocol::hostinfo::configuration::VERSION + 1
+                    )),
+                "the refusal names the registry and the document: {said}"
+            );
+            assert_eq!(
+                host.store.current().expect("reads"),
+                Some(two.name().clone()),
+                "nothing was switched"
+            );
+        }
+        assert_eq!(
+            idle.version(),
+            kr_controller::registry::SCHEMA_VERSION + 1,
+            "the registry stays at the version it was found at"
+        );
+        assert_eq!(idle.records(), before, "and what it records is as it was");
+        assert_eq!(
+            std::fs::read_to_string(&document).expect("the document"),
+            the_document_one_version_ahead(),
+            "the document is the owner's"
+        );
+    }
 }
 
 /// KR-REQ-26.08: an environment whose identity cannot be looked at because what holds it is gone,
@@ -8445,7 +8606,7 @@ async fn an_update_that_cannot_take_the_writers_lock_stops_nothing_for_good() {
 fn the_next_version() -> Vec<u8> {
     format!(
         r#"{{"version": {}}}"#,
-        kr_protocol::hostinfo::configuration::VERSION + 1
+        kr_protocol::hostinfo::configuration::READS_THROUGH + 1
     )
     .into_bytes()
 }
@@ -9660,6 +9821,21 @@ async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
         found.is_empty(),
         "stored-formats.lock does not match the code:\n{}",
         found.join("\n")
+    );
+}
+
+/// KR-REQ-26.10, KR-REQ-26.13: the release lists the registry at schema version 16 and the
+/// configuration document at version 4 as read through, and no other store. The release after this
+/// one writes them, so a rollback to this one is not refused for a store at those versions.
+#[test]
+fn the_release_reads_through_the_registry_and_the_configuration_document_and_no_other_store() {
+    let through: Vec<(String, u32)> = stored_formats::table::table()
+        .into_iter()
+        .filter_map(|store| Some((store.entry.store.clone(), store.entry.reads_through?)))
+        .collect();
+    assert_eq!(
+        through,
+        vec![("configuration".to_owned(), 4), ("registry".to_owned(), 16)]
     );
 }
 

@@ -55,6 +55,14 @@ fn entry(
     }
 }
 
+/// `entry`, for a release that reads the store `through` without writing it.
+fn reading_through(entry: ReleaseStore, through: u32) -> ReleaseStore {
+    ReleaseStore {
+        reads_through: Some(through),
+        ..entry
+    }
+}
+
 /// The types a store keeps that the table does not declare yet, each with the store that keeps it and a
 /// digest of what it is today. Each store declares its own at its next raise, and deletes its lines.
 #[must_use]
@@ -610,13 +618,18 @@ pub fn table() -> Vec<Store> {
         Store {
             levels: None,
             writers: Writers::Daemon,
-            entry: entry(
-                "registry",
-                StoreScope::Environment,
-                "registry.sqlite",
-                sqlite_table("schema_version"),
-                version(kr_controller::registry::SCHEMA_VERSION),
-                version(kr_controller::registry::OLDEST_SCHEMA_VERSION),
+            // This release reads the schema after its own as it finds it, which is the registry
+            // the release after this one leaves.
+            entry: reading_through(
+                entry(
+                    "registry",
+                    StoreScope::Environment,
+                    "registry.sqlite",
+                    sqlite_table("schema_version"),
+                    version(kr_controller::registry::SCHEMA_VERSION),
+                    version(kr_controller::registry::OLDEST_SCHEMA_VERSION),
+                ),
+                version(kr_controller::registry::READS_THROUGH_SCHEMA_VERSION),
             ),
             owned: Vec::new(),
             kept: vec![
@@ -1456,13 +1469,18 @@ pub fn table() -> Vec<Store> {
                 >(),
             }),
             writers: Writers::Barred(&kr_cli::doctor::configuration::WRITTEN),
-            entry: entry(
-                kr_cli::doctor::configuration::WRITTEN.store,
-                StoreScope::Configuration,
-                "config.json",
-                member("version", 1),
-                kr_cli::doctor::configuration::WRITTEN.version,
-                u32::try_from(hostinfo::configuration::OLDEST_VERSION).expect("a small number"),
+            // This release reads the version after its own, strictly, as a document of its own
+            // version: one that holds a ceiling it lacks is refused whole.
+            entry: reading_through(
+                entry(
+                    kr_cli::doctor::configuration::WRITTEN.store,
+                    StoreScope::Configuration,
+                    "config.json",
+                    member("version", 1),
+                    kr_cli::doctor::configuration::WRITTEN.version,
+                    u32::try_from(hostinfo::configuration::OLDEST_VERSION).expect("a small number"),
+                ),
+                u32::try_from(hostinfo::configuration::READS_THROUGH).expect("a small number"),
             ),
             owned: Vec::new(),
             kept: vec![protocol_at_base::<

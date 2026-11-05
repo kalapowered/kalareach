@@ -1193,7 +1193,7 @@ mod tests {
         }
         let from_the_future = format!(
             r#"{{"version": {}, "preferences": {{"sleep_inhibition": "battery_too"}}}}"#,
-            configuration::VERSION + 1
+            configuration::READS_THROUGH + 1
         );
         for damaged in [
             b"".as_slice(),

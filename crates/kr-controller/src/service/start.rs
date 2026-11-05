@@ -348,6 +348,21 @@ impl Controller {
         // key store, and the loser would overwrite the key every live worker recorded at spawn.
         let mut lock = SingletonLock::acquire(&setup.paths.singleton_lock(), setup.environment_id)?;
         let mut registry = Registry::open(setup.paths.registry_database(), setup.environment_id)?;
+        // The copy of the document this environment last accepted decides the restrictions in force
+        // from the first request, so it is read before anything is changed: a copy this build
+        // cannot read would lift the rights ceiling, the enrolment budgets and the disable policy
+        // the owner accepted, and the daemon does not start over it.
+        let durably_accepted = registry.accepted_configuration()?;
+        let accepted_document = crate::config::from_record(durably_accepted.document.as_deref())
+            .map_err(|state| ControllerError::RegistryUnavailable {
+                detail: format!(
+                    "the registry of environment {} holds the configuration document it accepted \
+                     in a form this build cannot read ({}), and a daemon that started without it \
+                     would lift the restrictions it records: use a release that reads it",
+                    setup.environment_id,
+                    state.as_str(),
+                ),
+            })?;
         // Before the generation moves and before anything is recovered, adopted or accepted: on
         // Windows an environment's work stays in one login session, so a daemon that is not in the
         // session its earlier work still runs in does not take that work over.
@@ -375,8 +390,6 @@ impl Controller {
         // durable record is the only thing that says which document this environment accepted:
         // anything else is an edit this host has not seen yet, and it goes through acceptance
         // below rather than being taken for a fact.
-        let durably_accepted = registry.accepted_configuration()?;
-        let accepted_document = crate::config::from_record(durably_accepted.document.as_deref());
         let unaccepted = accepted_document != startup_configuration.loaded().document;
         // The document whose effects are in force, which is the one the record holds and not the
         // one on disk. What an edit owes is the difference between the two, so a daemon that seeded

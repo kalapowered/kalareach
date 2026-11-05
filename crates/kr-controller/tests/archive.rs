@@ -2551,7 +2551,7 @@ fn a_registry_of_another_schema_version_is_not_read() {
         .expect("a second connection")
         .execute(
             "UPDATE schema_version SET version = ?1",
-            [kr_controller::registry::SCHEMA_VERSION + 1],
+            [kr_controller::registry::READS_THROUGH_SCHEMA_VERSION + 1],
         )
         .expect("the version moves");
     let session_id = session();

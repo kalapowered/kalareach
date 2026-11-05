@@ -3360,7 +3360,9 @@ async fn a_document_that_selects_an_authority_feed_is_accepted_with_its_section(
         })
         .expect("the accepted document");
     drop(connection);
-    let accepted = config::from_record(record.as_deref()).expect("accepted");
+    let accepted = config::from_record(record.as_deref())
+        .expect("this build reads the record")
+        .expect("accepted");
     assert_eq!(accepted.level, 2);
     assert_eq!(
         accepted.authority.origin(),
@@ -3428,7 +3430,9 @@ async fn a_document_that_selects_a_mailbox_service_is_accepted_with_its_section(
         })
         .expect("the accepted document");
     drop(connection);
-    let accepted = config::from_record(record.as_deref()).expect("accepted");
+    let accepted = config::from_record(record.as_deref())
+        .expect("this build reads the record")
+        .expect("accepted");
     assert_eq!(accepted.level, 3);
     assert_eq!(
         accepted.mailbox.origin(),
@@ -3498,7 +3502,9 @@ async fn a_document_that_selects_a_relay_lease_service_is_accepted_with_its_sect
         })
         .expect("the accepted document");
     drop(connection);
-    let accepted = config::from_record(record.as_deref()).expect("accepted");
+    let accepted = config::from_record(record.as_deref())
+        .expect("this build reads the record")
+        .expect("accepted");
     assert_eq!(accepted.level, 4);
     assert_eq!(accepted.relay.origin(), Some("http://127.0.0.1:9"));
     let file = std::fs::read(kr_worker::config::document_path(&environment)).expect("the file");
@@ -3578,7 +3584,9 @@ async fn a_document_that_names_a_test_suite_is_accepted_with_its_section() {
         })
         .expect("the accepted document");
     drop(connection);
-    let accepted = config::from_record(record.as_deref()).expect("accepted");
+    let accepted = config::from_record(record.as_deref())
+        .expect("this build reads the record")
+        .expect("accepted");
     assert_eq!(accepted.level, 5);
     assert_eq!(
         accepted
@@ -3658,7 +3666,9 @@ async fn a_host_says_the_shell_mode_it_creates_sessions_in_and_where_that_came_f
         })
         .expect("the accepted document");
     drop(connection);
-    let accepted = config::from_record(record.as_deref()).expect("accepted");
+    let accepted = config::from_record(record.as_deref())
+        .expect("this build reads the record")
+        .expect("accepted");
     assert_eq!(accepted.level, 6);
     assert_eq!(accepted.shell.mode(), Some(ShellMode::NativeCompat));
 }
@@ -3703,7 +3713,8 @@ async fn a_restart_over_a_document_at_a_higher_level_accepts_nothing_again() {
         .expect("the accepted document");
     drop(connection);
     let file = std::fs::read(&path).expect("the document");
-    let from_the_record = config::from_record(record.as_deref());
+    let from_the_record =
+        config::from_record(record.as_deref()).expect("this build reads the record");
     assert_eq!(
         from_the_record,
         kr_protocol::hostinfo::configuration::load(Some(&file)).document,

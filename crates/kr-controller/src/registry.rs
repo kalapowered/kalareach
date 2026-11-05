@@ -68,6 +68,15 @@ use crate::error::{ControllerError, Result};
 /// for.
 pub const SCHEMA_VERSION: i64 = 15;
 
+/// The newest schema version above [`SCHEMA_VERSION`] that this build reads without writing it.
+///
+/// A registry at that version has the tables of [`SCHEMA_VERSION`] and records the configuration
+/// document it accepted at the next version of the document. This build opens it as it finds it:
+/// it brings nothing forward, writes no version and changes no row, and the reader of an update
+/// reads it. A copy of the accepted document that this build cannot read stops the daemon's start
+/// ([`crate::config::from_record`]).
+pub const READS_THROUGH_SCHEMA_VERSION: i64 = 16;
+
 /// The oldest schema version this build brings forward. A writer that stops handling an older
 /// shape raises this past the last version that wrote it.
 pub const OLDEST_SCHEMA_VERSION: i64 = 1;
@@ -798,7 +807,11 @@ impl Registry {
         }
         let connection = open_immutable(path)?;
         let versions = recorded_versions(&connection)?;
-        if versions != [SCHEMA_VERSION] {
+        let readable = matches!(
+            versions[..],
+            [version] if (SCHEMA_VERSION..=READS_THROUGH_SCHEMA_VERSION).contains(&version)
+        );
+        if !readable {
             let recorded = match versions.as_slice() {
                 [] => "no schema version".to_owned(),
                 [version] => format!("schema version {version}"),
@@ -807,7 +820,7 @@ impl Registry {
             return Err(ControllerError::RegistryUnavailable {
                 detail: format!(
                     "this registry records {recorded}, and this build reads one as it is only at \
-                     schema version {SCHEMA_VERSION}"
+                     schema version {SCHEMA_VERSION} or {READS_THROUGH_SCHEMA_VERSION}"
                 ),
             });
         }
@@ -952,7 +965,8 @@ impl Registry {
                     )
                     .map_err(ControllerError::registry)?;
             }
-            Some(version) if version == SCHEMA_VERSION => {}
+            Some(version) if (SCHEMA_VERSION..=READS_THROUGH_SCHEMA_VERSION).contains(&version) => {
+            }
             Some(1) => {
                 self.migrate_1_to_2()?;
                 self.migrate_2_to_3()?;
@@ -1087,7 +1101,8 @@ impl Registry {
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
-                        "this registry is at schema version {version}; this build reads {SCHEMA_VERSION}"
+                        "this registry is at schema version {version}; this build reads versions \
+                         {OLDEST_SCHEMA_VERSION} to {READS_THROUGH_SCHEMA_VERSION}"
                     ),
                 });
             }
@@ -4665,7 +4680,8 @@ mod tests {
             "the record is as it was"
         );
         let document = crate::config::from_record(accepted.document.as_deref())
-            .expect("the record is a document this build reads");
+            .expect("the record is a document this build reads")
+            .expect("and there is one");
         assert_eq!(
             document.version,
             kr_protocol::hostinfo::configuration::VERSION,
@@ -4858,6 +4874,68 @@ mod tests {
             assert_eq!(files_in(directory.path()), before, "{table}");
             assert_eq!(recorded(&path), vec![4]);
         }
+    }
+
+    /// A registry one schema version past the one this build writes is what the release after this
+    /// one leaves. Both openers take it as it is: the daemon's open writes no version and changes
+    /// no row, the reader reads it, and nothing carries it. A registry two versions past is
+    /// refused by both, and nothing in it changes.
+    #[test]
+    fn a_registry_one_schema_version_ahead_is_opened_and_read_as_it_is() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        let environment_id = environment();
+        let mut registry = Registry::open(&path, environment_id).expect("a registry");
+        registry
+            .record_accepted_configuration(&AcceptedConfiguration {
+                revision: 4,
+                document: Some(r#"{"version":4,"revision":4}"#.to_owned()),
+            })
+            .expect("records the document");
+        drop(registry);
+        let change = |sql: &str| {
+            Connection::open(&path)
+                .expect("a second connection")
+                .execute_batch(sql)
+                .expect("changes the registry");
+        };
+        change("UPDATE schema_version SET version = 16;");
+
+        assert_eq!(
+            Registry::bring_forward(&path, environment_id).expect("is left"),
+            None,
+            "nothing carries a registry that is ahead"
+        );
+        let read = Registry::open_to_read(&path, environment_id).expect("the reader reads it");
+        assert_eq!(
+            read.accepted_configuration()
+                .expect("reads the record")
+                .document
+                .as_deref(),
+            Some(r#"{"version":4,"revision":4}"#)
+        );
+        drop(read);
+        let opened = Registry::open(&path, environment_id).expect("the daemon opens it as found");
+        assert_eq!(
+            opened.accepted_configuration().expect("reads").revision,
+            4,
+            "the rows are the rows it held"
+        );
+        drop(opened);
+        assert_eq!(
+            recorded(&path),
+            vec![16],
+            "and the version is as it was found"
+        );
+
+        change("UPDATE schema_version SET version = 17;");
+        assert!(Registry::open(&path, environment_id).is_err());
+        assert!(Registry::open_to_read(&path, environment_id).is_err());
+        assert_eq!(
+            recorded(&path),
+            vec![17],
+            "and the version is as it was found"
+        );
     }
 
     /// A step that fails leaves the registry at the version of the last step that committed, whole:

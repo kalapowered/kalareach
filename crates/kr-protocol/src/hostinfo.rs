@@ -1795,6 +1795,18 @@ pub mod configuration {
     /// release before levels reads a document at version 3 as one at a version it does not know.
     pub const VERSION: u64 = 3;
 
+    /// The newest version above [`VERSION`] that this build reads without writing it.
+    ///
+    /// A document at that version is read strictly, as one at [`VERSION`]: every member this build
+    /// knows is read as it is, and a document that holds a member this build does not know, at any
+    /// depth, is refused whole and left as it is, as it is at any version. The release that writes
+    /// that version adds members that narrow what a host may do, so this build never reads past
+    /// one: a document it cannot read is not read as no document, and the copy of the accepted
+    /// document that the registry keeps is held to the same rule (a daemon does not start over a
+    /// copy it cannot read). A document that holds none of those members is the document this build
+    /// writes, and the next edit writes it at [`VERSION`].
+    pub const READS_THROUGH: u64 = 4;
+
     /// The oldest version this build reads and brings forward.
     ///
     /// A document at version 1 has no `storage` section, which reads as a selection of none; it is
@@ -1804,9 +1816,9 @@ pub mod configuration {
     ///
     /// Raise this, and remove the step in [`load`] that brings an earlier document forward, once no
     /// supported upgrade starts from a document at version 1. A release that does so refuses a
-    /// switch to it while a document is at version 1, naming the document, and reads a registry
-    /// record at version 1 as no accepted document, which makes its next start accept the document
-    /// on disk again.
+    /// switch to it while a document is at version 1, naming the document. The registry's record of
+    /// the accepted document is rewritten at the version this build writes by a step of the
+    /// registry's own chain first, since a daemon does not start over a record it cannot read.
     pub const OLDEST_VERSION: u64 = 1;
 
     /// The longest configuration document this host reads.
@@ -3194,7 +3206,7 @@ pub mod configuration {
             .get("version")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(VERSION);
-        if !(OLDEST_VERSION..=VERSION).contains(&declared) {
+        if !(OLDEST_VERSION..=READS_THROUGH).contains(&declared) {
             return Loaded {
                 newer: None,
                 document: None,
@@ -3206,10 +3218,10 @@ pub mod configuration {
                         .stated(" and this build reads versions ")
                         .number(OLDEST_VERSION)
                         .stated(" to ")
-                        .number(VERSION)
+                        .number(READS_THROUGH)
                         .stated("; it is left alone, ")
                         .stated(FAILS_CLOSED)
-                        .stated(if declared > VERSION {
+                        .stated(if declared > READS_THROUGH {
                             "; use a release that reads this version, or rewrite the document"
                         } else {
                             "; rewrite the document"
@@ -3257,21 +3269,24 @@ pub mod configuration {
             ]);
         }
         document.level = held;
-        // The step from an earlier version: its sections are read as they are, and the ones it
-        // lacks are the defaults, so only the version it is read at changes. The file is not
-        // touched; the next edit writes it at the version this build writes.
-        let detail = if document.version < VERSION {
-            let detail = Sentence::new()
+        // A version other than the one this build writes: an earlier document's sections are read
+        // as they are and the ones it lacks are the defaults, and a document at the version this
+        // build reads through is the document this build writes, since it holds no member this
+        // build lacks (the strict read above refused one). Only the version it is read at changes.
+        // The file is not touched; the next edit writes it at the version this build writes.
+        let version = if document.version == VERSION {
+            Sentence::new().stated("version ").number(VERSION)
+        } else {
+            let version = Sentence::new()
                 .stated("version ")
                 .number(document.version)
                 .stated(", read as version ")
                 .number(VERSION);
             document.version = VERSION;
-            detail
-        } else if let Some(newer) = &newer {
-            Sentence::new()
-                .stated("version ")
-                .number(VERSION)
+            version
+        };
+        let detail = match &newer {
+            Some(newer) => version
                 .stated(", level ")
                 .number(newer.declared)
                 .stated("; this build reads level ")
@@ -3282,9 +3297,8 @@ pub mod configuration {
                     " member this build does not know is ignored"
                 } else {
                     " members this build does not know are ignored"
-                })
-        } else {
-            Sentence::new().stated("version ").number(VERSION)
+                }),
+            None => version,
         };
         if let Err(problems) = validate(&document) {
             return invalid(problems);
