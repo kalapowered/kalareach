@@ -1,5 +1,5 @@
 //! The drafts a person has written and not sent, kept by the application on this device and read
-//! back by the page, through the commands the page calls (KR-REQ-13.13, 24.13).
+//! back by the page, through the commands the page calls.
 //!
 //! The store is the client library's real one, in a directory of the test's own. A restart is a new
 //! application state over the same directory; a second window is a second state over it too.
