@@ -649,6 +649,11 @@ pub struct Controller {
     /// between. Compiled away in every shipped build.
     #[cfg(test)]
     before_a_proxy_is_opened: ReadPause,
+    /// Where this host's own tests stop a remote connection's refusal of a mutation after it is
+    /// made and before it is worded for the device, so that a copy of the request can claim the
+    /// action's route in between. Compiled away in every shipped build.
+    #[cfg(test)]
+    before_a_refusal_is_worded: ReadPause,
     /// Where this host's own tests stop a close asked for by voice once it is held against its
     /// grant and before the revision and the authority are read, so that a withdrawal of the grant
     /// can land in between. Compiled away in every shipped build.

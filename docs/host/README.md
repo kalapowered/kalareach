@@ -3513,25 +3513,27 @@ read the session's receipts, or whose grant no longer reaches what the action pr
 the action again; an answer the daemon cannot read in the worker's level, a close's included; and a
 response that its edits make larger than the device said it can receive. The device is told
 `OUTCOME_UNKNOWN`, in a sentence that names nothing of the host, and nothing of the answer is shown.
-A fresh answer that is the worker's own refusal of the action, or a receipt that says the action was
-refused or rejected, stays a refusal, because the action did not happen. An answer kept from an
-earlier submission, which the daemon finds in a record or the worker gives from a receipt it held,
-is told as unknown whatever it was, so that a device that may not read it cannot tell a result from
-a refusal. A repeat is an action the daemon has already routed for the device, asked again with the
-same request. The daemon writes the route before it dispatches the action and keeps no word of
-whether a dispatch followed, so it cannot show that the earlier copy did not run. A refusal it makes
-of a repeat on its own account is therefore told as unknown too, wherever the check sits: a
-registration withdrawn, a grant gone or narrowed, a connection opened for the host or for another
-session or grant, a window that belongs to another connection, a session whose worker has ended, or
-a worker that refuses before it looks for the receipt. A repeated close is the one the daemon can
-still answer without its worker: the closure record answers it for a device that may read the
-session's receipts, as it answers a close made after the closure. A request the daemon never routed
-is refused as any request is, and so is a reused identifier that carries another request. The
-services behind the door check the registration again where they write, and a copy
-of an action that meets a fence owed there is refused in their words. A service that answers a
-copy of an action from its own record while it carries the action out, because the first copy
-finished meanwhile, hands the door an answer the door does not know to be kept, and it is told as
-a fresh answer is: a result as unknown, and the service's own refusal as that refusal.
+For a request that is not a repeat, a fresh answer that is the worker's own refusal of the action,
+or a receipt that says the action was refused or rejected, stays a refusal, because the action did
+not happen. An answer kept from an earlier submission, which the daemon finds in a record or the
+worker gives from a receipt it held, is told as unknown whatever it was, so that a device that may
+not read it cannot tell a result from a refusal. A repeat is an action the daemon has already routed
+for the device, asked again with the same request, whether the route was there when the request
+arrived or a copy claimed it while the request waited. The daemon writes the route before it
+dispatches the action and keeps no word of whether a dispatch followed, so it cannot show that the
+earlier copy did not run. A refusal it makes of a repeat on its own account is therefore told as
+unknown too, wherever the check sits: a registration withdrawn, a grant gone or narrowed, a
+connection opened for the host or for another session or grant, a window that belongs to another
+connection, a session whose worker has ended, a worker refusal that the worker did not read from a
+receipt, or a route the daemon cannot read. A repeated close is the one the daemon can still answer
+without its worker: the closure record answers it for a device that may read the session's receipts,
+as it answers a close made after the closure. A request the daemon never routed is refused as any
+request is, and so is a reused identifier that carries another request. The services behind the door
+check the registration again where they write, and a copy of an action that meets a fence owed there
+is refused in their words. A service that answers a copy of an action from its own record while it
+carries the action out, because the first copy finished meanwhile, hands the door an answer the door
+does not know to be kept, and it is told as a fresh answer is: a result as unknown, and the
+service's own refusal as that refusal.
 
 A device that falls behind is told rather than waited for. What the daemon holds for one device is
 bounded in bytes, not in messages, at section 9's send queue per peer; a device that reaches that

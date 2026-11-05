@@ -1197,6 +1197,8 @@ impl Controller {
             #[cfg(test)]
             before_a_proxy_is_opened: ReadPause::default(),
             #[cfg(test)]
+            before_a_refusal_is_worded: ReadPause::default(),
+            #[cfg(test)]
             after_a_voice_close_is_held: ReadPause::default(),
             #[cfg(test)]
             before_a_close_asks_for_its_link: ReadPause::default(),
