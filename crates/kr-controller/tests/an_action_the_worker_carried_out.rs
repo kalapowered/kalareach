@@ -28,6 +28,11 @@ const VIEWING: [ActionRight; 2] = [ActionRight::SessionView, ActionRight::Questi
 ///
 /// A call that is answered before it reaches its pause fails the case at once, instead of leaving
 /// it to wait for a pause that cannot come.
+///
+/// The refusal cuts the connection from its worker, and the host ends the connection as soon as it
+/// has answered the request in flight, closing it under an answer the device has not yet read. The
+/// connection is held after that answer until the call has returned, so that the device always
+/// reads what the host wrote.
 async fn refused_at_its_pause<T>(
     environment: &Environment,
     pause: (
@@ -37,6 +42,7 @@ async fn refused_at_its_pause<T>(
     call: impl Future<Output = T>,
 ) -> T {
     let (arrived, go) = pause;
+    let (_, hold) = environment.host.pause_after_a_frame_is_answered();
     tokio::pin!(call);
     tokio::select! {
         arrived = arrived => arrived.expect("the call arrives at its pause"),
@@ -48,7 +54,9 @@ async fn refused_at_its_pause<T>(
         .raise_the_unverified_withdrawal_refusal()
         .await;
     go.send(()).expect("the call waits at its pause");
-    call.await
+    let told = call.await;
+    drop(hold);
+    told
 }
 
 /// An answer the worker took, whose grant the authority feed refuses before the reply is written,

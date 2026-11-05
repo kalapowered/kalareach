@@ -600,6 +600,11 @@ pub struct Controller {
     /// change in between. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_worker_answered: ReadPause,
+    /// Where this host's own tests stop a paired device's connection once it has answered a frame,
+    /// before it goes on to the next one, so that a device reads that answer before a connection
+    /// that has ended is closed under it. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_a_frame_is_answered: ReadPause,
     /// Where this host's own tests stop a paired device's key registration that found no retained
     /// answer, before it looks again, so that an earlier attempt can finish in between. Compiled
     /// away in every shipped build.
