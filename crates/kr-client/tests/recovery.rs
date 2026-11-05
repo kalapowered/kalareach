@@ -1,6 +1,6 @@
 //! The recovery seed, its kit, the bundle at its locator, and what a fresh restore puts back.
 //!
-//! Section 20 ¶9 to ¶13 and KR-ACC-033. Nothing here talks to a real service: the compare-and-swap
+//! Section 20 ¶9 to ¶13. Nothing here talks to a real service: the compare-and-swap
 //! seam is `kr_client::services::SyncBackupService`, and the scripted implementation below is one
 //! store's worth of bytes and positions.
 
