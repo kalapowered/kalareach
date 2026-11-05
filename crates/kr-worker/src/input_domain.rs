@@ -979,17 +979,23 @@ impl InputDomain {
         replies: Vec<crate::projection::LaneReply>,
     ) -> Option<Applied> {
         let mut queued_bytes = 0_u64;
-        // Where the editor's cursor report goes: ahead of the replies that still wait here for the
-        // writer, which were queued before the report and are not the person's keys. The lane
-        // lets the report out first, and this keeps it first all the way to the terminal.
+        // Where the editor's cursor report goes: ahead of the run of replies that ends the queue
+        // and still waits here for the writer (it waits only behind a fence the bridge's writer
+        // has not written). The lane lets the report out first, and this keeps it first all the
+        // way to the terminal. It stays behind a person's keys and a fence frame, and so behind
+        // a reply queued before either: those keep their places.
         let mut ahead_of_replies = self
             .fence
             .as_ref()
             .is_some_and(FenceDriver::cursor_report_owed)
             .then(|| {
-                self.pending
+                let trailing = self
+                    .pending
                     .iter()
-                    .position(|queued| matches!(queued, Queued::Batch(InputBatch::Reply { .. })))
+                    .rev()
+                    .take_while(|queued| matches!(queued, Queued::Batch(InputBatch::Reply { .. })))
+                    .count();
+                (trailing > 0).then(|| self.pending.len() - trailing)
             })
             .flatten();
         let mut cursor_reported = false;

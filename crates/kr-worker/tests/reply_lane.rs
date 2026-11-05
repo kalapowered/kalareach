@@ -19,12 +19,12 @@ use kr_protocol::ids::{
 };
 use kr_protocol::root::{
     CwdRevision, EditorBufferRevision, EditorKeymap, EditorLeaveReason, EditorState,
-    KeyQueueSnapshot, PendingReaderInput, PromptGeneration, ReaderContext, ReaderRevision,
-    RootEditorEnterParams, RootEditorLeaveParams,
+    PendingReaderInput, PromptGeneration, ReaderContext, ReaderRevision, RootEditorEnterParams,
+    RootEditorLeaveParams,
 };
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
-use kr_shell_integration::contract::events::{BridgeEvent, HooksActivated, ReaderIdle};
+use kr_shell_integration::contract::events::{BridgeEvent, HooksActivated};
 use kr_shell_integration::contract::fence::LeaseView;
 use kr_shell_integration::contract::qualification::ShellKind;
 use kr_worker::action::time::{ManualWallClock, TimeSources};
@@ -364,6 +364,9 @@ impl Fixture {
     /// The root editor reports itself idle, which it does once it is reading keys.
     #[cfg(not(windows))]
     fn editor_idles(&mut self) {
+        use kr_protocol::root::KeyQueueSnapshot;
+        use kr_shell_integration::contract::events::ReaderIdle;
+
         self.editor_reports(BridgeEvent::ReaderIdle(ReaderIdle {
             session_id: self.session_id,
             prompt_generation: PromptGeneration::new(1),
@@ -388,6 +391,21 @@ impl Fixture {
     /// The application writes `output`, which asks the questions in it.
     fn application_writes(&mut self, output: &[u8]) {
         let _ = self.session.ingest_output(output);
+    }
+
+    /// Everything queued for the terminal since the last call, in the order it is written: what the
+    /// host answers and what the person typed.
+    #[cfg(not(windows))]
+    fn queued(&mut self) -> Vec<(&'static str, Vec<u8>)> {
+        self.session
+            .take_pending_input()
+            .into_iter()
+            .filter_map(|batch| match batch {
+                InputBatch::Reply { bytes, .. } => Some(("reply", bytes)),
+                InputBatch::Lease { bytes, .. } => Some(("keys", bytes)),
+                InputBatch::LeaseChanged => None,
+            })
+            .collect()
     }
 }
 
@@ -507,9 +525,62 @@ async fn a_cursor_report_is_written_ahead_of_an_answer_still_waiting_for_the_wri
     );
 }
 
-/// The rule is the PowerShell editor's alone. A Zsh, Bash or Fish editor asks the terminal nothing
-/// about the cursor, and an answer it is sent is read as keys whenever it arrives, so nothing is
-/// held for it; and no session holds an answer while no editor reads.
+/// KR-REQ-08.48: the cursor report passes the answers that wait at the end of the queue for the
+/// writer, and no further: a key the person typed behind a waiting answer keeps its place ahead of
+/// the report, which a key does not harm (the runtime gives bytes before an escape back as keys).
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cursor_report_stays_behind_the_keys_that_were_queued_after_a_waiting_answer() {
+    let (_clock, time) = manual();
+    let mut fixture = Fixture::managed(time, ShellKind::PowerShell);
+    // Asked before the editor began its read, and queued for the writer, which has not taken it,
+    // with a key of the person's behind it.
+    fixture.application_writes(DEVICE_ATTRIBUTES);
+    fixture.type_bytes(b"x");
+    fixture.editor_enters();
+    fixture.application_writes(b"\x1b[6n");
+    assert_eq!(
+        fixture.queued(),
+        vec![
+            ("reply", DEVICE_ATTRIBUTES_REPLY.to_vec()),
+            ("keys", b"x".to_vec()),
+            ("reply", CURSOR_REPORT.to_vec())
+        ]
+    );
+}
+
+/// KR-REQ-08.49: a hold that ended while the gate was shut is over. The editor is owed a report again
+/// at its next read, and the time between the two reads is not time the report gives back to the
+/// answer the first hold kept: that answer has waited past its deadline by then, and is dropped
+/// instead of reaching the next reader.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_kept_for_one_read_is_not_given_the_time_before_the_next_to_reach_it() {
+    let (clock, mut fixture) = at_a_powershell_prompt();
+    fixture.application_writes(b"\x1b[?2004h");
+    fixture.application_writes(DEVICE_ATTRIBUTES);
+    assert!(fixture.replies().is_empty(), "kept for the cursor report");
+
+    // The person's paste shuts the gate, the editor leaves, and the next read begins; the paste ends.
+    fixture.type_bytes(PASTE_OPEN);
+    let _ = fixture.replies();
+    clock.advance(Duration::from_millis(2_500));
+    fixture.editor_leaves();
+    fixture.editor_enters();
+    fixture.type_bytes(PASTE_CLOSE);
+    fixture.session.pump_replies();
+    fixture.application_writes(b"\x1b[6n");
+    assert_eq!(
+        fixture.replies(),
+        vec![CURSOR_REPORT.to_vec()],
+        "the answer is not handed to the second read"
+    );
+}
+
+/// The rule is the PowerShell editor's alone. A Zsh or Bash editor asks the terminal nothing about
+/// the cursor, and an answer it is sent is read as keys whenever it arrives; Fish asks, with two
+/// other questions in one write, and reads the three answers in the order of the questions. So
+/// nothing is held for any of them; and no session holds an answer while no editor reads.
 #[tokio::test(flavor = "multi_thread")]
 async fn answers_keep_the_order_of_their_questions_wherever_no_cursor_report_is_owed() {
     let (_clock, time) = manual();
