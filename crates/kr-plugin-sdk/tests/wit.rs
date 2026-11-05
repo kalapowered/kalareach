@@ -60,6 +60,10 @@ fn the_world_exports_exactly_the_eight_component_functions() {
     );
 }
 
+/// KR-REQ-11.25, the part about the closed import surface: the world imports exactly the four host
+/// interfaces and nothing else, no function or type directly, so no component is given a fifth
+/// import to send through. Not shown here: the functions inside the four interfaces (the case
+/// below), and which grants a binding holds.
 #[test]
 fn the_world_imports_exactly_the_four_host_interfaces() {
     let (resolve, world) = resolve();
@@ -85,11 +89,11 @@ fn the_world_imports_exactly_the_four_host_interfaces() {
     assert_eq!(found, expected);
 }
 
-/// KR-REQ-11.25, the part about the upstream-send handle: no function of any interface the
-/// component world imports has a name that says send, write, submit, dispatch, respond, spawn or
-/// open, so no component, an observation-only one included, is handed a way to send to its
-/// upstream. Not shown here: a function under another name (the case reads names), and which grants
-/// a binding holds, which the broker cases show.
+/// KR-REQ-11.25, the part about the upstream-send handle, as a check of names: no function of any
+/// interface the component world imports has a name that says send, write, submit, dispatch,
+/// respond, spawn or open. Not shown here: what an imported function with another name does, a
+/// bare function import (the case skips imports that are not interfaces; the case above holds the
+/// imports to the four interfaces), and which grants a binding holds, which the broker cases show.
 #[test]
 fn no_host_import_sends_anything() {
     // The component proposes effects and the broker dispatches them. An import that sent data
