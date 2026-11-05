@@ -529,6 +529,22 @@ async fn an_update_replaces_the_daemon_and_a_live_session_keeps_its_release() {
         format!("kr-controller/{}", two.name()),
         "the daemon was started again, of the new release"
     );
+    // It was started from the new release's own program, a path with no link in it, and not
+    // through `current`: the first word of its command line is the path it was started with.
+    #[cfg(target_os = "linux")]
+    {
+        let pid = host.daemon_process().await.pid.get();
+        let command = std::fs::read(format!("/proc/{pid}/cmdline")).expect("the daemon's command");
+        let started_as = command.split(|byte| *byte == 0).next().expect("a program");
+        assert_eq!(
+            String::from_utf8_lossy(started_as),
+            host.store
+                .release_program(two.name(), Program::Controller)
+                .display()
+                .to_string(),
+            "the daemon was started from the release's own program"
+        );
+    }
     assert_eq!(
         host.worker_build(session_id).await,
         format!("kr-worker/{}", one.name()),
@@ -2719,6 +2735,30 @@ fn a_store_s_startup_entry_sources_the_current_release_s_entry() {
     assert!(
         !written.contains("versions"),
         "the entry names no release's own directory: {written}"
+    );
+
+    // The packages are read in the release `current` names, with the link read once: the
+    // executable a package reports is that release's own, a path with no link in it, though the
+    // entry written above names the stable file.
+    let status = host
+        .command(
+            &host.store.stable(Program::Kr),
+            &["--json", "shell", "status", "--shell", "zsh"],
+        )
+        .env("HOME", &home)
+        .stdin(Stdio::null())
+        .output()
+        .expect("kr runs");
+    assert!(
+        status.status.success(),
+        "kr shell status: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let reported = String::from_utf8_lossy(&status.stdout);
+    let own = shells.join("zsh/test-1/bin/zsh");
+    assert!(
+        reported.contains(&own.display().to_string()),
+        "the package's executable is in the release: {reported}"
     );
 
     // The control: outside a store, the same packages give an entry that sources the package's
