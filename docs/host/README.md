@@ -4137,16 +4137,25 @@ request that supersedes it. So a fresh identifier for a subject that already car
 its preconditions name that action and the receipt revision the caller read it at. A service that
 wanted to hide the uncertainty would have to name the receipt it was hiding.
 
-The subject of every `question.answer` in a session is the target alone, and so is the subject of
-every `question.cancel`, so a digest cannot tell the requests about two questions apart. The worker
-reads the envelope the receipt kept instead: an answer to a question is refused for an uncertain
-answer to that same question, a cancellation of a question is refused for an uncertain cancellation
-of that same question, and a request about another question of the session is admitted. A request
-that names an uncertain answer or cancellation of another question names nothing it has to show, and
-is refused. A receipt whose question the worker cannot read holds back every request of its kind by
-the actor in the session, as the rule above does: its envelope is gone (privacy mode removes it once
-an action settles), does not decode, or is not a request of that kind. Every other method keeps the
-rule above.
+The subject of a `question.answer`, a `question.cancel`, a `question.cancel_own`, a
+`question.create` and an `alert.create` is the target alone, so a digest cannot tell two requests of
+one of these methods apart. The worker reads the envelope the receipt kept instead. An uncertain
+request holds back a request of the same method only when both carry the same identity: the question
+an answer, a cancellation or a source's own cancellation names, the request identifier a question is
+asked under, or the de-duplication identifier an alert is raised under. A request with another
+identity is admitted. A request that names an uncertain request with another identity names nothing
+it has to show, and is refused. The envelope of a source's cancellation keeps no caller token, and
+no envelope keeps which application sent a question or an alert, so two applications of one actor
+that use the same identifier hold each other back. A receipt whose identity the worker cannot read
+holds back every request of its method by the actor in the session, as the rule above does: its
+envelope is gone (privacy mode removes it once an action settles), does not decode, or is not a
+request of that method. Every other method keeps the rule above.
+
+When a subject carries several uncertain outcomes, a request has to show the one the journal
+recorded last. The order comes from the journal's event record. A clock reading cannot give it,
+because two outcomes can share a millisecond and the wall clock can step back, and neither can an
+identifier or the order the actions were admitted in. An outcome with no event in that record,
+written by an earlier build, comes after every outcome that has one.
 
 The revision has to be one the caller was shown. The worker remembers, in memory and for a bounded
 number of receipts, the revision of each receipt that `action.read` answered to each actor, and a
