@@ -39,7 +39,7 @@ impl Served {
     /// A host whose epoch runs, so that a call into a component is stopped by its deadline when the
     /// machine's time passes it.
     async fn start() -> Self {
-        Self::start_with(false).await
+        Self::start_with(false, None).await
     }
 
     /// A host whose epoch no time advances: a call into a component is stopped by its deadline only
@@ -47,10 +47,16 @@ impl Served {
     /// slow to run a call cannot make a component fault. For the cases that read what a call
     /// returns and are not about a deadline.
     async fn start_held() -> Self {
-        Self::start_with(true).await
+        Self::start_with(true, None).await
     }
 
-    async fn start_with(epoch_held: bool) -> Self {
+    /// A host that gives an unbind `deadline` to be answered in, instead of a few seconds short of
+    /// what a worker's client waits for it.
+    async fn start_unbinding_within(deadline: core::time::Duration) -> Self {
+        Self::start_with(false, Some(deadline)).await
+    }
+
+    async fn start_with(epoch_held: bool, unbinding_within: Option<core::time::Duration>) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         // Owner-only: it holds the payloads this host compiles, and the host refuses a packages
@@ -73,15 +79,17 @@ impl Served {
             packages_root: packages.clone(),
             cache_root: environment.state_dir().join("plugin-cache"),
         };
-        let host = Arc::new(
-            if epoch_held {
-                PluginHost::new_with_epoch_held(identity, config)
-            } else {
-                PluginHost::new(identity, config)
-            }
-            .expect("a plugin host")
-            .registering_within(REGISTRATION_PATIENCE),
-        );
+        let host = if epoch_held {
+            PluginHost::new_with_epoch_held(identity, config)
+        } else {
+            PluginHost::new(identity, config)
+        }
+        .expect("a plugin host")
+        .registering_within(REGISTRATION_PATIENCE);
+        let host = Arc::new(match unbinding_within {
+            Some(deadline) => host.unbinding_within(deadline),
+            None => host,
+        });
         let endpoint_for_wait =
             kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
         let serving = tokio::spawn({
@@ -385,6 +393,163 @@ async fn kr_req_06_06_a_worker_registers_delivers_and_calls_over_the_protocol() 
         .await
         .expect("the binding registers");
     assert!(again.cached, "the second registration recompiled");
+}
+
+/// How long the case below lets the host take to answer an unbind that nothing can run. The case
+/// waits for the answer for as long as it takes, so this is only the figure the host is told to be
+/// ready by.
+const HELD_UNBIND_DEADLINE: core::time::Duration = core::time::Duration::from_millis(1);
+
+/// How long the case below waits for the blocking pool's one thread to be held, for the host's
+/// answer, and for work to run on the pool's thread once it is let go. None of them is decided by
+/// it: it ends only a wait for something that never comes.
+const POOL_THREAD: core::time::Duration = core::time::Duration::from_secs(60 * 60);
+
+/// A connection that speaks the protocol's frames itself, with no client between it and the host,
+/// so that what it waits for is the host's answer and nothing shorter.
+struct Raw {
+    reader: kr_ipc::framed::FrameReader,
+    writer: kr_ipc::framed::FrameWriter,
+    next: u64,
+}
+
+impl Raw {
+    async fn connect(served: &Served) -> Self {
+        let endpoint =
+            kr_ipc::paths::Endpoint::from_path(&served.descriptor.endpoint).expect("an endpoint");
+        let connection = kr_ipc::endpoint::Connection::connect(&endpoint)
+            .await
+            .expect("connects to the plugin host");
+        let (reader, writer) =
+            kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+        Self {
+            reader,
+            writer,
+            next: 0,
+        }
+    }
+
+    /// Asks the host something and returns its answer, whatever notices come first.
+    async fn ask(&mut self, body: RequestBody) -> ResponseBody {
+        self.next += 1;
+        let request_id = self.next;
+        self.writer
+            .write_message(&kr_plugin_service::protocol::Request { request_id, body })
+            .await
+            .expect("the request is written");
+        loop {
+            let frame: Frame = self
+                .reader
+                .read_message_without_schema()
+                .await
+                .expect("the host answers");
+            if let Frame::Response { reply_to, body } = frame
+                && reply_to == request_id
+            {
+                return body;
+            }
+        }
+    }
+
+    async fn health(&mut self) -> kr_plugin_service::protocol::HostHealth {
+        match self.ask(RequestBody::Health).await {
+            ResponseBody::Health(health) => *health,
+            other => panic!("the host answered a health request with {other:?}"),
+        }
+    }
+}
+
+// An unbind waits for the binding's thread, on the blocking pool. A pool that other work keeps busy
+// leaves it waiting for a thread of its own, and the request is answered at the host's deadline
+// all the same, with its place among the connection's calls given up. The unbind is not taken back:
+// it runs when the pool has a thread, removes the binding and gives the connection its place back.
+//
+// The pool has one thread, which the case holds once the binding is registered. A task spawned
+// after the unbind runs after it on that thread, so by the time it has run the unbind has too.
+// Nothing in the case is decided by how long anything takes: it waits for the host's answer.
+#[test]
+fn an_unbind_a_busy_blocking_pool_holds_up_is_refused_in_time_and_runs_when_the_pool_has_a_thread()
+{
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let executor = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("an executor with one blocking thread");
+    executor.block_on(async {
+        let served = Served::start_unbinding_within(HELD_UNBIND_DEADLINE).await;
+        let mut host = Raw::connect(&served).await;
+        let (path, digest, bytes) = served.install("well-behaved", &wasm);
+        let request = components::request("well-behaved", 1);
+        let registered = host
+            .ask(RequestBody::RegisterBinding(Box::new(
+                kr_plugin_service::protocol::BindingRegistration {
+                    binding_id: request.binding_id.get(),
+                    identity: request.identity.clone(),
+                    facts: kr_plugin_service::vocabulary::wire_facts(&request.facts),
+                    executable: request.executable.clone(),
+                    component: ComponentSource {
+                        path,
+                        digest,
+                        bytes,
+                    },
+                },
+            )))
+            .await;
+        assert!(
+            matches!(registered, ResponseBody::Registered { .. }),
+            "the binding was answered with {registered:?}"
+        );
+        let health = host.health().await;
+        assert_eq!((health.live_bindings, health.connection_bindings), (1, 1));
+
+        // The pool's only thread is held by work that ends when the case drops `release`.
+        let (running, occupied) = tokio::sync::oneshot::channel::<()>();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = running.send(());
+            let _ = held.recv();
+        });
+        tokio::time::timeout(POOL_THREAD, occupied)
+            .await
+            .expect("the pool's thread was held")
+            .expect("the held work started");
+
+        let answered = tokio::time::timeout(
+            POOL_THREAD,
+            host.ask(RequestBody::Unbind {
+                binding_id: request.binding_id.get(),
+            }),
+        )
+        .await
+        .expect("the host answered the unbind, and did not wait for the pool");
+        assert!(
+            matches!(&answered, ResponseBody::Refused { detail, .. }
+                if detail.contains(&format!("{} ms", HELD_UNBIND_DEADLINE.as_millis()))),
+            "the unbind was answered with {answered:?}"
+        );
+        // The host answered, and the removal is still to be run: the binding is there.
+        let health = host.health().await;
+        assert_eq!((health.live_bindings, health.connection_bindings), (1, 1));
+
+        // The pool gets its thread back. The unbind runs on it ahead of this task.
+        drop(release);
+        blocker.await.expect("the held work ended");
+        tokio::time::timeout(POOL_THREAD, tokio::task::spawn_blocking(|| ()))
+            .await
+            .expect("work ran on the pool's thread once it was free")
+            .expect("the work ended");
+        let health = host.health().await;
+        assert_eq!(
+            (health.live_bindings, health.connection_bindings),
+            (0, 0),
+            "the unbind the caller stopped waiting for was not carried out"
+        );
+    });
+    executor.shutdown_timeout(POOL_THREAD);
 }
 
 // KR-REQ-04.07, KR-REQ-11.40: the refusal a worker gets for a component that wants more than the

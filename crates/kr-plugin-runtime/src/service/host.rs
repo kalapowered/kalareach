@@ -64,6 +64,16 @@ use crate::service::wire;
 pub const REGISTER_DEADLINE: core::time::Duration =
     core::time::Duration::from_millis(COMPILE_DEADLINE_MS);
 
+/// How long an unbind may keep a worker waiting.
+///
+/// An unbind carries no deadline of its own, so a worker's client waits for it as long as it waits
+/// for any request that has none, less the round trip, and this is that figure: the answer a worker
+/// gets is the host's own, and not its patience running out first. The removal waits for the
+/// binding's thread, which a blocking pool that other work keeps busy leaves waiting for a thread of
+/// its own for as long as that work lasts.
+const UNBIND_DEADLINE: core::time::Duration = kr_plugin_service::client::DEFAULT_DEADLINE
+    .saturating_sub(kr_plugin_service::client::ROUND_TRIP_ALLOWANCE);
+
 /// The file, in the state directory beside the compiled-code cache, that holds every registration
 /// for as long as it exists. A host built without the `testing` feature reads no such file.
 #[cfg(feature = "testing")]
@@ -153,6 +163,8 @@ pub struct PluginHost {
     started: std::time::Instant,
     /// How long a registration may keep a worker waiting.
     register_deadline: core::time::Duration,
+    /// How long an unbind may keep a worker waiting.
+    unbind_deadline: core::time::Duration,
     /// The pause the notice writers take between taking a notice and writing it, which a test
     /// holds to stand where a document has left the queue and not yet been written.
     #[cfg(feature = "testing")]
@@ -246,6 +258,7 @@ impl PluginHost {
             packages: Arc::new(packages),
             started: std::time::Instant::now(),
             register_deadline: REGISTER_DEADLINE,
+            unbind_deadline: UNBIND_DEADLINE,
             #[cfg(feature = "testing")]
             notice_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
         })
@@ -259,6 +272,17 @@ impl PluginHost {
     #[must_use]
     pub fn registering_within(mut self, deadline: core::time::Duration) -> Self {
         self.register_deadline = deadline;
+        self
+    }
+
+    /// Gives an unbind `deadline` instead of [`UNBIND_DEADLINE`], for the test of what a host does
+    /// with an unbind that a busy blocking pool holds up: the default is a few seconds short of the
+    /// time a worker's client waits, and a test that needs the host's answer to be due long before
+    /// the client's has to say how long before.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn unbinding_within(mut self, deadline: core::time::Duration) -> Self {
+        self.unbind_deadline = deadline;
         self
     }
 
@@ -351,7 +375,7 @@ impl PluginHost {
             notices: sink.clone(),
             writer: Arc::clone(&writer),
             work: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CALLS)),
-            bindings: BindingPlaces::default(),
+            bindings: Arc::default(),
             conversation: Arc::clone(&conversation),
             registered: Registered::default(),
         });
@@ -732,43 +756,7 @@ impl PluginHost {
             RequestBody::Privacy { .. } => Err(refused(
                 "privacy is answered by the task that reads this connection".to_owned(),
             )),
-            RequestBody::Unbind { binding_id } => {
-                // Removing a binding waits for its thread, so it happens off the executor. The
-                // handle is taken first so the record can be cleared by identity afterwards: the
-                // identifier may have been registered again by then, and that binding's place is
-                // not this removal's to take.
-                let removing = served
-                    .registered
-                    .lock()
-                    .ok()
-                    .and_then(|held| held.live.get(&binding_id).cloned());
-                let runtime = Arc::clone(&self.runtime);
-                let owner = served.owner;
-                let binding = BindingId::new(binding_id);
-                let removed = tokio::task::spawn_blocking(move || runtime.unbind(owner, binding))
-                    .await
-                    .unwrap_or(Unbound::Absent);
-                // Only a binding that existed had a place of its own. A preparation that was still
-                // running holds its place until it finishes and gives it back itself, so counting
-                // it here as well would let this connection hold more bindings than it may.
-                if matches!(removed, Unbound::Stopped) {
-                    served.bindings.give_back();
-                }
-                if let Ok(mut held) = served.registered.lock()
-                    && let Some(removing) = removing
-                {
-                    // By identity, and nothing else: a registration that started while this unbind
-                    // was joining the old thread owns the identifier now, and its state is not this
-                    // removal's to clear.
-                    held.parted(binding_id, &removing);
-                }
-                // The binding has gone, so what the notice queue was holding for it has nothing
-                // left to catch, and the identifier's next incarnation starts clean.
-                served.notices.forget(binding_id);
-                Ok(ResponseBody::Unbound {
-                    existed: removed.existed(),
-                })
-            }
+            RequestBody::Unbind { binding_id } => self.unbind(binding_id, served).await,
             RequestBody::Health => Ok(ResponseBody::Health(Box::new(HostHealth {
                 live_bindings: self.runtime.live_bindings() as u64,
                 connection_bindings: served.bindings.taken() as u64,
@@ -942,6 +930,67 @@ impl PluginHost {
         })
     }
 
+    /// Removes one binding, and answers inside the time a worker waits for the answer.
+    ///
+    /// Removing a binding waits for its thread, so it happens off the executor, and the removal and
+    /// what is recorded once it is done are one task of the blocking pool's. A blocking pool that
+    /// other work keeps busy can leave that task waiting for a thread for longer than the worker
+    /// waits, and a request that waited for it would hold its place among the calls the connection
+    /// may have running, and with it the connection's cleanup, for as long. So the wait is held to
+    /// the time a worker gives it. A caller that stops waiting does not take the task back: it runs
+    /// when it gets a thread, removes the binding, gives the connection its place back and clears
+    /// the records, as it would for a caller that waited.
+    async fn unbind(
+        &self,
+        binding_id: Uuid,
+        served: &Arc<Served>,
+    ) -> Result<ResponseBody, (String, bool)> {
+        // The handle is taken first so the record can be cleared by identity afterwards: the
+        // identifier may have been registered again by then, and that binding's place is not this
+        // removal's to take.
+        let removing = served
+            .registered
+            .lock()
+            .ok()
+            .and_then(|held| held.live.get(&binding_id).cloned());
+        let runtime = Arc::clone(&self.runtime);
+        // Only what the task needs: it is not given the connection's writer, so a connection that is
+        // over does not stay open for the task.
+        let owner = served.owner;
+        let places = Arc::clone(&served.bindings);
+        let registered = Arc::clone(&served.registered);
+        let notices = served.notices.clone();
+        let binding = BindingId::new(binding_id);
+        let removal = tokio::task::spawn_blocking(move || {
+            let removed = runtime.unbind(owner, binding);
+            // Only a binding that existed had a place of its own. A preparation that was still
+            // running holds its place until it finishes and gives it back itself, so counting it
+            // here as well would let this connection hold more bindings than it may.
+            if matches!(removed, Unbound::Stopped) {
+                places.give_back();
+            }
+            if let Ok(mut held) = registered.lock()
+                && let Some(removing) = removing
+            {
+                // By identity, and nothing else: a registration that started while this unbind was
+                // joining the old thread owns the identifier now, and its state is not this
+                // removal's to clear.
+                held.parted(binding_id, &removing);
+            }
+            // The binding has gone, so what the notice queue was holding for it has nothing left
+            // to catch, and the identifier's next incarnation starts clean.
+            notices.forget(binding_id);
+            removed
+        });
+        let removed = tokio::time::timeout(self.unbind_deadline, removal)
+            .await
+            .map_err(|_elapsed| caller_deadline(self.unbind_deadline))?
+            .map_err(|error| (format!("the binding could not be removed: {error}"), false))?;
+        Ok(ResponseBody::Unbound {
+            existed: removed.existed(),
+        })
+    }
+
     fn descriptor(&self) -> kr_plugin_service::protocol::HostDescriptor {
         kr_plugin_service::protocol::HostDescriptor {
             protocol: HostProtocol::THIS.name.to_owned(),
@@ -1009,7 +1058,10 @@ struct Served {
     /// How much work that enters a component this connection may have running.
     work: Arc<tokio::sync::Semaphore>,
     /// How many bindings it holds.
-    bindings: BindingPlaces,
+    ///
+    /// Shared, so that an unbind the connection's end does not wait for can still give its place
+    /// back without holding the rest of what the connection held.
+    bindings: Arc<BindingPlaces>,
     /// Whether it is still worth talking on.
     conversation: Arc<Conversation>,
     /// The bindings this connection holds, by identifier.
@@ -1418,7 +1470,7 @@ fn refused(detail: String) -> (String, bool) {
     (detail, false)
 }
 
-/// The refusal for a registration that has run out of the time it was given.
+/// The refusal for a request that has run out of the time it was given.
 fn caller_deadline(deadline: core::time::Duration) -> (String, bool) {
     (
         RuntimeError::CallerDeadline {
