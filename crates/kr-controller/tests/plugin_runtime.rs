@@ -958,6 +958,27 @@ impl World {
             .map(|descriptor| descriptor.process_start_identity)
     }
 
+    /// Waits until the daemon has published a plugin runtime that answers a health call and whose
+    /// process is running, and returns that process.
+    ///
+    /// The launcher publishes the descriptor a moment before it accepts the runtime's claim, and a
+    /// runtime serves only once its claim is accepted, so an answer shows that its start is
+    /// complete. One connection settles which process answered: the process returned is the one
+    /// whose descriptor that connection verified, so a runtime that ended and was replaced
+    /// meanwhile is not taken for the one that answered. No binding needs to be registered for it.
+    async fn running_published_host(&self) -> ProcessStartIdentity {
+        until(
+            "the daemon to publish a plugin runtime that answers",
+            || async {
+                let client = PluginClient::connect(&self.environment()).await.ok()?;
+                client.health().await.ok()?;
+                let host = client.descriptor().process_start_identity.clone();
+                (kr_ipc::identity::process_state(&host) == ProcessState::Running).then_some(host)
+            },
+        )
+        .await
+    }
+
     /// What the plugin runtime says it holds, asked as a connection of this test's own, which the
     /// runtime counts across every connection in its `live_bindings`.
     async fn health(&self) -> Option<HostHealth> {
@@ -1857,6 +1878,16 @@ async fn the_plugin_runtime_is_a_job_of_its_own_and_outlives_the_daemon_that_sta
 
 /// The control for the test above: a plugin runtime that is an ordinary child of the daemon ends
 /// with the daemon's group. If this did not end it, the test above would show nothing.
+///
+/// The runtime is started because a worker's binding holds a package that ships a component, and
+/// the case goes on once the daemon has published it and it answers. It does not wait for the
+/// binding to be registered: a registration compiles the component on a thread the runtime asks
+/// the platform to hold at the lowest priority, and the runtime discards a compile that takes
+/// longer than its budget. The runtime of this case is an ordinary child of the daemon, so it runs
+/// where the test is held, beside whatever else runs there; while a machine gives a
+/// lowest-priority thread next to nothing the compile ends after its budget, and the registration
+/// does not complete however long the case waits. That the runtime ends with the daemon's group
+/// does not depend on the registration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_plugin_runtime_started_as_a_child_of_the_daemon_ends_with_the_daemons_group() {
     let Some(component) = well_behaved() else {
@@ -1865,8 +1896,7 @@ async fn a_plugin_runtime_started_as_a_child_of_the_daemon_ends_with_the_daemons
     let mut world = World::start_apart(&component, "child").await;
     let created = world.session().await;
     let (_typing, _agent) = world.run_agent(&created).await;
-    world.holding(1).await;
-    let host = world.published_host().expect("the runtime is published");
+    let host = world.running_published_host().await;
 
     world.apart.end_with_its_group();
 
