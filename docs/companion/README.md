@@ -54,10 +54,10 @@ the person says the host's words alone. Native code names the action by its key,
 words for each key are the client library's own. Native code also gives the page the retry category
 of the code (`retry`). The page shows a send the host refused for now, a `transient` code, as "Not
 taken for now": its text goes back to the composer, and it is not counted among the actions waiting
-for a receipt. Only the host's definite word shows a send as refused. A refusal the application makes itself, for a
-cause it knows (a size limit, a dropped folder, input the program cannot read, a call or a
-verification this device cannot make), names no action: its words say what is wrong, and no update,
-wait or setting would change it.
+for a receipt. Only the host's definite word shows a send as refused. A refusal the application
+makes itself, for a cause it knows (a size limit, a dropped folder, input the program cannot read, a
+call or a verification this device cannot make), names no action: its words say what is wrong, and
+no update, wait or setting would change it.
 
 Native code tells the page about changes through listeners: the connection's state, the host's
 events, where the account stands, pairing, owner confirmations and dropped files. The shell
@@ -1010,12 +1010,12 @@ answer never came back.
   the only way to put it under this recovery is a replacement: the card offers it as a second,
   confirmed choice, and the host then starts a new archive under this recovery. What it backed up
   before stays at the service and opens only with the earlier kit; the host stops adding to it and
-  does not remove its old backups. A host that declines, or refuses the call in its definite word, has recorded
-  nothing, so the bundle is written again without the archive it was made to name, and the card says
-  why the host declined and that its backups were not changed. A setup whose answer was lost, or
-  that the host refused for now, keeps its entry in the bundle until the next try finds the setup
-  if it landed; if it did not land, the
-  entry names an archive the host never made, which a restore lists as holding nothing. A setup is
+  does not remove its old backups. A host that declines, or refuses the call in its definite word,
+  has recorded nothing, so the bundle is written again without the archive it was made to name, and
+  the card says why the host declined and that its backups were not changed. A setup whose answer
+  was lost, or that the host refused for now, keeps its entry in the bundle until the next try finds
+  the setup if it landed; if it did not land, the entry names an archive the host never made, which
+  a restore lists as holding nothing. A setup is
   told from another by the recipient's public key that the host's status carries, and not by the
   fingerprint, which is 40 bits of it: the fingerprint is for people. The card covers the host on
   this computer only: a paired host cannot be asked for its status.

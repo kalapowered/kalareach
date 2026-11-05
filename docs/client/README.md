@@ -914,10 +914,11 @@ marked as one this device cannot check, and nothing is signed for it. The platfo
 trait the application implements, and names itself as a `CeremonyKind` (Touch ID, Face ID, the
 password or passcode, Windows Hello, a phone's strong biometric or screen lock, or none); it is
 asked with that line and the challenge's remaining lifetime, and only a confirmation inside that lifetime is signed, on `owner_device_presence`, and
-completed. Only the host's own refusal makes a review "not confirmed". A host that says nothing for
-ten seconds, one that replies that it does not know what came of the answer, or a connection that
-ends after the answer went, may still have taken it: the device asks what the host lists, and the
-review is "confirmed" when the challenge is listed as answered and "unknown" otherwise.
+completed. Only the host's own definite refusal makes a review "not confirmed". A host that says
+nothing for ten seconds, one that replies that it does not know what came of the answer or that it
+cannot take it now (a transient code), or a connection that ends after the answer went, may still
+have taken it: the device asks what the host lists, and the review is "confirmed" when the challenge
+is listed as answered and "unknown" otherwise.
 
 ## Managed services
 

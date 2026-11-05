@@ -835,9 +835,10 @@ impl Session {
     ///
     /// A host that refuses the mutation for now (a transient code) has decided nothing: the action
     /// stays on the unresolved list, with the others the host refused for now, of which the
-    /// newest 64 are kept. A caller that wants the same send tried again
-    /// composes it and sends it ([`Session::send`]) rather than calling this again, which is a new
-    /// intent under a new identifier; the host performs the identifier it is sent at most once.
+    /// newest 64 are kept. A caller that wants the same send tried again sends it under its own
+    /// identifier ([`Session::mutate_continuing`]), or composes it and sends it
+    /// ([`Session::send`]); calling this again is a new intent under a new identifier. The host
+    /// performs the identifier it is sent at most once.
     ///
     /// # Errors
     ///
