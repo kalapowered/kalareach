@@ -380,11 +380,11 @@ impl Drop for Shell {
     }
 }
 
-/// KR-REQ-12.02, KR-REQ-05.09 and KR-REQ-07.61: a launch is committed for the program the launcher
-/// created and not for the launcher, which is that program's parent; the program runs in a job of
-/// its own, with the variable its package declares, and in the directory the launcher worked in.
+/// KR-REQ-05.09 and KR-REQ-07.61: a launch is committed for the program the launcher created and
+/// not for the launcher, which is that program's parent; the program runs in a job of its own, with
+/// the variable its package declares, and in the directory the launcher worked in.
 #[test]
-fn kr_req_12_02_a_launch_commits_the_program_the_launcher_created() {
+fn a_launch_commits_the_program_the_launcher_created() {
     let shell = Shell::new();
     let answer = shell.establish();
     let mut launcher = shell.launch(&answer, "committed", &[]);
@@ -441,10 +441,10 @@ fn kr_req_12_02_a_launch_commits_the_program_the_launcher_created() {
     );
 }
 
-/// KR-REQ-12.02: the launcher ends with the whole exit code of its program, which is 32 bits on this
-/// platform. Control: a small code reaches the shell as it is.
+/// The launcher ends with the whole exit code of its program, which is 32 bits on this platform.
+/// Control: a small code reaches the shell as it is.
 #[test]
-fn kr_req_12_02_the_launcher_returns_the_programs_whole_exit_code() {
+fn the_launcher_returns_the_programs_whole_exit_code() {
     let shell = Shell::new();
     for (code, name) in [("305419896", "whole"), ("3", "small")] {
         let answer = shell.establish();
@@ -460,11 +460,11 @@ fn kr_req_12_02_the_launcher_returns_the_programs_whole_exit_code() {
     }
 }
 
-/// KR-REQ-12.02: a program run as typed, because the backend refused the launch, also ends the
-/// launcher with its whole 32-bit exit code and not with that code cut to a byte. Control: a small
-/// code reaches the shell as it is (`kr_req_12_07_a_launch_the_backend_refuses_runs_as_typed`).
+/// A program run as typed, because the backend refused the launch, also ends the launcher with its
+/// whole 32-bit exit code and not with that code cut to a byte. Control: a small code reaches the
+/// shell as it is (`kr_req_12_07_a_launch_the_backend_refuses_runs_as_typed`).
 #[test]
-fn kr_req_12_02_a_program_run_as_typed_returns_its_whole_exit_code() {
+fn a_program_run_as_typed_returns_its_whole_exit_code() {
     let shell = Shell::new();
     let answer = shell.establish();
     let mut launcher = shell.launcher(
@@ -1014,13 +1014,13 @@ fn a_launcher_gone_before_it_is_confirmed_leaves_no_suspended_program() {
     });
 }
 
-/// KR-REQ-12.02: a launcher that stops after it created its program and before the backend has
-/// looked at it leaves no program suspended: the program ends with the launcher, whatever the
-/// backend does or does not do next. The backend is held where it has been told the program's name
-/// and not yet shown it, so nothing of the host can end the program for it. Control: the next case,
-/// in which a launcher that is not stopped has its program started and that program outlives it.
+/// A launcher that stops after it created its program and before the backend has looked at it
+/// leaves no program suspended: the program ends with the launcher, whatever the backend does or
+/// does not do next. The backend is held where it has been told the program's name and not yet
+/// shown it, so nothing of the host can end the program for it. Control: the next case, in which a
+/// launcher that is not stopped has its program started and that program outlives it.
 #[test]
-fn kr_req_12_02_a_launcher_gone_before_its_program_is_shown_leaves_no_suspended_program() {
+fn a_launcher_gone_before_its_program_is_shown_leaves_no_suspended_program() {
     let shell = Shell::new();
     let answer = shell.establish();
     let (arrived, release) = shell.backends.pause_before_showing();
@@ -1059,13 +1059,13 @@ fn kr_req_12_02_a_launcher_gone_before_its_program_is_shown_leaves_no_suspended_
     let _ = release.send(());
 }
 
-/// KR-REQ-12.02, the control of the case above: a program a launcher started is not ended with the
-/// launcher. Once the worker has read that the launcher started the program, the launcher is ended
-/// from outside, and the program, which waits for that, still writes what it was waiting to write.
-/// The program is started after the launcher has let go of its job; a launcher that is gone before
-/// it has said so is the worker's to answer by ending the program, which is not this case.
+/// The control of the case above: a program a launcher started is not ended with the launcher. Once
+/// the worker has read that the launcher started the program, the launcher is ended from outside,
+/// and the program, which waits for that, still writes what it was waiting to write. The program is
+/// started after the launcher has let go of its job; a launcher that is gone before it has said so
+/// is the worker's to answer by ending the program, which is not this case.
 #[test]
-fn kr_req_12_02_a_program_that_is_started_outlives_the_launcher_that_started_it() {
+fn a_program_that_is_started_outlives_the_launcher_that_started_it() {
     let shell = Shell::new();
     let answer = shell.establish();
     let gone = shell.reports.join("launcher.gone");
@@ -1130,14 +1130,14 @@ fn kr_req_05_09_the_hold_on_a_launchs_file_ends_with_its_commit() {
     ));
 }
 
-/// KR-REQ-12.02: a program that has run and ended before the worker has heard that the launcher
-/// started it does not take what it started with it: the program's end retires its backend and ends
-/// the worker's wait, and what the program started is still running. Here the test plays the
-/// program: it puts a helper in the program's job and ends the program while the launcher holds it,
-/// committed, before it starts it. Control: the same wait, with the launcher saying nothing,
-/// ends at its deadline and ends the job (`kr_req_12_02_a_program_that_is_never_started_is_ended`).
+/// A program that has run and ended before the worker has heard that the launcher started it does
+/// not take what it started with it: the program's end retires its backend and ends the worker's
+/// wait, and what the program started is still running. Here the test plays the program: it puts a
+/// helper in the program's job and ends the program while the launcher holds it, committed, before
+/// it starts it. Control: the same wait, with the launcher saying nothing, ends at its deadline and
+/// ends the job (`a_program_that_is_never_started_is_ended`).
 #[test]
-fn kr_req_12_02_a_program_that_ends_before_the_launcher_is_heard_leaves_what_it_started() {
+fn a_program_that_ends_before_the_launcher_is_heard_leaves_what_it_started() {
     let shell = Shell::new();
     let answer = shell.establish();
     *shell.barrier.lock().expect("the barrier") = Some(shell.reports.join("barrier"));
@@ -1182,10 +1182,10 @@ fn kr_req_12_02_a_program_that_ends_before_the_launcher_is_heard_leaves_what_it_
     drop(launcher);
 }
 
-/// KR-REQ-12.02: a program that was committed and never started is ended with everything in its job
-/// when the launcher says nothing within its deadline, and its instance ends with it.
+/// A program that was committed and never started is ended with everything in its job when the
+/// launcher says nothing within its deadline, and its instance ends with it.
 #[test]
-fn kr_req_12_02_a_program_that_is_never_started_is_ended() {
+fn a_program_that_is_never_started_is_ended() {
     let shell = Shell::new();
     let answer = shell.establish();
     let mut scripted = shell.admitted_launcher(&answer);
@@ -1438,14 +1438,14 @@ fn kr_req_12_16_a_directory_converted_to_a_link_before_the_commit_grants_nothing
     );
 }
 
-/// KR-REQ-12.02: a launch of a program as large as the largest agent, written new and so not yet
-/// seen by the system, is committed within the launcher's deadlines and the worker's, which are
-/// measured together here: the backend hashes 300 MB while the launcher waits, the program is
-/// created from the file the worker holds, and the commit follows. The time each step takes is
-/// printed, so the evidence names what the deadlines were set against. Control: the launch of a
-/// small file is committed by the same run.
+/// A launch of a program as large as the largest agent, written new and so not yet seen by the
+/// system, is committed within the launcher's deadlines and the worker's, which are measured
+/// together here: the backend hashes 300 MB while the launcher waits, the program is created from
+/// the file the worker holds, and the commit follows. The time each step takes is printed, so the
+/// evidence names what the deadlines were set against. Control: the launch of a small file is
+/// committed by the same run.
 #[test]
-fn kr_req_12_02_a_cold_copy_of_the_largest_agent_is_launched_within_the_deadlines() {
+fn a_cold_copy_of_the_largest_agent_is_launched_within_the_deadlines() {
     let shell = Shell::large(300 * 1024 * 1024);
     let answer = shell.establish();
     let started = Instant::now();
