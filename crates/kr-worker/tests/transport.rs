@@ -6074,15 +6074,41 @@ async fn kr_req_11_33_a_blocked_partial_or_unanswered_write_is_never_a_success()
         "an answer whose fate nobody can establish leaves the resource uncertain"
     );
 
-    // And it is never sent again: a second attempt is refused by the arbitration rather than
-    // writing the same answer twice.
-    assert!(
-        owner
-            .from_client(answer.as_bytes(), TimestampMs::new(4))
-            .await
-            .is_err(),
-        "an uncertain answer is not replayed"
+    // And it is never sent again. The arbitration is what refuses a second answer for a resource
+    // whose fate nobody can establish, and it does so from the moment the resource is settled,
+    // which is the moment this case has waited for.
+    let again = broker.admit_native_answer(
+        GatewayConnectionId::new(1),
+        answer.as_bytes(),
+        TimestampMs::new(4),
     );
+    assert!(
+        matches!(
+            again,
+            Err(kr_worker::broker::BrokerError::Arbitration(
+                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
+                    state: PendingState::Uncertain
+                }
+            ))
+        ),
+        "the arbitration admits no second answer for an uncertain resource: {again:?}"
+    );
+    // The same answer sent through the owner is not forwarded either. The writer settles the
+    // resource first and stops the owner right after, and this case does not control the gap
+    // between the two: sent in it, the answer is reported late and the connection goes on; sent
+    // after it, the owner has stopped serving and refuses it. It is a second answer to the
+    // upstream in neither.
+    match owner
+        .from_client(answer.as_bytes(), TimestampMs::new(5))
+        .await
+    {
+        Err(_) => {}
+        Ok(Carried::ClientAnswerLate { resource_id, state }) => {
+            assert_eq!(resource_id, resource.resource_id);
+            assert_eq!(state, PendingState::Uncertain);
+        }
+        other => panic!("an uncertain answer is not replayed: {other:?}"),
+    }
     // What the observers are told is the uncertainty, not a resolution: every authorised watcher
     // of the instance learns the state the resource actually reached.
     let transition = settlement_of(&mut observations, resource.resource_id).await;
