@@ -1,8 +1,8 @@
 //! Holds: which workspaces a capture can hold still, what holding one keeps the host's own
 //! writers from doing, and which sessions stand in the way.
 //!
-//! KR-REQ-14.32 (a quiesced capture rests on a reservation that every writer this host
-//! coordinates respects) and KR-REQ-25.20 (the writers consult the quiescence authority).
+//! A quiesced capture rests on a reservation that every writer this host coordinates respects,
+//! and the writers consult the quiescence authority.
 //!
 //! Every test here asks the project service to run Git, which it does not do on Windows; the
 //! registry's own cases, which need no repository, are in `src/holds.rs` and run there.
