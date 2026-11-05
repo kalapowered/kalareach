@@ -100,9 +100,14 @@ pub fn packages() -> Result<PackageSet> {
     if let Some(store) = installed_store() {
         let root = match store.current_shells() {
             Ok(Some(root)) => root,
-            // No release is current, so there is no package to find: the path through `current`
-            // names nothing, and reads as it always has.
-            Ok(None) => store.stable_shells(),
+            // No release is current, so the store holds no package: the link is not walked to
+            // find that out, since a first installation could publish it meanwhile.
+            Ok(None) => {
+                return Err(CliError::ShellIntegrationUnsupported(shown!(
+                    "the store at {} names no current release, so it holds no shell package",
+                    Shown::root(store.root())
+                )));
+            }
             Err(error) => {
                 return Err(CliError::ShellIntegrationUnsupported(crate::update::said(
                     &error,
@@ -178,11 +183,12 @@ fn stable_entry(package: &ShellPackage) -> Result<Option<std::path::PathBuf>> {
     // The file is looked for in the release `current` names, read once, so a switch under way
     // cannot make a file every release carries look absent. The path written is the one through
     // `current`, which follows every update.
-    let carried = match store.current_shells() {
-        Ok(Some(shells)) => shells.join(package.kind().as_str()).join(name).is_file(),
-        // No release is current, or the link cannot be read: nothing carries the file.
-        Ok(None) | Err(_) => false,
-    };
+    let shells = store
+        .current_shells()
+        .map_err(|error| CliError::ShellIntegrationUnsupported(crate::update::said(&error)))?;
+    // With no release current nothing carries the file.
+    let carried =
+        shells.is_some_and(|shells| shells.join(package.kind().as_str()).join(name).is_file());
     if !carried {
         return Err(CliError::ShellIntegrationUnsupported(shown!(
             "the current release has no {} startup entry at {}, which the startup file of an \
