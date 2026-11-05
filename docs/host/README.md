@@ -4107,14 +4107,16 @@ request that supersedes it. So a fresh identifier for a subject that already car
 its preconditions name that action and the receipt revision the caller read it at. A service that
 wanted to hide the uncertainty would have to name the receipt it was hiding.
 
-The subject of every `question.answer` in a session is the target alone, so its digest cannot tell
-the answers to two questions apart. The worker reads the envelope the receipt kept instead: an
-answer to a question is refused for an uncertain answer to that same question, and an answer to
-another question of the session is admitted. A request that names an uncertain answer to another
-question names nothing this answer has to show, and is refused. A receipt whose question the worker
-cannot read holds back every answer of the actor in the session, as the rule above does: its
-envelope is gone (privacy mode removes it once an action settles), does not decode, or is not an
-answer. `question.cancel` and every other method keep the rule above.
+The subject of every `question.answer` in a session is the target alone, and so is the subject of
+every `question.cancel`, so a digest cannot tell the requests about two questions apart. The worker
+reads the envelope the receipt kept instead: an answer to a question is refused for an uncertain
+answer to that same question, a cancellation of a question is refused for an uncertain cancellation
+of that same question, and a request about another question of the session is admitted. A request
+that names an uncertain answer or cancellation of another question names nothing it has to show, and
+is refused. A receipt whose question the worker cannot read holds back every request of its kind by
+the actor in the session, as the rule above does: its envelope is gone (privacy mode removes it once
+an action settles), does not decode, or is not a request of that kind. Every other method keeps the
+rule above.
 
 The revision has to be one the caller was shown. The worker remembers, in memory and for a bounded
 number of receipts, the revision of each receipt that `action.read` answered to each actor, and a
