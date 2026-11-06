@@ -13,9 +13,10 @@ use kr_protocol::authority::{CapabilityRequirement, EffectClass, RevisionBinding
 use kr_protocol::envelope::{ActionTarget, TargetError};
 use kr_protocol::ids::{
     ActionId, AgentBindingRevision, AgentThreadId, AgentTurnId, ApplicationInstanceId,
-    ApprovalRequestId, CapabilityId, CapabilityRevision, ControllerGeneration, DeviceId, DraftId,
-    DraftRevision, EnvironmentId, GrantId, MachineId, QuestionId, QuestionRevision,
-    RemoteDispatchLeaseId, SessionEpoch, SessionId, SessionRef, StreamCursor,
+    ApprovalRequestId, CapabilityId, CapabilityRevision, CausalRootId, ChangeSetId,
+    ChangeSetVersion, ControllerGeneration, DeviceId, DraftId, DraftRevision, EnvironmentId,
+    GrantId, MachineId, ProjectRepositoryId, QuestionId, QuestionRevision, RemoteDispatchLeaseId,
+    SessionEpoch, SessionId, SessionRef, StreamCursor, WorkflowId, WorkflowRunId, WorkspaceId,
 };
 use kr_protocol::method::lookup;
 use kr_protocol::scalars::{EndpointKey, Nullable, Uuid};
@@ -342,6 +343,109 @@ fn questions_devices_grants_and_drafts_are_distinct_objects() {
                 CapabilityRequirement::Required { revision, .. } if revision == binding
             ),
             "{method} is bound to the exact {binding:?}"
+        );
+    }
+}
+
+/// KR-REQ-06.09: a project repository, a workspace, a change set, the exact version of a change
+/// set, a workflow, one run of it and a causal root are seven distinct objects: seven types that
+/// cannot stand in for one another and seven named definitions in the published schema. Six are
+/// 16-byte identifiers and the version is an unsigned counter, so neither kind decodes as the
+/// other. A record of a workflow run names its workflow, its run and its causal root as three
+/// fields of their own types, and the method registry binds reading, materialising, applying and
+/// reverting a change set to the exact change-set version. Not shown here: how a repository's
+/// identifier follows the checkout it names, which is the project service's own cases, and how a
+/// causal chain is bounded, which is the automation cases.
+#[test]
+fn repositories_workspaces_change_sets_and_workflows_are_distinct_objects() {
+    assert_distinct(&[
+        ("project_repository_id", TypeId::of::<ProjectRepositoryId>()),
+        ("workspace_id", TypeId::of::<WorkspaceId>()),
+        ("change_set_id", TypeId::of::<ChangeSetId>()),
+        ("change_set_version", TypeId::of::<ChangeSetVersion>()),
+        ("workflow_id", TypeId::of::<WorkflowId>()),
+        ("workflow_run_id", TypeId::of::<WorkflowRunId>()),
+        ("causal_root_id", TypeId::of::<CausalRootId>()),
+    ]);
+
+    let schema = protocol_schema();
+    for (object, definition) in [
+        ("project_repository_id", "ProjectRepositoryId"),
+        ("workspace_id", "WorkspaceId"),
+        ("change_set_id", "ChangeSetId"),
+        ("workflow_id", "WorkflowId"),
+        ("workflow_run_id", "WorkflowRunId"),
+        ("causal_root_id", "CausalRootId"),
+    ] {
+        assert_object(&schema, object, definition, Shape::Uuid);
+    }
+    assert_object(
+        &schema,
+        "change_set_version",
+        "ChangeSetVersion",
+        Shape::Counter,
+    );
+
+    // Six identifiers are 16-byte strings and the version is an integer, and neither decodes as
+    // the other: a version is not an identifier, and an identifier is not a version.
+    let identifier = uuid("0f7c0b64-52c2-4a41-9d62-6ad1f9f8b6a3");
+    let identifiers = [
+        wire(&ProjectRepositoryId::new(identifier)),
+        wire(&WorkspaceId::new(identifier)),
+        wire(&ChangeSetId::new(identifier)),
+        wire(&WorkflowId::new(identifier)),
+        wire(&WorkflowRunId::new(identifier)),
+        wire(&CausalRootId::new(identifier)),
+    ];
+    for bytes in &identifiers {
+        assert_eq!(bytes.len(), 17, "a 16-byte string and its head");
+        assert!(
+            from_canonical_slice::<ChangeSetVersion>(bytes, &Limits::DEFAULT).is_err(),
+            "an identifier is not a change-set version"
+        );
+    }
+    let version = ChangeSetVersion::new(3);
+    assert_eq!(hex::encode(wire(&version)), "03");
+    assert!(
+        from_canonical_slice::<WorkspaceId>(&wire(&version), &Limits::DEFAULT).is_err(),
+        "a change-set version is not an identifier"
+    );
+    let last = ChangeSetVersion::new(u64::MAX);
+    assert_eq!(
+        from_canonical_slice::<ChangeSetVersion>(&wire(&last), &Limits::DEFAULT).expect("decodes"),
+        last,
+        "a version reaches the full unsigned 64-bit range"
+    );
+
+    // A run of a workflow names the three objects as fields of their own types.
+    let run = &schema["$defs"]["WorkflowRunSummary"]["properties"];
+    for (field, definition) in [
+        ("run_id", "WorkflowRunId"),
+        ("workflow_id", "WorkflowId"),
+        ("causal_root_id", "CausalRootId"),
+    ] {
+        assert_eq!(
+            run[field]["$ref"],
+            format!("#/$defs/{definition}"),
+            "a workflow run's {field}"
+        );
+    }
+
+    // Reading, materialising, applying and reverting a change set name the exact version.
+    for method in [
+        "changeset.read",
+        "changeset.materialize",
+        "diff.apply",
+        "diff.revert",
+    ] {
+        let entry = lookup(method).expect("listed");
+        assert!(
+            matches!(
+                entry.capability,
+                CapabilityRequirement::Required { revision, .. }
+                    if revision == RevisionBinding::ChangeSetVersion
+            ),
+            "{method} is bound to the exact change-set version"
         );
     }
 }
