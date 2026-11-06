@@ -10,8 +10,12 @@
 //! each program's load commands and not by running anything: the libraries a program names, the
 //! `@rpath` entries it carries, and the same of each library found, until nothing new is named.
 //! Where this host differs from the loader it leaves a library ungranted, so that the program does
-//! not start inside the profile, or it refuses the set; both fail closed. The one difference that
-//! grants more is a name under a system path, which `find` explains. A library is granted by the
+//! not start inside the profile, or it refuses the set; both fail closed. The differences that
+//! grant more are a name under a system path, which `find` explains; a library that two images
+//! reach through different search paths, which is followed through the first image the walk goes
+//! into it from, as the loader does, while the other image's name for it may lead to another file
+//! that is granted too; and the first slice of a universal file that is this machine's kind of
+//! program, whatever its subtype. A library is granted by the
 //! directory it is in once every link in its name is resolved, because a profile judges the path a
 //! file has, not the one it was opened by, and because Git and the libraries it loads open further
 //! modules from the same directory while they run.
@@ -69,7 +73,8 @@ struct Image {
     file: PathBuf,
     /// The directory of the program the loader started, which `@executable_path` names.
     executable_directory: PathBuf,
-    /// The `@rpath` entries of the images that loaded this one, each already expanded.
+    /// The `@rpath` entries of the images the walk went through to reach this one, nearest first,
+    /// each already expanded.
     inherited: Vec<PathBuf>,
 }
 
@@ -110,6 +115,7 @@ pub fn support_set(programs: &[&Path], helper_directory: &Path) -> Result<Vec<Pa
         candidates.push((entry.path(), false));
     }
     let mut reader = Reader::default();
+    let roots = Roots::account();
     let mut seen = HashSet::new();
     let mut directories = BTreeSet::new();
     for (candidate, required) in &candidates {
@@ -127,58 +133,80 @@ pub fn support_set(programs: &[&Path], helper_directory: &Path) -> Result<Vec<Pa
             continue;
         }
         let executable_directory = file.parent().unwrap_or(&file).to_owned();
-        // A library is loaded once for a program, by the first image that names it, and the loader
-        // goes into the libraries an image names in the order it names them: what a library
-        // names through `@rpath` is found through the search path of whoever named it first.
-        let mut loaded = HashSet::new();
-        let mut pending = vec![Image {
+        let mut walk = Walk {
+            reader: &mut reader,
+            roots: &roots,
+            directories: &mut directories,
+            entered: HashSet::from([file.clone()]),
+        };
+        walk.go_into(&Image {
             file,
             executable_directory,
             inherited: Vec::new(),
-        }];
-        while let Some(image) = pending.pop() {
-            let Some(named) = reader.named(&image.file)? else {
-                continue;
-            };
-            let own: Vec<PathBuf> = named
-                .rpaths
-                .iter()
-                .filter_map(|rpath| expand(rpath, &image))
-                .collect();
-            let search: Vec<PathBuf> = own.iter().chain(image.inherited.iter()).cloned().collect();
-            let mut next = Vec::new();
-            for (name, weak) in &named.libraries {
-                let Some(found) = find(name, &image, &search) else {
-                    if *weak {
-                        continue;
-                    }
-                    return Err(ProjectError::GitFailed {
-                        detail: format!(
-                            "{} loads {}, which this host does not find, so the support set of an \
-                             invocation for a caller bounded by a grant cannot be named",
-                            crate::git::redact(&image.file.display().to_string()),
-                            crate::git::redact(&shown(name))
-                        )
-                        .into(),
-                    });
-                };
-                let Found::File(library) = found else {
-                    continue;
-                };
-                directories.insert(library_directory(&library, name)?);
-                if loaded.insert(library.clone()) {
-                    next.push(Image {
-                        file: library,
-                        executable_directory: image.executable_directory.clone(),
-                        inherited: search.clone(),
-                    });
-                }
-            }
-            // The stack is last in, first out, so the first library named is pushed last.
-            pending.extend(next.into_iter().rev());
-        }
+        })?;
     }
     Ok(directories.into_iter().collect())
+}
+
+/// One program's walk through the libraries it loads.
+struct Walk<'a> {
+    reader: &'a mut Reader,
+    roots: &'a Roots,
+    directories: &'a mut BTreeSet<PathBuf>,
+    /// The files the walk has gone into. A library is gone into once for a program, from the
+    /// first image the walk goes into it from.
+    entered: HashSet<PathBuf>,
+}
+
+impl Walk<'_> {
+    /// Goes into one image as the loader does: it finds everything the image names, and only then
+    /// goes into each of those in the order they are named, so a library that two images name is
+    /// gone into from the earlier of them, and what it names through `@rpath` is found through
+    /// the search path of that image and of the ones above it.
+    fn go_into(&mut self, image: &Image) -> Result<()> {
+        let Some(named) = self.reader.named(&image.file)? else {
+            return Ok(());
+        };
+        let own: Vec<PathBuf> = named
+            .rpaths
+            .iter()
+            .filter_map(|rpath| expand(rpath, image))
+            .collect();
+        let search: Vec<PathBuf> = own.iter().chain(image.inherited.iter()).cloned().collect();
+        let mut found_here = Vec::new();
+        for (name, weak) in &named.libraries {
+            let Some(found) = find(name, image, &search) else {
+                if *weak {
+                    continue;
+                }
+                return Err(ProjectError::GitFailed {
+                    detail: format!(
+                        "{} loads {}, which this host does not find, so the support set of an \
+                         invocation for a caller bounded by a grant cannot be named",
+                        crate::git::redact(&image.file.display().to_string()),
+                        crate::git::redact(&shown(name))
+                    )
+                    .into(),
+                });
+            };
+            let Found::File(library) = found else {
+                continue;
+            };
+            self.directories
+                .insert(library_directory(&library, name, self.roots)?);
+            found_here.push(library);
+        }
+        for library in found_here {
+            if self.entered.insert(library.clone()) {
+                self.go_into(&Image {
+                    file: library,
+                    executable_directory: image.executable_directory.clone(),
+                    inherited: search.clone(),
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What each object names, read once however many programs load it: the libraries and `@rpath`
@@ -379,9 +407,9 @@ fn this_machine() -> u32 {
 
 /// Returns the directory one library is in, and refuses a directory that is not one to grant as a
 /// support directory.
-fn library_directory(library: &Path, named: &Path) -> Result<PathBuf> {
+fn library_directory(library: &Path, named: &Path, roots: &Roots) -> Result<PathBuf> {
     let directory = library.parent().unwrap_or(library).to_owned();
-    if broad(&directory) {
+    if broad(&directory, roots) {
         return Err(ProjectError::GitFailed {
             detail: format!(
                 "{} is in {}, which is not a directory this host grants as a support directory, so \
@@ -395,12 +423,88 @@ fn library_directory(library: &Path, named: &Path) -> Result<PathBuf> {
     Ok(directory)
 }
 
+/// The home directory of the account this host runs as and its `Library`, which keep the
+/// keychains, the applications' data and the credentials of a person, and so are no support
+/// directory and are held by no support directory.
+///
+/// Each is kept by every name it can be compared by: the one it was given by, and the one it has
+/// once every link in it is resolved. A library's directory is resolved before it is compared, so
+/// a home reached through a link, a home that is not under `/Users` and a `Library` that was
+/// moved elsewhere are each compared by the name the library's directory would have in them.
+#[derive(Debug, Default)]
+struct Roots {
+    homes: Vec<PathBuf>,
+    libraries: Vec<PathBuf>,
+}
+
+impl Roots {
+    /// Returns the roots of the account this process runs as: the home its environment names and
+    /// the one the system's account database gives.
+    fn account() -> Self {
+        Self::resolving(&account_homes())
+    }
+
+    /// Returns the roots of these homes, each by its own name and by its resolved one, and of the
+    /// `Library` in each, by the same two.
+    fn resolving(homes: &[PathBuf]) -> Self {
+        let mut roots = Self::default();
+        for home in homes.iter().filter(|home| home.is_absolute()) {
+            let mut names = vec![home.clone()];
+            names.extend(std::fs::canonicalize(home).ok());
+            for name in names {
+                let library = name.join("Library");
+                let mut libraries = vec![library.clone()];
+                libraries.extend(std::fs::canonicalize(&library).ok());
+                push_new(&mut roots.homes, name);
+                for root in libraries {
+                    push_new(&mut roots.libraries, root);
+                }
+            }
+        }
+        roots
+    }
+
+    /// Returns whether an object is one of these roots, holds one, or is directly in one.
+    fn hold(&self, object: &Path) -> bool {
+        self.homes
+            .iter()
+            .chain(&self.libraries)
+            .any(|root| root.starts_with(object) || object.parent() == Some(root))
+    }
+}
+
+/// Adds a path to a list that does not hold it yet.
+fn push_new(list: &mut Vec<PathBuf>, path: PathBuf) {
+    if !list.contains(&path) {
+        list.push(path);
+    }
+}
+
+/// Returns the homes of the account this process runs as, by the two sources there are for them:
+/// the `HOME` of its environment, and the home the system's account database gives its user, which
+/// the environment cannot change.
+fn account_homes() -> Vec<PathBuf> {
+    homes_from(
+        std::env::var_os("HOME").map(PathBuf::from),
+        super::macos::passwd_home(),
+    )
+}
+
+/// Returns the absolute ones of these two homes, once each.
+fn homes_from(environment: Option<PathBuf>, database: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut homes: Vec<PathBuf> = environment.into_iter().chain(database).collect();
+    homes.retain(|home| home.is_absolute());
+    homes.dedup();
+    homes
+}
+
 /// Returns whether a support object lies in, or holds, a tree no support object may, or holds a
 /// tree a support directory may only lie in, or is the top of one: a directory directly in such a
 /// tree is a volume, a package prefix or a bundle, and holds a great deal besides libraries. So is
 /// a person's home, the directories directly in it and those directly in its `Library`, where the
-/// keychains and the applications' data are kept.
-fn broad(object: &Path) -> bool {
+/// keychains and the applications' data are kept: the homes under `/Users` by their names, and the
+/// account's own by the names `Roots` keeps, with whatever holds them.
+fn broad(object: &Path, roots: &Roots) -> bool {
     let directly_in = |trees: &[&str]| {
         object
             .parent()
@@ -420,10 +524,7 @@ fn broad(object: &Path) -> bool {
             .ok()
             .and_then(|rest| rest.components().next())
             .is_some_and(|name| near_a_home(object, &Path::new("/Users").join(name)))
-        || std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|home| home.is_absolute())
-            .is_some_and(|home| near_a_home(object, &home))
+        || roots.hold(object)
 }
 
 /// Returns whether an object is a home directory, directly in it, or directly in its `Library`.
@@ -488,7 +589,10 @@ mod tests {
             "/usr/local",
             "/Applications/Tool.app",
         ] {
-            assert!(broad(Path::new(broad_path)), "{broad_path} is broad");
+            assert!(
+                broad(Path::new(broad_path), &Roots::default()),
+                "{broad_path} is broad"
+            );
         }
         for fine in [
             "/opt/homebrew/Cellar/gettext/1.0/lib",
@@ -503,37 +607,173 @@ mod tests {
             "/Volumes/Tools/git/lib",
         ] {
             assert!(
-                !broad(Path::new(fine)),
+                !broad(Path::new(fine), &Roots::default()),
                 "{fine} is a directory of libraries"
             );
         }
     }
 
+    /// A directory to build a home in, next to the test program, which no rule about the system's
+    /// own trees refuses, and its own name with every link in it resolved.
+    fn scratch() -> (tempfile::TempDir, PathBuf) {
+        let program = std::env::current_exe().expect("the test program's own path");
+        let directory = tempfile::Builder::new()
+            .prefix("kr-macho-")
+            .tempdir_in(program.parent().expect("the program is in a directory"))
+            .expect("a directory to build in");
+        let root = std::fs::canonicalize(directory.path()).expect("the directory's own name");
+        (directory, root)
+    }
+
+    /// Makes these directories.
+    fn make(paths: &[PathBuf]) {
+        for path in paths {
+            std::fs::create_dir_all(path).expect("a directory");
+        }
+    }
+
     #[test]
-    fn a_home_that_is_not_under_the_users_directory_is_broad_at_its_top_as_well() {
-        let home = Path::new("/Volumes/Elsewhere/someone");
-        for top in [
-            "/Volumes/Elsewhere/someone",
-            "/Volumes/Elsewhere/someone/Documents",
-            "/Volumes/Elsewhere/someone/Library",
-            "/Volumes/Elsewhere/someone/Library/Keychains",
+    fn a_home_reached_through_a_link_is_held_by_the_name_a_library_has() {
+        let (_directory, root) = scratch();
+        let home = root.join("real").join("alice");
+        make(&[
+            home.join(".ssh"),
+            home.join("Library").join("Keychains"),
+            home.join("tools").join("lib"),
+            root.join("real").join("bob").join("lib"),
+        ]);
+        std::os::unix::fs::symlink("real/alice", root.join("via")).expect("a link to the home");
+        // The account is told its home by the link, and a library is found by the home itself.
+        let roots = Roots::resolving(&[root.join("via")]);
+        for held in [
+            home.clone(),
+            home.join(".ssh"),
+            home.join("Library"),
+            home.join("Library").join("Keychains"),
+            root.join("real"),
+            root.clone(),
         ] {
+            assert!(roots.hold(&held), "{} is held", held.display());
             assert!(
-                near_a_home(Path::new(top), home),
-                "{top} is the top of a home"
+                broad(&held, &roots),
+                "and is no support directory: {}",
+                held.display()
             );
         }
-        for deeper in [
-            "/Volumes/Elsewhere/someone/Library/Application Support/tool/lib",
-            "/Volumes/Elsewhere/someone/tools/lib",
-            "/Volumes/Elsewhere/other/Library",
-            "/Volumes/Elsewhere",
+        // The controls: what is in the home deeper than its top, and a neighbour.
+        for free in [
+            home.join("tools").join("lib"),
+            root.join("real").join("bob").join("lib"),
         ] {
+            assert!(!roots.hold(&free), "{} is not held", free.display());
             assert!(
-                !near_a_home(Path::new(deeper), home),
-                "{deeper} is not the top of that home"
+                !broad(&free, &roots),
+                "and is a directory of libraries: {}",
+                free.display()
             );
         }
+    }
+
+    #[test]
+    fn a_library_directory_moved_elsewhere_is_held_where_it_now_is() {
+        let (_directory, root) = scratch();
+        let home = root.join("alice");
+        let moved = root.join("elsewhere").join("Library");
+        make(&[
+            home.clone(),
+            moved.join("Keychains"),
+            moved.join("Application Support").join("tool").join("lib"),
+            root.join("other").join("lib"),
+        ]);
+        std::os::unix::fs::symlink(&moved, home.join("Library")).expect("a link to the Library");
+        let roots = Roots::resolving(std::slice::from_ref(&home));
+        for held in [
+            moved.clone(),
+            moved.join("Keychains"),
+            moved.join("Application Support"),
+            root.join("elsewhere"),
+        ] {
+            assert!(
+                broad(&held, &roots),
+                "{} is held where the Library now is",
+                held.display()
+            );
+        }
+        for free in [
+            moved.join("Application Support").join("tool").join("lib"),
+            root.join("other").join("lib"),
+        ] {
+            assert!(
+                !broad(&free, &roots),
+                "{} is a directory of libraries",
+                free.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_library_in_a_home_is_refused_by_the_name_it_has_through_a_link() {
+        let (_directory, root) = scratch();
+        let home = root.join("real").join("alice");
+        make(&[home.join("Library"), home.join("tools").join("lib")]);
+        std::os::unix::fs::symlink("real/alice", root.join("via")).expect("a link to the home");
+        let roots = Roots::resolving(&[root.join("via")]);
+        let refusal = library_directory(
+            &home.join("Library").join("libkr.dylib"),
+            Path::new("@rpath/libkr.dylib"),
+            &roots,
+        )
+        .expect_err("a library at the top of a Library is no support object");
+        assert!(
+            refusal
+                .to_string()
+                .contains("not a directory this host grants"),
+            "and the refusal says why: {refusal}"
+        );
+        assert_eq!(
+            library_directory(
+                &home.join("tools").join("lib").join("libkr.dylib"),
+                Path::new("@rpath/libkr.dylib"),
+                &roots
+            )
+            .expect("a library deeper in the home is a support object"),
+            home.join("tools").join("lib")
+        );
+    }
+
+    #[test]
+    fn the_homes_of_the_account_are_named_by_its_environment_and_by_the_system() {
+        let home = |path: &str| Some(PathBuf::from(path));
+        assert_eq!(
+            homes_from(home("/Volumes/One/me"), home("/Users/me")),
+            [PathBuf::from("/Volumes/One/me"), PathBuf::from("/Users/me")],
+            "both are kept when they differ"
+        );
+        assert_eq!(
+            homes_from(None, home("/Users/me")),
+            [PathBuf::from("/Users/me")]
+        );
+        assert_eq!(
+            homes_from(home("/Users/me"), home("/Users/me")),
+            [PathBuf::from("/Users/me")],
+            "and once when they do not"
+        );
+        assert!(
+            homes_from(home("relative/me"), None).is_empty(),
+            "a home that is not absolute names nothing"
+        );
+
+        let passwd = super::super::macos::passwd_home().expect("the system names a home");
+        assert!(
+            passwd.is_absolute() && passwd.is_dir(),
+            "{}",
+            passwd.display()
+        );
+        assert!(
+            account_homes().contains(&passwd),
+            "the account's homes hold it"
+        );
+        assert!(Roots::account().hold(&passwd), "and so do its roots");
     }
 
     #[test]

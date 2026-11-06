@@ -25,7 +25,9 @@
 //! by reading it. The directories above each granted path may be examined, which tells that they
 //! exist and what their attributes are, because Git resolves a name one directory at a time. The
 //! profile also allows `sysctl-read` without a filter, as the owner's profile does: it is a
-//! question to the kernel and not the read of a file, and this boundary does not narrow it.
+//! question to the kernel and not the read of a file, and this boundary does not narrow it. A
+//! program inside the profile can read the argument list of another process of the same account
+//! through it, and through the same call without that rule.
 //!
 //! A profile judges the path a file has, not the name it was opened by, so every path it names is
 //! resolved first, and a link inside a granted directory that leads outside it is refused at the
@@ -73,8 +75,9 @@
 
 #![expect(
     unsafe_code,
-    reason = "the table of mounted filesystems is asked of the kernel with a raw system call that \
-              fills a buffer, which has no safe form here; this module holds that one call"
+    reason = "the table of mounted filesystems and the account database are asked of the system \
+              with raw calls that fill a buffer, which have no safe form here; this module holds \
+              those calls"
 )]
 
 use std::ffi::{CStr, OsString};
@@ -439,6 +442,45 @@ fn mount_points() -> std::io::Result<Vec<PathBuf>> {
     Err(std::io::Error::other(
         "the table of mounted filesystems kept changing",
     ))
+}
+
+/// Returns the home directory the system's account database gives the user this process runs as,
+/// which the process's environment cannot change.
+pub(super) fn passwd_home() -> Option<PathBuf> {
+    // SAFETY: `getuid` takes no argument and cannot fail.
+    let user = unsafe { libc::getuid() };
+    let mut room = 1024;
+    // The entry is copied into a buffer of the caller's, which the call says is too small by
+    // failing with `ERANGE`, so a longer one is made and the call is made again.
+    for _ in 0..8 {
+        let mut buffer: Vec<libc::c_char> = vec![0; room];
+        // SAFETY: an all-zero `passwd` is a valid value: its fields are integers and pointers.
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `entry`, `buffer` and `found` are live for the call, `buffer` has `room` bytes,
+        // and the call writes only into them.
+        let status = unsafe {
+            libc::getpwuid_r(
+                user,
+                &raw mut entry,
+                buffer.as_mut_ptr(),
+                room,
+                &raw mut found,
+            )
+        };
+        if status == libc::ERANGE {
+            room *= 4;
+            continue;
+        }
+        if status != 0 || found.is_null() || entry.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: the call ends `pw_dir` with a zero byte, inside `buffer`, which is still live.
+        let directory = unsafe { CStr::from_ptr(entry.pw_dir) };
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(directory.to_bytes()));
+        return path.is_absolute().then_some(path);
+    }
+    None
 }
 
 /// Returns one path as a profile's literal filter.

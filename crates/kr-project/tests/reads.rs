@@ -2196,5 +2196,141 @@ mod confined {
                 owner.stderr
             );
         }
+
+        /// A library takes the search path of the first image the loader goes into it from, not of
+        /// the first image that names it. The loader finds everything an image names, and then goes
+        /// into each of those in order, so a library that the program and an earlier library both
+        /// name is gone into from that earlier library, with its search path. Here the program
+        /// names `libkra` and then `libkrx`, `libkra` names `libkrx` too, and `libkrx` names
+        /// `libkrm`. The program's rpath leads to one directory of a `libkrm` and `libkra`'s to
+        /// another, and the loader takes the one `libkra`'s leads to, so that is the one granted.
+        #[test]
+        fn a_library_takes_the_search_path_of_the_image_the_loader_goes_into_it_from() {
+            let fixture = Fixture::create();
+            let Some(clang) = compiler() else {
+                println!("not exercised: this host has no developer tools to build a library");
+                return;
+            };
+            let (_directory, root) = scratch();
+            for name in ["a", "x", "ma", "mb", "bin", "helpers"] {
+                std::fs::create_dir(root.join(name)).expect("a directory to build in");
+            }
+            let source = |name: &str, text: &str| {
+                std::fs::write(root.join(name), text).expect("a source file");
+            };
+            source("m1.c", "int krm_answer(void) { return 1; }\n");
+            source("m2.c", "int krm_answer(void) { return 2; }\n");
+            source(
+                "x.c",
+                "int krm_answer(void);\nint krx_answer(void) { return krm_answer(); }\n",
+            );
+            source(
+                "a.c",
+                "int krx_answer(void);\nint kra_answer(void) { return krx_answer(); }\n",
+            );
+            source(
+                "program.c",
+                "int kra_answer(void);\nint krx_answer(void);\n\
+                 int main(void) { return kra_answer() + krx_answer(); }\n",
+            );
+            let directory = |name: &str| root.join(name);
+            let flag = |prefix: &str, name: &str| {
+                OsString::from(format!("{prefix}{}", directory(name).display()))
+            };
+            // Every file is built for both architectures, as the system's own programs are
+            // shipped, so the slice for this machine is the one that is read.
+            let compile = |arguments: Vec<OsString>| {
+                let output = Command::new(&clang)
+                    .args(["-arch", "arm64", "-arch", "x86_64"])
+                    .args(&arguments)
+                    .output()
+                    .expect("the compiler starts");
+                assert!(
+                    output.status.success(),
+                    "the compiler builds it: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            let library = |directory_name: &str, name: &str, source: &str, extra: Vec<OsString>| {
+                let mut arguments: Vec<OsString> = vec![
+                    "-dynamiclib".into(),
+                    "-install_name".into(),
+                    format!("@rpath/lib{name}.dylib").into(),
+                    "-o".into(),
+                    directory(directory_name)
+                        .join(format!("lib{name}.dylib"))
+                        .into(),
+                    directory(source).into(),
+                ];
+                arguments.extend(extra);
+                compile(arguments);
+            };
+            library("ma", "krm", "m1.c", Vec::new());
+            library("mb", "krm", "m2.c", Vec::new());
+            library("x", "krx", "x.c", vec![flag("-L", "ma"), "-lkrm".into()]);
+            library(
+                "a",
+                "kra",
+                "a.c",
+                vec![
+                    flag("-L", "x"),
+                    "-lkrx".into(),
+                    flag("-Wl,-rpath,", "mb"),
+                    flag("-Wl,-rpath,", "x"),
+                ],
+            );
+            let program = directory("bin").join("program");
+            compile(vec![
+                "-o".into(),
+                program.clone().into(),
+                directory("program.c").into(),
+                flag("-L", "a"),
+                "-lkra".into(),
+                flag("-L", "x"),
+                "-lkrx".into(),
+                flag("-Wl,-rpath,", "a"),
+                flag("-Wl,-rpath,", "x"),
+                flag("-Wl,-rpath,", "ma"),
+            ]);
+
+            let named =
+                kr_project::boundary::support_set(&[program.as_path()], &directory("helpers"))
+                    .expect("the set of the program is named");
+            assert_eq!(
+                named.libraries(),
+                [directory("a"), directory("mb"), directory("x")],
+                "the directory `libkra`'s search path leads to is granted, and the program's is not"
+            );
+            let location = fixture.work().join("location");
+            std::fs::create_dir_all(&location).expect("a location");
+            let run = |reads: Reads| {
+                run_enclosed(
+                    &fixture,
+                    &location,
+                    Enclosed {
+                        program: &program,
+                        arguments: Vec::new(),
+                        helpers: Vec::new(),
+                        readable: Vec::new(),
+                        reads,
+                        exec_path: None,
+                    },
+                )
+            };
+            let owner = run(Reads::Everywhere);
+            assert_eq!(
+                owner.status,
+                Some(4),
+                "the owner's run is the control, and the loader took `libkrm` from `mb`: {}",
+                owner.stderr
+            );
+            let ran = run(Reads::Bounded(std::sync::Arc::new(named)));
+            assert_eq!(
+                ran.status,
+                Some(4),
+                "the program runs under its set: {}",
+                ran.stderr
+            );
+        }
     }
 }
