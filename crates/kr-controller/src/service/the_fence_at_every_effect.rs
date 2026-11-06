@@ -1749,6 +1749,22 @@ impl Refreshing {
         .expect("the record opens")
         .expect("the environment is enrolled")
     }
+
+    /// What this host last recorded of the integration of the environment `byte` enrolled.
+    #[cfg(unix)]
+    fn recorded_readiness(&self, byte: u8) -> kr_protocol::identity::EnvironmentReadiness {
+        let state_dir = self.controller.paths.state_dir().to_path_buf();
+        let environment_id = enrolment_of(byte).environment_id;
+        crate::bridge::store::Store::with_locked(&state_dir, |store| {
+            Ok(store
+                .list(None, kr_ipc::now_ms().get())
+                .into_iter()
+                .find(|row| row.enrolment.environment_id == environment_id)
+                .map(|row| row.readiness))
+        })
+        .expect("the record opens")
+        .expect("the environment is enrolled")
+    }
 }
 
 /// KR-REQ-09.09: a fence that lands while a refresh waits on the platform stops what it was about
@@ -1982,6 +1998,190 @@ async fn a_fence_that_lands_while_a_refresh_opens_a_bridge_leaves_it_answered() 
         result.connection
     );
     assert_eq!(rig.recorded_status(1), EnvironmentPresence::Running);
+}
+
+/// Set in the program that runs the case below again, which finds the stand-in for the launcher
+/// first on its search path.
+#[cfg(unix)]
+const WITH_AN_ANSWERING_BRIDGE: &str = "KR_TEST_HOST_WITH_AN_ANSWERING_BRIDGE";
+
+/// The case's name as the test program lists it.
+#[cfg(unix)]
+const THE_ANSWERING_BRIDGE_CASE: &str = "service::the_fence_at_every_effect::a_fence_that_lands_after_a_bridge_has_answered_says_the_answer_was_not_recorded";
+
+/// What the destination's helper writes to the stand-in's output when a bridge is opened to the
+/// environment `byte` enrolled: its acknowledgement and its answer to the one read a refresh makes.
+#[cfg(unix)]
+fn what_an_answering_helper_writes(byte: u8) -> Vec<u8> {
+    use kr_protocol::envelope::Response;
+    use kr_protocol::frame::{FrameCodec, StreamKind};
+    use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION};
+    use kr_protocol::identity::{BootIdentity, BootIdentitySource, BridgeFrame, BridgeHelloAck};
+    use kr_protocol::ids::{BootEpoch, BuildId};
+    use kr_protocol::local::{LocalBuild, LocalRole};
+    use kr_protocol::scalars::{Bytes, TimestampMs, U64, Uuid};
+
+    let connection_id = ConnectionId::new(Uuid::from_bytes([0x5c; 16]));
+    let frames = [
+        BridgeFrame::HelloAck(Box::new(BridgeHelloAck {
+            protocol_version: PROTOCOL_VERSION,
+            build: Some(LocalBuild::this(BuildId::new("kr/0.1.0").expect("a build"))),
+            base: kr_protocol::identity::DestinationBase {
+                home: "/home/kala".to_owned(),
+                variables: Vec::new(),
+            },
+            environment_id: enrolment_of(byte).environment_id,
+            os_user: "kala".to_owned(),
+            role: LocalRole::Controller,
+            connection_id,
+            boot_identity: BootIdentity {
+                source: BootIdentitySource::LinuxBootId,
+                value: Bytes::new(b"fixture-boot".to_vec()),
+            },
+            max_frame_len: U64::new(65_536),
+            action_window: ActionWindow {
+                action_window_id: ActionWindowId::new("w-fixture").expect("a window"),
+                connection_id,
+                boot_epoch: BootEpoch::new(1),
+                issued_at_ms: TimestampMs::new(100),
+                valid_for_ms: DurationMs::new(120_000),
+            },
+        })),
+        BridgeFrame::Control(Box::new(ControlFrame::Response(Response {
+            request_id: RequestId::new(1),
+            outcome: Outcome::Ok(ParamsValue::empty()),
+        }))),
+    ];
+    let codec = FrameCodec::new(StreamKind::Control);
+    frames
+        .iter()
+        .flat_map(|frame| codec.encode_message(frame).expect("a bridge frame encodes"))
+        .collect()
+}
+
+/// Runs the case below again as a program whose search path finds, first, a `wsl.exe` that answers
+/// a bridge as the helper of the environment `enrolment_of(1)` names would.
+///
+/// The launcher is a program of a fixed name that a refresh finds on the search path, and a search
+/// path belongs to the whole process, so a case that wants a bridge to answer cannot change it for
+/// itself. The stand-in is placed and started once here, where nothing is timed.
+#[cfg(unix)]
+fn run_again_with_an_answering_bridge() {
+    let kept = tempfile::tempdir().expect("a directory for the stand-in");
+    let bin = kept.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("the stand-in's directory");
+    let answer = kept.path().join("answer");
+    std::fs::write(&answer, what_an_answering_helper_writes(1)).expect("the answer");
+    let answer_path = answer.to_str().expect("a temporary path is text");
+    assert!(
+        !answer_path.contains('\''),
+        "the stand-in quotes its answer with single quotes: {answer_path}"
+    );
+    let text = kept.path().join("wsl.exe.text");
+    std::fs::write(
+        &text,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) exit 0 ;;\nesac\n/bin/cat '{answer_path}'\nexec /bin/cat >/dev/null\n"
+        ),
+    )
+    .expect("the stand-in's text");
+    kr_ipc::testing::place_and_start_once(&text, &bin.join("wsl.exe"), &["--version"]);
+
+    let mut path = std::ffi::OsString::from(bin.as_os_str());
+    if let Some(inherited) = std::env::var_os("PATH") {
+        path.push(":");
+        path.push(inherited);
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("this test program"))
+        .args(["--exact", THE_ANSWERING_BRIDGE_CASE, "--test-threads=1"])
+        .env("PATH", path)
+        .env(WITH_AN_ANSWERING_BRIDGE, "1")
+        .output()
+        .expect("this test program runs again");
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && report.contains("1 passed"),
+        "{report}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// KR-REQ-09.09: a fence that lands after a bridge has answered, and before this host records what
+/// answered, leaves the refresh answered and not refused, and says that the bridge answered and was
+/// not recorded: the answer establishes nothing, and the same bridge records once nothing is owed.
+///
+/// The destination answers through a stand-in for the launcher, so the bridge really opens and
+/// really answers. Not shown here: a fence at the other places a refresh waits, which the cases
+/// beside this one show, or a registration withdrawn at this one.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_that_lands_after_a_bridge_has_answered_says_the_answer_was_not_recorded() {
+    use kr_protocol::identity::{EnvironmentPresence, EnvironmentRefreshResult};
+    if std::env::var_os(WITH_AN_ANSWERING_BRIDGE).is_none() {
+        run_again_with_an_answering_bridge();
+        return;
+    }
+    let rig = Refreshing::start().await;
+    rig.controller
+        .ask_instead(SteppedPlatform::new(&rig.controller, RaisesAt::Never, true));
+    // The record's pause fires first where the refresh takes the record and again where the
+    // bridge's outcome is recorded, which is after the bridge has answered.
+    let (first, release_first) = rig.controller.after_the_environment_record_is_taken.arm();
+    let waiting = tokio::spawn(rig.refresh(1, false));
+    arrival(first).await;
+    let (second, release_second) = rig.controller.after_the_environment_record_is_taken.arm();
+    release_first.send(()).expect("the refresh goes on");
+    arrival(second).await;
+    rig.controller.hold_fence(true);
+    release_second.send(()).expect("the refresh goes on");
+    let answered = waiting
+        .await
+        .expect("the refresh finishes")
+        .expect("a refresh that has run is answered");
+    rig.controller.hold_fence(false);
+    let result: EnvironmentRefreshResult = answered.to_typed().expect("a result");
+    assert_eq!(result.row.status, EnvironmentPresence::Running);
+    assert!(
+        result.verification.0.is_none(),
+        "an answer this host did not record is not told as an environment's: {:?}",
+        result.verification
+    );
+    assert!(
+        result.connection.contains("the bridge answered")
+            && result.connection.contains("did not record")
+            && result.connection.contains("fence"),
+        "{}",
+        result.connection
+    );
+    assert!(
+        !result.row.readiness.channel_scoped,
+        "the answer established no scoped channel: {:?}",
+        result.row.readiness
+    );
+    assert_eq!(rig.recorded_status(1), EnvironmentPresence::Running);
+    assert!(
+        !rig.recorded_readiness(1).channel_scoped,
+        "the answer established nothing"
+    );
+
+    // The control: with nothing owed the same bridge answers and the refresh records it.
+    let recorded: EnvironmentRefreshResult = rig
+        .refresh(1, false)
+        .await
+        .expect("a refresh with nothing owed is answered")
+        .to_typed()
+        .expect("a result");
+    assert!(
+        recorded.verification.0.is_some(),
+        "the bridge answered: {}",
+        recorded.connection
+    );
+    assert!(
+        recorded.row.readiness.channel_scoped,
+        "the bridge's answer is recorded once nothing is owed: {:?}",
+        recorded.row.readiness
+    );
+    assert!(rig.recorded_readiness(1).channel_scoped);
 }
 
 /// KR-REQ-09.09, 09.12 and 26.16: a machine group step another attempt recorded is not given back
