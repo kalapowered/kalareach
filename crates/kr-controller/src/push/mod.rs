@@ -365,6 +365,10 @@ pub struct DeliveryModule {
     /// again once the journal has taken it. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     key_write: [crate::attention::Pause; 3],
+    /// Where this host's own tests stop the sweep of owed revocations once it has an answer for a
+    /// debt and before it settles the debt. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_a_debt_is_settled: crate::attention::Pause,
 }
 
 /// What storing one destination's credential did.
@@ -417,6 +421,8 @@ impl DeliveryModule {
             gateways: std::sync::OnceLock::new(),
             #[cfg(feature = "testing")]
             key_write: Default::default(),
+            #[cfg(feature = "testing")]
+            before_a_debt_is_settled: Default::default(),
         })
     }
 
@@ -426,6 +432,23 @@ impl DeliveryModule {
     /// Once. Returns false when they were already attached.
     pub fn attach_gateways(&self, gateways: std::sync::Arc<gateways::AllowedGateways>) -> bool {
         self.gateways.set(gateways).is_ok()
+    }
+
+    /// Makes `listed` the gateways in force, in the journal's lock.
+    ///
+    /// The sweep of owed revocations decides in that lock whether a debt may be given up, and it
+    /// never gives one up for a gateway that is not in force. The list moves under the same lock,
+    /// so a change of the list is never between the sweep's reading of it and its settling of a
+    /// debt. Does nothing until the gateways are attached.
+    pub fn replace_gateways(&self, listed: &[String]) {
+        let Some(gateways) = self.gateways.get() else {
+            return;
+        };
+        let _journal = self
+            .producer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gateways.replace(listed);
     }
 
     /// Attaches what places the encrypted objects previews refer to.
@@ -458,6 +481,18 @@ impl DeliveryModule {
         std::sync::mpsc::SyncSender<()>,
     ) {
         self.key_write[1].arm()
+    }
+
+    /// Stops the sweep of owed revocations once it has an answer for the next debt and before it
+    /// settles that debt. Returns the end that says it has arrived and the end that lets it go.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_a_debt_is_settled(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.before_a_debt_is_settled.arm()
     }
 
     /// Stops the next destination write after everything it reads has been read and before its
@@ -1182,30 +1217,29 @@ impl DeliveryModule {
                 other => other,
             };
             let now_ms = clock.now_ms();
+            #[cfg(feature = "testing")]
+            self.before_a_debt_is_settled.wait();
             // Patience runs out after thirty days and some attempts: a host that was off for the
             // whole time has not been refused by anyone, and is asked a few times first. It runs
             // out only for a host that has let go of the authorisation: a debt given up with the
             // item still in the secret store leaves an item nothing names and no start finds.
             //
             // Never for a gateway that was taken out of the list: its credentials were let go of
-            // when it was, and the debt is all that is left of what the host owes it.
-            let retired = self
-                .gateways
-                .get()
-                .is_some_and(|allowed| !allowed.allows(&owed.gateway_origin));
-            let given_up = forgotten
-                && !retired
-                && matches!(answer, sender::RevocationAnswer::Later(_))
-                && owed.attempts >= REVOCATION_MIN_ATTEMPTS
-                && now_ms.saturating_sub(owed.queued_at_ms) >= REVOCATION_PATIENCE_MS;
-            if given_up {
-                eprintln!(
-                    "kr-controller: a revocation owed to a gateway was not accepted in thirty \
-                     days and is no longer asked for"
-                );
-            }
-            self.with(|producer| {
+            // when it was, and the debt is all that is left of what the host owes it. The list is
+            // read here, in the journal's lock, which is also where the host moves it
+            // ([`Self::replace_gateways`]): a gateway taken out is either seen to be out, or the
+            // debt was settled before it was.
+            let given_up = self.with(|producer| {
                 let journal = producer.journal_mut();
+                let retired = self
+                    .gateways
+                    .get()
+                    .is_some_and(|allowed| !allowed.allows(&owed.gateway_origin));
+                let given_up = forgotten
+                    && !retired
+                    && matches!(answer, sender::RevocationAnswer::Later(_))
+                    && owed.attempts >= REVOCATION_MIN_ATTEMPTS
+                    && now_ms.saturating_sub(owed.queued_at_ms) >= REVOCATION_PATIENCE_MS;
                 match answer {
                     sender::RevocationAnswer::Later(_) if !given_up => journal
                         .note_revocation_attempt(
@@ -1216,8 +1250,15 @@ impl DeliveryModule {
                     _ => journal
                         .settle_revocation(owed.sender_record_id)
                         .map_err(unavailable),
-                }
+                }?;
+                Ok(given_up)
             })?;
+            if given_up {
+                eprintln!(
+                    "kr-controller: a revocation owed to a gateway was not accepted in thirty \
+                     days and is no longer asked for"
+                );
+            }
             if !matches!(answer, sender::RevocationAnswer::Later(_)) || given_up {
                 settled += 1;
             }

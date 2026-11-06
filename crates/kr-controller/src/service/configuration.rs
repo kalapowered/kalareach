@@ -441,7 +441,9 @@ impl Controller {
     ) -> Option<Sentence> {
         let document = resolver.loaded().document.as_ref()?;
         let registry = self.registry.lock().await;
-        self.gateways.replace(document.push.gateways());
+        // In the journal's lock, which the sweep of owed revocations reads the list under, so a
+        // debt is never given up for a gateway after this has taken it out.
+        self.delivery.replace_gateways(document.push.gateways());
         let failure = self.let_go_of_credentials_outside_the_gateways();
         drop(registry);
         failure

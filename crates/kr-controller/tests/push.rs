@@ -10574,3 +10574,82 @@ fn a_revocation_owed_to_a_gateway_taken_out_of_the_list_is_never_given_up() {
         .expect("a sweep");
     assert!(owed().is_empty());
 }
+
+/// KR-REQ-16.04, KR-REQ-16.10: a gateway taken out of the list while the sweep is settling a debt
+/// owed to it keeps the debt. The sweep reads the list when it settles, not before it takes the
+/// journal: a debt owed to a gateway that left the list ends only when the gateway has made it.
+///
+/// The host moves the list with `replace_gateways`, as it does in production. That the sweep reads
+/// the list inside the journal's lock, and the move takes the same lock, is not shown by a case: it
+/// would take a wait for a thread to block, and a case decides by a condition and not by a delay.
+#[test]
+fn a_gateway_taken_out_of_the_list_as_the_sweep_settles_its_debt_keeps_the_debt() {
+    use kr_controller::push::gateways::AllowedGateways;
+    use kr_controller::push::sender::RevocationAnswer::Later;
+
+    const LISTED: &str = "https://push.listed.invalid";
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let t0 = 1_700_000_000_000_u64;
+    // Three asks the gateway never answers, then a fourth after more than thirty days, which gives
+    // a debt owed to an allowed gateway up. The fourth is stopped once the sweep has its answer,
+    // and the gateway is taken out of the list there when `remove` says so.
+    let still_owed_after_the_fourth_ask = |remove: bool| {
+        let directory = tempfile::tempdir().expect("a directory");
+        let module = DeliveryModule::open_at(
+            &directory.path().join("delivery.sqlite3"),
+            kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+            secrets(),
+        )
+        .expect("a delivery module");
+        let gateways = Arc::new(AllowedGateways::new(
+            "https://reach.invalid",
+            &[LISTED.to_owned()],
+        ));
+        assert!(module.attach_gateways(Arc::clone(&gateways)));
+        let debt = PushSenderRecordId::new(uuid(1));
+        module
+            .with(|producer| {
+                producer
+                    .journal_mut()
+                    .owe_revocation(debt, LISTED, t0)
+                    .expect("a debt");
+                Ok(())
+            })
+            .expect("the debt is written");
+        let sweep = |at: u64| {
+            let revoking = Revoking::default();
+            *revoking.answers.lock().expect("not poisoned") =
+                [Later("no answer".to_owned())].into();
+            module
+                .settle_revocations(&revoking, &|_| true, &move || at)
+                .expect("a sweep");
+        };
+        for at in [31, 80, 200] {
+            sweep(t0 + at * DAY);
+        }
+        let (arrived, release) = module.pause_before_a_debt_is_settled();
+        std::thread::scope(|scope| {
+            let sweeping = scope.spawn(|| sweep(t0 + 400 * DAY));
+            arrived.recv().expect("the sweep has its answer");
+            if remove {
+                module.replace_gateways(&[]);
+            }
+            release.send(()).expect("the sweep goes on");
+            sweeping.join().expect("the sweep ends");
+        });
+        module
+            .with(|producer| Ok(producer.journal().owed_revocations().expect("a read")))
+            .expect("a read")
+            .contains(&debt)
+    };
+
+    assert!(
+        !still_owed_after_the_fourth_ask(false),
+        "the control: a debt owed to a gateway still in the list is given up"
+    );
+    assert!(
+        still_owed_after_the_fourth_ask(true),
+        "a debt owed to a gateway taken out of the list as it is settled is kept"
+    );
+}
