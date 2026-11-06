@@ -518,6 +518,24 @@ struct SlowHandler {
     queued: tokio::sync::Notify,
     /// Waited for before the handler takes its next frame.
     go: tokio::sync::Semaphore,
+    /// How many of the holds the handler made for the frames the listener read are still alive.
+    holds: Arc<AtomicUsize>,
+}
+
+/// What the handler holds for a frame: it counts itself while it lives.
+struct Counted(Arc<AtomicUsize>);
+
+impl Counted {
+    fn made(holds: &Arc<AtomicUsize>) -> Self {
+        holds.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(holds))
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl PairedDirectory for SlowHandler {
@@ -537,6 +555,14 @@ impl HostHandler for SlowHandler {
 
     fn pairing_surface(&self) -> Option<Arc<dyn PairingSurface>> {
         None
+    }
+
+    fn frame_read(
+        &self,
+        _device_id: &DeviceId,
+        _frame: &ControlFrame,
+    ) -> Option<kr_transport::listener::FrameHold> {
+        Some(Box::new(Counted::made(&self.holds)))
     }
 
     fn serve(self: Arc<Self>, mut session: AuthorisedSession) -> BoxFuture<'static, ()> {
@@ -577,6 +603,7 @@ async fn a_control_frame_is_stamped_when_it_is_read_and_not_when_the_handler_rea
         stamps: std::sync::Mutex::new(Vec::new()),
         queued: tokio::sync::Notify::new(),
         go: tokio::sync::Semaphore::new(0),
+        holds: Arc::new(AtomicUsize::new(0)),
     });
     let clock = kr_transport::clock::ManualClock::new();
     let config = ListenerConfig::new(
@@ -645,6 +672,68 @@ async fn a_control_frame_is_stamped_when_it_is_read_and_not_when_the_handler_rea
     );
 
     drop(authorised);
+    listener.shutdown().await;
+}
+
+/// A frame carries what the host held for it from the moment the listener read it, also while it
+/// waits behind a handler that is busy, and the hold is released with the frame when the connection
+/// ends with the frame unserved.
+#[tokio::test]
+async fn what_the_host_holds_for_a_frame_lasts_as_long_as_the_frame() {
+    let (host, client) = paired_pair().await;
+    let handler = Arc::new(SlowHandler {
+        client: client.record,
+        stamps: std::sync::Mutex::new(Vec::new()),
+        queued: tokio::sync::Notify::new(),
+        go: tokio::sync::Semaphore::new(0),
+        holds: Arc::new(AtomicUsize::new(0)),
+    });
+    let config = ListenerConfig::new(
+        EndpointConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+            ..EndpointConfig::default()
+        },
+        epochs(),
+        ControllerGeneration::new(1),
+    );
+    let listener = kr_transport::listener::register(
+        config,
+        Arc::clone(&host.identity),
+        &host.keys.transport,
+        Arc::clone(&handler),
+    )
+    .await
+    .expect("a listener");
+    let connection = client
+        .endpoint
+        .connect(listener_addr(&listener), ALPN)
+        .await
+        .expect("a connection");
+    let mut authorised = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect("an authorised connection");
+
+    // The handler takes the first frame and is busy with it; the second is read and waits.
+    for _ in 0..2 {
+        authorised
+            .control_writer
+            .write_message(&ControlFrame::Event(ControlEvent::Keepalive))
+            .await
+            .expect("writes a frame");
+    }
+    tokio::time::timeout(Duration::from_secs(60), handler.queued.notified())
+        .await
+        .expect("the listener read the second frame while the handler was busy");
+    assert_eq!(
+        handler.holds.load(Ordering::SeqCst),
+        2,
+        "the frame the handler holds and the frame that waits each carry what the host held"
+    );
+
+    // The connection ends with the second frame unserved.
+    drop(authorised);
+    connection.close(0u32.into(), b"gone");
+    wait_until(|| handler.holds.load(Ordering::SeqCst) == 0).await;
     listener.shutdown().await;
 }
 
