@@ -3101,16 +3101,16 @@ mod tests {
             /// How many times the loop has asked the console to spell its keys.
             asked: Arc<std::sync::atomic::AtomicUsize>,
             /// The terminal the loop reads its size from, for a case that changes it.
-            sized: Option<Sized>,
+            sized: Option<SizedTerminal>,
         }
 
         /// A pseudo-terminal the loop reads its size from, and the signal that tells it the size
         /// changed.
-        pub struct Sized {
+        pub struct SizedTerminal {
             master: Box<dyn portable_pty::MasterPty + Send>,
         }
 
-        impl Sized {
+        impl SizedTerminal {
             /// The person resizes the terminal: its size is set and the loop is told, as the system
             /// does with a signal.
             pub fn changes_to(&self, columns: u16, rows: u16) {
@@ -3234,7 +3234,7 @@ mod tests {
             }
 
             /// The terminal the case changes the size of.
-            pub const fn terminal(&self) -> &Sized {
+            pub const fn terminal(&self) -> &SizedTerminal {
                 self.sized.as_ref().expect("the case has a sized terminal")
             }
 
@@ -3409,7 +3409,7 @@ mod tests {
                         .expect("a stream of size changes");
                 (
                     ControllingTerminal::over(handle),
-                    Some(Sized { master: pty.master }),
+                    Some(SizedTerminal { master: pty.master }),
                     Some(pty.slave),
                     Some(changes),
                 )
