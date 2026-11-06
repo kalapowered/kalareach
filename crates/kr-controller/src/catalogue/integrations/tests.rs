@@ -1580,7 +1580,13 @@ fn the_search_the_doctor_makes_names_the_file_the_shell_finds_first() {
         (
             "a file only PATHEXT names, before a program",
             vec![other_extension, program_later],
-            First::NotAProgram,
+            // The `.vbs` file is a hit when this machine's extensions name `.vbs`; where they do
+            // not, the program in the later directory is.
+            if at(".vbs").is_some() {
+                First::NotAProgram
+            } else {
+                First::Program
+            },
         ),
         ("nothing", vec![nowhere], First::Nothing),
     ];
