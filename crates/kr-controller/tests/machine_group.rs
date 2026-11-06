@@ -527,8 +527,9 @@ async fn a_step_is_performed_once_and_a_retry_is_answered_from_its_receipt() {
 /// claimed the step and is stopped before its write. A repeat of it is told that what became of it
 /// is not known yet, and does not perform it again. A second action against the same record, as a
 /// client composes one when it cannot tell a running first action from one that ended without
-/// recording what it did, waits behind the first, and once the first has moved the record it is
-/// refused for the record it no longer matches: the record moves once, to the first action's group.
+/// recording what it did, is sent while the first holds the step lock, and once the first has moved
+/// the record it is refused for the record it no longer matches: the record moves once, to the first
+/// action's group, in whichever order the second reaches the lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn of_the_actions_a_step_is_sent_under_only_one_applies() {
     let host = Host::start_unowned().await;
@@ -561,7 +562,8 @@ async fn of_the_actions_a_step_is_sent_under_only_one_applies() {
                 .expect("reaches the daemon")
                 .expect_err("the first action has not finished");
             assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
-            // The second action queues behind the first, which holds the step lock.
+            // The second action is sent while the first holds the step lock, and cannot run before
+            // the first has finished, whether it reaches the lock before or after.
             *waiting.borrow_mut() = Some(tokio::spawn(async move {
                 let answer = second
                     .mutate(Method::MachineJoin, action(), at, &second_params)
