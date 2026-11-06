@@ -178,21 +178,25 @@ impl RemoteConnection {
             self.held_ahead
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(mutation.request_id, arrival);
+                .push(arrival);
         }
     }
 
     /// The entry of `mutation` among the calls that have not claimed, when it was held ahead and
     /// its turn has come, and otherwise a new one: the call is entered once, when it arrives.
     pub(super) fn arrival_of(&self, mutation: &MutationRequest) -> Option<Arrival> {
-        self.held_ahead
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&mutation.request_id)
-            .or_else(|| {
-                request_of(&self.device.principal(), mutation)
-                    .map(|request| self.controller.arrivals().arrive(request))
-            })
+        let request = request_of(&self.device.principal(), mutation)?;
+        let held = {
+            let mut held_ahead = self
+                .held_ahead
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            held_ahead
+                .iter()
+                .position(|arrival| arrival.carries(&request))
+                .map(|at| held_ahead.remove(at))
+        };
+        Some(held.unwrap_or_else(|| self.controller.arrivals().arrive(request)))
     }
 
     /// The standing work decided under `acting` takes with it: this connection's pairing grant,

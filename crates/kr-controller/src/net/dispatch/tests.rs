@@ -6797,6 +6797,60 @@ async fn a_call_leaves_those_that_have_not_claimed_once_it_has_its_route() {
     }
 }
 
+/// Two different mutations that a connection reads ahead and holds under one request identifier,
+/// which a device could send, are each among the calls that have not claimed: the entry of one is
+/// not given up for the other's, and each is handed to its own call when its turn comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_mutations_held_ahead_under_one_request_identifier_are_each_entered() {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let connection = super::RemoteConnection::for_test(
+        controller,
+        paired(controller, 86, |grant| {
+            grant.actions = [ActionRight::SessionView, ActionRight::AgentPrompt]
+                .into_iter()
+                .collect();
+        }),
+    );
+    let first = device_mutation(
+        &world,
+        &connection,
+        Method::AgentPromptSubmit,
+        96,
+        ParamsValue::empty(),
+    );
+    let mut second = first.clone();
+    second.action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    for held in [&first, &second] {
+        connection.hold_ahead(&ControlFrame::Mutation(Box::new(held.clone())));
+    }
+    assert_eq!(
+        controller.arrivals().entered(),
+        2,
+        "both mutations are among the calls that have not claimed"
+    );
+
+    let entry = connection
+        .arrival_of(&second)
+        .expect("the second mutation has an entry");
+    assert_eq!(controller.arrivals().entered(), 2, "handed over, not made");
+    drop(entry);
+    assert_eq!(controller.arrivals().entered(), 1);
+    let entry = connection
+        .arrival_of(&first)
+        .expect("the first mutation has an entry");
+    assert_eq!(controller.arrivals().entered(), 1, "handed over, not made");
+    drop(entry);
+    assert_eq!(controller.arrivals().entered(), 0);
+    world.serving.abort();
+}
+
 /// The authority feed raises a refusal on remote grants while a mutation, which has its lease,
 /// waits for the write half of its link to the worker. For a repeat that refusal says nothing of
 /// the copy that went before, so it is told as an unknown outcome; the same request never routed is
