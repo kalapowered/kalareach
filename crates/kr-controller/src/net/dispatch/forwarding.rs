@@ -121,15 +121,10 @@ impl OwnClaim {
     /// itself. [`Self::leave`] gives up the call's handle only: the entry leaves the set when the
     /// work lets go of it as well.
     pub(super) fn shared_with_the_work(&self) -> Option<Arc<Arrival>> {
-        let entry = self
-            .arrival
+        self.arrival
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(entry) = &entry {
-            entry.goes_on_without_a_route();
-        }
-        entry
+            .clone()
     }
 
     /// Whether another call that carries `request` has not yet claimed its route.
@@ -139,20 +134,6 @@ impl OwnClaim {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         arrivals.another_carries(request, own.as_deref())
-    }
-
-    /// Whether another call has carried out, or is carrying out, a close of `request` with no
-    /// route.
-    fn another_close_went_on_without_a_route(
-        &self,
-        arrivals: &Arrivals,
-        request: &Carried,
-    ) -> bool {
-        let own = self
-            .arrival
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        arrivals.another_close_went_on_without_a_route(request, own.as_deref())
     }
 }
 
@@ -245,7 +226,7 @@ impl RemoteConnection {
     /// request refused after its own claim is refused as ever. A route that holds another request
     /// under the identifier does not either: the identifier is spent, this host dispatches nothing
     /// under it for this request, and the refusal keeps its code however many copies of this request
-    /// are queued. A close that went on without a route is the exception
+    /// are queued. Two kinds of mutation are the exception
     /// ([`Self::identifier_is_spent_on_another_request`]). A code that is already `OUTCOME_UNKNOWN`
     /// is told as it is.
     pub(super) fn told_of_a_repeat(
@@ -256,7 +237,7 @@ impl RemoteConnection {
     ) -> ProtocolError {
         if error.code == ErrorCode::OutcomeUnknown
             || own_claim.is_made()
-            || self.identifier_is_spent_on_another_request(own_claim, mutation)
+            || self.identifier_is_spent_on_another_request(mutation)
             || !(self.another_copy_has_not_claimed(own_claim, mutation)
                 || self.holds_a_route_for(mutation))
         {
@@ -269,25 +250,24 @@ impl RemoteConnection {
     /// Whether the route of the action a mutation carries holds another request, which makes the
     /// identifier a reused one that nothing is carried out under for this request.
     ///
-    /// A close that went on without a route is the exception: another request can have claimed the
-    /// identifier since, and the close was carried out, or may be, before it did. A call that is
-    /// only waiting its turn is not one, since the route leaves nothing of it to be carried out.
-    fn identifier_is_spent_on_another_request(
-        &self,
-        own_claim: &OwnClaim,
-        mutation: &MutationRequest,
-    ) -> bool {
+    /// Two kinds of mutation are never decided so. A close goes on without a route when storage
+    /// cannot record one, because a stop is let through, so another request that holds the route
+    /// by the time a copy is refused does not say the close was not carried out. A voice
+    /// delegation's challenge gives its route back, so the identifier is free again for the request
+    /// that is signed. A copy of either is told as a repeat's, as it is when it meets no conflict.
+    fn identifier_is_spent_on_another_request(&self, mutation: &MutationRequest) -> bool {
+        if matches!(
+            mutation.method.method(),
+            Some(Method::SessionClose | Method::VoiceDelegate)
+        ) {
+            return false;
+        }
         let actor_id = self.device.principal();
-        let held_by_another = match self.devices.action_route(&actor_id, mutation.action_id) {
+        match self.devices.action_route(&actor_id, mutation.action_id) {
             Ok(Some(routed)) => kr_protocol::digest::mutation_digest(mutation, &actor_id)
                 .is_ok_and(|digest| routed.payload_digest != Some(digest)),
             Ok(None) | Err(_) => false,
-        };
-        held_by_another
-            && !request_of(&actor_id, mutation).is_some_and(|request| {
-                own_claim
-                    .another_close_went_on_without_a_route(self.controller.arrivals(), &request)
-            })
+        }
     }
 
     /// Whether a copy of this request is being served that has not yet claimed the route of its
