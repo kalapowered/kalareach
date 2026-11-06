@@ -563,7 +563,7 @@ impl QuestionHost for Host<'_> {
     /// under the pairing. The host's word that the question is answered settles all of them. No
     /// link is opened for it: a link that is not held has no book.
     async fn settle_earlier(&self, session_id: SessionId, sends: &[ActionId]) {
-        let held = self.links.held_for(self.state, session_id).await;
+        let held = self.links.held_for(self.state, session_id);
         let_go_of(&held, session_id, sends).await;
     }
 

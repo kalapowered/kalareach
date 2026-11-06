@@ -154,14 +154,34 @@ impl Link {
     }
 }
 
-/// The place one session's link is held, which the calls for that session take turns with while
-/// it opens.
-type Slot = Arc<tokio::sync::Mutex<Option<Arc<Link>>>>;
+/// The place one session's link is held.
+///
+/// The link is readable at any moment, whether or not a call is opening one: a look at the links
+/// held does not wait for an open, which can take as long as [`OPEN_DEADLINE`], and a link that
+/// ended is let go whatever else goes on for the session. What the calls for the session take
+/// turns with is the open alone, so that they open one link between them.
+#[derive(Default)]
+struct Slot {
+    /// Held for the length of an open.
+    opening: tokio::sync::Mutex<()>,
+    /// The link held now.
+    held: Mutex<Option<Arc<Link>>>,
+}
+
+impl Slot {
+    /// The link held now, if any.
+    fn link(&self) -> Option<Arc<Link>> {
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
 
 /// The links this application holds to its sessions' workers, one for each session.
 pub struct WorkerLinks {
     locate: Locate,
-    held: Mutex<BTreeMap<SessionId, Slot>>,
+    held: Mutex<BTreeMap<SessionId, Arc<Slot>>>,
 }
 
 /// A session's live agent instances and the resources its broker is still arbitrating.
@@ -471,7 +491,7 @@ impl WorkerLinks {
     pub fn held(&self) -> usize {
         self.lock()
             .values()
-            .filter(|slot| slot.try_lock().is_ok_and(|held| held.is_some()))
+            .filter(|slot| slot.link().is_some())
             .count()
     }
 
@@ -479,10 +499,16 @@ impl WorkerLinks {
     /// is held. For a test of what the link's book keeps.
     #[doc(hidden)]
     pub async fn unsettled(&self, session_id: SessionId) -> Option<Vec<ActionId>> {
-        let slot = self.lock().get(&session_id).cloned()?;
-        let link = slot.lock().await.clone()?;
+        let link = self.lock().get(&session_id)?.link()?;
         let held = link.session.submitted_actions().await;
         Some(held.into_iter().map(|each| each.action_id).collect())
+    }
+
+    /// How many links [`Self::held_for`] finds for `session_id`. For a test of the route it takes.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn held_for_count(&self, state: &AppState, session_id: SessionId) -> usize {
+        self.held_for(state, session_id).len()
     }
 
     /// Every link held for `session_id` now, none of them opened for the asking: the books of
@@ -490,26 +516,26 @@ impl WorkerLinks {
     ///
     /// On this machine's own host that is the link over the worker's descriptor, if one is held. On
     /// a host this device is paired with it is the link of the session's opening, which may act
-    /// under a share, and its ambient link, which acts under the pairing.
-    pub(crate) async fn held_for(&self, state: &AppState, session_id: SessionId) -> Vec<Arc<Link>> {
+    /// under a share, and its ambient link, which acts under the pairing. A link a call is still
+    /// opening is not held yet and has no book, so nothing waits for it.
+    pub(crate) fn held_for(&self, state: &AppState, session_id: SessionId) -> Vec<Arc<Link>> {
         let paired = state
             .paired_context()
             .is_some()
             .then(|| state.paired_links());
-        self.held_in(paired.map(|links| &**links), session_id).await
+        self.held_in(paired.map(|links| &**links), session_id)
     }
 
     /// As [`Self::held_for`], for the places `paired` and this application's own slots hold.
-    async fn held_in(&self, paired: Option<&PairedLinks>, session_id: SessionId) -> Vec<Arc<Link>> {
+    fn held_in(&self, paired: Option<&PairedLinks>, session_id: SessionId) -> Vec<Arc<Link>> {
         if let Some(paired) = paired {
             return paired.held_for(session_id);
         }
-        let Some(slot) = self.lock().get(&session_id).cloned() else {
-            return Vec::new();
-        };
-        // The slot is locked while a link is opened, and for a moment when the link it holds is
-        // handed out, so a lock that is not free does not say there is no link: it is waited for.
-        slot.lock().await.clone().into_iter().collect()
+        self.lock()
+            .get(&session_id)
+            .and_then(|slot| slot.link())
+            .into_iter()
+            .collect()
     }
 
     /// The link to `session_id`'s worker: the one held, or a new one.
@@ -546,9 +572,13 @@ impl WorkerLinks {
     /// The link to `session_id`'s worker on this machine: the one held, or a new one.
     async fn local_link(&self, session_id: SessionId) -> Result<Arc<Link>> {
         let slot = Arc::clone(self.lock().entry(session_id).or_default());
-        let mut held = slot.lock().await;
-        if let Some(link) = held.as_ref() {
-            return Ok(Arc::clone(link));
+        if let Some(link) = slot.link() {
+            return Ok(link);
+        }
+        let _opening = slot.opening.lock().await;
+        // A call that held the open before this one has opened it.
+        if let Some(link) = slot.link() {
+            return Ok(link);
         }
         let paths = (self.locate)().map_err(CommandError::unavailable)?;
         let reached = tokio::time::timeout(OPEN_DEADLINE, crate::worker::reach(&paths, session_id))
@@ -568,7 +598,7 @@ impl WorkerLinks {
             reached.build,
             reached.capabilities,
         ));
-        *held = Some(Arc::clone(&link));
+        *slot.held.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&link));
         Ok(link)
     }
 
@@ -609,17 +639,22 @@ impl WorkerLinks {
         let Some(slot) = self.lock().get(&session_id).cloned() else {
             return;
         };
-        if let Ok(mut held) = slot.try_lock()
-            && held
+        let was_held = {
+            let mut held = slot.held.lock().unwrap_or_else(PoisonError::into_inner);
+            let is_held = held
                 .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, link))
-        {
-            *held = None;
+                .is_some_and(|current| Arc::ptr_eq(current, link));
+            if is_held {
+                *held = None;
+            }
+            is_held
+        };
+        if was_held {
             link.session.close();
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<SessionId, Slot>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<SessionId, Arc<Slot>>> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -715,8 +750,8 @@ mod tests {
     }
 
     /// KR-REQ-11.63: the links held for a session are the paired host's links when this application
-    /// is on a paired host, and the slot's own when it is not. A slot that is locked, as it is when
-    /// the link it holds is being handed out, is waited for, and the link is found.
+    /// is on a paired host, and the slot's own when it is not. Off a paired host that is what
+    /// `held_for` finds through the application's state, and a session with no slot has none.
     #[tokio::test]
     async fn the_links_held_for_a_session_are_found_on_either_route() {
         use crate::standing::tests::{link_holding_a_send, paired_links_holding};
@@ -739,35 +774,63 @@ mod tests {
         let paired = paired_links_holding(session_id, &shared, &ambient);
 
         // On a paired host, the paired host's links, and not the slot's.
-        links.lock().insert(
-            session_id,
-            Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(&local)))),
-        );
-        let held = links.held_in(Some(&paired), session_id).await;
+        let slot = Arc::new(Slot::default());
+        *slot.held.lock().expect("the slot") = Some(Arc::clone(&local));
+        links.lock().insert(session_id, slot);
+        let held = links.held_in(Some(&paired), session_id);
         assert_eq!(held.len(), 2);
         assert!(held.iter().all(|link| !Arc::ptr_eq(link, &local)));
 
-        // Off it, the slot's link, found though the slot is locked at first.
-        let slot = Arc::clone(links.lock().get(&session_id).expect("the slot"));
-        let locked = slot.lock().await;
-        let links = Arc::new(links);
-        let finding = {
-            let links = Arc::clone(&links);
-            tokio::spawn(async move { links.held_in(None, session_id).await })
-        };
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!finding.is_finished(), "a locked slot is waited for");
-        drop(locked);
-        let held = finding.await.expect("the lookup ends");
+        // Off it, the slot's link, through the application's state: one that is on no paired host.
+        let state = AppState::new();
+        assert!(state.paired_context().is_none());
+        let held = links.held_for(&state, session_id);
         assert_eq!(held.len(), 1);
         assert!(Arc::ptr_eq(&held[0], &local));
         assert!(
             links
-                .held_in(None, SessionId::new(Uuid::from_bytes([9; 16])))
-                .await
+                .held_for(&state, SessionId::new(Uuid::from_bytes([9; 16])))
                 .is_empty()
         );
+    }
+
+    /// KR-REQ-11.63: what a call opening a link for a session holds does not hide the link held, or
+    /// keep it. The look at the links held does not wait for the open, which can last as long as
+    /// the open deadline, and a link that ended is let go while it goes on. A link let go is no
+    /// longer found and is closed; one that is not the link held is left alone.
+    #[tokio::test]
+    async fn a_call_opening_a_link_neither_hides_the_link_held_nor_keeps_it() {
+        use crate::standing::tests::link_holding_a_send;
+        use kr_protocol::scalars::Uuid;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let links = WorkerLinks::at(host.environment());
+        let environment_id = EnvironmentId::new(Uuid::from_bytes([1; 16]));
+        let session_id = SessionId::new(Uuid::from_bytes([2; 16]));
+        let (ended, _) = link_holding_a_send(environment_id, session_id, None, 7).await;
+        let (newer, _) = link_holding_a_send(environment_id, session_id, None, 8).await;
+        let state = AppState::new();
+        let slot = Arc::new(Slot::default());
+        links.lock().insert(session_id, Arc::clone(&slot));
+
+        // A call is opening a link, and none is held: nothing to find, and nothing waited for.
+        let opening = slot.opening.lock().await;
+        assert!(links.held_for(&state, session_id).is_empty());
+
+        // A link is held while a call opens another for it, as the call that holds the open and
+        // the one that stores the link are not the same moment: it is found.
+        *slot.held.lock().expect("the slot") = Some(Arc::clone(&ended));
+        let held = links.held_for(&state, session_id);
+        assert_eq!(held.len(), 1);
+        assert!(Arc::ptr_eq(&held[0], &ended));
+
+        // A link that is not the one held is not let go, and the one held is, though a call is
+        // opening.
+        links.forget(&state, session_id, &newer);
+        assert_eq!(links.held(), 1, "another link's end does not take this one");
+        links.forget(&state, session_id, &ended);
+        assert_eq!(links.held(), 0, "the link that ended is let go");
+        assert!(links.held_for(&state, session_id).is_empty());
+        drop(opening);
     }
 }
