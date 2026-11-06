@@ -503,17 +503,17 @@ where
     let expires_at_ms = challenge.request.expires_at_ms.get();
     let deadline = tokio::time::Instant::now() + time_left(expires_at_ms, kr_ipc::now_ms().get());
     if !json {
-        let pending = ask_within(daemon.read::<_, OwnerConfirmationPendingResult>(
-            Method::OwnerConfirmationPending,
-            &OwnerConfirmationPendingParams {},
-        ))
-        .await?;
-        if let Some(listed) = pending
-            .pending
-            .iter()
-            .find(|pending| pending.request == challenge.request)
+        if let Some(display) = display_listed(
+            deadline,
+            daemon.read::<_, OwnerConfirmationPendingResult>(
+                Method::OwnerConfirmationPending,
+                &OwnerConfirmationPendingParams {},
+            ),
+            &challenge.request,
+        )
+        .await?
         {
-            say_what_is_asked(&listed.display);
+            say_what_is_asked(&display);
         }
         crate::report::say(&shown!(
             "Confirm this on an owner device. Waiting {}.",
@@ -542,16 +542,68 @@ pub(crate) async fn ask_within<T>(
         .map_err(|_| host_did_not_answer())?
 }
 
-/// As [`ask_within`], and never past `deadline`: a challenge that ends sooner than the host is
-/// given to answer ends the wait for it.
+/// Asks for what the host lists, within the time [`ask_within`] gives and never past `deadline`: a
+/// challenge that ends sooner than the host is given to answer ends the wait for it.
+///
+/// The error is the command's end, and the request changed nothing: the challenge had ended before
+/// the host was asked, the host did not answer in time, or the connection failed before it did,
+/// whether it ended or sent what could not be read. The request is not made at all once the
+/// challenge has ended. The inner result is the host's own answer or refusal, which the caller
+/// reads for itself; an answer that cannot be read is one of those, since the connection stands.
 pub(crate) async fn ask_before<T>(
     deadline: tokio::time::Instant,
     request: impl std::future::Future<Output = Result<T>>,
-) -> Result<T> {
-    let limit = deadline.min(tokio::time::Instant::now() + ASK_WITHIN);
-    tokio::time::timeout_at(limit, request)
-        .await
-        .map_err(|_| host_did_not_answer())?
+) -> Result<Result<T>> {
+    let now = tokio::time::Instant::now();
+    if now >= deadline {
+        return Err(challenge_ran_out());
+    }
+    match tokio::time::timeout_at(deadline.min(now + ASK_WITHIN), request).await {
+        Err(_) => Err(host_did_not_answer()),
+        Ok(Err(CliError::Ipc(failure))) => Err(connection_failed_before_it_answered(&failure)),
+        Ok(answered) => Ok(answered),
+    }
+}
+
+/// What the host lists as shown to an owner device for the challenge `request`, read as
+/// [`ask_before`] reads, when it lists it.
+pub(crate) async fn display_listed(
+    deadline: tokio::time::Instant,
+    read: impl std::future::Future<Output = Result<OwnerConfirmationPendingResult>>,
+    request: &kr_protocol::pairing::OwnerConfirmationRequest,
+) -> Result<Option<ConfirmationDisplay>> {
+    Ok(display_in(ask_before(deadline, read).await??, request))
+}
+
+/// What the host's list of pending challenges shows for `request`, when it lists it.
+pub(crate) fn display_in(
+    pending: OwnerConfirmationPendingResult,
+    request: &kr_protocol::pairing::OwnerConfirmationRequest,
+) -> Option<ConfirmationDisplay> {
+    pending
+        .pending
+        .into_iter()
+        .find(|listed| listed.request == *request)
+        .map(|listed| listed.display)
+}
+
+/// What the command says when the challenge has ended before the host is asked what an owner
+/// device is shown for it.
+fn challenge_ran_out() -> CliError {
+    CliError::Refused(refusal(
+        ErrorCode::OwnerConfirmationRequired,
+        Shown::said("the challenge ran out before it could be confirmed. Nothing was changed"),
+    ))
+}
+
+/// What the command says when the connection fails before the host answers a request that changes
+/// nothing: its own words for what failed, since it may have ended, or sent what could not be read.
+fn connection_failed_before_it_answered(failure: &kr_ipc::IpcError) -> CliError {
+    CliError::HostUnavailable(shown!(
+        "the connection to the host failed before it answered the request for an owner device's \
+         confirmation ({}). Nothing was changed",
+        Shown::ipc(failure)
+    ))
 }
 
 /// What the command says when the host does not answer a request that changes nothing.
@@ -1539,6 +1591,141 @@ mod tests {
         })
         .await;
         assert!(matches!(refused, Err(CliError::Refused(_))));
+    }
+
+    /// KR-REQ-07.47: the read of what an owner device is shown ends with the challenge when that
+    /// comes before the time any request that changes nothing is given, and says why it ended, with
+    /// nothing changed: a challenge that had already ended is not asked about and is not a host that
+    /// did not answer, and a connection that ends is not a host that said nothing. The host's own
+    /// answer, its refusal, and an answer that cannot be read are passed on for the caller to read.
+    #[tokio::test(start_paused = true)]
+    async fn the_read_of_what_an_owner_device_is_shown_ends_with_the_challenge_and_says_why() {
+        use kr_protocol::confirmation::PendingConfirmation;
+        // The outer bound is the test's own: a read that is never given up never ends.
+        let outer = tokio::time::Duration::from_secs(3600);
+        let request = a_challenge(1);
+        let nothing_changed = |error: &CliError| error.to_string().contains("Nothing was changed");
+
+        // A challenge that ends in five seconds ends the wait for the read there, and not at the
+        // time any request is given.
+        let started = tokio::time::Instant::now();
+        let silent = tokio::time::timeout(
+            outer,
+            display_listed(
+                started + tokio::time::Duration::from_secs(5),
+                std::future::pending::<Result<OwnerConfirmationPendingResult>>(),
+                &request,
+            ),
+        )
+        .await
+        .expect("the read was given up at the challenge's end");
+        let Err(unanswered @ CliError::HostUnavailable(_)) = silent else {
+            panic!("the host did not answer");
+        };
+        assert!(nothing_changed(&unanswered));
+        assert_eq!(
+            started.elapsed(),
+            tokio::time::Duration::from_secs(5),
+            "on the paused clock, at the challenge's end and not at the bound of any request"
+        );
+
+        // A challenge that has ended is not asked about.
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let ended = display_listed(
+            tokio::time::Instant::now(),
+            async {
+                asked.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(OwnerConfirmationPendingResult { pending: vec![] })
+            },
+            &request,
+        )
+        .await;
+        let Err(ran_out @ CliError::Refused(_)) = ended else {
+            panic!("the challenge ran out");
+        };
+        assert_eq!(ran_out.code(), ErrorCode::OwnerConfirmationRequired);
+        assert!(nothing_changed(&ran_out));
+        assert!(
+            !asked.load(std::sync::atomic::Ordering::SeqCst),
+            "the host is not asked about a challenge that has ended"
+        );
+
+        // A connection that fails before the host answers, and says what failed: it may have
+        // ended, or sent a frame that is not the answer.
+        for (failure, cause) in [
+            (kr_ipc::IpcError::PeerClosed, "closed the connection"),
+            (
+                kr_ipc::IpcError::UnexpectedMessage("a frame that is not the answer"),
+                "a frame that is not the answer",
+            ),
+        ] {
+            let lost = display_listed(
+                tokio::time::Instant::now() + tokio::time::Duration::from_secs(60),
+                async move { Err(CliError::Ipc(failure)) },
+                &request,
+            )
+            .await;
+            let Err(lost @ CliError::HostUnavailable(_)) = lost else {
+                panic!("the connection failed");
+            };
+            assert!(nothing_changed(&lost));
+            assert!(lost.to_string().contains(cause), "{lost}");
+        }
+
+        // The controls: what the host lists is read, and what it refuses and what cannot be read
+        // are its answer.
+        let live = tokio::time::Instant::now() + tokio::time::Duration::from_secs(60);
+        let listed = display_listed(
+            live,
+            async {
+                Ok(OwnerConfirmationPendingResult {
+                    pending: vec![PendingConfirmation {
+                        request: request.clone(),
+                        display: ConfirmationDisplay::EstablishClock,
+                        answered: false,
+                    }],
+                })
+            },
+            &request,
+        )
+        .await;
+        assert!(matches!(
+            listed,
+            Ok(Some(ConfirmationDisplay::EstablishClock))
+        ));
+        let unlisted = display_listed(
+            live,
+            async { Ok(OwnerConfirmationPendingResult { pending: vec![] }) },
+            &request,
+        )
+        .await;
+        assert!(
+            matches!(unlisted, Ok(None)),
+            "a challenge the host does not list"
+        );
+        let refused = display_listed(
+            live,
+            async {
+                Err(CliError::Refused(refusal(
+                    ErrorCode::PermissionDenied,
+                    Shown::said("no"),
+                )))
+            },
+            &request,
+        )
+        .await;
+        assert!(matches!(refused, Err(CliError::Refused(_))));
+        let unreadable = display_listed(
+            live,
+            async {
+                Err(CliError::Other(Shown::said(
+                    "the host's answer could not be read",
+                )))
+            },
+            &request,
+        )
+        .await;
+        assert!(matches!(unreadable, Err(CliError::Other(_))));
     }
 
     /// KR-REQ-07.47: a connection that ends after a request was sent, or an answer that cannot be

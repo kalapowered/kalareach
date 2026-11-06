@@ -654,9 +654,13 @@ struct Issued {
 ///
 /// A host that holds the connection open and answers neither does not hold the command: the
 /// request for the challenge is given the time any request that changes nothing is given, and the
-/// read of what is shown that time at most, and not past the challenge's own end. The second read
-/// ends the command when it is not answered, since an answer that came late would be taken on this
-/// connection for the answer to the request after it.
+/// read of what is shown that time at most, and not past the challenge's own end. The command ends
+/// with nothing changed when that read is not answered in time, when the connection fails before
+/// it is answered, or when the challenge has already ended, and says which. It ends on the first
+/// because the answer may still come, and each answer is matched to its request by identifier, so
+/// the next request on this connection would fail on a frame that is not its own; and on the
+/// second because the effect would otherwise be asked for on a connection that has failed, and its
+/// failure would say the outcome is not known when nothing was sent.
 async fn issued<C>(
     client: &mut C,
     wants_display: bool,
@@ -670,16 +674,9 @@ async fn issued<C>(
             kr_ipc::now_ms().get(),
         );
     let display = if wants_display {
-        match crate::plugin::ask_before(deadline, pending(client)).await {
-            Err(unanswered @ CliError::HostUnavailable(_)) => return Err(unanswered),
-            read => read.map(|pending| {
-                pending
-                    .pending
-                    .into_iter()
-                    .find(|listed| listed.request == challenge.request)
-                    .map(|listed| listed.display)
-            }),
-        }
+        crate::plugin::ask_before(deadline, pending(client))
+            .await?
+            .map(|listed| crate::plugin::display_in(listed, &challenge.request))
     } else {
         Ok(None)
     };
@@ -1769,6 +1766,59 @@ mod tests {
         .await
         .expect("the challenge");
         assert!(matches!(not_asked.display, Ok(None)));
+    }
+
+    /// KR-REQ-07.47: the read of what an owner device is shown ends the command there when the
+    /// connection ended before it was answered, or when the challenge had ended when it arrived,
+    /// with nothing changed and the reason it was: the effect is not asked for on a connection that
+    /// has gone, whose failure would say its outcome is not known when nothing was sent, and a
+    /// challenge that has ended is not a host that did not answer. The controls are a host's refusal
+    /// and an answer that cannot be read, which the command goes on without.
+    #[tokio::test(start_paused = true)]
+    async fn the_read_of_what_is_shown_ends_the_command_with_the_reason_it_ended() {
+        let challenge = a_challenge(600_000);
+        let lost = issued(
+            &mut (),
+            true,
+            async |_| Ok(challenge.clone()),
+            async |_| Err(CliError::Ipc(kr_ipc::IpcError::PeerClosed)),
+        )
+        .await;
+        let Err(lost @ CliError::HostUnavailable(_)) = lost else {
+            panic!("the command ends where the connection ended");
+        };
+        let said = lost.to_string();
+        assert!(said.contains("connection"), "{said}");
+        assert!(said.contains("Nothing was changed"), "{said}");
+
+        let mut ended = a_challenge(0);
+        ended.request.expires_at_ms = TimestampMs::new(1);
+        let ran_out = issued(
+            &mut (),
+            true,
+            async |_| Ok(ended.clone()),
+            async |_| unreachable!("a challenge that has ended is not asked about"),
+        )
+        .await;
+        let Err(ran_out @ CliError::Refused(_)) = ran_out else {
+            panic!("the challenge ran out");
+        };
+        assert_eq!(ran_out.code(), ErrorCode::OwnerConfirmationRequired);
+        assert!(ran_out.to_string().contains("ran out"), "{ran_out}");
+
+        let unreadable = issued(
+            &mut (),
+            true,
+            async |_| Ok(challenge.clone()),
+            async |_| {
+                Err(CliError::Other(Shown::said(
+                    "the host's answer could not be read",
+                )))
+            },
+        )
+        .await
+        .expect("an answer that cannot be read does not end the command");
+        assert!(matches!(unreadable.display, Err(CliError::Other(_))));
     }
 
     /// KR-REQ-07.47: a host that holds the connection open and does not answer the terminal's
