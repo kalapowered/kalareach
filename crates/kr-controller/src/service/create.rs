@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
-use kr_protocol::error::{ErrorCode, ProtocolError, RetryCategory};
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::local::LocalClientKind;
@@ -1209,7 +1209,9 @@ impl Controller {
             .get(reservation.session_id)
             .is_none()
         {
-            self.recover_claim_for(reservation.session_id).await?;
+            self.recover_claim_for(reservation.session_id)
+                .await
+                .map_err(session_not_known)?;
         }
         let worker = self
             .directory
@@ -1231,18 +1233,7 @@ impl Controller {
             let described = self
                 .describe_a_created_session(&worker)
                 .await
-                .map_err(|error| {
-                    if error.code().retry_category() == RetryCategory::Transient {
-                        ControllerError::Uncertain {
-                            detail: format!(
-                                "the worker of the session this create token made cannot be asked \
-                                 about it now, so what the session is like is not known: {error}"
-                            ),
-                        }
-                    } else {
-                        error
-                    }
-                })?;
+                .map_err(session_not_known)?;
             if let Some(session) = described {
                 return encode(&SessionCreateResult {
                     session,
@@ -1264,8 +1255,9 @@ impl Controller {
                     "this create token is already recorded as {phase} and its worker is not \
                      available"
                 )),
-                // The first attempt has reserved the session and not yet asked for a worker, or is
-                // not finished with asking: it may still make the session.
+                // The first attempt has reserved the session and not yet asked for a worker: it may
+                // still make the session. A row its attempt left behind when a write failed reads the
+                // same until the next start moves it to failed, and nothing ran for it.
                 LaunchPhase::Reserved => ControllerError::attempt_still_running(),
                 // A worker was asked for, or ran: with it gone and no closure recorded, whether the
                 // session was made and what it came to is not known.
@@ -1310,6 +1302,29 @@ impl Controller {
             deduplicated,
         })
         .map(Some)
+    }
+}
+
+/// What a repeat of a create is told when the worker its first attempt started, or the claim that
+/// worker made, cannot be asked about the session.
+///
+/// The first attempt got as far as a worker, so the session may exist. Whatever stops the answer,
+/// the repeat is told that what became of the session is not known, and asking again under the
+/// same token answers once it can be: not a transient word, which says nothing took effect, and not
+/// a refusal, which a client takes for the host's word that nothing was done. A storage failure
+/// is left for the wording of the record that cannot be read, and a failure that already says the
+/// outcome is not known is left as it is.
+pub(super) fn session_not_known(error: ControllerError) -> ControllerError {
+    if error.code() == ErrorCode::StorageUnavailable
+        || matches!(error, ControllerError::Uncertain { .. })
+    {
+        return error;
+    }
+    ControllerError::Uncertain {
+        detail: format!(
+            "the worker of the session this create token made cannot be asked about it now, so \
+             what became of the session is not known: {error}"
+        ),
     }
 }
 
