@@ -22,6 +22,7 @@ worker directly for what a session owns.
 | `kr doctor` | — | Read-only diagnostics, this host's effective configuration, and support bundles |
 | `kr host power` | — | Show or change whether this host stays awake for work it has admitted |
 | `kr host shell-mode` | — | Show or choose the shell mode a new session is created in when none is named |
+| `kr host push-gateways` | — | Show or choose the push gateways, besides the official one, that a paired device's notification credential may name |
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
 | `kr host terminal-profile` | — | Show, add or take out the optional `KalaReach` profile in one terminal application, so each window or tab opened through it is a session of its own |
 | `kr host startup` | — | Show or choose how `kr new` starts this environment's control daemon when none is running |
@@ -1420,6 +1421,7 @@ configuration /home/someone/.config/kalareach/environments/ab12cd34/config.json 
   relay.origin = none from default, applies at the next start
   automation.test_suites = none from default, applies immediately
   automation.test_outputs = none from default, applies immediately
+  push.gateways = none from default, applies immediately
   session_limit ceiling 128
   enrolment ceiling 67108864 metadata bytes, 100000 entries, 5 generations retained, …;
     configured here: retained_generations
@@ -2392,6 +2394,37 @@ keeps the mode it was created in. A request outranks it
 "source": "..." } }`. `native_compat` is a stock shell chosen on purpose and never an automatic
 fallback; `docs/host/README.md` has the document's schema and the order a request, the document and
 the default are taken in.
+
+## `kr host push-gateways`
+
+A host delivers notifications through the official gateway and through the gateways listed here,
+and through no other. An independently signed app registers with its own gateway, and a host reaches
+it only once its owner lists it:
+
+```sh
+kr host push-gateways                                   # the gateways in force
+kr host push-gateways --set https://push.builder.example  # allow this gateway
+kr host push-gateways --set https://push.a.example http://127.0.0.1:8788
+kr host push-gateways --clear                           # the official gateway only
+```
+
+`--set` replaces the list with the origins it names; each is an `https` origin, or an `http` origin
+on a loopback address, with no path and no trailing slash. The official gateway is always allowed and
+cannot be listed. The command applies one validated revision of the host's configuration document, which
+states level 7 while the list is not empty. It refuses an origin that is not one, by the name
+`push.gateways`, and writes nothing. It asks the running control daemon before it writes: with none
+running it says so and changes nothing, and a daemon that does not report the setting, as one of an
+earlier release does not, is refused with nothing written, because it would ignore the list. It asks
+the daemon again after it writes, and says the list is in force only when the daemon reports it so.
+A gateway taken out of the list is then retired: the host stops using and renewing the credentials it
+holds for that gateway, forgets them, and asks the gateway to revoke each authorisation, again until
+it has (`docs/delivery/README.md`). When the daemon cannot put the change into force, because it
+cannot write down the revocation it owes, for one, the command fails and says why, and the daemon's
+own report (`kr doctor`) says which gateways are in force. Devices paired through a gateway taken
+out stay paired and are not sent notifications until their app registers with a gateway the host
+allows. With `--json` the answer is
+`{ "ok": true, "environment_id": "...", "push_gateways": ["..."] }`, listing the gateways besides the
+official one that the daemon reports in force.
 
 ## `kr host machine`
 

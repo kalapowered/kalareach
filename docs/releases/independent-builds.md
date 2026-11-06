@@ -53,11 +53,25 @@ official gateway without a KalaReach account.
 
 ## What a host does with a gateway
 
-A host delivers notifications only through the official gateway. The origin a credential names is
-where the host sends every notification, status question and renewal under it, so a paired device
-does not get to choose that address: a host refuses, when a device registers, a credential that
-names another gateway. An independently signed app that registers with its own gateway is therefore
-reached by no host.
+A host delivers notifications through the official gateway and through the gateways its owner
+lists, and through no other. The origin a credential names is where the host sends every
+notification, status question and renewal under it, so a paired device does not get to choose that
+address: when a device registers, the host refuses a credential that names a gateway it does not
+allow, and does not ask that gateway anything. An independently signed app that registers with its
+own gateway is reached once the owner of the host lists that gateway, with
+`kr host push-gateways --set <origin>` (the `push.gateways` setting of the host's configuration
+document, a list of origins, each an `https` origin or an `http` origin on a loopback address, with
+no path and no trailing slash). The official gateway is always allowed and is never listed.
+
+Taking a gateway out of the list retires what the host holds for it when the host next puts its
+document into force, which `kr host push-gateways` does at once and a hand edit leaves to the
+next time the host reads it (a question about itself, `kr doctor`, or a start). The host stops using
+and renewing every credential issued by that gateway, forgets them, and writes down that it owes the
+gateway a revocation of each authorisation, which it asks for again until the gateway has made it.
+The device stays paired. Notifications for it are not sent until its app registers a credential from
+a gateway the host allows. A host rolled back to an earlier release asks for the same revocations,
+because the debt is kept in the delivery journal that release reads. `docs/delivery/README.md`
+describes the retirement and its limits.
 
 ## What the repository holds
 
