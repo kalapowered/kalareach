@@ -12,3 +12,10 @@ version = "0.1.0"
 dependencies = [
  "embed",
 ]
+
+[[package]]
+name = "racy"
+version = "0.1.0"
+dependencies = [
+ "embed",
+]
