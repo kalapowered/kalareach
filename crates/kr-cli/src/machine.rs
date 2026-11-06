@@ -34,18 +34,19 @@
 //!   `RESOURCE_UNAVAILABLE`, which says the environment dispatched nothing, leaves the step sent
 //!   for the next `finish` to send the same action again. A step composed now is refused for what
 //!   the environment refused it for, unless the environment could not write, answer or finish it,
-//!   which stay sent.
+//!   or refused it for now with another transient code, which stay sent.
 //!   One step on, the plan takes the record as showing the step was taken once the environment has
 //!   confirmed that the record survives a crash, which it does before it claims any step, so a step
 //!   it refuses with `DRAFT_CONFLICT` after it claimed it, for the record it now holds, is taken,
 //!   while an answer it kept for an action sent again was made earlier and confirms nothing, and
 //!   one refused any other way may have come before that confirmation: it is composed again under a
-//!   new action to ask if it was sent before, and stays sent if it was composed now. Whichever
-//!   action it was sent under, a step the environment answers with `OUTCOME_UNKNOWN` (it could not
-//!   say whether its change survives a crash, or its action is still running) or with
-//!   `RESOURCE_UNAVAILABLE` stays sent. At a record that is neither the one the step was approved
-//!   against nor the one that shows it taken, another group or a later revision, the step can never
-//!   apply and is refused with `DRAFT_CONFLICT`, whatever the environment refused it for.
+//!   new action to ask if it was sent before, and stays sent if it was composed now. At that record,
+//!   whichever action the step was sent under, an answer of `OUTCOME_UNKNOWN` (the environment could
+//!   not say whether its change survives a crash, or its action is still running) or of
+//!   `RESOURCE_UNAVAILABLE` leaves it sent. At a record that is neither the one the step was
+//!   approved against nor the one that shows it taken, such as another group or a later revision,
+//!   the step can never apply and is refused with `DRAFT_CONFLICT`, whatever the environment
+//!   refused it for but `INVALID_ARGUMENT`, which is final at any record.
 //!   An environment that reports no record takes no step, and what it refuses a step for says
 //!   nothing of an earlier action of that step, which it may have taken: the first action sent for
 //!   a step that the environment refuses in its definite word is refused with
