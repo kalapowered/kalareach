@@ -4137,21 +4137,14 @@ impl ProjectService {
         method: &str,
         payload_digest: kr_protocol::scalars::Digest256,
     ) -> Result<Option<RetainedOutcome>> {
-        let Some(record) = self.locked()?.retained_action(actor_id, action_id)? else {
-            return Ok(None);
-        };
-        if record.method != method || record.payload_digest != payload_digest {
-            return Err(ProjectError::IdConflict {
-                action: action_id.to_string().into(),
-                method: record.method.into(),
-            });
-        }
         // A claim with no outcome is not an answer: the request reaches the service, which finishes
         // what its claim started rather than telling the caller the outcome is unknown for ever.
-        if record.result.is_none() && record.error_code.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(outcome_of(&record)))
+        Ok(
+            match self.action_state(actor_id, action_id, method, payload_digest)? {
+                ActionState::Settled(outcome) => Some(outcome),
+                ActionState::Absent | ActionState::Open => None,
+            },
+        )
     }
 
     /// Says, from one read of the action's row, whether the action is absent, open or settled.
