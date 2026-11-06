@@ -3603,6 +3603,72 @@ mod tests {
         );
     }
 
+    /// KR-REQ-26.16, the part about a change affecting authority fencing dispatch before it is
+    /// acknowledged: a repeat of a recorded key registration, stopped where its receipt has been
+    /// read, is not given the receipt once the revocation of its device has been acknowledged.
+    /// The control: the same repeat, let go with no revocation, is given the receipt, and the
+    /// registration was made once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_registrations_repeat_is_not_answered_once_its_devices_revocation_is_acknowledged()
+     {
+        let host = Host::start(GrantExpiry::Never, false).await;
+        let rotated = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a key");
+        let actor = kr_transport::listener::device_principal(&host.device_id);
+        let registration = host.registration(0x75, *rotated.public());
+        host.controller
+            .preview_key_update_action(
+                &actor,
+                &registration,
+                host.admission(Duration::from_secs(10)),
+            )
+            .await
+            .into_answer()
+            .expect("the registration is made");
+
+        // A repeat stopped where its receipt has been read, let go as it is.
+        let repeat = |admission: AdmittedMutation| {
+            let controller = Arc::clone(&host.controller);
+            let actor = actor.clone();
+            let registration = registration.clone();
+            tokio::spawn(async move {
+                controller
+                    .preview_key_update_action(&actor, &registration, admission)
+                    .await
+            })
+        };
+        let (arrived, release) = host.controller.pause_retained_lookup();
+        let waiting = repeat(host.admission(Duration::from_secs(10)));
+        tokio::time::timeout(Duration::from_secs(30), arrived)
+            .await
+            .expect("the repeat reaches the place it is stopped at")
+            .expect("the pause is armed");
+        release.send(()).expect("the repeat goes on");
+        let given = waiting.await.expect("the repeat finishes");
+        assert!(given.is_copied(), "the receipt is a copy of the record");
+        given
+            .into_answer()
+            .expect("with nothing changed the receipt is given back");
+
+        // The same repeat, with the revocation of its device acknowledged while it is stopped.
+        let (arrived, release) = host.controller.pause_retained_lookup();
+        let waiting = repeat(host.admission(Duration::from_secs(10)));
+        tokio::time::timeout(Duration::from_secs(30), arrived)
+            .await
+            .expect("the repeat reaches the place it is stopped at")
+            .expect("the pause is armed");
+        host.controller
+            .revoke_device_authority(host.device_id, None, None)
+            .await
+            .expect("the revocation is acknowledged");
+        release.send(()).expect("the repeat goes on");
+        let withheld = waiting
+            .await
+            .expect("the repeat finishes")
+            .into_answer()
+            .expect_err("a revoked device is not given the receipt");
+        assert_eq!(withheld.code(), ErrorCode::PermissionDenied, "{withheld}");
+    }
+
     /// KR-REQ-09.13: the daemon's entry for a worker replaces the one an answer was given with only
     /// when it carries every name that answer gave. An entry whose totals are as high but from
     /// which a carried report's names have gone, as the report of an earlier revision does when
