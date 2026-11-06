@@ -977,9 +977,12 @@ pub fn a_long_run_of_escape_pairs_before_a_device_control_header_leaves_the_shel
 /// `ESC ESC P !` is owed to the person ahead of the key that is read again, in both. The case sets
 /// the editor to its vi keys, takes the terminal's answers away so that the next prompt's query
 /// stays open, types a line with a word that ends in a letter, the Escapes with the header and an
-/// `x`, and a return, then gives the answers back. The Escape makes the editor leave insert mode
-/// and the `x` deletes the last letter of the word, so the word is printed without it; with the
-/// two the other way round the `x` is typed into the word.
+/// `x`, and a return, then gives the answers back. The Escape comes out ahead of the `x`, and an
+/// Escape followed at once by a key is read by the editor as the two of them together, which leave
+/// the word as it was, so the line prints the whole word and a dash. With the two the other way
+/// round the `x` is typed into the word and the Escape ends up beside the return, so the line
+/// does not print that word. The dash is what the case waits for with the word, so that a word with
+/// anything after its last letter is not taken for the one that was asked for.
 ///
 /// # Panics
 ///
@@ -998,11 +1001,11 @@ pub fn the_keys_around_a_device_control_header_keep_their_order_while_the_termin
     assert!(session.answered("kr-held"));
     let _ = session.next_prompt();
     let start = session.written();
-    session.type_bytes(b"printf '%s%s\\n' kr-ord ered\x1b\x1bP!x\r");
+    session.type_bytes(b"printf '%s%s-\\n' kr-ord ered\x1b\x1bP!x\r");
     session.release_terminal_answers();
     let deadline = session.deadline_for(REPLY);
     assert!(
-        session.wait_for_output_after_by(start, "kr-ordere", deadline),
+        session.wait_for_output_after_by(start, "kr-ordered-", deadline),
         "the Escape did not stay ahead of the key behind the header:\n{}",
         shown_since(&session, start)
     );
