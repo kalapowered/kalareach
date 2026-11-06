@@ -4,7 +4,10 @@
 //! evidence directory, `KR_TEST_ARTIFACTS_DIR` naming that directory, so what a test records beside
 //! its verdict lands with the result. A `cargo test` step is built once with `--no-run` first,
 //! which is how the report learns which package and target each test binary is: two packages can
-//! both have a test target called `fixtures`, and only the executable tells them apart.
+//! both have a test target called `fixtures`, and only the executable tells them apart. The calls
+//! after the build, the listing and the run, build nothing: a file that a macro wrote while a crate
+//! compiled is dated before the build began, as `date_before` says, or Cargo would compile the
+//! crate again in the listing.
 //!
 //! What the build names is what the run is held to. Every test binary it built is listed, by the
 //! step's own command with this program as Cargo's runner, and has to be run and read; a listing
@@ -26,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::lane;
 use crate::libtest::{self, Binary, Recording};
@@ -814,6 +817,7 @@ fn build_first(
         .open(log_path)
         .map_err(|error| format!("{} could not be opened: {error}", log_path.display()))?;
     let _ = writeln!(log, "== the build before the run: {}", command.join(" "));
+    let began = SystemTime::now();
     let output = place
         .command(&command)
         .stdin(Stdio::null())
@@ -833,10 +837,21 @@ fn build_first(
     }
     let mut built = Vec::new();
     let mut executables = BTreeMap::new();
+    let mut outputs = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        // The output directory of a build script of a crate of this tree (a path, not a registry).
+        if message["reason"] == "build-script-executed"
+            && message["package_id"]
+                .as_str()
+                .is_some_and(|package| package.starts_with("path+"))
+            && let Some(directory) = message["out_dir"].as_str()
+        {
+            outputs.push(PathBuf::from(directory));
+            continue;
+        }
         // A test binary is a target built with the test profile; a program the tests launch is
         // built too, as itself, and is not one.
         if message["reason"] != "compiler-artifact" || message["profile"]["test"] != true {
@@ -861,7 +876,75 @@ fn build_first(
             }
         }
     }
+    let (dated, failed) = date_before(&outputs, began);
+    if dated > 0 || !failed.is_empty() {
+        let _ = append_to_log(
+            log_path,
+            &format!(
+                "== {dated} files written while a crate compiled were dated before the build \
+                 began, so that Cargo does not compile the crate again\n{}",
+                failed
+                    .iter()
+                    .map(|file| format!("{file}\n"))
+                    .collect::<String>()
+            ),
+        );
+    }
     Ok((built, executables))
+}
+
+/// Gives each file under `directories` that was written after `began` a time a second before it.
+///
+/// Cargo takes a crate for out of date when a file the compile read is newer than the start of that
+/// compile. The macros of some crates write a file into the build script's output directory while
+/// the crate compiles and read it back at once (Tauri's context macro does it with an application's
+/// icon and front end), and that file is newer than the start of the compile that read it. The
+/// build is complete and the file is what the compile read, but the next call of Cargo compiles the
+/// crate again and links its test programs again, which on a cold target is a second build of the
+/// biggest crate of a step. A time only goes back, to before the build, and only for a file that
+/// the build wrote in the output directory of one of its build scripts: no source file, and no file
+/// an earlier build wrote, looks older than it is, and a file that changed after the compile read
+/// it is not one the build wrote. Returns how many files were given a time, and those that could
+/// not be.
+fn date_before(directories: &[PathBuf], began: SystemTime) -> (usize, Vec<String>) {
+    let before = began.checked_sub(Duration::from_secs(1)).unwrap_or(began);
+    let mut dated = 0;
+    let mut failed = Vec::new();
+    let mut pending = directories.to_vec();
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            let path = entry.path();
+            let written_after = kind.is_file()
+                && entry
+                    .metadata()
+                    .and_then(|found| found.modified())
+                    .is_ok_and(|written| written > before);
+            if !written_after {
+                continue;
+            }
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(before))
+            {
+                Ok(()) => dated += 1,
+                Err(error) => {
+                    failed.push(format!("{} could not be dated: {error}", path.display()))
+                }
+            }
+        }
+    }
+    (dated, failed)
 }
 
 /// Runs `command` at `place`, its standard output and error both appended to `log`, and returns
