@@ -1403,7 +1403,8 @@ async fn a_send_refused_because_an_earlier_one_was_taken_frees_the_link_of_the_o
     .await;
     for id in [older, newer] {
         let call = link.expect(Method::ActionRead).await;
-        link.answer(&call, &receipt_at(id, ReceiptState::Unknown, 9_000))
+        let at = if id == older { 5_000 } else { 9_000 };
+        link.answer(&call, &receipt_at(id, ReceiptState::Unknown, at))
             .await;
     }
     let call = link.expect(Method::QuestionAnswer).await;
