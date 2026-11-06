@@ -708,6 +708,7 @@ fn windows() -> Vec<Step> {
         step
     };
     let credential = "sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again";
+    let thread_time = "kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time";
     vec![
         // The pairing tests run `kr` against a control daemon they find built beside them, and a
         // test that starts a worker through the environment's scheduled task registers the
@@ -1214,6 +1215,51 @@ fn windows() -> Vec<Step> {
                 "launcher::",
             ],
             "launcher::",
+        ),
+        // The compile budget's reading of a thread's processor time, which no other case reaches on
+        // this platform, and the rest of the plugin runtime's suites, which run the test components.
+        qualified_only(
+            "the compile budget's reading of a thread's processor time",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-plugin-runtime",
+                "--test",
+                "execution",
+                thread_time,
+            ],
+            thread_time,
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the plugin runtime's library",
+            &["test", "--locked", "-p", "kr-plugin-runtime", "--lib"],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the plugin runtime running real components",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-plugin-runtime",
+                "--test",
+                "execution",
+            ],
+        )
+        .skipping(&[(thread_time, "it has a step of its own")]),
+        Step::cargo(
+            Group::Rust,
+            "the plugin runtime's service over a pipe",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-plugin-runtime",
+                "--test",
+                "service",
+            ],
         ),
         // kr new through the environment's scheduled task. The daemon the task starts keeps its
         // keys in this machine's credential store, so these cases are ignored in an ordinary run

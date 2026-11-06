@@ -666,6 +666,10 @@ jobs:
       #   - the plugin host's launcher: `kr-plugin-service`'s library filter `launcher::`, which
       #     holds the endpoint name a host of another release derives for its protocol, in its
       #     Windows form (a pipe's name);
+      #   - the plugin runtime itself: `kr-plugin-runtime`'s library, its `execution` suite, which
+      #     runs real components under the bounds the host holds them to, and its `service` suite,
+      #     which serves workers over this platform's pipe, with the compile budget's reading of a
+      #     thread's processor time, a case of the `execution` suite, as a step of its own;
       #   - the daemon's other Windows suites: the library filters `catalogue::integrations`,
       #     `catalogue::launch_probes`, `agent_tools`, `machine`, `registry` and `singleton`, and
       #     the `agent_tools`, `contact_skill`, `catalogue`, `voice_broker` (the sign-in cases),
@@ -1167,6 +1171,39 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         # Quoted: a plain YAML scalar cannot end in `:`.
         run: "cargo test --locked -p kr-plugin-service --lib launcher::"
+
+      # The compile budget counts the processor time of the thread that compiles, and on this
+      # platform that is the thread-times query. The case reads it on two real threads, one that
+      # spins and one that waits, and holds the waiting thread to a fraction of what the other used.
+      # No other case reaches that query. This step carries its own limit, and the three below
+      # carry theirs, so that a case that hangs ends its step and not the leg.
+      - name: Test the compile budget's reading of a thread's processor time
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        timeout-minutes: 20
+        run: cargo test --locked -p kr-plugin-runtime --test execution kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time
+
+      # The plugin runtime's own cases, which run the test components built above: the engine, the
+      # compile pool and the compiled-code cache, the host's read of a payload inside its packages
+      # directory, and the bindings' queues and faults.
+      - name: Test the plugin runtime's library
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        timeout-minutes: 10
+        run: cargo test --locked -p kr-plugin-runtime --lib
+
+      # Real components run under the bounds of section 11: memory, output, fuel and deadlines, the
+      # cache's refusals and the compile queue. The case above is run by its own step and left out
+      # here.
+      - name: Test the plugin runtime running real components
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        timeout-minutes: 10
+        run: cargo test --locked -p kr-plugin-runtime --test execution -- --skip kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time
+
+      # The host and a worker over the pipe the host serves on this platform: the handshake and the
+      # challenge, registration, delivery, calls, unbinds and the refusals of each.
+      - name: Test the plugin runtime's service over a pipe
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        timeout-minutes: 10
+        run: cargo test --locked -p kr-plugin-runtime --test service
 
       # kr new through the environment's scheduled task, as the standalone start runs it here: three
       # first commands at once meet one daemon that serves every caller, the daemon is in none of
