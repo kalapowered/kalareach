@@ -1,0 +1,13 @@
+# A tree the conformance report's own tests read and run. It is a workspace of its own, so the
+# repository's workspace never builds it.
+#
+# Three libraries, each with a unit test and a documentation test: when the first test program
+# fails, Cargo goes on to the others, and the output after the failure is long.
+[package]
+name = "first"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+members = ["second", "third"]

@@ -1388,6 +1388,59 @@ fn a_listing_that_fails_leaves_what_it_said_in_the_log_and_the_end_of_it_in_the_
     assert!(!document.passed());
 }
 
+/// A program to stand where the report's own does as Cargo's runner when the first test program
+/// cannot be listed: it says `why` on its standard error and fails, once, and is silent and well
+/// for every program after that.
+#[cfg(unix)]
+fn runner_whose_first_program_cannot_be_listed(directory: &Path, why: &str) -> PathBuf {
+    let path = directory.join("runner-whose-first-program-cannot-be-listed");
+    let marker = directory.join("ran-once");
+    let script = format!(
+        "#!/bin/sh\n[ -e \"{marker}\" ] && exit 0\n: > \"{marker}\"\necho \"{why}\" >&2\nexit 3\n",
+        marker = marker.display()
+    );
+    kr_ipc::testing::place_script(&path, script);
+    path
+}
+
+/// With several libraries Cargo goes on after the first program that fails, and what it writes for
+/// the others (a line for each program and each library's documentation tests) comes after the
+/// failure, so it fills the end of the standard error. The error names what the failed program said,
+/// which comes before Cargo's account of it, and none of Cargo's own lines.
+#[cfg(unix)]
+#[test]
+fn a_listing_whose_first_program_fails_names_what_it_said_and_not_what_cargo_wrote_after_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let lister = runner_whose_first_program_cannot_be_listed(
+        directory.path(),
+        "cannot write in $CARGO_MANIFEST_DIR: the volume is full",
+    );
+    let (document, _evidence) = run_step_through(
+        "several",
+        &["test", "--locked", "--workspace", "--no-fail-fast"],
+        lister,
+    )
+    .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let error = document.steps[0].error.as_deref().unwrap_or_default();
+    assert!(error.contains("did not list the step's tests"), "{error}");
+    assert!(
+        error.contains("the volume is full"),
+        "the error does not name what the first program said: {error}"
+    );
+    for cargo in [
+        "Doc-tests",
+        "Caused by",
+        "didn't exit successfully",
+        "rerun pass",
+        "targets failed",
+    ] {
+        assert!(
+            !error.contains(cargo),
+            "the error holds a line of Cargo's ({cargo}): {error}"
+        );
+    }
+}
+
 /// A crate whose macro writes a file into the build script's output directory while the crate
 /// compiles (Tauri's context macro does it with an application's icon and front end) is out of date
 /// to Cargo in the next call: the file is newer than the start of the compile that read it. The

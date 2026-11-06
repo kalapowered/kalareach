@@ -1500,9 +1500,14 @@ mod tests {
         let root = std::env::temp_dir().join("checkout");
         let given = root.to_string_lossy().into_owned();
         let backslashes = given.replace('/', "\\");
+        // What Cargo writes after a failed program, and for the programs after it, is not what
+        // the failed program said.
         let text = format!(
             "{given}/a\n{}\\b\n{}\\c\n{}\n\
              error: test failed, to rerun pass `-p t --test x`\n\
+             \nCaused by:\n  process didn't exit successfully: `lister list-one x --list` (exit status: 1)\n\
+             note: test exited abnormally; to see the full output pass --no-capture to the harness.\n\
+             \x20    Running tests/y.rs (target/debug/deps/y-0123)\n   Doc-tests t\n\
              error: 2 targets failed:\n    `-p t --lib`\n    `-p t --test x`\n",
             backslashes,
             backslashes.replace('\\', "\\\\"),
@@ -1510,10 +1515,16 @@ mod tests {
         );
         let ends = ends_of(&text, &root);
         assert!(ends.contains("the volume is full"), "{ends}");
-        assert!(
-            !ends.contains("targets failed") && !ends.contains("rerun pass"),
-            "{ends}"
-        );
+        for cargo in [
+            "targets failed",
+            "rerun pass",
+            "Caused by",
+            "didn't exit",
+            "Running",
+            "Doc-tests",
+        ] {
+            assert!(!ends.contains(cargo), "{cargo}: {ends}");
+        }
         assert!(!ends.contains("checkout"), "{ends}");
         assert!(ends.contains("<root>"), "{ends}");
         // A relative root names the working directory: the paths in the output are the
