@@ -811,7 +811,9 @@ impl Attention {
     ///
     /// Returns [`crate::Error::ActionConflict`] when the identity was used with a different
     /// request, whatever `admit` returns, the mutation's own refusals, and the store's errors as
-    /// [`Attention::apply`]. Nothing is recorded when the action is refused.
+    /// [`Attention::apply`]. Nothing is recorded when the action is refused. A record of the action
+    /// that cannot be read is [`crate::Error::ActionUnreadable`]: the action is not begun, and the
+    /// caller cannot tell it from a repeat of one that was performed.
     pub fn perform(
         &mut self,
         action: &ActionKey,
@@ -820,8 +822,13 @@ impl Attention {
         admit: impl FnOnce() -> Result<()>,
         encode: impl FnOnce(&Answer) -> Vec<u8>,
     ) -> Result<Performed> {
-        self.live()?;
-        if let Some(record) = self.store.action(&action.actor, &action.action_id)? {
+        let held = self
+            .live()
+            .and_then(|()| self.store.action(&action.actor, &action.action_id))
+            .map_err(|source| crate::Error::ActionUnreadable {
+                source: Box::new(source),
+            })?;
+        if let Some(record) = held {
             if record.method == action.method && record.digest == action.digest {
                 return Ok(Performed::Retained(record));
             }

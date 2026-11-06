@@ -85,6 +85,17 @@ pub enum Error {
         /// What the store reported.
         detail: String,
     },
+    /// The store's record of an action could not be read, so nothing says whether an earlier
+    /// attempt at the action performed it.
+    ///
+    /// A caller must not take this for the failure of an action that had not begun. The action
+    /// may have been performed, and a repeat of it is answered from the record once it can be read.
+    #[error("the attention feature store's record of an action cannot be read: {source}")]
+    ActionUnreadable {
+        /// Why the record could not be read.
+        #[source]
+        source: Box<Error>,
+    },
     /// A stored row could not be read back as the value it was written from.
     #[error("the attention feature store holds a {field} this build cannot read")]
     StoreUnreadable {
