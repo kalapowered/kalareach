@@ -9,7 +9,8 @@ byte or two: the rest was left in the input, and the reader typed it into the li
 says which string it is, the string is now read to its terminator, as the strings the reader does
 use already are. A byte that does not come within the reader's own wait for the next byte of a
 sequence ends the string early, as it ends any other. A device control string whose header is
-anything else is left as it was, so text typed behind an Alt-Shift-p is not taken for one.
+anything else is left as it was: the one byte read to tell is given back as the key it is, so text
+typed behind an Alt-Shift-p is not taken for one and loses nothing it did not lose before.
 
 A control sequence that ends in `t` was always taken for the old mouse-highlight report and took the
 next two bytes with it. A report of the window (`CSI 8 ; rows ; columns t`) is such a sequence, and
@@ -34,7 +35,32 @@ shells/fish/LICENSE.
                  flog!(reader, "mouse event");
                  // VT200 button released in mouse highlighting mode at valid text location. 5 chars.
                  let _ = next_char(self);
-@@ -698,9 +704,28 @@
+@@ -658,6 +664,24 @@
+         }
+     }
+ 
++    /// Puts the byte just read to see whether a string was one the reader skips back where it
++    /// would have been, as the key it is: it is not part of the string, and is the person's. It
++    /// leaves the buffer of the string, so that the rest of a character that it begins is not
++    /// waited for twice.
++    fn give_back_sequence_byte(&mut self, buffer: &mut Vec<u8>, byte: u8) {
++        buffer.pop();
++        if byte == b'\x1b' {
++            // An escape begins a sequence of its own, which is read from what follows it as usual
++            // once the reader is back at its input.
++            self.enqueue_event(CharEvent::from_key_seq(
++                KeyEvent::from_raw(key::ESCAPE),
++                WString::from_str("\x1b"),
++            ));
++        } else {
++            self.on_byte_read(byte);
++        }
++    }
++
+     fn parse_xtversion(&mut self, buffer: &mut Vec<u8>) -> Option<()> {
+         assert_eq!(buffer, b"\x1bP>");
+         self.read_until_sequence_terminator(buffer, false)?;
+@@ -698,11 +722,36 @@
                  self.parse_xtversion(buffer);
                  return None;
              }
@@ -42,9 +68,12 @@ shells/fish/LICENSE.
 +                // The terminal's tertiary device attributes (`\e P ! | id ST`) are a string this
 +                // reader does not use. Its body is read to the string terminator, so none of it is
 +                // left to be typed into the line. Only the header says it is one: Alt-Shift-p,
-+                // typed before text, is not.
-+                if self.read_sequence_byte(buffer)? == b'|' {
++                // typed before text, is not, and the byte behind it is the person's.
++                let next = self.read_sequence_byte(buffer)?;
++                if next == b'|' {
 +                    self.read_until_sequence_terminator(buffer, false);
++                } else {
++                    self.give_back_sequence_byte(buffer, next);
 +                }
 +                return None;
 +            }
@@ -55,12 +84,17 @@ shells/fish/LICENSE.
 +        if intermediate == b'$' {
 +            // The terminal's report of a setting (`\e P 1 $ r setting ST`) is another, read the
 +            // same way once its header is whole.
-+            if self.read_sequence_byte(buffer)? == b'r' {
++            let next = self.read_sequence_byte(buffer)?;
++            if next == b'r' {
 +                self.read_until_sequence_terminator(buffer, false);
++            } else {
++                self.give_back_sequence_byte(buffer, next);
 +            }
-+            return None;
-+        }
-+        if intermediate != b'+' {
              return None;
          }
++        if intermediate != b'+' {
++            return None;
++        }
          if self.read_sequence_byte(buffer)? != b'r' {
+             return None;
+         }

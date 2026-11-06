@@ -865,6 +865,37 @@ pub fn the_keys_a_person_types_around_a_hosts_answers_arrive_whole_and_in_order(
     );
 }
 
+/// KR-REQ-08.48: the byte behind the start of a device control string that is not one the reader
+/// skips stays the person's.
+///
+/// A reader that reads a device control string to its end decides from its first bytes which string
+/// it is. The tertiary device attributes begin with `!` and the report of a setting with `1$`, and
+/// the byte behind such a header says whether the string is one: a person who presses Alt+Shift+p
+/// and then types `!` or `1$` and a command has typed no string, and the first letter of the
+/// command is theirs. The case types each header and a command that prints a word, with no
+/// terminal answer anywhere in the line: a reader that took the letter for the string's next byte
+/// runs a command with a letter missing, and the word is not printed.
+///
+/// # Panics
+///
+/// Panics when a line does not print its word.
+#[cfg(unix)]
+pub fn the_byte_behind_a_device_control_header_the_reader_does_not_skip_stays_the_persons(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    for (header, marker) in [("\x1bP!", "kr-dcs-a"), ("\x1bP1$", "kr-dcs-b")] {
+        let line = format!("{header}{}", print_assembled(kind, marker));
+        assert!(
+            session.run(&line, marker),
+            "the line typed behind {header:?} did not print {marker:?}:\n{}",
+            session.terminal_output()
+        );
+    }
+}
+
 /// KR-REQ-08.48: the host's answer between the cursor keys a person presses leaves the cursor keys
 /// working.
 ///

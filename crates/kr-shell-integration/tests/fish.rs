@@ -44,6 +44,16 @@ fn the_keys_a_person_types_around_a_hosts_answers_arrive_whole_and_in_order() {
     shellpkg::the_keys_a_person_types_around_a_hosts_answers_arrive_whole_and_in_order(FISH);
 }
 
+/// KR-REQ-08.48: the byte behind the start of a device control string that is not one the reader
+/// skips stays the person's.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_byte_behind_a_device_control_header_the_reader_does_not_skip_stays_the_persons() {
+    shellpkg::the_byte_behind_a_device_control_header_the_reader_does_not_skip_stays_the_persons(
+        FISH,
+    );
+}
+
 /// KR-REQ-08.48: the host's answer between the cursor keys a person presses leaves them working.
 #[test]
 #[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
