@@ -1001,10 +1001,11 @@ async fn kr_req_18_13_a_withdrawal_leaves_an_invitation_whose_end_was_found_sinc
 
     assert_eq!(withdrawn, [untouched.grant.grant_id]);
     let states = |grants: &[GrantSummary]| grants.iter().map(|g| g.state).collect::<Vec<_>>();
-    // Not withdrawn: the grant is not revoked and its invitation is not cancelled.
+    // Not withdrawn: the grant is not revoked and its invitation is not cancelled. The end the
+    // redeem wrote down stands, so the issuer's list says it ended and not that it still waits.
     assert_eq!(
         states(&issued_over(&host, session).await),
-        [GrantState::Pending]
+        [GrantState::Expired]
     );
     let kept = grants
         .invitation(waiting.preview.invitation_id)
