@@ -43,8 +43,9 @@ windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
 # What this crate's own tests use to hold the engine's epoch still and advance it one tick at a
 # time, to hold a registration at a gate file in the environment's state directory until the file
 # is removed, to hold the compiles a registration queues at another, to count the compiles the
-# pool runs and the requests that join one, to count the unbinds a host has waiting, and to script
-# what a thread's processor-time clock reads. It compiles to nothing without this feature, and no shipped build enables it.
+# pool runs and the requests that join one, to count the unbinds a host has waiting and the ones that
+# found every place taken, and to script what a thread's processor-time clock reads. It compiles to
+# nothing without this feature, and no shipped build enables it.
 testing = ["kr-plugin-service/testing"]
 
 [dev-dependencies]

@@ -679,9 +679,10 @@ fn an_unbind_a_busy_blocking_pool_holds_up_is_refused_in_time_and_runs_when_the_
 // as any other is, with its binding's thread waited for.
 //
 // The host here has the time a worker gives an unbind to be an hour, which only ends an answer that
-// never comes. The pool's one thread is held, and one connection has asked for as many unbinds as
-// the host has places, each of which takes one and waits for the pool. The other connection asks
-// for its own; it finds no place, and waits. Nothing is answered until the pool is let go.
+// never comes. The pool's one thread is held, and two connections have asked, between them, for as
+// many unbinds as the host has places, each of which takes one and waits for the pool (each stays
+// well under the calls a connection may have running). A third connection asks for its own: it
+// finds no place, and waits. Nothing is answered until the pool is let go.
 #[test]
 fn an_unbind_that_finds_every_place_taken_waits_for_one_and_is_carried_out() {
     let Some(wasm) = components::well_behaved() else {
@@ -698,6 +699,7 @@ fn an_unbind_that_finds_every_place_taken_waits_for_one_and_is_carried_out() {
         };
         let mut host = Raw::connect(&served).await;
         let mut other = Raw::connect(&served).await;
+        let mut third = Raw::connect(&served).await;
         let first = components::request("well-behaved", 1);
         let second = components::request("well-behaved", 2);
         for (connection, request) in [(&mut host, &first), (&mut other, &second)] {
@@ -709,9 +711,15 @@ fn an_unbind_that_finds_every_place_taken_waits_for_one_and_is_carried_out() {
         }
         let pool = HeldPool::take().await;
 
+        // Half of the places are taken by each of two connections, so that neither is near the
+        // calls a connection may have running, whatever its last request has not yet given back.
         let mut taking = Vec::new();
-        for _ in 0..MAX_PENDING_UNBINDS {
+        for _ in 0..MAX_PENDING_UNBINDS / 2 {
             taking.push(host.send_unbind(&first).await);
+        }
+        let mut taking_too = Vec::new();
+        for _ in 0..MAX_PENDING_UNBINDS / 2 {
+            taking_too.push(third.send_unbind(&first).await);
         }
         tokio::time::timeout(POOL_THREAD, async {
             while served.host.unbinds_waiting() < MAX_PENDING_UNBINDS {
@@ -721,18 +729,27 @@ fn an_unbind_that_finds_every_place_taken_waits_for_one_and_is_carried_out() {
         .await
         .expect("the host took a place for each unbind");
 
-        // The host reads one connection's requests in order, so once it has answered a health
-        // request the unbind before it has been read and is on its way.
+        // The host says when an unbind has found every place taken, which is before it waits for
+        // one and long before the pool is let go.
         let waiting = other.send_unbind(&second).await;
+        tokio::time::timeout(POOL_THREAD, async {
+            while served.host.unbinds_found_full() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the host found every place taken");
         let health = other.health().await;
         assert_eq!(health.live_bindings, 2, "an unbind was carried out at once");
 
         pool.let_go().await;
-        for answered in host.collect(&taking).await {
-            assert!(
-                matches!(answered, ResponseBody::Unbound { .. }),
-                "an unbind that took a place was answered with {answered:?}"
-            );
+        for (connection, asked) in [(&mut host, &taking), (&mut third, &taking_too)] {
+            for answered in connection.collect(asked).await {
+                assert!(
+                    matches!(answered, ResponseBody::Unbound { .. }),
+                    "an unbind that took a place was answered with {answered:?}"
+                );
+            }
         }
         let answered = other.collect(&[waiting]).await.pop().expect("one answer");
         assert!(
