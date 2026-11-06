@@ -57,8 +57,9 @@ pub(crate) const UNROUTED_KEPT: usize = 256;
 #[derive(Debug, Default)]
 pub(crate) struct Arrivals {
     held: Mutex<HashMap<Carried, Vec<u64>>>,
-    /// The requests of closes whose work has ended and which have no route, newest last.
-    unrouted: Mutex<VecDeque<Carried>>,
+    /// The requests of closes whose work has ended and which have no route, with the number of the
+    /// call that carried each, newest last.
+    unrouted: Mutex<VecDeque<(Carried, u64)>>,
     next: AtomicU64,
 }
 
@@ -75,17 +76,22 @@ impl Arrivals {
     }
 
     /// Whether a call other than `own` carries `request` and has not claimed its route, or a close
-    /// of it was carried out with no route.
+    /// of it, made by a call other than `own`, was carried out with no route.
+    ///
+    /// The call that made a close does not count itself, before or after its work has ended: a
+    /// first close that is refused before anything is dispatched is refused as ever.
     pub(crate) fn another_carries(&self, request: &Carried, own: Option<&Arrival>) -> bool {
-        self.held().get(request).is_some_and(|calls| {
-            calls
-                .iter()
-                .any(|call| own.is_none_or(|own| own.call != *call))
-        }) || self
+        let others = |call: &u64| own.is_none_or(|own| own.call != *call);
+        let held = self
+            .held()
+            .get(request)
+            .is_some_and(|calls| calls.iter().any(others));
+        held || self
             .unrouted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains(request)
+            .iter()
+            .any(|(kept, call)| kept == request && others(call))
     }
 
     fn held(&self) -> std::sync::MutexGuard<'_, HashMap<Carried, Vec<u64>>> {
@@ -121,8 +127,8 @@ impl Arrival {
             .unrouted
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if !unrouted.contains(&self.request) {
-            unrouted.push_back(self.request.clone());
+        if !unrouted.iter().any(|(kept, _)| *kept == self.request) {
+            unrouted.push_back((self.request.clone(), self.call));
         }
         while unrouted.len() > UNROUTED_KEPT {
             unrouted.pop_front();
@@ -139,5 +145,64 @@ impl Drop for Arrival {
                 held.remove(&self.request);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(number: usize) -> Carried {
+        let mut bytes = [0_u8; 32];
+        bytes[..8].copy_from_slice(&u64::try_from(number).expect("a number").to_le_bytes());
+        (
+            ActorId::new("device:test").expect("an actor"),
+            ActionId::new(kr_protocol::scalars::Uuid::from_bytes(
+                bytes[..16].try_into().expect("sixteen bytes"),
+            )),
+            Digest256::from_bytes(bytes),
+        )
+    }
+
+    /// A close carried out with no route is kept after its work, for the copies that come later,
+    /// and the call that made it is not one of them: a first close refused before anything is
+    /// dispatched is refused as ever, whether its work has ended before it words the refusal or
+    /// not.
+    #[test]
+    fn a_close_kept_without_a_route_is_a_copy_to_every_call_but_the_one_that_made_it() {
+        let arrivals = Arc::new(Arrivals::default());
+        let carried = request(1);
+        let first = arrivals.arrive(carried.clone());
+        assert!(!arrivals.another_carries(&carried, Some(&first)));
+
+        first.settle_without_a_route();
+        assert!(
+            !arrivals.another_carries(&carried, Some(&first)),
+            "the call does not count itself"
+        );
+        drop(first);
+        let copy = arrivals.arrive(carried.clone());
+        assert!(
+            arrivals.another_carries(&carried, Some(&copy)),
+            "a copy meets what the first kept"
+        );
+        assert!(
+            !arrivals.another_carries(&request(2), Some(&copy)),
+            "another request is not met"
+        );
+    }
+
+    /// Only the last [`UNROUTED_KEPT`] closes are kept, oldest out.
+    #[test]
+    fn the_closes_kept_without_a_route_are_bounded() {
+        let arrivals = Arc::new(Arrivals::default());
+        for number in 0..=UNROUTED_KEPT {
+            arrivals.arrive(request(number)).settle_without_a_route();
+        }
+        assert!(
+            !arrivals.another_carries(&request(0), None),
+            "the oldest is gone"
+        );
+        assert!(arrivals.another_carries(&request(1), None));
     }
 }
