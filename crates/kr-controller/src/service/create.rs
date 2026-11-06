@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::{ErrorCode, ProtocolError, RetryCategory};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::local::LocalClientKind;
@@ -1223,30 +1223,50 @@ impl Controller {
             .create_intent
             .as_deref()
             .and_then(|recorded| recorded_create(recorded).ok());
-        if let Some(worker) = worker
-            && let Some(session) = self.describe_a_created_session(&worker).await?
-        {
-            return encode(&SessionCreateResult {
-                session,
-                endpoint: Nullable::some(worker.endpoint.as_text()),
-                deduplicated: true,
-                presentation_error: Nullable(
-                    self.replayed_presentation(requested.as_ref(), reservation.session_id)
-                        .await,
-                ),
-            });
+        if let Some(worker) = worker {
+            // A worker in the directory means the first attempt made the session. When that worker
+            // cannot be asked about it now, the repeat is not told a transient word, which says
+            // nothing took effect: it is told that the session is not known, and asking again under
+            // the same token answers once the worker can be reached.
+            let described = self
+                .describe_a_created_session(&worker)
+                .await
+                .map_err(|error| {
+                    if error.code().retry_category() == RetryCategory::Transient {
+                        ControllerError::Uncertain {
+                            detail: format!(
+                                "the worker of the session this create token made cannot be asked \
+                                 about it now, so what the session is like is not known: {error}"
+                            ),
+                        }
+                    } else {
+                        error
+                    }
+                })?;
+            if let Some(session) = described {
+                return encode(&SessionCreateResult {
+                    session,
+                    endpoint: Nullable::some(worker.endpoint.as_text()),
+                    deduplicated: true,
+                    presentation_error: Nullable(
+                        self.replayed_presentation(requested.as_ref(), reservation.session_id)
+                            .await,
+                    ),
+                });
+            }
         }
         self.closed_create(reservation, true).await?.ok_or_else(|| {
             let phase = reservation.phase.as_str();
             match reservation.phase {
-                // Nothing was launched, or the launch is confirmed to have produced no worker: the
-                // host knows the session does not exist.
-                LaunchPhase::Reserved | LaunchPhase::Failed => {
-                    ControllerError::supervision(format!(
-                        "this create token is already recorded as {phase} and its worker is not \
+                // The launch is confirmed to have produced no worker: the host knows the session
+                // does not exist.
+                LaunchPhase::Failed => ControllerError::supervision(format!(
+                    "this create token is already recorded as {phase} and its worker is not \
                      available"
-                    ))
-                }
+                )),
+                // The first attempt has reserved the session and not yet asked for a worker, or is
+                // not finished with asking: it may still make the session.
+                LaunchPhase::Reserved => ControllerError::attempt_still_running(),
                 // A worker was asked for, or ran: with it gone and no closure recorded, whether the
                 // session was made and what it came to is not known.
                 _ => ControllerError::Uncertain {

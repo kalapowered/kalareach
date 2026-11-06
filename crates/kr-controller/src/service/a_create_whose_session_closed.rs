@@ -299,6 +299,29 @@ async fn a_create_whose_worker_cannot_be_reached_and_has_not_ended_fails_with_th
     assert!(!gone.closure_is_recorded().await, "no closure was invented");
 }
 
+/// KR-REQ-09.09: the same create asked again, whose worker is in the directory and cannot be
+/// reached though it has not ended, is told that what the session is like is not known. The first
+/// attempt made the session, so a transient word, which says nothing took effect, would have the
+/// create sent again as though nothing had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_asked_again_whose_worker_cannot_be_reached_is_told_the_outcome_is_unknown() {
+    let gone = Gone::with_the_worker_process(
+        kr_ipc::identity::current_process_start_identity().expect("this process is described"),
+    )
+    .await;
+
+    let told = gone
+        .controller
+        .replay_create(&gone.reservation)
+        .await
+        .expect_err("a worker that cannot be reached leaves no answer");
+    assert!(
+        matches!(told, ControllerError::Uncertain { .. }),
+        "the session is not known: {told:?}"
+    );
+    assert!(!gone.closure_is_recorded().await, "no closure was invented");
+}
+
 /// KR-REQ-09.12: the same create asked again under its token, whose worker ended before the daemon
 /// recorded a closure, is answered from the closure the daemon establishes for a worker the kernel
 /// says has ended, as the create itself is: the session closed, with no endpoint to attach to, and

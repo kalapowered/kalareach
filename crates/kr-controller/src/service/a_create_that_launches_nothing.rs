@@ -374,10 +374,12 @@ async fn a_create_asked_again_whose_closure_cannot_be_read_is_told_the_outcome_i
 }
 
 /// KR-REQ-09.09: a create asked again whose worker is not in the directory and whose session has
-/// no closure is told what the host knows. Where the reservation shows that nothing was launched, or
-/// that the launch produced no worker, the session does not exist and the create is refused as
-/// ever. Where a worker was asked for, or ran, whether the session was made and what it came to
-/// is not known.
+/// no closure is told what the host knows. Where the reservation shows that the launch produced no
+/// worker, the session does not exist and the create is refused as ever. Where the first attempt
+/// has not yet asked for a worker, it may still make the session, and where a worker was asked
+/// for, or ran, whether the session was made and what it came to is not known: both are told that.
+/// A `claimed` reservation is not among the phases here: a daemon looks for its worker again before
+/// it answers, which is a different path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_create_asked_again_whose_worker_is_gone_is_told_what_the_reservation_shows() {
     let (temp, controller, request, carried, actor_id) =
@@ -388,8 +390,8 @@ async fn a_create_asked_again_whose_worker_is_gone_is_told_what_the_reservation_
         .busy_timeout(Duration::from_secs(10))
         .expect("waits for the daemon's own writes");
     for (phase, owed) in [
-        ("reserved", ErrorCode::ResourceUnavailable),
         ("failed", ErrorCode::ResourceUnavailable),
+        ("reserved", ErrorCode::OutcomeUnknown),
         ("spawned", ErrorCode::OutcomeUnknown),
         ("live", ErrorCode::OutcomeUnknown),
         ("fenced", ErrorCode::OutcomeUnknown),
