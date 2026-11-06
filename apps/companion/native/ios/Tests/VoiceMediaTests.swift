@@ -32,6 +32,18 @@ final class VoiceMediaTests: XCTestCase {
         XCTAssertTrue(watch.reading(read(0.2, 3_000), playbackOnAtRequest: true, playbackOnAtAnswer: true))
     }
 
+    /// KR-PERF-010: audio that arrived and that the speaker side has not taken yet is not audio
+    /// played out; the samples have to grow with the energy.
+    func testAudioTheSpeakerHasNotTakenIsNotPlayedOut() {
+        var watch = PlayoutWatch()
+        XCTAssertFalse(watch.reading(read(0, 0), playbackOnAtRequest: true, playbackOnAtAnswer: true))
+        XCTAssertFalse(
+            watch.reading(read(0.5, 0), playbackOnAtRequest: true, playbackOnAtAnswer: true),
+            "energy grew and the samples did not"
+        )
+        XCTAssertTrue(watch.reading(read(0.9, 480), playbackOnAtRequest: true, playbackOnAtAnswer: true))
+    }
+
     /// KR-PERF-010: energy that grew with the speaker side muted, silenced or interrupted is not
     /// audio played out, and a reading that spans a change of that state is not one reading.
     func testNothingIsPlayedOutWhilePlaybackIsOffOrChangesDuringTheReading() {
