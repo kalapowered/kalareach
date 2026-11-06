@@ -268,36 +268,54 @@ impl core::fmt::Display for BindingOwner {
     }
 }
 
+/// Which registration of an identifier a binding is.
+///
+/// An identifier is registered, removed and registered again, and what was meant for one
+/// registration must not reach the next. The caller that starts a registration chooses its
+/// incarnation, names it again to remove that registration, and so removes that one and no other:
+/// a removal that is left waiting for a thread, or for a caller that has gone, finds the identifier
+/// registered again by then and leaves it alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Incarnation(u64);
+
+/// The source of incarnation numbers, which are never reused inside a process.
+static NEXT_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl Incarnation {
+    /// Takes an incarnation number nothing else in this process holds.
+    #[must_use]
+    pub fn next() -> Self {
+        Self(NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// One entry in the registry.
 ///
 /// A binding is reserved before anything is started and becomes live when its instance exists.
 /// Reserving first is what makes two registrations of one identifier a refusal rather than a race:
 /// without it both could pass a "is it live" check before either had finished starting.
+///
+/// The incarnation is the registration's: the entry is found, kept and removed by it, and the
+/// identifier alone names nothing once it can be registered again.
 #[derive(Debug)]
 struct Registration {
     owner: BindingOwner,
+    incarnation: Incarnation,
     state: RegistrationState,
 }
 
 #[derive(Debug)]
 enum RegistrationState {
-    /// Somebody is preparing this binding, under this attempt.
+    /// Somebody is preparing this binding, under the entry's incarnation.
     ///
-    /// The attempt is what makes a reservation one preparation's and not the identifier's. Without
-    /// it, a preparation that had lost its reservation -- because the identifier was unbound while
-    /// it ran -- could take the reservation a later preparation of the same identifier had made,
-    /// and hand that caller an instance it never asked for.
-    Reserved(Attempt),
+    /// The incarnation is what makes a reservation one preparation's and not the identifier's.
+    /// Without it, a preparation that had lost its reservation -- because the identifier was
+    /// unbound while it ran -- could take the reservation a later preparation of the same
+    /// identifier had made, and hand that caller an instance it never asked for.
+    Reserved,
     /// The binding is live.
     Live(Arc<BindingHandle>),
 }
-
-/// One preparation's claim on an identifier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Attempt(u64);
-
-/// The source of attempt numbers, which are never reused inside a process.
-static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// What removing a binding found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,6 +430,7 @@ impl Runtime {
                 Some(Registration {
                     owner: held,
                     state: RegistrationState::Live(handle),
+                    ..
                 }) if *held == owner => Some(Arc::clone(handle)),
                 _ => None,
             })
@@ -439,18 +458,18 @@ impl Runtime {
     ///
     /// The returned guard gives the reservation up if the preparation does not finish, however it
     /// ends: a refusal, a caller's deadline, or a future nobody polled again.
-    fn reserve_attempt(
+    fn reserve_for(
         self: &Arc<Self>,
         owner: BindingOwner,
+        incarnation: Incarnation,
         binding_id: BindingId,
     ) -> RuntimeResult<Reservation> {
-        let attempt = Attempt(NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed));
-        self.reserve(owner, binding_id, attempt)?;
+        self.reserve(owner, incarnation, binding_id)?;
         Ok(Reservation {
             runtime: Arc::clone(self),
             owner,
+            incarnation,
             binding_id,
-            attempt,
             kept: false,
         })
     }
@@ -462,8 +481,8 @@ impl Runtime {
     fn reserve(
         &self,
         owner: BindingOwner,
+        incarnation: Incarnation,
         binding_id: BindingId,
-        attempt: Attempt,
     ) -> RuntimeResult<()> {
         let mut bindings = self
             .bindings
@@ -480,21 +499,23 @@ impl Runtime {
             binding_id,
             Registration {
                 owner,
-                state: RegistrationState::Reserved(attempt),
+                incarnation,
+                state: RegistrationState::Reserved,
             },
         );
         Ok(())
     }
 
-    /// Gives up one attempt's reservation, if it is still that attempt's.
-    fn release(&self, owner: BindingOwner, binding_id: BindingId, attempt: Attempt) {
+    /// Gives up one incarnation's reservation, if it is still that incarnation's.
+    fn release(&self, owner: BindingOwner, incarnation: Incarnation, binding_id: BindingId) {
         if let Ok(mut bindings) = self.bindings.lock()
             && matches!(
                 bindings.get(&binding_id),
                 Some(Registration {
                     owner: held,
-                    state: RegistrationState::Reserved(held_attempt),
-                }) if *held == owner && *held_attempt == attempt
+                    incarnation: held_incarnation,
+                    state: RegistrationState::Reserved,
+                }) if *held == owner && *held_incarnation == incarnation
             )
         {
             bindings.remove(&binding_id);
@@ -529,6 +550,9 @@ impl Runtime {
 
     /// Instantiates a compiled component, calls `bind`, and starts the binding's thread.
     ///
+    /// The registration is `incarnation`'s: the caller chose it, and names it to remove this
+    /// registration and no other.
+    ///
     /// The instantiation and `bind` run on that thread rather than this one, and this call waits
     /// for them with the caller's own deadline. The call budgets in [`crate::runtime::budget`]
     /// start after they have finished, which is what section 11 means by starting a call budget
@@ -543,6 +567,7 @@ impl Runtime {
     pub async fn instantiate(
         self: &Arc<Self>,
         owner: BindingOwner,
+        incarnation: Incarnation,
         request: BindingRequest,
         compiled: &Compiled,
         events: tokio::sync::mpsc::Sender<BindingEvent>,
@@ -553,10 +578,11 @@ impl Runtime {
         // running that nothing could reach and nothing would stop, so the identifier is taken
         // before anything is started rather than checked before anything is awaited. The guard
         // gives it up however this ends, including a caller that stopped polling.
-        let mut reservation = self.reserve_attempt(owner, binding_id)?;
+        let mut reservation = self.reserve_for(owner, incarnation, binding_id)?;
 
         let handle = BindingHandle::start(
             request,
+            incarnation,
             &self.engine,
             &compiled.component,
             self.config.fuel_rate,
@@ -571,9 +597,10 @@ impl Runtime {
             handle.signal_stop();
             return Err(error);
         }
-        // The reservation is what this replaces, and only if it is still this attempt's. An owner
-        // that went away while its instance was starting took its reservation with it, and the
-        // instance it no longer has a use for is stopped here rather than left running for nobody.
+        // The reservation is what this replaces, and only if it is still this incarnation's. An
+        // owner that went away while its instance was starting took its reservation with it, and
+        // the instance it no longer has a use for is stopped here rather than left running for
+        // nobody.
         if !reservation.becomes(&handle) {
             handle.signal_stop();
             return Err(RuntimeError::NoSuchBinding {
@@ -608,32 +635,55 @@ impl Runtime {
         let compilation = self.compile(payload)?;
         let compiled = compilation.wait(deadline).await?;
         let remaining = remaining_of(started, deadline)?;
-        self.instantiate(owner, request, &compiled, events, remaining)
-            .await
+        self.instantiate(
+            owner,
+            Incarnation::next(),
+            request,
+            &compiled,
+            events,
+            remaining,
+        )
+        .await
     }
 
-    /// Removes a binding and stops its thread.
+    /// Removes one registration of a binding and stops its thread.
+    ///
+    /// Only `incarnation`'s registration is removed. An identifier that is registered again, by
+    /// the same owner, is a registration of another incarnation, and the caller that is removing
+    /// the earlier one finds nothing to remove: [`Unbound::Absent`].
     ///
     /// Blocks until the thread is gone, so a caller knows the instance is no longer running when
     /// this returns. The component's own state goes with it; nothing a decision depends on was in
     /// there, because pending and dispatch state is the worker broker's.
-    pub fn unbind(&self, owner: BindingOwner, binding_id: BindingId) -> Unbound {
-        self.remove(owner, binding_id, BindingHandle::stop)
+    pub fn unbind(
+        &self,
+        owner: BindingOwner,
+        binding_id: BindingId,
+        incarnation: Incarnation,
+    ) -> Unbound {
+        self.remove(owner, binding_id, incarnation, BindingHandle::stop)
     }
 
-    /// Removes a binding and tells its thread to stop, without waiting for it.
+    /// Removes one registration of a binding and tells its thread to stop, without waiting for it.
     ///
     /// For a caller that cannot block: the binding is gone from the runtime when this returns, and
     /// its thread ends on its own after at most one bounded call. What [`Self::unbind`] guarantees
-    /// about the instance having stopped is not given.
-    pub fn detach(&self, owner: BindingOwner, binding_id: BindingId) -> Unbound {
-        self.remove(owner, binding_id, BindingHandle::signal_stop)
+    /// about the instance having stopped is not given. As there, only `incarnation`'s registration
+    /// is removed.
+    pub fn detach(
+        &self,
+        owner: BindingOwner,
+        binding_id: BindingId,
+        incarnation: Incarnation,
+    ) -> Unbound {
+        self.remove(owner, binding_id, incarnation, BindingHandle::signal_stop)
     }
 
     fn remove(
         &self,
         owner: BindingOwner,
         binding_id: BindingId,
+        incarnation: Incarnation,
         stop: impl FnOnce(&BindingHandle),
     ) -> Unbound {
         let entry =
@@ -641,7 +691,9 @@ impl Runtime {
                 .lock()
                 .ok()
                 .and_then(|mut bindings| match bindings.get(&binding_id) {
-                    Some(held) if held.owner == owner => bindings.remove(&binding_id),
+                    Some(held) if held.owner == owner && held.incarnation == incarnation => {
+                        bindings.remove(&binding_id)
+                    }
                     _ => None,
                 });
         match entry {
@@ -654,20 +706,22 @@ impl Runtime {
             }
             // A reservation somebody is still preparing. Removing it is the whole of the removal:
             // the preparation will find its reservation gone and give the handle up. The caller is
-            // told which of the two it was, because the preparation's own accounting is still
-            // outstanding and giving its place back twice would let a connection hold more
-            // bindings than it may.
+            // told which of the two it was, because the preparation's instance has not been
+            // stopped by this removal and is still to go.
             Some(Registration {
-                state: RegistrationState::Reserved(_),
+                state: RegistrationState::Reserved,
                 ..
             }) => Unbound::Preparing,
             None => Unbound::Absent,
         }
     }
 
-    /// Removes every binding one owner holds, and stops them.
+    /// Removes every binding one owner holds, and tells their threads to stop, without waiting for
+    /// them.
     ///
-    /// What a connection's end costs: its own bindings and nothing else. Reservations go too, so a
+    /// What a connection's end costs: its own bindings and nothing else, and no thread of a pool
+    /// that other work may keep busy, since nothing here waits. Each thread ends on its own after
+    /// at most one bounded call, as one that [`Self::detach`] left does. Reservations go too, so a
     /// preparation still running for a caller that has gone finds its reservation removed and stops
     /// the instance it was about to hand over.
     pub fn release_owner(&self, owner: BindingOwner) -> usize {
@@ -693,7 +747,7 @@ impl Runtime {
             .unwrap_or_default();
         let stopped = handles.len();
         for handle in handles {
-            handle.stop();
+            handle.signal_stop();
         }
         stopped
     }
@@ -708,7 +762,7 @@ impl Runtime {
                     .drain()
                     .filter_map(|(_id, entry)| match entry.state {
                         RegistrationState::Live(handle) => Some(handle),
-                        RegistrationState::Reserved(_) => None,
+                        RegistrationState::Reserved => None,
                     })
                     .collect()
             })
@@ -732,13 +786,13 @@ impl Drop for Runtime {
 struct Reservation {
     runtime: Arc<Runtime>,
     owner: BindingOwner,
+    incarnation: Incarnation,
     binding_id: BindingId,
-    attempt: Attempt,
     kept: bool,
 }
 
 impl Reservation {
-    /// Turns this claim into the live binding, if it is still this attempt's claim.
+    /// Turns this claim into the live binding, if it is still this incarnation's claim.
     fn becomes(&mut self, handle: &Arc<BindingHandle>) -> bool {
         let Ok(mut bindings) = self.runtime.bindings.lock() else {
             return false;
@@ -747,8 +801,9 @@ impl Reservation {
             bindings.get(&self.binding_id),
             Some(Registration {
                 owner,
-                state: RegistrationState::Reserved(attempt),
-            }) if *owner == self.owner && *attempt == self.attempt
+                incarnation,
+                state: RegistrationState::Reserved,
+            }) if *owner == self.owner && *incarnation == self.incarnation
         );
         if !held {
             return false;
@@ -757,6 +812,7 @@ impl Reservation {
             self.binding_id,
             Registration {
                 owner: self.owner,
+                incarnation: self.incarnation,
                 state: RegistrationState::Live(Arc::clone(handle)),
             },
         );
@@ -769,7 +825,7 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         if !self.kept {
             self.runtime
-                .release(self.owner, self.binding_id, self.attempt);
+                .release(self.owner, self.incarnation, self.binding_id);
         }
     }
 }
@@ -877,6 +933,7 @@ struct PendingUpdates {
 /// by the binding's own thread, which is the only thread that ever touches the store.
 pub struct BindingHandle {
     request: BindingRequest,
+    incarnation: Incarnation,
     commands: mpsc::Sender<Command>,
     queue: Arc<Mutex<ObservationQueue>>,
     disabled: Arc<Mutex<Option<String>>>,
@@ -905,6 +962,7 @@ impl BindingHandle {
     /// Starts the binding's thread, which instantiates the component and binds it.
     fn start(
         request: BindingRequest,
+        incarnation: Incarnation,
         engine: &RuntimeEngine,
         component: &wasmtime::component::Component,
         fuel_rate: u64,
@@ -963,6 +1021,7 @@ impl BindingHandle {
 
         Ok(Self {
             request,
+            incarnation,
             commands,
             queue,
             disabled,
@@ -1007,6 +1066,12 @@ impl BindingHandle {
     #[must_use]
     pub const fn request(&self) -> &BindingRequest {
         &self.request
+    }
+
+    /// Returns which registration of the binding's identifier this instance is.
+    #[must_use]
+    pub const fn incarnation(&self) -> Incarnation {
+        self.incarnation
     }
 
     /// Returns the plugin identity the binding is running.
@@ -1899,7 +1964,11 @@ mod tests {
         let runtime = Runtime::new(config).expect("a runtime");
         let owner = BindingOwner::next();
         assert_eq!(
-            runtime.unbind(owner, BindingId::new(Uuid::from_bytes([9; 16]))),
+            runtime.unbind(
+                owner,
+                BindingId::new(Uuid::from_bytes([9; 16])),
+                Incarnation::next()
+            ),
             Unbound::Absent
         );
         assert!(!Unbound::Absent.existed());
