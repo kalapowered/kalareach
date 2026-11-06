@@ -2130,7 +2130,10 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
             } else if path.is_file() {
                 // A lock file holds no content, and on Windows the daemon's cannot be opened for
                 // reading while it holds it.
-                if path.extension().is_some_and(|extension| extension == "lock") {
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "lock")
+                {
                     continue;
                 }
                 // A regular file that exists and cannot be read would leave a scan of the tree
