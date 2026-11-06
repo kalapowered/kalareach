@@ -3530,9 +3530,10 @@ queue or is read ahead and held behind the request being answered, and a refusal
 meets another such call carrying the same request is told as a repeat's. A close whose route cannot
 be recorded goes on without one, because a stop is let through when storage fails, and its call
 stays among them until the work it started has ended, so a copy that arrives while the close runs is
-told as a repeat's. The daemon then keeps the request, in memory, as a close it carried out with no
-route, so a copy that arrives later is told the same; it keeps the last 256 and none after a
-restart. The daemon writes the route before it dispatches the action and
+told as a repeat's. When the work has ended, the daemon keeps the request, in memory, as a close it
+carried out with no route if the close reached the worker, so a copy that arrives later is told the
+same; it keeps the last 256 and none after a restart. A close that never reached the worker did
+nothing and keeps nothing. The daemon writes the route before it dispatches the action and
 keeps no word of whether a dispatch followed, so it cannot show that the earlier copy did not run. A
 refusal it makes of a repeat on its own account is therefore told as unknown too, wherever the check
 sits: a registration withdrawn, a grant gone or narrowed, a connection opened for the host or for
@@ -3542,13 +3543,14 @@ read. A repeated close is the one the daemon can still answer without its worker
 answers it for a device that may read the session's receipts, as it answers a close made after the
 closure. A request the daemon never routed is refused as any request is, and so is a reused
 identifier that carries another request, whether the daemon finds it at the route or in a service's
-record. That refusal is the daemon's word about the identifier and names no result, so a device that
+record, and whether or not copies of that request wait behind it. That refusal is the daemon's word about the identifier and names no result, so a device that
 may not read the record is told it as it is; the change-set service's lookups of a capture, an
 apply, a revert and a materialisation are the exception, and tell such a device the outcome is
 unknown. A request whose route the daemon cannot read counts as a repeat. A repeat of a create
-whose reservation the daemon cannot read, of an attention action whose store it cannot ask, or of a
-rearm whose chain or grant it cannot read, is told `OUTCOME_UNKNOWN` and nothing is performed: a
-record that cannot be read is not one that is absent.
+whose reservation the daemon cannot read, of an action whose record it cannot read in the attention
+store, the workflow journal, the registry's receipts of authority changes or its record of pairing
+actions, or of a rearm whose chain or grant it cannot read, is told `OUTCOME_UNKNOWN` and nothing is
+performed: a record that cannot be read is not one that is absent.
 The services behind the door check the registration again where they write, and a copy of an
 action that meets a fence owed there is refused in their words. A service that answers a copy of an
 action from its own record while it carries the action out, because the first copy finished
@@ -3568,7 +3570,10 @@ A transient failure says nothing took effect, so the daemon does not give one fo
 it has dispatched or committed the action. It tells `OUTCOME_UNKNOWN` instead: a decision that could
 not be held while the answer waited to be written; an answer, or a session's closure, that it could
 not record after the action was carried out; and an attempt under the action's identifier that is
-still running when a copy of it arrives.
+still running when a copy of it arrives. A project action that was refused, when the journal cannot
+keep the refusal, is told as the record another copy of the action left where it left one, and
+`OUTCOME_UNKNOWN` where there is none to read, because the refusal can be a word about what that
+copy did.
 
 A device that falls behind is told rather than waited for. What the daemon holds for one device is
 bounded in bytes, not in messages, at section 9's send queue per peer; a device that reaches that
