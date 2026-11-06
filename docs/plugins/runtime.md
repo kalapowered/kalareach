@@ -195,11 +195,12 @@ The binding's own channel is bounded in places: 256 of them, of which the last e
 must-arrive events' and presentation may not take them. The two the service keeps (one in the host
 per connection, one in the worker's client) are bounded in bytes, and that bound covers the record
 of what has already been dropped as well as what is waiting. In those two, losses coalesce into one
-record per binding, so a reader that stopped reading cannot be given a backlog of gaps either, and a
+record per registration of a binding, so a reader that stopped reading cannot be given a backlog of
+gaps either, and a
 document is dropped whole: every piece of it that is waiting goes together, and the pieces of it
 that have not arrived yet are dropped as they arrive, whether they were dropped to make room or
 refused for want of it. Half a document would tell a reader it had a whole one. The queue remembers
-which documents went until their last piece has been accounted for or until their binding goes. That
+which documents went until their last piece has been accounted for or until their registration goes. That
 record is counted rather than measured: past 256 unfinished ones the connection ends, because
 forgetting one would mean delivering the end of a document without its beginning. A fault and a
 disabling are never dropped; if even those will not fit once every document has gone, the connection
@@ -213,6 +214,18 @@ presentation.
 
 A document the host withholds because privacy mode stands is not one a queue dropped for want of room,
 and no gap is owed for it while it is withheld (see "Privacy mode at the host").
+
+A notice names its binding and nothing else, and a worker can unbind an identifier and register it
+again while the first registration's notices are still waiting. So the host's queue keeps, with each
+notice and with each loss it records, the registration that produced it, and two registrations of
+one identifier never share a record. Removing a binding takes out of the queue everything its
+registration put there. The notice writer asks, while it holds the connection's writer, whether the
+connection still stands behind the registration a notice came from, and writes nothing when it does
+not. That covers a notice the writer had already taken off the queue, and the report of a lost
+document, which would otherwise ask the identifier's next registration to draw again. The host
+writes everything a registration produced before it answers that registration's unbind, and nothing
+after, so the worker's client empties its own queue of the binding's notices when the answer says a
+binding was removed. The next registration of the identifier is shown none of the old one's.
 
 A binding also holds a bounded number of unanswered calls. A caller whose deadline ran out has
 stopped waiting, but its request is still on the binding's thread until that thread reaches it, and
@@ -446,6 +459,14 @@ A binding belongs to the connection that registered it. Another connection that 
 finds no binding, which is the same answer it would get for one nobody ever registered, and a
 connection that ends takes its own bindings and nobody else's, once whatever it had running has
 finished.
+
+The host settles what a registration or an unbind is about when it reads the request, and not when
+the request's task runs. A registration is the connection's from that moment, so an unbind that
+arrives before the host has read or compiled the component is about it: the host answers that a
+binding existed, and refuses the registration when it gets further. An unbind removes the
+registration the connection held under the identifier when the request was read, so a second unbind
+of an identifier that was registered again in the meantime finds nothing and leaves the new
+registration alone.
 
 A document travels as its own frames, chunked so each fits one, and every piece names the document it
 belongs to; only the last is marked as the last. That is how a reader knows which notices go together

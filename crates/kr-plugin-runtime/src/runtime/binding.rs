@@ -287,6 +287,13 @@ impl Incarnation {
     pub fn next() -> Self {
         Self(NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed))
     }
+
+    /// Returns the number itself, for a caller that has to name the registration to code that
+    /// does not know this type.
+    #[must_use]
+    pub(crate) const fn number(self) -> u64 {
+        self.0
+    }
 }
 
 /// One entry in the registry.
