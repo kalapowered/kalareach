@@ -1767,7 +1767,7 @@ async fn a_client_keeps_what_the_new_registration_wrote_before_the_removal_of_th
     health_until(&client, |health| health.live_bindings == 0).await;
     register_on(&client, &request, &component).await;
     tokio::time::timeout(HANG_GUARD, async {
-        while client.held_notice_bytes().await == 0 {
+        while client.held_notice_bytes() == 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -1787,6 +1787,139 @@ async fn a_client_keeps_what_the_new_registration_wrote_before_the_removal_of_th
         1,
         "the new registration's first document was not kept: {bound:?}"
     );
+}
+
+// The same holds when the registration of the identifier was under way before the removal began, and
+// finished while it waited: the client cannot tell its first notices from the removed registration's
+// either, so it keeps what its queue holds.
+//
+// The new registration is held where the host has read its request and nothing else, by the gate file
+// the host honours in the state directory it files its cache in. The removal begins then: the host
+// removes the live registration, whose thread stands at a stopped pass. The gate is opened, the
+// registration finishes, its first document is in the client's queue unread, and the pass is let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_keeps_what_a_registration_already_under_way_wrote_before_the_removal_of_the_old_one_was_answered()
+ {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let served = Served::start_unbinding_within(HANG_GUARD).await;
+    let client = Arc::new(served.client().await.unbinding_within(HANG_GUARD));
+    let (path, digest, bytes) = served.install("well-behaved", &wasm);
+    let component = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let request = components::request("well-behaved", 1);
+    register_on(&client, &request, &component).await;
+    notices_through(&client, request.binding_id, "bind", 1).await;
+    let stop = overflow_behind_a_stopped_pass(&served, &client, &request).await;
+
+    let state = served._temp.environment().state_dir().to_path_buf();
+    let gate = state.join("hold-registrations");
+    std::fs::write(&gate, b"").expect("the gate is closed");
+    let registering = tokio::spawn({
+        let client = Arc::clone(&client);
+        let request = request.clone();
+        let component = component.clone();
+        async move { register_on(&client, &request, &component).await }
+    });
+    appears(&state.join("hold-registrations.reached")).await;
+
+    let removing = tokio::spawn({
+        let client = Arc::clone(&client);
+        let binding_id = request.binding_id;
+        async move { client.unbind(binding_id).await }
+    });
+    health_until(&client, |health| health.live_bindings == 0).await;
+    std::fs::remove_file(&gate).expect("the gate is opened");
+    tokio::time::timeout(HANG_GUARD, registering)
+        .await
+        .expect("the new registration was answered")
+        .expect("the registration task ended");
+    tokio::time::timeout(HANG_GUARD, async {
+        while client.held_notice_bytes() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the new registration's first document never reached the client's queue");
+
+    stop.release();
+    let existed = tokio::time::timeout(HANG_GUARD, removing)
+        .await
+        .expect("the unbind was answered")
+        .expect("the unbind task ended")
+        .expect("the unbind ran");
+    assert!(existed, "the removed binding was not there to remove");
+    let bound = notices_through(&client, request.binding_id, "bind", 1).await;
+    assert_eq!(
+        bound.len(),
+        1,
+        "the new registration's first document was not kept: {bound:?}"
+    );
+}
+
+// A removal that no registration overlapped empties the client's queue of the identifier, whatever
+// else is going on: another removal of the identifier that waits, because the registration it
+// removes is stopped at a pass, does not make this one keep what the registration it removed wrote.
+//
+// The first registration's removal waits at a stopped pass. The identifier is registered again, the
+// registration's first document is in the client's queue unread, and that registration is removed.
+// The removal is answered with the registration's thread ended, and nothing started a registration
+// while it waited, so the queue holds nothing of the identifier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_empties_its_queue_for_a_removal_no_registration_overlapped_while_another_removal_waits()
+ {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let served = Served::start_unbinding_within(HANG_GUARD).await;
+    let client = Arc::new(served.client().await.unbinding_within(HANG_GUARD));
+    let (path, digest, bytes) = served.install("well-behaved", &wasm);
+    let component = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let request = components::request("well-behaved", 1);
+    register_on(&client, &request, &component).await;
+    notices_through(&client, request.binding_id, "bind", 1).await;
+    let stop = overflow_behind_a_stopped_pass(&served, &client, &request).await;
+
+    let removing = tokio::spawn({
+        let client = Arc::clone(&client);
+        let binding_id = request.binding_id;
+        async move { client.unbind(binding_id).await }
+    });
+    health_until(&client, |health| health.live_bindings == 0).await;
+    register_on(&client, &request, &component).await;
+    tokio::time::timeout(HANG_GUARD, async {
+        while client.held_notice_bytes() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the new registration's first document never reached the client's queue");
+
+    let existed = client
+        .unbind(request.binding_id)
+        .await
+        .expect("the second unbind ran");
+    assert!(existed, "the second registration was not there to remove");
+    assert_eq!(
+        client.held_notice_bytes(),
+        0,
+        "the queue still held what the removed registration left in it"
+    );
+
+    stop.release();
+    tokio::time::timeout(HANG_GUARD, removing)
+        .await
+        .expect("the first unbind was answered")
+        .expect("the unbind task ended")
+        .expect("the first unbind ran");
 }
 
 // An unbind is about the registration the connection holds under the identifier when the request

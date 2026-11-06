@@ -197,14 +197,14 @@ per connection, one in the worker's client) are bounded in bytes, and that bound
 of what has already been dropped as well as what is waiting. In those two, losses coalesce into one
 record per registration of a binding, so a reader that stopped reading cannot be given a backlog of
 gaps either, and a document is dropped whole: every piece of it that is waiting goes together, and
-the pieces of it
-that have not arrived yet are dropped as they arrive, whether they were dropped to make room or
-refused for want of it. Half a document would tell a reader it had a whole one. The queue remembers
-which documents went until their last piece has been accounted for or until their registration goes. That
-record is counted rather than measured: past 256 unfinished ones the connection ends, because
-forgetting one would mean delivering the end of a document without its beginning. A fault and a
-disabling are never dropped; if even those will not fit once every document has gone, the connection
-is over, because a connection whose reliable news cannot be delivered is not one worth keeping open.
+the pieces of it that have not arrived yet are dropped as they arrive, whether they were dropped to
+make room or refused for want of it. Half a document would tell a reader it had a whole one. The
+queue remembers which documents went until their last piece has been accounted for or until their
+registration goes. That record is counted rather than measured: past 256 unfinished ones the
+connection ends, because forgetting one would mean delivering the end of a document without its
+beginning. A fault and a disabling are never dropped; if even those will not fit once every document
+has gone, the connection is over, because a connection whose reliable news cannot be delivered is
+not one worth keeping open.
 
 A document the host's queue dropped is one the component is asked to draw again, and the ask goes to
 the binding the lost document belonged to, not always the binding whose document made room for
@@ -227,10 +227,10 @@ again, and it asks only the registration that suffered the loss. The host writes
 registration produced before it answers that registration's unbind, and nothing after, so the
 worker's client empties its own queue of the binding's notices when the answer says a binding was
 removed. That is exact for a worker, which registers the identifier again only after the answer. A
-caller that registers it again while the unbind waits could have the new registration's first
-notices written before the answer, with nothing in a notice to tell them from the old ones, so its
-client keeps what its queue holds. The next registration of the identifier is shown none of the old
-one's.
+caller with a registration of the identifier under way when the unbind begins, or one that starts
+one while it waits, could have the new registration's first notices written before the answer, with
+nothing in a notice to tell them from the old ones, so its client keeps what its queue holds. A
+worker's next registration of the identifier is shown none of the old one's.
 
 A binding also holds a bounded number of unanswered calls. A caller whose deadline ran out has
 stopped waiting, but its request is still on the binding's thread until that thread reaches it, and

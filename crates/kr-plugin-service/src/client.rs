@@ -116,50 +116,114 @@ impl core::fmt::Debug for WriterHold {
     }
 }
 
-/// A binding's removal the host has not answered yet.
+/// What this client is doing about the registrations and removals of one identifier, for as long as
+/// it is doing any.
 #[derive(Debug, Default)]
-struct Removal {
-    /// How many requests to remove the binding are waiting for their answers.
-    asking: usize,
-    /// Whether the identifier was registered again while one of them waited.
-    registered_again: bool,
+struct Churn {
+    /// How many registrations of the identifier this client has started.
+    started: u64,
+    /// How many registrations of it wait for their answers now.
+    registering: usize,
+    /// How many removals of it wait for their answers now.
+    removing: usize,
 }
 
-/// One request to remove a binding, counted until its answer has been read or it is dropped.
-struct Removing<'a> {
-    removals: &'a Mutex<HashMap<Uuid, Removal>>,
+/// What the client is doing about each identifier it is registering or removing.
+type Churning = Mutex<HashMap<Uuid, Churn>>;
+
+/// One request to register a binding, counted from before it is sent until its answer has been read
+/// or it is dropped.
+struct Registering<'a> {
+    churning: &'a Churning,
     binding_id: Uuid,
 }
 
-impl<'a> Removing<'a> {
-    fn begin(removals: &'a Mutex<HashMap<Uuid, Removal>>, binding_id: Uuid) -> Self {
-        if let Ok(mut removals) = removals.lock() {
-            removals.entry(binding_id).or_default().asking += 1;
+impl<'a> Registering<'a> {
+    fn begin(churning: &'a Churning, binding_id: Uuid) -> Self {
+        if let Ok(mut churning) = churning.lock() {
+            let churn = churning.entry(binding_id).or_default();
+            churn.started += 1;
+            churn.registering += 1;
         }
         Self {
-            removals,
+            churning,
             binding_id,
         }
     }
+}
 
-    /// Returns true when the identifier was registered again since a removal of it was asked for.
-    fn registered_again(&self) -> bool {
-        self.removals.lock().is_ok_and(|removals| {
-            removals
+impl Drop for Registering<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut churning) = self.churning.lock()
+            && let Some(churn) = churning.get_mut(&self.binding_id)
+        {
+            churn.registering = churn.registering.saturating_sub(1);
+            if churn.registering == 0 && churn.removing == 0 {
+                churning.remove(&self.binding_id);
+            }
+        }
+    }
+}
+
+/// One request to remove a binding, counted from before it is sent until its answer has been read or
+/// it is dropped.
+struct Removing<'a> {
+    churning: &'a Churning,
+    binding_id: Uuid,
+    /// How many registrations of the identifier had been started when the request began.
+    started_before: u64,
+    /// Whether a registration of the identifier was waiting for its answer when the request began.
+    registering_before: bool,
+}
+
+impl<'a> Removing<'a> {
+    fn begin(churning: &'a Churning, binding_id: Uuid) -> Self {
+        let mut started_before = 0;
+        let mut registering_before = false;
+        if let Ok(mut churning) = churning.lock() {
+            let churn = churning.entry(binding_id).or_default();
+            churn.removing += 1;
+            started_before = churn.started;
+            registering_before = churn.registering > 0;
+        }
+        Self {
+            churning,
+            binding_id,
+            started_before,
+            registering_before,
+        }
+    }
+
+    /// Takes out of `sink` everything it holds for the identifier, unless a registration of the
+    /// identifier was under way when this removal began or has been started since.
+    ///
+    /// The host can write such a registration's first notices before it answers this removal, and
+    /// nothing in a notice says which registration it is from, so what the queue holds may be that
+    /// registration's. The decision and the cleanup are one step under the record of what the
+    /// client is registering: a registration that is started afterwards sends its request after
+    /// the cleanup, and the host writes nothing for it before it reads that request.
+    fn forget(&self, sink: &NoticeSink) {
+        let Ok(churning) = self.churning.lock() else {
+            return;
+        };
+        let overlapped = self.registering_before
+            || churning
                 .get(&self.binding_id)
-                .is_some_and(|removal| removal.registered_again)
-        })
+                .is_some_and(|churn| churn.started != self.started_before);
+        if !overlapped {
+            sink.forget(self.binding_id);
+        }
     }
 }
 
 impl Drop for Removing<'_> {
     fn drop(&mut self) {
-        if let Ok(mut removals) = self.removals.lock()
-            && let Some(removal) = removals.get_mut(&self.binding_id)
+        if let Ok(mut churning) = self.churning.lock()
+            && let Some(churn) = churning.get_mut(&self.binding_id)
         {
-            removal.asking = removal.asking.saturating_sub(1);
-            if removal.asking == 0 {
-                removals.remove(&self.binding_id);
+            churn.removing = churn.removing.saturating_sub(1);
+            if churn.registering == 0 && churn.removing == 0 {
+                churning.remove(&self.binding_id);
             }
         }
     }
@@ -356,8 +420,8 @@ pub struct PluginClient {
     register_deadline: core::time::Duration,
     /// How long an unbind is waited for.
     unbind_deadline: core::time::Duration,
-    /// The identifiers whose removal the host has not answered yet.
-    removals: Mutex<HashMap<Uuid, Removal>>,
+    /// What this client is doing about the identifiers it is registering or removing.
+    churning: Churning,
     next_request: AtomicU64,
     descriptor: HostDescriptor,
     reader_task: tokio::task::JoinHandle<()>,
@@ -454,7 +518,7 @@ impl PluginClient {
             offer_hold,
             register_deadline: REGISTER_DEADLINE,
             unbind_deadline: DEFAULT_DEADLINE,
-            removals: Mutex::new(HashMap::new()),
+            churning: Mutex::new(HashMap::new()),
             next_request: AtomicU64::new(1),
             descriptor,
             reader_task,
@@ -509,11 +573,7 @@ impl PluginClient {
         executable: &str,
         component: &ComponentSource,
     ) -> ServiceResult<Registration> {
-        if let Ok(mut removals) = self.removals.lock()
-            && let Some(removal) = removals.get_mut(&binding_id.get())
-        {
-            removal.registered_again = true;
-        }
+        let _registering = Registering::begin(&self.churning, binding_id.get());
         let body = self
             .request_within(
                 RequestBody::RegisterBinding(Box::new(BindingRegistration {
@@ -624,8 +684,9 @@ impl PluginClient {
     /// Returns how many bytes of notices this client's queue holds and nobody has read, for the
     /// tests of a crate that drives this client.
     #[cfg(feature = "testing")]
-    pub async fn held_notice_bytes(&self) -> u64 {
-        self.notices.lock().await.held_bytes()
+    #[must_use]
+    pub fn held_notice_bytes(&self) -> u64 {
+        self.sink.held_bytes()
     }
 
     /// Takes the connection's writer, as a task in the middle of writing a frame holds it, and
@@ -778,17 +839,18 @@ impl PluginClient {
     /// none of it is shown to the identifier's next one.
     ///
     /// That holds for a caller that registers the identifier again only after this returns, which
-    /// is what a worker does. A caller that registers it again while this waits has the host's
-    /// word for nothing more than that the old registration's notices came before the answer, and
-    /// the new registration's first notices can have come before it too, with nothing to tell the
-    /// two apart. Such a caller keeps everything its queue holds.
+    /// is what a worker does. A caller that has a registration of the identifier under way when
+    /// this begins, or starts one while this waits, has the host's word for nothing more than that
+    /// the old registration's notices came before the answer, and the new registration's first
+    /// notices can have come before it too, with nothing to tell the two apart. Such a caller
+    /// keeps everything its queue holds.
     ///
     /// # Errors
     ///
     /// Returns [`ServiceError::Protocol`] for the host's refusal, which is an answer and not a
     /// failure to get one, and [`ServiceError::Unavailable`] when the host is gone.
     pub async fn unbind(&self, binding_id: BindingId) -> ServiceResult<bool> {
-        let removing = Removing::begin(&self.removals, binding_id.get());
+        let removing = Removing::begin(&self.churning, binding_id.get());
         let body = self
             .request_within(
                 RequestBody::Unbind {
@@ -797,40 +859,27 @@ impl PluginClient {
                 self.unbind_deadline,
             )
             .await?;
-        // What the queue holds for the identifier is the removed registration's only if the
-        // identifier was not registered again before the host answered: the host can write the new
-        // registration's first notices before it answers the removal of the old one, and nothing
-        // in a notice says which registration it is from. A caller that registers again before it
-        // has the answer keeps what its queue holds.
-        let forget = !removing.registered_again();
+        // What the queue holds for the identifier is the removed registration's, and goes with it,
+        // when the host says it removed one and no registration of the identifier overlapped the
+        // removal: the host can write such a registration's first notices before it answers the
+        // removal of the old one, and nothing in a notice says which registration it is from.
         match body {
             ResponseBody::Unbound { existed } => {
                 // An answer that found nothing removed nothing: the host held no registration of
                 // the identifier when it read the request.
-                if existed && forget {
-                    self.forget(binding_id);
+                if existed {
+                    removing.forget(&self.sink);
                 }
                 Ok(existed)
             }
             ResponseBody::Refused {
                 detail, disabled, ..
             } => {
-                if forget {
-                    self.forget(binding_id);
-                }
+                removing.forget(&self.sink);
                 Err(refused(detail, disabled))
             }
             other => Err(protocol_error(&other)),
         }
-    }
-
-    /// Takes out of the notice queue everything it holds for a binding the host has answered the
-    /// removal of. The host wrote everything it had to say about the registration before it
-    /// answered, so what the queue holds, notices and the records that wait for the rest of a
-    /// document, belongs to the registration that was removed, and the identifier's next
-    /// registration starts with a queue that knows nothing of it.
-    fn forget(&self, binding_id: BindingId) {
-        self.sink.forget(binding_id.get());
     }
 
     /// Asks what the host is doing.
