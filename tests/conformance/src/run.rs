@@ -921,7 +921,7 @@ fn build_first(
                 continue;
             }
             if message["reason"] == "compiler-artifact" && message["fresh"] != true {
-                compiled.extend(Compiled::from_artifact(package, &message));
+                compiled.extend(Compiled::from_artifact(package, &message, began));
             }
         }
         // A test binary is a target built with the test profile; a program the tests launch is
@@ -993,7 +993,12 @@ struct Compiled {
 
 impl Compiled {
     /// The unit a `compiler-artifact` message of Cargo's describes, unless it is a build script.
-    fn from_artifact(package: &str, message: &serde_json::Value) -> Option<Self> {
+    /// `began` is when the build began: only a dependency file written since then is the build's.
+    fn from_artifact(
+        package: &str,
+        message: &serde_json::Value,
+        began: SystemTime,
+    ) -> Option<Self> {
         let kinds: Vec<&str> = message["target"]["kind"]
             .as_array()?
             .iter()
@@ -1011,33 +1016,68 @@ impl Compiled {
             (true, true) => Unit::LibraryTests,
             (false, _) => Unit::Other,
         };
-        // The dependency file lies beside the outputs: `host-<hash>.d` for the executable
-        // `host-<hash>`, `krate-<hash>.d` for `libkrate-<hash>.rlib`.
-        let stem = if let Some(executable) = message["executable"].as_str() {
-            Some(PathBuf::from(executable))
-        } else {
-            message["filenames"]
-                .as_array()?
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .find(|name| name.ends_with(".rlib"))
-                .map(PathBuf::from)
-        }
-        .and_then(|path| {
-            let name = path.file_stem()?.to_str()?.to_owned();
-            let name = if message["executable"].is_null() {
-                name.strip_prefix("lib").map_or(name.clone(), str::to_owned)
-            } else {
-                name
-            };
-            Some(path.with_file_name(format!("{name}.d")))
-        });
+        let outputs: Vec<PathBuf> = message["executable"]
+            .as_str()
+            .into_iter()
+            .chain(
+                message["filenames"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(serde_json::Value::as_str),
+            )
+            .map(PathBuf::from)
+            .collect();
+        let name = message["target"]["name"].as_str()?.replace('-', "_");
         Some(Self {
             package: package.to_owned(),
             unit,
-            read: stem.and_then(|path| std::fs::read_to_string(path).ok()),
+            read: dependency_file(&name, &outputs, began)
+                .and_then(|path| std::fs::read_to_string(path).ok()),
         })
     }
+}
+
+/// Rustc's dependency file for the compile of crate `name` that made `outputs`, which lists every
+/// file the compile read. It lies in the `deps` directory, named for the crate and the hash of the
+/// compile (`host-<hash>.d` for the program `host-<hash>`, `krate-<hash>.d` for
+/// `libkrate-<hash>.rlib`), or for the crate alone when a library has other crate types too
+/// (`krate.d` for `libkrate.rlib`). A program that Cargo copied out of `deps` has no hash in its
+/// name: then the one dependency file of the crate that this build wrote is it, and when there are
+/// two the file is not told.
+fn dependency_file(name: &str, outputs: &[PathBuf], began: SystemTime) -> Option<PathBuf> {
+    for output in outputs {
+        let directory = output.parent()?;
+        if directory.file_name().is_some_and(|last| last == "deps") {
+            let stem = output.file_stem()?.to_str()?;
+            let stem = if output.extension().is_some_and(|ext| ext == "rlib") {
+                stem.strip_prefix("lib").unwrap_or(stem)
+            } else {
+                stem
+            };
+            let beside = directory.join(format!("{stem}.d"));
+            if beside.is_file() {
+                return Some(beside);
+            }
+        }
+    }
+    let deps = outputs.first()?.parent()?.join("deps");
+    let written: Vec<PathBuf> = std::fs::read_dir(deps)
+        .ok()?
+        .flatten()
+        .filter(|entry| {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            file.strip_suffix(".d")
+                .and_then(|stem| stem.strip_prefix(name))
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|hash| hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                && entry
+                    .metadata()
+                    .and_then(|found| found.modified())
+                    .is_ok_and(|written| written >= began)
+        })
+        .map(|entry| entry.path())
+        .collect();
+    (written.len() == 1).then(|| written[0].clone())
 }
 
 /// Whether the compiles in `readers` could have run beside each other.
