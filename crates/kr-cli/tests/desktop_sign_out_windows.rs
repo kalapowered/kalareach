@@ -561,7 +561,11 @@ async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost(
         .status()
         .expect("schtasks runs");
     assert!(removed.success(), "the entry {name} is removed: {removed}");
-    std::fs::remove_dir_all(&tree)
-        .unwrap_or_else(|error| panic!("{} is removed: {error}", tree.display()));
+    // The tree is in the account's own temporary directory, which the run removes with the
+    // account's profile. A file of it that the daemon of this process still holds for a moment
+    // after it is dropped keeps it until then, and is said here and not refused.
+    if let Err(error) = std::fs::remove_dir_all(&tree) {
+        eprintln!("{} is not removed yet: {error}", tree.display());
+    }
     std::fs::remove_file(&path).expect("the record is removed");
 }
