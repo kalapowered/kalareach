@@ -853,16 +853,32 @@ fn the_linux_runs_of_the_workspace_tests_require_a_user_service_manager() {
     );
 }
 
+/// The names of a workflow's jobs, in file order: the keys at two spaces below `jobs:`.
+fn jobs_of(workflow: &str) -> Vec<String> {
+    workflow
+        .lines()
+        .skip_while(|line| without_comment(line) != "jobs:")
+        .skip(1)
+        .filter_map(|line| {
+            let name = without_comment(line)
+                .strip_prefix("  ")?
+                .strip_suffix(':')?;
+            (!name.is_empty() && !name.starts_with([' ', '#'])).then(|| name.to_owned())
+        })
+        .collect()
+}
+
 /// The report builds every suite's test programs in turn into one directory, with no build cache,
 /// and the debug information is the greater part of what that directory holds. A run of the
-/// Windows job that built with it filled the drive near the end, and the last two suites were
-/// reported as not built. Each job of the conformance workflow, like the landing workflow, builds
-/// without it.
+/// Windows job that built with it filled the drive near the end, and the last two suites failed to
+/// build. Each job of the conformance workflow, like the landing workflow, builds without it.
 #[test]
 fn every_job_of_the_conformance_workflow_builds_without_debug_information() {
     let report = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
         .expect("the conformance workflow");
-    for name in ["linux", "macos", "windows"] {
+    let names = jobs_of(&report);
+    assert!(!names.is_empty(), "the conformance workflow has no job");
+    for name in &names {
         // Among the job's own keys, in its environment ahead of its steps, so that every step that
         // builds has it.
         let keys = header(&job(&report, name));
