@@ -1530,30 +1530,36 @@ fn a_cold_copy_of_the_largest_agent_is_launched_within_the_deadlines() {
     );
 }
 
-/// Looking for bytes in the memory of a process of this account.
-mod memory {
-    #![expect(
-        unsafe_code,
-        reason = "reading another process's memory has no safe interface"
-    )]
-
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQueryEx,
-    };
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
-    };
-
+/// Looking for bytes in the address space of a process. This goes over the memory that a `Space`
+/// describes and reads; the system's calls that make a process one are in `memory`.
+mod scanning {
     /// How much of a region is read at once.
     const CHUNK: usize = 1 << 20;
 
     /// The size of the pages a short read is gone over one by one.
-    const PAGE: usize = 0x1000;
+    pub const PAGE: usize = 0x1000;
 
     /// The system's answer to a query beyond the last region of the address space.
-    const BEYOND_THE_ADDRESS_SPACE: i32 = 87;
+    pub const BEYOND_THE_ADDRESS_SPACE: i32 = 87;
+
+    /// A run of pages that the system describes alike.
+    #[derive(Clone)]
+    pub struct Region {
+        pub base: usize,
+        pub size: usize,
+        /// Whether it is committed and can be read.
+        pub readable: bool,
+    }
+
+    /// The memory of a process, as far as a reading of it needs.
+    pub trait Space {
+        /// Describes the region that holds `address`, or says with the system's error why not.
+        fn describe(&self, address: usize) -> Result<Region, std::io::Error>;
+
+        /// Reads up to `buffer.len()` bytes at `address` and returns how many came back, which is
+        /// what a read that stopped short copied.
+        fn read(&self, address: usize, buffer: &mut [u8]) -> usize;
+    }
 
     /// What a reading of a process's memory found.
     pub struct Scan {
@@ -1573,10 +1579,23 @@ mod memory {
         /// The end of the bytes fed last, as long as the longest needle less one, so that a needle
         /// that straddles two reads is found.
         kept: Vec<u8>,
+        /// The address after the last byte fed.
+        next: Option<usize>,
     }
 
     impl Matcher<'_> {
-        fn feed(&mut self, bytes: &[u8]) {
+        /// Looks for the needles in `bytes`, which were read at `address`, and in the end of the
+        /// bytes fed before them when those end where these begin. Bytes that are not next to what
+        /// was fed last (a page that no read returned lies between them, or a region that cannot
+        /// be read) do not join it, so no needle is made of both sides of a hole.
+        fn feed(&mut self, address: usize, bytes: &[u8]) {
+            if bytes.is_empty() {
+                return;
+            }
+            if self.next != Some(address) {
+                self.kept.clear();
+            }
+            self.next = address.checked_add(bytes.len());
             self.kept.extend_from_slice(bytes);
             for (needle, seen) in self.needles.iter().zip(&mut self.found) {
                 if !*seen {
@@ -1590,66 +1609,142 @@ mod memory {
             let from = self.kept.len().saturating_sub(longest - 1);
             self.kept.drain(..from);
         }
-
-        /// Memory that is not next to what was fed last.
-        fn gap(&mut self) {
-            self.kept.clear();
-        }
     }
 
-    /// Describes the region that holds `address`, or says with the system's error why not.
-    fn describe(
-        process: HANDLE,
-        address: usize,
-    ) -> Result<MEMORY_BASIC_INFORMATION, std::io::Error> {
-        // SAFETY: an all-zero description is a valid value for this plain structure.
-        let mut region: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: the handle is open for the call, and the structure is this function's own with its
-        // true size passed.
-        let described = unsafe {
-            VirtualQueryEx(
-                process,
-                address as *const _,
-                &raw mut region,
-                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-            )
-        };
-        if described == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(region)
-        }
-    }
-
-    /// Whether a region is committed and can be read.
-    fn readable(region: &MEMORY_BASIC_INFORMATION) -> bool {
-        region.State == MEM_COMMIT && region.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
-    }
-
-    /// Reads up to `buffer.len()` bytes at `address` and returns how many came back, which is what
-    /// a read that stopped short copied.
-    fn read(process: HANDLE, address: usize, buffer: &mut [u8]) -> usize {
-        let mut copied = 0_usize;
-        // SAFETY: the buffer is the caller's own and its length is passed; the handle is open for
-        // the call.
-        unsafe {
-            ReadProcessMemory(
-                process,
-                address as *const _,
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &raw mut copied,
-            );
-        }
-        copied.min(buffer.len())
-    }
-
-    /// Reads the committed, readable memory of process `pid` and says which of `needles` it holds.
+    /// Reads the committed, readable memory of `space` and says which of `needles` it holds.
     ///
     /// The reading ends when the system says there is no region beyond the last one; any other
     /// answer is an error. A read that stops short is searched for what it returned, and the rest
     /// is read again a page at a time; what the system still describes as readable and cannot be
-    /// read is counted as unresolved.
+    /// read is counted as unresolved. A needle that straddles the end of one read and the start of
+    /// the next is found whenever the two are next to each other in the address space: the end of
+    /// a read, a page read again, and the regions that touch.
+    pub fn walk(space: &impl Space, needles: &[Vec<u8>]) -> Result<Scan, String> {
+        let mut matcher = Matcher {
+            needles,
+            found: vec![false; needles.len()],
+            kept: Vec::new(),
+            next: None,
+        };
+        let mut unresolved = 0_usize;
+        let mut address = 0_usize;
+        loop {
+            let region = match space.describe(address) {
+                Ok(region) => region,
+                Err(error) if error.raw_os_error() == Some(BEYOND_THE_ADDRESS_SPACE) => break,
+                Err(error) => {
+                    return Err(format!(
+                        "the region at {address:#x} is not described: {error}"
+                    ));
+                }
+            };
+            if region.readable {
+                unresolved += read_region(space, &region, &mut matcher);
+            }
+            let next = region.base.saturating_add(region.size);
+            if next <= address {
+                break;
+            }
+            address = next;
+        }
+        Ok(Scan {
+            found: matcher.found,
+            unresolved,
+        })
+    }
+
+    /// Feeds the matcher the readable `region`, a chunk at a time, and returns how many of its bytes
+    /// are unresolved.
+    fn read_region(space: &impl Space, region: &Region, matcher: &mut Matcher<'_>) -> usize {
+        let mut unresolved = 0;
+        let mut offset = 0;
+        while offset < region.size {
+            let want = (region.size - offset).min(CHUNK);
+            let mut buffer = vec![0_u8; want];
+            let start = region.base + offset;
+            let got = space.read(start, &mut buffer);
+            matcher.feed(start, &buffer[..got]);
+            let mut at = got;
+            while at < want {
+                let here = start + at;
+                let step = (PAGE - here % PAGE).min(want - at);
+                let returned = space.read(here, &mut buffer[at..at + step]);
+                matcher.feed(here, &buffer[at..at + returned]);
+                if returned < step && space.describe(here).is_ok_and(|now| now.readable) {
+                    unresolved += step - returned;
+                }
+                at += step;
+            }
+            offset += want;
+        }
+        unresolved
+    }
+}
+
+/// Looking for bytes in the memory of a process of this account.
+mod memory {
+    #![expect(
+        unsafe_code,
+        reason = "reading another process's memory has no safe interface"
+    )]
+
+    use super::scanning::{Region, Scan, Space, walk};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQueryEx,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    };
+
+    /// A process opened for querying and reading its memory.
+    struct Opened(HANDLE);
+
+    impl Space for Opened {
+        fn describe(&self, address: usize) -> Result<Region, std::io::Error> {
+            // SAFETY: an all-zero description is a valid value for this plain structure.
+            let mut region: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: the handle is open for the call, and the structure is this function's own
+            // with its true size passed.
+            let described = unsafe {
+                VirtualQueryEx(
+                    self.0,
+                    address as *const _,
+                    &raw mut region,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if described == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(Region {
+                    base: region.BaseAddress as usize,
+                    size: region.RegionSize,
+                    readable: region.State == MEM_COMMIT
+                        && region.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0,
+                })
+            }
+        }
+
+        fn read(&self, address: usize, buffer: &mut [u8]) -> usize {
+            let mut copied = 0_usize;
+            // SAFETY: the buffer is the caller's own and its length is passed; the handle is open
+            // for the call.
+            unsafe {
+                ReadProcessMemory(
+                    self.0,
+                    address as *const _,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    &raw mut copied,
+                );
+            }
+            copied.min(buffer.len())
+        }
+    }
+
+    /// Reads the committed, readable memory of process `pid` and says which of `needles` it holds.
     pub fn scan(pid: u32, needles: &[Vec<u8>]) -> Result<Scan, String> {
         // SAFETY: the call takes plain integers and returns a handle or null, which is checked.
         let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
@@ -1659,65 +1754,192 @@ mod memory {
                 std::io::Error::last_os_error()
             ));
         }
-        let mut matcher = Matcher {
-            needles,
-            found: vec![false; needles.len()],
-            kept: Vec::new(),
-        };
-        let mut unresolved = 0_usize;
-        let mut address = 0_usize;
-        let outcome = loop {
-            let region = match describe(process, address) {
-                Ok(region) => region,
-                Err(error) if error.raw_os_error() == Some(BEYOND_THE_ADDRESS_SPACE) => {
-                    break Ok(());
-                }
-                Err(error) => {
-                    break Err(format!(
-                        "process {pid}: the region at {address:#x} is not described: {error}"
-                    ));
-                }
-            };
-            let base = region.BaseAddress as usize;
-            let size = region.RegionSize;
-            if readable(&region) {
-                matcher.gap();
-                let mut offset = 0;
-                while offset < size {
-                    let want = (size - offset).min(CHUNK);
-                    let mut buffer = vec![0_u8; want];
-                    let got = read(process, base + offset, &mut buffer);
-                    matcher.feed(&buffer[..got]);
-                    let mut at = got;
-                    while at < want {
-                        matcher.gap();
-                        let here = base + offset + at;
-                        let step = (PAGE - here % PAGE).min(want - at);
-                        let returned = read(process, here, &mut buffer[at..at + step]);
-                        matcher.feed(&buffer[at..at + returned]);
-                        if returned < step
-                            && describe(process, here).is_ok_and(|now| readable(&now))
-                        {
-                            unresolved += step - returned;
-                        }
-                        at += step;
-                    }
-                    offset += want;
-                }
-            }
-            let next = base.saturating_add(size);
-            if next <= address {
-                break Ok(());
-            }
-            address = next;
-        };
+        let outcome =
+            walk(&Opened(process), needles).map_err(|why| format!("process {pid}: {why}"));
         // SAFETY: the handle was opened above and is closed once.
         unsafe { CloseHandle(process) };
-        outcome.map(|()| Scan {
-            found: matcher.found,
-            unresolved,
-        })
+        outcome
     }
+}
+
+/// A process's memory built in a test: its regions, the bytes of the readable ones, and pages that
+/// cannot be read.
+struct Planted {
+    regions: Vec<scanning::Region>,
+    /// The bytes of each readable region, from its base.
+    bytes: Vec<(usize, Vec<u8>)>,
+    /// The pages, by their first address, that no read returns.
+    gone: Vec<usize>,
+    /// The pages, by their first address, that the first read of fails and a later one returns, as
+    /// when a page is taken away and given back between the query that described it and the read.
+    once: std::cell::RefCell<Vec<usize>>,
+}
+
+impl Planted {
+    /// Regions of `layout`, each as its first address, its length in pages and whether it can be
+    /// read. A readable region holds `0xAA` bytes.
+    fn new(layout: &[(usize, usize, bool)]) -> Self {
+        let regions: Vec<scanning::Region> = layout
+            .iter()
+            .map(|&(base, pages, readable)| scanning::Region {
+                base,
+                size: pages * scanning::PAGE,
+                readable,
+            })
+            .collect();
+        let bytes = regions
+            .iter()
+            .filter(|region| region.readable)
+            .map(|region| (region.base, vec![0xAA; region.size]))
+            .collect();
+        Self {
+            regions,
+            bytes,
+            gone: Vec::new(),
+            once: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Puts `bytes` into the memory at `address`.
+    fn plant(&mut self, address: usize, bytes: &[u8]) {
+        for (offset, byte) in bytes.iter().enumerate() {
+            let at = address + offset;
+            let (base, held) = self
+                .bytes
+                .iter_mut()
+                .find(|(base, held)| (*base..*base + held.len()).contains(&at))
+                .expect("the byte is in a readable region");
+            held[at - *base] = *byte;
+        }
+    }
+
+    fn byte(&self, address: usize) -> Option<u8> {
+        self.bytes
+            .iter()
+            .find(|(base, held)| (*base..*base + held.len()).contains(&address))
+            .map(|(base, held)| held[address - base])
+    }
+}
+
+impl scanning::Space for Planted {
+    fn describe(&self, address: usize) -> Result<scanning::Region, std::io::Error> {
+        if let Some(region) = self
+            .regions
+            .iter()
+            .find(|region| (region.base..region.base + region.size).contains(&address))
+        {
+            return Ok(region.clone());
+        }
+        // Like the system, an address that no region holds is described as free up to the next
+        // region, and as beyond the address space after the last.
+        self.regions
+            .iter()
+            .map(|region| region.base)
+            .filter(|base| *base > address)
+            .min()
+            .map(|next| scanning::Region {
+                base: address,
+                size: next - address,
+                readable: false,
+            })
+            .ok_or_else(|| std::io::Error::from_raw_os_error(scanning::BEYOND_THE_ADDRESS_SPACE))
+    }
+
+    /// Copies up to the first page that cannot be read, as the system does.
+    fn read(&self, address: usize, buffer: &mut [u8]) -> usize {
+        let mut copied = 0;
+        while copied < buffer.len() {
+            let at = address + copied;
+            let page = at - at % scanning::PAGE;
+            if self.gone.contains(&page) {
+                break;
+            }
+            let mut once = self.once.borrow_mut();
+            if let Some(position) = once.iter().position(|first| *first == page) {
+                once.remove(position);
+                break;
+            }
+            drop(once);
+            let Some(byte) = self.byte(at) else { break };
+            buffer[copied] = byte;
+            copied += 1;
+        }
+        copied
+    }
+}
+
+const NEEDLE: &[u8] = b"4f1c9a07e2b85d36";
+
+/// Reads `memory` for `NEEDLE` and returns whether it was found and how many bytes are unresolved.
+fn looked_for_in(memory: &Planted) -> (bool, usize) {
+    let scan = scanning::walk(memory, &[NEEDLE.to_vec()]).expect("the memory is read");
+    (scan.found[0], scan.unresolved)
+}
+
+/// The needle's first `before` bytes end at `boundary` and the rest follow it.
+fn straddling(memory: &mut Planted, boundary: usize, before: usize) {
+    memory.plant(boundary - before, NEEDLE);
+}
+
+#[test]
+fn a_needle_across_a_page_a_short_read_stopped_before_is_found() {
+    const BASE: usize = 0x40000;
+    let mut memory = Planted::new(&[(BASE, 4, true)]);
+    straddling(&mut memory, BASE + scanning::PAGE, 7);
+    // The second page is not returned by the first read and is by the next.
+    memory.once.borrow_mut().push(BASE + scanning::PAGE);
+    assert_eq!(
+        looked_for_in(&memory),
+        (true, 0),
+        "a needle across the end of a short read and the page read again after it"
+    );
+}
+
+#[test]
+fn a_needle_across_two_pages_read_again_after_a_short_read_is_found() {
+    const BASE: usize = 0x40000;
+    let mut memory = Planted::new(&[(BASE, 4, true)]);
+    // The second page cannot be read at all; the two after it can.
+    memory.gone.push(BASE + scanning::PAGE);
+    straddling(&mut memory, BASE + 3 * scanning::PAGE, 9);
+    assert_eq!(
+        looked_for_in(&memory),
+        (true, scanning::PAGE),
+        "a needle across two pages that were read one at a time"
+    );
+}
+
+#[test]
+fn a_needle_made_of_both_sides_of_a_page_that_cannot_be_read_is_not_found() {
+    const BASE: usize = 0x40000;
+    let mut memory = Planted::new(&[(BASE, 4, true)]);
+    memory.gone.push(BASE + scanning::PAGE);
+    // The needle's first part ends the page before the hole and the rest begins the page after it.
+    memory.plant(BASE + scanning::PAGE - 8, &NEEDLE[..8]);
+    memory.plant(BASE + 2 * scanning::PAGE, &NEEDLE[8..]);
+    assert_eq!(
+        looked_for_in(&memory),
+        (false, scanning::PAGE),
+        "the bytes either side of a hole are not next to each other"
+    );
+}
+
+#[test]
+fn a_needle_across_two_regions_is_found_where_they_touch_and_not_where_they_do_not() {
+    const BASE: usize = 0x40000;
+    // Two regions that the system describes apart and that are next to each other.
+    let mut touching = Planted::new(&[(BASE, 2, true), (BASE + 2 * scanning::PAGE, 2, true)]);
+    straddling(&mut touching, BASE + 2 * scanning::PAGE, 5);
+    assert_eq!(looked_for_in(&touching), (true, 0));
+    // The same two regions with one that cannot be read between them.
+    let mut apart = Planted::new(&[
+        (BASE, 2, true),
+        (BASE + 2 * scanning::PAGE, 1, false),
+        (BASE + 3 * scanning::PAGE, 2, true),
+    ]);
+    apart.plant(BASE + 2 * scanning::PAGE - 8, &NEEDLE[..8]);
+    apart.plant(BASE + 3 * scanning::PAGE, &NEEDLE[8..]);
+    assert_eq!(looked_for_in(&apart), (false, 0));
 }
 
 /// The batch file the next case's program runs: it writes the whole of its environment and its own
