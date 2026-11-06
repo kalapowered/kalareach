@@ -374,6 +374,13 @@ fn record_wsl_exe() {
     );
 }
 
+/// Whether a `whoami /groups /fo csv /nh` listing names an integrity level, which it does by the
+/// level's SID, a field that begins `S-1-16-`, and not by the group's name, which the system
+/// translates.
+fn names_an_integrity_level(listing: &str) -> bool {
+    listing.contains(",\"S-1-16-")
+}
+
 /// Whether this account is in the Administrators group.
 fn is_in_administrators() -> bool {
     let output = Command::new(system32("whoami.exe"))
@@ -385,7 +392,7 @@ fn is_in_administrators() -> bool {
     // Every account's listing names the integrity level it runs at, so a listing without one is not
     // one, and an account is not taken for a standard one on the strength of an answer that is empty.
     assert!(
-        listing.contains("Mandatory Label"),
+        names_an_integrity_level(&listing),
         "whoami /groups listed no integrity level: {listing:?}"
     );
     listing.contains("S-1-5-32-544")
@@ -504,6 +511,29 @@ fn record_ssh_exe() {
         &recorded,
     );
 }
+
+#[test]
+fn an_integrity_level_is_named_by_its_sid_whatever_the_language() {
+    // The words of the first field are translated and the SID is not. The second listing is an
+    // example of a translation, not a recording.
+    let english = "\"Everyone\",\"Well-known group\",\"S-1-1-0\",\"Mandatory group\"\r\n\
+                   \"Mandatory Label\\Medium Mandatory Level\",\"Label\",\"S-1-16-8192\",\"Mandatory group\"\r\n";
+    let translated = "\"Tout le monde\",\"Groupe connu\",\"S-1-1-0\",\"Groupe obligatoire\"\r\n\
+                      \"Etiquette obligatoire\\Niveau moyen\",\"Etiquette\",\"S-1-16-8192\",\"Groupe obligatoire\"\r\n";
+    assert!(names_an_integrity_level(english));
+    assert!(names_an_integrity_level(translated));
+    assert!(
+        !names_an_integrity_level(""),
+        "an empty answer names no level"
+    );
+    assert!(
+        !names_an_integrity_level(
+            "\"Everyone\",\"Well-known group\",\"S-1-1-0\",\"Mandatory group\"\r\n"
+        ),
+        "a listing of groups without a level names none"
+    );
+}
+
 #[test]
 fn a_directory_made_for_a_case_that_then_fails_is_removed_with_what_is_in_it() {
     let parent = std::env::temp_dir().join(format!("kr-made-directory-{}", std::process::id()));
