@@ -6801,7 +6801,9 @@ async fn a_macos_host_proves_the_read_confined_profile_and_the_doctor_says_so() 
         "and there is nothing to tell the person to change"
     );
     assert!(
-        mounts.contains("disk image") && mounts.contains("does not close it"),
+        mounts.contains("disk image")
+            && mounts.contains("neither refused nor reported")
+            && mounts.contains("does not close it"),
         "the report names what a Mac leaves open: {mounts}"
     );
     assert!(

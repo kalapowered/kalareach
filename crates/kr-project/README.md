@@ -174,11 +174,13 @@ of these falls back to reading the configuration and hoping.
   object may (the machine's shared temporary directory, `/private/etc`, the top of a person's home
   or of its `Library`, the top of a volume, a package prefix such as `/opt/homebrew` or
   `/usr/local`, or an application bundle), or a program in Git's helper directory is built for the
-  other kind of Mac. The account's own home and `Library` are held by every name they have: the
-  one the environment gives, the one the system's account database gives, and each with its links
-  resolved, so a home reached through a link, one outside `/Users` and a `Library` moved elsewhere
-  are refused as the plain ones are, and so is a directory that holds one. Each refusal names the
-  object, and the host does not qualify.
+  other kind of Mac. The account's own home and `Library` are held by what they are, a device and
+  an inode, and not by what they are called: the home the environment gives and the one the
+  system's account database gives, a home reached through a link, one outside `/Users`, a `Library`
+  moved elsewhere and the data volume's spelling of any of their paths are each refused as the
+  plain ones are, and so is a directory that holds one. The set is also refused when the database
+  gives no home or when a home or its `Library` cannot be examined, since a protection that is
+  partly missing is not one. Each refusal names the object, and the host does not qualify.
 * **A caller bounded by a grant, on a Linux host that cannot name the support set** is refused when
   a program in Git's helper directory has a loader, or a library its loader resolves, that cannot be
   named or lies in a system directory such as `/etc`, `/proc` or `/dev`. So is an invocation that
@@ -259,10 +261,11 @@ After the run this host opens again the directories the operation owns and repor
 the object it started against, and it cannot tell a change made and undone between the two readings
 from none. The paths the invocation is lent, a clone's source for one, and the support set are held
 by name alone: one of them replaced while Git runs is read under its name and nothing detects it. A
-mount at a lent directory itself is no mount beneath it, so the check does not refuse it, and for a
-lent directory nothing reports it. Nothing prevents any of it. The other limits are Linux's: the
-invocation writes only the operation's own directories, executes only the installed Git and reaches
-no network, and a remote clone is refused for such a caller.
+mount at a lent directory, a support directory or Git's helper directory itself is no mount beneath
+it, so the check does not refuse it, and nothing reports it; for a directory the operation owns, the
+reading after the run does. Nothing prevents any of it. The other limits are Linux's: the invocation
+writes only the operation's own directories, executes only the installed Git and reaches no network,
+and a remote clone is refused for such a caller.
 
 The mount check reads the table of mounted filesystems from the kernel without asking any
 filesystem to answer for itself, so a share that has stopped answering cannot hold an invocation. It
