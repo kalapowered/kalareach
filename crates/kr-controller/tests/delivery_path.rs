@@ -2044,7 +2044,6 @@ async fn a_push_registration_recorded_before_an_attempt_claims_it_is_not_given_b
  {
     use kr_protocol::envelope::{MutationRequest, ParamsValue};
     use kr_protocol::error::ErrorCode;
-    use kr_protocol::method::MethodVersion;
 
     let environment = Environment::start().await;
     let phone = environment.phone().await;
@@ -2068,6 +2067,9 @@ async fn a_push_registration_recorded_before_an_attempt_claims_it_is_not_given_b
         .expect("the daemon registers a credential its gateway confirms")
         .to_typed()
         .expect("a registration result");
+    // What the daemon keeps the action under covers the window and the life the first attempt
+    // named, so the second names the same.
+    let window = phone.connection.action_window_id();
     let asked = environment
         .gateway
         .answers_on("/api/push/deliver/status")
@@ -2085,13 +2087,13 @@ async fn a_push_registration_recorded_before_an_attempt_claims_it_is_not_given_b
         let mutation = MutationRequest {
             request_id: kr_protocol::ids::RequestId::new(2),
             method: Method::DevicePushRegister.into(),
-            method_version: MethodVersion::V1,
+            method_version: Method::DevicePushRegister.entry().version,
             action_id: action,
             grant_id: Nullable::null(),
             target: target.clone(),
             expected: ParamsValue::empty(),
-            action_window_id: kr_protocol::ids::ActionWindowId::new("window-1").expect("a window"),
-            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+            action_window_id: window.clone(),
+            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(120_000),
             params: ParamsValue::from_typed(&params).expect("encodes"),
         };
         let actor_id = kr_transport::listener::device_principal(&phone.device_id());
