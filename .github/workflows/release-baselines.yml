@@ -32,7 +32,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Each build starts from nothing, so incremental artefacts would only take disk.
+  # Each build starts from nothing, or from the third-party crates' output in the Intel leg's cache,
+  # so incremental artefacts would only take disk.
   CARGO_INCREMENTAL: "0"
   # The release's macOS floor. Rust's own default is older (11.0 on Apple Silicon), and the C that
   # the build compiles reads the same variable, so every object in an executable targets 14.0.
@@ -177,11 +178,13 @@ jobs:
       # this job took 98 to 163 minutes on the Intel runners (see the limit in the matrix). With
       # these crates' output kept the seven builds below take about a third less (measured on
       # Linux with four build jobs: 1,646 s from nothing, 1,126 s with the output kept, and about
-      # 12 s more with the llama.cpp build left out of it, as it is: see the last step). This
-      # workspace's own crates are built again whatever the cache holds, so what is built of them
-      # is always this commit's, and Cargo decides what else is current. The key holds the
-      # toolchain, `.cargo/config.toml`, the profiles, the compiler flags of the environment, the
-      # runner image and the week.
+      # 12 s more with the llama.cpp build left out of it, as it is: see the step that leaves it
+      # out). This workspace's own crates are built again whatever the cache holds, so what is
+      # built of them is always this commit's, and Cargo decides what else is current. The key
+      # holds the toolchain, `.cargo/config.toml`, the profiles, Rust's flags in the environment
+      # (`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_PROFILE_*`), the runner image and the
+      # week; the flags of the C and C++ compilers (`CFLAGS`, `CXXFLAGS`, `CC`) and
+      # `MACOSX_DEPLOYMENT_TARGET` are not in it.
       - name: Restore the third-party crates' build output
         id: cargo-cache
         if: ${{ matrix.cache }}
