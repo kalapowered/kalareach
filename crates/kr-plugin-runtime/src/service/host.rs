@@ -73,12 +73,14 @@ pub const REGISTER_DEADLINE: core::time::Duration =
 const UNBIND_DEADLINE: core::time::Duration = kr_plugin_service::client::DEFAULT_DEADLINE
     .saturating_sub(kr_plugin_service::client::ROUND_TRIP_ALLOWANCE);
 
-/// How many unbinds one connection may have queued or running on the blocking pool.
+/// How many unbinds the host may have queued or running on the blocking pool, whichever connections
+/// asked for them.
 ///
 /// A request that stops waiting at its deadline does not take its removal back, so a removal is
-/// counted from the request that queued it until it has run: a connection that has this many
-/// behind it is refused the next rather than queued behind itself, and the removals one connection
-/// leaves behind are bounded as the calls it has running are.
+/// counted from the request that queued it until it has run, and it is counted for the host: a
+/// worker that closes its connection and opens another leaves its removals behind and finds them
+/// still counted. An unbind that finds this many waiting is refused rather than queued behind them,
+/// so the removals a host leaves on the pool are bounded however many connections asked for them.
 pub const MAX_PENDING_UNBINDS: usize = 16;
 
 /// The file, in the state directory beside the compiled-code cache, that holds every registration
@@ -163,6 +165,9 @@ pub struct PluginHost {
     config: HostConfig,
     /// How many payloads may be in hand at once, across every connection.
     payloads: Arc<tokio::sync::Semaphore>,
+    /// How many unbinds may be queued or running on the blocking pool at once, across every
+    /// connection.
+    unbinds: Arc<tokio::sync::Semaphore>,
     /// The packages directory, opened once. Every payload is opened relative to this handle, which
     /// is what keeps a component's location inside it a property of the open rather than of a
     /// comparison made before it.
@@ -262,6 +267,7 @@ impl PluginHost {
             runtime: Arc::new(runtime),
             config,
             payloads: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PAYLOADS)),
+            unbinds: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_UNBINDS)),
             packages: Arc::new(packages),
             started: std::time::Instant::now(),
             register_deadline: REGISTER_DEADLINE,
@@ -382,7 +388,6 @@ impl PluginHost {
             notices: sink.clone(),
             writer: Arc::clone(&writer),
             work: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CALLS)),
-            unbinds: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_UNBINDS)),
             bindings: Arc::default(),
             conversation: Arc::clone(&conversation),
             registered: Registered::default(),
@@ -951,8 +956,9 @@ impl PluginHost {
     /// may have running, and with it the connection's cleanup, for as long. So the wait is held to
     /// the time a worker gives it. A caller that stops waiting does not take the task back: it runs
     /// when it gets a thread, removes the binding, gives the connection its place back and clears
-    /// the records, as it would for a caller that waited. The tasks a connection leaves behind are
-    /// counted, [`MAX_PENDING_UNBINDS`] at most, and an unbind beyond that is refused at once.
+    /// the records, as it would for a caller that waited. The tasks the host has waiting are counted
+    /// across its connections, [`MAX_PENDING_UNBINDS`] at most, and an unbind beyond that is refused
+    /// at once.
     async fn unbind(
         &self,
         binding_id: Uuid,
@@ -966,11 +972,12 @@ impl PluginHost {
             .lock()
             .ok()
             .and_then(|held| held.live.get(&binding_id).cloned());
-        // A place among the removals this connection may have waiting, held by the task until it
-        // has run and not by this request, which stops waiting at its deadline.
-        let Ok(waiting) = Arc::clone(&served.unbinds).try_acquire_owned() else {
+        // A place among the removals this host may have waiting, held by the task until it has run
+        // and not by this request, which stops waiting at its deadline, nor by the connection,
+        // which may be over by then.
+        let Ok(waiting) = Arc::clone(&self.unbinds).try_acquire_owned() else {
             return Err(refused(format!(
-                "this connection already has the {MAX_PENDING_UNBINDS} unbinds it may have waiting"
+                "this host already has the {MAX_PENDING_UNBINDS} unbinds it may have waiting"
             )));
         };
         let runtime = Arc::clone(&self.runtime);
@@ -1078,8 +1085,6 @@ struct Served {
     writer: Arc<tokio::sync::Mutex<FrameWriter>>,
     /// How much work that enters a component this connection may have running.
     work: Arc<tokio::sync::Semaphore>,
-    /// How many unbinds this connection may have queued or running on the blocking pool.
-    unbinds: Arc<tokio::sync::Semaphore>,
     /// How many bindings it holds.
     ///
     /// Shared, so that an unbind the connection's end does not wait for can still give its place
