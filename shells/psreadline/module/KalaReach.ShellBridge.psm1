@@ -1010,6 +1010,33 @@ function Restore-KrReplyHandlers {
     $script:Hooks.Replies = @()
 }
 
+# The introducers of the chords the module bound for a host's answer that are still its own now.
+#
+# A chord is the module's own while the editor still holds the module's handler on it and the Escape
+# key is still the first key of a chord: a person can bind either at the prompt after the module has
+# bound its own, and then the keys behind an Escape are theirs. The editor's tables are read each
+# time, because the list of chords the module bound is as it was when it bound them.
+function Get-KrOwnReplyIntroducers {
+    try {
+        $escape = $null
+        foreach ($entry in (Get-KrBindingTables).Keys.GetEnumerator()) {
+            if ("$($entry.Key)" -ceq 'Escape') { $escape = $entry.Value; break }
+        }
+        if ($null -eq $escape -or "$($escape.BriefDescription)" -cne 'ChordFirstKey') { return @() }
+        $own = [System.Collections.Generic.List[string]]::new()
+        foreach ($chord in @($script:Hooks.Replies)) {
+            $current = Get-KrBindingOn $chord
+            if ($null -ne $current -and "$($current.Description)" -ceq $script:ReplyDescription) {
+                $own.Add(($chord -creplace '^Escape,', ''))
+            }
+        }
+        return @($own)
+    } catch {
+        Write-KrTrace "the module's reply chords could not be read: $($_.Exception.Message)"
+        return @()
+    }
+}
+
 # The editor's tables of bindings in the place this module binds into: the keys, and the chords of
 # two keys.
 #

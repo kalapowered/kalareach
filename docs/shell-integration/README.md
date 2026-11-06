@@ -1017,9 +1017,11 @@ method, and that is exactly what it cannot do:
   A reply the writer had taken when the entry was applied is normally written by the time the
   worker's answer arrives, and is then in the input the module reads; one the writer has not yet
   written by then, because its thread has not run or the terminal's input is full, is written ahead
-  of the editor's reply. In the Vi and Windows edit modes, and for a chord the person has bound
-  themselves, the module takes nothing, as the next item says: the answers reach the editor as keys
-  there, as they did. What the module controls is when the reader first reports its queues clear. A
+  of the editor's reply. In the Vi and Windows edit modes the module reads nothing, as the next item
+  says: an answer already in the input when the editor asks joins the editor's reply there, as it
+  did. Where the person has bound one of the chords, or the Escape key, since the module bound its
+  own, the module reads the keys and gives every one of them back to the editor, so the answers
+  reach it as keys there. What the module controls is when the reader first reports its queues clear. A
   fence proved before the editor has asked its question comes before the reply, and an answer the
   host writes behind that fence lands ahead of the reply and joins it: the runtime takes the
   answer's `ESC [` and its first `;` for the start of the reply and its digits for the position,

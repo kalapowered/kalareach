@@ -1450,6 +1450,113 @@ pub fn a_chord_the_person_bound_on_an_escape_runs_when_it_was_typed_ahead_of_a_r
     );
 }
 
+/// KR-REQ-08.48: a chord the person binds after the module has bound its own runs when its keys were
+/// typed ahead of a read.
+///
+/// The module binds `Escape,[`, `Escape,]` and `Escape,P` where nothing is bound when it starts, and
+/// takes a host's answer out of the keys typed ahead only where those chords are still its own. A
+/// person can bind a chord later, at the prompt, and the module reads the editor's tables at each
+/// read for that reason. The case runs a line that binds `Escape,P` to a handler of the person's
+/// own, leaves the entry of the next read unanswered, types the chord, a backslash (which ends a
+/// device control string, so the three keys are a whole answer by their shape) and a return, and
+/// expects the handler to have run: a module that went by the chords it bound at the start would
+/// drop the three keys and run an empty line.
+///
+/// # Panics
+///
+/// Panics when the person's handler does not run.
+#[cfg(unix)]
+pub fn a_chord_the_person_binds_after_the_first_prompt_runs_when_it_was_typed_ahead_of_a_read(
+    kind: ShellKind,
+) {
+    let handler = "Set-PSReadLineKeyHandler -Chord 'Escape,P' -ScriptBlock { \
+        [Microsoft.PowerShell.PSConsoleReadLine]::Insert('Write-Output (''kr-lat'' + ''e'') # ') }";
+    keys_typed_ahead_of_a_read_after_a_binding_made_at_the_prompt(
+        kind,
+        handler,
+        "kr-late",
+        "the person's handler on Escape,P, bound after the first prompt, did not run when its keys \
+         were typed ahead",
+    );
+}
+
+/// KR-REQ-08.48: an Escape the person binds alone after the module has bound its chords is theirs,
+/// and the keys typed ahead of a read after it are the line they spell.
+///
+/// The chords the module binds stand behind the Escape key, which the editor keeps as the first key
+/// of a chord. A person who binds the Escape key to an operation of their own at the prompt makes
+/// the keys behind it a new line, as the Windows edit mode does, and the module reads the editor's
+/// tables at each read for that reason. The case binds the Escape key to reverting the line, leaves
+/// the entry of the next read unanswered and types an Escape, a `P`, a backslash and a return; the
+/// editor has to meet the `P` and the backslash as the line it runs, which the shell says it does
+/// not know as a command, where a module that went by the chords it bound at the start would take
+/// the three keys for an answer and run an empty line.
+///
+/// # Panics
+///
+/// Panics when the shell does not run the line the keys spell.
+#[cfg(unix)]
+pub fn an_escape_the_person_binds_after_the_first_prompt_leaves_the_keys_behind_it_theirs(
+    kind: ShellKind,
+) {
+    keys_typed_ahead_of_a_read_after_a_binding_made_at_the_prompt(
+        kind,
+        "Set-PSReadLineKeyHandler -Chord 'Escape' -Function RevertLine",
+        "The term 'P\\' is not recognized",
+        "the keys typed behind an Escape the person bound after the first prompt did not run as the \
+         line they spell",
+    );
+}
+
+/// Binds with `binding` in a line the person runs at the prompt, then types an Escape, a `P`, a
+/// backslash and a return into the read that follows the next one, whose entry is left unanswered,
+/// and waits for `expected` to be shown.
+#[cfg(unix)]
+fn keys_typed_ahead_of_a_read_after_a_binding_made_at_the_prompt(
+    kind: ShellKind,
+    binding: &str,
+    expected: &str,
+    complaint: &str,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.stepping = false;
+    let bound = format!("{binding}; {}", print_assembled(kind, "kr-bound"));
+    assert!(
+        session.run(&bound, "kr-bound"),
+        "the line that binds did not run:\n{}",
+        session.terminal_output()
+    );
+    // The read that follows the binding has started and been answered before the next entry is
+    // left unanswered, so that it is the entry of the read after it that is.
+    assert!(
+        session.wait_for_prompt() && session.wait_for_editor_reading(),
+        "the editor did not start the read after the binding:\n{}",
+        session.terminal_output()
+    );
+    session.commands.hold_entries = true;
+    assert!(
+        session.answered("kr-after"),
+        "a line did not run after the binding:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        session.wait_for_prompt(),
+        "the shell drew no prompt after the line:\n{}",
+        session.terminal_output()
+    );
+    let start = session.written();
+    session.type_bytes(b"\x1bP\\\r");
+    session.answer_held_entries();
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, expected, deadline),
+        "{complaint}:\n{}",
+        shown_since(&session, start)
+    );
+}
+
 /// KR-REQ-08.48: in the Windows edit mode the keys typed ahead of a read are the person's, whatever
 /// follows an Escape in them.
 ///
