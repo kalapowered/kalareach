@@ -4507,6 +4507,104 @@ async fn an_attention_action_whose_record_cannot_be_read_where_it_is_performed_i
     host.stop().await;
 }
 
+/// KR-REQ-09.09: a visit that finds the store taken from the daemon before it is performed is told,
+/// as every other attention action is, that what became of it is not known: the store cannot be
+/// asked what it holds of the action. The visit looks up the numbering its reader is shown before
+/// the store is asked for the action's record, and that read is the first to find the store gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_that_finds_the_store_taken_before_it_is_performed_is_told_the_outcome_is_unknown()
+{
+    let owner_keys = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner_keys).await;
+    let controller = Arc::clone(host.controller());
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let mut control = host.client().await;
+    let mutation = control
+        .compose(
+            Method::VisitAcknowledge,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &VisitAcknowledgeParams {
+                session_id,
+                acknowledged_cursor: U64::new(0),
+                views: Vec::new(),
+            },
+        )
+        .await
+        .expect("the mutation is composed");
+    let admission = AdmittedMutation {
+        connection_id: control.acknowledgement().connection_id,
+        admitted_revision: controller.authority_revision().await.expect("the revision"),
+        deadline: Some(
+            controller
+                .continuous_now()
+                .checked_add(Duration::from_secs(30))
+                .expect("a deadline"),
+        ),
+    };
+
+    // The visit is stopped before it reaches the store.
+    let (arrived, release) = controller.attention().pause_before_store();
+    let visiting = {
+        let controller = Arc::clone(&controller);
+        tokio::spawn(async move {
+            controller
+                .attention()
+                .write(
+                    &controller,
+                    &Caller::Owner,
+                    &owner(),
+                    &mutation,
+                    Method::VisitAcknowledge,
+                    &admission,
+                )
+                .await
+                .into_answer()
+        })
+    };
+    tokio::task::spawn_blocking(move || {
+        arrived
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the visit reached the store")
+    })
+    .await
+    .expect("the wait finishes");
+
+    // The store is taken from the daemon, and a write that finds out marks it so.
+    let gone = |_: &kr_protocol::identity::ProcessStartIdentity| kr_attention::Liveness::Ended;
+    let taker = kr_attention::Claimant::new(
+        kr_ipc::identity::current_process_start_identity().expect("the kernel answers"),
+        &gone,
+    );
+    let _taken = kr_attention::Attention::open(
+        host.tree()
+            .environment()
+            .state_dir()
+            .join("attention.sqlite3"),
+        kr_attention::HostReading::new(
+            kr_attention::time::BootMark::of(b"another daemon"),
+            kr_ipc::clock::boot_elapsed_ms(),
+            kr_ipc::now_ms().get(),
+            true,
+        ),
+        &taker,
+    )
+    .expect("the store is taken from a process this opener is told has gone");
+    controller
+        .attention()
+        .observe(&[approval(session_id, "req-1")])
+        .expect_err("a store this daemon no longer holds records nothing");
+
+    release.send(()).expect("the visit is let go");
+    let told = tokio::time::timeout(Duration::from_secs(10), visiting)
+        .await
+        .expect("the visit answers")
+        .expect("the visit finishes")
+        .expect_err("a store that is gone performs nothing");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    host.stop().await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // A session's own work: agent turns that end and commands that fail
 // ---------------------------------------------------------------------------------------------

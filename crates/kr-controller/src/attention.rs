@@ -2387,10 +2387,16 @@ impl AttentionModule {
                                 })?;
                             // A reader whose history has a bound sends back the number it was
                             // shown, and the store keeps the log's own.
+                            //
+                            // A store that is no longer this daemon's cannot be asked, here or
+                            // for the record of the action, so it is told as the lookups are.
                             let cursor = match store
                                 .numbering(actor, viewer, params.session_id)
-                                .map_err(Unperformed::Store)?
-                            {
+                                .map_err(|source| {
+                                    Unperformed::Store(kr_attention::Error::ActionUnreadable {
+                                        source: Box::new(source),
+                                    })
+                                })? {
                                 None => params.acknowledged_cursor.get(),
                                 Some(numbering) => numbering
                                     .cursor(params.acknowledged_cursor.get())
