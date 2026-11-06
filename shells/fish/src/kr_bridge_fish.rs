@@ -1458,6 +1458,15 @@ pub fn note_partial_character(first: Option<u8>) {
     state.partial_bytes = usize::from(first.is_some());
 }
 
+/// Keys owed to the reader's own queue that the decoder holds back with the character or sequence it
+/// is reading, so that a takeover counts them with what it drops.
+pub fn note_held_keys(count: usize) {
+    let state = state();
+    if state.partial_character.is_some() {
+        state.partial_bytes += count;
+    }
+}
+
 /// One more byte taken for the character or sequence the decoder is holding.
 pub fn note_partial_byte() {
     let state = state();

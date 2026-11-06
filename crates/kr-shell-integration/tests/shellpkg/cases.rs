@@ -886,11 +886,124 @@ pub fn the_byte_behind_a_device_control_header_the_reader_does_not_skip_stays_th
     let package = Package::built(kind);
     let mut session = Session::start(&package);
     session.first_prompt();
-    for (header, marker) in [("\x1bP!", "kr-dcs-a"), ("\x1bP1$", "kr-dcs-b")] {
+    for (header, marker) in DEVICE_CONTROL_HEADERS_NOT_SKIPPED {
         let line = format!("{header}{}", print_assembled(kind, marker));
         assert!(
             session.run(&line, marker),
             "the line typed behind {header:?} did not print {marker:?}:\n{}",
+            session.terminal_output()
+        );
+    }
+}
+
+/// The starts of the device control strings a reader skips to their end, each with the word a line
+/// typed behind it prints. The strings are the tertiary device attributes (`ESC P !`) and the
+/// reports of a setting (`ESC P 1 $` and `ESC P 0 $`); the header is all the reader has to go on
+/// until the byte behind it says whether it is one.
+#[cfg(unix)]
+const DEVICE_CONTROL_HEADERS_NOT_SKIPPED: [(&str, &str); 3] = [
+    ("\x1bP!", "kr-dcs-a"),
+    ("\x1bP1$", "kr-dcs-b"),
+    ("\x1bP0$", "kr-dcs-c"),
+];
+
+/// KR-REQ-08.48: a cursor key behind the start of a device control string that is not one the
+/// reader skips is still the cursor key.
+///
+/// The reader tells the string from text by the byte behind its header, and an Escape there begins
+/// a sequence of its own. A person who presses Alt+Shift+p, types `!` (or `1$` or `0$`) and moves
+/// the cursor with an arrow key inside the wait for the next byte of a sequence has typed no
+/// string, and the arrow key is theirs whole. The case types a line that prints a word from two
+/// arguments, each header, the left arrow and one letter: the word is printed only if the arrow
+/// moved the cursor before the last letter of the second argument. A reader that takes the Escape
+/// for a key of its own and the rest for text puts `[D` into the line.
+///
+/// # Panics
+///
+/// Panics when a line does not print its word.
+#[cfg(unix)]
+pub fn a_cursor_key_behind_a_device_control_header_the_reader_does_not_skip_still_moves_the_cursor(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    for (header, _) in DEVICE_CONTROL_HEADERS_NOT_SKIPPED {
+        let word = "kr-curexd";
+        let line = format!("printf '%s%s\\n' kr-cur ed{header}\x1b[Dx");
+        assert!(
+            session.run(&line, word),
+            "the arrow key typed behind {header:?} did not move the cursor:\n{}",
+            session.terminal_output()
+        );
+    }
+}
+
+/// KR-REQ-08.48: a long run of Escape pairs, each ahead of the start of a device control string that
+/// is not one the reader skips, is read to its end and leaves the shell running.
+///
+/// The Escape that comes before an `ESC P !` header is a key of the person's own, and the reader
+/// owes one for each pair it reads again after dropping the header. A reader that counts them in a
+/// byte stops at the 256th, and a shell built with overflow checks ends on it: the host's shell
+/// session goes with it. The case types three hundred pairs, each with the header, and a
+/// control character that clears the line, then runs a command that prints a word: the word is
+/// printed only if the shell took them all and went on.
+///
+/// # Panics
+///
+/// Panics when the shell does not print the word.
+#[cfg(unix)]
+pub fn a_long_run_of_escape_pairs_before_a_device_control_header_leaves_the_shell_running(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let mut keys = "\x1b\x1bP!".repeat(300);
+    keys.push('\x15');
+    session.type_bytes(keys.as_bytes());
+    assert!(
+        session.answered("kr-esc-run"),
+        "the shell did not go on after three hundred pairs of Escapes and headers:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// KR-REQ-08.48: a bracketed paste with the start of a device control string that is not one the
+/// reader skips in its text still ends, and the text behind the start is pasted.
+///
+/// The paste ends with a sequence of the terminal's own, and the Escape that begins it comes
+/// right behind the text. When the text ends in the header of a string the reader skips (`ESC P !`,
+/// `ESC P 1 $`, `ESC P 0 $`) that Escape is the byte the reader reads to tell the string from
+/// text, and a reader that does not read it again as the start of the paste's end takes the rest
+/// of the end for pasted text: the paste never ends and every key typed after it is held with the
+/// paste. A letter behind the header inside the paste is the byte read to tell, too, and belongs
+/// to the paste, not to the keys typed. The case pastes a command with each header at its end,
+/// types the last word of the command behind the paste and returns, and pastes a command with
+/// each header before its last word: the word is printed only if the paste ended, the typed word
+/// came after it and the pasted word reached the line in its place.
+///
+/// # Panics
+///
+/// Panics when a line does not print its word.
+#[cfg(unix)]
+pub fn a_paste_with_a_device_control_header_the_reader_does_not_skip_in_its_text_is_pasted_whole(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    for (header, _) in DEVICE_CONTROL_HEADERS_NOT_SKIPPED {
+        let line = format!("\x1b[200~printf '%s%s\\n' kr-pas{header}\x1b[201~ ed");
+        assert!(
+            session.run(&line, "kr-pased"),
+            "the keys typed behind the paste ending in {header:?} did not reach the line:\n{}",
+            session.terminal_output()
+        );
+        let line = format!("\x1b[200~printf '%s%s\\n' kr-pa{header}sted\x1b[201~");
+        assert!(
+            session.run(&line, "kr-pasted"),
+            "the text pasted behind {header:?} did not reach the line:\n{}",
             session.terminal_output()
         );
     }

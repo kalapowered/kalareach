@@ -304,9 +304,12 @@ ones it uses: the terminal's version, a capability, a colour and the cursor posi
   (`ESC P 1 $ r setting ST`) are two that the host's query broker writes. The reader now reads these
   two to their terminator once the header says which they are, as it reads the strings it uses. A
   byte that does not come within the reader's own wait for the next byte of a sequence ends the
-  string early, as it ends any other. A string with another header is left as it was, and the one
-  byte read to tell is given back as the key it is, so text typed behind an Alt-Shift-p is not taken
-  for one.
+  string early, as it ends any other. When the header is `ESC P !`, `ESC P 1 $` or `ESC P 0 $` and
+  the byte behind it does not continue the string, the string is left as it was, and the byte read
+  to tell is read again from the start, as the first byte of a key or of a sequence of its own: text
+  typed behind an Alt-Shift-p and `!` or `1$` is not taken for the string, and a cursor key or the
+  end of a bracketed paste behind the header is the sequence it is. A string with any other header
+  is left as it was, and the one byte that told it is lost, as before.
 - **A report of the window.** Any control sequence ending in `t` was taken for the old
   mouse-highlight report, which takes the next two bytes with it, so the two keys a person typed
   behind a report of the window (`CSI 8 ; rows ; columns t`) were lost. That mouse report has no

@@ -8,9 +8,13 @@ The terminal's tertiary device attributes (`ESC P ! | id ST`) and its report of 
 byte or two: the rest was left in the input, and the reader typed it into the line. Once the header
 says which string it is, the string is now read to its terminator, as the strings the reader does
 use already are. A byte that does not come within the reader's own wait for the next byte of a
-sequence ends the string early, as it ends any other. A device control string whose header is
-anything else is left as it was: the one byte read to tell is given back as the key it is, so text
-typed behind an Alt-Shift-p is not taken for one and loses nothing it did not lose before.
+sequence ends the string early, as it ends any other. When the header is `ESC P !`, `ESC P 1 $` or
+`ESC P 0 $` and the byte behind it does not continue the string (`|` or `r`), the string is left as
+it was, but the byte read to tell is not part of it: it is read again from the start, as the first
+byte of a key or of a sequence of its own. Text typed behind an Alt-Shift-p and `!` or `1$` loses
+nothing it did not lose before, and a cursor key or the end of a bracketed paste behind the header
+is the sequence it is. A string with any other header is left as it was, and the one byte that told
+it is lost, as before.
 
 A control sequence that ends in `t` was always taken for the old mouse-highlight report and took the
 next two bytes with it. A report of the window (`CSI 8 ; rows ; columns t`) is such a sequence, and
@@ -22,7 +26,129 @@ shells/fish/LICENSE.
 
 --- a/src/input/decode.rs
 +++ b/src/input/decode.rs
-@@ -398,6 +398,12 @@
+@@ -30,6 +30,9 @@
+     Incomplete,
+     Complete(CharEvent),
+     Error,
++    /// A device control string the reader does not skip, whose start is dropped. The buffer holds
++    /// the one byte read to tell, which is read again from the start as the byte it is.
++    ReadAgain,
+ }
+ #[derive(Debug)]
+ struct EscapeSequenceParseResult {
+@@ -45,25 +48,44 @@
+ 
+ trait InputEventQueuerExt: InputEventQueuer {
+     fn on_byte_read(&mut self, read_byte: u8) {
+-        if read_byte != b'\x1b' && self.paste_is_buffering() {
+-            // A byte the paste is collecting belongs to the paste, not to a key this reader is
+-            // still decoding: it is taken here before anything below holds it.
+-            self.paste_push_char(read_byte);
+-            return;
+-        }
+-        // Bytes this reader has taken and not yet turned into a key are input it still owes the
+-        // buffer, so it is not between operations while it holds them. This covers the rest of a
+-        // character and the rest of an escape sequence alike, and the byte it starts with is
+-        // what tells one from the other.
+-        kr_bridge::note_partial_character(Some(read_byte));
+-        let mut buffer = vec![read_byte];
+-        let escape_sequence = if read_byte == b'\x1b' {
+-            self.parse_escape_sequence(&mut buffer, false)
+-        } else {
+-            EscapeSequenceParseResult {
+-                state: EscapeSequenceParseState::Incomplete,
+-                unconsumed_escapes: 0,
++        // The Escape keys that came before a device control string the reader dropped. They are
++        // keys of their own, owed ahead of the keys the byte read again makes.
++        let mut owed_escapes: usize = 0;
++        let mut read_byte = read_byte;
++        let (mut buffer, escape_sequence) = loop {
++            if read_byte != b'\x1b' && self.paste_is_buffering() {
++                // A byte the paste is collecting belongs to the paste, not to a key this reader is
++                // still decoding: it is taken here before anything below holds it.
++                self.paste_push_char(read_byte);
++                kr_bridge::note_partial_character(None);
++                self.enqueue_escapes(owed_escapes);
++                return;
+             }
++            // Bytes this reader has taken and not yet turned into a key are input it still owes
++            // the buffer, so it is not between operations while it holds them. This covers the
++            // rest of a character and the rest of an escape sequence alike, and the byte it starts
++            // with is what tells one from the other.
++            kr_bridge::note_partial_character(Some(read_byte));
++            kr_bridge::note_held_keys(owed_escapes);
++            let mut buffer = vec![read_byte];
++            let escape_sequence = if read_byte == b'\x1b' {
++                self.parse_escape_sequence(&mut buffer, false)
++            } else {
++                EscapeSequenceParseResult {
++                    state: EscapeSequenceParseState::Incomplete,
++                    unconsumed_escapes: 0,
++                }
++            };
++            if matches!(escape_sequence.state, EscapeSequenceParseState::ReadAgain) {
++                // The byte that told the string was not one this reader skips from a string that
++                // is one is not part of it: it is the person's next key, or the Escape that begins
++                // a sequence of its own, and it is read from the start here rather than in a call
++                // of its own, so that a run of such headers does not nest.
++                owed_escapes += usize::from(escape_sequence.unconsumed_escapes);
++                read_byte = buffer[0];
++                continue;
++            }
++            break (buffer, escape_sequence);
+         };
+         let (decoded_buffer, mut is_err) = match decode_utf8_at_least_one(&mut buffer, |buffer| {
+             // The rest of one character is still a wait, and a takeover has to be able to end it:
+@@ -116,7 +138,9 @@
+             match escape_sequence.state {
+                 EscapeSequenceParseState::Incomplete => None,
+                 EscapeSequenceParseState::Complete(evt) => Some(evt),
+-                EscapeSequenceParseState::Error => unreachable!(),
++                EscapeSequenceParseState::Error | EscapeSequenceParseState::ReadAgain => {
++                    unreachable!()
++                }
+             }
+             .or_else(|| {
+                 let code_unit_first_byte = *buffer.last().unwrap();
+@@ -156,6 +180,16 @@
+         }
+         if let Some(evt) = evt {
+             self.enqueue_event(evt);
++        }
++        self.enqueue_escapes(owed_escapes);
++    }
++
++    fn enqueue_escapes(&mut self, count: usize) {
++        for _ in 0..count {
++            self.enqueue_event(CharEvent::from_key_seq(
++                KeyEvent::from_raw(key::ESCAPE),
++                WString::from_str("\x1b"),
++            ));
+         }
+     }
+ 
+@@ -218,7 +252,19 @@
+                 b'[' => self.parse_csi(buffer),
+                 b'O' => self.parse_ss3(buffer),
+                 b']' => self.parse_osc(buffer),
+-                b'P' => self.parse_dcs(buffer),
++                b'P' => {
++                    let mut given_back = None;
++                    let event = self.parse_dcs(buffer, &mut given_back);
++                    if let Some(byte) = given_back {
++                        buffer.clear();
++                        buffer.push(byte);
++                        return EscapeSequenceParseResult {
++                            state: ReadAgain,
++                            unconsumed_escapes: 0,
++                        };
++                    }
++                    event
++                }
+                 _ => {
+                     return EscapeSequenceParseResult {
+                         state: Incomplete,
+@@ -398,6 +444,12 @@
                  return Some(CharEvent::Implicit(ImplicitEvent::MouseLeft(position)));
              }
              b't' => {
@@ -35,32 +161,23 @@ shells/fish/LICENSE.
                  flog!(reader, "mouse event");
                  // VT200 button released in mouse highlighting mode at valid text location. 5 chars.
                  let _ = next_char(self);
-@@ -658,6 +664,24 @@
-         }
+@@ -686,7 +738,14 @@
+         Some(query_response(QueryResponse::BackgroundColor(c)))
      }
  
-+    /// Puts the byte just read to see whether a string was one the reader skips back where it
-+    /// would have been, as the key it is: it is not part of the string, and is the person's. It
-+    /// leaves the buffer of the string, so that the rest of a character that it begins is not
-+    /// waited for twice.
-+    fn give_back_sequence_byte(&mut self, buffer: &mut Vec<u8>, byte: u8) {
-+        buffer.pop();
-+        if byte == b'\x1b' {
-+            // An escape begins a sequence of its own, which is read from what follows it as usual
-+            // once the reader is back at its input.
-+            self.enqueue_event(CharEvent::from_key_seq(
-+                KeyEvent::from_raw(key::ESCAPE),
-+                WString::from_str("\x1b"),
-+            ));
-+        } else {
-+            self.on_byte_read(byte);
-+        }
-+    }
-+
-     fn parse_xtversion(&mut self, buffer: &mut Vec<u8>) -> Option<()> {
-         assert_eq!(buffer, b"\x1bP>");
-         self.read_until_sequence_terminator(buffer, false)?;
-@@ -698,11 +722,36 @@
+-    fn parse_dcs(&mut self, buffer: &mut Vec<u8>) -> Option<CharEvent> {
++    /// Reads a device control string. A byte read to tell a string the reader skips from one it
++    /// does not is left in `given_back` when it is not part of a string: it is the person's, and
++    /// the caller reads it again.
++    fn parse_dcs(
++        &mut self,
++        buffer: &mut Vec<u8>,
++        given_back: &mut Option<u8>,
++    ) -> Option<CharEvent> {
+         assert_eq!(buffer, b"\x1bP");
+         let Some(success) = self.read_sequence_byte(buffer) else {
+             return char_event(buffer, KeyEvent::from(alt('P')));
+@@ -698,11 +757,36 @@
                  self.parse_xtversion(buffer);
                  return None;
              }
@@ -73,7 +190,7 @@ shells/fish/LICENSE.
 +                if next == b'|' {
 +                    self.read_until_sequence_terminator(buffer, false);
 +                } else {
-+                    self.give_back_sequence_byte(buffer, next);
++                    *given_back = Some(next);
 +                }
 +                return None;
 +            }
@@ -88,7 +205,7 @@ shells/fish/LICENSE.
 +            if next == b'r' {
 +                self.read_until_sequence_terminator(buffer, false);
 +            } else {
-+                self.give_back_sequence_byte(buffer, next);
++                *given_back = Some(next);
 +            }
              return None;
          }
