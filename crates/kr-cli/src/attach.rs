@@ -9,6 +9,8 @@
 //! Before any of that the restoration guard is armed, because the terminal must come back even if
 //! this process is killed outright. See [`crate::terminal`].
 
+use kr_client::error::HostWord;
+use kr_client::retry::{Attempts, Failure, Recovery, RequestClass};
 use kr_client::shown;
 use kr_client::shown::Shown;
 use std::io::Read as _;
@@ -605,6 +607,11 @@ pub async fn detach_attachment(
 
 /// Subscribes an attachment to the session's output.
 ///
+/// A session that refuses for now has changed nothing, and the subscription is a read, so it is
+/// asked for again by the shared retry policy: after the pause the policy gives, and for as many
+/// times as it gives. The session's definite word, and an answer that cannot say what became of the
+/// request, end the attachment at once.
+///
 /// # Errors
 ///
 /// Returns the host's refusal, or a transport failure.
@@ -623,8 +630,21 @@ pub async fn subscribe(
         streams,
         from_cursor: Nullable(from_cursor.map(kr_protocol::scalars::U64::new)),
     };
-    let outcome = client.request(Method::EventsSubscribe, &params).await?;
-    outcome.map(|_| ()).map_err(CliError::Refused)
+    let mut attempts = Attempts::new();
+    loop {
+        let Err(refused) = client.request(Method::EventsSubscribe, &params).await? else {
+            return Ok(());
+        };
+        if HostWord::of(refused.code) == HostWord::Transient
+            && let Recovery::Retry { delay } = attempts
+                .decide(Failure::new(refused.code), RequestClass::IdempotentRead)
+                .recovery
+        {
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+        return Err(CliError::Refused(refused));
+    }
 }
 
 /// What makes a console that reports its keys as records spell them itself.
@@ -2846,5 +2866,139 @@ mod unix_stop {
         }
         println!("kr-probe:done");
         let _ = controlling.restore(&saved, None, &ScreenModes::UNASKED);
+    }
+}
+
+/// The first subscription of an attachment.
+#[cfg(test)]
+mod the_first_subscription {
+    use std::collections::VecDeque;
+
+    use kr_client::retry::RETRY_BACKOFF_MIN;
+    use kr_protocol::envelope::{ActionTarget, ControlFrame, ParamsValue};
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+    use kr_protocol::ids::{ActionId, ActionWindowId, AttachmentId, SessionId};
+    use kr_protocol::local::LocalBuild;
+    use kr_protocol::method::Method;
+    use kr_protocol::scalars::Uuid;
+
+    use super::subscribe;
+    use crate::bridge::link::{Answer, Link};
+    use crate::error::{CliError, Result};
+
+    /// A connection that answers each request with the next answer it was given, and counts them.
+    struct Answers {
+        answers: VecDeque<Answer>,
+        asked: usize,
+    }
+
+    impl Answers {
+        fn with(answers: impl IntoIterator<Item = Answer>) -> Self {
+            Self {
+                answers: answers.into_iter().collect(),
+                asked: 0,
+            }
+        }
+    }
+
+    impl Link for Answers {
+        fn build(&self) -> Option<&LocalBuild> {
+            None
+        }
+
+        fn action_window_id(&self) -> ActionWindowId {
+            ActionWindowId::new("case").expect("a window")
+        }
+
+        async fn request<T: serde::Serialize + ?Sized>(
+            &mut self,
+            _method: Method,
+            _params: &T,
+        ) -> Result<Answer> {
+            self.asked += 1;
+            Ok(self.answers.pop_front().expect("an answer for each asking"))
+        }
+
+        async fn mutate<T: serde::Serialize + ?Sized>(
+            &mut self,
+            _method: Method,
+            _action_id: ActionId,
+            _target: ActionTarget,
+            _params: &T,
+        ) -> Result<Answer> {
+            unreachable!("a subscription is a read")
+        }
+
+        async fn recv(&mut self) -> Result<ControlFrame> {
+            std::future::pending().await
+        }
+
+        async fn send(&mut self, _frame: ControlFrame) -> Result<()> {
+            Ok(())
+        }
+
+        async fn finish(self) {}
+    }
+
+    fn refusing(code: ErrorCode) -> Answer {
+        Err(ProtocolError::new(code, "refused"))
+    }
+
+    async fn subscribed(link: &mut Answers) -> Result<()> {
+        subscribe(
+            link,
+            SessionId::new(Uuid::from_bytes([1; 16])),
+            AttachmentId::new(Uuid::from_bytes([2; 16])),
+            Some(7),
+        )
+        .await
+    }
+
+    /// KR-REQ-07.47: a first subscription the session refuses for now changed nothing and is a
+    /// read, so it is asked for again after the shared policy's pause and for as many times as the
+    /// policy gives, as the subscription that replaces another is. The session's definite word,
+    /// and an answer that cannot say what became of the request, end the attachment at the first
+    /// asking, with no pause.
+    #[tokio::test(start_paused = true)]
+    async fn a_subscription_the_session_refuses_for_now_is_asked_for_again_after_the_policys_pause()
+    {
+        let started = tokio::time::Instant::now();
+        let mut link = Answers::with([
+            refusing(ErrorCode::ResourceUnavailable),
+            refusing(ErrorCode::ResourceUnavailable),
+            Ok(ParamsValue::empty()),
+        ]);
+        subscribed(&mut link)
+            .await
+            .expect("taken at the third asking");
+        assert_eq!(link.asked, 3);
+        assert!(
+            started.elapsed() >= RETRY_BACKOFF_MIN * 2,
+            "a pause before each asking after the first, on the paused clock"
+        );
+
+        // Refused for now at every asking: three askings after the first, and the refusal of the
+        // fourth is the attachment's end.
+        let mut link = Answers::with(std::iter::repeat_n(
+            refusing(ErrorCode::ResourceUnavailable),
+            4,
+        ));
+        let Err(CliError::Refused(refused)) = subscribed(&mut link).await else {
+            panic!("the refusal ends the attachment");
+        };
+        assert_eq!(refused.code, ErrorCode::ResourceUnavailable);
+        assert_eq!(link.asked, 4);
+
+        // The controls.
+        for code in [ErrorCode::PermissionDenied, ErrorCode::OutcomeUnknown] {
+            let started = tokio::time::Instant::now();
+            let mut link = Answers::with([refusing(code)]);
+            let Err(CliError::Refused(refused)) = subscribed(&mut link).await else {
+                panic!("{code:?} ends the attachment");
+            };
+            assert_eq!(refused.code, code);
+            assert_eq!(link.asked, 1, "{code:?} is not asked again");
+            assert_eq!(started.elapsed(), tokio::time::Duration::ZERO, "{code:?}");
+        }
     }
 }
