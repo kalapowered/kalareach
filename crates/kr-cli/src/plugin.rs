@@ -323,15 +323,7 @@ pub(crate) async fn wait_for_an_owner_device<T>(
     loop {
         let answered = tokio::time::timeout_at(deadline + grace, ask()).await;
         match answered {
-            Err(_) => {
-                return Err(CliError::Unfinished {
-                    code: ErrorCode::OutcomeUnknown,
-                    message: Shown::said(
-                        "the host did not answer the request, so whether it was performed is not \
-                         known: look at what the host lists before asking again",
-                    ),
-                });
-            }
+            Err(_) => return Err(request_not_answered()),
             Ok(Ok(answer)) => return Ok(answer),
             Ok(Err(CliError::Refused(refused)))
                 if refused.code == ErrorCode::OwnerConfirmationRequired =>
@@ -389,17 +381,47 @@ pub(crate) async fn wait_for_an_owner_device<T>(
             // connection that ended or an answer that cannot be read, may have come after the host
             // performed the request.
             Ok(Err(error @ CliError::Refused(_))) => return Err(error),
-            Ok(Err(_)) => {
-                return Err(CliError::Unfinished {
-                    code: ErrorCode::OutcomeUnknown,
-                    message: Shown::said(
-                        "the connection to the host ended before it answered the request, so \
-                         whether it was performed is not known: look at what the host lists before \
-                         asking again",
-                    ),
-                });
-            }
+            Ok(Err(_)) => return Err(connection_ended()),
         }
+    }
+}
+
+/// What the command says when the host does not answer a request it may have begun to perform.
+fn request_not_answered() -> CliError {
+    CliError::Unfinished {
+        code: ErrorCode::OutcomeUnknown,
+        message: Shown::said(
+            "the host did not answer the request, so whether it was performed is not known: look \
+             at what the host lists before asking again",
+        ),
+    }
+}
+
+/// What the command says when the connection ends, or the host's answer cannot be read, after a
+/// request it may have begun to perform was sent.
+fn connection_ended() -> CliError {
+    CliError::Unfinished {
+        code: ErrorCode::OutcomeUnknown,
+        message: Shown::said(
+            "the connection to the host ended before it answered the request, so whether it was \
+             performed is not known: look at what the host lists before asking again",
+        ),
+    }
+}
+
+/// What the host answers to a request it may perform, or the command's word that it did not answer
+/// within `grace`, or that the connection ended without its answer: either way the outcome is not
+/// known, and never that nothing was changed. The host's own refusal is its answer and passes
+/// through as itself.
+pub(crate) async fn performed_within<T>(
+    grace: tokio::time::Duration,
+    request: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(grace, request).await {
+        Err(_) => Err(request_not_answered()),
+        Ok(Err(error @ CliError::Refused(_))) => Err(error),
+        Ok(Err(_)) => Err(connection_ended()),
+        Ok(Ok(answer)) => Ok(answer),
     }
 }
 
@@ -512,8 +534,22 @@ where
 
 /// What the host answers to a request that changes nothing, or the command's word that it did not
 /// answer within [`ASK_WITHIN`].
-async fn ask_within<T>(request: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+pub(crate) async fn ask_within<T>(
+    request: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
     tokio::time::timeout(ASK_WITHIN, request)
+        .await
+        .map_err(|_| host_did_not_answer())?
+}
+
+/// As [`ask_within`], and never past `deadline`: a challenge that ends sooner than the host is
+/// given to answer ends the wait for it.
+pub(crate) async fn ask_before<T>(
+    deadline: tokio::time::Instant,
+    request: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let limit = deadline.min(tokio::time::Instant::now() + ASK_WITHIN);
+    tokio::time::timeout_at(limit, request)
         .await
         .map_err(|_| host_did_not_answer())?
 }
