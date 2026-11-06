@@ -12,13 +12,14 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use kr_client::ClientError;
-use kr_client::error::is_definite;
+use kr_client::error::HostWord;
 use kr_client::recovery::{
     BundleWrite, BundleWriter, BundleWritten, CandidateState, CheckpointRecorded, ExportSource,
     FilesRestore, MemberRefusal, MemberRole, MemberVerdict, OfflineExport, PublicationRefusal,
     RecoveryError, RestoreError, RestoreSource, SignInCause, SourceService, SourceSignIn,
     fresh_locator,
 };
+use kr_client::retry::RETRY_BACKOFF_MIN;
 use kr_client::services::{ServiceFuture, SyncFetched, SyncPosition};
 use kr_crypto::backup::{
     ArchivePlan, ArchiveRecipients, CollectionKind, Material, ObjectSource, seal_archive,
@@ -1005,6 +1006,10 @@ struct Bundle {
     loses_the_answer: Mutex<bool>,
     /// The code the next write that applies is refused with, before the service applies it.
     refuses_with: Mutex<Option<ErrorCode>>,
+    /// The code every write that applies is refused with, before the service applies it.
+    keeps_refusing_with: Mutex<Option<ErrorCode>>,
+    /// How many of the next writes find the bundle moved on, and are answered as a conflict.
+    conflicts: Mutex<usize>,
     /// How many writes met the service.
     writes: Mutex<usize>,
 }
@@ -1016,6 +1021,8 @@ impl Bundle {
             meanwhile: Mutex::new(None),
             loses_the_answer: Mutex::new(false),
             refuses_with: Mutex::new(None),
+            keeps_refusing_with: Mutex::new(None),
+            conflicts: Mutex::new(0),
             writes: Mutex::new(0),
         }
     }
@@ -1031,7 +1038,20 @@ impl BundleWriter for Bundle {
             if write.expected != self.source.position() {
                 return Ok(BundleWritten::Conflict);
             }
-            if let Some(code) = self.refuses_with.lock().expect("refuses").take() {
+            {
+                let mut conflicts = self.conflicts.lock().expect("conflicts");
+                if *conflicts > 0 {
+                    *conflicts -= 1;
+                    return Ok(BundleWritten::Conflict);
+                }
+            }
+            let refusing = self
+                .refuses_with
+                .lock()
+                .expect("refuses")
+                .take()
+                .or(*self.keeps_refusing_with.lock().expect("keeps refusing"));
+            if let Some(code) = refusing {
                 return Err(ClientError::Host(ProtocolError::new(
                     code,
                     "the service refused it".to_owned(),
@@ -1133,9 +1153,12 @@ async fn recording_the_checkpoint_keeps_what_another_device_wrote_to_the_bundle_
 
 /// KR-REQ-24.16: a checkpoint write the service refuses for now, or cannot say the outcome of, is
 /// made again after the bundle is read again, and the service's definite word ends the call. The
-/// two are told apart by the retry category of the code, every code, as every other place that
-/// settles a send tells them.
-#[tokio::test]
+/// three are told apart by the retry category of the code, every code, as every other place that
+/// settles a send tells them. A write whose outcome is unknown is made again at once, since the
+/// next read settles it; one the service refused for now is made again after the pause the retry
+/// policy gives, and the pauses are not waited for when the clock is stopped: the case reads the
+/// time the call slept.
+#[tokio::test(start_paused = true)]
 async fn a_checkpoint_write_the_service_does_not_take_for_now_is_made_again() {
     let world = World::new();
     let sealed = world.seal(4, &honest_members());
@@ -1146,23 +1169,109 @@ async fn a_checkpoint_write_the_service_does_not_take_for_now_is_made_again() {
         let prepared = restore(&world, &source, None).await.expect("a restore");
         let bundle = Bundle::over(&source);
         *bundle.refuses_with.lock().expect("refuses") = Some(*code);
+        let started = tokio::time::Instant::now();
         let recorded = prepared
             .record_checkpoint(&bundle, TimestampMs::new(9_000))
             .await;
-        if is_definite(*code) {
+        let slept = started.elapsed();
+        match HostWord::of(*code) {
+            HostWord::Definite => {
+                assert!(
+                    matches!(&recorded, Err(RestoreError::Read(error)) if error.code() == *code),
+                    "{code:?}: a definite word ends the call"
+                );
+                assert_eq!(*bundle.writes.lock().expect("writes"), 1, "{code:?}");
+                assert!(bundle_held(&world, &source).checkpoints.is_empty());
+                assert!(slept.is_zero(), "{code:?}: it ends at once");
+            }
+            HostWord::Unknown => {
+                assert!(
+                    matches!(recorded, Ok(CheckpointRecorded::Written { .. })),
+                    "{code:?}: the write is made again"
+                );
+                assert_eq!(*bundle.writes.lock().expect("writes"), 2, "{code:?}");
+                assert_eq!(bundle_held(&world, &source).checkpoints.len(), 1);
+                assert!(
+                    slept.is_zero(),
+                    "{code:?}: the next read settles it, at once"
+                );
+            }
+            HostWord::Transient => {
+                assert!(
+                    matches!(recorded, Ok(CheckpointRecorded::Written { .. })),
+                    "{code:?}: the write is made again"
+                );
+                assert_eq!(*bundle.writes.lock().expect("writes"), 2, "{code:?}");
+                assert_eq!(bundle_held(&world, &source).checkpoints.len(), 1);
+                assert!(
+                    slept >= RETRY_BACKOFF_MIN,
+                    "{code:?}: a service that refused for now is not asked again at once"
+                );
+            }
+        }
+    }
+}
+
+/// KR-REQ-24.16: the pause before another write is taken only when another write follows it. Three
+/// writes that found the bundle moved on and a fourth that the service refused for now end the call
+/// with that refusal at once.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_for_now_at_the_last_attempt_is_not_followed_by_a_pause() {
+    let world = World::new();
+    let sealed = world.seal(4, &honest_members());
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a restore");
+    let bundle = Bundle::over(&source);
+    *bundle.conflicts.lock().expect("conflicts") = 3;
+    *bundle.keeps_refusing_with.lock().expect("keeps refusing") = Some(ErrorCode::RateLimited);
+    let started = tokio::time::Instant::now();
+    let recorded = prepared
+        .record_checkpoint(&bundle, TimestampMs::new(9_000))
+        .await;
+    assert!(
+        matches!(&recorded, Err(RestoreError::Read(error)) if error.code() == ErrorCode::RateLimited),
+        "the call ends with the service's word"
+    );
+    assert_eq!(*bundle.writes.lock().expect("writes"), 4);
+    assert!(started.elapsed().is_zero(), "no pause before the end");
+}
+
+/// KR-REQ-24.16: a service that refuses every write for now is asked four times, with the policy's
+/// pauses between, and the call ends with its refusal; one that cannot say what became of every
+/// write is asked four times at once, and the call ends with that.
+#[tokio::test(start_paused = true)]
+async fn a_service_that_keeps_refusing_for_now_is_asked_four_times_with_pauses_between() {
+    let world = World::new();
+    let sealed = world.seal(4, &honest_members());
+    for (code, paused) in [
+        (ErrorCode::RateLimited, true),
+        (ErrorCode::StorageUnavailable, true),
+        (ErrorCode::OutcomeUnknown, false),
+    ] {
+        let source = Arc::new(
+            Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed),
+        );
+        let prepared = restore(&world, &source, None).await.expect("a restore");
+        let bundle = Bundle::over(&source);
+        *bundle.keeps_refusing_with.lock().expect("keeps refusing") = Some(code);
+        let started = tokio::time::Instant::now();
+        let recorded = prepared
+            .record_checkpoint(&bundle, TimestampMs::new(9_000))
+            .await;
+        let slept = started.elapsed();
+        assert!(
+            matches!(&recorded, Err(RestoreError::Read(error)) if error.code() == code),
+            "{code:?}: the call ends with the service's word"
+        );
+        assert_eq!(*bundle.writes.lock().expect("writes"), 4, "{code:?}");
+        if paused {
             assert!(
-                matches!(&recorded, Err(RestoreError::Read(error)) if error.code() == *code),
-                "{code:?}: a definite word ends the call"
+                slept >= RETRY_BACKOFF_MIN * 3,
+                "{code:?}: three pauses between four writes, {slept:?}"
             );
-            assert_eq!(*bundle.writes.lock().expect("writes"), 1, "{code:?}");
-            assert!(bundle_held(&world, &source).checkpoints.is_empty());
         } else {
-            assert!(
-                matches!(recorded, Ok(CheckpointRecorded::Written { .. })),
-                "{code:?}: the write is made again"
-            );
-            assert_eq!(*bundle.writes.lock().expect("writes"), 2, "{code:?}");
-            assert_eq!(bundle_held(&world, &source).checkpoints.len(), 1);
+            assert!(slept.is_zero(), "{code:?}: no pause {slept:?}");
         }
     }
 }

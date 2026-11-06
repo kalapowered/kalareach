@@ -61,13 +61,14 @@ use kr_protocol::scalars::{Bytes, Digest256, KeyId, StoredEnvelopeKey, Timestamp
 use kr_protocol::service::GatewayOrigin;
 use serde::Serialize;
 
-use crate::error::{ClientError, is_definite};
+use crate::error::{ClientError, HostWord};
 use crate::recovery::bundle::read_bundle;
 use crate::recovery::checkpoint::Strongest;
 use crate::recovery::{
     ExportedArchive, ExportedObject, FreshRestore, MAX_EXPORT_BYTES, OfflineExport, RecoveryError,
     RetrievalPolicy, ServiceAccess, TrustedMaterial, advance_checkpoint,
 };
+use crate::retry::{Attempts, Failure, Recovery, RequestClass};
 use crate::services::{
     ServiceFuture, SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched, SyncPosition,
     SyncRequestFence, SyncRequestStatus,
@@ -1018,11 +1019,15 @@ impl PreparedRestore {
     /// checkpoint is changed (see [`advance_checkpoint`]), and the result is written on at the
     /// place it was read at. The revision moves here and nowhere else: one more than the bundle
     /// that was read. A write the bundle has moved on from is a conflict, and the bundle is read
-    /// again and the change made on what is there; a write whose answer was lost, or that the
-    /// service refused for now, is treated the same way, because the next read either finds the
-    /// checkpoint recorded or finds the bundle where the lost write compared, and a request that
-    /// arrives late then compares against a place the bundle has left and changes nothing. Only
-    /// the service's definite word ends the call. Between the attempts of one call the place and
+    /// again and the change made on what is there. So is a write whose answer the service says it
+    /// cannot establish, at once, because the next read either finds the checkpoint recorded or
+    /// finds the bundle where the lost write compared, and a request that arrives late then
+    /// compares against a place the bundle has left and changes nothing. A write the service
+    /// refused for now, or whose connection ended, is made again too, after the pause the retry
+    /// policy gives ([`crate::retry::Attempts`]), so that a service that is limiting its callers
+    /// or short of room is not asked again at once; the call ends with the refusal when the policy
+    /// gives no more. Only the service's definite word ends the
+    /// call before the attempts are spent. Between the attempts of one call the place and
     /// the strongest read are kept, the newest revision and every archive's highest checkpoint, and
     /// every read is held to them, so that no attempt writes on a bundle older than one an attempt
     /// read or seals a checkpoint below one an attempt read.
@@ -1060,7 +1065,8 @@ impl PreparedRestore {
         let mut seen = self.first_place;
         let mut strongest = self.first_read.clone();
         let mut last_failure: Option<ClientError> = None;
-        for _ in 0..CHECKPOINT_ATTEMPTS {
+        let mut pauses = Attempts::new();
+        for attempt in 0..CHECKPOINT_ATTEMPTS {
             let read = read_bundle(&reader, &self.context, Some(seen), &self.seed)
                 .await
                 .map_err(from_recovery)?;
@@ -1112,8 +1118,33 @@ impl PreparedRestore {
                 Ok(BundleWritten::Wait { seconds }) => {
                     return Err(RestoreError::ServiceAskedToWait { seconds });
                 }
-                Err(error) if !is_definite(error.code()) => last_failure = Some(error),
-                Err(error) => return Err(RestoreError::Read(error)),
+                Err(error) => match HostWord::of(error.code()) {
+                    HostWord::Definite => return Err(RestoreError::Read(error)),
+                    // The service says it cannot establish what became of the write: the next
+                    // read finds the checkpoint recorded, or the bundle where the write compared,
+                    // so it is read at once.
+                    HostWord::Unknown => last_failure = Some(error),
+                    // The service refused for now, or a connection to it ended, which the library
+                    // words the same way. Either way the next read settles whether the write
+                    // landed, so a pause before it loses nothing, and nothing the service said is
+                    // a reason to ask at once: the shared policy gives the pause, and the call
+                    // ends with the refusal when the policy has no more attempts to give, or when
+                    // no attempt would follow the pause.
+                    HostWord::Transient => {
+                        let decision = pauses.decide(
+                            Failure::new(error.code()),
+                            RequestClass::ReceiptProvesNoDispatch,
+                        );
+                        let Recovery::Retry { delay } = decision.recovery else {
+                            return Err(RestoreError::Read(error));
+                        };
+                        if attempt + 1 == CHECKPOINT_ATTEMPTS {
+                            return Err(RestoreError::Read(error));
+                        }
+                        last_failure = Some(error);
+                        tokio::time::sleep(delay).await;
+                    }
+                },
             }
         }
         Err(last_failure.map_or(RestoreError::BundleKeptMoving, RestoreError::Read))
