@@ -2259,7 +2259,10 @@ async fn a_receipt_for_an_answer_leaves_its_action_on_the_connections_book() {
     )
     .await
     .expect_err("a receipt is no result to read");
-    assert!(!failure.settled(), "an answer that is not a result settles nothing");
+    assert!(
+        !failure.settled(),
+        "an answer that is not a result settles nothing"
+    );
     assert_eq!(
         session
             .submitted_actions()

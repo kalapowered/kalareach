@@ -1267,10 +1267,7 @@ async fn with_two_uncertain_sends_on_a_live_link(
     use kr_protocol::receipt::ReceiptState;
 
     let (mut link, older, _) = with_an_uncertain_send_on_a_live_link(worker, page).await;
-    let held = page.call(
-        "question_answer",
-        answer_params(worker, 2, &choice("main")),
-    );
+    let held = page.call("question_answer", answer_params(worker, 2, &choice("main")));
     let call = link.expect(Method::ActionRead).await;
     link.answer(&call, &receipt_at(older, ReceiptState::Unknown, 5_000))
         .await;
@@ -1331,7 +1328,10 @@ async fn a_kept_answer_whose_earlier_send_the_worker_took_frees_the_link_of_the_
         &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
     )
     .await;
-    for (id, state) in [(older, ReceiptState::Unknown), (newer, ReceiptState::Applied)] {
+    for (id, state) in [
+        (older, ReceiptState::Unknown),
+        (newer, ReceiptState::Applied),
+    ] {
         let call = link.expect(Method::ActionRead).await;
         link.answer(&call, &receipt_at(id, state, 9_000)).await;
     }
@@ -1359,7 +1359,10 @@ async fn a_new_answer_whose_earlier_send_the_worker_took_frees_the_link_of_the_o
         "question_answer",
         answer_params(&worker, 2, &choice("release")),
     );
-    for (id, state) in [(older, ReceiptState::Unknown), (newer, ReceiptState::Applied)] {
+    for (id, state) in [
+        (older, ReceiptState::Unknown),
+        (newer, ReceiptState::Applied),
+    ] {
         let call = link.expect(Method::ActionRead).await;
         link.answer(&call, &receipt_at(id, state, 9_000)).await;
     }
@@ -1411,7 +1414,10 @@ async fn a_send_refused_because_an_earlier_one_was_taken_frees_the_link_of_the_o
         "the question was already answered",
     )
     .await;
-    for (id, state) in [(older, ReceiptState::Unknown), (newer, ReceiptState::Applied)] {
+    for (id, state) in [
+        (older, ReceiptState::Unknown),
+        (newer, ReceiptState::Applied),
+    ] {
         let call = link.expect(Method::ActionRead).await;
         link.answer(&call, &receipt_at(id, state, 9_000)).await;
     }

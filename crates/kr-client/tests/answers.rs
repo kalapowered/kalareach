@@ -1794,7 +1794,10 @@ async fn a_send_the_host_took_lets_go_of_the_answers_other_sends_wherever_it_is_
         .await
         .outcome
         .expect("the host took an earlier send");
-    assert!(matches!(outcome, Answered::Taken(id) if id == taken), "{outcome:?}");
+    assert!(
+        matches!(outcome, Answered::Taken(id) if id == taken),
+        "{outcome:?}"
+    );
     assert_eq!(
         *host.settled_earlier.lock().expect("the lock"),
         vec![recorded.clone()],
@@ -1814,7 +1817,10 @@ async fn a_send_the_host_took_lets_go_of_the_answers_other_sends_wherever_it_is_
         .await
         .outcome
         .expect("the host took an earlier send");
-    assert!(matches!(outcome, Answered::Taken(id) if id == taken), "{outcome:?}");
+    assert!(
+        matches!(outcome, Answered::Taken(id) if id == taken),
+        "{outcome:?}"
+    );
     assert_eq!(
         *host.settled_earlier.lock().expect("the lock"),
         vec![recorded.clone()],
