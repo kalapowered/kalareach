@@ -4,7 +4,8 @@
 //!
 //! This is the machine side of a device run, not a test of the product by itself: a script starts
 //! it (`scripts/e2e-pairing-device.sh`) beside the installed application, so it is ignored in an
-//! ordinary run. The daemon is the real one, on the loopback interface. The phone's side is the
+//! ordinary run. The daemons are the real one, on the loopback interface: one the phone is paired with
+//! and a second one it is paired with later. The phone's side is the
 //! installed application, driven through its own screens by the platform's UI automation; this suite
 //! never sees the phone except through what the host records.
 //!
@@ -25,8 +26,8 @@
 //! | `up` | `go-up` | the host starts again on the same address, with every record it kept, and says so with `done-up`; asked again as `down` is |
 //! | `sent` | `go-sent`, then `go-counted` | `sent-first.txt` once the agent in the session was sent the draft the phone wrote (`DRAFT`); `sent-result.txt`, how many times it was, once the script has seen the phone itself say the send is applied and asks for the count |
 //! | `handover` | `go-handover` | a session shared with a second device is to be handed to a third: `handover-asked.txt` once the host asks, `handover-result.txt` with the record of the phone's answer and who holds the session after the transfer |
-//! | `second` | `go-second`, then `second-approve` | a second host, a daemon of its own that the phone reaches at its own address, issues a guest invitation: `second.png`, its QR; `second-value.txt`, the value that host shows once a candidate redeemed; `second-paired.txt` once approved |
-//! | `bound` | `go-bound` | the owner of the second host bounds how long personal remote access stands without its authority feed, which no feed has been reached for, so the bound has lapsed as it is chosen: `bound-result.txt` holds what that host answers the inbox read of another guest of its before and after |
+//! | `second` | `go-second`, then `second-approve` | the second host, a daemon of its own that the phone reaches at its own address, issues a guest invitation: `second-environment.txt`, its environment; `second.png`, the invitation's QR; `second-value.txt`, the value that host shows once a candidate redeemed; `second-paired.txt` once approved |
+//! | `bound` | `go-bound` | once the second host is serving the phone, its owner bounds how long personal remote access stands without its authority feed, which no feed has been reached for, so the bound has lapsed as it is chosen: `bound-result.txt` holds what that host answers the inbox read of another guest of its before and after, the refusal's words included |
 //!
 //! `KR_HARNESS_PEER` is the name the phone reaches this machine by: `127.0.0.1` for a simulator,
 //! which shares the machine's network, and `10.0.2.2` for an emulator. `KR_HARNESS_SERVICE_PEER` is
@@ -51,7 +52,9 @@ use kr_ipc::client::LocalClient;
 use kr_pairing::grants::{DEFAULT_GUEST_PAIRING_MS, guest_grant, personal_owner_grant};
 use kr_protocol::attention::{AttentionReadParams, AttentionReadResult, AttentionSource};
 use kr_protocol::confirmation::{ConfirmationSubject, TransferControlSubject};
-use kr_protocol::ids::{ActionId, ConfirmationId, EnvironmentId, InvitationId, SessionId};
+use kr_protocol::ids::{
+    ActionId, ConfirmationId, DeviceId, EnvironmentId, InvitationId, SessionId,
+};
 use kr_protocol::invitation::{
     InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairConfirmParams, PairConfirmResult,
     PairInviteParams, PairInviteResult,
@@ -67,7 +70,9 @@ use kr_protocol::sharing::{
 };
 use net_support::pairing::{self as calls, Signer};
 use net_support::worker::{Adopted, Upstream, Worker};
-use net_support::{Device, Host, Stopped, connect, holds, on_the_session, recipient, shared_as};
+use net_support::{
+    Device, Host, Stopped, connect, holds, on_the_session, pair_with, recipient, shared_as,
+};
 
 /// How long the script is given to take each step the suite waits for.
 const STEP: Duration = Duration::from_secs(300);
@@ -258,8 +263,8 @@ const SECOND: Answers = Answers {
     paired: "second-paired.txt",
 };
 
-/// What `session` is answered when it reads the inbox: how many items it is served, or the code the
-/// host refuses it with.
+/// What `session` is answered when it reads the inbox: how many items it is served, or the code and
+/// the words the host refuses it with.
 async fn inbox_answer(session: &kr_client::session::Session) -> String {
     let read: Result<AttentionReadResult, kr_client::ClientError> = session
         .read(
@@ -274,12 +279,14 @@ async fn inbox_answer(session: &kr_client::session::Session) -> String {
         .await;
     match read {
         Ok(page) => format!("served items={}", page.items.len()),
-        Err(kr_client::ClientError::Host(refusal)) => format!("refused {:?}", refusal.code),
+        Err(kr_client::ClientError::Host(refusal)) => {
+            format!("refused {:?}: {}", refusal.code, refusal.message)
+        }
         Err(other) => format!("failed {other}"),
     }
 }
 
-/// One daemon and the owner the run bootstraps it with.
+/// The daemon a phone is paired with and the owner the run bootstraps it with, and a second daemon.
 struct Run {
     directory: PathBuf,
     peer: String,
@@ -301,6 +308,8 @@ struct Run {
     upstream: Arc<Upstream>,
     /// The second host: a daemon of its own that holds no session.
     second_host: Box<Adopted>,
+    /// The device the second host made of the phone, once it approved it.
+    phone_of_second: std::sync::Mutex<Option<DeviceId>>,
 }
 
 impl Run {
@@ -449,7 +458,7 @@ impl Run {
         name: &str,
         (kind, proposal): (InviteGrantKind, &ProposedGrant),
         answers: &Answers,
-    ) {
+    ) -> PairConfirmResult {
         let signer = Signer::OwnerDevice(owner);
         let invited = calls::invite_direct(environment, client, kind, proposal, &signer)
             .await
@@ -475,14 +484,17 @@ impl Run {
             appears(&self.directory.join(answers.approve), STEP).await,
             "the script never approved the phone"
         );
-        calls::confirm_candidate(environment, client, invited.invitation_id, &signer)
-            .await
-            .expect("the owner approves the phone");
+        let confirmed =
+            calls::confirm_candidate(environment, client, invited.invitation_id, &signer)
+                .await
+                .expect("the owner approves the phone");
         self.say(answers.paired, "paired=1\n");
+        confirmed
     }
 
     /// The second host, a daemon of its own that holds no session, issues the phone a guest
-    /// invitation at its own address. A guest sees no session.
+    /// invitation at its own address. A guest sees no session. The host says which environment it
+    /// is, so that the phone's screens can be told to name this host and no other.
     async fn second(&self) {
         let adopted = &self.second_host;
         let guest = guest_grant(
@@ -491,26 +503,47 @@ impl Run {
             adopted.host.environment_id,
         )
         .expect("a guest grant");
+        self.say(
+            "second-environment.txt",
+            &format!("{}\n", adopted.host.environment_id),
+        );
         let mut client = adopted.host.client().await;
-        self.scanned(
-            &mut client,
-            adopted.host.environment_id,
-            &adopted.owner,
-            "second",
-            (InviteGrantKind::SessionInvitation, &guest),
-            &SECOND,
-        )
-        .await;
+        let confirmed = self
+            .scanned(
+                &mut client,
+                adopted.host.environment_id,
+                &adopted.owner,
+                "second",
+                (InviteGrantKind::SessionInvitation, &guest),
+                &SECOND,
+            )
+            .await;
+        *self.phone_of_second.lock().expect("the record") = Some(confirmed.device_id);
     }
 
     /// The owner of the second host chooses a bounded offline validity for personal remote access,
     /// with no synchronisation of its authority feed to measure from, so the bound has lapsed as it is
     /// chosen and no clock is waited on. From then on the host refuses every read of a device that
-    /// reaches it, the phone's inbox read among them. Another guest of that host, paired here, is
-    /// read before and after, so that the run records what the host itself answered.
+    /// reaches it, the phone's inbox read among them. The choice is made once the host is serving the
+    /// phone: the phone has read its inbox and been answered. Another guest of that host, paired here,
+    /// is read before and after, so that the run records what the host itself answered.
     async fn bound(&self) {
         let second = &self.second_host;
         let host = &second.host;
+        let phone = host.record_of(
+            self.phone_of_second
+                .lock()
+                .expect("the record")
+                .expect("the second host approved the phone"),
+        );
+        let end = Instant::now() + STEP;
+        while host.connections_of(&phone) == 0 {
+            assert!(
+                Instant::now() < end,
+                "the phone never read the second host's inbox"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
         let guest = Device::create().await;
         let proposal = guest_grant(
             kr_ipc::now_ms().get(),
@@ -518,29 +551,7 @@ impl Run {
             host.environment_id,
         )
         .expect("a guest grant");
-        let signer = Signer::OwnerDevice(&second.owner);
-        let mut client = host.client().await;
-        let invited = calls::invite_direct(
-            host.environment_id,
-            &mut client,
-            InviteGrantKind::SessionInvitation,
-            &proposal,
-            &signer,
-        )
-        .await
-        .expect("a guest invitation");
-        let (connection, _candidate, _value) = calls::redeem(&guest.candidate(), &invited).await;
-        let confirmed = calls::confirm_candidate(
-            host.environment_id,
-            &mut client,
-            invited.invitation_id,
-            &signer,
-        )
-        .await
-        .expect("the owner approves the guest");
-        connection.close(0u32.into(), b"paired");
-        let record = host.record_of(confirmed.device_id);
-
+        let record = pair_with(host, &guest, &second.owner, proposal).await;
         let served = connect(host, &guest, &record).await;
         let before = inbox_answer(&served).await;
         served.close();
@@ -1024,6 +1035,7 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         workers,
         upstream,
         second_host: second,
+        phone_of_second: std::sync::Mutex::new(None),
     };
     run.say(
         "ready.json",

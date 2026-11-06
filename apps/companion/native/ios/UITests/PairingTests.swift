@@ -640,18 +640,24 @@ final class PairingTests: DeviceTestCase {
         screenshot("tab-hosts-two-hosts")
         say("PAIRING the second host is paired by the same scan and listed beside the first, which stays in use")
 
-        // The second host is read and answers: nothing of it is refused yet.
+        // Nothing of the second host is refused yet. The host chooses to refuse once it is serving the
+        // phone, which is once the phone has read its inbox and been answered: it waits for that itself.
+        let environment = String(read("second-environment.txt").prefix(8))
         openAttention()
         eventually("the first host's rows", timeout: 120) { hasRow("Waiting for you", "An approval is waiting for you") }
         XCTAssertFalse(shows("refused to show its inbox"), "the inbox says a host refused it before any host did")
         askHost("bound", timeout: 180)
-        eventually("the inbox to say the second host refused it", timeout: 180) { shows("refused to show its inbox") }
+        let refusal = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@ AND label ENDSWITH 'refused to show its inbox'", "environment \(environment)")).firstMatch
+        eventually("the inbox to say the second host refused it", timeout: 180) { refusal.exists }
         XCTAssertTrue(shows("offline-validity policy has lapsed"), "the inbox does not give the host's own words for the refusal")
         XCTAssertTrue(shows("It answered, so contact is not lost"), "the inbox does not say the host answered, so contact is not lost")
         XCTAssertFalse(shows("is out of contact"), "the inbox calls a host that refused it out of contact")
-        XCTAssertTrue(hasRow("Waiting for you", "An approval is waiting for you"), "the first host's rows are not listed beside the refusal")
+        let approval = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Waiting for you. ' AND label CONTAINS 'An approval is waiting for you'")).firstMatch
+        XCTAssertTrue(approval.exists, "the first host's rows are not listed beside the refusal")
+        XCTAssertLessThan(refusal.frame.minY, approval.frame.minY, "the refusal is not drawn above the first host's rows")
         screenshot("inbox-host-refused")
         say("PAIRING the inbox shows a host that refused it, in the host's words, above what the host in use holds")
-        XCTAssertEqual(read("bound-result.txt"), "before served items=0\nafter refused PermissionDenied", "the second host did not answer as expected")
+        let result = read("bound-result.txt")
+        XCTAssertTrue(result.hasPrefix("before served items=0\nafter refused PermissionDenied: ") && result.contains("offline-validity policy has lapsed"), "the second host did not answer as expected: \(result)")
     }
 }

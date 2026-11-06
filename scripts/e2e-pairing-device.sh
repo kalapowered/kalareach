@@ -349,12 +349,13 @@ judge() { # <driver output>
         bad=1
     fi
     result="$(host_file bound-result.txt)"
-    if [ "$result" = "before served items=0after refused PermissionDenied" ]; then
-        say "check=the second host served a guest's inbox, empty, and refused it once its owner bounded offline validity ok=1 detail=$result"
-    else
-        say "check=the second host served a guest's inbox, empty, and refused it once its owner bounded offline validity ok=0 detail=${result:-no record}"
-        bad=1
-    fi
+    case "$result" in
+        "before served items=0after refused PermissionDenied: "*"offline-validity policy has lapsed"*)
+            say "check=the second host served a guest's inbox, empty, and refused it once its owner bounded offline validity ok=1 detail=$result" ;;
+        *)
+            say "check=the second host served a guest's inbox, empty, and refused it once its owner bounded offline validity ok=0 detail=${result:-no record}"
+            bad=1 ;;
+    esac
     result="$(host_file connections.txt)"
     if [ "$result" = "1" ]; then
         say "check=the other service took one connection in all ok=1"

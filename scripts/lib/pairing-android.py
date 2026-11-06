@@ -822,28 +822,40 @@ def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
     phone.shot("tab-hosts-two-hosts")
     say("the second host is paired by the same scan and listed beside the first, which stays in use")
 
-    # The second host is read and answers: nothing of it is refused yet.
+    # Nothing of the second host is refused yet. The host chooses to refuse once it is serving the
+    # phone, which is once the phone has read its inbox and been answered: it waits for that itself.
+    environment = read(directory, "second-environment.txt")[:8]
     open_tab(phone, "Attention")
     phone.wait(lambda each: each.startswith("Waiting for you. ") and "An approval is waiting for you" in each, "the first host's rows", 120, nudging=True)
     if phone.find(lambda each: "refused to show its inbox" in each) is not None:
         phone.give_up("the inbox says a host refused it before any host did")
     ask_host(directory, "bound", 180)
-    wait_after_touch(
-        phone, lambda each: "refused to show its inbox" in each, "the inbox to say the second host refused it", 180, at=(0.5, 0.07)
-    )
+    refusal = lambda each: f"environment {environment}" in each and "refused to show its inbox" in each
+    wait_after_touch(phone, refusal, "the inbox to say the second host refused it", 180, at=(0.5, 0.07))
+    # Everything is judged on one reading of the screen, so that what it lacks is lacking from a screen
+    # that holds the refusal.
+    labels = [(node["label"], node["box"]) for node in phone.screen() if node["label"]]
+    refused = next((box for label, box in labels if refusal(label)), None)
+    if refused is None:
+        phone.give_up("the screen read for the refusal does not hold it")
+    holds = lambda text: any(text in label for label, _ in labels)
     # The host's own words, which the row gives after its title.
-    if phone.find(lambda each: "offline-validity policy has lapsed" in each) is None:
+    if not holds("offline-validity policy has lapsed"):
         phone.give_up("the inbox does not give the host's own words for the refusal")
-    if phone.find(lambda each: "It answered, so contact is not lost" in each) is None:
+    if not holds("It answered, so contact is not lost"):
         phone.give_up("the inbox does not say the host answered, so contact is not lost")
-    if phone.find(lambda each: "is out of contact" in each) is not None:
+    if holds("is out of contact"):
         phone.give_up("the inbox calls a host that refused it out of contact")
-    if phone.find(lambda each: each.startswith("Waiting for you. An approval is waiting for you")) is None:
+    approval = next((box for label, box in labels if label.startswith("Waiting for you. An approval is waiting for you")), None)
+    if approval is None:
         phone.give_up("the first host's rows are not listed beside the refusal")
+    if refused[1] >= approval[1]:
+        phone.give_up("the refusal is not drawn above the first host's rows")
     phone.shot("inbox-host-refused")
     say("the inbox shows a host that refused it, in the host's words, above what the host in use holds")
-    if read(directory, "bound-result.txt") != "before served items=0\nafter refused PermissionDenied":
-        raise SystemExit(f"the second host did not answer as expected: {read(directory, 'bound-result.txt')}")
+    result = read(directory, "bound-result.txt")
+    if not result.startswith("before served items=0\nafter refused PermissionDenied: ") or "offline-validity policy has lapsed" not in result:
+        raise SystemExit(f"the second host did not answer as expected: {result}")
 
 
 def picker_on_a_paired_phone(phone: Phone) -> None:
