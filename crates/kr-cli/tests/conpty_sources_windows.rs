@@ -406,6 +406,29 @@ fn run_ok(program: &Path, arguments: &[&str]) {
     );
 }
 
+/// A directory this case made and is to leave no trace of: it is removed, with what is in it, when
+/// this is dropped, whichever way the case ends. A failure that is reported says so and does not
+/// stop the unwinding.
+struct Made(PathBuf);
+
+impl Made {
+    /// Makes `path`, which must not be there.
+    fn directory(path: PathBuf) -> Self {
+        std::fs::create_dir(&path).expect("the directory");
+        Self(path)
+    }
+}
+
+impl Drop for Made {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!("{} is not removed: {error}", self.0.display()),
+        }
+    }
+}
+
 /// Records `ssh.exe` signed in to this machine's own `sshd` as this account, with a key pair made in
 /// this account's profile and authorised only for this account, and removes the pair again.
 ///
@@ -431,7 +454,7 @@ fn record_ssh_exe() {
         "{} is there already; this case makes it and removes it",
         directory.display()
     );
-    std::fs::create_dir(&directory).expect("the account's .ssh directory");
+    let made = Made::directory(directory.clone());
     let key = directory.join("kr_capture");
     let ssh_directory = system32("OpenSSH");
     run_ok(
@@ -467,8 +490,12 @@ fn record_ssh_exe() {
         "echo kr-capture-ssh",
     ]);
     let recorded = record_in_a_pseudo_console(command, 24, 100);
-    std::fs::remove_dir_all(&directory).expect("removes the account's .ssh directory again");
-    assert!(!directory.exists());
+    drop(made);
+    assert!(
+        !directory.exists(),
+        "{} is removed again",
+        directory.display()
+    );
     assert_the_source_ran("ssh-exe", "kr-capture-ssh", &recorded);
     write_recording(
         "ssh-exe",
@@ -477,6 +504,23 @@ fn record_ssh_exe() {
         &recorded,
     );
 }
+#[test]
+fn a_directory_made_for_a_case_that_then_fails_is_removed_with_what_is_in_it() {
+    let parent = std::env::temp_dir().join(format!("kr-made-directory-{}", std::process::id()));
+    std::fs::create_dir_all(&parent).expect("a parent directory");
+    let directory = parent.join(".ssh");
+    let failed = std::panic::catch_unwind(|| {
+        let _made = Made::directory(directory.clone());
+        std::fs::write(directory.join("kr_capture"), b"a private key").expect("a key");
+        std::fs::write(directory.join("authorized_keys"), b"its public half").expect("a file");
+        panic!("a step after the directory was made fails");
+    });
+    let left = directory.exists();
+    std::fs::remove_dir_all(&parent).expect("the parent directory is removed");
+    assert!(failed.is_err(), "the step failed");
+    assert!(!left, "the directory and the key in it are left behind");
+}
+
 /// UTF-16 text, little-endian, as `wsl.exe` writes it.
 fn utf16le(text: &str) -> Vec<u8> {
     text.encode_utf16().flat_map(u16::to_le_bytes).collect()
