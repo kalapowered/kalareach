@@ -262,7 +262,9 @@ The checks that need a person on a real phone are in [phone-checks.md](phone-che
 
 The emulator starts with `-audio none` in this mode unless `KR_EMULATOR_AUDIO_ARGS` says otherwise;
 the default mode starts it with `-no-audio`, and a call there reads its capture as `unavailable`. The
-input driver should be `none` wherever it works, so that no microphone of the machine is opened.
+input driver should be `none` wherever it works, so that no microphone of the machine is opened. The
+script turns the emulator's mobile data off, so that only Wi-Fi carries the run;
+`KR_EMULATOR_MOBILE_DATA=on` leaves it as the emulator starts it.
 
 ## Unlocked-screen ceremony
 
