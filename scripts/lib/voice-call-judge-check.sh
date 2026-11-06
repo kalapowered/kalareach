@@ -111,6 +111,10 @@ report lock-screen-stays "r['peer']['figures'][-1]['figures']['lockScreen']['pau
 report never-offered "[f['figures']['lockScreen'].update(pauseOffered=False, stopOffered=False, title=None, rate=None) for f in r['peer']['figures']]"
 report never-offered-unheard "[f['figures']['lockScreen'].update(pauseOffered=False, stopOffered=False, title=None, rate=None) for f in r['peer']['figures']]; [f['figures'].update(packetsReceived=3) for f in r['peer']['figures']]"
 report play-offered "r['peer']['figures'][0]['figures']['lockScreen']['playOffered'] = True"
+report toggle-offered "r['peer']['figures'][0]['figures']['lockScreen']['toggleOffered'] = True"
+report stop-not-offered "r['peer']['figures'][0]['figures']['lockScreen']['stopOffered'] = False"
+report wrong-title "r['peer']['figures'][0]['figures']['lockScreen']['title'] = 'Someone else'"
+report rate-against-pause "r['peer']['figures'][0]['figures']['lockScreen']['rate'] = 0"
 report unanswered "r['peer']['answered'] = 0; r['peer']['errors'] = ['no connection to the peer']"
 judge_report good android 0
 judge_report good ios 0
@@ -120,6 +124,10 @@ judge_report deaf-peer android 4 --send-unmeasured
 judge_report lock-screen-stays ios 2
 judge_report never-offered ios 2
 judge_report play-offered ios 2
+judge_report toggle-offered ios 2
+judge_report stop-not-offered ios 2
+judge_report wrong-title ios 2
+judge_report rate-against-pause ios 2
 judge_report never-offered-unheard ios 4 --send-unmeasured
 judge_report unanswered android 2
 
