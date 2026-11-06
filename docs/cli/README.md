@@ -2429,17 +2429,19 @@ earlier release does not, is refused with nothing written, because it would igno
 the daemon again after it writes, and says the list is in force only when the daemon reports it so.
 A gateway taken out of the list is then retired: the host stops using and renewing the credentials it
 holds for that gateway, forgets them, and asks the gateway to revoke each authorisation, again until
-it has (`docs/delivery/README.md`). When the daemon cannot put the change into force, because it
-cannot write down the revocation it owes, for one, the command fails and says why, and the daemon's
-own report (`kr doctor`) says which gateways are in force. With neither `--set` nor `--clear` the
-command shows the gateways the daemon reports in force. It fails in the same way, with the daemon's
-reason and a non-zero exit status, when the daemon reports that it has not put its configuration
-document into force or that it cannot use the document. A list shown without that reason would
-suggest that the host delivers through exactly what the document says. A host that started over a
-document it could not use keeps its routes closed until it starts again, though it reports the
-document as usable once it is put right; `kr doctor` says so in its network check. Devices paired
-through a gateway taken out stay paired and are not sent notifications until their app registers
-with a gateway the host allows. With `--json` the answer is
+it has (`docs/delivery/README.md`). A request that was already waiting for its connection to that
+gateway when the list changed can still leave the host for up to about ten seconds, which can be
+after the command has returned; no request that starts later does. When the daemon cannot put the
+change into force, because it cannot write down the revocation it owes, for one, the command fails
+and says why, and the daemon's own report (`kr doctor`) says which gateways are in force. With
+neither `--set` nor `--clear` the command shows the gateways the daemon reports in force. It fails
+in the same way, with the daemon's reason and a non-zero exit status, when the daemon reports that
+it has not put its configuration document into force or that it cannot use the document. A list
+shown without that reason would suggest that the host delivers through exactly what the document
+says. A host that started over a document it could not use keeps its routes closed until it starts
+again, though it reports the document as usable once it is put right; `kr doctor` says so in its
+network check. Devices paired through a gateway taken out stay paired and are not sent
+notifications until their app registers with a gateway the host allows. With `--json` the answer is
 `{ "ok": true, "environment_id": "...", "push_gateways": ["..."] }`, listing the gateways besides the
 official one that the daemon reports in force.
 

@@ -172,7 +172,9 @@ pub const QUESTION_BUDGET: Duration = Duration::from_secs(30);
 /// What the loops reach the network through, built once a transport is attached.
 #[derive(Debug)]
 struct Adapters {
-    /// The transport every exchange below goes through.
+    /// The transport as it was attached, which reaches any origin. Revocations, the mailbox placer
+    /// and the external senders go through it; every exchange under a bearer goes through the
+    /// gate over it ([`super::gateways::GatedTransports`]).
     transports: Arc<dyn DeliveryTransports>,
     sender: GatewayClient,
     /// Renewals and revocations, proven with this host's key.
@@ -329,7 +331,9 @@ impl DeliveryRuntime {
         self.adapters.get().is_some()
     }
 
-    /// The transport every delivery exchange goes through, once one is attached.
+    /// The transport as it was attached, once one is, before the gate that every exchange under a
+    /// bearer goes through. It is what revocations, the mailbox placer and the external senders
+    /// use.
     #[must_use]
     pub fn transports(&self) -> Option<&Arc<dyn DeliveryTransports>> {
         self.adapters.get().map(|adapters| &adapters.transports)
@@ -351,7 +355,8 @@ impl DeliveryRuntime {
         self.adapters.get().is_none() && self.mailbox.set(origin).is_ok()
     }
 
-    /// Attaches the transport every delivery exchange goes through.
+    /// Attaches the transport the delivery service reaches the network through, which every
+    /// exchange under a bearer goes through behind the gate of the gateways the host allows.
     ///
     /// Once: the transport is the composition root's decision, made at startup, and a second one
     /// would put two sets of rules on one host's exchanges. Returns false when one was already

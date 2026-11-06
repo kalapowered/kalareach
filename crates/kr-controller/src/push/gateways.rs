@@ -92,7 +92,9 @@ impl AllowedGateways {
 /// request it then puts must find the origin as it stands. A request is put when its future is
 /// first polled, which is where the transport starts its work, so one that was called while the
 /// origin was allowed and polled after it was removed sends nothing. One already put completes,
-/// including one still waiting for its connection.
+/// including one still waiting for its connection: the transport waits five seconds for a
+/// connection and tries once more, so such a request can leave the host for up to about ten
+/// seconds after the origin was taken out.
 #[derive(Debug)]
 pub struct GatedTransports {
     inner: Arc<dyn DeliveryTransports>,

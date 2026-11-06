@@ -66,8 +66,9 @@ no path and no trailing slash). The official gateway is always allowed and is ne
 Taking a gateway out of the list retires what the host holds for it when the host next puts its
 document into force, which `kr host push-gateways` does at once and a hand edit leaves to the
 next time the host reads it (a question about itself, `kr doctor`, or a start). The host stops using
-and renewing every credential issued by that gateway, forgets them, and writes down that it owes the
-gateway a revocation of each authorisation, which it asks for again until the gateway has made it.
+and renewing every credential issued by that gateway, writes down that it owes the gateway a
+revocation of each authorisation, and then forgets the credentials. It asks for the revocations
+again until the gateway has made them or says it holds no such authorisation.
 The device stays paired. Notifications for it are not sent until its app registers a credential from
 a gateway the host allows. A host rolled back to an earlier release asks for the same revocations,
 because the debt is kept in the delivery journal that release reads. `docs/delivery/README.md`

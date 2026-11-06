@@ -373,7 +373,11 @@ The host checks the set in three places.
   notification settles as revoked, as it does for a destination with no credential.
 - Every exchange under a bearer (a post, a status question, a request to forget, a renewal, and the
   confirmation of a registration) is made through the same set when it starts. One that begins after
-  a gateway was taken out never leaves the host. One already on the wire completes.
+  a gateway was taken out never leaves the host. One that began before it is carried out. A request
+  still waiting for its connection when the gateway is taken out can leave the host up to about ten
+  seconds later, which can be after `kr host push-gateways` has said the list is in force: the
+  transport waits five seconds for a connection and tries once more. One already written ends
+  within twenty seconds, the longest the transport gives one exchange.
 
 A revocation is the one request that still goes to a gateway that was taken out. It carries no
 bearer and no notification, and it is how that gateway is told to end what it issued.
