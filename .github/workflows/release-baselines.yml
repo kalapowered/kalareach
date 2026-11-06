@@ -69,11 +69,14 @@ jobs:
             runner: macos-15
             python: python3
             exe: ''
-          # The Intel runners start at macOS 15, so the Intel executables are started there.
+          # The Intel runners start at macOS 15, so the Intel executables are started there. They
+          # are the slowest runners of the six, so this leg keeps the third-party crates' release
+          # build output in a cache (see "Restore the third-party crates' build output").
           - target: x86_64-apple-darwin
             runner: macos-15-intel
             python: python3
             exe: ''
+            cache: true
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             python: python
@@ -156,6 +159,22 @@ jobs:
       # refuse, and one built at 14.0, which it has to pass.
       - name: Test the floor check
         run: '"$PYTHON" scripts/check-release-floors.py self-test'
+
+      # What the third-party crates build is the same from one night to the next. This job took 98
+      # to 152 minutes on the Intel runners from nothing (2026-11-01 to -06); the 152 was ended by
+      # the limit in the seventh of the seven builds below, and at its pace the job takes about
+      # 163. With these crates' output kept the seven builds take about a third less (measured on
+      # Linux with four build jobs: 1,646 s from nothing, 1,126 s with the output kept). This
+      # workspace's own crates are built again whatever the cache holds, so what is built of them
+      # is always this commit's. Cargo decides what is current: a crate whose version, features or
+      # build settings differ, and a native build whose compiler variables differ, are built again.
+      - name: Restore the third-party crates' build output
+        id: cargo-cache
+        if: ${{ matrix.cache }}
+        timeout-minutes: 15
+        uses: ./.github/actions/cargo-cache-restore
+        with:
+          name: release-baselines-${{ matrix.target }}
 
       # Each executable is built by a command of its own, as the Windows release builds them, so
       # each one's dependencies are resolved exactly as they are for the release.
@@ -639,3 +658,13 @@ jobs:
               sh "${names[@]}"
             echo "- $TARGET starts on $image" >> "$GITHUB_STEP_SUMMARY"
           done
+
+      # The last step, under no condition but success: a job that failed saves nothing, and the
+      # action saves from the default branch's runs that found no cache of exactly these crates.
+      - name: Save the third-party crates' build output
+        if: ${{ success() && matrix.cache }}
+        timeout-minutes: 15
+        uses: ./.github/actions/cargo-cache-save
+        with:
+          primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
+          cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
