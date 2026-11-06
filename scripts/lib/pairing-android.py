@@ -827,9 +827,11 @@ def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
     phone.shot("tab-hosts-two-hosts")
     say("the second host is paired by the same scan and listed beside the first, which stays in use")
 
-    # Nothing of the second host is refused yet. The host chooses to refuse once it is serving the
-    # phone, which is once the phone has read its inbox and been answered: it waits for that itself.
+    # Nothing of the second host is refused yet. The host chooses to refuse once it is serving a
+    # connection of the phone, which the phone's visit of its inbox keeps: it waits for that itself.
     environment = read(directory, "second-environment.txt")[:8]
+    if re.fullmatch(r"[0-9a-f]{8}", environment) is None:
+        phone.give_up(f"the second host named no environment: {environment!r}")
     open_tab(phone, "Attention")
     phone.wait(lambda each: each.startswith("Waiting for you. ") and "An approval is waiting for you" in each, "the first host's rows", 120, nudging=True)
     if phone.find(lambda each: "refused to show its inbox" in each) is not None:

@@ -3,7 +3,7 @@
 # Pairs a phone with a real host through the application's own screens, on the iOS Simulator or the
 # Android emulator.
 #
-# The machine side is `kr-controller`'s ignored `pairing_device` suite: the real daemon on the
+# The machine side is `kr-controller`'s ignored `pairing_device` suite: the real daemons on the
 # loopback interface. It issues the invitations as pictures of their QR codes. This script puts each
 # picture where a phone finds it (the simulator's photo library, or the wall of the emulator's
 # virtual camera scene), and the installed application is driven through its own screens by the

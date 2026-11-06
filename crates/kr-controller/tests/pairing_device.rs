@@ -4,8 +4,8 @@
 //!
 //! This is the machine side of a device run, not a test of the product by itself: a script starts
 //! it (`scripts/e2e-pairing-device.sh`) beside the installed application, so it is ignored in an
-//! ordinary run. The daemons are the real one, on the loopback interface: one the phone is paired with
-//! and a second one it is paired with later. The phone's side is the
+//! ordinary run. Both daemons are real, on the loopback interface: one the phone is paired with and a
+//! second one it is paired with later. The phone's side is the
 //! installed application, driven through its own screens by the platform's UI automation; this suite
 //! never sees the phone except through what the host records.
 //!
@@ -27,7 +27,7 @@
 //! | `sent` | `go-sent`, then `go-counted` | `sent-first.txt` once the agent in the session was sent the draft the phone wrote (`DRAFT`); `sent-result.txt`, how many times it was, once the script has seen the phone itself say the send is applied and asks for the count |
 //! | `handover` | `go-handover` | a session shared with a second device is to be handed to a third: `handover-asked.txt` once the host asks, `handover-result.txt` with the record of the phone's answer and who holds the session after the transfer |
 //! | `second` | `go-second`, then `second-approve` | the second host, a daemon of its own that the phone reaches at its own address, issues a guest invitation: `second-environment.txt`, its environment; `second.png`, the invitation's QR; `second-value.txt`, the value that host shows once a candidate redeemed; `second-paired.txt` once approved |
-//! | `bound` | `go-bound` | once the second host is serving the phone, its owner bounds how long personal remote access stands without its authority feed, which no feed has been reached for, so the bound has lapsed as it is chosen: `bound-result.txt` holds what that host answers the inbox read of another guest of its before and after, the refusal's words included |
+//! | `bound` | `go-bound` | once the second host is serving a connection of the phone, its owner bounds how long personal remote access stands without its authority feed, which no feed has been reached for, so the bound has lapsed as it is chosen: `bound-result.txt` holds what that host answers the inbox read of another guest of its before and after, the refusal's words included |
 //!
 //! `KR_HARNESS_PEER` is the name the phone reaches this machine by: `127.0.0.1` for a simulator,
 //! which shares the machine's network, and `10.0.2.2` for an emulator. `KR_HARNESS_SERVICE_PEER` is
@@ -524,9 +524,10 @@ impl Run {
     /// The owner of the second host chooses a bounded offline validity for personal remote access,
     /// with no synchronisation of its authority feed to measure from, so the bound has lapsed as it is
     /// chosen and no clock is waited on. From then on the host refuses every read of a device that
-    /// reaches it, the phone's inbox read among them. The choice is made once the host is serving the
-    /// phone: the phone has read its inbox and been answered. Another guest of that host, paired here,
-    /// is read before and after, so that the run records what the host itself answered.
+    /// reaches it, the phone's inbox read among them. The choice is made once the host is serving a
+    /// connection of the phone, which the phone's visit of its inbox keeps (that the phone's read was
+    /// answered is not shown here). Another guest of that host, paired here, is read before and after,
+    /// so that the run records what the host itself answered, served and then refused.
     async fn bound(&self) {
         let second = &self.second_host;
         let host = &second.host;
@@ -540,7 +541,7 @@ impl Run {
         while host.connections_of(&phone) == 0 {
             assert!(
                 Instant::now() < end,
-                "the phone never read the second host's inbox"
+                "the second host never served a connection of the phone"
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }

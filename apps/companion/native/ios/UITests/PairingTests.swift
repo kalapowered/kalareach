@@ -311,6 +311,14 @@ final class PairingTests: DeviceTestCase {
         eventually("the \(name) view to be chosen") { app.buttons.matching(NSPredicate(format: "label == %@", name)).firstMatch.isSelected }
     }
 
+    /// Whether the inbox's refusal says, in its title, that the host named by `prefix` refused. The tree
+    /// gives the host's name and the rest of the title as texts of their own, one after the other.
+    private func refusalTitleNames(_ prefix: String) -> Bool {
+        let texts = app.staticTexts.allElementsBoundByIndex.map { $0.label }
+        guard let at = texts.firstIndex(where: { $0.hasSuffix("refused to show its inbox") }), at > 0 else { return false }
+        return texts[at - 1].hasPrefix(prefix)
+    }
+
     // MARK: The cases
 
     /// A direct invitation whose secret has one bit changed opens nothing, and the page says so.
@@ -640,18 +648,16 @@ final class PairingTests: DeviceTestCase {
         screenshot("tab-hosts-two-hosts")
         say("PAIRING the second host is paired by the same scan and listed beside the first, which stays in use")
 
-        // Nothing of the second host is refused yet. The host chooses to refuse once it is serving the
-        // phone, which is once the phone has read its inbox and been answered: it waits for that itself.
+        // Nothing of the second host is refused yet. The host chooses to refuse once it is serving a
+        // connection of the phone, which the phone's visit of its inbox keeps: it waits for that itself.
         let environment = String(read("second-environment.txt").prefix(8))
+        XCTAssertNotNil(environment.range(of: "^[0-9a-f]{8}$", options: .regularExpression), "the second host named no environment: \(environment)")
         openAttention()
         eventually("the first host's rows", timeout: 120) { hasRow("Waiting for you", "An approval is waiting for you") }
         XCTAssertFalse(shows("refused to show its inbox"), "the inbox says a host refused it before any host did")
         askHost("bound", timeout: 180)
-        // The tree gives the host's name and the rest of the title as texts of their own. The first host's
-        // rows name the first host, so a text that names the second one is the refusal's.
-        let named = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "environment \(environment)")).firstMatch
         let refusal = app.staticTexts.matching(NSPredicate(format: "label ENDSWITH 'refused to show its inbox'")).firstMatch
-        eventually("the inbox to say the second host refused it", timeout: 180) { named.exists && refusal.exists }
+        eventually("the inbox to say the second host refused it", timeout: 180) { refusalTitleNames("environment \(environment)") }
         XCTAssertTrue(shows("offline-validity policy has lapsed"), "the inbox does not give the host's own words for the refusal")
         XCTAssertTrue(shows("It answered, so contact is not lost"), "the inbox does not say the host answered, so contact is not lost")
         XCTAssertFalse(shows("is out of contact"), "the inbox calls a host that refused it out of contact")
