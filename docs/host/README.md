@@ -3529,30 +3529,30 @@ a mutation it has read ahead of the request it is answering and holds behind it,
 request that meets another such call carrying the same request is told as a repeat's. A close whose
 route cannot be recorded goes on without one, because a stop is let through when storage fails, and
 its call stays among them until the work it started has ended, so a copy that arrives while the
-close runs is told as a repeat's. The daemon
-writes the route before it dispatches the action and keeps no word of whether a dispatch followed,
-so it cannot show that the earlier copy did not run. A refusal it makes of a repeat on its
-own account is therefore told as unknown too, wherever the check sits: a registration withdrawn, a
-grant gone or narrowed, a connection opened for the host or for another session or grant, a window
-that belongs to another connection, a session whose worker has ended, a worker refusal that the
-worker did not read from a receipt, or a route the daemon cannot read. A repeated close is the one
-the daemon can still answer without its worker: the closure record answers it for a device that may
-read the session's receipts, as it answers a close made after the closure. A request the daemon
-never routed is refused as any request is, and so is a reused identifier that carries another
-request; a request whose route the daemon cannot read counts as a repeat. The services behind the
-door check the registration again where they write, and a copy of an action that meets a fence owed
-there is refused in their words. A service that answers a copy of an action from its own record
-while it carries the action out, because the first copy finished meanwhile, flags the answer to the
-door as read from a record. The door then tells it as it tells one it found in a record itself. A
-device that may read the record is given the recorded answer. A device that may not is told the
-outcome is unknown, whatever the answer was, and so is any device when the authority feed refuses
-before the answer is written. The service's refusals that are not copies of a record, such as the
-refusal of a request that reaches no record, are told as a fresh answer is. A create is answered
-from the reservation under its token, and the reservation holds a session whether its first attempt
-launched it or failed to. A repeat of a create that failed is therefore a copy of a record, as a
-repeat of one that succeeded is: the session the reservation holds decides whether the device may
-read the answer, and a device that may not is told the outcome is unknown, and not the phase the
-launch ended in.
+close runs is told as a repeat's. The daemon writes the route before it dispatches the action and
+keeps no word of whether a dispatch followed, so it cannot show that the earlier copy did not run. A
+refusal it makes of a repeat on its own account is therefore told as unknown too, wherever the check
+sits: a registration withdrawn, a grant gone or narrowed, a connection opened for the host or for
+another session or grant, a window that belongs to another connection, a session whose worker has
+ended, a worker refusal that the worker did not read from a receipt, or a route the daemon cannot
+read. A repeated close is the one the daemon can still answer without its worker: the closure record
+answers it for a device that may read the session's receipts, as it answers a close made after the
+closure. A request the daemon never routed is refused as any request is, and so is a reused
+identifier that carries another request; a request whose route the daemon cannot read counts as a
+repeat. The services behind the door check the registration again where they write, and a copy of an
+action that meets a fence owed there is refused in their words. A service that answers a copy of an
+action from its own record while it carries the action out, because the first copy finished
+meanwhile, flags the answer to the door as read from a record. The door then tells it as it tells
+one it found in a record itself. A device that may read the record is given the recorded answer. A
+device that may not is told the outcome is unknown, whatever the answer was, and so is any device
+when the authority feed refuses before the answer is written. The service's refusals that are not
+copies of a record, such as the refusal of a request that reaches no record, are told as a fresh
+answer is. A create is answered from the reservation under its token, and the reservation holds a
+session whether its first attempt launched it or failed to. A repeat of a create whose launch failed
+after it reserved its session is therefore a copy of a record, as a repeat of one that succeeded is:
+the session the reservation holds decides whether the device may read the answer, and a device that
+may not is told the outcome is unknown, and not the phase the launch ended in. A create the host
+refuses before it reserves holds no reservation, and its repeat is decided again.
 
 A transient failure says nothing took effect, so the daemon does not give one for these answers once
 it has dispatched or committed the action. It tells `OUTCOME_UNKNOWN` instead: a decision that could

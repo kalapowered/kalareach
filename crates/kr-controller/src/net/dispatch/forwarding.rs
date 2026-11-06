@@ -116,6 +116,10 @@ impl OwnClaim {
     /// claimed the route of its action. The entry stays among the calls that have not claimed until
     /// that work ends too, so a copy of the request that arrives while the work runs is a repeat of
     /// an action that is being carried out, and is told so.
+    ///
+    /// The work holds the same entry, with the same call number, so the call still does not count
+    /// itself. [`Self::leave`] gives up the call's handle only: the entry leaves the set when the
+    /// work lets go of it as well.
     pub(super) fn shared_with_the_work(&self) -> Option<Arc<Arrival>> {
         self.arrival
             .lock()
@@ -271,7 +275,7 @@ impl RemoteConnection {
     ///
     /// Read before the route is: a call writes its route before it leaves the set, so a reader that
     /// finds the set without the copy finds the copy's route. A close whose route could not be
-    /// recorded has neither once its connection has ended ([`Arrivals`]).
+    /// recorded has neither once its work has ended ([`Arrivals`]).
     fn another_copy_has_not_claimed(
         &self,
         own_claim: &OwnClaim,
