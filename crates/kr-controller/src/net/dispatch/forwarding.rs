@@ -67,10 +67,12 @@ impl RouteRefusal {
 ///
 /// It also holds the call's entry among the calls that have not yet claimed the route of their
 /// action ([`Arrivals`]), which it gives up when the route is claimed or found, and when the call
-/// ends.
+/// ends. A close whose route cannot be recorded goes on without one, and its work outlives the
+/// call, so the entry is shared with that work ([`Self::shared_with_the_work`]) and leaves when both
+/// are done with it.
 pub(super) struct OwnClaim {
     made: AtomicBool,
-    arrival: std::sync::Mutex<Option<Arrival>>,
+    arrival: std::sync::Mutex<Option<Arc<Arrival>>>,
 }
 
 impl OwnClaim {
@@ -83,10 +85,10 @@ impl OwnClaim {
     }
 
     /// A call that has claimed nothing, and is entered among those that have not yet claimed.
-    pub(super) const fn arrived(arrival: Arrival) -> Self {
+    pub(super) fn arrived(arrival: Arrival) -> Self {
         Self {
             made: AtomicBool::new(false),
-            arrival: std::sync::Mutex::new(Some(arrival)),
+            arrival: std::sync::Mutex::new(Some(Arc::new(arrival))),
         }
     }
 
@@ -110,13 +112,24 @@ impl OwnClaim {
             .take();
     }
 
+    /// The call's entry, for the work that goes on after the call has ended, when the call has not
+    /// claimed the route of its action. The entry stays among the calls that have not claimed until
+    /// that work ends too, so a copy of the request that arrives while the work runs is a repeat of
+    /// an action that is being carried out, and is told so.
+    pub(super) fn shared_with_the_work(&self) -> Option<Arc<Arrival>> {
+        self.arrival
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Whether another call that carries `request` has not yet claimed its route.
     fn another_has_not_claimed(&self, arrivals: &Arrivals, request: &Carried) -> bool {
         let own = self
             .arrival
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        arrivals.another_carries(request, own.as_ref())
+        arrivals.another_carries(request, own.as_deref())
     }
 }
 

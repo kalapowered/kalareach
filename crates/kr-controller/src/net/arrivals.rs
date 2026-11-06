@@ -20,10 +20,10 @@
 //! is answering a request keeps reading ahead only for the keys that follow it, and the transport
 //! queues what it has parsed before any of this sees it.
 //!
-//! One call can outlive its entry: a close whose route cannot be recorded goes on without one,
-//! because a stop is let through when storage fails, and its work continues on a task of its own
-//! after the connection has ended. A copy of it that arrives then finds neither an entry nor a
-//! route.
+//! A close whose route cannot be recorded goes on without one, because a stop is let through when
+//! storage fails, and its work continues on a task of its own after the connection has ended. The
+//! task keeps the call's entry until it ends, so a copy of the close that arrives meanwhile finds
+//! the entry in place of the route.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

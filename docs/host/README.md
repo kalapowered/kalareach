@@ -3517,7 +3517,10 @@ device, asked again with the same request, whether the route was there when the 
 copy claimed it while the request waited. A copy that has arrived and not yet claimed counts too:
 the daemon keeps in memory the calls it is serving that have not yet written their route, among them
 a mutation it has read ahead of the request it is answering and holds behind it, and a refusal of a
-request that meets another such call carrying the same request is told as a repeat's. The daemon
+request that meets another such call carrying the same request is told as a repeat's. A close whose
+route cannot be recorded goes on without one, because a stop is let through when storage fails, and
+its call stays among them until the work it started has ended, so a copy that arrives while the
+close runs is told as a repeat's. The daemon
 writes the route before it dispatches the action and keeps no word of whether a dispatch followed,
 so it cannot show that the earlier copy did not run. A refusal it makes of a repeat on its
 own account is therefore told as unknown too, wherever the check sits: a registration withdrawn, a
