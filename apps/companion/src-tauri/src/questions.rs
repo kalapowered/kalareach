@@ -1112,6 +1112,8 @@ pub async fn settle(
             Earlier::default()
         };
         let standing = if let Some(action_id) = earlier.taken() {
+            // The question is answered, so the link stops holding the other sends of the answer.
+            host.settle_earlier(draft.session_id, basis.sends()).await;
             Standing::Taken { action_id }
         } else {
             match draft.submission(question.as_ref()) {
