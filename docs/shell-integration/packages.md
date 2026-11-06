@@ -202,19 +202,23 @@ The fifth patch changes where Readline takes a key from the typeahead and the te
 asks whether input is waiting. In `rl_read_key`, a byte that is an Escape is offered to the bridge,
 which looks at the bytes already delivered, from the reader's own buffer and then the terminal's
 queue, and takes all of them when they are a whole answer of the host's query broker. Otherwise it
-gives them back to the front of the reader's buffer with `_rl_unget_char`, in order. The buffer
-holds 511 bytes and the longest run the bridge reads ahead is 480, so what it gives back always
-fits. `_rl_input_available` takes an answer that is at the front of the terminal's bytes before it
-reports input, and asks again for what is left of its time limit, measured on a clock that does not
-go backwards, so a caller that checks first and
-then reads is never sent to wait for a key that was an answer. `_rl_nchars_available` counts the
-bytes the reader holds with the terminal's, and the bracketed paste prefix reader reads them, so a
-paste whose opening was read ahead is still found whole in a search or a command name.
-`_rl_kr_buffered` also counts the full ring correctly. The reader's buffer keeps, for each byte,
-whether Readline put it back after it collected a bracketed paste, to read the text again key by
-key (`rl_vi_overstrike_bracketed_paste` and `_rl_bracketed_read_key`). The Escape of such a byte is
-not offered to the bridge, and the run the bridge follows ends before such a byte. A `read -e` is
-declined by the prompt context.
+gives them back to the front of the reader's buffer with `_rl_kr_unget_delivered_char`, in order.
+The buffer holds 511 bytes and the longest run the bridge reads ahead is 480, so what it gives back
+always fits. `_rl_input_available` takes an answer that is at the front of the terminal's bytes
+before it reports input, and asks again for what is left of its time limit, measured on a clock that
+does not go backwards, so a caller that checks first and then reads is never sent to wait for a key
+that was an answer. `_rl_nchars_available` counts the bytes the reader holds with the terminal's,
+and the bracketed paste prefix reader reads them, so a paste whose opening was read ahead is still
+found whole in a search or a command name. `_rl_kr_buffered` also counts the full ring correctly.
+The reader's buffer keeps, for each byte, whether Readline put it back after it collected a
+bracketed paste, to read the text again key by key (`rl_vi_overstrike_bracketed_paste` and
+`_rl_bracketed_read_key`). The Escape of such a byte is not offered to the bridge, and the run the
+bridge follows ends before such a byte. A byte Readline gives back with `_rl_unget_char` takes its
+mark from a record of the marks of the keys it took, as long as the typeahead and read newest first,
+so the bytes of a paste that Readline gives back in a row after a key sequence fails stay marked
+behind keys that were typed. The reader's own reads and gives-back are not in that record. A key
+taken from marked text reports the paste as its source, so it is never the end-of-input gesture. A
+`read -e` is declined by the prompt context.
 
 ## What fish changes
 

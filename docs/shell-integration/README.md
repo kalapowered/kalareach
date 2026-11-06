@@ -836,10 +836,13 @@ it was given.
 - **Pastes.** Inside a bracketed paste the reader leaves the bytes alone, and so it does in a
   quoted insertion. Readline reads some pasted text again key by key: text pasted in vi replace
   mode, and the rest of a paste whose first byte is the target of a character search, a
-  replacement or a key after a numeric argument. The patch marks that text as pasted when Readline
-  puts it back; the reader examines no Escape in marked text and follows no run into it. A paste
-  into a Readline search or a command name (`C-r`, `M-p`, `M-x`) is found whole: the bytes of its
-  opening that the reader read ahead are counted with the terminal's.
+  replacement, the motion after a vi operator or a key after a numeric argument. The patch marks
+  that text as pasted when Readline puts it back; the reader examines no Escape in marked text and
+  follows no run into it, and a byte of it is never the end-of-input gesture. A byte that Readline
+  gives back keeps the mark it had when Readline took it, also when it gives several back in a row
+  after a key sequence fails, with a key typed behind them. A paste into a Readline search or a
+  command name (`C-r`, `M-p`, `M-x`) is found whole: the bytes of its opening that the reader read
+  ahead are counted with the terminal's.
 - **Where it applies.** The root shell of a session, at the prompts the shell draws, primary and
   continuation. In `vared` and `select` (Zsh) and in `read -e` (Bash) the program that is reading
   may have asked, so the reader leaves the bytes alone. A Zsh `read -k` in a widget never goes

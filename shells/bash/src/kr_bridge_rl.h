@@ -138,4 +138,10 @@ int _rl_kr_macro_remaining (void);
    when Readline takes it, nor follow a run into it. Returns non-zero if the byte went in. */
 int _rl_kr_unget_pasted_char (int key);
 
+/* Puts a byte the reader took with `_rl_kr_delivered_byte' and found to be no part of an answer
+   back at the front of the typeahead, as a key the person typed. What the reader takes and gives
+   back is no key Readline took, so Readline's record of the marks of its own keys does not see it.
+   Returns non-zero if the byte went in. */
+int _rl_kr_unget_delivered_char (int key);
+
 #endif /* KR_BRIDGE_RL_H */

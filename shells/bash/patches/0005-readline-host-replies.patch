@@ -16,7 +16,9 @@ and read from the typeahead, so a paste in a minibuffer is still found whole. Th
 are left alone when Readline reads them again, too: text it puts back into the typeahead to read key
 by key (a paste in vi replace mode, the rest of a paste whose first byte is a character search's
 target) is marked as pasted, an Escape in it is not examined, and no run the reader follows goes
-into it.
+into it. A byte Readline gives back keeps the mark it had when Readline took it, also when it gives
+several back in a row (a key sequence that fails, a paste's opening that was not one) with a key
+typed behind them, and a key taken from the paste is not the end-of-input gesture.
 
 This patch is a derivative work of GNU Readline as bundled with GNU Bash and carries the GNU
 General Public Licence, version 3 or later; see shells/bash/LICENSE.
@@ -44,7 +46,15 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  DOCSOURCE = doc/rlman.texinfo doc/rltech.texinfo doc/rluser.texinfo
 --- a/lib/readline/input.c
 +++ b/lib/readline/input.c
-@@ -182,6 +182,13 @@
+@@ -113,6 +113,7 @@
+ 
+ static int ibuffer_space (void);
+ static int rl_get_char (int *);
++static int kr_take_char (int *);
+ static int rl_gather_tyi (void);
+ 
+ /* Windows isatty returns true for every character device, including the null
+@@ -182,6 +183,43 @@
  static unsigned char ibuffer[512];
  static int ibuffer_len = sizeof (ibuffer) - 1;
  
@@ -55,22 +65,53 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
 +static unsigned char ibuffer_pasted[sizeof (ibuffer)];
 +static int kr_key_was_pasted;
 +
++/* The marks of the bytes Readline's key reads took, the newest last.  Readline gives back more
++   than one byte in a row, the last it took first (a key sequence that fails, the opening of a
++   bracketed paste that was not one), and a byte read from the terminal in between leaves no trace
++   in the typeahead; so a byte given back with `_rl_unget_char' takes its mark from here, and a
++   byte of pasted text stays pasted across the boundary with the keys typed behind it.  The record
++   is as long as the typeahead: Readline cannot give back more bytes than that. */
++#define KR_TAKEN_MARKS (sizeof (ibuffer))
++static unsigned char kr_taken_marks[KR_TAKEN_MARKS];
++static int kr_taken_top, kr_taken_held;
++
++static void
++kr_taken_push (int mark)
++{
++  kr_taken_marks[kr_taken_top] = mark;
++  kr_taken_top = (kr_taken_top + 1) % KR_TAKEN_MARKS;
++  if (kr_taken_held < KR_TAKEN_MARKS)
++    kr_taken_held++;
++}
++
++/* The mark of the byte taken last and not given back, or 0 when the record has run out. */
++static int
++kr_taken_pop (void)
++{
++  if (kr_taken_held == 0)
++    return 0;
++  kr_taken_held--;
++  kr_taken_top = (kr_taken_top + KR_TAKEN_MARKS - 1) % KR_TAKEN_MARKS;
++  return kr_taken_marks[kr_taken_top];
++}
++
  #define any_typein (push_index != pop_index)
  
  int
-@@ -205,10 +212,33 @@
+@@ -205,8 +243,34 @@
    int held = push_index - pop_index;
  
    if (held < 0)
 -    held += ibuffer_len;
 +    held += ibuffer_len + 1;
    return held;
- }
- 
++}
++
 +/* The next byte already delivered, or -1 when there is none: the typeahead this reader holds
 +   first, then the terminal's own queue, one byte at a time.  It never waits.  A reader that
 +   would tell a host's answer to an application's question from the keys a person presses reads
-+   ahead with it, and gives back with `_rl_unget_char' what it finds is not an answer. */
++   ahead with it, and gives back with `_rl_kr_unget_delivered_char' what it finds is not an
++   answer. */
 +int
 +_rl_kr_delivered_byte (void)
 +{
@@ -81,20 +122,24 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
 +     it. */
 +  if (push_index != pop_index && ibuffer_pasted[pop_index])
 +    return -1;
-+  if (rl_get_char (&key))
++  /* The reader gives back what it finds is no answer with `_rl_kr_unget_delivered_char', so what it
++     takes is not a key Readline took and is not in the record of them. */
++  if (kr_take_char (&key))
 +    return key;
 +#if defined (FIONREAD)
 +  if (_rl_nchars_available () > 0 && read (fileno (rl_instream), &c, sizeof (c)) == sizeof (c))
 +    return c;
 +#endif
 +  return -1;
-+}
-+
+ }
+ 
  /* Return the amount of space available in the buffer for stuffing
-    characters. */
+@@ -224,11 +288,15 @@
+    Return the key in KEY.
+    Result is non-zero if there was a key, or 0 if there wasn't. */
  static int
-@@ -227,8 +257,12 @@
- rl_get_char (int *key)
+-rl_get_char (int *key)
++kr_take_char (int *key)
  {
    if (push_index == pop_index)
 -    return (0);
@@ -107,33 +152,73 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
    *key = ibuffer[pop_index++];
  #if 0
    if (pop_index >= ibuffer_len)
-@@ -252,11 +286,25 @@
+@@ -240,11 +308,22 @@
+   return (1);
+ }
+ 
+-/* Stuff KEY into the *front* of the input buffer.
++/* Get a key from the buffer of characters to be read, and put its mark in the record of the keys
++   Readline took. */
++static int
++rl_get_char (int *key)
++{
++  if (kr_take_char (key) == 0)
++    return (0);
++  kr_taken_push (kr_key_was_pasted);
++  return (1);
++}
++
++/* Stuff KEY into the *front* of the input buffer, marked as pasted text or not.
+    Returns non-zero if successful, zero if there is
+    no space left in the buffer. */
+-int
+-_rl_unget_char (int key)
++static int
++kr_unget_marked (int key, int mark)
+ {
+   if (ibuffer_space ())
+     {
+@@ -252,11 +331,39 @@
        if (pop_index < 0)
  	pop_index = ibuffer_len;
        ibuffer[pop_index] = key;
-+      /* A byte Readline gives back is the byte it took last, and stays what it was. */
-+      ibuffer_pasted[pop_index] = kr_key_was_pasted;
++      ibuffer_pasted[pop_index] = mark;
        return (1);
      }
    return (0);
- }
- 
++}
++
++/* Stuff KEY into the *front* of the input buffer.
++   Returns non-zero if successful, zero if there is
++   no space left in the buffer.  A byte Readline gives back is the byte it took last, and stays
++   what it was. */
++int
++_rl_unget_char (int key)
++{
++  return (kr_unget_marked (key, kr_taken_pop ()));
++}
++
 +/* Stuff KEY into the front of the input buffer as a byte of pasted text that Readline will read
 +   again as a key.  Returns non-zero if successful, zero if there is no space left in the
 +   buffer. */
 +int
 +_rl_kr_unget_pasted_char (int key)
 +{
-+  if (_rl_unget_char (key) == 0)
-+    return (0);
-+  ibuffer_pasted[pop_index] = 1;
-+  return (1);
++  return (kr_unget_marked (key, 1));
+ }
+ 
++/* Stuff KEY into the front of the input buffer as a byte the reader took with
++   `_rl_kr_delivered_byte' and found to be no part of an answer: a key the person typed. */
++int
++_rl_kr_unget_delivered_char (int key)
++{
++  return (kr_unget_marked (key, 0));
 +}
 +
  /* If a character is available to be read, then read it and stuff it into
     IBUFFER.  Otherwise, just return.  Returns number of characters read
     (0 if none available) and -1 on error (EIO). */
-@@ -404,8 +452,8 @@
+@@ -404,8 +511,8 @@
     readline function wants to specify a timeout and not leave it up to
     the user, it should use _rl_input_queued(timeout_value_in_microseconds)
     instead. */
@@ -144,12 +229,10 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  {
  #if defined (HAVE_PSELECT) || defined (HAVE_SELECT)
    fd_set readfds, exceptfds;
-@@ -447,6 +495,55 @@
- #endif
- 
+@@ -449,7 +556,56 @@
    return 0;
-+}
-+
+ }
+ 
 +/* The time now, from a clock that does not go backwards where there is one. */
 +static void
 +_rl_kr_now (struct timeval *now)
@@ -173,7 +256,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
 +   answer that has been delivered whole, it is taken and dropped here, and the check asks again for
 +   what is left of the time it was given, never more than that time.  Keys the person typed before
 +   the answer are taken into the typeahead, which is input too. */
-+int
+ int
 +_rl_input_available (void)
 +{
 +  struct timeval began, now;
@@ -197,10 +280,13 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
 +      _keyboard_input_timeout = timeout;
 +    }
 +  return r;
- }
- 
- int
-@@ -464,7 +561,9 @@
++}
++
++int
+ _rl_nchars_available ()
+ {
+   int chars_avail, fd, result;
+@@ -464,7 +620,9 @@
      return -1;    
  #endif
  
@@ -211,7 +297,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  }
  
  int
-@@ -515,6 +614,7 @@
+@@ -515,6 +673,7 @@
        rl_pending_input = EOF;
        RL_SETSTATE (RL_STATE_INPUTPENDING);
      }
@@ -219,7 +305,33 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
    ibuffer[push_index++] = key;
  #if 0
    if (push_index >= ibuffer_len)
-@@ -841,15 +941,21 @@
+@@ -795,6 +954,17 @@
+ /*								    */
+ /* **************************************************************** */
+ 
++/* True when the Escape just taken began a host's answer and the reader took the whole answer out
++   of the keys.  The Escape is gone with it, and so is its place in the record of the bytes taken. */
++static int
++kr_reply_dropped_after_key (void)
++{
++  if (kr_rl_host_reply_dropped () == 0)
++    return 0;
++  kr_taken_pop ();
++  return 1;
++}
++
+ /* Read a key, including pending input. */
+ int
+ rl_read_key (void)
+@@ -806,6 +976,7 @@
+       c = rl_pending_input;	/* XXX - cast to unsigned char if > 0? */
+       rl_clear_pending_input ();
+       kr_rl_source (KR_SOURCE_PUSHED_BACK);
++      kr_taken_push (0);
+     }
+   else
+     {
+@@ -841,15 +1012,24 @@
  	}
        else
  	{
@@ -237,14 +349,17 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
 +		{
 +		  c = (*rl_getc_function) (rl_instream);
 +		  kr_rl_source (KR_SOURCE_TERMINAL);
++		  /* An end of file, an error or a cancellation is no key, and Readline gives none back. */
++		  if (c >= 0)
++		    kr_taken_push (0);
 +		}
 +	      else
-+		kr_rl_source (KR_SOURCE_TYPEAHEAD);
++		kr_rl_source (kr_key_was_pasted ? KR_SOURCE_PASTE : KR_SOURCE_TYPEAHEAD);
  /* fprintf(stderr, "rl_read_key: calling RL_CHECK_SIGNALS: _rl_caught_signal = %d\r\n", _rl_caught_signal); */
 -	  RL_CHECK_SIGNALS ();
 +	      RL_CHECK_SIGNALS ();
 +	    }
-+	  while (c == ESC && kr_key_was_pasted == 0 && kr_rl_host_reply_dropped ());
++	  while (c == ESC && kr_key_was_pasted == 0 && kr_reply_dropped_after_key ());
  	}
      }
  

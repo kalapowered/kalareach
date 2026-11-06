@@ -421,7 +421,7 @@ static void
 kr_rl_give_back (const unsigned char *held, size_t from, size_t to)
 {
   while (to > from)
-    _rl_unget_char (held[--to]);
+    _rl_kr_unget_delivered_char (held[--to]);
 }
 
 int

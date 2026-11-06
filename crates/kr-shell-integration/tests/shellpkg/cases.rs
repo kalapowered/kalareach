@@ -1243,6 +1243,154 @@ pub fn the_rest_of_a_paste_read_as_a_search_target_reaches_the_keys_whole(kind: 
     );
 }
 
+/// KR-REQ-08.48: pasted bytes that Readline gives back after a key sequence fails are still pasted.
+///
+/// A key sequence that is a prefix of a longer binding is read on until a key fails it, and
+/// Readline then gives every key it read back, the last first. When the first key is a letter that
+/// a character search took the rest of a paste for, the bytes behind it are pasted text, and so are
+/// the bytes it gives back; the keys that failed the sequence are not, and a reader that gave the
+/// bytes the marks of those keys, or lost the marks of the oldest of a long sequence, would take an
+/// answer-shaped run among them for the host's. The case binds the answer-shaped run to a command
+/// that prints a word, and a longer sequence that begins with a letter, holds the run and ends in
+/// a hundred and forty keys and a last one. It presses the editor's character-search key and
+/// pastes a letter, the letter that begins the longer sequence, the run and a hundred and thirty of
+/// the keys, then types the other ten and a key that is not the sequence's last. The sequence fails
+/// at the last key: the word is printed only if the run reached the editor's keys whole after the
+/// hundred and fifty keys were given back.
+///
+/// # Panics
+///
+/// Panics when the bound command does not run.
+#[cfg(unix)]
+pub fn a_key_sequence_that_fails_behind_pasted_bytes_gives_them_back_as_pasted(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let sequence_end = "z".repeat(140);
+    let binding = format!(
+        "bind -x '\"\\e[?62;22c\": printf \"%s%s\\n\" kr-ke ys'; \
+         bind -x '\"x\\e[?62;22c{sequence_end}q\": printf \"%s%s\\n\" kr-ot her'; {}",
+        print_assembled(kind, "kr-bound")
+    );
+    assert!(
+        session.run(&binding, "kr-bound"),
+        "the line that binds the key sequences did not run:\n{}",
+        session.terminal_output()
+    );
+    let _ = session.next_prompt();
+    let start = session.written();
+    // The search key, then a paste of the search target, the sequence and most of its end, then
+    // the rest of its end and a key that is not the sequence's last, typed behind the paste.
+    let mut keys = b"\x1d\x1b[200~ax\x1b[?62;22c".to_vec();
+    keys.extend(std::iter::repeat_n(b'z', 130));
+    keys.extend_from_slice(b"\x1b[201~");
+    keys.extend(std::iter::repeat_n(b'z', 10));
+    keys.push(b'y');
+    session.type_bytes(&keys);
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-keys", deadline),
+        "the pasted bytes a failed key sequence gave back did not reach the editor's keys whole:\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// KR-REQ-08.48: a byte of a paste that Readline reads again as a key is not the end-of-input
+/// gesture.
+///
+/// A character search takes the first byte of a paste for its target and reads the rest again as
+/// keys. They are pasted text, whatever they are: a person who pastes a letter and an end-of-input
+/// character has not pressed the gesture, as they have not when the paste reaches the line the usual
+/// way. The case sets the shell to keep the end-of-input character from ending it, presses the
+/// character-search key at an empty prompt under a fence and pastes a letter with the character
+/// behind it: the reader sends no decision about it, and the shell goes on.
+///
+/// # Panics
+///
+/// Panics when a decision is sent for the character, or the shell stops answering.
+#[cfg(unix)]
+pub fn a_byte_of_a_paste_read_again_as_a_key_is_not_the_gesture(kind: ShellKind) {
+    let package = Package::built(kind);
+    let speech = dialect(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    // The editor's own answer to the character at an empty prompt can be to end the shell, so the
+    // person's setting that keeps it is on, as it is in the drives of the detach condition.
+    let ready = speech
+        .ignore_eof_on
+        .map_or_else(|| print_assembled(kind, "kr-ready"), ToOwned::to_owned);
+    assert!(session.run(&ready, "kr-ready"));
+    let (_enter, _fence) = session.fenced_prompt(5);
+    session.ensure_reading();
+    session.forget_events();
+    session.type_bytes(b"\x1d\x1b[200~x\x04\x1b[201~");
+    session
+        .serving_after_teardown(&[], "kr-paste-gesture-served")
+        .unwrap_or_else(|why| {
+            panic!(
+                "after the paste with the character: {why}:\n{}",
+                session.terminal_output()
+            )
+        });
+    session
+        .ended_whole_with_no_decision()
+        .unwrap_or_else(|why| {
+            panic!(
+                "at the end of the paste with the character: {why}:\n{}",
+                session.terminal_output()
+            )
+        });
+}
+
+/// KR-REQ-08.48: the end-of-input gesture a person types behind pasted bytes that a failed key
+/// sequence gave back is still the gesture.
+///
+/// Readline gives the keys of a sequence that fails back to its typeahead, the last first, and the
+/// key that failed it is one the person typed. A reader that took the marks of the bytes from the
+/// wrong places would call that key pasted, and the gesture would be taken for a letter of the
+/// paste. The case binds the shape of an answer to a command that does nothing, and a longer
+/// sequence that begins with a control character and holds it, sets the shell to keep the
+/// end-of-input character from ending it, and at an empty prompt under a fence presses the
+/// character-search key, pastes a letter, the control character and the answer's shape, and
+/// types the end-of-input character behind the paste: it fails the longer sequence, the keys it
+/// gave back run, and the character is read again as typed and is the gesture.
+///
+/// # Panics
+///
+/// Panics when no detach is asked for, or the shell stops.
+#[cfg(unix)]
+pub fn a_gesture_typed_behind_bytes_a_failed_key_sequence_gave_back_is_still_the_gesture(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    let setup = format!(
+        "set -o ignoreeof; bind -x '\"\\C-a\\e[?62;22cq\": :'; bind -x '\"\\e[?62;22c\": :'; {}",
+        print_assembled(kind, "kr-ready")
+    );
+    assert!(
+        session.run(&setup, "kr-ready"),
+        "the line that sets the shell up did not run:\n{}",
+        session.terminal_output()
+    );
+    let (_enter, _fence) = session.fenced_prompt(5);
+    session.ensure_reading();
+    session.forget_events();
+    session.type_bytes(b"\x1d\x1b[200~a\x01\x1b[?62;22c\x1b[201~\x04");
+    let (id, event) = session.expect_event("eof_detach", |event| {
+        matches!(event, BridgeEvent::EofDetach(_))
+    });
+    assert!(matches!(event, BridgeEvent::EofDetach(_)));
+    session.answer_event(id, detached(attachment_id(1)));
+    assert!(
+        session.alive(),
+        "the gesture typed behind the pasted bytes ended the shell"
+    );
+}
+
 /// KR-REQ-08.48: the end-of-input gesture a person makes after an Escape sequence the editor does
 /// not know is still the gesture.
 ///
