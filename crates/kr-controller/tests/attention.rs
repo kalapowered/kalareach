@@ -4408,6 +4408,105 @@ async fn a_device_sees_an_automation_item_only_under_its_grant() {
     host.stop().await;
 }
 
+/// KR-REQ-09.09: a copy of an attention action that passed the door with no record, when the store
+/// then cannot read its record of actions where the action is performed, is told that what became
+/// of the action is not known. An earlier copy may have been performed in it, and a transient word
+/// would say that nothing took effect and have the action sent again as though nothing had. The
+/// store cannot tell a first action from a repeat then, so a first action is told the same; a write
+/// that fails keeps its own code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attention_action_whose_record_cannot_be_read_where_it_is_performed_is_told_the_outcome_is_unknown()
+ {
+    let owner_keys = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner_keys).await;
+    let controller = Arc::clone(host.controller());
+    let mut control = host.client().await;
+    let mutation = control
+        .compose(
+            Method::AttentionQuietHours,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &AttentionQuietHoursParams {
+                quiet_hours: Nullable::some(night()),
+            },
+        )
+        .await
+        .expect("the mutation is composed");
+    let admitted_revision = controller.authority_revision().await.expect("the revision");
+    let admission = AdmittedMutation {
+        connection_id: control.acknowledgement().connection_id,
+        admitted_revision,
+        deadline: Some(
+            controller
+                .continuous_now()
+                .checked_add(Duration::from_secs(30))
+                .expect("a deadline"),
+        ),
+    };
+
+    // The action is stopped once it has reached the store, where it looks for a record of itself.
+    let (arrived, release) = controller.attention().pause_before_store();
+    let writing = {
+        let controller = Arc::clone(&controller);
+        let mutation = mutation.clone();
+        tokio::spawn(async move {
+            controller
+                .attention()
+                .write(
+                    &controller,
+                    &Caller::Owner,
+                    &owner(),
+                    &mutation,
+                    Method::AttentionQuietHours,
+                    &admission,
+                )
+                .await
+                .into_answer()
+        })
+    };
+    tokio::task::spawn_blocking(move || {
+        arrived
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the action reached the store")
+    })
+    .await
+    .expect("the wait finishes");
+    let store =
+        rusqlite::Connection::open(host.attention_database()).expect("opens the attention store");
+    store
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    store
+        .execute_batch("ALTER TABLE attention_actions RENAME TO attention_actions_aside;")
+        .expect("the record cannot be read");
+    release.send(()).expect("the action is let go");
+    let told = tokio::time::timeout(Duration::from_secs(10), writing)
+        .await
+        .expect("the action answers")
+        .expect("the action finishes")
+        .expect_err("a record that cannot be read does not let the action begin");
+    store
+        .execute_batch("ALTER TABLE attention_actions_aside RENAME TO attention_actions;")
+        .expect("the record can be read again");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    // Nothing was performed, so the action is performed when it is sent again.
+    let performed = controller
+        .attention()
+        .write(
+            &controller,
+            &Caller::Owner,
+            &owner(),
+            &mutation,
+            Method::AttentionQuietHours,
+            &admission,
+        )
+        .await
+        .into_answer();
+    assert!(performed.is_ok(), "{performed:?}");
+    host.stop().await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // A session's own work: agent turns that end and commands that fail
 // ---------------------------------------------------------------------------------------------

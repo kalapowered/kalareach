@@ -2419,6 +2419,12 @@ impl AttentionModule {
                 });
                 performed.map_err(|unperformed| match unperformed {
                     Unperformed::Refused(error) => error,
+                    // The store could not be asked what it holds of this action, which a copy that
+                    // passed the door with no record meets when the store fails before its write:
+                    // an earlier copy may have been performed, so nothing is told a transient word.
+                    Unperformed::Store(kr_attention::Error::ActionUnreadable { .. }) => {
+                        ControllerError::record_unreadable("attention actions")
+                    }
                     Unperformed::Store(error) => lapsed
                         .borrow_mut()
                         .take()
