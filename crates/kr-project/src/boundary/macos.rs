@@ -40,10 +40,11 @@
 //! operation owns and reports one that is not the object it started against; a change made and
 //! undone between the two readings is not told from none. The paths the invocation is lent and the
 //! support set are held by name alone, so one of them replaced while Git runs is read under its
-//! name and nothing detects it, and a mount at a lent directory itself is no mount beneath it, so
-//! it is neither refused nor reported. Nothing here prevents any of it. A filesystem mounted
-//! beneath a granted directory would be read under a granted name too, so such an invocation is
-//! refused, from the table of mounted filesystems read just before the child starts.
+//! name and nothing detects it, and a mount at a lent, a support or Git's helper directory itself
+//! is no mount beneath it, so it is neither refused nor reported. Nothing here prevents any of it.
+//! A filesystem mounted beneath a granted directory would be read under a granted name too, so such
+//! an invocation is refused, from the table of mounted filesystems read just before the child
+//! starts.
 //!
 //! ## What applies it
 //!
@@ -446,7 +447,12 @@ fn mount_points() -> std::io::Result<Vec<PathBuf>> {
 
 /// Returns the home directory the system's account database gives the user this process runs as,
 /// which the process's environment cannot change.
-pub(super) fn passwd_home() -> Option<PathBuf> {
+///
+/// # Errors
+///
+/// Returns the system's error when the database cannot be asked or has no entry for the user, and
+/// an error of kind `InvalidData` when the entry holds no absolute home.
+pub(super) fn passwd_home() -> std::io::Result<PathBuf> {
     // SAFETY: `getuid` takes no argument and cannot fail.
     let user = unsafe { libc::getuid() };
     let mut room = 1024;
@@ -472,15 +478,34 @@ pub(super) fn passwd_home() -> Option<PathBuf> {
             room *= 4;
             continue;
         }
-        if status != 0 || found.is_null() || entry.pw_dir.is_null() {
-            return None;
+        if status != 0 {
+            return Err(std::io::Error::from_raw_os_error(status));
+        }
+        if found.is_null() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the account database has no entry for this user",
+            ));
+        }
+        if entry.pw_dir.is_null() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the account database entry has no home",
+            ));
         }
         // SAFETY: the call ends `pw_dir` with a zero byte, inside `buffer`, which is still live.
         let directory = unsafe { CStr::from_ptr(entry.pw_dir) };
         let path = PathBuf::from(std::ffi::OsStr::from_bytes(directory.to_bytes()));
-        return path.is_absolute().then_some(path);
+        return if path.is_absolute() {
+            Ok(path)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the account database gives a home that is not an absolute path",
+            ))
+        };
     }
-    None
+    Err(std::io::Error::from_raw_os_error(libc::E2BIG))
 }
 
 /// Returns one path as a profile's literal filter.

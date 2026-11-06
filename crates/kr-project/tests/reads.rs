@@ -2332,5 +2332,144 @@ mod confined {
                 ran.stderr
             );
         }
+
+        /// An `@rpath` name that an image already loaded answers is not searched for again. The
+        /// loader reuses the loaded image whose install name is that name, so a library that the
+        /// program names and that a later library names too is the one the first search found,
+        /// and what it names is found through the search path of the image the walk goes into it
+        /// from. Here the program names `libkra` and then `libkrx`, and finds the `libkrx` in
+        /// `ma`; `libkra` names `libkrx` too, with an rpath to a `mb` that holds another one, and
+        /// the loader reuses the one in `ma`. That one names `libkrm`, which the loader finds in
+        /// `mq` through `libkra`'s rpath, though the program's own leads to another in `mp`.
+        #[test]
+        fn a_library_an_image_already_loaded_answers_is_not_searched_for_again() {
+            let fixture = Fixture::create();
+            let Some(clang) = compiler() else {
+                println!("not exercised: this host has no developer tools to build a library");
+                return;
+            };
+            let (_directory, root) = scratch();
+            for name in ["a", "ma", "mb", "mp", "mq", "bin", "helpers"] {
+                std::fs::create_dir(root.join(name)).expect("a directory to build in");
+            }
+            let source = |name: &str, text: &str| {
+                std::fs::write(root.join(name), text).expect("a source file");
+            };
+            source("m1.c", "int krm_answer(void) { return 1; }\n");
+            source("m2.c", "int krm_answer(void) { return 2; }\n");
+            source(
+                "x1.c",
+                "int krm_answer(void);\nint krx_answer(void) { return krm_answer(); }\n",
+            );
+            source("x2.c", "int krx_answer(void) { return 100; }\n");
+            source(
+                "a.c",
+                "int krx_answer(void);\nint kra_answer(void) { return krx_answer(); }\n",
+            );
+            source(
+                "program.c",
+                "int kra_answer(void);\nint krx_answer(void);\n\
+                 int main(void) { return kra_answer() + krx_answer(); }\n",
+            );
+            let directory = |name: &str| root.join(name);
+            let flag = |prefix: &str, name: &str| {
+                OsString::from(format!("{prefix}{}", directory(name).display()))
+            };
+            // Every file is built for both architectures, as the system's own programs are
+            // shipped, so the slice for this machine is the one that is read.
+            let compile = |arguments: Vec<OsString>| {
+                let output = Command::new(&clang)
+                    .args(["-arch", "arm64", "-arch", "x86_64"])
+                    .args(&arguments)
+                    .output()
+                    .expect("the compiler starts");
+                assert!(
+                    output.status.success(),
+                    "the compiler builds it: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            let library = |directory_name: &str, name: &str, source: &str, extra: Vec<OsString>| {
+                let mut arguments: Vec<OsString> = vec![
+                    "-dynamiclib".into(),
+                    "-install_name".into(),
+                    format!("@rpath/lib{name}.dylib").into(),
+                    "-o".into(),
+                    directory(directory_name)
+                        .join(format!("lib{name}.dylib"))
+                        .into(),
+                    directory(source).into(),
+                ];
+                arguments.extend(extra);
+                compile(arguments);
+            };
+            library("mp", "krm", "m1.c", Vec::new());
+            library("mq", "krm", "m2.c", Vec::new());
+            library("ma", "krx", "x1.c", vec![flag("-L", "mp"), "-lkrm".into()]);
+            library("mb", "krx", "x2.c", Vec::new());
+            library(
+                "a",
+                "kra",
+                "a.c",
+                vec![
+                    flag("-L", "mb"),
+                    "-lkrx".into(),
+                    flag("-Wl,-rpath,", "mb"),
+                    flag("-Wl,-rpath,", "mq"),
+                ],
+            );
+            let program = directory("bin").join("program");
+            compile(vec![
+                "-o".into(),
+                program.clone().into(),
+                directory("program.c").into(),
+                flag("-L", "a"),
+                "-lkra".into(),
+                flag("-L", "ma"),
+                "-lkrx".into(),
+                flag("-Wl,-rpath,", "a"),
+                flag("-Wl,-rpath,", "ma"),
+                flag("-Wl,-rpath,", "mp"),
+            ]);
+
+            let named =
+                kr_project::boundary::support_set(&[program.as_path()], &directory("helpers"))
+                    .expect("the set of the program is named");
+            assert_eq!(
+                named.libraries(),
+                [directory("a"), directory("ma"), directory("mq")],
+                "the directories the loader uses: not `mb`, which it does not search, and not `mp`"
+            );
+            let location = fixture.work().join("location");
+            std::fs::create_dir_all(&location).expect("a location");
+            let run = |reads: Reads| {
+                run_enclosed(
+                    &fixture,
+                    &location,
+                    Enclosed {
+                        program: &program,
+                        arguments: Vec::new(),
+                        helpers: Vec::new(),
+                        readable: Vec::new(),
+                        reads,
+                        exec_path: None,
+                    },
+                )
+            };
+            let owner = run(Reads::Everywhere);
+            assert_eq!(
+                owner.status,
+                Some(4),
+                "the owner's run is the control, and the loader took `libkrm` from `mq`: {}",
+                owner.stderr
+            );
+            let ran = run(Reads::Bounded(std::sync::Arc::new(named)));
+            assert_eq!(
+                ran.status,
+                Some(4),
+                "the program runs under its set: {}",
+                ran.stderr
+            );
+        }
     }
 }
