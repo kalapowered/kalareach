@@ -305,6 +305,108 @@ async fn a_create_whose_token_cannot_be_read_is_told_the_outcome_is_unknown() {
     assert_eq!(told.code(), ErrorCode::OutcomeUnknown, "{told}");
 }
 
+/// A create the first attempt of which reserved its token and started nothing, and the same create
+/// asked again, as a function of what the test does to the registry between the two.
+///
+/// Returns the daemon, so that the case can ask again, with what it needs to do so.
+async fn a_create_whose_first_attempt_reserved_its_token() -> (
+    kr_ipc::testing::TempHost,
+    Arc<Controller>,
+    MutationRequest,
+    crate::authority::AdmittedMutation,
+    kr_protocol::ids::ActorId,
+) {
+    let (temp, controller, _asked) = daemon().await;
+    let environment_id = temp.environment_id();
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let accepted = AcceptedDeadline {
+        deadline: controller
+            .clock
+            .now()
+            .checked_add(Duration::from_secs(30))
+            .expect("a deadline half a minute out"),
+        bound: DeadlineBound::RequestedTtl,
+    };
+    let request = create_request(environment_id);
+    let carried = carried(&controller, connection_id, accepted);
+    let _ = controller
+        .session_create(&actor_id, &request, carried)
+        .await
+        .into_answer();
+    assert!(
+        controller
+            .registry
+            .lock()
+            .await
+            .reservation_for_token(&actor_id, request.action_id.get())
+            .expect("reads the token")
+            .is_some(),
+        "the first attempt reserved the token"
+    );
+    (temp, controller, request, carried, actor_id)
+}
+
+/// KR-REQ-09.09: a create asked again whose session's closure cannot be read is told that what
+/// became of the session is not known. The token is held, so a first attempt was made, and a
+/// transient word would say that nothing took effect and have the create sent again as though
+/// nothing had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_asked_again_whose_closure_cannot_be_read_is_told_the_outcome_is_unknown() {
+    let (temp, controller, request, carried, actor_id) =
+        a_create_whose_first_attempt_reserved_its_token().await;
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("the registry opens beside the daemon's own handle");
+    registry
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    registry
+        .execute_batch("ALTER TABLE tombstones RENAME TO tombstones_aside;")
+        .expect("the closures cannot be read");
+    let told = controller
+        .session_create(&actor_id, &request, carried)
+        .await
+        .into_answer()
+        .expect_err("a closure that cannot be read does not answer the repeat");
+    registry
+        .execute_batch("ALTER TABLE tombstones_aside RENAME TO tombstones;")
+        .expect("the closures can be read again");
+    assert_eq!(told.code(), ErrorCode::OutcomeUnknown, "{told}");
+}
+
+/// KR-REQ-09.09: a create asked again whose worker is not in the directory and whose session has
+/// no closure is told what the host knows. Where the reservation shows that nothing was launched, or
+/// that the launch produced no worker, the session does not exist and the create is refused as
+/// ever. Where a worker was asked for, or ran, whether the session was made and what it came to
+/// is not known.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_asked_again_whose_worker_is_gone_is_told_what_the_reservation_shows() {
+    let (temp, controller, request, carried, actor_id) =
+        a_create_whose_first_attempt_reserved_its_token().await;
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("the registry opens beside the daemon's own handle");
+    registry
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    for (phase, owed) in [
+        ("reserved", ErrorCode::ResourceUnavailable),
+        ("failed", ErrorCode::ResourceUnavailable),
+        ("spawned", ErrorCode::OutcomeUnknown),
+        ("live", ErrorCode::OutcomeUnknown),
+        ("fenced", ErrorCode::OutcomeUnknown),
+        ("closed", ErrorCode::OutcomeUnknown),
+    ] {
+        registry
+            .execute("UPDATE reservations SET phase = ?1", [phase])
+            .expect("the reservation is put in the phase");
+        let told = controller
+            .session_create(&actor_id, &request, carried)
+            .await
+            .into_answer()
+            .expect_err("a worker that is gone leaves no session to answer with");
+        assert_eq!(told.code(), owed, "a reservation {phase}: {told}");
+    }
+}
+
 /// Creates a session on a daemon whose reading of its host has been made short by `shorten`, and
 /// shows that the create is refused with `RESOURCE_UNAVAILABLE` naming `resource`, before a
 /// reservation is taken and before the supervisor is asked for a worker.

@@ -1181,7 +1181,22 @@ impl Controller {
         let _ = std::fs::remove_dir_all(self.paths.worker_dir(session_id));
     }
 
+    /// The answer to a create asked again under a token this host holds a reservation for.
+    ///
+    /// The reservation says a first attempt was made, so a record that cannot be read here, the
+    /// session's closure among them, is not one that is absent: the session may have been made.
+    /// The repeat is told that what became of it is not known, and not a transient word, which says
+    /// nothing took effect and has the create sent again as though nothing had.
     pub(super) async fn replay_create(
+        self: &Arc<Self>,
+        reservation: &crate::registry::Reservation,
+    ) -> Result<ParamsValue> {
+        self.replayed_create(reservation)
+            .await
+            .map_err(|error| error.found_unreadable("sessions"))
+    }
+
+    async fn replayed_create(
         self: &Arc<Self>,
         reservation: &crate::registry::Reservation,
     ) -> Result<ParamsValue> {
@@ -1222,10 +1237,26 @@ impl Controller {
             });
         }
         self.closed_create(reservation, true).await?.ok_or_else(|| {
-            ControllerError::supervision(format!(
-                "this create token is already recorded as {} and its worker is not available",
-                reservation.phase.as_str()
-            ))
+            let phase = reservation.phase.as_str();
+            match reservation.phase {
+                // Nothing was launched, or the launch is confirmed to have produced no worker: the
+                // host knows the session does not exist.
+                LaunchPhase::Reserved | LaunchPhase::Failed => {
+                    ControllerError::supervision(format!(
+                        "this create token is already recorded as {phase} and its worker is not \
+                     available"
+                    ))
+                }
+                // A worker was asked for, or ran: with it gone and no closure recorded, whether the
+                // session was made and what it came to is not known.
+                _ => ControllerError::Uncertain {
+                    detail: format!(
+                        "this create token is already recorded as {phase}, its worker is not \
+                         available and no closure of its session is recorded, so what became of \
+                         the session is not known"
+                    ),
+                },
+            }
         })
     }
 
