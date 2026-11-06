@@ -1755,35 +1755,41 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
         ),
     }
 
-    // And the handoff that never waits at all does not even write a frame: the writer is held at
-    // an event it took, and the next event is handed over all the same.
-    let hold = client.hold_offered_writes();
+    // And the handoff that never waits at all does not even write a frame: another task holds the
+    // connection's writer, and the events are handed over all the same, and written once it lets
+    // go. Everything handed over so far is written first, so that the queue has room.
+    tokio::time::timeout(HANG_GUARD, async {
+        while client.offered_bytes() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the events handed over so far were never written");
+    let writer = client.hold_writer().await;
     for index in 2..4 {
         let handoff = client.offer(
             request.binding_id,
             &components::scrape(&format!("se-{index}"), "y"),
         );
-        assert!(
-            matches!(
-                handoff,
-                kr_plugin_service::client::Handoff::Accepted
-                    | kr_plugin_service::client::Handoff::Refused { .. }
-            ),
-            "the handoff was {handoff:?}"
+        assert_eq!(
+            handoff,
+            kr_plugin_service::client::Handoff::Accepted,
+            "an event was not handed over while another task held the connection's writer"
         );
-        // The writer stops at the first event it takes, if the first was taken in; a handoff that
-        // was refused left it nothing to stop at.
-        if index == 2 && handoff == kr_plugin_service::client::Handoff::Accepted {
-            tokio::time::timeout(HANG_GUARD, async {
-                while !hold.parked() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("the writer never took an event off the queue");
-        }
     }
-    hold.release();
+    assert_ne!(
+        client.offered_bytes(),
+        0,
+        "an event handed over while the writer was held was written"
+    );
+    drop(writer);
+    tokio::time::timeout(HANG_GUARD, async {
+        while client.offered_bytes() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the events handed over were never written");
 
     // Health, too: nothing about this connection is behind the component.
     let health = client.health().await.expect("a health report");

@@ -103,6 +103,19 @@ const OFFER_WRITE_DEADLINE: core::time::Duration = core::time::Duration::from_se
 /// wait, and that somewhere has to be bounded in both directions: how many, and how much they hold.
 const MAX_OFFERED_EVENTS: usize = 256;
 
+/// The connection's writer, held by a test until this is dropped.
+#[cfg(feature = "testing")]
+pub struct WriterHold {
+    _writer: tokio::sync::OwnedMutexGuard<Option<FrameWriter>>,
+}
+
+#[cfg(feature = "testing")]
+impl core::fmt::Debug for WriterHold {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.debug_struct("WriterHold").finish_non_exhaustive()
+    }
+}
+
 /// What an event handed over without waiting became.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Handoff {
@@ -549,6 +562,16 @@ impl PluginClient {
     #[must_use]
     pub fn hold_offered_writes(&self) -> HoldHandle {
         self.offer_hold.set()
+    }
+
+    /// Takes the connection's writer, as a task in the middle of writing a frame holds it, and
+    /// keeps it until the returned hold is dropped. For the tests of a crate that drives this
+    /// client: what is handed over while it is held waits in the queue for it.
+    #[cfg(feature = "testing")]
+    pub async fn hold_writer(&self) -> WriterHold {
+        WriterHold {
+            _writer: Arc::clone(&self.writer).lock_owned().await,
+        }
     }
 
     /// Waits `deadline` for a registration instead of [`REGISTER_DEADLINE`]. For the tests of a
