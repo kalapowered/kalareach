@@ -2221,6 +2221,87 @@ async fn a_conclusive_receipt_of_an_answer_lets_the_connection_forget_it() {
     serving.abort();
 }
 
+/// KR-REQ-11.63: only a result is the host's word that an answer's action ended. A receipt says the
+/// host holds the action and has not finished with it, so the answer cannot be read and the action
+/// stays on the connection's book, where the read of its receipt settles it. An answer that is a
+/// result settles the action whether or not it can be read.
+#[tokio::test]
+async fn a_receipt_for_an_answer_leaves_its_action_on_the_connections_book() {
+    use kr_client::answers::{Dispatch, QuestionHost, answer_over};
+    use kr_protocol::ids::{QuestionId, QuestionRevision};
+    use kr_protocol::question::{QuestionAnswer, QuestionAnswerParams};
+
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+    let session_id = SessionId::new(Uuid::from_bytes([8; 16]));
+    let params = || QuestionAnswerParams {
+        session_id,
+        question_id: QuestionId::new(Uuid::from_bytes([7; 16])),
+        expected_revision: QuestionRevision::new(1),
+        answer: QuestionAnswer::Decision { decided: true },
+    };
+    let held = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x49; 16]));
+
+    // The host answers with a receipt, in the state of an action it has accepted.
+    let failure = answer_over(
+        &session,
+        None,
+        target.clone(),
+        params(),
+        Dispatch {
+            action_id: held,
+            quote: None,
+        },
+    )
+    .await
+    .expect_err("a receipt is no result to read");
+    assert!(!failure.settled(), "an answer that is not a result settles nothing");
+    assert_eq!(
+        session
+            .submitted_actions()
+            .await
+            .iter()
+            .map(|action| action.action_id)
+            .collect::<Vec<_>>(),
+        vec![held],
+        "the action stays on the book"
+    );
+    *script.record_state.lock().await = Some(ReceiptState::Applied);
+    QuestionHost::receipt(&session, session_id, held)
+        .await
+        .expect("read");
+    assert!(
+        session.submitted_actions().await.is_empty(),
+        "and the read of its receipt lets it go"
+    );
+
+    // The control: a result settles the action, though this one is not an answer's result.
+    *script.answer_mutations_with_result.lock().await = 1;
+    answer_over(
+        &session,
+        None,
+        target,
+        params(),
+        Dispatch {
+            action_id: kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x4a; 16])),
+            quote: None,
+        },
+    )
+    .await
+    .expect_err("the result is not an answer's");
+    assert!(
+        session.submitted_actions().await.is_empty(),
+        "a result is the host's word that the action ended"
+    );
+
+    session.close();
+    serving.abort();
+}
+
 /// A request composed first and sent for the first time carries the same unknown as a mutation: the
 /// action its caller named, with what the host said, and it stays held until the caller settles it.
 #[tokio::test]
