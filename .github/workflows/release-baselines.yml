@@ -47,15 +47,8 @@ jobs:
   floors:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    # The Intel macOS leg is the slow one. Its jobs took 98, 155, 98, 131, 123 and 163 minutes on
-    # the nights of 2026-11-01 to -06; the former limit of 150 ended two of them, the second night
-    # in the first check after the build and the last in the seventh of its seven builds, so those
-    # two figures are the job's time as it would have gone on. A build from nothing is what the
-    # cache of that leg starts from (the first night, the first of each week and after an
-    # eviction), and the cache is saved only by a job that finishes, so the limit has to hold a
-    # build from nothing at the slowest pace with 30 minutes over: 163 and 30 make 193. With the
-    # cache the same pace takes about 110 minutes. The other five legs took 30 to 88 minutes.
-    timeout-minutes: 210
+    # 150 minutes, unless the leg names its own (the Intel macOS leg does).
+    timeout-minutes: ${{ matrix.timeout || 150 }}
     strategy:
       # One target's failure says nothing about another's, and each is worth seeing.
       fail-fast: false
@@ -80,11 +73,23 @@ jobs:
           # The Intel runners start at macOS 15, so the Intel executables are started there. They
           # are the slowest runners of the six, so this leg keeps the third-party crates' release
           # build output in a cache (see "Restore the third-party crates' build output").
+          #
+          # Its jobs took 98, 155, 98, 131, 123 and 163 minutes on the nights of 2026-11-01 to -06.
+          # The former limit of 150 ended two of them, the second night in the first check after
+          # the build and the last in the seventh of its seven builds, so those two figures are the
+          # job's time as it would have gone on. A build from nothing is what the cache starts
+          # from (the first night, the first of each week, and the first after the runner image,
+          # the toolchain, `.cargo/config.toml` or a `[profile]` changed or the cache was evicted),
+          # and the cache is saved only by a job that finishes, so the limit holds a build from
+          # nothing at the slowest pace with 30 minutes over: 163 and 30 make 193, rounded up to
+          # 210. With the cache the same pace takes about 110 minutes. The other five legs took 30
+          # to 88 minutes and keep 150.
           - target: x86_64-apple-darwin
             runner: macos-15-intel
             python: python3
             exe: ''
             cache: true
+            timeout: 210
           - target: x86_64-pc-windows-msvc
             runner: windows-2025
             python: python
@@ -169,13 +174,14 @@ jobs:
         run: '"$PYTHON" scripts/check-release-floors.py self-test'
 
       # What the third-party crates build is the same from one night to the next. From nothing,
-      # this job took 98 to 163 minutes on the Intel runners (2026-11-01 to -06; see the limit
-      # above). With these crates' output kept the seven builds below take about a third less
-      # (measured on Linux with four build jobs: 1,646 s from nothing, 1,126 s with the output
-      # kept). This workspace's own crates are built again whatever the cache holds, so what is
-      # built of them is always this commit's. Cargo decides what is current: a crate whose
-      # version, features or build settings differ, and a native build whose compiler variables
-      # differ, are built again.
+      # this job took 98 to 163 minutes on the Intel runners (see the limit in the matrix). With
+      # these crates' output kept the seven builds below take about a third less (measured on
+      # Linux with four build jobs: 1,646 s from nothing, 1,126 s with the output kept, and about
+      # 12 s more with the llama.cpp build left out of it, as it is: see the last step). This
+      # workspace's own crates are built again whatever the cache holds, so what is built of them
+      # is always this commit's, and Cargo decides what else is current. The key holds the
+      # toolchain, `.cargo/config.toml`, the profiles, the compiler flags of the environment, the
+      # runner image and the week.
       - name: Restore the third-party crates' build output
         id: cargo-cache
         if: ${{ matrix.cache }}
@@ -666,6 +672,18 @@ jobs:
               sh "${names[@]}"
             echo "- $TARGET starts on $image" >> "$GITHUB_STEP_SUMMARY"
           done
+
+      # The llama.cpp build stays out of the cache, so that the instruction check above reads the
+      # archives this job compiled with this job's environment and no others: a restored entry
+      # would put the units of an earlier set of dependencies beside the current ones (the check
+      # reads every one it finds), and a native build can keep its configuration, with the flags
+      # of an earlier run, in the tree it is restored to. The check's own scratch directory goes
+      # too: it holds the disassembly of the archives, and the next run deletes it before it starts.
+      - name: Leave out of the cache what the checks must read afresh
+        if: ${{ success() && matrix.cache }}
+        run: |
+          release="target/$TARGET/release"
+          rm -rf "$release"/build/llama-cpp-sys-2-* "$release"/.fingerprint/llama-cpp-sys-2-* "$release"/deps/*llama_cpp_sys_2* "$release/instruction-check"
 
       # The last step, under no condition but success: a job that failed saves nothing, and the
       # action saves from the default branch's runs that found no cache of exactly these crates.
