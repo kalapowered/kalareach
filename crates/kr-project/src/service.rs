@@ -56,9 +56,9 @@ use crate::operation::{
 };
 use crate::policy::{Admitting, HeldLocation, LocationPolicy, LocationUse};
 use crate::store::{
-    Action, LocatedName, OperationRow, OperationUpdate, Performed, PinnedRow, ProjectRow,
-    RecordedAuthority, RetainedOutcome, RetainedRow, Store, WorkspaceRow, WorkspaceUpdate,
-    outcome_of,
+    Action, ActionState, LocatedName, OperationRow, OperationUpdate, Performed, PinnedRow,
+    ProjectRow, RecordedAuthority, RetainedOutcome, RetainedRow, Store, WorkspaceRow,
+    WorkspaceUpdate, outcome_of,
 };
 use crate::workspace::{
     PathOutcome, PreviewRequest, Survey, check_choice, copy_included, outcome_text, survey,
@@ -4154,25 +4154,26 @@ impl ProjectService {
         Ok(Some(outcome_of(&record)))
     }
 
-    /// Whether this action has claimed an effect that has no recorded outcome yet.
+    /// Says, from one read of the action's row, whether the action is absent, open or settled.
     ///
     /// A claim is written beside the state its action changes, before the action is carried out,
     /// and settled with the outcome. One that is not settled belongs to an attempt that is still
-    /// carrying the action out, or that ended without recording what it did.
+    /// carrying the action out, or that ended without recording what it did. Deciding from one
+    /// read matters: a claim that is open at one read and settled at the next is not an absent one.
     ///
     /// # Errors
     ///
     /// Returns [`ProjectError::IdConflict`] when the identifier was used for a different request,
     /// and [`ProjectError::StoreUnavailable`] when the read fails.
-    pub fn claim_is_open(
+    pub fn action_state(
         &self,
         actor_id: &ActorId,
         action_id: Uuid,
         method: &str,
         payload_digest: kr_protocol::scalars::Digest256,
-    ) -> Result<bool> {
+    ) -> Result<ActionState> {
         let Some(record) = self.locked()?.retained_action(actor_id, action_id)? else {
-            return Ok(false);
+            return Ok(ActionState::Absent);
         };
         if record.method != method || record.payload_digest != payload_digest {
             return Err(ProjectError::IdConflict {
@@ -4180,7 +4181,10 @@ impl ProjectService {
                 method: record.method.into(),
             });
         }
-        Ok(record.result.is_none() && record.error_code.is_none())
+        if record.result.is_none() && record.error_code.is_none() {
+            return Ok(ActionState::Open);
+        }
+        Ok(ActionState::Settled(outcome_of(&record)))
     }
 
     /// Records one action's outcome, leaving an existing row alone.
