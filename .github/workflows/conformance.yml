@@ -307,6 +307,14 @@ jobs:
     # GitHub's six hours.
     timeout-minutes: 355
     env:
+      # No debug information, as the Linux and macOS jobs above and the landing workflow's Windows
+      # jobs have it: nothing here reads it, and the report builds every suite's test programs in
+      # turn into one directory, with no build cache, on the drive the workspace is on. With debug
+      # information that directory filled the drive in the last two steps of the run of 5 November
+      # ("There is not enough space on the disk", then the linker's "limit exceeded for program
+      # database"), and the 1,321 tests of those two steps were reported as not built.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
       # The plugin runtime's tests run real components, which the steps below build; a component
       # that is not there is a failure here rather than a skip.
@@ -318,6 +326,19 @@ jobs:
       - name: Check out
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # The drives as the job starts and, in the step after the report, as it ends. The hosted
+      # Windows runner's figures for the workspace drive are not documented, and the run that filled
+      # it printed none: this is how much room the build starts with and how much it takes. The
+      # build only adds to its target directory, so the figure at the end is close to the lowest
+      # the drive reached.
+      - name: What the drives hold
+        timeout-minutes: 2
+        continue-on-error: true
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Where-Object { $null -ne $_.Free } | ForEach-Object {
+            '{0}: {1:N1} GiB used, {2:N1} GiB free of {3:N1} GiB' -f $_.Name, ($_.Used / 1GB), ($_.Free / 1GB), (($_.Used + $_.Free) / 1GB)
+          }
 
       - name: Install the pinned toolchain
         timeout-minutes: 5
@@ -382,10 +403,11 @@ jobs:
       # A run with 91 steps and the limit below took 185 minutes (29 October). The limit is what
       # this job's limit leaves once the other steps have theirs, less 3 minutes for the set-up and
       # clean-up that no step limit counts: the limits of the job's steps add up to 352 of its 355
-      # minutes. That is 1.5 times the longest full run; twice it, 370 minutes, does not fit in a job.
+      # minutes. That is about 1.5 times the longest full run (190 minutes, 3 November); twice it,
+      # 370 minutes, does not fit in a job.
       - name: The conformance report
         if: ${{ !cancelled() }}
-        timeout-minutes: 285
+        timeout-minutes: 279
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
         run: |
@@ -397,6 +419,22 @@ jobs:
             $arguments += $name
           }
           cargo run --locked -p kr-conformance --bin kr-conformance -- run --root $PWD.Path --evidence $env:KR_TEST_ARTIFACTS_DIR @arguments
+
+      # The drives as the report left them, and what the build took of them.
+      - name: What the drives hold at the end
+        if: ${{ !cancelled() }}
+        timeout-minutes: 4
+        continue-on-error: true
+        run: |
+          Get-PSDrive -PSProvider FileSystem | Where-Object { $null -ne $_.Free } | ForEach-Object {
+            '{0}: {1:N1} GiB used, {2:N1} GiB free of {3:N1} GiB' -f $_.Name, ($_.Used / 1GB), ($_.Free / 1GB), (($_.Used + $_.Free) / 1GB)
+          }
+          $target = Join-Path $PWD.Path 'target'
+          if (Test-Path -LiteralPath $target) {
+            $files = ([System.IO.DirectoryInfo]$target).EnumerateFiles('*', [System.IO.SearchOption]::AllDirectories)
+            $size = ($files | Measure-Object -Property Length -Sum).Sum
+            '{0}: {1:N1} GiB' -f $target, ($size / 1GB)
+          }
 
       - name: Keep the result and the evidence
         if: ${{ !cancelled() }}
