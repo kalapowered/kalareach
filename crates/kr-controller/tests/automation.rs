@@ -4508,6 +4508,42 @@ async fn an_exhausted_chain_stays_paused_until_an_authorised_rearm_gives_it_a_ne
             .expect("the repeat is answered"),
     );
     assert_eq!(repeated, rearmed);
+    // The chain's budget cannot be read when the request comes again on another connection: whether
+    // the rearm was performed is not known, and the repeat is told so and not decided as a new
+    // request, which its freshness window would refuse. Once the budget reads again it is answered.
+    let budgets = rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::store::WORKFLOW_DB_NAME),
+    )
+    .expect("opens the workflow journal beside the daemon's own handle");
+    budgets
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .expect("a busy timeout");
+    budgets
+        .execute(
+            "UPDATE causal_budgets SET generation = 'unreadable' WHERE causal_root_id = ?1",
+            [root.to_string()],
+        )
+        .expect("the budget is made unreadable");
+    let unknown = failure(
+        client(&host)
+            .await
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(unknown.code, ErrorCode::OutcomeUnknown, "{unknown:?}");
+    budgets
+        .execute(
+            "UPDATE causal_budgets SET generation = ?1 WHERE causal_root_id = ?2",
+            rusqlite::params![
+                i64::try_from(rearmed.generation.get()).expect("a generation"),
+                root.to_string()
+            ],
+        )
+        .expect("the budget is restored");
     // A request that leaves the generation the chain has left, under an action of its own, which
     // is what `kr` sends when it is run again, is told where the chain is and changes nothing.
     let told: WorkflowRearmResult = typed(
