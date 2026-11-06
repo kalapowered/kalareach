@@ -1516,9 +1516,11 @@ fn powershell_finds(name: &str, directories: &[PathBuf]) -> Option<PathBuf> {
 /// extension), the two the other way round, a program and two batch files in one directory (the
 /// extensions go in `PATHEXT`'s order), a `.ps1` script and a program in one directory (the script
 /// comes first, as the doctor's search takes it), a file with an extension that `PATHEXT` names
-/// but that is neither a program nor a batch file, and nothing at all. `where.exe` is no judge of
-/// the order within one directory, since it lists a directory's files as the file system gives
-/// them.
+/// but that is neither a program nor a batch file, and nothing at all. Each arrangement says what
+/// its first hit is by what the files in it are (a program, a script or a batch file that no
+/// launcher starts, or nothing), and the shell has to find a file in each that holds one.
+/// `where.exe` is no judge of the order within one directory, since it lists a directory's files
+/// as the file system gives them.
 #[cfg(windows)]
 #[test]
 fn the_search_the_doctor_makes_names_the_file_the_shell_finds_first() {
@@ -1540,26 +1542,57 @@ fn the_search_the_doctor_makes_names_the_file_the_shell_finds_first() {
     executable(&script, "claude.exe");
     executable(&script, "claude.ps1");
     executable(&other_extension, "claude.vbs");
-    let arrangements: [(&str, Vec<PathBuf>); 6] = [
+    // The third arrangement rests on the order of the extensions this machine's search goes in.
+    let extensions = std::env::var("PATHEXT").unwrap_or_default().to_lowercase();
+    let at = |extension: &str| extensions.split(';').position(|word| word == extension);
+    assert!(
+        at(".exe").is_some() && at(".exe") < at(".bat") && at(".exe") < at(".cmd"),
+        "this machine's PATHEXT puts .exe before .bat and .cmd: {extensions:?}"
+    );
+    /// What the first hit of an arrangement is, by what its files are.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum First {
+        Program,
+        NotAProgram,
+        Nothing,
+    }
+    let arrangements: [(&str, Vec<PathBuf>, First); 6] = [
         (
             "a batch file in an earlier directory and a program in a later one",
             vec![batch_first.clone(), program_later.clone()],
+            First::NotAProgram,
         ),
         (
             "a program in an earlier directory and a batch file in a later one",
             vec![program_later.clone(), batch_first],
+            First::Program,
         ),
-        ("a program and two batch files in one directory", vec![both]),
-        ("a script and a program in one directory", vec![script]),
+        (
+            "a program and two batch files in one directory",
+            vec![both],
+            First::Program,
+        ),
+        (
+            "a script and a program in one directory",
+            vec![script],
+            First::NotAProgram,
+        ),
         (
             "a file only PATHEXT names, before a program",
             vec![other_extension, program_later],
+            First::NotAProgram,
         ),
-        ("nothing", vec![nowhere]),
+        ("nothing", vec![nowhere], First::Nothing),
     ];
-    for (what, directories) in arrangements {
+    for (what, directories, first_is) in arrangements {
         let shell_finds = powershell_finds("claude", &directories);
         let found = resolve("claude", &directories);
+        assert_eq!(
+            shell_finds.is_some(),
+            first_is != First::Nothing,
+            "{what}: the shell's search finds a file exactly when the arrangement holds one \
+             ({shell_finds:?})"
+        );
         // The same file may be named in its short or its long form, so each is named by what the
         // file system makes of it.
         let named = |path: &PathBuf| {
@@ -1582,22 +1615,27 @@ fn the_search_the_doctor_makes_names_the_file_the_shell_finds_first() {
             &able(directories),
         );
         let reason = reported.reports[0].reason.0.clone();
-        match found {
-            Some(first) if kr_worker::broker::commands::starts_directly(&first) => {
+        match (first_is, found) {
+            (First::Program, Some(_)) => {
                 assert_eq!(reason, None, "{what}: a program is not a shim");
             }
-            Some(first) => {
+            (First::NotAProgram, Some(first)) => {
                 let reason = reason.unwrap_or_else(|| panic!("{what}: a shim says why"));
                 assert!(
                     reason.starts_with(&format!("first hit is {}", first.display())),
                     "{what}: {reason}"
                 );
             }
-            None => {
+            (First::Nothing, None) => {
                 assert!(
                     reported.reports[0].executable.0.is_none(),
                     "{what}: nothing is found, and an executable is named"
                 );
+            }
+            (expected, found) => {
+                panic!(
+                    "{what}: the arrangement's first hit is {expected:?}, the search found {found:?}"
+                )
             }
         }
     }
