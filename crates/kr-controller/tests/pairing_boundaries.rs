@@ -1358,6 +1358,21 @@ mod a_repeat_the_owner_authority_answers {
             !reused.load(Ordering::Acquire),
             "a reused identifier is not a copy"
         );
+        // The owner authority's own lookup, which the request reaches when the service's finds
+        // nothing, says the same of a reused identifier.
+        let by_the_owner = AtomicBool::new(false);
+        let refused = pairing.owner().request(
+            &caller,
+            resolved(Digest256::from_bytes([7; 32])),
+            (action.0, Digest256::from_bytes([36; 32])),
+            &|| Ok(()),
+            &by_the_owner,
+        );
+        assert!(is_id_conflict(&refused), "{refused:?}");
+        assert!(
+            !by_the_owner.load(Ordering::Acquire),
+            "a reused identifier is not a copy"
+        );
         host.stop().await;
     }
 
