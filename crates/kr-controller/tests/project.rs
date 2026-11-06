@@ -3989,5 +3989,66 @@ async fn a_copy_of_an_action_with_an_open_claim_is_told_the_outcome_is_unknown_w
         .into_answer()
         .expect_err("the admission lapsed");
     assert_eq!(first.code, ErrorCode::PermissionDenied, "{first:?}");
+
+    // A claim the first copy settles while the copy waits for its admission is not an open one: the
+    // record is the copy's answer, and it is given as a copy. A real init leaves the result such a
+    // record holds.
+    let made: ProjectInitResult = typed(
+        &control
+            .mutate(
+                Method::ProjectInit,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &init("made"),
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.init succeeds"),
+    );
+    let result: Vec<u8> = beside_the_journal(&host)
+        .query_row(
+            "SELECT result FROM actions WHERE method = 'project.init' AND result IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the result the init left");
+    let racing = composed(
+        &mut control,
+        host.environment_id,
+        Method::ProjectInit,
+        ActionId::new(kr_ipc::new_uuid()),
+        &init("racing"),
+    )
+    .await;
+    an_open_claim(&host, &actor, &racing, Method::ProjectInit);
+    let journal = kr_project::ProjectService::root_of(&host.temp.environment())
+        .join(kr_project::store::STORE_FILE_NAME);
+    let action_bytes = racing.action_id.get().as_bytes().to_vec();
+    let settling = move || {
+        let connection = rusqlite::Connection::open(&journal).expect("opens the project journal");
+        connection
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .expect("waits for the daemon's own writes");
+        connection
+            .execute(
+                "UPDATE actions SET result = ?1 WHERE action_id = ?2 AND result IS NULL",
+                rusqlite::params![result, action_bytes],
+            )
+            .expect("the first copy settles its claim");
+        Err(ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            "the registration this was admitted under has been withdrawn",
+        ))
+    };
+    let answered: ProjectInitResult = typed(
+        &host
+            .controller
+            .project()
+            .write(&actor, &racing, Method::ProjectInit, settling, None)
+            .await
+            .into_answer()
+            .expect("the copy is answered with the record the first copy left"),
+    );
+    assert_eq!(answered, made);
     let _ = host.stop().await;
 }

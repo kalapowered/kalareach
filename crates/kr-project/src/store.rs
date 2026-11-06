@@ -507,6 +507,18 @@ pub enum RetainedOutcome {
     },
 }
 
+/// What one read of an action's row says about the action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionState {
+    /// The journal holds no row for the action.
+    Absent,
+    /// The action claimed an effect and its outcome is not recorded yet: its attempt is still
+    /// carrying it out, or ended without recording what it did.
+    Open,
+    /// The action's outcome is recorded.
+    Settled(RetainedOutcome),
+}
+
 /// One row of the action table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetainedAction {

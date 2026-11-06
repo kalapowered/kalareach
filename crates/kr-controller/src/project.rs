@@ -35,7 +35,7 @@ use std::sync::{Arc, OnceLock};
 use kr_pairing::confirm::ConfirmationExpectation;
 use kr_project::ProjectService;
 use kr_project::policy::{Enlargement, OwnerAuthority};
-use kr_project::store::{Action, RetainedOutcome};
+use kr_project::store::{Action, ActionState, RetainedOutcome};
 use kr_protocol::confirmation::{ConfirmationDisplay, DescribedAction};
 use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
@@ -572,7 +572,11 @@ impl ProjectModule {
             // the record above answered it: section 9 keeps a receipt readable after the freshness
             // that admitted it is gone. One whose first attempt has not settled its claim does,
             // and is not refused as though it were a first admission.
-            admitted_to_begin(&service, &actor, action_id, name, digest, &admission)?;
+            if let Err(answer) = admitted_to_begin(
+                &service, &actor, action_id, name, digest, &admission, &copied,
+            ) {
+                return answer;
+            }
             // The action this mutation is performed under. Each of these methods commits it beside
             // the state it changes, which is what makes a second copy of one action find the claim
             // rather than starting a second clone.
@@ -720,13 +724,15 @@ fn kept(
         .map_err(|error| ControllerError::found_unreadable_on_the_wire(error.into(), RECORDS))
 }
 
-/// Asks the admission an action begins under, for an action that found no settled record.
+/// Asks the admission an action begins under, for an action that found no settled record, and
+/// says either that the action may begin or what answers it instead.
 ///
 /// A claim with no outcome is not a record, so a copy of an action whose first attempt is still
 /// carrying it out, or ended without recording what it did, comes here too. The admission refusing
-/// it is then no word about an action that never began: the first attempt did, so the copy is told
-/// that what became of the action is not known. A first action holds no claim and is refused as
-/// ever.
+/// it is then no word about an action that never began: the first attempt did. What the journal
+/// holds is read once, after the refusal: a claim still open tells the copy that what became of the
+/// action is not known, a claim the first attempt has settled since is the copy's answer, and no
+/// claim leaves the refusal as it is, as for any first action.
 fn admitted_to_begin<A>(
     service: &ProjectService,
     actor: &ActorId,
@@ -734,20 +740,27 @@ fn admitted_to_begin<A>(
     name: &str,
     digest: kr_protocol::scalars::Digest256,
     admission: &A,
-) -> Answer<()>
+    copied: &AtomicBool,
+) -> std::result::Result<(), Answer<ParamsValue>>
 where
     A: Fn() -> std::result::Result<(), ProtocolError>,
 {
     let Err(refusal) = admission() else {
         return Ok(());
     };
-    match service.claim_is_open(actor, action_id, name, digest) {
-        Ok(true) => Err(ControllerError::attempt_still_running().to_protocol_error()),
-        Ok(false) => Err(refusal),
-        Err(error) => Err(ControllerError::found_unreadable_on_the_wire(
+    match service.action_state(actor, action_id, name, digest) {
+        Ok(ActionState::Absent) => Err(Err(refusal)),
+        Ok(ActionState::Open) => Err(Err(
+            ControllerError::attempt_still_running().to_protocol_error()
+        )),
+        Ok(ActionState::Settled(retained)) => {
+            copied.store(true, Ordering::Release);
+            Err(recorded(retained))
+        }
+        Err(error) => Err(Err(ControllerError::found_unreadable_on_the_wire(
             error.into(),
             RECORDS,
-        )),
+        ))),
     }
 }
 
@@ -810,7 +823,11 @@ where
         copied.store(true, Ordering::Release);
         return recorded(retained);
     }
-    admitted_to_begin(service, actor, action_id, name, digest, admission)?;
+    if let Err(answer) =
+        admitted_to_begin(service, actor, action_id, name, digest, admission, copied)
+    {
+        return answer;
+    }
     let claim = Action {
         actor_id: actor.clone(),
         action_id,
