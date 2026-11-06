@@ -245,6 +245,66 @@ async fn reserved(controller: &Controller) {
     .unwrap_or_else(|_| panic!("the create wrote no reservation within {BOUND:?}"));
 }
 
+/// KR-REQ-09.09: a create asked for again whose token's reservation cannot be read is told that
+/// what became of it is not known, on a path that does not stand behind the door's own lookup of
+/// the token (a workflow node's). The host cannot say the token is new, so it does not answer with a
+/// transient word, which says nothing took effect and has the create sent again as though nothing
+/// had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_token_cannot_be_read_is_told_the_outcome_is_unknown() {
+    let (temp, controller, _asked) = daemon().await;
+    let environment_id = temp.environment_id();
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let accepted = AcceptedDeadline {
+        deadline: controller
+            .clock
+            .now()
+            .checked_add(Duration::from_secs(30))
+            .expect("a deadline half a minute out"),
+        bound: DeadlineBound::RequestedTtl,
+    };
+    let request = create_request(environment_id);
+
+    // The first attempt reserves the token and starts nothing.
+    let _ = controller
+        .session_create(
+            &actor_id,
+            &request,
+            carried(&controller, connection_id, accepted),
+        )
+        .await
+        .into_answer();
+    assert!(
+        controller
+            .registry
+            .lock()
+            .await
+            .reservation_for_token(&actor_id, request.action_id.get())
+            .expect("reads the token")
+            .is_some(),
+        "the first attempt reserved the token"
+    );
+
+    // The reservation can no longer be read: its phase is one this build does not know.
+    rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("the registry opens beside the daemon's own handle")
+        .execute(
+            "UPDATE reservations SET phase = 'a phase this build does not know'",
+            [],
+        )
+        .expect("the reservation is made unreadable");
+    let told = controller
+        .session_create(
+            &actor_id,
+            &request,
+            carried(&controller, connection_id, accepted),
+        )
+        .await
+        .into_answer()
+        .expect_err("a reservation that cannot be read does not answer the repeat");
+    assert_eq!(told.code(), ErrorCode::OutcomeUnknown, "{told}");
+}
+
 /// Creates a session on a daemon whose reading of its host has been made short by `shorten`, and
 /// shows that the create is refused with `RESOURCE_UNAVAILABLE` naming `resource`, before a
 /// reservation is taken and before the supervisor is asked for a worker.

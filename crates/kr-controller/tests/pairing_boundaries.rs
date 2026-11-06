@@ -599,6 +599,71 @@ async fn a_repeated_invitation_is_answered_across_connections_and_a_restart() {
     host.stop().await;
 }
 
+/// KR-REQ-09.09: a repeated `pair.invite` whose record cannot be read is told that what became of
+/// the action is not known. The registry holds the record of every pairing action it answered, so
+/// a record it cannot read is not one that is absent: the invitation may have been issued, and a
+/// transient word would say that nothing took effect. Once the record can be read the repeat is
+/// answered from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_invitation_whose_record_cannot_be_read_is_told_the_outcome_is_unknown() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let grant = viewer();
+    calls::confirm_subject(
+        environment,
+        &mut client,
+        issue(InviteModeKind::Direct, &grant),
+        &Signer::OwnerDevice(&owner_keys),
+    )
+    .await
+    .expect("answered");
+    let original = client
+        .compose(
+            Method::PairInvite,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(environment),
+            &direct(&grant),
+        )
+        .await
+        .expect("an envelope");
+    let first: PairInviteResult = client
+        .repeat(&original)
+        .await
+        .expect("the daemon answers")
+        .expect("an invitation")
+        .to_typed()
+        .expect("decodes");
+
+    // The table that holds the record of every pairing action is moved aside, as a registry that
+    // fails to read it would leave it.
+    let registry =
+        rusqlite::Connection::open(host.registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    registry
+        .execute_batch("ALTER TABLE pairing_actions RENAME TO pairing_actions_aside;")
+        .expect("the record cannot be read");
+    let mut other = host.client().await;
+    let told = other.repeat(&original).await.expect("the daemon answers");
+    registry
+        .execute_batch("ALTER TABLE pairing_actions_aside RENAME TO pairing_actions;")
+        .expect("the record can be read again");
+    assert_eq!(code(told), ErrorCode::OutcomeUnknown);
+
+    let again: PairInviteResult = other
+        .repeat(&original)
+        .await
+        .expect("the daemon answers")
+        .expect("the repeat is answered once the record can be read")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(again, first);
+    host.stop().await;
+}
+
 /// A repeated `owner.confirmation.request` gets the challenge its action was given, before and
 /// after that challenge is spent, and the same action with another subject is `ID_CONFLICT`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1455,6 +1455,10 @@ mod a_transfer_whose_giver_keeps_control;
 #[cfg(test)]
 mod a_revocation_answered_to_a_device;
 
+/// What a repeat of an authority change is told when the record of its first attempt cannot be read.
+#[cfg(test)]
+mod a_repeat_whose_record_cannot_be_read;
+
 /// A transfer of control to a device that was revoked after the transfer was planned.
 #[cfg(test)]
 mod a_transfer_to_a_device_revoked_since;

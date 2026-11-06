@@ -1338,6 +1338,89 @@ async fn a_replayed_mutation_is_answered_from_its_record() {
     host.clients.abort();
 }
 
+/// KR-REQ-19.04: a repeat of an automation action whose record cannot be read is told that what
+/// became of the action is not known. The journal holds the record of every action it performed, so
+/// one it cannot read is not one that holds none: the action may have been carried out, and a
+/// transient word would say that it was not. Once the record can be read the repeat is answered
+/// from it, and the action is not performed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_whose_record_in_the_journal_cannot_be_read_is_told_the_outcome_is_unknown() {
+    let host = host().await;
+    let mut control = client(&host).await;
+
+    host.issue(grant_id(6), &COMMAND_RIGHTS);
+    let document = definition(
+        workflow_id(6),
+        grant_id(6),
+        "asked when the journal cannot be read",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    let original = control
+        .compose(
+            Method::WorkflowInstall,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &WorkflowInstallParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                definition: document.clone(),
+                grant_reference: document.grant_reference,
+            },
+        )
+        .await
+        .expect("the mutation is composed");
+    let first: WorkflowInstallResult = typed(
+        &control
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the workflow is installed"),
+    );
+
+    // The table that holds the record of every action is moved aside, as a journal that fails to
+    // read it would leave it.
+    let journal = rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::store::WORKFLOW_DB_NAME),
+    )
+    .expect("opens the workflow journal beside the daemon's own handle");
+    journal
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .expect("a busy timeout");
+    journal
+        .execute_batch("ALTER TABLE action_records RENAME TO action_records_aside;")
+        .expect("the record cannot be read");
+    let told = failure(
+        client(&host)
+            .await
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    journal
+        .execute_batch("ALTER TABLE action_records_aside RENAME TO action_records;")
+        .expect("the record can be read again");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    let again: WorkflowInstallResult = typed(
+        &client(&host)
+            .await
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the repeat is answered once the record can be read"),
+    );
+    assert_eq!(again, first);
+    host.clients.abort();
+}
+
 /// KR-REQ-19.04: a caller that lost its reply and asks again over a new connection is answered
 /// from the record.
 ///

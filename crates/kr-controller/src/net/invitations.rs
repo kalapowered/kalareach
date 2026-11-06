@@ -599,8 +599,8 @@ impl InvitationRows {
     /// # Errors
     ///
     /// The inner result is `ID_CONFLICT` when the identifier was used with another payload, for
-    /// this method or for any other pairing method, and a registry error when the record cannot be
-    /// read.
+    /// this method or for any other pairing method, and an unknown outcome when the record cannot
+    /// be read.
     #[must_use]
     pub fn answered(
         &self,
@@ -612,7 +612,9 @@ impl InvitationRows {
             Ok(Some(recorded)) if recorded.digest == digest => Some(Ok(recorded.subject)),
             Ok(Some(_)) => Some(Err(id_conflict(action_id))),
             Ok(None) => None,
-            Err(error) => Some(Err(error)),
+            // A record that cannot be read is not one that is absent: the action may have been
+            // carried out, and a repeat is not told a transient word that says it was not.
+            Err(error) => Some(Err(error.found_unreadable("pairing actions"))),
         }
     }
 
