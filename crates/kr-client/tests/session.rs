@@ -141,6 +141,9 @@ struct HostScript {
     /// The window the host renews to, on the same stream and right after the answer, the next time
     /// it refuses a mutation.
     renew_after_refusing: Mutex<Option<kr_protocol::hello::ActionWindow>>,
+    /// The window the host has ended: a mutation under it is a first admission the host cannot
+    /// take, and it refuses it in its definite word.
+    ended_window: Mutex<Option<String>>,
     /// Answer this many of the next mutations with the method's own result instead of a receipt.
     ///
     /// That is what a host does when it will not act until it has more: it answers the request it
@@ -330,6 +333,21 @@ fn spawn_host(
                                     if writer.lock().await.write_message(&renewed).await.is_err() {
                                         return;
                                     }
+                                }
+                                continue;
+                            }
+                            if script.ended_window.lock().await.as_deref()
+                                == Some(mutation.action_window_id.as_str())
+                            {
+                                let answer = ControlFrame::Response(Response {
+                                    request_id: mutation.request_id,
+                                    outcome: Outcome::Error(ProtocolError::new(
+                                        ErrorCode::PermissionDenied,
+                                        "this action window has expired",
+                                    )),
+                                });
+                                if writer.lock().await.write_message(&answer).await.is_err() {
+                                    return;
                                 }
                                 continue;
                             }
@@ -1901,6 +1919,94 @@ async fn another_send_under_the_identifier_of_one_refused_for_now_is_composed_no
     assert_eq!(requests[1].action_id, action_id);
     assert_eq!(requests[1].action_window_id.as_str(), "renewed");
     assert_ne!(requests[1].params, requests[0].params);
+
+    session.close();
+    serving.abort();
+}
+
+/// A send the host refused for now, sent again once the window it kept has ended, is a question to
+/// the host and nothing more: a host that holds no answer for the action cannot first-admit it
+/// under an ended window and says so in its definite word, which settles the send as not taken.
+/// The library composes nothing anew by itself, since replacing a window changes the request and is
+/// never an automatic retry; a caller that still wants the action sends a new request, under the
+/// window the host has issued since, and that lands.
+#[tokio::test]
+async fn a_send_refused_for_now_asked_again_after_its_window_ended_settles_as_not_taken() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+
+    let first = session.action_window().await;
+    *script.renew_after_refusing.lock().await = Some(kr_protocol::hello::ActionWindow {
+        action_window_id: kr_protocol::ids::ActionWindowId::new("renewed").expect("an identifier"),
+        connection_id: first.connection_id,
+        boot_epoch: first.boot_epoch,
+        issued_at_ms: TimestampMs::new(1),
+        valid_for_ms: DurationMs::new(300_000),
+    });
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::StorageUnavailable);
+    session
+        .mutate(
+            Method::SessionCreate,
+            target.clone(),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("the host cannot take the send now");
+    let kept = session.submitted_actions().await;
+    assert!(kept.len() == 1 && kept[0].refused_for_now);
+    session
+        .read::<_, SessionList>(Method::SessionList, &Empty {})
+        .await
+        .expect("a read behind the renewal");
+
+    // The host ends the window the send first carried, and holds no answer for the action.
+    *script.refuse_mutations_with.lock().await = None;
+    *script.ended_window.lock().await = Some(first.action_window_id.to_string());
+    let asked = session
+        .mutate_continuing(
+            kept[0].action_id,
+            Method::SessionCreate,
+            target.clone(),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("the host cannot first-admit the kept request");
+    assert_eq!(asked.code(), ErrorCode::PermissionDenied, "{asked:?}");
+    assert!(
+        session.submitted_actions().await.is_empty(),
+        "the host's definite word settles the send as not taken"
+    );
+    assert_eq!(
+        script.requests.lock().await[1].action_window_id.as_str(),
+        first.action_window_id.as_str(),
+        "the question went as the send first did, and nothing was composed anew"
+    );
+
+    session
+        .mutate(
+            Method::SessionCreate,
+            target,
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("a new request lands");
+    let requests = script.requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert_ne!(requests[2].action_id, requests[0].action_id);
+    assert_eq!(requests[2].action_window_id.as_str(), "renewed");
 
     session.close();
     serving.abort();
