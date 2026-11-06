@@ -708,7 +708,9 @@ impl SharingService {
     /// Whether a grant that is not revoked has run out: its end is on record, or one of its two
     /// deadlines has passed. A grant that does not expire reads no clock, and a revoked one is
     /// revoked whatever its time says. An end on record is read first and stands whatever the
-    /// clocks say, as it does where a share is opened: an object that ended never revives.
+    /// clocks say, as it does where a share is opened: an object that ended never revives. The
+    /// floor on disk at or after the expiry proves it ended next, and a refusal for a clock that
+    /// cannot be trusted names the grant it could not decide.
     fn has_run_out(&self, record: &GrantRecord, now_ms: u64) -> Result<bool> {
         if record.revoked_at_ms.is_some() || record.grant.expiry == GrantExpiry::Never {
             return Ok(false);
@@ -720,7 +722,22 @@ impl SharingService {
         {
             return Ok(true);
         }
-        self.grants.lapsed(record, now_ms)
+        // The floor on disk at or after the expiry proves the grant ended, and holds while this
+        // boot's clock continuity is lost and nothing anchors the grant.
+        if self.grants.floor_on_disk_covers(record.grant.expiry) {
+            return Ok(true);
+        }
+        self.grants
+            .lapsed(record, now_ms)
+            .map_err(|error| match error {
+                ControllerError::ClockUntrusted { detail } => ControllerError::ClockUntrusted {
+                    detail: format!(
+                        "{detail}; the grant it could not decide is {}",
+                        record.grant.grant_id
+                    ),
+                },
+                other => other,
+            })
     }
 
     /// Every live grant one device currently holds.

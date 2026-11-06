@@ -607,6 +607,20 @@ impl GrantDirectory {
         unrecorded()
     }
 
+    /// Whether the floor on disk is at or after `expiry`, so that a grant that expires then has
+    /// ended: the floor only rises, and a reading at or after an expiry proves it passed, whatever
+    /// this boot's clock continuity or anchors say. A grant that never expires is not covered, and
+    /// before the daemon binds its clocks there is no floor of this store's own.
+    #[must_use]
+    pub fn floor_on_disk_covers(&self, expiry: GrantExpiry) -> bool {
+        let GrantExpiry::At { expires_at_ms } = expiry else {
+            return false;
+        };
+        self.host_clock
+            .get()
+            .is_some_and(|clock| clock.floor.written() >= expires_at_ms.get())
+    }
+
     /// Whether a stored grant has lapsed for an effect its caller decided at `admitted_ms`, on
     /// both of its deadlines, for a check made before the effect's own transaction.
     ///
