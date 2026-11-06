@@ -51,7 +51,7 @@ use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, EndpointKe
 use super::devices::{CommitFn, DeviceDirectory, DeviceRecord};
 use super::invitations::{
     ActionSubject, InvitationRows, PairingAction, TerminalStanding, another_subject, claim_effect,
-    consume,
+    consume, noted_as_a_copy,
 };
 use super::lifetimes::GrantLifetimes;
 use super::pairing::HostPairingClock;
@@ -646,8 +646,7 @@ impl OwnerAuthority {
         // Asked under the lock every challenge is issued under, so two copies of one request meet
         // here and the second is given the challenge the first recorded.
         if let Some(requested) = self.requested(caller, action) {
-            copied.store(true, Ordering::Release);
-            return requested;
+            return noted_as_a_copy(requested, copied);
         }
         self.sweep(&mut state);
         let request = request_confirmation(
@@ -1084,8 +1083,7 @@ impl OwnerAuthority {
         // Asked under the lock every answer is recorded under, so two copies of one completion meet
         // here and the second is given what the first recorded.
         if let Some(completed) = self.completed(caller, action) {
-            copied.store(true, Ordering::Release);
-            return completed;
+            return noted_as_a_copy(completed, copied);
         }
         self.sweep(&mut state);
         let key = *proof.request.confirmation_id.get().as_bytes();
@@ -1327,8 +1325,7 @@ impl OwnerAuthority {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut state = self.state();
         if let Some(answered) = self.established(caller, action) {
-            copied.store(true, Ordering::Release);
-            return answered;
+            return noted_as_a_copy(answered, copied);
         }
         let spendable = self.select(&mut state, &expectation, &|display| {
             matches!(display, ConfirmationDisplay::EstablishClock)

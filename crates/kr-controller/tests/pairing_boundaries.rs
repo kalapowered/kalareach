@@ -992,10 +992,11 @@ async fn a_confirmation_whose_identifier_is_spent_meanwhile_spends_no_confirmati
     );
     assert!(is_id_conflict(&refused), "{refused:?}");
     // The lookup that found the identifier spent is the service reading the record of the action,
-    // as every early lookup is, and says so.
+    // as every early lookup is. What it found is a reused identifier, this host's word about the
+    // identifier, which names no result: it is no copy.
     assert!(
-        copied.load(Ordering::Acquire),
-        "an answer read from the record of the identifier is flagged as one"
+        !copied.load(Ordering::Acquire),
+        "a reused identifier is not flagged as an answer read from a record"
     );
     let committed = pairing
         .confirm(
@@ -1126,6 +1127,23 @@ async fn a_repeated_confirmation_is_answered_as_a_copy_of_its_record() {
         copied.load(Ordering::Acquire),
         "the repeat is answered from the record of the first"
     );
+    // The identifier reused with another payload is this host's word about the identifier, which
+    // names no result: it is no copy.
+    let reused = AtomicBool::new(false);
+    let refused = pairing.confirm(
+        &caller,
+        &params,
+        (action.0, Digest256::from_bytes([30; 32])),
+        revision,
+        &admitted,
+        &life(),
+        &reused,
+    );
+    assert!(is_id_conflict(&refused), "{refused:?}");
+    assert!(
+        !reused.load(Ordering::Acquire),
+        "a reused identifier is not a copy"
+    );
     connection.close(0u32.into(), b"paired");
     host.stop().await;
 }
@@ -1190,6 +1208,20 @@ async fn a_repeated_withdrawal_is_answered_as_a_copy_of_its_record() {
     assert!(
         copied.load(Ordering::Acquire),
         "the repeat is answered from the record of the first"
+    );
+    let reused = AtomicBool::new(false);
+    let refused = pairing.cancel(
+        &caller,
+        &withdrawal,
+        (action.0, Digest256::from_bytes([31; 32])),
+        &admitted,
+        &life(),
+        &reused,
+    );
+    assert!(is_id_conflict(&refused), "{refused:?}");
+    assert!(
+        !reused.load(Ordering::Acquire),
+        "a reused identifier is not a copy"
     );
     host.stop().await;
 }
@@ -1262,6 +1294,19 @@ mod a_repeat_the_owner_authority_answers {
             copied.load(Ordering::Acquire),
             "the repeat is answered from the record of the first"
         );
+        let reused = AtomicBool::new(false);
+        let refused = pairing.request_confirmation(
+            &caller,
+            &params,
+            (action.0, Digest256::from_bytes([32; 32])),
+            &|| Ok(()),
+            &reused,
+        );
+        assert!(is_id_conflict(&refused), "{refused:?}");
+        assert!(
+            !reused.load(Ordering::Acquire),
+            "a reused identifier is not a copy"
+        );
         host.stop().await;
     }
 
@@ -1299,6 +1344,19 @@ mod a_repeat_the_owner_authority_answers {
         assert!(
             copied.load(Ordering::Acquire),
             "the repeat is answered from the record of the first"
+        );
+        let reused = AtomicBool::new(false);
+        let refused = pairing.request_resolved(
+            &caller,
+            resolved(Digest256::from_bytes([7; 32])),
+            (action.0, Digest256::from_bytes([33; 32])),
+            &|| Ok(()),
+            &reused,
+        );
+        assert!(is_id_conflict(&refused), "{refused:?}");
+        assert!(
+            !reused.load(Ordering::Acquire),
+            "a reused identifier is not a copy"
         );
         host.stop().await;
     }
@@ -1339,6 +1397,19 @@ mod a_repeat_the_owner_authority_answers {
             copied.load(Ordering::Acquire),
             "the repeat is answered from the record of the first"
         );
+        let reused = AtomicBool::new(false);
+        let refused = owner.complete(
+            &caller,
+            &params,
+            (action.0, Digest256::from_bytes([34; 32])),
+            &|| Ok(()),
+            &reused,
+        );
+        assert!(is_id_conflict(&refused), "{refused:?}");
+        assert!(
+            !reused.load(Ordering::Acquire),
+            "a reused identifier is not a copy"
+        );
         host.stop().await;
     }
 
@@ -1376,6 +1447,19 @@ mod a_repeat_the_owner_authority_answers {
         assert!(
             copied.load(Ordering::Acquire),
             "the repeat is answered from the record of the first"
+        );
+        let reused = AtomicBool::new(false);
+        let refused = owner.establish_clock(
+            &caller,
+            (action.0, Digest256::from_bytes([35; 32])),
+            boot,
+            commit,
+            &reused,
+        );
+        assert!(is_id_conflict(&refused), "{refused:?}");
+        assert!(
+            !reused.load(Ordering::Acquire),
+            "a reused identifier is not a copy"
         );
         host.stop().await;
     }
