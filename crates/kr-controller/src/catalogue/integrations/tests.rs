@@ -1475,44 +1475,54 @@ fn a_candidate_this_account_cannot_execute_is_passed_over() {
     );
 }
 
-/// What the system's own `where.exe` finds for `name`, in the order it finds it, when the only
-/// directories searched are `directories` and the working directory holds nothing of that name.
+/// What Windows PowerShell, which every Windows has, would run for `name` when the only
+/// directories searched are `directories`: the first command it finds, or nothing.
 #[cfg(windows)]
-fn where_finds(name: &str, directories: &[PathBuf], nowhere: &Path) -> Vec<PathBuf> {
+fn powershell_finds(name: &str, directories: &[PathBuf]) -> Option<PathBuf> {
     let system = PathBuf::from(std::env::var_os("SystemRoot").expect("the system directory"))
         .join("System32");
-    let output = std::process::Command::new(system.join("where.exe"))
-        .arg(name)
-        .env(
-            "PATH",
-            std::env::join_paths(directories).expect("a search path"),
-        )
-        .current_dir(nowhere)
-        .output()
-        .expect("where.exe runs");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|line| PathBuf::from(line.trim()))
-        .filter(|path| !path.as_os_str().is_empty())
-        .collect()
+    let output = std::process::Command::new(
+        system
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe"),
+    )
+    .args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &format!(
+            "$found = Get-Command {name} -ErrorAction SilentlyContinue | Select-Object -First 1; \
+             if ($found) {{ [Console]::Out.Write($found.Source) }}"
+        ),
+    ])
+    .env(
+        "PATH",
+        std::env::join_paths(directories).expect("a search path"),
+    )
+    .output()
+    .expect("powershell runs");
+    let found = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!found.is_empty()).then(|| PathBuf::from(found))
 }
 
 /// KR-REQ-11.42, KR-REQ-07.45: on Windows the search the doctor makes for an application's
-/// executable, with the extensions this machine's `PATHEXT` names, finds the file the system's own
-/// search (`where.exe`) finds first, and says it is a shim, which no launcher starts, exactly when
-/// that file is not a program.
+/// executable, with the extensions this machine's `PATHEXT` names, finds the file the shell would
+/// run, which Windows PowerShell says by its own search, and says it is a shim, which no launcher
+/// starts, exactly when that file is not a program.
 ///
-/// Real files in real directories stand in a search path in five arrangements: a batch file in
-/// an earlier directory and a program in a later one (the earlier directory wins whatever the
-/// extension), the two the other way round, a program and a batch file in one directory (the
-/// extensions go in `PATHEXT`'s order), a file with an extension that `PATHEXT` names but that is
-/// neither a program nor a batch file, and nothing at all. One difference is the host's own: a
-/// `.ps1` script is taken before the extensions in one directory, as PowerShell takes it, and
-/// `where.exe` does not know it, so no `.ps1` is used here.
+/// Real files in real directories stand in a search path in six arrangements: a batch file in an
+/// earlier directory and a program in a later one (the earlier directory wins whatever the
+/// extension), the two the other way round, a program and two batch files in one directory (the
+/// extensions go in `PATHEXT`'s order), a `.ps1` script and a program in one directory (the script
+/// comes first, as the doctor's search takes it), a file with an extension that `PATHEXT` names
+/// but that is neither a program nor a batch file, and nothing at all. `where.exe` is no judge of
+/// the order within one directory, since it lists a directory's files as the file system gives
+/// them.
 #[cfg(windows)]
 #[test]
-fn the_search_the_doctor_makes_names_the_file_the_system_finds_first() {
-    let store = Store::new("where");
+fn the_search_the_doctor_makes_names_the_file_the_shell_finds_first() {
+    let store = Store::new("shell");
     let reading =
         Integrations::new().read(&[store.admitted(&fixture::Shape::claude_code(), |_| {})]);
     let nowhere = store.0.join("nowhere");
@@ -1520,14 +1530,17 @@ fn the_search_the_doctor_makes_names_the_file_the_system_finds_first() {
     let batch_first = store.0.join("batch-first");
     let program_later = store.0.join("program-later");
     let both = store.0.join("both");
+    let script = store.0.join("script");
     let other_extension = store.0.join("other-extension");
     executable(&batch_first, "claude.cmd");
     executable(&program_later, "claude.exe");
     executable(&both, "claude.exe");
     executable(&both, "claude.cmd");
     executable(&both, "claude.bat");
+    executable(&script, "claude.exe");
+    executable(&script, "claude.ps1");
     executable(&other_extension, "claude.vbs");
-    let arrangements: [(&str, Vec<PathBuf>); 5] = [
+    let arrangements: [(&str, Vec<PathBuf>); 6] = [
         (
             "a batch file in an earlier directory and a program in a later one",
             vec![batch_first.clone(), program_later.clone()],
@@ -1537,14 +1550,15 @@ fn the_search_the_doctor_makes_names_the_file_the_system_finds_first() {
             vec![program_later.clone(), batch_first],
         ),
         ("a program and two batch files in one directory", vec![both]),
+        ("a script and a program in one directory", vec![script]),
         (
             "a file only PATHEXT names, before a program",
             vec![other_extension, program_later],
         ),
-        ("nothing", vec![nowhere.clone()]),
+        ("nothing", vec![nowhere]),
     ];
     for (what, directories) in arrangements {
-        let system_finds = where_finds("claude", &directories, &nowhere);
+        let shell_finds = powershell_finds("claude", &directories);
         let found = resolve("claude", &directories);
         // The same file may be named in its short or its long form, so each is named by what the
         // file system makes of it.
@@ -1558,8 +1572,8 @@ fn the_search_the_doctor_makes_names_the_file_the_system_finds_first() {
         };
         assert_eq!(
             found.as_ref().map(named),
-            system_finds.first().map(named),
-            "{what}: the doctor's search and the system's differ (the system finds {system_finds:?})"
+            shell_finds.as_ref().map(named),
+            "{what}: the doctor's search and the shell's differ (the shell finds {shell_finds:?})"
         );
         let reported = report(
             Some(&reading),
