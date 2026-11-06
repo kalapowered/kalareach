@@ -69,6 +69,19 @@ export class ReceiptReads {
   readonly #named = new Map<string, number>()
   /** When this window kept the first refusal that named an action, or never. */
   #firstRefusalAt = Number.POSITIVE_INFINITY
+  /** The highest stamp this window has put on a prompt or a refusal. */
+  #stamped = 0
+
+  /**
+   * A time to put on a prompt this window sends or a refusal it keeps, by this window's clock but
+   * never at or below a stamp it has already given. A clock that steps back would otherwise put
+   * what happens next below what happened before the step, and the page would rank a newer prompt
+   * under an older action until the clock passed the older stamp.
+   */
+  stamp = (at: number = Date.now()): number => {
+    this.#stamped = Math.max(at, this.#stamped + 1)
+    return this.#stamped
+  }
 
   /** Keeps what a read of an action's record said, unless a newer revision has been read. */
   note = (receipt: Receipt): void => {
@@ -89,12 +102,13 @@ export class ReceiptReads {
    * Keeps the action a host's refusal names, which is the first identifier in its words: the one it
    * holds as the newest uncertain outcome of the conversation, or the one the quote was about.
    */
-  noteRefusal = (words: string, at: number = Date.now()): void => {
+  noteRefusal = (words: string, at?: number): void => {
     const named = ACTION_ID.exec(words)?.[0]
     if (named === undefined) return
-    this.#firstRefusalAt = Math.min(this.#firstRefusalAt, at)
+    const kept = this.stamp(at)
+    this.#firstRefusalAt = Math.min(this.#firstRefusalAt, kept)
     this.#named.delete(named)
-    this.#named.set(named, at)
+    this.#named.set(named, kept)
     for (const oldest of this.#named.keys()) {
       if (this.#named.size <= MAX_NAMED) break
       this.#named.delete(oldest)

@@ -670,7 +670,7 @@ export function MobileSession({
       const stillHere = () => openings.isCurrent(sessionId, opening)
       // The session is in the identity, so one session's outcome is never shown under another.
       const submission: Submission = {
-        ...queued(localId(sessionId, now), text.slice(0, 60), now, text),
+        ...queued(localId(sessionId, now), text.slice(0, 60), receiptReads.stamp(), text),
         sentTo: {
           applicationInstanceId: draft.target.applicationInstanceId,
           agentBindingRevision: draft.target.agentBindingRevision

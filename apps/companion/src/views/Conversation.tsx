@@ -411,7 +411,7 @@ export function Conversation({
       // The conversation it goes to is kept with it: a later prompt to the same conversation is
       // the one that can name this action's unconfirmed outcome.
       const local: Submission = {
-        ...queued(`s-${Date.now()}-${Math.random()}`, label, Date.now(), typed),
+        ...queued(`s-${Date.now()}-${Math.random()}`, label, receiptReads.stamp(), typed),
         sentTo: {
           applicationInstanceId: written.applicationInstanceId,
           agentBindingRevision: written.agentBindingRevision
