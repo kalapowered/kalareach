@@ -1031,7 +1031,7 @@ const RECORD_READER: &str = "KR_ATTACH_RECORD_READER";
 /// own virtual key, scan code, character and control-key state.
 ///
 /// The session's root shell starts this test binary, which reads the key records of the session's
-/// console with the same reader `kr attach` uses and prints the six numbers of each key that went
+/// console with the same reader `kr attach` uses and prints the five numbers of each key that went
 /// down. The console that `kr attach` runs in is written, in the documented record sequence, what a
 /// keyboard with an input method and a dead key gives it: the hiragana letter A composed by the
 /// input method (no virtual key, no scan code), the circumflex as a dead key (a virtual key and a
@@ -1090,10 +1090,10 @@ async fn a_composed_character_a_dead_key_and_alt_graph_reach_the_application_as_
     // virtual key : scan code : character : control-key state : repeat count
     let mut from = 0;
     for expected in [
-        "kr-rec:0:0:12354:0:1",
-        "kr-rec:221:26:0:0:1",
-        "kr-rec:69:18:234:0:1",
-        "kr-rec:50:3:64:9:1",
+        "kr-rec:0:0:12354:0:1;",
+        "kr-rec:221:26:0:0:1;",
+        "kr-rec:69:18:234:0:1;",
+        "kr-rec:50:3:64:9:1;",
     ] {
         match seen[from..].find(expected) {
             Some(at) => from += at + expected.len(),
@@ -1108,8 +1108,9 @@ async fn a_composed_character_a_dead_key_and_alt_graph_reach_the_application_as_
     drop(typist);
 }
 
-/// The session half of the test above: reads the key records of this console and prints the six
-/// numbers of each key that went down, until it has four.
+/// The session half of the test above: reads the key records of this console and prints the five
+/// numbers of each key that went down, each record closed with a semicolon so that a number is read
+/// to its end, until it has four.
 fn record_reader_in_the_session() {
     use kr_cli::platform::ControllingTerminal;
     use kr_cli::windows::records::{ConsoleEvent, RecordReader};
@@ -1125,7 +1126,7 @@ fn record_reader_in_the_session() {
                 && key.key_down
             {
                 println!(
-                    "kr-rec:{}:{}:{}:{}:{}",
+                    "kr-rec:{}:{}:{}:{}:{};",
                     key.virtual_key, key.scan_code, key.unicode, key.control_keys, key.repeat
                 );
                 printed += 1;
@@ -1184,7 +1185,7 @@ async fn the_console_an_attachment_ran_in_is_given_back_in_the_modes_it_had() {
         String::from_utf8_lossy(&closed.stdout),
         String::from_utf8_lossy(&closed.stderr)
     );
-    probe.waits_for("kr-probe:after:");
+    probe.waits_for("kr-probe:end");
     probe.report();
     let shown = probe.shown();
     let modes = |which: &str| -> (u32, u32) {
@@ -1261,6 +1262,7 @@ fn restore_probe_in_the_console() {
         "kr-probe:after:{:x}:{:x}:attach {status}",
         after.input, after.output
     );
+    println!("kr-probe:end");
 }
 
 /// `bytes` as lower-case hexadecimal.
