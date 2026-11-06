@@ -204,7 +204,12 @@ impl RemoteConnection {
                         (Judgement::Serve, Some(frame)) => {
                             key = Some(Box::pin(self.answer_and_write(frame)));
                         }
-                        (_, next) => held.push_back(next),
+                        (_, next) => {
+                            if let Some(frame) = next.as_ref() {
+                                self.hold_ahead(frame.frame());
+                            }
+                            held.push_back(next);
+                        }
                     }
                 }
             }

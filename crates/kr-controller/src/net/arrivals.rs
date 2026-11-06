@@ -11,6 +11,15 @@
 //! in progress, and none for a call that has gone: not for one that was refused, and not for one
 //! whose connection ended and whose work was dropped. It is kept in memory only. A daemon that
 //! restarts has no call before its claim, and a call before its claim has dispatched nothing.
+//!
+//! A connection reads some mutations ahead of the request it is answering, to serve the keys that
+//! follow, and holds them behind it ([`RemoteConnection::hold_ahead`]); each is entered when it is
+//! read, since it is on this host and will be carried out when its turn comes.
+//!
+//! One call can outlive its entry: a close whose route cannot be recorded goes on without one,
+//! because a stop is let through when storage fails, and its work continues on a task of its own
+//! after the connection has ended. A copy of it that arrives then finds neither an entry nor a
+//! route.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

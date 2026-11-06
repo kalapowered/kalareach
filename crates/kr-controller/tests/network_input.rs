@@ -521,6 +521,68 @@ async fn a_lone_escape_sent_after_a_mutation_on_its_own_connection_reaches_the_a
     rig.close().await;
 }
 
+/// KR-REQ-23.49: a mutation the daemon has read ahead of the request it is answering, and holds
+/// behind it, is on this host and will be carried out when its turn comes. A copy of it that
+/// another connection of the same device sends meanwhile, in the window the first connection holds,
+/// is refused on the daemon's own account, and is told the outcome is unknown, as the copy of any
+/// call that has not yet claimed the route of its action is: the held mutation may still run.
+///
+/// The connection's first mutation is stopped in its commit at the worker and a second follows it,
+/// which the daemon reads ahead and holds. The daemon answers the copy `PERMISSION_DENIED` until it
+/// has the held mutation among the calls it is serving, and `OUTCOME_UNKNOWN` from then on; the test
+/// asks until it is told so, and fails naming the last word if it never is. Then both mutations are
+/// let through and answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_copy_of_a_mutation_held_behind_a_stalled_request_is_told_the_outcome_is_unknown() {
+    let rig = Rig::start().await;
+    let report = rig.viewport_report();
+    let (stall, viewport) = rig.stall_own(Method::AttachmentViewport, &report).await;
+    // The window the held mutation carries, which no answer has renewed while the first is stopped.
+    let window = rig.device.action_window_id();
+    let behind = ActionId::new(kr_ipc::new_uuid());
+    let held = rig
+        .device
+        .submit(Method::AttachmentViewport, behind, rig.target(), &report)
+        .await;
+    let (device, record) = &rig.paired;
+    let other = RawDevice::connect(&rig.host, device, record).await;
+
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
+    let told = loop {
+        let refused = other
+            .try_mutate_in(
+                window.clone(),
+                Method::AttachmentViewport,
+                behind,
+                rig.target(),
+                &report,
+            )
+            .await
+            .expect("the host answers on an open control stream")
+            .expect_err("a window that is not this connection's admits nothing");
+        if refused.code == ErrorCode::OutcomeUnknown || Instant::now() >= deadline {
+            break refused;
+        }
+    };
+    stall.let_go();
+    assert_eq!(
+        told.code,
+        ErrorCode::OutcomeUnknown,
+        "the copy was refused as {told:?}, although the held mutation will run"
+    );
+
+    let mut answers = Answers::default();
+    for request in [viewport, held] {
+        let answer = answers.until(&rig.device, request, LIVENESS_DEADLINE).await;
+        assert!(
+            matches!(answer, Some(Outcome::Ok(_))),
+            "the mutation was answered {answer:?}"
+        );
+    }
+    drop(other);
+    rig.close().await;
+}
+
 /// KR-PERF-002: a lone Escape that follows a read on the device's connection reaches the
 /// application while that read waits at the worker for a session another connection's mutation is
 /// holding.

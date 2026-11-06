@@ -571,10 +571,9 @@ impl RemoteConnection {
     ) -> ControlFrame {
         // Entered among the calls that have not claimed the route of their action until it claims
         // it or ends, so a refusal of a copy of it that arrives meanwhile is worded as a repeat's.
-        let own_claim = match super::forwarding::request_of(&self.device.principal(), mutation) {
-            Some(request) => OwnClaim::arrived(self.controller.arrivals().arrive(request)),
-            None => OwnClaim::none(),
-        };
+        let own_claim = self
+            .arrival_of(mutation)
+            .map_or_else(OwnClaim::none, OwnClaim::arrived);
         match self
             .serve_mutation(mutation, asked, received_at, &own_claim)
             .await
