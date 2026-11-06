@@ -39,6 +39,22 @@ def lock_screen(series):
     ]
 
 
+SHOWN_TITLE = "Kala Reach voice call"
+
+
+def as_designed(each):
+    """One reading of the system's lock-screen state while the call is held: stop is offered, play and
+    toggle are not, the fixed title is shown, and the rate follows the microphone (pause offered, rate
+    1; muted, rate 0)."""
+    return (
+        each.get("title") == SHOWN_TITLE
+        and each.get("stopOffered") is True
+        and not each.get("playOffered")
+        and not each.get("toggleOffered")
+        and each.get("rate") == (1 if each.get("pauseOffered") else 0)
+    )
+
+
 def checks_for(report, mode, platform, send_unmeasured):
     expected = "Bearer " + report["token"]
     checks = [
@@ -93,12 +109,20 @@ def checks_for(report, mode, platform, send_unmeasured):
     checks.append(("the peer's audio device reported no error", int(not errors), "; ".join(errors)))
     if platform == "ios":
         readings = lock_screen(series)
-        offered = [each for each in readings if each.get("pauseOffered") and each.get("title")]
-        checks.append((
-            "the lock screen offered pause while the call was held",
-            1 if offered else 2,
-            "%d of %d readings" % (len(offered), len(readings)) if offered else "no reading showed the controls; the call was not permitted, so the audio unit did not start",
-        ))
+        shown = [each for each in readings if each.get("title")]
+        offered = [each for each in shown if each.get("pauseOffered")]
+        wrong = [each for each in shown if not as_designed(each)]
+        # The audio unit starts only when the call is permitted, so a peer that heard the call is proof
+        # that it was: controls never read then are a failure, not a call that was not permitted.
+        if offered and not wrong:
+            verdict, said = 1, "%d of %d readings" % (len(offered), len(readings))
+        elif wrong:
+            verdict, said = 0, "a reading of the held call was not as designed: " + json.dumps(wrong[0], sort_keys=True)
+        elif heard == 1:
+            verdict, said = 0, "no reading offered pause, though the peer heard the call, which was therefore permitted"
+        else:
+            verdict, said = 2, "no reading showed the controls; the peer heard nothing, so the call may not have been permitted"
+        checks.append(("the lock screen offered pause while the call was held", verdict, said))
         if readings:
             last = readings[-1]
             clear = not (last.get("pauseOffered") or last.get("stopOffered") or last.get("playOffered") or last.get("toggleOffered") or last.get("title"))

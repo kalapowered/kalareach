@@ -85,7 +85,7 @@ r = {
         "errors": [],
         "figures": [
             sample(1, packetsReceived=0, packetsSent=10, recorderStarted=True, errors=[],
-                   lockScreen={"pauseOffered": True, "stopOffered": True, "playOffered": False, "toggleOffered": False, "title": "Call", "rate": 1.0}),
+                   lockScreen={"pauseOffered": True, "stopOffered": True, "playOffered": False, "toggleOffered": False, "title": "Kala Reach voice call", "rate": 1.0}),
             sample(9, packetsReceived=400, packetsSent=450, recorderStarted=True, errors=[],
                    lockScreen={"pauseOffered": False, "stopOffered": False, "playOffered": False, "toggleOffered": False, "title": None, "rate": None}),
         ],
@@ -108,7 +108,9 @@ report good "pass"
 report never-down "r['went_down'] = False"
 report deaf-peer "r['peer']['figures'] = [f for f in r['peer']['figures']]; [f['figures'].update(packetsReceived=3) for f in r['peer']['figures']]"
 report lock-screen-stays "r['peer']['figures'][-1]['figures']['lockScreen']['pauseOffered'] = True"
-report never-offered "[f['figures']['lockScreen'].update(pauseOffered=False) for f in r['peer']['figures']]"
+report never-offered "[f['figures']['lockScreen'].update(pauseOffered=False, stopOffered=False, title=None, rate=None) for f in r['peer']['figures']]"
+report never-offered-unheard "[f['figures']['lockScreen'].update(pauseOffered=False, stopOffered=False, title=None, rate=None) for f in r['peer']['figures']]; [f['figures'].update(packetsReceived=3) for f in r['peer']['figures']]"
+report play-offered "r['peer']['figures'][0]['figures']['lockScreen']['playOffered'] = True"
 report unanswered "r['peer']['answered'] = 0; r['peer']['errors'] = ['no connection to the peer']"
 judge_report good android 0
 judge_report good ios 0
@@ -116,7 +118,9 @@ judge_report never-down android 2
 judge_report deaf-peer android 2
 judge_report deaf-peer android 4 --send-unmeasured
 judge_report lock-screen-stays ios 2
-judge_report never-offered ios 4
+judge_report never-offered ios 2
+judge_report play-offered ios 2
+judge_report never-offered-unheard ios 4 --send-unmeasured
 judge_report unanswered android 2
 
 [ "$failed" = 0 ] && echo "the judges decide every case as they should"
