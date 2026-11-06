@@ -153,6 +153,15 @@ fn an_escape_the_person_binds_after_the_first_prompt_leaves_the_keys_behind_it_t
     );
 }
 
+/// KR-REQ-08.48: the keys typed while the module asks the terminal for its settings are the person's own.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn keys_typed_while_the_module_asks_the_terminal_for_its_settings_are_the_persons_own() {
+    shellpkg::keys_typed_while_the_module_asks_the_terminal_for_its_settings_are_the_persons_own(
+        PWSH,
+    );
+}
+
 /// KR-REQ-08.48: in the Windows edit mode the keys typed ahead of a read are the person's own.
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]

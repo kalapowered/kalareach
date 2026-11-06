@@ -2110,12 +2110,9 @@ fn keys_typed_ahead_of_a_read_after_a_binding_made_at_the_prompt(
         "the shell drew no prompt after the line:\n{}",
         session.terminal_output()
     );
-    // The prompt is drawn before the module sends the read's entry, and in between it runs a
-    // program of its own to ask the terminal for its settings. While that program has the
-    // terminal, the runtime gives the terminal back its line mode: a key typed then is shown by
-    // the terminal itself and a return reaches the editor as a line feed, which it does not take
-    // for Enter. Once the read's entry has arrived, that program has ended and the terminal is
-    // the editor's again.
+    // The prompt is drawn before the module sends the read's entry, and the module does some work
+    // of its own in between. The keys are typed ahead of a read the module holds at its entry,
+    // so they are typed once that entry has arrived.
     session.until("the entry of the read after the line", |commands| {
         commands.entries.len() > entries
     });
@@ -2126,6 +2123,125 @@ fn keys_typed_ahead_of_a_read_after_a_binding_made_at_the_prompt(
     assert!(
         session.wait_for_output_after_by(start, expected, deadline),
         "{complaint}:\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// A `stty` that, once, says what mode the terminal is in while it runs, waits until the case lets
+/// it go, then does what `stty` does. The case puts the directory it lives in first on the shell's path
+/// and arms it with a file; the pipe is what it waits on, so no time is measured.
+#[cfg(unix)]
+const HELD_STTY: &str = "#!/bin/sh\n\
+    if [ -e \"$KR_STTY_HOLD/armed\" ] && mv \"$KR_STTY_HOLD/armed\" \"$KR_STTY_HOLD/used\" 2>/dev/null; then\n\
+    settings=$(stty -a </dev/tty 2>/dev/null | tr '\\n' ' ')\n\
+    case \" $settings \" in *\" -icanon \"*) mode=raw ;; *) mode=line ;; esac\n\
+    printf 'kr-stty-held-%s\\n' \"$mode\" > /dev/tty\n\
+    read -r _ < \"$KR_STTY_HOLD/release\"\n\
+    fi\n\
+    PATH=${PATH#*:}\n\
+    exec stty \"$@\"\n";
+
+/// KR-REQ-08.48: the keys a person types while the module asks the terminal for its settings are
+/// theirs, whole, and a return among them is accepted.
+///
+/// Between drawing the prompt and sending the read's entry the module runs `stty` once, to learn
+/// the terminal's end-of-file character. The runtime puts the terminal in line mode for as long as
+/// a program runs that has the terminal for any of its three standard streams, and a terminal in
+/// line mode shows every key itself and hands the editor a line feed where the return was, which
+/// the editor does not take for Enter. The case puts a `stty` first on the shell's path that
+/// says what mode the terminal is in while it runs and waits, moves the shell to the directory it
+/// lives in (the path names it by a relative entry), runs a line so that the next read is the one
+/// it waits in, expects the terminal to be raw, types a line and a return while it waits, lets it
+/// go, and expects the line to run.
+///
+/// # Panics
+///
+/// Panics when the line the keys spell does not run.
+#[cfg(unix)]
+pub fn keys_typed_while_the_module_asks_the_terminal_for_its_settings_are_the_persons_own(
+    kind: ShellKind,
+) {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = tempfile::Builder::new()
+        .prefix("kr-stty-")
+        .tempdir()
+        .expect("a directory for the held program");
+    let programs = fixture.path().join("kr-stty-bin");
+    let hold = fixture.path().join("hold");
+    std::fs::create_dir(&programs).expect("a directory for the held program's path");
+    std::fs::create_dir(&hold).expect("a directory for the held program's state");
+    let release = hold.join("release");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&release)
+            .status()
+            .expect("mkfifo starts")
+            .success(),
+        "no pipe to let the held program go on"
+    );
+    // Opened for reading and writing here, before the program is started, so that neither side
+    // waits for the other to open it: the program opens it to read, and a byte written here waits
+    // in it until the program reads.
+    let mut pipe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&release)
+        .expect("the pipe opens");
+    let program = programs.join("stty");
+    std::fs::write(&program, HELD_STTY).expect("the held program");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("an executable held program");
+
+    let package = Package::built(kind);
+    // The held program is named on the path by a relative entry, and the shell is moved to the
+    // directory that holds it: the module has to look for `stty` where the shell is, which is not
+    // the directory the shell was started in.
+    let path = format!("kr-stty-bin:{}", std::env::var("PATH").unwrap_or_default());
+    let mut session = Session::start_with(
+        &package,
+        &[
+            ("PATH".to_owned(), path),
+            ("KR_STTY_HOLD".to_owned(), hold.display().to_string()),
+        ],
+    );
+    session.first_prompt();
+    session.stepping = false;
+    // The program waits in the read that follows the next line, which moves the shell.
+    std::fs::write(hold.join("armed"), b"").expect("the file that arms the held program");
+    // Counted from before the line runs: the program can say it is running before the line's own
+    // check has returned.
+    let waiting = session.written();
+    let moving = format!(
+        "Set-Location '{}'; {}",
+        fixture.path().display(),
+        print_assembled(kind, "kr-armed")
+    );
+    assert!(
+        session.run(&moving, "kr-armed"),
+        "the line that moves the shell did not run:\n{}",
+        session.terminal_output()
+    );
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(waiting, "kr-stty-held-", deadline),
+        "the module never asked the terminal for its settings:\n{}",
+        shown_since(&session, waiting)
+    );
+    assert!(
+        shown_since(&session, waiting).contains("kr-stty-held-raw"),
+        "the terminal was in line mode while the module asked it for its settings:\n{}",
+        shown_since(&session, waiting)
+    );
+
+    let start = session.written();
+    session.type_bytes(format!("{}\r", print_assembled(kind, "kr-held")).as_bytes());
+    pipe.write_all(b"\n").expect("the held program is let go");
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-held", deadline),
+        "the line typed while the module asked the terminal for its settings did not run:\n{}",
         shown_since(&session, start)
     );
 }

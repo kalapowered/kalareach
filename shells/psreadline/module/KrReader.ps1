@@ -768,25 +768,60 @@ function Write-KrHint {
     } catch { }
 }
 
+# What `stty -a` says of the terminal, or nothing when it says nothing.
+#
+# The runtime puts the terminal in its line mode, where the terminal shows every key itself and
+# gives the editor a line feed where the return was, for as long as a program runs that has the
+# terminal for any of its three standard streams. A key the person types in that time is shown
+# twice and a return among the keys is not the editor's Enter. So the program is started with all
+# three streams redirected, which leaves the terminal as the editor has it, and the terminal is
+# given to `stty` by the system shell, which opens it by path as `stty`'s input: that works for the
+# BSD `stty` and for the GNU one, which name a terminal by different options. The shell is started
+# by its absolute path, so that no program of the current directory is found in its place, and it
+# finds `stty` on the path as the person's own shell would, not as a function or an alias of theirs.
+# The terminal it reads is the controlling one, which is the terminal the editor reads in a terminal
+# emulator, a multiplexer or a login with a terminal. A shell whose input is another terminal than
+# its controlling one gets the controlling terminal's character, and one with no controlling
+# terminal gets none, and the gesture is then not enabled. The program starts in the directory the
+# shell is in, as the program of a command line would, so that a relative entry of the path means
+# what it means at the prompt.
+function Read-KrTerminalSettings {
+    $start = [System.Diagnostics.ProcessStartInfo]::new('/bin/sh')
+    foreach ($argument in '-c', 'exec stty -a </dev/tty') { $start.ArgumentList.Add($argument) }
+    $directory = Get-KrFileSystemDirectory
+    if ($directory) { $start.WorkingDirectory = $directory }
+    $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    try {
+        $process = [System.Diagnostics.Process]::Start($start)
+    } catch {
+        return $null
+    }
+    try {
+        $process.StandardInput.Close()
+        $output = $process.StandardOutput.ReadToEndAsync()
+        $null = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $output.GetAwaiter().GetResult()
+    } catch {
+        $null
+    } finally {
+        $process.Dispose()
+    }
+}
+
 # The terminal's own end-of-file character, or -1 when it has none.
 #
 # The host reads keys rather than the line discipline's own characters, so the gesture is read from
 # the terminal and matched against the key the reader was given. `stty` is what a shell has here;
-# it is asked once per prompt rather than once per key.
+# it is asked once per prompt rather than once per key, and `Read-KrTerminalSettings` says how.
 function Get-KrTerminalEof {
     if ($IsWindows) { return -1 }
-    # `stty` leaves its own exit code in `$LASTEXITCODE`, which is the code of the last program the
-    # person ran and stays theirs: it is put back as it was, or taken out if there was none.
-    $before = $ExecutionContext.SessionState.PSVariable.GetValue('LASTEXITCODE')
-    $settings = try { & stty -a 2>$null } catch { $null }
-    if ($null -ne $before) {
-        $global:LASTEXITCODE = $before
-    } else {
-        Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
-    }
+    $settings = Read-KrTerminalSettings
     if (-not $settings) { return -1 }
-    $text = ($settings -join ' ')
-    if ($text -notmatch 'eof\s*=\s*([^;]+);') { return -1 }
+    if ($settings -notmatch 'eof\s*=\s*([^;]+);') { return -1 }
     $value = $Matches[1].Trim()
     if ($value -eq '<undef>' -or $value -eq 'undef' -or $value -eq '^-') { return -1 }
     if ($value -match '^\^(.)$') {
