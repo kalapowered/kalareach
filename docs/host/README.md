@@ -7399,10 +7399,12 @@ have issued.
 
 `grant.list` is the list of grants, each of which includes its expiry date as well as its effective
 end date, which is the earlier of its expiry date and the end of the pairing of the grantee. A grant
-is listed as pending, active, expired or revoked. It is listed as expired when its end is on record
-or when either of its two deadlines, on the continuous clock or in UTC, has passed, which is how the
-host decides it for every other use of the grant. While the host cannot decide that for a grant, the
-list is refused with `CLOCK_UNTRUSTED` or `STORAGE_UNAVAILABLE`.
+is listed as pending, active, expired or revoked. A revoked grant is listed as revoked, whatever its
+time says. A grant that expires and is not revoked is listed as expired when its end is on record or
+when either of its two deadlines, on the continuous clock or in UTC, has passed. While the host
+cannot decide that for a grant, it refuses the list. `CLOCK_UNTRUSTED` lasts until the owner
+establishes the clock with `host.clock.establish`; `STORAGE_UNAVAILABLE` is transient, and the
+caller asks again.
 `device.list` is the list of devices, each of which indicates the platform of the device, the end of
 the pairing of the device, whether the pairing of the device has run out as far as the host is
 concerned and whether the pairing opens all sessions of the environment. Note that sharing a session
