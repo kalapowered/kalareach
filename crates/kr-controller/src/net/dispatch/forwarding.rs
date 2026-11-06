@@ -223,9 +223,10 @@ impl RemoteConnection {
     ///
     /// The route is read now, when the refusal is worded, because a copy of the request can claim it
     /// at any point while this one waits. A route this call made itself does not count, so a first
-    /// request refused after its own claim is refused as ever, and a route that holds another
-    /// request under the identifier does not either, so a reused identifier keeps its code. A code
-    /// that is already `OUTCOME_UNKNOWN` is told as it is.
+    /// request refused after its own claim is refused as ever. A route that holds another request
+    /// under the identifier does not either: the identifier is spent, no copy of this request can
+    /// have been carried out under it, and the refusal keeps its code however many copies of this
+    /// request are queued. A code that is already `OUTCOME_UNKNOWN` is told as it is.
     pub(super) fn told_of_a_repeat(
         &self,
         own_claim: &OwnClaim,
@@ -234,12 +235,24 @@ impl RemoteConnection {
     ) -> ProtocolError {
         if error.code == ErrorCode::OutcomeUnknown
             || own_claim.is_made()
+            || self.route_holds_another_request(mutation)
             || !(self.another_copy_has_not_claimed(own_claim, mutation)
                 || self.holds_a_route_for(mutation))
         {
             error
         } else {
             outcome_not_shown()
+        }
+    }
+
+    /// Whether the route of the action a mutation carries holds another request, which makes the
+    /// identifier a reused one that nothing is carried out under for this request.
+    fn route_holds_another_request(&self, mutation: &MutationRequest) -> bool {
+        let actor_id = self.device.principal();
+        match self.devices.action_route(&actor_id, mutation.action_id) {
+            Ok(Some(routed)) => kr_protocol::digest::mutation_digest(mutation, &actor_id)
+                .is_ok_and(|digest| routed.payload_digest != Some(digest)),
+            Ok(None) | Err(_) => false,
         }
     }
 
@@ -714,7 +727,22 @@ impl RemoteConnection {
         decided: &Asked,
         asked: &mut Option<Asked>,
     ) -> std::result::Result<ControlFrame, ProtocolError> {
-        *asked = Some(decided.clone().kept());
+        // A reused identifier is this host's word about the identifier and names no result, so it
+        // is no read of a record and is shown as it is, whoever asks. It is written under the
+        // decision of the request, not as an answer kept from an earlier submission: a refusal to
+        // write a kept answer is told as an unknown outcome, and nothing was carried out here.
+        let reused = matches!(
+            &kept,
+            ControlFrame::Response(Response {
+                outcome: Outcome::Error(error),
+                ..
+            }) if error.code == ErrorCode::IdConflict
+        );
+        *asked = Some(if reused {
+            decided.clone()
+        } else {
+            decided.clone().kept()
+        });
         #[cfg(feature = "testing")]
         self.controller.after_the_retained_lookup.wait().await;
         // What this host holds is the outcome of an action. When it will not show the device
@@ -722,14 +750,7 @@ impl RemoteConnection {
         if self.admitted_to_answer(validated).is_err() {
             return Err(outcome_not_shown());
         }
-        // A reused identifier is this host's word about the identifier and names no result, so it
-        // is no read of a record and is shown as it is, whoever asks.
-        if let ControlFrame::Response(Response {
-            outcome: Outcome::Error(error),
-            ..
-        }) = &kept
-            && error.code == ErrorCode::IdConflict
-        {
+        if reused {
             return Ok(kept);
         }
         // The answer is a read of what an earlier submission produced, and is written under the

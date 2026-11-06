@@ -785,7 +785,9 @@ async fn the_project_service_gives_a_refusal_another_copy_recorded_first_as_a_co
 
 /// KR-REQ-09.09: a reused identifier found by a service's own lookup is this host's word about the
 /// identifier and names no result, so the door shows it as it is to a device that may not read the
-/// record the identifier was spent on, as it shows a create's.
+/// record the identifier was spent on, as it shows a create's. It is written under the decision of
+/// the request and not as an answer kept from an earlier submission, which a refusal to write it
+/// would turn into an unknown outcome although nothing was carried out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reused_identifier_is_shown_to_a_device_that_may_not_read_the_record() {
     let world = fake::fake_worker(None).await;
@@ -839,6 +841,12 @@ async fn a_reused_identifier_is_shown_to_a_device_that_may_not_read_the_record()
         )
         .await;
     assert_eq!(answer.ok(), Some(kept));
+    assert!(
+        !asked
+            .expect("the decision the answer is written under")
+            .is_kept(),
+        "a reused identifier is not an answer kept from an earlier submission"
+    );
     world.serving.abort();
 }
 

@@ -1773,6 +1773,10 @@ impl Controller {
     ///
     /// `receive` is what the device the close came from said it can receive, which the link the
     /// close opens says to the worker; a close with no device behind it says the usual limits.
+    ///
+    /// Returns whether the close went as far as the worker: whether a link to it was opened, so
+    /// that the close was carried out or may have been. A close of a session that is not running
+    /// here, or whose deadline had passed, or whose link could not be opened, did nothing.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn close_remote_session(
         self: &Arc<Self>,
@@ -1784,7 +1788,7 @@ impl Controller {
         answer: tokio::sync::oneshot::Sender<Result<ClosedRemotely>>,
         delivered: tokio::sync::oneshot::Receiver<()>,
         receive: kr_protocol::hello::ReceiveLimits,
-    ) {
+    ) -> bool {
         let mut link = None;
         let mut retained = Retained::Not;
         let settled = self
@@ -1808,10 +1812,12 @@ impl Controller {
         // way through a closure. The device's own answer does not wait for the review.
         self.review_power_soon();
         let _ = answer.send(settled);
+        let reached_the_worker = link.is_some();
         if let Some(proxy) = link {
             let _ = tokio::time::timeout(CLOSE_DELIVERY, delivered).await;
             proxy.close();
         }
+        reached_the_worker
     }
 
     /// The close itself. `link` receives the link it opened, whichever way the close ended.

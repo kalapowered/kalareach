@@ -896,7 +896,7 @@ impl RemoteConnection {
                 let standing = self.feed_standing(&decided.acting.grant);
                 let entered = own_claim.shared_with_the_work();
                 tokio::spawn(async move {
-                    controller
+                    let reached_the_worker = controller
                         .close_remote_session(
                             &mutation,
                             Vouched {
@@ -915,9 +915,12 @@ impl RemoteConnection {
                             receive,
                         )
                         .await;
-                    // The close has no route and its entry goes with this task. A copy that arrives
-                    // later finds the request kept as one carried out without a route.
-                    if let Some(entered) = entered {
+                    // The close has no route and its entry goes with this task. A close that was
+                    // carried out, or may have been, is kept: a copy that arrives later finds the
+                    // request kept as one carried out without a route. A close that never reached
+                    // the worker did nothing, and keeps nothing: its copy is refused as any request
+                    // the host has not seen.
+                    if reached_the_worker && let Some(entered) = entered {
                         entered.settle_without_a_route();
                     }
                 });

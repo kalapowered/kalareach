@@ -24,9 +24,10 @@
 //! A close whose route cannot be recorded goes on without one, because a stop is let through when
 //! storage fails, and its work continues on a task of its own after the connection has ended. The
 //! task keeps the call's entry until it ends, so a copy of the close that arrives meanwhile finds
-//! the entry in place of the route. When the work ends, the request is kept as one that was carried
-//! out with no route ([`Arrival::settle_without_a_route`]), so a copy that arrives later still finds
-//! something to read: the last [`UNROUTED_KEPT`] such closes, in memory only. A daemon that
+//! the entry in place of the route. When the work ends having reached the worker, the request is
+//! kept as one that was carried out with no route ([`Arrival::settle_without_a_route`]), so a copy
+//! that arrives later still finds something to read: the last [`UNROUTED_KEPT`] such closes, in
+//! memory only. A close that never reached the worker did nothing and keeps nothing. A daemon that
 //! restarts has none, and a copy of a close it carried out before the restart is asked as a
 //! request the host never routed.
 
