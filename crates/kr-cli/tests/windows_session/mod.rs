@@ -28,6 +28,43 @@ pub fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
 
+/// The session's root shell as its worker reports it now, by the identity it was started under, or
+/// nothing when the worker reports none. The worker is reached on a connection of its own, through
+/// its descriptor, as a command would.
+pub async fn root_process_of(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    session_id: kr_protocol::ids::SessionId,
+) -> Option<kr_protocol::identity::ProcessStartIdentity> {
+    let descriptor = kr_ipc::descriptor::read_all(environment)
+        .expect("reads the runtime directory")
+        .into_iter()
+        .filter_map(|entry| entry.descriptor.ok())
+        .find(|descriptor| descriptor.session_id == session_id)
+        .expect("the session's descriptor is published");
+    let endpoint = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the worker");
+    client
+        .verify_worker(&descriptor)
+        .await
+        .expect("the worker answers the descriptor's challenge");
+    let snapshot: kr_protocol::recovery::EventsSnapshotResult = client
+        .request(
+            kr_protocol::method::Method::EventsSnapshot,
+            &kr_protocol::recovery::EventsSnapshotParams {
+                session_id,
+                agent_resources_from: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the worker answers the snapshot")
+        .to_typed()
+        .expect("decodes");
+    snapshot.session.root_process.as_ref().cloned()
+}
+
 /// A terminal attached to a real worker's session, holding its keys: what it types reaches the
 /// session's root shell, and what the session writes reaches it.
 pub struct WorkerTerminal {
@@ -168,26 +205,6 @@ impl WorkerTerminal {
             .to_typed()
             .expect("decodes");
         self.sequence += 1;
-    }
-
-    /// The session's root shell as its worker reports it now, by the identity it was started under,
-    /// or nothing when the worker reports none.
-    pub async fn root_process(&mut self) -> Option<kr_protocol::identity::ProcessStartIdentity> {
-        let snapshot: kr_protocol::recovery::EventsSnapshotResult = self
-            .client
-            .request(
-                kr_protocol::method::Method::EventsSnapshot,
-                &kr_protocol::recovery::EventsSnapshotParams {
-                    session_id: self.session_id,
-                    agent_resources_from: Nullable::null(),
-                },
-            )
-            .await
-            .expect("the call reaches the worker")
-            .expect("the worker answers the snapshot")
-            .to_typed()
-            .expect("decodes");
-        snapshot.session.root_process.as_ref().cloned()
     }
 
     /// What the session has written so far, with its control sequences and line breaks taken out,

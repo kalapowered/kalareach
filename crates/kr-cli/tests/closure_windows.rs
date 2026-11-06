@@ -21,7 +21,7 @@ mod support;
 mod teardown;
 mod windows_session;
 
-use windows_session::{LIVENESS_DEADLINE, WorkerHost, WorkerTerminal};
+use windows_session::{LIVENESS_DEADLINE, WorkerHost, WorkerTerminal, root_process_of};
 
 /// A program of the system directory.
 fn system32(program: &str) -> String {
@@ -131,9 +131,8 @@ async fn opened(
         .find(|descriptor| descriptor.session_id == session)
         .expect("the session's descriptor is published")
         .process_start_identity;
-    let mut typist = WorkerTerminal::attach(&environment, session, dimensions).await;
-    let root = typist
-        .root_process()
+    let typist = WorkerTerminal::attach(&environment, session, dimensions).await;
+    let root = root_process_of(&environment, session)
         .await
         .expect("the worker reports the session's root shell");
     (session, typist, worker, root)
@@ -148,7 +147,7 @@ async fn opened(
 /// number of its own.
 async fn nothing_started_the_closed_session_again(
     host: &WorkerHost,
-    (session, mut terminal, worker, root): (
+    (session, terminal, worker, root): (
         kr_protocol::ids::SessionId,
         WorkerTerminal,
         ProcessStartIdentity,
@@ -172,7 +171,7 @@ async fn nothing_started_the_closed_session_again(
         named, root,
         "the shell the closure names is the one the session started with: {closed}"
     );
-    let now = terminal.root_process().await;
+    let now = root_process_of(&host.tree.environment(), session).await;
     assert!(
         now.as_ref().is_none_or(|reported| *reported == root),
         "no other shell took the root's place: the worker reports {now:?}, the session started with {root:?}"
