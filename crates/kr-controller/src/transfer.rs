@@ -969,7 +969,13 @@ impl TransferModule {
             // An exact repeat that carries no freshness is only ever allowed to finish an effect
             // its action already claimed, which is the one thing a lapsed window does not take
             // from it. Anything else it asks for is a first admission, and has none.
-            if admission.settling && !service.claim_is_open(&actor, action_id, name, digest)? {
+            if admission.settling
+                && !service
+                    .claim_is_open(&actor, action_id, name, digest)
+                    .map_err(|error| {
+                        ControllerError::found_unreadable_on_the_wire(error.into(), RECORDS)
+                    })?
+            {
                 // A claim moves from open to settled and never back, so one that is not open
                 // now and was when the lookup above found it open has been settled since, and
                 // what it was settled with is the answer.
