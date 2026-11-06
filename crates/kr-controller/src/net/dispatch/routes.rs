@@ -8,7 +8,7 @@ use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{RequestId, SessionId};
+use kr_protocol::ids::RequestId;
 use kr_protocol::method::Method;
 
 use super::super::proxy::Vouched;
@@ -835,16 +835,17 @@ impl RemoteConnection {
                         .session_create(&actor_id, &mutation, carried)
                         .await
                 });
-                let answer = settled(
-                    request_id,
-                    tokio::time::timeout(crate::service::CREATE_WAIT, effect).await,
-                );
                 // A create the daemon answered from the reservation an earlier submission made is
-                // the same read of somebody's result as a retained answer anywhere else, and it
-                // says so: `deduplicated` is what distinguishes it from a session made now. It is
-                // told as any answer read from a record is.
-                copied |= deduplicated(&answer);
-                answer
+                // the same read of somebody's result as a retained answer anywhere else, whether
+                // that attempt launched a session or failed to, and it says so. It is told as any
+                // answer read from a record is.
+                noting(
+                    &mut copied,
+                    settled_by_a_service(
+                        request_id,
+                        tokio::time::timeout(crate::service::CREATE_WAIT, effect).await,
+                    ),
+                )
             }
             // A close is dispatched to the worker, so it goes over a bounded link of its own
             // rather than over the connection this host announces authority revisions on: a worker
@@ -1729,36 +1730,4 @@ fn framed_protocol(
 fn noting(copied: &mut bool, given: Given<ControlFrame>) -> ControlFrame {
     *copied |= given.is_copied();
     given.into_answer()
-}
-
-/// Returns whether an answer is a create the daemon deduplicated rather than performed.
-fn deduplicated(answer: &ControlFrame) -> bool {
-    let ControlFrame::Response(Response {
-        outcome: Outcome::Ok(value),
-        ..
-    }) = answer
-    else {
-        return false;
-    };
-    value
-        .to_typed::<kr_protocol::session::SessionCreateResult>()
-        .is_ok_and(|created| created.deduplicated)
-}
-
-/// Returns the session a retained answer is about, when it names one.
-///
-/// A create's result names the session it made, which is the subject the answer is a read of. An
-/// answer that names none leaves the selector nothing to check, and the grant's own scope decides.
-pub(super) fn answered_session(answer: &ControlFrame) -> Option<SessionId> {
-    let ControlFrame::Response(Response {
-        outcome: Outcome::Ok(value),
-        ..
-    }) = answer
-    else {
-        return None;
-    };
-    value
-        .to_typed::<kr_protocol::session::SessionCreateResult>()
-        .ok()
-        .map(|created| created.session.session_id)
 }

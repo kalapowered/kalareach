@@ -389,6 +389,88 @@ async fn a_deduplicated_create_is_told_as_a_kept_answer() {
     }
 }
 
+/// KR-REQ-09.09: a create the daemon answers from a reservation whose first attempt failed is an
+/// answer read from a record, as one made from a session that was launched is. The copy is stopped
+/// before its effect, and meanwhile another copy has reserved the session and failed to launch it.
+/// A device that may read the session the reservation holds is given the refusal the reservation
+/// leaves, held as a kept answer; one that may not is told the outcome is unknown, since that the
+/// create failed is not for a device that may not read the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deduplicated_create_that_failed_is_told_as_a_kept_answer() {
+    let without_viewing: Vec<ActionRight> = ActionRight::ALL
+        .iter()
+        .copied()
+        .filter(|right| *right != ActionRight::SessionView)
+        .collect();
+    for (rights, may_read) in [(EVERY_RIGHT, true), (without_viewing.as_slice(), false)] {
+        let world = fake::fake_worker(None).await;
+        let controller = &world.controller;
+        let (connection, _) = paired_connection(controller, 86, rights);
+        let create =
+            crate::service::a_create_that_launches_nothing::create_params(world.environment_id);
+        let mutation = mutation_of(
+            &world,
+            &connection,
+            Method::SessionCreate,
+            91,
+            ParamsValue::from_typed(&create).expect("encodes"),
+        );
+
+        let (arrived, go) = controller.before_the_effect.arm();
+        let (answered, ()) = tokio::join!(
+            connection.answer_now(ControlFrame::Mutation(Box::new(mutation.clone()))),
+            async {
+                tokio::time::timeout(WAIT_BOUND, arrived)
+                    .await
+                    .expect("the copy reaches the place it is stopped at")
+                    .expect("the pause is armed");
+                let actor = connection.device.principal();
+                let digest =
+                    kr_protocol::digest::mutation_digest(&mutation, &actor).expect("a digest");
+                let intent = kr_cbor::to_canonical_vec(&create).expect("encodes");
+                {
+                    let mut registry = controller.registry.lock().await;
+                    let admitted = registry
+                        .reserve(
+                            &actor,
+                            mutation.action_id.get(),
+                            digest,
+                            &intent,
+                            kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+                        )
+                        .expect("the other copy's reservation");
+                    registry
+                        .set_phase(
+                            admitted.reservation.reservation_id,
+                            crate::registry::LaunchPhase::Failed,
+                        )
+                        .expect("the launch failed");
+                }
+                go.send(()).expect("the copy goes on");
+            }
+        );
+        let answered = answered.expect("the copy is answered");
+        let told = refusal_of(&answered);
+        if may_read {
+            assert_eq!(told.code, ErrorCode::ResourceUnavailable, "{told:?}");
+            assert!(
+                told.message.contains("failed"),
+                "the recorded phase is told: {told:?}"
+            );
+            assert!(
+                answered
+                    .asked
+                    .as_ref()
+                    .is_some_and(super::decision::Asked::is_kept),
+                "and held as a kept answer"
+            );
+        } else {
+            assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+        }
+        world.serving.abort();
+    }
+}
+
 /// KR-REQ-09.09: an owner device's request for the confirmation that establishes the host's clock.
 /// The challenge is recorded with the action, and a copy of the request is given the challenge the
 /// first recorded.

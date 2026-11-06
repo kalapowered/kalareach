@@ -1599,7 +1599,7 @@ async fn a_kept_owner_confirmation_answer_is_told_as_unknown_when_a_feed_refusal
         .read_of_retained(
             Method::OwnerConfirmationRequest,
             &request,
-            &kept,
+            None,
             &pending.acting,
         )
         .expect("the read is decided")
