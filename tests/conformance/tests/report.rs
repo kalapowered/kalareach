@@ -1382,6 +1382,59 @@ fn a_listing_that_fails_leaves_what_it_said_in_the_log_and_the_end_of_it_in_the_
     assert!(!document.passed());
 }
 
+/// A crate whose macro writes a file into the build script's output directory while the crate
+/// compiles (Tauri's context macro does it with an application's icon and front end) is out of date
+/// to Cargo in the next call: the file is newer than the start of the compile that read it. The
+/// step's tests are built once, and neither the listing nor the run builds them again.
+#[test]
+fn a_file_a_macro_writes_while_a_crate_compiles_does_not_have_the_listing_build_it_again() {
+    let evidence = tempfile::tempdir().expect("an evidence directory");
+    // A target directory of its own, so that the macro runs in this test's build.
+    let target = tempfile::tempdir().expect("a target directory");
+    let options = Options {
+        root: tree("late"),
+        evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
+        selection: Some(vec![Group::Rust]),
+        all_terminals: false,
+        platform: Platform::current(),
+        case_tables: &[],
+        lanes: &[],
+        ignored_runs: None,
+        applications: None,
+        steps: Some(vec![Step::cargo(
+            Group::Rust,
+            "the tree's tests",
+            &["test", "--locked", "-p", "late", "--no-fail-fast"],
+        )]),
+        lister: lister(),
+        environment: vec![(
+            "CARGO_TARGET_DIR".to_owned(),
+            target.path().to_string_lossy().into_owned(),
+        )],
+    };
+    let document = report::run(&options, &mut |_| {}).expect("runs");
+    let step = &document.steps[0];
+    assert!(step.error.is_none(), "{step:?}");
+    let log = std::fs::read_to_string(evidence.path().join(&step.log)).expect("the step's log");
+    assert!(
+        log.lines().any(|line| line.contains("Compiling late ")),
+        "the build did not compile the crate, so the macro did not run in it:\n{log}"
+    );
+    assert!(
+        !log.contains("the listing compiled again"),
+        "the listing built what the build before it had built:\n{log}"
+    );
+    let run = log
+        .split("\n== cargo test ")
+        .nth(1)
+        .expect("the log holds the step's run");
+    assert!(
+        !run.contains("Compiling "),
+        "the run built what the build before it had built:\n{log}"
+    );
+    assert!(document.passed());
+}
+
 #[test]
 fn a_test_that_records_a_known_difference_is_never_counted_as_a_pass() {
     let (document, _evidence) = run("known").unwrap_or_else(|stopped| panic!("{stopped:?}"));

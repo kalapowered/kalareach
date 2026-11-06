@@ -579,13 +579,13 @@ fn list(
         .stderr(Stdio::piped())
         .output()
         .map_err(|error| format!("the step's tests could not be listed: {error}"))?;
+    let standard_error = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         let command = command.join(" ");
         let code = output
             .status
             .code()
             .map_or_else(|| "by a signal".to_owned(), |code| code.to_string());
-        let standard_error = String::from_utf8_lossy(&output.stderr);
         let kept = keep_failed_listing(
             log_path,
             &format!("`{command}` (exit {code})"),
@@ -597,6 +597,19 @@ fn list(
             "`{command}` did not list the step's tests (exit {code}); {} ({kept})",
             ends_of(&libtest::plain(&standard_error), place.root)
         ));
+    }
+    // A listing is not a build: the step's tests were built before it. Say so in the log when it
+    // compiled anything, which takes time and disk the step's own run does not account for.
+    let compiled: Vec<&str> = standard_error
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("Compiling "))
+        .collect();
+    if !compiled.is_empty() {
+        let _ = append_to_log(
+            log_path,
+            &format!("== the listing compiled again:\n{}\n", compiled.join("\n")),
+        );
     }
     read_listing(&String::from_utf8_lossy(&output.stdout), executables, &own)
 }
@@ -648,17 +661,24 @@ fn keep_failed_listing(
     standard_output: &str,
     standard_error: &str,
 ) -> Result<(), String> {
+    append_to_log(
+        log_path,
+        &format!(
+            "== the listing failed: {what}\n== its standard output\n{standard_output}\n\
+             == its standard error\n{standard_error}\n"
+        ),
+    )
+}
+
+/// Appends `text` to the step's log.
+fn append_to_log(log_path: &Path, text: &str) -> Result<(), String> {
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)
         .map_err(|error| format!("{} could not be opened: {error}", log_path.display()))?;
-    write!(
-        log,
-        "== the listing failed: {what}\n== its standard output\n{standard_output}\n\
-         == its standard error\n{standard_error}\n"
-    )
-    .map_err(|error| format!("{} could not be written: {error}", log_path.display()))
+    log.write_all(text.as_bytes())
+        .map_err(|error| format!("{} could not be written: {error}", log_path.display()))
 }
 
 /// Reads what a step's listing printed into the tests each binary of the build's listed; `own`
