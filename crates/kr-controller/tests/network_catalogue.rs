@@ -772,6 +772,11 @@ async fn what_a_device_without_host_manage_reaches_is_what_the_registry_lists() 
 ///
 /// The receipt lives with the catalogue, beside the state the effect changed, so the answer comes
 /// from the record that effect settled rather than from performing it a second time.
+///
+/// KR-REQ-23.24, the duplicate half only: a duplicate request from a device that is still
+/// authorised returns the retained receipt without a second performance. Not shown here: the check
+/// of current authority before a retained receipt is returned, as for a device that has been
+/// revoked, or the rule for a replacement action identifier after an uncertain result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resubmitted_catalogue_action_is_answered_from_its_own_record() {
     let owner = DeviceKeys::generate().expect("owner keys");
