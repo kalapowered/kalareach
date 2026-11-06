@@ -786,6 +786,9 @@ impl PairingHost {
     /// Returns the refusal: another caller than the issuing owner, an approval naming another
     /// candidate, no answered confirmation for exactly this candidate, `ID_CONFLICT` for a reused
     /// action, or a store failure.
+    ///
+    /// `copied` is set when the answer is the one an earlier submission of the action recorded.
+    #[allow(clippy::too_many_arguments)]
     pub fn confirm(
         &self,
         caller: &Caller,
@@ -794,6 +797,7 @@ impl PairingHost {
         authority_revision: AuthorityRevision,
         admission: &Admission,
         life: &Life,
+        copied: &AtomicBool,
     ) -> Result<PairConfirmResult> {
         let recorded = PairingAction {
             actor: caller.actor_id.clone(),
@@ -805,6 +809,7 @@ impl PairingHost {
         // Under the invitation's lock, so two copies of one confirmation meet here and the second
         // is given what the first did.
         if let Some(confirmed) = self.confirmed(caller, action) {
+            copied.store(true, std::sync::atomic::Ordering::Release);
             return confirmed;
         }
         let Some(offered) = open
@@ -846,6 +851,7 @@ impl PairingHost {
         // a completion records its action: an identifier one of them spent since the check above is
         // found before the owner's answer is spent, and the answer stays for the next action.
         if let Some(confirmed) = self.confirmed(caller, action) {
+            copied.store(true, std::sync::atomic::Ordering::Release);
             return confirmed;
         }
         let (committed, written) = match (&mut offered.mode, params.approval) {
@@ -936,6 +942,8 @@ impl PairingHost {
     ///
     /// Returns the refusal: another caller than the issuing owner, `ID_CONFLICT` for a reused
     /// action, or a store failure.
+    ///
+    /// `copied` is set when the answer is the one an earlier submission of the action recorded.
     pub fn cancel(
         &self,
         caller: &Caller,
@@ -943,6 +951,7 @@ impl PairingHost {
         action: (ActionId, Digest256),
         admission: &Admission,
         life: &Life,
+        copied: &AtomicBool,
     ) -> Result<PairStatusResult> {
         let recorded = PairingAction {
             actor: caller.actor_id.clone(),
@@ -954,6 +963,7 @@ impl PairingHost {
         // Under the invitation's lock, so two copies of one withdrawal meet here and the second is
         // given what the first did.
         if let Some(ended) = self.ended(caller, action) {
+            copied.store(true, std::sync::atomic::Ordering::Release);
             return ended;
         }
         let mut room = None;
