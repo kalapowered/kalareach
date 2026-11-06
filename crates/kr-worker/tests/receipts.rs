@@ -6065,6 +6065,10 @@ async fn a_reconnect_discards_unsent_keystrokes_rather_than_replaying_them() {
     assert_eq!(error.code, ErrorCode::LeaseLost);
 }
 
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.20: the connection identity of the input stream
+// ---------------------------------------------------------------------------------------------
+
 /// KR-REQ-09.20, the connection identity of the input stream: the lease record names the
 /// connection that holds it, and a client that goes away and comes back is a connection of its own,
 /// so the lease it takes records another identity, a later epoch and a sequence that starts again
