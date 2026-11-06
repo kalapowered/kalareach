@@ -898,8 +898,9 @@ pub struct Controller {
     /// its own schedule, so two removals can reach the same session together. Each takes the
     /// session's recovery lock without waiting, so the second would find the session held and
     /// leave it owed, and the change would answer that it was. The second waits for the first
-    /// and then asks what is still owed.
-    removing_closed: Mutex<()>,
+    /// and then asks what is still owed. A removal waits for its turn holding the lock and not the
+    /// daemon, so the lock is shared and taken by an owner of its own.
+    removing_closed: Arc<Mutex<()>>,
     /// The sessions whose crashed worker is being cleaned up, each under a lock of its own.
     ///
     /// A worker's death is noticed by a read, a list, the closure watcher, the barrier and the
@@ -1543,6 +1544,10 @@ mod a_closed_session_read_back;
 /// A descriptor write that the task waiting for it stops waiting for.
 #[cfg(test)]
 mod a_write_that_outlives_its_daemon;
+
+/// The passes the daemon runs on its own, which keep nothing of it while they wait.
+#[cfg(test)]
+mod a_pass_that_waits_for_its_turn;
 
 /// A daemon making way for an update: its gate to new sessions, the creates it waits for, and
 /// the stop, through its own door.

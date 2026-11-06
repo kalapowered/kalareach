@@ -1321,7 +1321,7 @@ impl Controller {
                 kr_ipc::install::measured_environment(),
             )),
             finalising: Mutex::new(()),
-            removing_closed: Mutex::new(()),
+            removing_closed: Arc::new(Mutex::new(())),
             crash_flights: std::sync::Mutex::new(std::collections::HashMap::new()),
             left_by_an_earlier_boot: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             collection: crate::collection::Collection::default(),
@@ -2141,18 +2141,35 @@ impl Controller {
     /// worker may still own, is left for the next pass; a removal that left something is owed with
     /// the reason and tried again on a schedule. Only a removal that left nothing ends the
     /// session's obligation.
-    pub(crate) async fn remove_closed_content(self: &Arc<Self>) {
-        let _alone = self.removing_closed.lock().await;
-        let privacy = Arc::clone(&self.privacy);
+    ///
+    /// The removal holds the daemon weakly while it waits, for its turn behind another removal or
+    /// for a blocking thread, as the transfer sweep does: a daemon let go meanwhile goes at once,
+    /// and a removal whose turn comes after that does nothing, leaving what it owed on the record
+    /// for the next daemon. A removal holds the daemon only while it runs, and answers `None`
+    /// when the daemon had gone before it began.
+    pub(crate) async fn remove_closed_content(daemon: &std::sync::Weak<Self>) -> Option<()> {
+        let (turn, privacy) = {
+            let controller = daemon.upgrade()?;
+            (
+                Arc::clone(&controller.removing_closed),
+                Arc::clone(&controller.privacy),
+            )
+        };
+        let _alone = turn.lock_owned().await;
         let now_ms = kr_ipc::now_ms();
         let due = tokio::task::spawn_blocking(move || privacy.awaiting_removal(now_ms))
             .await
             .unwrap_or_default();
         for session_id in due {
-            let controller = Arc::clone(self);
-            let _ =
-                tokio::task::spawn_blocking(move || controller.remove_one_closed(session_id)).await;
+            let daemon = std::sync::Weak::clone(daemon);
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(controller) = daemon.upgrade() {
+                    controller.remove_one_closed(session_id);
+                }
+            })
+            .await;
         }
+        Some(())
     }
 
     /// Brings the record up to date with the sessions that have ended and has the archive remove
@@ -2163,7 +2180,7 @@ impl Controller {
             let now_ms = kr_ipc::now_ms();
             let _ = tokio::task::spawn_blocking(move || seen.record(now_ms)).await;
         }
-        self.remove_closed_content().await;
+        let _ = Self::remove_closed_content(&Arc::downgrade(self)).await;
     }
 
     /// Removes what one ended worker retained, under the recovery ownership of its session.
@@ -2225,7 +2242,7 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<bool> {
         // so the tick goes on and the next pass learns it again.
         return Some(false);
     };
-    daemon.upgrade()?.remove_closed_content().await;
+    Controller::remove_closed_content(daemon).await?;
     let (notices, dormant) = tokio::task::spawn_blocking(move || {
         let _ = seen.privacy.tick(now_ms);
         let notices = seen.privacy.notices_due(now_ms);
