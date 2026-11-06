@@ -334,7 +334,9 @@ key. A move, or the return to the live screen that typing asks for, which the se
 now or cannot say what became of, is settled as not taken and is not made again: press the key
 again. If the terminal owes a size after such a return, or the question a refused resize leaves
 owed, it sends it at the live screen, where the typing wanted the window, until a screen says where
-the window is. A resize that the terminal makes as the owner of the session's size, and that the
+the window is. That includes the size the return itself carried: the return takes the newest size
+with it, and when the session does not take the return the size is owed again, with the session's
+next word. A resize that the terminal makes as the owner of the session's size, and that the
 session refuses for now or cannot say what became of, is asked about with the session's next word:
 the answer says what size the session has, and the terminal resizes again if the session is at
 another. It does this for at most three such resizes in a row, and after that the session stays at
@@ -424,9 +426,13 @@ own. A refusal settles a report at once and changes nothing. So does an answer t
 terminal the session's own bytes, and so does a new subscription that begins with them, because the
 session hands its bytes only to a window at the live screen's first line and column. Nothing is
 reported while a new subscription is being asked for, so the first thing it delivers can only answer
-what was sent before. What the person presses meanwhile waits too, and goes from where that screen
-puts the window. Presses in one direction add up, and a reversal waits its turn, so a press the
-window cannot make is spent without taking the next one with it. A report of this terminal's *size*
+what was sent before. A session that refuses a new subscription for now has changed nothing: the
+stream goes on, and the subscription is asked for again after the pause the retry policy gives,
+whether or not the session says anything meanwhile, up to three times, after which the attachment
+ends as it does when the session refuses in its definite word. What the person presses meanwhile
+waits too, and goes from where that screen puts the window. Presses in one direction add up, and a
+reversal waits its turn, so a press the window cannot make is spent without taking the next one
+with it. A report of this terminal's *size*
 waits the same way. Only the newest size waits, carrying where the window is, so a report refused
 meanwhile never takes a newer size with it. A resize this terminal makes as the size's owner is not
 such a report and goes at once.
@@ -1171,7 +1177,7 @@ Because a restore puts content on disk outside what this host retains, it follow
 
 When the storage service asks to be left alone, the daemon sends it nothing until the time has passed. The command waits for that time, prints a message to the error stream to say how long, and then asks again, at most five times for each read. If, after five waits, the service still asks for quiet, the command stops, removes the files it made, and says when to try again.
 
-A recovery bundle gives one flat set of writers, so any writer the bundle trusts can verify any of the owner's archives at any generation. When a writer is replaced, the old one continues to be trusted for as long as the bundle contains it. An older authentic revision of the bundle still opens and supplies an older checkpoint. The plan shows which revision of the bundle is being used and the generation it last verified, so that you can see both. After the files and `restore.json` are written, the command records the generation it verified in the bundle at the service. It reads the bundle again, opens it with the kit, changes only that archive's checkpoint, and writes it back so that it replaces the bundle only if no one has changed it since. A writer, a producer or a checkpoint that another device added in the meantime is kept, and the command reads and merges again if it finds the bundle moved. A checkpoint never goes down: a restore of a generation older than the one recorded, which you accepted, leaves the bundle as it was. The same generation recorded with another manifest is refused and reported. If the checkpoint cannot be recorded, the restore stays done and the output says why and that restoring again records it. The next restore then refuses a service that offers an older generation. This has limits. The first restore after a loss has nothing to compare with, and a service can hold the bundle back as well as an archive. A checkpoint you can trust independently of the service comes from pairing.
+A recovery bundle gives one flat set of writers, so any writer the bundle trusts can verify any of the owner's archives at any generation. When a writer is replaced, the old one continues to be trusted for as long as the bundle contains it. An older authentic revision of the bundle still opens and supplies an older checkpoint. The plan shows which revision of the bundle is being used and the generation it last verified, so that you can see both. After the files and `restore.json` are written, the command records the generation it verified in the bundle at the service. It reads the bundle again, opens it with the kit, changes only that archive's checkpoint, and writes it back so that it replaces the bundle only if no one has changed it since. A writer, a producer or a checkpoint that another device added in the meantime is kept, and the command reads and merges again if it finds the bundle moved. A service that refuses the write for now is asked again after a pause, at most three times, and the output then says why the checkpoint is not recorded. A checkpoint never goes down: a restore of a generation older than the one recorded, which you accepted, leaves the bundle as it was. The same generation recorded with another manifest is refused and reported. If the checkpoint cannot be recorded, the restore stays done and the output says why and that restoring again records it. The next restore then refuses a service that offers an older generation. This has limits. The first restore after a loss has nothing to compare with, and a service can hold the bundle back as well as an archive. A checkpoint you can trust independently of the service comes from pairing.
 
 `--accept-older <generation>` is for a service that was put back to an earlier state on purpose. Without it, a service that holds an older generation than the bundle recorded is refused, and the refusal names the generation the service holds, the generation the bundle recorded and this flag. With it, exactly the generation you name is restored, and only if the service holds that generation and nothing newer. A name given when the service holds the recorded generation or a newer one is refused by name, because that generation needs no such word and would otherwise be restored under one you gave for another. The plan shows that you named it, and its digest covers it, so a confirmation made without the flag does not write. The flag does not lower the bundle's checkpoint, the plan says the bundle keeps the newer one, and it never accepts the recorded generation's number with another manifest.
 
@@ -1793,7 +1799,12 @@ is the one the plugin commands use. A host that says it cannot take the request 
 transient code, is asked again, and a request refused for now after the host spent the owner
 device's answer ends the wait with that refusal. A host that does not answer, or a connection that
 ends after the request was sent, leaves the outcome unknown: the command says so, with
-`OUTCOME_UNKNOWN`, and exits 1.
+`OUTCOME_UNKNOWN`, and exits 1. A host that does not answer the request for the challenge, or the
+read of what the owner device is shown, within thirty seconds, or before the challenge ends if that
+comes first, has changed nothing: the command says so and exits 3. At a terminal that confirms for
+a host with no owner, the answer to the challenge and the effect it confirms are each waited for
+as long as the wait gives a request the host began to perform, and a host that answers neither
+leaves the outcome unknown, as above.
 
 ### A host's first owner
 
