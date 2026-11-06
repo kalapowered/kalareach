@@ -1027,7 +1027,8 @@ impl Controller {
                     "A disk image, a network share or a user-space volume that a program running \
                      as this account attaches beneath a directory the owner authorised is refused \
                      when an invocation starts. One attached while Git runs is read as part of the \
-                     tree. This narrows what a paired device's repository operations can reach \
+                     tree, and one attached at a directory the invocation was lent is neither \
+                     refused nor reported. This narrows what a paired device's repository operations can reach \
                      and does not close it, and nothing on this host narrows it further.",
                 ),
                 None,

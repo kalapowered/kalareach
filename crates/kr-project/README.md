@@ -174,7 +174,11 @@ of these falls back to reading the configuration and hoping.
   object may (the machine's shared temporary directory, `/private/etc`, the top of a person's home
   or of its `Library`, the top of a volume, a package prefix such as `/opt/homebrew` or
   `/usr/local`, or an application bundle), or a program in Git's helper directory is built for the
-  other kind of Mac. Each refusal names the object, and the host does not qualify.
+  other kind of Mac. The account's own home and `Library` are held by every name they have: the
+  one the environment gives, the one the system's account database gives, and each with its links
+  resolved, so a home reached through a link, one outside `/Users` and a `Library` moved elsewhere
+  are refused as the plain ones are, and so is a directory that holds one. Each refusal names the
+  object, and the host does not qualify.
 * **A caller bounded by a grant, on a Linux host that cannot name the support set** is refused when
   a program in Git's helper directory has a loader, or a library its loader resolves, that cannot be
   named or lies in a system directory such as `/etc`, `/proc` or `/dev`. So is an invocation that
@@ -245,7 +249,9 @@ to start any program. A symbolic link may be read wherever it is, which tells wh
 directories above a granted path may be examined, which tells that they exist and what their
 attributes are; Git resolves a name one directory at a time and asks about each. The profile also
 allows `sysctl-read` without a filter, as the owner's profile does: it is a question to the kernel
-and not the read of a file, and this boundary does not narrow it.
+and not the read of a file, and this boundary does not narrow it. A program inside the profile can
+read the argument list of another process of the same account through it, and through the same
+call without that rule, which the Linux boundary's closure of `/proc` has no counterpart for.
 
 The profile names paths where the Linux ruleset holds objects. A granted directory that a writer
 under the same account renames or replaces while Git runs is read under the name the profile holds.
