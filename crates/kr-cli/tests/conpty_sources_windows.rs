@@ -278,18 +278,43 @@ fn record_a_plain_program_and_a_nested_pseudo_console() {
     );
 }
 
-/// The state `wsl.exe --list --verbose` gives a distribution, which it writes in UTF-16.
-fn wsl_listing() -> String {
+/// What `wsl.exe` printed for `arguments`, which it writes in UTF-16.
+fn wsl_text(arguments: &[&str]) -> String {
     let output = Command::new(system32("wsl.exe"))
-        .args(["--list", "--verbose"])
+        .args(arguments)
         .output()
         .expect("wsl runs");
-    let units: Vec<u16> = output
-        .stdout
+    utf16_text(&output.stdout)
+}
+
+/// UTF-16 text, little-endian, as `wsl.exe` writes it.
+fn utf16_text(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     String::from_utf16_lossy(&units)
+}
+
+/// The distribution names in what `wsl.exe --list --quiet` or `--list --running --quiet` printed:
+/// one to a line and nothing else on it, so no word of the display language is read.
+fn listed_names(text: &str) -> Vec<&str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// Whether `distribution` is registered and not running, by the two lists `wsl.exe` prints. A name
+/// is matched whole and without regard to case, so that a distribution whose name holds another's
+/// (`Ubuntu-24.04` holds `Ubuntu`) is never taken for it.
+fn is_stopped(distribution: &str, registered: &str, running: &str) -> bool {
+    let named = |text: &str| {
+        listed_names(text)
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(distribution))
+    };
+    named(registered) && !named(running)
 }
 
 /// Records `wsl.exe` running a command in the distribution, and leaves the distribution stopped if
@@ -304,14 +329,18 @@ fn record_wsl_exe() {
     );
     let distribution =
         std::env::var("KR_WSL_DISTRIBUTION").unwrap_or_else(|_| "Ubuntu-24.04".into());
-    let before = wsl_listing();
     println!(
         "wsl before: {}",
-        before.split_whitespace().collect::<Vec<_>>().join(" ")
+        wsl_text(&["--list", "--verbose"])
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     );
-    let was_stopped = before
-        .lines()
-        .any(|line| line.contains(&distribution) && line.contains("Stopped"));
+    let was_stopped = is_stopped(
+        &distribution,
+        &wsl_text(&["--list", "--quiet"]),
+        &wsl_text(&["--list", "--running", "--quiet"]),
+    );
     let mut command = CommandBuilder::new(system32("wsl.exe"));
     command.args([
         "--distribution",
@@ -331,7 +360,7 @@ fn record_wsl_exe() {
     }
     println!(
         "wsl after: {}",
-        wsl_listing()
+        wsl_text(&["--list", "--verbose"])
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
@@ -446,5 +475,43 @@ fn record_ssh_exe() {
         "ssh.exe -tt -i <the account's own key> -o BatchMode=yes -o StrictHostKeyChecking=accept-new <the account>@127.0.0.1 \"echo kr-capture-ssh\"",
         "kr-capture-ssh",
         &recorded,
+    );
+}
+/// UTF-16 text, little-endian, as `wsl.exe` writes it.
+fn utf16le(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+#[test]
+fn a_distribution_is_stopped_by_its_complete_name_whatever_the_language() {
+    // The lists as `wsl.exe --list --quiet` and `--list --running --quiet` printed them, on build
+    // 26100 with WSL 2.7.14.0, with Ubuntu-24.04 registered and stopped: its name and a line end in
+    // UTF-16, and nothing at all for the running list.
+    let registered = utf16_text(&utf16le("Ubuntu-24.04\r\n"));
+    let running = utf16_text(&[]);
+    assert!(is_stopped("Ubuntu-24.04", &registered, &running));
+
+    // Lists of the same shape with two distributions, one whose name is the other's beginning. The
+    // lists hold no state word, so a language that has other words reads the same.
+    let both = "Ubuntu\r\nUbuntu-24.04\r\n";
+    assert!(
+        !is_stopped("Ubuntu", both, "Ubuntu\r\n"),
+        "Ubuntu is running, and Ubuntu-24.04's line being stopped does not make it so"
+    );
+    assert!(
+        is_stopped("Ubuntu-24.04", both, "Ubuntu\r\n"),
+        "Ubuntu-24.04 is not among the running ones, and Ubuntu's line does not make it so"
+    );
+    assert!(
+        is_stopped("Ubuntu", both, "Ubuntu-24.04\r\n"),
+        "Ubuntu is not among the running ones, and Ubuntu-24.04's line does not make it so"
+    );
+    assert!(
+        !is_stopped("Ubuntu", both, "ubuntu\r\n"),
+        "a name is matched without regard to case, so a running distribution is never ended"
+    );
+    assert!(
+        !is_stopped("Debian", both, ""),
+        "a distribution that is not registered is not one to end"
     );
 }
