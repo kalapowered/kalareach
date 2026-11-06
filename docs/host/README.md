@@ -3554,10 +3554,19 @@ names no result, so a device that may not read the record is told it as it is; t
 service's lookups of a capture, an apply, a revert and a materialisation are the exception, and tell
 such a device the outcome is unknown. A request whose route the daemon cannot read counts as a repeat. A repeat of a create
 whose reservation the daemon cannot read, of an action whose record it cannot read in the attention
-store, the workflow journal, the registry's receipts of authority changes or its record of pairing
-actions, or of a rearm whose chain or grant it cannot read, is told `OUTCOME_UNKNOWN` and nothing is
-performed: a record that cannot be read is not one that is absent. Where the daemon cannot read
-such a record it cannot tell a first action from a repeat, and tells both the same.
+store, the workflow journal, the project journal, the change-set store, the transfer store, the
+registry's receipts of authority changes and voice changes, its record of device key declarations
+or its record of pairing actions, or of a rearm whose chain or grant it cannot read, is told
+`OUTCOME_UNKNOWN` and nothing is performed: a record that cannot be read is not one that is absent.
+A record that is read and cannot be decoded is told the same, and so is a workflow record that
+makes no sense: a row that says two things about how the action ended, a refusal under a code this
+build does not know, a run record under a method that starts no run, or the record of a run the
+journal does not hold. Where the daemon cannot read such a record it cannot tell a first action
+from a repeat, and tells both the same. That holds as well where the door found no record and the
+store then fails to read it at the point the action is performed. A create asked again whose worker
+has gone, and whose closure cannot be read or is not recorded, is told `OUTCOME_UNKNOWN` once its
+reservation shows that a worker was asked for. A reservation that shows nothing was launched, or
+that the launch produced no worker, is refused as ever.
 The services behind the door check the registration again where they write, and a copy of an
 action that meets a fence owed there is refused in their words. A service that answers a copy of an
 action from its own record while it carries the action out, because the first copy finished
@@ -3580,7 +3589,10 @@ not record after the action was carried out; and an attempt under the action's i
 still running when a copy of it arrives. A project action that was refused, when the journal cannot
 keep the refusal, is told as the record of the action where there is one to read, `ID_CONFLICT`
 where the record is another request's, and `OUTCOME_UNKNOWN` where there is none, because the
-refusal can be a word about what another copy of the action did.
+refusal can be a word about what another copy of the action did. A copy of a project action
+whose first copy's claim is still open, refused by the admission the action is performed under, is
+told `OUTCOME_UNKNOWN` too, because the claim shows the action began; a first action holds no claim
+and is refused as the admission says.
 
 A device that falls behind is told rather than waited for. What the daemon holds for one device is
 bounded in bytes, not in messages, at section 9's send queue per peer; a device that reaches that
