@@ -54,6 +54,10 @@ public struct PlayoutWatch: Sendable {
 
     public init() {}
 
+    /// The speaker side was switched on or off since the last reading was asked for: what was read
+    /// before is no baseline for what is read next, whatever the state is now.
+    public mutating func playbackChanged() { before = nil }
+
     /// Takes one reading. `playbackOnAtRequest` and `playbackOnAtAnswer` are whether playback was
     /// on, unmuted and uninterrupted when the statistics were asked for and when they came back.
     /// Returns true once: at the first reading, after one valid one, in which both figures grew.

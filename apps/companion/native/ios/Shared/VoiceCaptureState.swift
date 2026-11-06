@@ -439,6 +439,8 @@ public final class VoiceCallControl: @unchecked Sendable {
     /// Whether the speaker side is switched on now: the device runs, the person has not silenced
     /// the voice and nothing has interrupted the audio.
     private var playbackOn = false
+    /// How many times the speaker side has been switched on or off.
+    private var playbackChanges: UInt64 = 0
 
     /// - Parameter hearingConfirmedByReadings: true where the platform tells whether audio is
     ///   arriving only through readings, which ``recorderHeard(atMs:)`` then reports.
@@ -468,6 +470,9 @@ public final class VoiceCallControl: @unchecked Sendable {
     /// Whether the voice can be heard from this device now: playback is on, unmuted and
     /// uninterrupted.
     public var isPlaybackOn: Bool { entered { playbackOn } }
+    /// How many times the speaker side has been switched on or off. A figure that was equal when
+    /// two readings were asked for and answered saw no change between them, whatever the state is.
+    public var playbackSwitches: UInt64 { entered { playbackChanges } }
 
     /// Takes the host's answer to the start: the voice session and the moment the service closes
     /// the call, in milliseconds since the epoch.
@@ -607,7 +612,9 @@ public final class VoiceCallControl: @unchecked Sendable {
         let shown = gate.displayed(nowMs: now)
         switches.setAudioDevice(live)
         switches.setMicrophone(gate.captureEnabled(nowMs: now))
-        playbackOn = live && !playbackMuted && !interrupted
+        let playback = live && !playbackMuted && !interrupted
+        if playback != playbackOn { playbackChanges &+= 1 }
+        playbackOn = playback
         switches.setPlayback(playbackOn)
         platform.publish(shown, mutedByPerson: gate.isMutedByPerson)
     }
@@ -621,6 +628,7 @@ public final class VoiceCallControl: @unchecked Sendable {
         switches.setMicrophone(false)
         switches.setPlayback(false)
         switches.setAudioDevice(false)
+        if playbackOn { playbackChanges &+= 1 }
         playbackOn = false
         deviceOn = false
         if sessionOpen {

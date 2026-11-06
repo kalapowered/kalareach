@@ -519,6 +519,24 @@ final class VoiceCallControlTests: XCTestCase {
         }
     }
 
+    /// KR-PERF-010: every switch of the speaker side moves its count, whether or not it ends up on
+    /// again, and a setting that changes nothing moves nothing.
+    func testEverySwitchOfThePlaybackSideMovesItsCount() {
+        let (control, _, _) = running()
+        let first = control.playbackSwitches
+        XCTAssertTrue(control.isPlaybackOn)
+        control.setMutedByPerson(true)
+        XCTAssertEqual(control.playbackSwitches, first, "the person's mute does not touch the speaker side")
+        control.setPlaybackMuted(true)
+        XCTAssertEqual(control.playbackSwitches, first + 1)
+        control.setPlaybackMuted(true)
+        XCTAssertEqual(control.playbackSwitches, first + 1, "the same setting is no switch")
+        control.setPlaybackMuted(false)
+        XCTAssertEqual(control.playbackSwitches, first + 2, "on again is a switch too")
+        control.stop()
+        XCTAssertEqual(control.playbackSwitches, first + 3, "the end switches it off")
+    }
+
     /// KR-REQ-15.35: an interruption the system does not invite back from leaves the microphone
     /// closed, and the person's own mute survives one that it does.
     func testAnInterruptionEndsOnTheSystemsWordAndKeepsThePersonsMute() {

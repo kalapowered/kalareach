@@ -74,6 +74,8 @@ public final class VoiceCall: NSObject {
     private weak var observer: VoiceCallObserver?
     /// Watches the statistics for the first audio played out. Touched on ``queue`` only.
     private var playout = PlayoutWatch()
+    /// The count of switches of the speaker side the playout watch has been told of. Queue only.
+    private var playbackSwitchesSeen: UInt64 = 0
     /// The call's own queue: its timer, and every report from the audio session and WebRTC.
     private let queue: DispatchQueue
     /// The provider's events channel, which this end creates before the offer and only reads.
@@ -224,6 +226,13 @@ public final class VoiceCall: NSObject {
     /// was asked in.
     private func readCapturedAudio() {
         guard let generation = recorderReader.request() else { return }
+        // A switch of the speaker side since the last request ends the comparison; one while this
+        // reading is asked for and answered makes it no reading, even when the side is on again.
+        let switches = control.playbackSwitches
+        if switches != playbackSwitchesSeen {
+            playbackSwitchesSeen = switches
+            playout.playbackChanged()
+        }
         let playbackAtRequest = control.isPlaybackOn
         connection.statistics { [weak self] report in
             let source = report.statistics.values.first {
@@ -237,7 +246,7 @@ public final class VoiceCall: NSObject {
                 if self.playout.reading(
                     reading,
                     playbackOnAtRequest: playbackAtRequest,
-                    playbackOnAtAnswer: self.control.isPlaybackOn
+                    playbackOnAtAnswer: self.control.isPlaybackOn && self.control.playbackSwitches == switches
                 ) {
                     self.observer?.voiceCallPlayedAudio(self)
                 }

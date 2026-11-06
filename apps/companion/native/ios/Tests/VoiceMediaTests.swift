@@ -66,6 +66,19 @@ final class VoiceMediaTests: XCTestCase {
         XCTAssertTrue(watch.reading(read(1.9, 1_920), playbackOnAtRequest: true, playbackOnAtAnswer: true))
     }
 
+    /// KR-PERF-010: a switch of the speaker side between two readings, even one that left it on,
+    /// ends the comparison: the next reading is a baseline and growth is judged from there.
+    func testASwitchOfPlaybackBetweenReadingsEndsTheComparison() {
+        var watch = PlayoutWatch()
+        XCTAssertFalse(watch.reading(read(0, 0), playbackOnAtRequest: true, playbackOnAtAnswer: true))
+        watch.playbackChanged()
+        XCTAssertFalse(
+            watch.reading(read(0.5, 480), playbackOnAtRequest: true, playbackOnAtAnswer: true),
+            "growth over a switch is not played out audio"
+        )
+        XCTAssertTrue(watch.reading(read(0.9, 960), playbackOnAtRequest: true, playbackOnAtAnswer: true))
+    }
+
     /// KR-PERF-010: a reading that is missing, or has only one of the figures, counts as none and
     /// breaks the comparison; a stale one, equal to the last, shows no growth.
     func testAMissingOrStaleReadingIsNone() {
