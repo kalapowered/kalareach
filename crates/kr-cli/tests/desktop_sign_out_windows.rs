@@ -56,6 +56,14 @@ macro_rules! follows_a_sign_out {
     };
 }
 
+/// Why the case that registers a task is ignored in an ordinary run.
+macro_rules! registers_a_task {
+    () => {
+        "registers a scheduled task of the account that runs it for a moment; it runs with --ignored \
+         by hand"
+    };
+}
+
 /// The system directory's own copy of a program, which no search path can stand in for.
 fn system32(program: &str) -> PathBuf {
     PathBuf::from(std::env::var_os("SystemRoot").expect("the system directory"))
@@ -406,6 +414,45 @@ impl Drop for Reopened {
     }
 }
 
+/// A scheduled task, deleted when this is dropped, so that a failure anywhere after the entry is
+/// known leaves nothing of the account's registered: removing an account does not remove the tasks
+/// it registered.
+struct RegisteredTask {
+    name: Option<String>,
+}
+
+impl RegisteredTask {
+    fn new(name: String) -> Self {
+        Self { name: Some(name) }
+    }
+
+    /// Deletes the entry now, when it is not deleted yet, and says why it is not when the system
+    /// does not.
+    fn delete(&mut self) -> Result<(), String> {
+        let Some(name) = self.name.take() else {
+            return Ok(());
+        };
+        match Command::new(system32("schtasks.exe"))
+            .args(["/Delete", "/TN", &name, "/F"])
+            .status()
+        {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(format!("the entry {name} is not removed: {status}")),
+            Err(error) => Err(format!(
+                "schtasks does not run for the entry {name}: {error}"
+            )),
+        }
+    }
+}
+
+impl Drop for RegisteredTask {
+    fn drop(&mut self) {
+        if let Err(why) = self.delete() {
+            eprintln!("{why}");
+        }
+    }
+}
+
 /// KR-REQ-03.23, the second half: after the sign-out, the session closes with `desktop_lost`.
 ///
 /// Run in the account's next sign-in, by what the half before recorded. The worker and the root
@@ -436,6 +483,9 @@ async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost(
     let binding: DesktopBinding =
         serde_json::from_value(record["binding"].clone()).expect("a binding");
     let now = kr_ipc::starter::current_session().expect("this process's login session");
+    // The first half's task is deleted whichever way this half ends, after the daemon that uses it
+    // is let go of.
+    let mut task = RegisteredTask::new(record["task"].as_str().expect("a task").to_owned());
 
     // What the sign-out ended: the worker and the root shell, by the identity each was started
     // under.
@@ -564,12 +614,7 @@ async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost(
 
     // What the first half left in the account's temporary directory goes, the entry with it.
     drop(daemon);
-    let name = record["task"].as_str().expect("a task");
-    let removed = Command::new(system32("schtasks.exe"))
-        .args(["/Delete", "/TN", name, "/F"])
-        .status()
-        .expect("schtasks runs");
-    assert!(removed.success(), "the entry {name} is removed: {removed}");
+    task.delete().unwrap_or_else(|why| panic!("{why}"));
     // The tree is in the account's own temporary directory, which the run removes with the
     // account's profile. A file of it that the daemon of this process still holds, which the
     // aborted tasks of the daemon may do until this process ends, keeps it until then, and is said
@@ -602,3 +647,44 @@ fn an_integrity_level_is_named_by_its_sid_whatever_the_language() {
     );
 }
 
+/// The guard deletes the entry of a task when a step after it is registered fails.
+#[test]
+#[ignore = registers_a_task!()]
+fn a_registered_task_is_deleted_when_the_case_that_holds_it_fails() {
+    let name = format!("kr-guard-test-{}", std::process::id());
+    let schtasks = |arguments: &[&str]| {
+        Command::new(system32("schtasks.exe"))
+            .args(arguments)
+            .output()
+            .expect("schtasks runs")
+            .status
+            .success()
+    };
+    assert!(
+        schtasks(&[
+            "/Create",
+            "/TN",
+            &name,
+            "/TR",
+            "cmd.exe /c exit 0",
+            "/SC",
+            "ONCE",
+            "/ST",
+            "23:59",
+            "/F",
+        ]),
+        "the entry {name} is registered"
+    );
+    assert!(schtasks(&["/Query", "/TN", &name]), "the entry is there");
+    let failed = std::panic::catch_unwind(|| {
+        let _task = RegisteredTask::new(name.clone());
+        panic!("a step after the entry was registered fails");
+    });
+    let left = schtasks(&["/Query", "/TN", &name]);
+    if left {
+        // A run that is red leaves nothing of its own behind.
+        schtasks(&["/Delete", "/TN", &name, "/F"]);
+    }
+    assert!(failed.is_err(), "the step failed");
+    assert!(!left, "the entry {name} is left registered");
+}
