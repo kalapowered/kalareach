@@ -363,9 +363,6 @@ struct Host<'a> {
     taken: Mutex<Option<QuestionResolveResult>>,
     /// Whether a send of this call reached the point where it may be on its way to the host.
     sent: AtomicBool,
-    /// The link whose book holds the earlier sends of an answer the worker took: the one the answer
-    /// went over, or the one a receipt of an earlier send was read on.
-    over: Mutex<Option<Arc<Link>>>,
 }
 
 impl<'a> Host<'a> {
@@ -378,7 +375,6 @@ impl<'a> Host<'a> {
             exchange: state.questions().exchange(),
             taken: Mutex::new(None),
             sent: AtomicBool::new(false),
-            over: Mutex::new(None),
         }
     }
 
@@ -539,8 +535,6 @@ impl QuestionHost for Host<'_> {
         }
         if let Ok(resolved) = &answer {
             *self.taken.lock().unwrap_or_else(PoisonError::into_inner) = Some(resolved.clone());
-            *self.over.lock().unwrap_or_else(PoisonError::into_inner) =
-                Some(Arc::clone(link.link()));
         }
         answer
     }
@@ -558,27 +552,19 @@ impl QuestionHost for Host<'_> {
                 action_id,
             ))
             .await;
-        // The sends this call asks about were made on this link, and a send of them the host took
-        // is what lets it stop holding the others.
-        if answer.is_ok() {
-            *self.over.lock().unwrap_or_else(PoisonError::into_inner) =
-                Some(Arc::clone(link.link()));
-        }
         self.settle(session_id, link.link(), answer)
     }
 
-    /// Lets the link whose book holds the earlier sends of an answer the host took stop holding
-    /// them: the link the answer went over, or the link a receipt of an earlier send was read on.
-    /// A call that sent nothing and read no receipt has no such link, and no link is opened.
+    /// Lets every book that holds the earlier sends of an answer the host took stop holding them.
+    ///
+    /// The sends were made by calls of this application at different times, and a call goes over
+    /// the link its opening names or over the session's ambient link, so on a host this device is
+    /// paired with they can be on the books of a link that acts under a share and of one that acts
+    /// under the pairing. The host's word that the question is answered settles all of them. No
+    /// link is opened for it: a link that is not held has no book.
     async fn settle_earlier(&self, session_id: SessionId, sends: &[ActionId]) {
-        let over = self
-            .over
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(link) = over {
-            <Session as QuestionHost>::settle_earlier(&link.session, session_id, sends).await;
-        }
+        let held = self.links.held_for(self.state, session_id).await;
+        let_go_of(&held, session_id, sends).await;
     }
 
     /// Whether the host's record of the session says it ended.
@@ -622,6 +608,13 @@ impl QuestionHost for Host<'_> {
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+/// Lets the book of each of `links` stop holding the earlier `sends` of an answer the host took.
+pub(crate) async fn let_go_of(links: &[Arc<Link>], session_id: SessionId, sends: &[ActionId]) {
+    for link in links {
+        <Session as QuestionHost>::settle_earlier(&link.session, session_id, sends).await;
     }
 }
 

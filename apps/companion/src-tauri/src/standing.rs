@@ -1137,6 +1137,31 @@ impl PairedLinks {
         Ok(())
     }
 
+    /// Every link held for `session_id` now: the one its current opening holds, which acts under a
+    /// share or under the pairing, and its ambient link. None is opened for the asking.
+    ///
+    /// Sends of one answer are made on whichever of these the call that made them used, so the
+    /// books that hold them are all of these.
+    pub(crate) fn held_for(&self, session_id: SessionId) -> Vec<Arc<Link>> {
+        let inner = self.lock();
+        let opened = inner
+            .opened
+            .get(&session_id)
+            .and_then(|held| held.link.clone());
+        let ambient = inner
+            .ambient
+            .iter()
+            .filter(|entry| entry.session_id == session_id)
+            .filter_map(|entry| {
+                entry
+                    .held
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            });
+        opened.into_iter().chain(ambient).collect()
+    }
+
     /// Lets an ambient link go, if it is still the one held for `session_id`: a call that failed
     /// on an old link does not take a new one away.
     pub(crate) fn forget_ambient(&self, session_id: SessionId, link: &Arc<Link>) {
@@ -1491,4 +1516,169 @@ pub fn leave_session(state: &crate::AppState, session_id: &str, opening: &str) -
         .map_err(|_| CommandError::invalid("that is not a session identifier"))?;
     state.paired_links().leave(session_id, opening);
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use kr_client::error::Result as ClientResult;
+    use kr_client::transport::{ControlTransport, TransportFuture};
+    use kr_protocol::envelope::{ActionTarget, ControlFrame};
+    use kr_protocol::hello::{ActionWindow, ReceiveLimits};
+    use kr_protocol::ids::{ActionId, ActionWindowId, BootEpoch, ConnectionId};
+    use kr_protocol::scalars::{DurationMs, TimestampMs, Uuid};
+
+    /// A connection that takes every frame and never answers one.
+    #[derive(Debug)]
+    struct Silent(ConnectionId);
+
+    impl ControlTransport for Silent {
+        fn connection_id(&self) -> ConnectionId {
+            self.0
+        }
+
+        fn limits(&self) -> ReceiveLimits {
+            ReceiveLimits::default()
+        }
+
+        fn initial_action_window(&self) -> ActionWindow {
+            ActionWindow {
+                action_window_id: ActionWindowId::new("window-1").expect("a window"),
+                connection_id: self.0,
+                boot_epoch: BootEpoch::new(1),
+                issued_at_ms: TimestampMs::new(1),
+                valid_for_ms: DurationMs::new(60_000),
+            }
+        }
+
+        fn ended_by_this_device(&self) -> Option<ProtocolError> {
+            None
+        }
+
+        fn send<'a>(&'a self, _: &'a ControlFrame) -> TransportFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn claim_receiver(&self) -> ClientResult<()> {
+            Ok(())
+        }
+
+        fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn revoke_streams(&self) {}
+
+        fn close(&self) {}
+    }
+
+    /// A link whose book holds one send that nothing has answered, and the send's identifier.
+    pub(crate) async fn link_holding_a_send(
+        environment_id: EnvironmentId,
+        session_id: SessionId,
+        grant_id: Option<GrantId>,
+        byte: u8,
+    ) -> (Arc<Link>, ActionId) {
+        let transport = Silent(ConnectionId::new(Uuid::from_bytes([byte; 16])));
+        let session = Session::start(Arc::new(transport)).expect("a session");
+        let link = Arc::new(Link::paired(
+            session,
+            environment_id,
+            session_id,
+            SessionEpoch::V1,
+            grant_id,
+        ));
+        let sending = Arc::clone(&link);
+        tokio::spawn(async move {
+            let _ = sending
+                .session
+                .mutate(
+                    Method::QuestionAnswer,
+                    ActionTarget::environment(environment_id),
+                    grant_id,
+                    &serde_json::json!({}),
+                    &serde_json::json!({}),
+                    crate::commands::MUTATION_TTL,
+                )
+                .await;
+        });
+        // The send is recorded before it goes, so the book holds it as soon as it can be read.
+        let action_id = loop {
+            if let Some(held) = link.session.submitted_actions().await.first() {
+                break held.action_id;
+            }
+            tokio::task::yield_now().await;
+        };
+        (link, action_id)
+    }
+
+    /// The links of a paired host holding `opened` as the session's opened link and `ambient` as its
+    /// ambient link.
+    pub(crate) fn paired_links_holding(
+        session_id: SessionId,
+        opened: &Arc<Link>,
+        ambient: &Arc<Link>,
+    ) -> PairedLinks {
+        let links = PairedLinks::default();
+        {
+            let mut inner = links.lock();
+            inner.opened.insert(
+                session_id,
+                Opened {
+                    opening: "screen".to_owned(),
+                    link: Some(Arc::clone(opened)),
+                    standing: SessionStanding::Closed,
+                    watch: None,
+                    views: Vec::new(),
+                    losses: 0,
+                },
+            );
+            inner.ambient.push(AmbientEntry {
+                session_id,
+                slot: Arc::new(tokio::sync::Mutex::new(Some(Arc::clone(ambient)))),
+                held: Arc::new(Mutex::new(Some(Arc::clone(ambient)))),
+                busy: Arc::new(AtomicUsize::new(0)),
+                last_used: Instant::now(),
+            });
+        }
+        links
+    }
+
+    /// KR-REQ-11.63: on a paired host a session is held on the link its opening holds, which can
+    /// act under a share, and on its ambient link, which acts under the pairing. Sends of one
+    /// answer are on whichever the calls that made them used, so both are found, and an answer the
+    /// host took lets go of its earlier sends on both books. Another session's links are not found.
+    #[tokio::test]
+    async fn every_link_held_for_a_session_is_found_and_lets_go_of_the_earlier_sends() {
+        let environment_id = EnvironmentId::new(Uuid::from_bytes([1; 16]));
+        let session_id = SessionId::new(Uuid::from_bytes([2; 16]));
+        let other = SessionId::new(Uuid::from_bytes([3; 16]));
+        let (shared, on_the_share) = link_holding_a_send(
+            environment_id,
+            session_id,
+            Some(GrantId::new(Uuid::from_bytes([4; 16]))),
+            5,
+        )
+        .await;
+        let (ambient, on_the_pairing) =
+            link_holding_a_send(environment_id, session_id, None, 6).await;
+
+        let links = paired_links_holding(session_id, &shared, &ambient);
+        assert!(
+            links.held_for(other).is_empty(),
+            "another session's links are not found"
+        );
+        let held = links.held_for(session_id);
+        assert_eq!(held.len(), 2);
+        assert!(held.iter().any(|link| Arc::ptr_eq(link, &shared)));
+        assert!(held.iter().any(|link| Arc::ptr_eq(link, &ambient)));
+
+        crate::questions::let_go_of(&held, session_id, &[on_the_share, on_the_pairing]).await;
+        for link in [&shared, &ambient] {
+            assert!(
+                link.session.submitted_actions().await.is_empty(),
+                "the book no longer holds the earlier sends"
+            );
+        }
+    }
 }
