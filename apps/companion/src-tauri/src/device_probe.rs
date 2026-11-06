@@ -74,6 +74,7 @@ fn check(name: &'static str, ok: bool, detail: impl std::fmt::Display) -> Check 
     Check {
         name,
         ok,
+        measured: true,
         detail: detail.to_string().replace(['\n', '\r'], " "),
     }
 }

@@ -21,6 +21,8 @@ final class KRNativeLaunch: NSObject {
         debugMode = ProbeArguments.mode(from: CommandLine.arguments)?.rawValue
         DeviceProbe.applyColourMode()
         DeviceProbe.reportTextSize()
+        // The other end of a device run's call, when the run asked for one.
+        AudioPeer.startIfRequested()
         #endif
         let configured = FirebaseConfigurationCheck.read(
             fileAt: Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist"),

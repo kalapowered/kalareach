@@ -126,6 +126,9 @@ targets:
       # The extension's own code, run here against the real library and a golden preview.
       - path: ../../../native/ios/Receiver
       - path: ../../../native/ios/NotificationService
+      # The device run's peer, which a test drives directly: one file of the application's launch
+      # directory, built in debug only.
+      - path: ../../../native/ios/KalaReachApp/AudioPeer.swift
     # The test target compiles `KalaReachNative`, which imports WebRTC for the call and the audio
     # session, so it links the same product the application does.
     dependencies:

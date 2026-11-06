@@ -24,7 +24,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use companion_tauri::probe::harness::{Harness, call_check};
+use companion_platform::call::{CallEvent, Media};
+use companion_tauri::probe::harness::{Harness, Mode, call_check};
 use companion_tauri::voice::{Calls, Kept, Timings};
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::MemoryStore;
@@ -52,6 +53,9 @@ struct Scene {
     harness: Harness,
     /// Set when the checks have looked at the running call.
     looked: Arc<AtomicBool>,
+    /// Set when the outage mode has read the figure of the first audio played out, after which the
+    /// script takes the voice service away.
+    figure_read: Arc<AtomicBool>,
     /// The checks reported so far, by name.
     reported: Arc<std::sync::Mutex<Vec<&'static str>>>,
     _data: tempfile::TempDir,
@@ -74,6 +78,8 @@ async fn scene() -> Scene {
         origin: stand_in.origin().to_owned(),
         token: TOKEN.to_owned(),
         invitation: String::new(),
+        mode: Mode::NativeFailure,
+        media_seconds: 60,
     };
     let platform = ScriptedCalls::new();
     let data = tempfile::tempdir().expect("a directory");
@@ -102,12 +108,24 @@ async fn scene() -> Scene {
         companion,
         harness,
         looked: Arc::default(),
+        figure_read: Arc::default(),
         reported: Arc::default(),
         _data: data,
     }
 }
 
 impl Scene {
+    /// What a run is given: the stand-in, the token, the invitation's text and what the run is for.
+    fn harness_for(&self, invitation: &str, mode: Mode) -> Harness {
+        Harness {
+            origin: self.harness.origin.clone(),
+            token: self.harness.token.clone(),
+            invitation: invitation.to_owned(),
+            mode,
+            media_seconds: 3,
+        }
+    }
+
     /// A direct invitation to the host, as the device run's host issues one.
     async fn invitation(&self) -> (String, kr_protocol::ids::InvitationId) {
         let mut client = self.host.client().await;
@@ -155,7 +173,11 @@ impl Scene {
     /// Reports each check, and notes that the running call was looked at.
     fn reporting(&self) -> impl FnMut(&companion_tauri::probe::Check) + Send + 'static {
         let (looked, reported) = (Arc::clone(&self.looked), Arc::clone(&self.reported));
+        let figure_read = Arc::clone(&self.figure_read);
         move |check| {
+            if check.name == "the first audio played out" {
+                figure_read.store(true, Ordering::SeqCst);
+            }
             reported
                 .lock()
                 .expect("the list of reports")
@@ -188,6 +210,42 @@ impl Scene {
         .expect("the call runs");
     }
 
+    /// What native code's statistics say the media carried, and the news that audio was played out,
+    /// once the call runs; the counters grow while `grows` says so and stand still otherwise.
+    /// Returns the task that moves them.
+    async fn carry_audio_once_the_call_runs(&self, grows: bool) -> tokio::task::JoinHandle<()> {
+        self.call_runs().await;
+        let platform = Arc::clone(&self.platform);
+        platform.tell(CallEvent::Playout);
+        let mut counted = 100_u64;
+        tokio::spawn(async move {
+            loop {
+                platform.carry(Media {
+                    packets_received: Some(counted),
+                    packets_sent: Some(counted),
+                    played_samples: Some(counted * 480),
+                });
+                if grows {
+                    counted += 100;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    }
+
+    /// Takes the voice service away once the figure of the first audio has been read, as the device
+    /// script does when it sees that check.
+    async fn take_the_service_away_once_the_figure_is_read(&self) {
+        tokio::time::timeout(WATCHDOG, async {
+            while !self.figure_read.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the figure was read");
+        self.stand_in.go_down();
+    }
+
     /// Ends the call once it runs, the way a connection that leads nowhere does.
     async fn fail_the_connection_once_the_call_runs(&self) {
         self.call_runs().await;
@@ -218,12 +276,12 @@ async fn a_call_is_followed_from_the_invitation_to_the_end_native_code_tells() {
     let scene = scene().await;
     let (text, invitation) = scene.invitation().await;
     let mut report = scene.reporting();
-
+    let run = scene.harness_for(&text, Mode::NativeFailure);
     let (checks, (), ()) = tokio::join!(
         call_check(
             scene.companion.app.handle(),
             &*scene.platform,
-            &text,
+            &run,
             &mut report,
         ),
         scene.approve(invitation),
@@ -261,12 +319,12 @@ async fn a_call_the_person_ends_fails_the_check_that_reads_native_codes_end() {
     let scene = scene().await;
     let (text, invitation) = scene.invitation().await;
     let mut report = scene.reporting();
-
+    let run = scene.harness_for(&text, Mode::NativeFailure);
     let (checks, (), ()) = tokio::join!(
         call_check(
             scene.companion.app.handle(),
             &*scene.platform,
-            &text,
+            &run,
             &mut report,
         ),
         scene.approve(invitation),
@@ -280,6 +338,129 @@ async fn a_call_the_person_ends_fails_the_check_that_reads_native_codes_end() {
             .map(|check| check.name)
             .collect::<Vec<_>>(),
         ["native code ends a call whose connection fails"]
+    );
+    scene.host.stop().await;
+}
+
+/// In the outage mode the checks read the audio each end received from the counters, find the
+/// voice service unreachable once the script takes it away, exercise the local mute and silence,
+/// stop the call without the service and read that its closure is not confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_that_carries_audio_is_followed_through_the_loss_of_the_voice_service() {
+    let scene = scene().await;
+    let (text, invitation) = scene.invitation().await;
+    let mut report = scene.reporting();
+    let run = scene.harness_for(&text, Mode::Outage);
+    let (checks, (), moving, ()) = tokio::join!(
+        call_check(
+            scene.companion.app.handle(),
+            &*scene.platform,
+            &run,
+            &mut report,
+        ),
+        scene.approve(invitation),
+        scene.carry_audio_once_the_call_runs(true),
+        scene.take_the_service_away_once_the_figure_is_read(),
+    );
+    moving.abort();
+
+    assert!(failed(&checks).is_empty(), "{:#?}", failed(&checks));
+    for name in [
+        "audio reaches the call from the peer",
+        "audio leaves the call for the peer",
+        "the call takes audio to the speaker side",
+        "the first audio played out",
+        "the control reads unreachable when the service is gone",
+        "the microphone mutes with the service gone",
+        "the speaker is silenced with the service gone",
+        "the media stays connected with the service gone",
+        "the closure of the call at the service is not confirmed",
+    ] {
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.name == name && check.measured),
+            "{name} was not made and measured: {:#?}",
+            checks.iter().map(|check| check.line()).collect::<Vec<_>>()
+        );
+    }
+    scene.host.stop().await;
+}
+
+/// A counter that stands still is not a connection that carries audio, and a counter native code
+/// did not report is not measured: neither passes for a pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audio_that_does_not_move_fails_the_checks_and_audio_nobody_counted_is_not_measured() {
+    let scene = scene().await;
+    let (text, invitation) = scene.invitation().await;
+    let mut report = scene.reporting();
+    let run = scene.harness_for(&text, Mode::Outage);
+    // Counters that cross their floors and stand still: the media does not stay connected.
+    let (checks, (), moving, ()) = tokio::join!(
+        call_check(
+            scene.companion.app.handle(),
+            &*scene.platform,
+            &run,
+            &mut report,
+        ),
+        scene.approve(invitation),
+        scene.carry_audio_once_the_call_runs(false),
+        scene.take_the_service_away_once_the_figure_is_read(),
+    );
+    moving.abort();
+
+    assert_eq!(
+        failed(&checks)
+            .iter()
+            .filter_map(|line| line.strip_prefix("check="))
+            .filter_map(|line| line.split(" ok=").next())
+            .collect::<Vec<_>>(),
+        ["the media stays connected with the service gone"],
+        "{:#?}",
+        failed(&checks)
+    );
+    scene.host.stop().await;
+
+    // No counters at all: every audio check says it could not measure, and none fails.
+    let scene = self::scene().await;
+    let (text, invitation) = scene.invitation().await;
+    let mut report = scene.reporting();
+    let run = scene.harness_for(&text, Mode::Outage);
+    let (checks, (), (), ()) = tokio::join!(
+        call_check(
+            scene.companion.app.handle(),
+            &*scene.platform,
+            &run,
+            &mut report,
+        ),
+        scene.approve(invitation),
+        scene.call_runs(),
+        scene.take_the_service_away_once_the_figure_is_read(),
+    );
+    let not_measured: Vec<&str> = checks
+        .iter()
+        .filter(|check| !check.measured)
+        .map(|check| check.name)
+        .collect();
+    assert_eq!(
+        not_measured,
+        [
+            "audio reaches the call from the peer",
+            "audio leaves the call for the peer",
+            "the call takes audio to the speaker side",
+            "the first audio played out",
+            "the media stays connected with the service gone",
+        ],
+        "{:#?}",
+        checks.iter().map(|check| check.line()).collect::<Vec<_>>()
+    );
+    assert!(
+        checks
+            .iter()
+            .filter(|check| check.measured)
+            .all(|check| check.ok),
+        "{:#?}",
+        failed(&checks)
     );
     scene.host.stop().await;
 }

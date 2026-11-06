@@ -44,6 +44,16 @@ check(handWrittenNativeDeviceTests.isDirectory) {
 }
 
 /**
+ * The device run's peer, which only a debug build holds, and the empty hook a release build holds in
+ * its place, so that the activity starts the same call in both.
+ */
+val handWrittenNativeDebugSources = file("../../../../native/android/android/src/debug/java")
+val handWrittenNativeReleaseSources = file("../../../../native/android/android/src/release/java")
+check(handWrittenNativeDebugSources.isDirectory && handWrittenNativeReleaseSources.isDirectory) {
+    "The application's debug and release Android sources are not under ${handWrittenNativeDebugSources.parent}"
+}
+
+/**
  * The messages the receiver is held to: the gateway's recorded ones and the preview the host's own
  * code sealed, the same files the unit tests and the Rust and Swift halves read. The device tests
  * read them from the test package's assets.
@@ -150,6 +160,8 @@ android {
     }
     sourceSets {
         getByName("main").java.srcDir(handWrittenNativeSources)
+        getByName("debug").java.srcDir(handWrittenNativeDebugSources)
+        getByName("release").java.srcDir(handWrittenNativeReleaseSources)
         getByName("androidTest").java.srcDir(handWrittenNativeDeviceTests)
         getByName("androidTest").assets.srcDir(receiverFixtures)
     }

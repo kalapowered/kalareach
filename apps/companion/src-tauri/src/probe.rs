@@ -2,8 +2,8 @@
 //!
 //! A script puts a request in the application's data directory (`kr-probe/request.json`, naming a
 //! run), starts the application on a simulator or an emulator, and reads the result the application
-//! writes beside it (`kr-probe/result-<run>.txt`, one `check=<name> ok=<0 or 1> detail=<text>` line
-//! per check and `done=1` last). A request that names only a run checks the bridge: the
+//! writes beside it (`kr-probe/result-<run>.txt`, one `check=<name> ok=<0, 1 or 2> detail=<text>`
+//! line per check and `done=1` last; `2` says the check could not measure what it asks about). A request that names only a run checks the bridge: the
 //! application's own call, reached through the platform plugin, driven from an offer to an end. The
 //! answer to the offer is built here from the offer's own sections, so the connection is described
 //! and applied but never carries media: what is proved is the bridge, not a provider. A request
@@ -30,8 +30,11 @@ const AFTER_PERMIT: Duration = Duration::from_secs(3);
 pub struct Check {
     /// Its name.
     pub name: &'static str,
-    /// Whether it found what it expected.
+    /// Whether it found what it expected. A check that could not measure is not ok.
     pub ok: bool,
+    /// Whether the check could measure what it asks about. A check that could not says so and is
+    /// neither a pass nor a failure of what it asks about.
+    pub measured: bool,
     /// What it found, on one line.
     pub detail: String,
 }
@@ -41,19 +44,27 @@ impl Check {
         Self {
             name,
             ok,
+            measured: true,
             detail: detail.to_string().replace(['\n', '\r'], " "),
         }
     }
 
-    /// The line the result file holds.
+    /// A check that could not measure what it asks about, and why.
+    fn not_measured(name: &'static str, why: impl std::fmt::Display) -> Self {
+        Self {
+            name,
+            ok: false,
+            measured: false,
+            detail: why.to_string().replace(['\n', '\r'], " "),
+        }
+    }
+
+    /// The line the result file holds: `ok=1` for a pass, `ok=0` for a failure and `ok=2` for a
+    /// check that could not measure.
     #[must_use]
     pub fn line(&self) -> String {
-        format!(
-            "check={} ok={} detail={}",
-            self.name,
-            u8::from(self.ok),
-            self.detail
-        )
+        let verdict = if self.measured { u8::from(self.ok) } else { 2 };
+        format!("check={} ok={verdict} detail={}", self.name, self.detail)
     }
 }
 
@@ -455,7 +466,7 @@ pub fn start<R: tauri::Runtime>(app: &tauri::AppHandle<R>, request: Request) {
         let mut report = |check: &Check| append(&format!("{}\n", check.line()));
         match &request.harness {
             Some(harness) => {
-                harness::call_check(&app, &platform, &harness.invitation, &mut report).await;
+                harness::call_check(&app, &platform, harness, &mut report).await;
             }
             None => {
                 bridge_check(&platform, closes_at, &mut report).await;

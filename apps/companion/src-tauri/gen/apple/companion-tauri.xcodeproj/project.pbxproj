@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		0136D075C0906D197FCC7A72 /* ExtensionProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95A67B2C4E3E055F8FF0B3D2 /* ExtensionProbe.swift */; };
 		06B3AB8BA52A0737BE652DAC /* PreviewEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */; };
+		0CD461FC7BB7D06F4C456C1E /* AudioPeer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0B395222C741E5336631067 /* AudioPeer.swift */; };
 		0D98162CEC30F1D818006E25 /* VoiceCeremony.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B391808796597DF04323FC2 /* VoiceCeremony.swift */; };
 		0EDC15DCA7A4E554312092F4 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 02888BA271562F5FA7DF24C8 /* CoreGraphics.framework */; };
 		10783ADDD4C4372BD229CE42 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = AEC884C5D046E9A2F1550FC0 /* WebRTC */; };
@@ -30,6 +31,7 @@
 		261806B6F7A3AFFD7D57B70C /* SigningGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E49D3EC99878D20FEB66A165 /* SigningGate.swift */; };
 		2711FF06F109CDDE842B2803 /* ChallengeAnswerer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A3EA6CD9738D5D1BE903051 /* ChallengeAnswerer.swift */; };
 		27B4FE203288F26127E58B2C /* LaunchPlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F7673A3BC9A13535E7488A9 /* LaunchPlan.swift */; };
+		3252BCEEDA8457318E549049 /* AudioReceiveTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D64985F3D57C9FFBDA25136 /* AudioReceiveTests.swift */; };
 		3B54940743475B9B46645F23 /* CallAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA5D9E4FFFEAF3A1AAD81FC2 /* CallAdapter.swift */; };
 		3B6BDAE2BBAD62D318AAA49E /* FirebaseConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5BA8B3F99FC67438FEBDEFB /* FirebaseConfiguration.swift */; };
 		3BB00F33B3279B6F42690897 /* KeychainTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89A2D4B3AE9AD80CEDCEC961 /* KeychainTests.swift */; };
@@ -63,6 +65,7 @@
 		7940EE3C08E1537A5E3E0D2E /* PreviewOpenerJson.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5DDBD93E046A5E1997C1CB3 /* PreviewOpenerJson.swift */; };
 		7A6B27860E765547E301BC04 /* ExtensionProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95A67B2C4E3E055F8FF0B3D2 /* ExtensionProbe.swift */; };
 		7AAC755F1D7FA7682ABAC13B /* PushRegistrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80501AE28B92D372CBA6A15F /* PushRegistrationTests.swift */; };
+		7E132B9F4CEC4E1545EF9FDA /* AudioPeer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0B395222C741E5336631067 /* AudioPeer.swift */; };
 		7E30C29F5DB16348CAF27093 /* LockScreenControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C1E0A7D3B9F4126A8D05E71 /* LockScreenControls.swift */; };
 		7F51A81DB5EF05DDD1E9649C /* VoiceAnswerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF4DC9933F524066EFBCAD81 /* VoiceAnswerTests.swift */; };
 		7F6324AEB51F8C80D5C597E8 /* VoiceCall.swift in Sources */ = {isa = PBXBuildFile; fileRef = D607C597A5761B168642D0EB /* VoiceCall.swift */; };
@@ -242,6 +245,7 @@
 		89A2D4B3AE9AD80CEDCEC961 /* KeychainTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainTests.swift; sourceTree = "<group>"; };
 		8A7556962086670CA11B4113 /* LayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LayoutTests.swift; sourceTree = "<group>"; };
 		8B8736AB66D26BDC18C22D52 /* Support.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Support.swift; sourceTree = "<group>"; };
+		8D64985F3D57C9FFBDA25136 /* AudioReceiveTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioReceiveTests.swift; sourceTree = "<group>"; };
 		8E330FA8B7B00EAFC43E409F /* DelegateMethodsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateMethodsTests.swift; sourceTree = "<group>"; };
 		8F41D3A06EC27459DB038A14 /* LockScreenControlsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LockScreenControlsTests.swift; sourceTree = "<group>"; };
 		9036197802CA380577FAE896 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
@@ -298,6 +302,7 @@
 		DF4DC9933F524066EFBCAD81 /* VoiceAnswerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceAnswerTests.swift; sourceTree = "<group>"; };
 		E04FEC9E6BD6E0B6EC28B315 /* VoiceAnswer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceAnswer.swift; sourceTree = "<group>"; };
 		E0875A8D34EE15177C80D6FF /* harness.rs */ = {isa = PBXFileReference; path = harness.rs; sourceTree = "<group>"; };
+		E0B395222C741E5336631067 /* AudioPeer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioPeer.swift; sourceTree = "<group>"; };
 		E1E868E93CDD5B82672A098F /* KalaReachNotificationService.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = KalaReachNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		E49D3EC99878D20FEB66A165 /* SigningGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SigningGate.swift; sourceTree = "<group>"; };
 		E72EF35F1A622C5769FD7219 /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
@@ -416,6 +421,7 @@
 		3B506588AC88ABCEFBB10E36 /* KalaReachApp */ = {
 			isa = PBXGroup;
 			children = (
+				E0B395222C741E5336631067 /* AudioPeer.swift */,
 				FD0612CF62D2027ADF40D1D6 /* AudioProbe.swift */,
 				6A195DBBD19A2188DF699148 /* DeviceProbe.swift */,
 				5D97820B51FD28859F00F528 /* KRNativeLaunch.swift */,
@@ -613,6 +619,7 @@
 		A9A55303B287F5C61BAEEC6A /* Tests */ = {
 			isa = PBXGroup;
 			children = (
+				8D64985F3D57C9FFBDA25136 /* AudioReceiveTests.swift */,
 				FF435E203258C628AB02A9FD /* CallAdapterTests.swift */,
 				8E330FA8B7B00EAFC43E409F /* DelegateMethodsTests.swift */,
 				465801722BC2B2B9CACC69F2 /* ExtensionProbeTests.swift */,
@@ -997,6 +1004,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				0CD461FC7BB7D06F4C456C1E /* AudioPeer.swift in Sources */,
+				3252BCEEDA8457318E549049 /* AudioReceiveTests.swift in Sources */,
 				9611CBDD46D19D11C8953D90 /* AudioSession.swift in Sources */,
 				3B54940743475B9B46645F23 /* CallAdapter.swift in Sources */,
 				D38A316076ABA2FD75291A5F /* CallAdapterTests.swift in Sources */,
@@ -1049,6 +1058,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				7E132B9F4CEC4E1545EF9FDA /* AudioPeer.swift in Sources */,
 				E207DB4DBA3F0AF906B5BF2F /* AudioProbe.swift in Sources */,
 				CAB2C7432861A6D02761B7AB /* AudioSession.swift in Sources */,
 				775C842B6036D89F350BCB1B /* CallAdapter.swift in Sources */,
@@ -1154,7 +1164,7 @@
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"OTHER_CODE_SIGN_FLAGS[sdk=iphoneos*]" = "$(inherited) $(KR_SIGN_FLAGS)";
 				PRODUCT_BUNDLE_IDENTIFIER = to.kala.reach;
-				PRODUCT_NAME = KalaReach;
+				PRODUCT_NAME = "KalaReach";
 				"PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]" = "$(KR_APP_PROFILE)";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -1233,7 +1243,7 @@
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"OTHER_CODE_SIGN_FLAGS[sdk=iphoneos*]" = "$(inherited) $(KR_SIGN_FLAGS)";
 				PRODUCT_BUNDLE_IDENTIFIER = to.kala.reach;
-				PRODUCT_NAME = KalaReach;
+				PRODUCT_NAME = "KalaReach";
 				"PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]" = "$(KR_APP_PROFILE)";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";

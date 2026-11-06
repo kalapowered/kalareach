@@ -52,8 +52,10 @@ enum Disposition {
     Another,
 }
 
-/// How the service answers a start's offer.
-type Answering = Box<dyn Fn(&str) -> String + Send + Sync>;
+/// How the service answers a start's offer: what it builds from the offer's text, after it has
+/// done whatever it does to get one.
+type Answering =
+    Arc<dyn Fn(String) -> Pin<Box<dyn std::future::Future<Output = String> + Send>> + Send + Sync>;
 
 /// A step of the service that a test can hold: the request is read and counted, and answered once
 /// the step is released.
@@ -209,7 +211,9 @@ impl StandIn {
             control_follows_close: false,
             seen: Vec::new(),
             tokens: Vec::new(),
-            answer: Box::new(|_offer| "v=0\r\na=answered-by-the-stand-in\r\n".to_owned()),
+            answer: Arc::new(|_offer| {
+                Box::pin(async { "v=0\r\na=answered-by-the-stand-in\r\n".to_owned() })
+            }),
             upgrades_turned_away: 0,
             refuse_host_closes: false,
             hold_first_phone_close: false,
@@ -419,9 +423,14 @@ impl StandIn {
             .phone_closes
     }
 
-    /// Has the service answer a start's offer with what `answer` builds from it.
-    pub fn answer_offers_with(&self, answer: impl Fn(&str) -> String + Send + Sync + 'static) {
-        self.state.lock().expect("the stand-in's state").answer = Box::new(answer);
+    /// Has the service answer a start's offer with what `answer` builds from it. The answer is made
+    /// when the creation is answered, outside the service's own state, so it may wait for a peer.
+    pub fn answer_offers_with<F>(&self, answer: impl Fn(String) -> F + Send + Sync + 'static)
+    where
+        F: std::future::Future<Output = String> + Send + 'static,
+    {
+        self.state.lock().expect("the stand-in's state").answer =
+            Arc::new(move |offer| Box::pin(answer(offer)));
     }
 
     /// Every HTTP request received, in order.
@@ -582,7 +591,7 @@ async fn serve(mut stream: TcpStream, route: &ControlRoute, state: &Arc<Mutex<St
         .to_owned();
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
     let fault: Option<CloseFault>;
-    let answer = {
+    let (allowed, answering) = {
         let mut state = state.lock().expect("the stand-in's state");
         state.seen.push(Seen {
             path: path.clone(),
@@ -616,17 +625,13 @@ async fn serve(mut stream: TcpStream, route: &ControlRoute, state: &Arc<Mutex<St
         } else {
             None
         };
-        if allowed {
-            Some((state.answer)(parsed["offerSdp"].as_str().unwrap_or("")))
-        } else {
-            None
-        }
+        (allowed, Arc::clone(&state.answer))
     };
-    let Some(answer_sdp) = answer else {
+    if !allowed {
         let refusal = br#"{"ok":false,"error":{"code":"UNAUTHENTICATED","message":"No."}}"#;
         let _ = stream.write_all(&response(401, refusal)).await;
         return;
-    };
+    }
     if let Some(fault) = fault {
         if fault == CloseFault::HoldThenRefuse {
             let gate = Arc::clone(&state.lock().expect("the stand-in's state").phone_close_gate);
@@ -678,7 +683,7 @@ async fn serve(mut stream: TcpStream, route: &ControlRoute, state: &Arc<Mutex<St
             "callId": CALL,
             "attemptId": "attempt-1",
             "providerSessionId": "live_1",
-            "answerSdp": answer_sdp,
+            "answerSdp": answering(parsed["offerSdp"].as_str().unwrap_or("").to_owned()).await,
             "model": "gpt-live-1",
             "closesAt": "2099-01-01T00:10:00Z",
             "reservationEndsAt": "2099-01-01T00:10:15Z",

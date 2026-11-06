@@ -9,6 +9,7 @@ import androidx.core.view.WindowInsetsCompat
 import to.kala.reach.companion.mobile.CallBridgeHolder
 import to.kala.reach.companion.mobile.CurrentTokenHolder
 import to.kala.reach.companion.push.FirebaseCurrentToken
+import to.kala.reach.companion.voice.PeerHook
 import to.kala.reach.companion.voice.VoiceCallBridge
 
 class MainActivity : TauriActivity() {
@@ -18,6 +19,8 @@ class MainActivity : TauriActivity() {
     // application's context and no activity, so a call outlives the activity that started it, and
     // it is made once for the process: a recreated activity finds the bridge the call is held by.
     CallBridgeHolder.registerOnce { VoiceCallBridge(applicationContext) }
+    // The other end of a device run's call, which only a debug build has and only when the run asked.
+    PeerHook.start(applicationContext)
     // The way to ask the provider for its current token, which the platform plugin finds when the
     // application reads the token. Registered here because this module holds the provider's library.
     CurrentTokenHolder.registerOnce { FirebaseCurrentToken() }
