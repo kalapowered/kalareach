@@ -253,11 +253,13 @@ nothing, so the release it names is removed as any other.
 On macOS a read of `current` can still outlast the exchange. One that looked the link up before an
 exchange, and is held up (by a machine with more runnable threads than processors) until the next
 switch has taken that link away, answers that `current` is no link or is not there, though it was a
-link at every moment; with twelve readers in the background scheduling class that was 47 to 65 of
-about 3.2 million reads. A read that starts again finds the link, and the store's own read of
-`current` starts again, up to three times in all, before it says so. A program that reads or walks
-`current` some other way (a shell, a service manager) can meet that answer, rarely, and nothing
-starts it again.
+link at every moment. With twelve readers in the background scheduling class and a loop that
+switched with no pause, that was 47 to 72 of about 3.2 million reads; in use the next switch is that
+of the next update, rollback or install, so a read meets it only if it stays in one call for that
+long. A read that starts again finds the link unless it too is held up as long, and the store's own
+read of `current` starts again, up to three times in all, before it gives its answer. A program that
+reads or walks `current` some other way (a shell, a service manager) can meet that answer, rarely,
+and nothing starts it again.
 
 An update that is held waits. It starts again every daemon it stopped, from the release still
 current, keeps the new release staged for the next attempt, which replaces it by the copy it checks

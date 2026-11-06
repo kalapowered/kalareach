@@ -1983,10 +1983,10 @@ pub struct RecordedDocument {
 /// is a link at every moment of a switch, but one read of it can still meet a link that is gone:
 /// on macOS, a read that was taken off its processor after it looked the link up, and that resumes
 /// after the next switch has taken that link away (the one the previous switch swapped out),
-/// answers that the name is no link or is not there. A read that starts from the name again looked
-/// up the link that is there; a second read in a row meets the same fate only if it too is held up
-/// for as long as a switch takes, and the count keeps a `current` that really is no link from being
-/// read for ever.
+/// answers that the name is not there, or on Unix that it is no link. A read that starts from the
+/// name again looked up the link that is there; a second read in a row meets the same fate only if
+/// it too is held up for as long as a switch takes, and the count keeps a `current` that really is
+/// no link from being read for ever.
 const CURRENT_READ_ATTEMPTS: usize = 3;
 
 /// How many times [`Store::hold_current`] reads `current` again for a release that was removed
@@ -2566,8 +2566,8 @@ impl Pin {
 }
 
 /// Reads the link at `link`, and reads it again, `CURRENT_READ_ATTEMPTS` times in all, when the answer
-/// is that the name is no link or is not there. Any other answer, and the last of these, is returned
-/// as it came.
+/// is that the name is not there or, on Unix, that it is no link. Any other answer, and the last of
+/// these, is returned as it came.
 fn read_link_again_if_gone(link: &Path) -> std::io::Result<PathBuf> {
     let mut attempt = 1;
     loop {
@@ -3424,7 +3424,8 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
             .collect();
         // Only an exchange leaves the link it swapped out, which on macOS is every switch over a
-        // `current` that exists, and the next switch takes it away. The refused switch took none.
+        // `current` that exists, in a temporary directory whose file system can exchange names (the
+        // internal disk's is), and the next switch takes it away. The refused switch took none.
         assert_eq!(
             leftovers.len(),
             usize::from(cfg!(target_os = "macos")),

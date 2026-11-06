@@ -1462,8 +1462,8 @@ fn a_program_that_asks_what_it_runs_after_its_release_was_removed_is_refused() {
 /// does, shows it, so the store and its locks are not needed for it. What the switch decides is
 /// what the link names, and that is read whole.
 ///
-/// There are twice as many readers as processors (six to sixteen), so that on a small machine some
-/// are taken off a processor in the middle of a read. On macOS a read that is still going when the
+/// There are twice as many readers as processors, counted as three to eight (six to sixteen readers),
+/// so that on a small machine some are taken off a processor in the middle of a read. On macOS a read that is still going when the
 /// next switch takes away the link it looked up finds no link, though `current` was a link at every
 /// moment; the store's read of `current` reads again, and this is where that shows.
 #[test]
@@ -1490,6 +1490,8 @@ fn current_names_a_whole_release_at_every_moment_of_a_switch() {
     let finished = AtomicBool::new(false);
     let reads = AtomicU32::new(0);
     std::thread::scope(|scope| {
+        // The readers stop when the switches end or fail, so a failure is a failure and not a wait.
+        let _stop = Stop(&finished);
         for _ in 0..readers {
             scope.spawn(|| {
                 while !finished.load(Ordering::SeqCst) {
@@ -1512,8 +1514,6 @@ fn current_names_a_whole_release_at_every_moment_of_a_switch() {
                 }
             });
         }
-        // The readers stop when the switches end or fail, so a failed switch is a failure and not a wait.
-        let _stop = Stop(&finished);
         for round in 0..200 {
             test.switch(if round % 2 == 0 { &two } else { &one });
         }
