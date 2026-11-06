@@ -3533,11 +3533,14 @@ read. A repeated close is the one the daemon can still answer without its worker
 answers it for a device that may read the session's receipts, as it answers a close made after the
 closure. A request the daemon never routed is refused as any request is, and so is a reused
 identifier that carries another request, whether the daemon finds it at the route or in a service's
-record: it is the daemon's word about the identifier and names no result, so a device that may not
-read the record is told it as it is. A request whose route the daemon cannot read counts as a
-repeat. A repeat of a create whose reservation the daemon cannot read, of an attention action
-whose store it cannot ask, or of a rearm whose chain it cannot read, is told `OUTCOME_UNKNOWN` and
-nothing is performed: a record that cannot be read is not one that is absent. The services behind the door check the registration again where they write, and a copy of an
+record. That refusal is the daemon's word about the identifier and names no result, so a device that
+may not read the record is told it as it is; the change-set service's lookups of a capture, an
+apply, a revert and a materialisation are the exception, and tell such a device the outcome is
+unknown. A request whose route the daemon cannot read counts as a repeat. A repeat of a create
+whose reservation the daemon cannot read, of an attention action whose store it cannot ask, or of a
+rearm whose chain or grant it cannot read, is told `OUTCOME_UNKNOWN` and nothing is performed: a
+record that cannot be read is not one that is absent.
+The services behind the door check the registration again where they write, and a copy of an
 action that meets a fence owed there is refused in their words. A service that answers a copy of an
 action from its own record while it carries the action out, because the first copy finished
 meanwhile, flags the answer to the door as read from a record. The door then tells it as it tells
