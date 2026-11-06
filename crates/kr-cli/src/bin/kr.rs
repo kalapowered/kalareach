@@ -1083,8 +1083,16 @@ async fn run(cli: Cli) -> Result<Completion> {
                 let mut client = open_controller(&environment.paths, build_id()).await?;
                 let before: HostDoctorResult =
                     host_read(&mut client, &environment.paths, Method::HostDoctor, &()).await?;
-                let mut listed =
-                    kr_cli::doctor::configuration::push_gateways_reported(&before.configuration)?;
+                // The list the host reports is shown only when the host acts on its document, as a
+                // change says it was made only when the host reports it in force.
+                let mut listed = match change {
+                    Some(_) => kr_cli::doctor::configuration::push_gateways_reported(
+                        &before.configuration,
+                    )?,
+                    None => kr_cli::doctor::configuration::push_gateways_acted_on(
+                        &before.configuration,
+                    )?,
+                };
                 if let Some(chosen) = change {
                     let written = chosen.clone().unwrap_or_default();
                     let writers = kr_cli::barrier::hold_for_configuration(&environment.paths)?;

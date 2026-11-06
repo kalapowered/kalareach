@@ -471,6 +471,120 @@ impl Standalone {
         .expect("writes the configuration document");
     }
 
+    /// Starts this environment's daemon as a person starts one by hand, which is the only start
+    /// over a configuration document `kr` cannot use: `kr` starts no daemon then. The daemon is
+    /// left running, supervised like every other this tree starts, writing to a log in the tree,
+    /// and the call returns once it answers.
+    fn start_a_daemon_by_hand(&self) {
+        let paths = self.tree.paths();
+        let log = self.tree.root().join("daemon-by-hand.log");
+        let environment = self.tree.environment();
+        let started = spawning(|| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("log=$1; shift; \"$@\" </dev/null >\"$log\" 2>&1 &")
+                .arg("sh")
+                .arg(&log)
+                .arg(installation().join("kr-controller"))
+                .arg("--runtime-dir")
+                .arg(paths.runtime_root())
+                .arg("--state-dir")
+                .arg(paths.state_root())
+                .arg("--own-session")
+                .current_dir(environment.state_dir())
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &self.home)
+                .status()
+        })
+        .expect("sh starts");
+        assert!(started.success(), "sh puts the daemon in the background");
+        let begun = Instant::now();
+        while !answers(&environment) {
+            assert!(
+                begun.elapsed() < LIVENESS_DEADLINE,
+                "the daemon started by hand did not answer; it said {}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Leaves in this tree what a host holds once a paired device has registered a delivery
+    /// credential issued by `gateway`, for a daemon that has not started: the device's destination
+    /// in the delivery journal, and the credential in the secret store the daemon opens. Nothing
+    /// is sent to the gateway.
+    fn hold_a_credential_issued_by(&self, gateway: &str) {
+        use kr_delivery::destination::{
+            DeliveryRule, Destination, DestinationId, DestinationRecord, PreviewKeys,
+            PushDestination,
+        };
+        use kr_protocol::ids::{InstallationId, PushSenderRecordId};
+        use kr_protocol::push::PushDeliveryCredential;
+        use kr_protocol::scalars::{SecretBytes32, TimestampMs, Uuid};
+
+        let environment = self.tree.environment();
+        let sender_record_id = PushSenderRecordId::new(Uuid::from_bytes([3; 16]));
+        let installation_id = InstallationId::new(Uuid::from_bytes([2; 16]));
+        let store = kr_crypto::store::open_store_in(&environment.secrets_dir())
+            .expect("the daemon's secret store");
+        kr_controller::push::secrets::DestinationSecrets::new(
+            std::sync::Arc::from(store.store),
+            self.tree.environment_id(),
+        )
+        .put_push_credential(&PushDeliveryCredential {
+            expires_at_ms: TimestampMs::new(u64::MAX / 4),
+            gateway_origin: kr_protocol::service::GatewayOrigin::new(gateway).expect("an origin"),
+            installation_id,
+            issued_at_ms: TimestampMs::new(1_700_000_000_000),
+            revision: kr_protocol::ids::PushSenderRevision::new(1),
+            secret: SecretBytes32::from_bytes([9; 32]),
+            sender_record_id,
+        })
+        .expect("the credential is kept");
+        let mut journal = kr_delivery::journal::DeliveryJournal::open(
+            &environment
+                .state_dir()
+                .join(kr_controller::push::DELIVERY_JOURNAL),
+        )
+        .expect("the delivery journal");
+        journal
+            .configure_destination(&DestinationRecord {
+                // Not a paired device's identifier, so the watch over paired devices leaves it be.
+                id: DestinationId::new("phone").expect("an identifier"),
+                destination: Destination::Push(Box::new(PushDestination {
+                    installation_id,
+                    sender_record_id,
+                    preview_keys: PreviewKeys::only(
+                        *kr_crypto::keys::NotificationPreviewKeyPair::generate()
+                            .expect("a keypair")
+                            .public(),
+                        1,
+                    ),
+                    previews_enabled: false,
+                    mailbox_key: None,
+                })),
+                rule: Some(DeliveryRule {
+                    name: "anything that wants a person".to_owned(),
+                    grant_id: None,
+                }),
+                enabled: true,
+                configured_at_ms: TimestampMs::new(1_700_000_000_000),
+            })
+            .expect("the destination is configured");
+    }
+
+    /// The delivery journal of this environment, opened beside the daemon that has it open.
+    fn delivery_journal(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(
+            self.tree
+                .environment()
+                .state_dir()
+                .join(kr_controller::push::DELIVERY_JOURNAL),
+        )
+        .expect("the delivery journal")
+    }
+
     /// Where this environment's configuration document is.
     ///
     /// Its state directory was chosen with `KR_STATE_DIR`, so the document is inside it on every
@@ -2071,6 +2185,155 @@ fn kr_host_push_gateways_lists_and_clears_the_gateways_a_credential_may_name() {
             .expect("the document is JSON");
     assert!(written.get("push").is_none(), "{written}");
     host.close(&created);
+}
+
+/// A gateway of the test's own on a loopback port, which answers every request with a 503 and so
+/// never revokes or refuses anything. Returns its origin.
+fn a_gateway_that_is_unavailable() -> String {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let origin = format!("http://{}", listener.local_addr().expect("its address"));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut seen = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !seen.windows(4).any(|end| end == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => seen.extend_from_slice(&chunk[..read]),
+                }
+            }
+            let _ = stream.write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+        }
+    });
+    origin
+}
+
+/// KR-REQ-16.04: `kr host push-gateways` with nothing to change does not describe the list as the
+/// one the host delivers through when the host says it has not put its configuration document into
+/// force: it says so, with the host's reason, and fails, as a change does. Here the host could not
+/// write down the revocation it owes a gateway the document no longer lists, so the credential it
+/// holds for that gateway is unusable and the list it reports is not the one it acts on.
+#[test]
+fn kr_host_push_gateways_with_nothing_to_change_fails_when_the_host_did_not_put_the_document_into_force()
+ {
+    let gateway = a_gateway_that_is_unavailable();
+    let gateway = gateway.as_str();
+    let host = Standalone::create();
+    // The first revision of a document that chooses the standalone start and lists the gateway.
+    kr_ipc::paths::write_owner_only_file(
+        &host.document(),
+        format!(
+            r#"{{"version": 3, "level": 7, "revision": 1, "startup": {{"controller": "standalone"}}, "push": {{"gateways": ["{gateway}"]}}}}"#
+        )
+        .as_bytes(),
+    )
+    .expect("writes the configuration document");
+    host.hold_a_credential_issued_by(gateway);
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(output.status.success(), "{created}");
+    let show = || {
+        let output =
+            start(host.kr(&["--json", "host", "push-gateways"])).finish("kr host push-gateways");
+        (
+            output.status.success(),
+            document(&output, "kr host push-gateways"),
+        )
+    };
+    let owed = || -> i64 {
+        host.delivery_journal()
+            .query_row("SELECT COUNT(*) FROM delivery_revocations", [], |row| {
+                row.get(0)
+            })
+            .expect("the debts are counted")
+    };
+
+    // The control: while the gateway is listed the host delivers through it, and says so.
+    let (ok, shown) = show();
+    assert!(ok, "{shown}");
+    assert_eq!(
+        shown["push_gateways"],
+        serde_json::json!([gateway]),
+        "{shown}"
+    );
+
+    // The journal will not take a debt, and the owner takes the gateway out of the list by hand.
+    host.delivery_journal()
+        .execute_batch(
+            "CREATE TRIGGER refuse_a_debt BEFORE INSERT ON delivery_revocations
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .expect("the trigger");
+    kr_ipc::paths::write_owner_only_file(
+        &host.document(),
+        br#"{"version": 3, "revision": 2, "startup": {"controller": "standalone"}}"#,
+    )
+    .expect("writes the configuration document");
+    let (ok, shown) = show();
+    assert!(!ok, "the host did not put the document into force: {shown}");
+    assert_eq!(shown["code"], "RESOURCE_UNAVAILABLE", "{shown}");
+    assert!(
+        shown["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("could not be written down")),
+        "it gives the host's reason: {shown}"
+    );
+    assert_eq!(owed(), 0, "and nothing was written down");
+
+    // Once the journal takes it, the next question puts the document into force.
+    host.delivery_journal()
+        .execute_batch("DROP TRIGGER refuse_a_debt;")
+        .expect("the trigger goes");
+    let (ok, shown) = show();
+    assert!(ok, "{shown}");
+    assert_eq!(shown["push_gateways"], serde_json::json!([]), "{shown}");
+    assert_eq!(owed(), 1, "the revocation the host owes is written down");
+    host.close(&created);
+}
+
+/// KR-REQ-16.04: `kr host push-gateways` with nothing to change fails, and says why, on a host
+/// that started over a configuration document it cannot use and still reads one it cannot use.
+/// That host closes its routes, so it does not deliver through the official gateway or any other,
+/// whatever list it reports. Once the document is put right the host reports it as usable, and
+/// its routes stay closed until it starts again; the command cannot tell that from the report.
+#[test]
+fn kr_host_push_gateways_with_nothing_to_change_fails_on_a_host_started_over_an_unusable_document()
+{
+    let show = |host: &Standalone| {
+        let output =
+            start(host.kr(&["--json", "host", "push-gateways"])).finish("kr host push-gateways");
+        (
+            output.status.success(),
+            document(&output, "kr host push-gateways"),
+        )
+    };
+
+    // The control: a daemon started by hand over a document the host can use shows its list.
+    let usable = Standalone::create();
+    usable.select_standalone();
+    usable.start_a_daemon_by_hand();
+    let (ok, shown) = show(&usable);
+    assert!(ok, "{shown}");
+    assert_eq!(shown["push_gateways"], serde_json::json!([]), "{shown}");
+
+    let host = Standalone::create();
+    kr_ipc::paths::write_owner_only_file(&host.document(), br#"{"version": 99}"#)
+        .expect("writes a configuration document this build cannot use");
+    host.start_a_daemon_by_hand();
+    let (ok, shown) = show(&host);
+    assert!(!ok, "the host cannot use its document: {shown}");
+    assert_eq!(shown["code"], "RESOURCE_UNAVAILABLE", "{shown}");
+    assert!(
+        shown["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unknown_version")),
+        "it says what the document turned out to be: {shown}"
+    );
 }
 
 /// KR-REQ-08.02: `kr status` reports each terminal attachment's presentation and the reason for it.

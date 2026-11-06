@@ -167,6 +167,43 @@ pub fn push_gateways_reported(
     })
 }
 
+/// The push gateways the host reports it delivers through, when it says it acts on its document.
+///
+/// A host reports the list it holds. When it also says that it did not put the document into force
+/// (a revocation it owes could not be written down, say), or that it cannot use the document (a
+/// host that started over one closes its routes and delivers through no gateway), the list alone
+/// would mislead. That is said instead, with the host's reason.
+///
+/// # Errors
+///
+/// Returns why the host does not act on the document, or the refusal of
+/// [`push_gateways_reported`].
+pub fn push_gateways_acted_on(
+    effective: &kr_protocol::hostinfo::EffectiveConfiguration,
+) -> Result<Vec<String>> {
+    let reported = push_gateways_reported(effective)?;
+    if let Some(problem) = effective.not_in_force.as_ref() {
+        return Err(CliError::Unfinished {
+            code: kr_protocol::error::ErrorCode::ResourceUnavailable,
+            message: shown!(
+                "the host did not put its configuration into force: {}",
+                crate::shown::host_text(problem)
+            ),
+        });
+    }
+    if effective.status.state.is_a_problem() {
+        return Err(CliError::Unfinished {
+            code: kr_protocol::error::ErrorCode::ResourceUnavailable,
+            message: shown!(
+                "the host cannot use its configuration document ({}): {}",
+                effective.status.state.as_str(),
+                crate::shown::host_text(&effective.status.detail)
+            ),
+        });
+    }
+    Ok(reported)
+}
+
 /// The push gateways the host delivers through after a change, when it put the change into force.
 ///
 /// The host answers a question about its configuration only after it has put the document into
@@ -180,16 +217,7 @@ pub fn push_gateways_in_force(
     effective: &kr_protocol::hostinfo::EffectiveConfiguration,
     written: &[String],
 ) -> Result<Vec<String>> {
-    let reported = push_gateways_reported(effective)?;
-    if let Some(problem) = effective.not_in_force.as_ref() {
-        return Err(CliError::Unfinished {
-            code: kr_protocol::error::ErrorCode::ResourceUnavailable,
-            message: shown!(
-                "the host did not put its configuration into force: {}",
-                crate::shown::host_text(problem)
-            ),
-        });
-    }
+    let reported = push_gateways_acted_on(effective)?;
     // The same gateways, whatever order the host says them in.
     let sorted = |origins: &[String]| {
         let mut origins = origins.to_vec();
@@ -300,6 +328,25 @@ mod tests {
             push_gateways_in_force(&other, &written),
             Err(CliError::Unfinished { .. })
         ));
+
+        // With nothing to change, the list is shown for a document the host can use, or none, and
+        // not for one it cannot use.
+        for (state, shown) in [
+            (configuration::DocumentState::Absent, true),
+            (configuration::DocumentState::Loaded, true),
+            (configuration::DocumentState::UnknownVersion, false),
+            (configuration::DocumentState::Unreadable, false),
+            (configuration::DocumentState::Invalid, false),
+        ] {
+            let mut effective = reporting(Some(&[LISTED]), None);
+            effective.status.state = state;
+            assert_eq!(
+                push_gateways_acted_on(&effective).is_ok(),
+                shown,
+                "{}",
+                state.as_str()
+            );
+        }
     }
 
     /// A refused edit says the configuration's own sentences, and a sentence that arrived from a
