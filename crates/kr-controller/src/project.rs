@@ -700,7 +700,9 @@ impl ProjectModule {
                 Err(_) => {
                     return match service.retained_action(&actor, action_id, name, digest) {
                         Ok(Some(retained)) => {
-                            copied.store(true, Ordering::Release);
+                            if !claimed.load(Ordering::Acquire) {
+                                copied.store(true, Ordering::Release);
+                            }
                             recorded(retained)
                         }
                         Ok(None) => Err(refusal_not_recorded()),
