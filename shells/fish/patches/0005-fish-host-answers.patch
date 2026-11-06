@@ -1,0 +1,66 @@
+Subject: [PATCH 5/5] fish: leave a terminal's answers out of the line and the keys
+
+The reader decodes the strings and reports a terminal sends in answer to a query, and keeps the
+ones it uses. Two kinds of answer it does not use were not read to their end.
+
+The terminal's tertiary device attributes (`ESC P ! | id ST`) and its report of a setting
+(`ESC P 1 $ r setting ST`) are device control strings. The reader gave up on them after their first
+byte or two: the rest was left in the input, and the reader typed it into the line. Once the header
+says which string it is, the string is now read to its terminator, as the strings the reader does
+use already are. A byte that does not come within the reader's own wait for the next byte of a
+sequence ends the string early, as it ends any other. A device control string whose header is
+anything else is left as it was, so text typed behind an Alt-Shift-p is not taken for one.
+
+A control sequence that ends in `t` was always taken for the old mouse-highlight report and took the
+next two bytes with it. A report of the window (`CSI 8 ; rows ; columns t`) is such a sequence, and
+the two bytes behind it, the person's next keys, were lost. The mouse report has no parameters, so
+a sequence that has some is no longer taken for one.
+
+This patch is a derivative work of fish and carries the GNU General Public Licence, version 2; see
+shells/fish/LICENSE.
+
+--- a/src/input/decode.rs
++++ b/src/input/decode.rs
+@@ -398,6 +398,12 @@
+                 return Some(CharEvent::Implicit(ImplicitEvent::MouseLeft(position)));
+             }
+             b't' => {
++                if count != 0 || params[0][0] != 0 {
++                    // A sequence with parameters is a report of the window (`CSI 8 ; rows ; columns
++                    // t`, which a terminal sends in answer to a query), and no mouse report has any:
++                    // the two characters behind it are the person's.
++                    return None;
++                }
+                 flog!(reader, "mouse event");
+                 // VT200 button released in mouse highlighting mode at valid text location. 5 chars.
+                 let _ = next_char(self);
+@@ -698,9 +704,28 @@
+                 self.parse_xtversion(buffer);
+                 return None;
+             }
++            b'!' => {
++                // The terminal's tertiary device attributes (`\e P ! | id ST`) are a string this
++                // reader does not use. Its body is read to the string terminator, so none of it is
++                // left to be typed into the line. Only the header says it is one: Alt-Shift-p,
++                // typed before text, is not.
++                if self.read_sequence_byte(buffer)? == b'|' {
++                    self.read_until_sequence_terminator(buffer, false);
++                }
++                return None;
++            }
+             _ => return None,
+         };
+-        if self.read_sequence_byte(buffer)? != b'+' {
++        let intermediate = self.read_sequence_byte(buffer)?;
++        if intermediate == b'$' {
++            // The terminal's report of a setting (`\e P 1 $ r setting ST`) is another, read the
++            // same way once its header is whole.
++            if self.read_sequence_byte(buffer)? == b'r' {
++                self.read_until_sequence_terminator(buffer, false);
++            }
++            return None;
++        }
++        if intermediate != b'+' {
+             return None;
+         }
+         if self.read_sequence_byte(buffer)? != b'r' {

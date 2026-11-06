@@ -215,7 +215,7 @@ context.
 
 ## What fish changes
 
-There are four patches, against `fish-4.9.3`. This shell's reader is Rust, so the reader's own half
+There are five patches, against `fish-4.9.3`. This shell's reader is Rust, so the reader's own half
 of the bridge is Rust beside it and the shell-independent core is the same C the other packages
 compile, built into the shell by the build script that already compiles C for the shell's own
 probes.
@@ -226,6 +226,7 @@ probes.
 | `0002-fish-reader-state` | `src/input/binding.rs` | The states the detach condition needs that this reader keeps no flag for |
 | `0003-fish-bridge-activation` | `build.rs`, `src/bin/fish.rs`, `src/builtins/mod.rs`, `src/builtins/shared/misc.rs` | The core compiled in, the `kr-bridge` builtin, and the bridge loading before the startup files |
 | `0004-fish-command-resolve` | `src/exec.rs`, `src/reader/reader.rs` | The line the root shell runs as a command block with its capability, and the question in front of each command of that line, with the launcher its answer can name |
+| `0005-fish-host-answers` | `src/input/decode.rs` | A device control string the reader does not use, read to its terminator, and a report of the window no longer taken for a mouse report |
 
 The first patch does five things:
 
@@ -289,6 +290,26 @@ execve. If the launcher fails to start, the command as typed is run instead. A l
 forking path and not posix_spawn, because the child is where the launcher starts. If ctrl-c or
 another signal to end the shell comes in while waiting for an answer, the command is not started and
 the above status codes are returned.
+
+The fifth patch fixes two places where the reader's parser did not read a terminal's answer to its
+end. The reader decodes the strings and reports a terminal sends in answer to a query and keeps the
+ones it uses: the terminal's version, a capability, a colour and the cursor position.
+
+- **A device control string it does not use.** The reader gave up on any other such string after the
+  first byte or two, which left the rest in the input to be typed into the line: the terminal's
+  tertiary device attributes (`ESC P ! | id ST`) and its report of a setting
+  (`ESC P 1 $ r setting ST`) are two that the host's query broker writes. The reader now reads these
+  two to their terminator once the header says which they are, as it reads the strings it uses. A
+  byte that does not come within the reader's own wait for the next byte of a sequence ends the
+  string early, as it ends any other. A string with another header is left as it was, so text typed
+  behind an Alt-Shift-p is not taken for one.
+- **A report of the window.** Any control sequence ending in `t` was taken for the old
+  mouse-highlight report, which takes the next two bytes with it, so the two keys a person typed
+  behind a report of the window (`CSI 8 ; rows ; columns t`) were lost. That mouse report has no
+  parameters, so a sequence that has some is no longer taken for one.
+
+The other readers need a hook of their own, because they take the bytes of an answer as keys; this
+one decodes the answer, so its parser is where the answer was dropped or left.
 
 The guarded entry is a file of its own under `conf.d`. Files there run before the person's
 `config.fish`, so the entry registers a one-shot handler on the first prompt: by then the person's

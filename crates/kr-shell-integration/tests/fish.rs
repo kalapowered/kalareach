@@ -36,6 +36,14 @@ fn the_reader_counts_what_the_host_put_into_its_terminal_as_input_it_has_not_tak
     shellpkg::bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(FISH);
 }
 
+/// KR-REQ-08.48: the host's answers to a program's questions, written into the terminal in the
+/// middle of what a person types, leave the keys whole and in order.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_keys_a_person_types_around_a_hosts_answers_arrive_whole_and_in_order() {
+    shellpkg::the_keys_a_person_types_around_a_hosts_answers_arrive_whole_and_in_order(FISH);
+}
+
 /// KR-REQ-08.48: the host's answer between the cursor keys a person presses leaves them working.
 #[test]
 #[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
