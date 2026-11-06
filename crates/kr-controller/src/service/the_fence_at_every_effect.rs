@@ -1832,6 +1832,94 @@ async fn a_fence_that_lands_while_a_refresh_starts_the_environment_is_an_unknown
     assert_eq!(rig.recorded_status(1), EnvironmentPresence::Stale);
 }
 
+/// KR-REQ-09.09, the outcome of a refresh whose look fails after its start: the environment was
+/// started and the platform then could not be asked about it, so the refresh is an outcome this host
+/// does not know and not a refusal it keeps, and nothing is recorded. The control is a platform that
+/// cannot be asked at all: nothing was started, and the failure is not told as an unknown outcome.
+/// Not shown here: a fence, an expiry or a withdrawn registration at the same place, which the
+/// cases beside this one show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_whose_look_fails_after_its_start_is_an_unknown_outcome() {
+    use kr_protocol::identity::EnvironmentPresence;
+    let rig = Refreshing::start().await;
+
+    let platform = LosesTheLook::after_the_start();
+    rig.controller.ask_instead(platform.clone());
+    let unknown = rig
+        .refresh(1, true)
+        .await
+        .expect_err("the look after the start failed");
+    assert!(platform.was_started());
+    assert_eq!(unknown.code(), ErrorCode::OutcomeUnknown, "{unknown}");
+    assert!(
+        !matches!(
+            unknown.code().retry_category(),
+            kr_protocol::error::RetryCategory::NoRetry
+                | kr_protocol::error::RetryCategory::ConfigurationChange
+        ),
+        "no claim keeps it as a refusal"
+    );
+    assert_eq!(rig.recorded_status(1), EnvironmentPresence::Stale);
+
+    // The control: the platform that cannot be asked before anything is started.
+    let platform = LosesTheLook::from_the_first_look();
+    rig.controller.ask_instead(platform.clone());
+    let failed = rig
+        .refresh(2, true)
+        .await
+        .expect_err("the first look failed");
+    assert!(!platform.was_started());
+    assert_ne!(failed.code(), ErrorCode::OutcomeUnknown, "{failed}");
+    assert_eq!(rig.recorded_status(2), EnvironmentPresence::Stale);
+}
+
+/// A platform that cannot be asked about the environment: from its first look, or once it has been
+/// told to start it.
+struct LosesTheLook {
+    from_the_first_look: bool,
+    started: std::sync::atomic::AtomicBool,
+}
+
+impl LosesTheLook {
+    fn after_the_start() -> Arc<Self> {
+        Arc::new(Self {
+            from_the_first_look: false,
+            started: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn from_the_first_look() -> Arc<Self> {
+        Arc::new(Self {
+            from_the_first_look: true,
+            started: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn was_started(&self) -> bool {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl crate::bridge::store::Observer for LosesTheLook {
+    fn observe(
+        &self,
+        _: &kr_protocol::identity::EnvironmentEnrolment,
+    ) -> crate::error::Result<kr_protocol::identity::EnvironmentPresence> {
+        if self.from_the_first_look || self.was_started() {
+            return Err(crate::error::ControllerError::supervision(
+                "the platform did not answer",
+            ));
+        }
+        Ok(kr_protocol::identity::EnvironmentPresence::EnvironmentStopped)
+    }
+
+    fn start(&self, _: &kr_protocol::identity::EnvironmentEnrolment) -> crate::error::Result<()> {
+        self.started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 /// KR-REQ-09.09: a fence that lands after a refresh has recorded what the platform said leaves the
 /// refresh answered, with the observation recorded, and says that no bridge was opened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
