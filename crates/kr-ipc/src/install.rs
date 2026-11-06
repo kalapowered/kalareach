@@ -1259,9 +1259,10 @@ impl Store {
 
     /// The release `current` names, where it names one.
     ///
-    /// A read that finds no link, or no `current`, reads again (three times in all) before it says
-    /// so, since a switch that runs while the read is under way can take away the link the read
-    /// had looked up.
+    /// A read that finds no `current`, or on Unix a `current` that is no link, reads again (three
+    /// times in all) before it says so: on macOS a switch that runs while a read is under way can
+    /// take away the link the read had looked up. A read held up three times in a row for as long
+    /// as a switch takes still gives that answer.
     ///
     /// # Errors
     ///
@@ -1981,10 +1982,11 @@ pub struct RecordedDocument {
 /// How many times [`Store::current`] reads the link before it believes that it is not one. `current`
 /// is a link at every moment of a switch, but one read of it can still meet a link that is gone:
 /// on macOS, a read that was taken off its processor after it looked the link up, and that resumes
-/// after the switch after next has taken that link away (the one the previous switch swapped out),
-/// answers that the name is no link or is not there. The read that follows starts from the name
-/// again and finds the link that is there; the count only keeps a `current` that really is no link
-/// from being read for ever.
+/// after the next switch has taken that link away (the one the previous switch swapped out),
+/// answers that the name is no link or is not there. A read that starts from the name again looked
+/// up the link that is there; a second read in a row meets the same fate only if it too is held up
+/// for as long as a switch takes, and the count keeps a `current` that really is no link from being
+/// read for ever.
 const CURRENT_READ_ATTEMPTS: usize = 3;
 
 /// How many times [`Store::hold_current`] reads `current` again for a release that was removed
@@ -3421,10 +3423,18 @@ mod tests {
             .filter_map(std::result::Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
             .collect();
-        // Only an exchange leaves the link it swapped out, and the next switch takes it away.
-        assert!(
-            leftovers.len() <= usize::from(cfg!(target_os = "macos")),
-            "no temporary link is left behind: {leftovers:?}"
+        // Only an exchange leaves the link it swapped out, which on macOS is every switch over a
+        // `current` that exists, and the next switch takes it away. The refused switch took none.
+        assert_eq!(
+            leftovers.len(),
+            usize::from(cfg!(target_os = "macos")),
+            "no temporary link is left behind but the one an exchange swapped out: {leftovers:?}"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            std::fs::read_link(leftovers[0].path()).expect("a link"),
+            Path::new("versions").join(one.as_str()),
+            "the exchange left the link `current` was"
         );
     }
 

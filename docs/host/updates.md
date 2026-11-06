@@ -250,11 +250,14 @@ away: removing it at once failed a reader that had resolved `current` just befor
 failed none of about 1.2 million reads. The kept link names a release's directory and holds
 nothing, so the release it names is removed as any other.
 
-A read of `current` that is held up for the length of two switches, because the machine has more
-runnable threads than processors, can still find the link it looked up gone, and then answers that
-`current` is no link or is not there. The read that follows finds the link. The store's own read of
-`current` therefore reads again, up to three times in all, before it says so; a program that reads
-`current` by another way (a shell, a service manager) can meet the one answer, and reads again too.
+On macOS a read of `current` can still outlast the exchange. One that looked the link up before an
+exchange, and is held up (by a machine with more runnable threads than processors) until the next
+switch has taken that link away, answers that `current` is no link or is not there, though it was a
+link at every moment; with twelve readers in the background scheduling class that was 47 to 65 of
+about 3.2 million reads. A read that starts again finds the link, and the store's own read of
+`current` starts again, up to three times in all, before it says so. A program that reads or walks
+`current` some other way (a shell, a service manager) can meet that answer, rarely, and nothing
+starts it again.
 
 An update that is held waits. It starts again every daemon it stopped, from the release still
 current, keeps the new release staged for the next attempt, which replaces it by the copy it checks
