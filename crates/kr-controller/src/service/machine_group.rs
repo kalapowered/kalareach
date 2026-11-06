@@ -368,13 +368,13 @@ impl Controller {
                 // An earlier attempt recorded this action between the lookup that found nothing
                 // and this claim, which waited for the step lock. What it produced goes back only
                 // under authority that has not been withdrawn, as it does from that lookup, and
-                // without the deadline a receipt outlives.
+                // without the deadline a receipt outlives. The check is made here, with the answer
+                // in hand and the step lock held: a fence that lands while this attempt waited for
+                // the lock, or while it holds it, stops the answer.
                 *copied = true;
-                self.check_registration(&crate::authority::AdmittedMutation {
-                    deadline: None,
-                    ..carried
-                })?;
-                return recorded_answer(record);
+                return self
+                    .retained_under_authority(&carried, async { recorded_answer(record) })
+                    .await;
             }
         };
         #[cfg(feature = "testing")]
@@ -797,6 +797,14 @@ impl Controller {
         tokio::sync::oneshot::Sender<()>,
     ) {
         self.machine.after_the_claim_is_read.arm()
+    }
+
+    /// Whether a machine group step holds the lock that serialises steps now. For this host's own
+    /// tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn a_machine_step_holds_the_step_lock(&self) -> bool {
+        self.machine.steps.try_lock().is_err()
     }
 
     /// Ends the next machine group step after its write and before its receipt, as a daemon that

@@ -1962,6 +1962,88 @@ async fn a_machine_group_step_recorded_before_a_late_attempts_claim_is_not_given
     );
 }
 
+/// KR-REQ-26.16, the part about a change affecting authority fencing dispatch: a fence that lands
+/// while a late attempt holds the machine group's step lock stops the answer it found there. The
+/// attempt has waited for the lock and found its action recorded; the fence is raised with the
+/// lock held and the answer in hand, so only a check made after the record is found, and not one
+/// made before the lock was taken, sees it. The control: the same late attempt, with nothing
+/// raised while it is stopped there, is answered from the receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_answer_it_found() {
+    use kr_protocol::machine::{MachineExpected, MachineSplitParams};
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let group = controller
+        .machine_report()
+        .expect("this daemon serves a machine group record");
+    let mutation = mutation_of(
+        &temp,
+        Method::MachineSplit,
+        ParamsValue::from_typed(&MachineSplitParams {
+            expected: MachineExpected {
+                machine_id: group.machine_id,
+                revision: group.revision,
+            },
+        })
+        .expect("encodes"),
+    );
+    let attempt = |controller: Arc<Controller>| {
+        let actor_id = actor_id.clone();
+        let mutation = mutation.clone();
+        async move {
+            controller
+                .write_method(
+                    &actor_id,
+                    &mutation,
+                    Method::MachineSplit,
+                    connection_id,
+                    None,
+                    Some(accepted(&controller)),
+                    controller.admitted_revision(connection_id).ok(),
+                )
+                .await
+        }
+    };
+    let first = attempt(Arc::clone(&controller)).await;
+    assert!(refusal(&first).is_none(), "the first attempt: {first:?}");
+
+    // A late attempt stopped where it holds the step lock with the recorded answer in hand.
+    let stopped_with_the_lock = || async {
+        let (arrived, release) = controller.pause_retained_lookup();
+        let waiting = tokio::spawn(attempt(Arc::clone(&controller)));
+        tokio::time::timeout(Duration::from_secs(30), arrived)
+            .await
+            .expect("the late attempt reaches the place it is stopped at")
+            .expect("the pause is armed");
+        assert!(
+            controller.a_machine_step_holds_the_step_lock(),
+            "the late attempt holds the step lock where it is stopped"
+        );
+        (waiting, release)
+    };
+
+    let (waiting, release) = stopped_with_the_lock().await;
+    release.send(()).expect("the late attempt goes on");
+    let answered = waiting.await.expect("the late attempt finishes");
+    assert!(
+        refusal(&answered).is_none(),
+        "with nothing raised the late attempt is answered from the receipt: {answered:?}"
+    );
+
+    let (waiting, release) = stopped_with_the_lock().await;
+    controller.hold_fence(true);
+    release.send(()).expect("the late attempt goes on");
+    let refused = waiting.await.expect("the late attempt finishes");
+    refused_for_a_fence(refusal(&refused).unwrap_or_else(|| {
+        panic!("a fence raised while the step lock was held stops the answer: {refused:?}")
+    }));
+    controller.hold_fence(false);
+    assert!(
+        !controller.a_machine_step_holds_the_step_lock(),
+        "the refused attempt let the lock go"
+    );
+}
+
 /// KR-REQ-09.09, 09.12 and 26.16: an environment record change another attempt recorded is not
 /// given back to a late attempt while this host owes a fence, including one that lands while the
 /// answer is read, after the claim found the record. The control: with nothing owed, the same late
