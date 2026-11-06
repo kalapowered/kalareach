@@ -631,7 +631,8 @@ pub trait QuestionHost {
     }
 
     /// Called after the host took a send of the answer, with the earlier sends of it that the
-    /// record carried.
+    /// record carried: the send this call made, or one an earlier call made that a reading of the
+    /// host found taken.
     ///
     /// The question is answered, so none of those sends can take effect any more, and no reading of
     /// the host will settle the ones whose outcome was not established. A host that holds them as
@@ -1685,6 +1686,9 @@ async fn answered<H: QuestionHost + Sync, K: Keeper + Sync>(
         if let Some(taken) = earlier.taken() {
             // The host took it; a copy that cannot be removed now is retired by the next reading.
             let _ = drafts.remove_if_unchanged(draft.question_id, &basis);
+            // The question is answered, so the connection stops accounting for the other sends of
+            // the answer too.
+            host.settle_earlier(draft.session_id, basis.sends()).await;
             return Ok(Answered::Taken(taken));
         }
         if let Some(waiting) = earlier.waiting() {
@@ -1778,6 +1782,7 @@ async fn ended_after_send<H: QuestionHost>(
             if ours {
                 let _ = drafts.remove_if_unchanged(draft.question_id, &basis);
             }
+            host.settle_earlier(draft.session_id, carried).await;
             return Ok(Some(taken));
         }
         Some(_) => return Ok(None),
@@ -1862,6 +1867,7 @@ pub async fn reconcile<H: QuestionHost>(
             Earlier::default()
         };
         if let Some(action_id) = earlier.taken() {
+            host.settle_earlier(draft.session_id, basis.sends()).await;
             if drafts.remove_if_unchanged(draft.question_id, &basis)? {
                 reconciled.push(Reconciled::Taken { draft, action_id });
             } else {
@@ -1942,6 +1948,7 @@ async fn sent<H: QuestionHost + Sync, K: Keeper + Sync>(
         *earlier = learn(host, draft.session_id, basis.sends()).await;
         if let Some(taken) = earlier.taken() {
             let _ = drafts.remove_if_unchanged(draft.question_id, basis);
+            host.settle_earlier(draft.session_id, basis.sends()).await;
             return Ok(Answered::Taken(taken));
         }
     }
