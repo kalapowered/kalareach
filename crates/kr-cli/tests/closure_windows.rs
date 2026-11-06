@@ -177,10 +177,10 @@ async fn a_typed_exit_closes_the_session_with_the_shells_status_and_nothing_star
 /// KR-REQ-07.52: the end of the root shell's input closes the session just as the shell's own exit
 /// does, and the shell is not started again.
 ///
-/// The root shell is a program that reads the console until its input ends and then ends with
-/// status 0: the system's `sort`, which has nothing to sort. The end of input a console gives is
-/// Ctrl-Z at the start of a line, and in a session of the native-compatible mode it is the shell's
-/// own and reaches the shell as typed.
+/// The root program is the system's `nslookup`, which reads its commands from the console until its
+/// input ends and then ends with status 0. The end of input a console gives is Ctrl-Z at the start
+/// of a line, and in a session of the native-compatible mode it is the program's own: it reaches
+/// the program as typed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_end_of_the_shells_input_closes_the_session_and_nothing_starts_it_again() {
     let host = WorkerHost::start().await;
@@ -189,7 +189,7 @@ async fn the_end_of_the_shells_input_closes_the_session_and_nothing_starts_it_ag
             "--shell-mode",
             "native_compat",
             "--shell",
-            &system32("sort.exe"),
+            &system32("nslookup.exe"),
         ])
         .await;
     let (session, dimensions) = created.session();
