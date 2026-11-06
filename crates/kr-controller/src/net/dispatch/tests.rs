@@ -7139,6 +7139,92 @@ async fn a_copy_of_a_close_that_did_nothing_is_refused_as_ever() {
     world.serving.abort();
 }
 
+/// A close whose route cannot be recorded goes on and opens its link to the worker, but the
+/// authority feed raises its refusal on remote grants before the close writes: the check of its
+/// standing stops the frame, the worker has none of it, and the close did nothing. A copy of it
+/// that arrives after the work has ended, and is refused on this host's own account, is refused as
+/// ever. The host has no close to say may have been carried out, so the copy is not told the
+/// outcome is unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_of_a_close_stopped_before_its_frame_was_sent_is_refused_as_ever() {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::session::SessionCloseParams;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let record = paired(controller, 94, |grant| {
+        grant.actions = [ActionRight::SessionView, ActionRight::SessionClose]
+            .into_iter()
+            .collect();
+    });
+    let first = super::RemoteConnection::for_test(controller, record.clone());
+    let second = super::RemoteConnection::for_test(controller, record);
+    let close = device_mutation(
+        &world,
+        &first,
+        Method::SessionClose,
+        106,
+        ParamsValue::from_typed(&SessionCloseParams {
+            session_id: world.session_id,
+        })
+        .expect("encodes"),
+    );
+    rusqlite::Connection::open(controller.paths.registry_database())
+        .expect("the registry opens beside the daemon's own handle")
+        .execute_batch(
+            "CREATE TRIGGER the_route_is_not_kept BEFORE INSERT ON network_actions
+             BEGIN SELECT RAISE(ABORT, 'the registry keeps no route'); END;",
+        )
+        .expect("the registry is made to refuse the write that records a route");
+
+    // The close is admitted, and the refusal rises while it waits for its link to the worker.
+    let (arrived, go) = controller.before_a_proxy_is_opened.arm();
+    let (told, ()) = tokio::join!(
+        first.answer_now(ControlFrame::Mutation(Box::new(close.clone()))),
+        async {
+            arrived.await.expect("the close reaches the worker's door");
+            controller.raise_the_unverified_withdrawal_refusal().await;
+            go.send(()).expect("the close is waiting");
+        }
+    );
+    told.expect("the close is answered");
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while controller.arrivals().entered() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the close leaves the calls that have not claimed when its work has ended");
+    assert_eq!(
+        script.closes_taken(),
+        0,
+        "the worker was asked for no close"
+    );
+    assert!(
+        controller
+            .devices()
+            .action_route(&second.device.principal(), close.action_id)
+            .expect("the routes are readable")
+            .is_none(),
+        "the close has no route"
+    );
+
+    let copy = second
+        .answer_now(ControlFrame::Mutation(Box::new(close.clone())))
+        .await
+        .expect("the copy is answered");
+    let error = error_of(copy.frame());
+    assert!(
+        super::is_definite(error),
+        "a copy of a close stopped before it was sent is refused as ever: {error}"
+    );
+    world.serving.abort();
+}
+
 /// KR-REQ-09.09: the route of an action that holds another request makes the identifier a spent
 /// one for this request, so a refusal of it keeps its code however many copies of it are queued: no
 /// copy can have been carried out under an identifier the route holds for another. The queued copy
@@ -7203,6 +7289,79 @@ async fn a_reused_identifier_is_refused_as_one_though_a_copy_of_the_request_is_q
     );
     drop(queued);
     world.serving.abort();
+}
+
+/// KR-REQ-09.09: a voice delegation under an identifier whose route holds another request and
+/// names a session is refused as one that nothing is carried out under, however many copies of it
+/// are queued: a voice challenge gives back only a route that names no session, so this route is
+/// not given back for it. Where the route names none it may be a challenge's, which is given back,
+/// and a copy of the delegation can then be carried out: the queued copy makes the refusal a
+/// repeat's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_delegation_under_an_identifier_a_session_holds_is_refused_though_a_copy_is_queued()
+{
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::session::SessionCloseParams;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    for held_by_a_session in [true, false] {
+        let script = Scripted::new();
+        let world = scripted::scripted(&script).await;
+        let controller = &world.controller;
+        let connection =
+            super::RemoteConnection::for_test(controller, paired_with_every_right(controller, 92));
+        let held = device_mutation(
+            &world,
+            &connection,
+            Method::AgentPromptSubmit,
+            104,
+            ParamsValue::empty(),
+        );
+        assert!(
+            connection
+                .claim_route(
+                    &held,
+                    held_by_a_session.then_some(world.session_id),
+                    &super::forwarding::OwnClaim::none()
+                )
+                .is_ok(),
+            "the route holds the first request"
+        );
+        // The same identifier carrying a voice delegation, of which a copy is queued behind it.
+        let mut delegation = held.clone();
+        delegation.request_id = RequestId::new(105);
+        delegation.method = Method::VoiceDelegate.into();
+        delegation.params = ParamsValue::from_typed(&SessionCloseParams {
+            session_id: world.session_id,
+        })
+        .expect("encodes");
+        let queued = controller.arrivals().arrive(
+            crate::service::net::arrivals::request_of(&connection.device.principal(), &delegation)
+                .expect("a request"),
+        );
+
+        let refused = connection
+            .answer_now(ControlFrame::Mutation(Box::new(delegation.clone())))
+            .await
+            .expect("the delegation is answered");
+        let error = error_of(refused.frame());
+        if held_by_a_session {
+            assert!(
+                super::is_definite(error),
+                "a route that names a session is not given back for a delegation: {error}"
+            );
+        } else {
+            assert_eq!(
+                error.code,
+                ErrorCode::OutcomeUnknown,
+                "a route that names no session may be given back for a delegation: {error}"
+            );
+        }
+        drop(queued);
+        world.serving.abort();
+    }
 }
 
 /// The authority feed raises a refusal on remote grants while a mutation, which has its lease,
