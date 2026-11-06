@@ -8,7 +8,9 @@ The terminal's tertiary device attributes (`ESC P ! | id ST`) and its report of 
 byte or two: the rest was left in the input, and the reader typed it into the line. Once the header
 says which string it is, the string is now read to its terminator, as the strings the reader does
 use already are. A byte that does not come within the reader's own wait for the next byte of a
-sequence ends the string early, as it ends any other. When the header is `ESC P !`, `ESC P 1 $` or
+sequence ends the string early, as it ends any other. Inside a bracketed paste the strings are not
+read to their end: a terminal never answers there, and a string would take the end of the paste with
+it. When the header is `ESC P !`, `ESC P 1 $` or
 `ESC P 0 $` and the byte behind it does not continue the string (`|` or `r`), the string is left as
 it was, but the byte read to tell is not part of it: it is read again from the start, as the first
 byte of a key or of a sequence of its own. Text typed behind an Alt-Shift-p and `!` or `1$` loses
@@ -110,24 +112,43 @@ shells/fish/LICENSE.
              }
              .or_else(|| {
                  let code_unit_first_byte = *buffer.last().unwrap();
-@@ -156,6 +180,16 @@
-         }
+@@ -130,6 +154,14 @@
+                 CharEvent::from_key_seq(key_evt, decoded_buffer)
+             })
+         });
++        // While a query of the terminal is unanswered, keys go to the back of the queue; otherwise
++        // they go to the front and come out last in first. The Escapes owed come out before the
++        // key that follows them either way: queued ahead of it in the first case, behind it in the
++        // second.
++        let appending = self.is_blocked_querying();
++        if appending {
++            self.enqueue_escapes(owed_escapes);
++        }
+         if escape_sequence.unconsumed_escapes != 0 {
+             let escapes = escape_sequence.unconsumed_escapes;
+             if evt.as_mut().is_none_or(|evt| {
+@@ -157,8 +189,20 @@
          if let Some(evt) = evt {
              self.enqueue_event(evt);
+         }
++        if !appending {
++            self.enqueue_escapes(owed_escapes);
 +        }
-+        self.enqueue_escapes(owed_escapes);
-+    }
-+
+     }
+ 
 +    fn enqueue_escapes(&mut self, count: usize) {
 +        for _ in 0..count {
 +            self.enqueue_event(CharEvent::from_key_seq(
 +                KeyEvent::from_raw(key::ESCAPE),
 +                WString::from_str("\x1b"),
 +            ));
-         }
-     }
- 
-@@ -218,7 +252,19 @@
++        }
++    }
++
+     fn enqueue_event(&mut self, evt: CharEvent) {
+         if !self.is_blocked_querying() || !is_event_blocked_when_querying(&evt) {
+             self.push_front(evt);
+@@ -218,7 +262,19 @@
                  b'[' => self.parse_csi(buffer),
                  b'O' => self.parse_ss3(buffer),
                  b']' => self.parse_osc(buffer),
@@ -148,7 +169,7 @@ shells/fish/LICENSE.
                  _ => {
                      return EscapeSequenceParseResult {
                          state: Incomplete,
-@@ -398,6 +444,12 @@
+@@ -398,6 +454,12 @@
                  return Some(CharEvent::Implicit(ImplicitEvent::MouseLeft(position)));
              }
              b't' => {
@@ -161,7 +182,7 @@ shells/fish/LICENSE.
                  flog!(reader, "mouse event");
                  // VT200 button released in mouse highlighting mode at valid text location. 5 chars.
                  let _ = next_char(self);
-@@ -686,7 +738,14 @@
+@@ -686,7 +748,14 @@
          Some(query_response(QueryResponse::BackgroundColor(c)))
      }
  
@@ -177,23 +198,27 @@ shells/fish/LICENSE.
          assert_eq!(buffer, b"\x1bP");
          let Some(success) = self.read_sequence_byte(buffer) else {
              return char_event(buffer, KeyEvent::from(alt('P')));
-@@ -698,11 +757,36 @@
+@@ -696,13 +765,40 @@
+             b'1' => true,
+             b'>' => {
                  self.parse_xtversion(buffer);
-                 return None;
-             }
++                return None;
++            }
 +            b'!' => {
 +                // The terminal's tertiary device attributes (`\e P ! | id ST`) are a string this
 +                // reader does not use. Its body is read to the string terminator, so none of it is
 +                // left to be typed into the line. Only the header says it is one: Alt-Shift-p,
 +                // typed before text, is not, and the byte behind it is the person's.
 +                let next = self.read_sequence_byte(buffer)?;
-+                if next == b'|' {
++                // A terminal never answers inside a paste: the string would take the end of the paste
++                // with it, so inside one the bytes behind the header are the paste's own.
++                if next == b'|' && !self.paste_is_buffering() {
 +                    self.read_until_sequence_terminator(buffer, false);
 +                } else {
 +                    *given_back = Some(next);
 +                }
-+                return None;
-+            }
+                 return None;
+             }
              _ => return None,
          };
 -        if self.read_sequence_byte(buffer)? != b'+' {
@@ -202,7 +227,7 @@ shells/fish/LICENSE.
 +            // The terminal's report of a setting (`\e P 1 $ r setting ST`) is another, read the
 +            // same way once its header is whole.
 +            let next = self.read_sequence_byte(buffer)?;
-+            if next == b'r' {
++            if next == b'r' && !self.paste_is_buffering() {
 +                self.read_until_sequence_terminator(buffer, false);
 +            } else {
 +                *given_back = Some(next);

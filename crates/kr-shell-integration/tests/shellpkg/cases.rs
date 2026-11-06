@@ -969,6 +969,76 @@ pub fn a_long_run_of_escape_pairs_before_a_device_control_header_leaves_the_shel
     );
 }
 
+/// KR-REQ-08.48: the Escape that comes before a device control string that is not one the reader
+/// skips stays ahead of the key behind the string while the reader waits for the terminal's answer.
+///
+/// While a query of the terminal is unanswered the reader sets the keys typed aside at the back of
+/// its queue, and otherwise it puts a key it has decoded at the front. The Escape of an
+/// `ESC ESC P !` is owed to the person ahead of the key that is read again, in both. The case sets
+/// the editor to its vi keys, takes the terminal's answers away so that the next prompt's query
+/// stays open, types a line with a word that ends in a letter, the Escapes with the header and an
+/// `x`, and a return, then gives the answers back. The Escape makes the editor leave insert mode
+/// and the `x` deletes the last letter of the word, so the word is printed without it; with the
+/// two the other way round the `x` is typed into the word.
+///
+/// # Panics
+///
+/// Panics when the line does not print its word.
+#[cfg(unix)]
+pub fn the_keys_around_a_device_control_header_keep_their_order_while_the_terminal_is_asked(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let (vi_mode, _) = vi_keymap_commands(kind).expect("this editor has vi keys");
+    assert!(session.run(vi_mode, "kr-vi-on"));
+    let _ = session.next_prompt();
+    session.hold_terminal_answers();
+    assert!(session.answered("kr-held"));
+    let _ = session.next_prompt();
+    let start = session.written();
+    session.type_bytes(b"printf '%s%s\\n' kr-ord ered\x1b\x1bP!x\r");
+    session.release_terminal_answers();
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-ordere", deadline),
+        "the Escape did not stay ahead of the key behind the header:\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// KR-REQ-08.48: a bracketed paste with an unfinished device control string in its text still
+/// ends, and the key typed behind it reaches the line.
+///
+/// The reader reads a tertiary device attributes string or a report of a setting to its terminator,
+/// and a terminal sends one only as an answer, never inside a paste. A reader that reads one inside
+/// a paste takes the end of the paste for part of the string when the text has the string's start
+/// and no terminator, and stays in the paste: every key typed afterwards is held with it. The case
+/// pastes a command with each of the strings' starts (`ESC P ! |`, `ESC P 1 $ r`, `ESC P 0 $ r`)
+/// and no terminator in the middle of a quoted word, types the rest of the word and a last word
+/// behind the paste, and returns: the word is printed only if the paste ended and the typed keys
+/// reached the line, with the byte behind the start among the pasted text.
+///
+/// # Panics
+///
+/// Panics when a line does not print its word.
+#[cfg(unix)]
+pub fn a_paste_with_an_unfinished_device_control_string_in_it_still_ends(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    for (start, kept) in [("\x1bP!|", '|'), ("\x1bP1$r", 'r'), ("\x1bP0$r", 'r')] {
+        let line = format!("\x1b[200~printf '%s%s\\n' 'kr-pa{start}\x1b[201~' ted");
+        let word = format!("kr-pa{kept}ted");
+        assert!(
+            session.run(&line, &word),
+            "the keys typed behind the paste with {start:?} in it did not reach the line:\n{}",
+            session.terminal_output()
+        );
+    }
+}
+
 /// KR-REQ-08.48: a bracketed paste with the start of a device control string that is not one the
 /// reader skips in its text still ends, and the text behind the start is pasted.
 ///

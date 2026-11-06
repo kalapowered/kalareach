@@ -74,6 +74,24 @@ fn a_long_run_of_escape_pairs_before_a_device_control_header_leaves_the_shell_ru
     );
 }
 
+/// KR-REQ-08.48: the Escape before a device control string that is not one the reader skips stays
+/// ahead of the key behind the string while the reader waits for the terminal's answer.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_keys_around_a_device_control_header_keep_their_order_while_the_terminal_is_asked() {
+    shellpkg::the_keys_around_a_device_control_header_keep_their_order_while_the_terminal_is_asked(
+        FISH,
+    );
+}
+
+/// KR-REQ-08.48: a bracketed paste with an unfinished device control string in its text still
+/// ends, and the key typed behind it reaches the line.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_paste_with_an_unfinished_device_control_string_in_it_still_ends() {
+    shellpkg::a_paste_with_an_unfinished_device_control_string_in_it_still_ends(FISH);
+}
+
 /// KR-REQ-08.48: a bracketed paste with the start of a device control string that is not one the
 /// reader skips in its text still ends, and the text behind the start is pasted.
 #[test]
