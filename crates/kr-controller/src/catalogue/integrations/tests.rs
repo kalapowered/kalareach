@@ -1474,3 +1474,111 @@ fn a_candidate_this_account_cannot_execute_is_passed_over() {
         Some(runnable)
     );
 }
+
+/// What the system's own `where.exe` finds for `name`, in the order it finds it, when the only
+/// directories searched are `directories` and the working directory holds nothing of that name.
+#[cfg(windows)]
+fn where_finds(name: &str, directories: &[PathBuf], nowhere: &Path) -> Vec<PathBuf> {
+    let system = PathBuf::from(std::env::var_os("SystemRoot").expect("the system directory"))
+        .join("System32");
+    let output = std::process::Command::new(system.join("where.exe"))
+        .arg(name)
+        .env(
+            "PATH",
+            std::env::join_paths(directories).expect("a search path"),
+        )
+        .current_dir(nowhere)
+        .output()
+        .expect("where.exe runs");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| PathBuf::from(line.trim()))
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect()
+}
+
+/// KR-REQ-11.42, KR-REQ-07.45: on Windows the search the doctor makes for an application's
+/// executable, with the extensions this machine's `PATHEXT` names, finds the file the system's own
+/// search (`where.exe`) finds first, and says it is a shim, which no launcher starts, exactly when
+/// that file is not a program.
+///
+/// Real files in real directories stand in a search path in five arrangements: a batch file in
+/// an earlier directory and a program in a later one (the earlier directory wins whatever the
+/// extension), the two the other way round, a program and a batch file in one directory (the
+/// extensions go in `PATHEXT`'s order), a file with an extension that `PATHEXT` names but that is
+/// neither a program nor a batch file, and nothing at all. One difference is the host's own: a
+/// `.ps1` script is taken before the extensions in one directory, as PowerShell takes it, and
+/// `where.exe` does not know it, so no `.ps1` is used here.
+#[cfg(windows)]
+#[test]
+fn the_search_the_doctor_makes_names_the_file_the_system_finds_first() {
+    let store = Store::new("where");
+    let reading =
+        Integrations::new().read(&[store.admitted(&fixture::Shape::claude_code(), |_| {})]);
+    let nowhere = store.0.join("nowhere");
+    std::fs::create_dir_all(&nowhere).expect("a directory with nothing in it");
+    let batch_first = store.0.join("batch-first");
+    let program_later = store.0.join("program-later");
+    let both = store.0.join("both");
+    let other_extension = store.0.join("other-extension");
+    executable(&batch_first, "claude.cmd");
+    executable(&program_later, "claude.exe");
+    executable(&both, "claude.exe");
+    executable(&both, "claude.cmd");
+    executable(&both, "claude.bat");
+    executable(&other_extension, "claude.vbs");
+    let arrangements: [(&str, Vec<PathBuf>); 5] = [
+        (
+            "a batch file in an earlier directory and a program in a later one",
+            vec![batch_first.clone(), program_later.clone()],
+        ),
+        (
+            "a program in an earlier directory and a batch file in a later one",
+            vec![program_later.clone(), batch_first],
+        ),
+        ("a program and two batch files in one directory", vec![both]),
+        (
+            "a file only PATHEXT names, before a program",
+            vec![other_extension, program_later],
+        ),
+        ("nothing", vec![nowhere.clone()]),
+    ];
+    for (what, directories) in arrangements {
+        let system_finds = where_finds("claude", &directories, &nowhere);
+        let found = resolve("claude", &directories);
+        assert_eq!(
+            found
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_lowercase()),
+            system_finds
+                .first()
+                .map(|path| path.to_string_lossy().to_lowercase()),
+            "{what}: the doctor's search and the system's differ (the system finds {system_finds:?})"
+        );
+        let reported = report(
+            Some(&reading),
+            &[],
+            &enabled(&["claude-code"]),
+            &able(directories),
+        );
+        let reason = reported.reports[0].reason.0.clone();
+        match found {
+            Some(first) if kr_worker::broker::commands::starts_directly(&first) => {
+                assert_eq!(reason, None, "{what}: a program is not a shim");
+            }
+            Some(first) => {
+                let reason = reason.unwrap_or_else(|| panic!("{what}: a shim says why"));
+                assert!(
+                    reason.starts_with(&format!("first hit is {}", first.display())),
+                    "{what}: {reason}"
+                );
+            }
+            None => {
+                assert!(
+                    reported.reports[0].executable.0.is_none(),
+                    "{what}: nothing is found, and an executable is named"
+                );
+            }
+        }
+    }
+}
