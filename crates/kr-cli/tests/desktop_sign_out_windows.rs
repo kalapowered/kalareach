@@ -23,6 +23,10 @@ use std::sync::Arc;
 
 use kr_protocol::identity::{DesktopBinding, ProcessStartIdentity};
 use kr_protocol::ids::SessionId;
+use kr_protocol::local::LocalClientKind;
+use kr_protocol::method::Method;
+use kr_protocol::scalars::Nullable;
+use kr_protocol::session::{SessionListParams, SessionListResult, SessionSummary};
 use kr_worker::desktop::{Presence, recorded_presence};
 
 mod support;
@@ -91,6 +95,40 @@ fn worker_of(
         .find(|descriptor| descriptor.session_id == session_id)
         .expect("the worker published its descriptor")
         .process_start_identity
+}
+
+/// The session as the daemon lists it. `kr new` prints the login a session is bound to but not its
+/// root shell's process identity, which the daemon's listing names.
+async fn listed(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    session_id: SessionId,
+) -> SessionSummary {
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let mut client = kr_ipc::client::LocalClient::connect(
+        &endpoint,
+        LocalClientKind::Cli,
+        windows_session::build(),
+    )
+    .await
+    .expect("reaches the daemon");
+    let sessions: SessionListResult = client
+        .request(
+            Method::SessionList,
+            &SessionListParams {
+                environment_id: Nullable::some(environment.environment_id()),
+                include_closed: false,
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the daemon answers")
+        .to_typed()
+        .expect("decodes");
+    sessions
+        .sessions
+        .into_iter()
+        .find(|summary| summary.session_id == session_id)
+        .unwrap_or_else(|| panic!("the daemon lists the session {session_id}"))
 }
 
 /// What a created session's JSON says of the login it is bound to.
@@ -179,10 +217,16 @@ async fn a_desktop_bound_session_is_made_and_the_account_signed_out() {
 
     let login = kr_ipc::starter::current_session().expect("this process's login session");
     let worker = worker_of(&environment, session_id);
-    let root: ProcessStartIdentity =
-        serde_json::from_value(created.document["root_process"].clone()).unwrap_or_else(|error| {
-            panic!("the session's root process ({error}): {}", created.document)
-        });
+    let summary = listed(&environment, session_id).await;
+    assert_eq!(
+        summary.desktop, binding,
+        "the daemon holds the login the session was reported bound to"
+    );
+    let root: ProcessStartIdentity = summary
+        .root_process
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| panic!("the session names its root shell: {summary:?}"));
     assert_running_in(login, "the worker", &worker);
     assert_running_in(login, "the root shell", &root);
     assert_eq!(
