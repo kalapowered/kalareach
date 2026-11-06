@@ -251,11 +251,11 @@ answer does.
 The checks judge audio by counters crossing a floor, never by elapsed time: about a second of audio
 packets in each direction, and a fifth of a second of samples played. A direction that nothing
 counted, or that stayed under its floor with no microphone to send from, is reported as not measured.
-On a simulator the call's capture does not read `capturing`, so the packets it sends carry whatever its
-audio unit delivers, silence included, and say nothing of speech; the run grants the machine no
-permission, and what the Simulator does with the machine's input device is its own. When the
-application has read its figure of
-the first audio, the script takes the voice service away. The checks then expect the control to read
+The packets the call sent are counted whatever its microphone delivered, silence included, so they say
+nothing of speech; the call's capture word says whether speech could have been heard. The script
+grants the application the simulator's microphone permission and nothing on the machine, and it does
+not isolate the Simulator's input route. When the application has read its figure of the first audio,
+the script takes the voice service away. The checks then expect the control to read
 `unreachable`, the microphone's mute and the speaker's silence to work with the media still
 connected, a stop to return without waiting for the service, the media to stop on the device, the host
 to revoke the grant, and the service's closure to be reported as not confirmed. On iOS the machine also

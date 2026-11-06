@@ -27,10 +27,10 @@
 # the application has read its figure of the first audio, and the application then shows the
 # control unreachable, exercises the local mute and silence, stops the call without the service
 # and finds the closure not confirmed. The peer is a full ICE agent and not the provider's lite
-# one, sends nothing to a speaker of this machine (the emulator's audio is off in this mode and the
-# simulator's synthetic device only drains what it is played), and stands in for no provider: what
-# is proved is that the call connects to an answer marked as the provider's and carries audio, not
-# that the provider's own does.
+# one, sends nothing to a speaker of this machine (the Android peer mutes its speaker and the iOS
+# peer's synthetic device only drains what it is played), and stands in for no provider: what is
+# proved is that the call connects to an answer marked as the provider's and carries audio, not that
+# the provider's own does.
 #
 # The emulator's audio: the outage mode starts it with `-audio none` unless `KR_EMULATOR_AUDIO_ARGS`
 # says otherwise (it may be set to an empty string); a run may also pass `QEMU_AUDIO_OUT_DRV`,
@@ -90,6 +90,9 @@ emulator_serial=""
 emulator_adb=""
 # Set once this run has made its adb forward of the peer's port, so that only that forward is removed.
 peer_forward=""
+# The simulator application's directory for the run's request, set when the run has made it, so that its
+# request and peer files are removed however the run ends.
+app_data_directory=""
 
 say() { printf '== [voice-call-device] %s\n' "$*" | tee -a "$log"; }
 
@@ -102,6 +105,8 @@ say() { printf '== [voice-call-device] %s\n' "$*" | tee -a "$log"; }
 # is ended by its pid when it does not stop.
 finish() {
     touch "$harness/finish" 2>/dev/null
+    # A later launch of the installed application must not find this run's request or start its peer.
+    [ -z "$app_data_directory" ] || rm -f "${app_data_directory:?}/request.json" "${app_data_directory:?}/peer.json"
     if [ -n "$harness_pid" ]; then
         local waited=0
         while kill -0 "$harness_pid" 2>/dev/null && [ "$waited" -lt 30 ]; do
@@ -344,6 +349,7 @@ run_ios() {
     data="$(xcrun simctl get_app_container "$udid" "$app_id" data)"
     directory="$data/Library/Application Support/$app_id/kr-probe"
     mkdir -p "$directory"
+    app_data_directory="$directory"
     write_request "$directory/request.json" || return 2
     # The peer the application starts at launch, which only the outage mode asks for. A simulator
     # shares this machine's loopback interface, so the peer's port is reached as it is.
@@ -365,8 +371,6 @@ run_ios() {
     xcrun simctl spawn "$udid" log show --last 15m --style compact \
         --predicate 'process == "KalaReach"' 2>/dev/null | tail -300 >"$artefacts/application.log"
     xcrun simctl terminate "$udid" "$app_id" >/dev/null 2>&1
-    # A later launch of the installed application must not find this run's request or start its peer.
-    rm -f "${directory:?}/request.json" "${directory:?}/peer.json"
     local app_rc=0 host_rc=0
     judge "$artefacts/$result_name" || app_rc=$?
     judge_host || host_rc=$?
