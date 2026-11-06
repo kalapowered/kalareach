@@ -1465,6 +1465,190 @@ async fn a_repeat_whose_record_in_the_journal_cannot_be_read_is_told_the_outcome
     host.clients.abort();
 }
 
+/// KR-REQ-19.04: a repeat whose record the journal holds in a shape this build cannot make sense
+/// of is told that what became of the action is not known. The record is not a refusal of the
+/// argument, and it does not say the action was not performed: it says the host cannot read what
+/// it kept. Four shapes are such a record: a row that says more than one thing about how the action
+/// ended, a refusal under a code this build does not know, a run record under a method that starts
+/// no run, and the record of a run the journal does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_whose_record_in_the_journal_makes_no_sense_is_told_the_outcome_is_unknown() {
+    let host = host().await;
+    let mut control = client(&host).await;
+
+    host.issue(grant_id(7), &COMMAND_RIGHTS);
+    let document = definition(
+        workflow_id(7),
+        grant_id(7),
+        "asked when the journal holds a record that makes no sense",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    let installation = control
+        .compose(
+            Method::WorkflowInstall,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &WorkflowInstallParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                definition: document.clone(),
+                grant_reference: document.grant_reference,
+            },
+        )
+        .await
+        .expect("the mutation is composed");
+    let first: WorkflowInstallResult = typed(
+        &control
+            .repeat(&installation)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the workflow is installed"),
+    );
+    let run = control
+        .compose(
+            Method::WorkflowRun,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &WorkflowRunParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                event_id: "event-1".to_owned(),
+                event_type: "manual".to_owned(),
+                event_payload: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the run is composed");
+
+    let journal = rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::store::WORKFLOW_DB_NAME),
+    )
+    .expect("opens the workflow journal beside the daemon's own handle");
+    journal
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .expect("a busy timeout");
+    let (actor, kept): (String, String) = journal
+        .query_row(
+            "SELECT actor_id, result_json FROM action_records WHERE result_json IS NOT NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the installation's record");
+
+    // The installation's record, made to say what no build writes.
+    for (what, set) in [
+        (
+            "a refusal under a code this build does not know",
+            "UPDATE action_records SET result_json = NULL, error_code = 'A_CODE_FROM_A_LATER_BUILD',
+                                       error_detail = 'refused'",
+        ),
+        (
+            "a run record under a method that starts no run",
+            "UPDATE action_records SET result_json = NULL,
+                                       run_id = '5c5c5c5c-5c5c-4c5c-8c5c-5c5c5c5c5c5c'",
+        ),
+    ] {
+        journal.execute(set, []).expect("the record is made to say it");
+        let told = failure(
+            client(&host)
+                .await
+                .repeat(&installation)
+                .await
+                .expect("the call reaches the daemon"),
+        );
+        assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{what}: {told:?}");
+        journal
+            .execute(
+                "UPDATE action_records SET result_json = ?1, error_code = NULL,
+                                           error_detail = NULL, run_id = NULL",
+                [&kept],
+            )
+            .expect("the record is restored");
+    }
+
+    // A row that says two things about how the action ended. The table refuses to be written so,
+    // and a table an earlier build made does not: it is put back as that build made it.
+    journal
+        .execute_batch(
+            "ALTER TABLE action_records RENAME TO action_records_checked;
+             CREATE TABLE action_records (
+                actor_id TEXT NOT NULL,
+                action_id TEXT NOT NULL,
+                method TEXT NOT NULL,
+                payload_digest BLOB NOT NULL,
+                result_json TEXT,
+                run_id TEXT,
+                error_code TEXT,
+                error_detail TEXT,
+                recorded_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (actor_id, action_id)
+             );
+             INSERT INTO action_records SELECT * FROM action_records_checked;
+             DROP TABLE action_records_checked;
+             UPDATE action_records SET error_code = 'PERMISSION_DENIED', error_detail = 'no';",
+        )
+        .expect("the record is made to say two things");
+    let doubled = failure(
+        client(&host)
+            .await
+            .repeat(&installation)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(doubled.code, ErrorCode::OutcomeUnknown, "{doubled:?}");
+    journal
+        .execute(
+            "UPDATE action_records SET error_code = NULL, error_detail = NULL",
+            [],
+        )
+        .expect("the record is restored");
+
+    // The record of a run the journal does not hold: this action started it.
+    let actor_id = kr_protocol::ids::ActorId::new(actor).expect("the actor the record names");
+    let digest = kr_protocol::digest::mutation_digest(&run, &actor_id).expect("digests it");
+    journal
+        .execute(
+            "INSERT INTO action_records (
+                actor_id, action_id, method, payload_digest, result_json, run_id, error_code,
+                error_detail, recorded_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, NULL, '5d5d5d5d-5d5d-4d5d-8d5d-5d5d5d5d5d5d', NULL, NULL, 1)",
+            rusqlite::params![
+                actor_id.as_str(),
+                run.action_id.to_string(),
+                Method::WorkflowRun.as_str(),
+                digest.as_bytes().to_vec(),
+            ],
+        )
+        .expect("the run's record is written");
+    let missing = failure(
+        client(&host)
+            .await
+            .repeat(&run)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(missing.code, ErrorCode::OutcomeUnknown, "{missing:?}");
+
+    let again: WorkflowInstallResult = typed(
+        &client(&host)
+            .await
+            .repeat(&installation)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the repeat is answered once the record makes sense"),
+    );
+    assert_eq!(again, first);
+    host.clients.abort();
+}
+
 /// KR-REQ-19.04: a caller that lost its reply and asks again over a new connection is answered
 /// from the record.
 ///

@@ -922,11 +922,12 @@ impl AutomationService {
             ActionRecord::Started { run_id } => run_id,
             other => return recorded(other),
         };
-        let run = self.store.run_summary(run_id)?.ok_or_else(|| {
-            AutomationError::InvalidArgument(format!(
-                "the run {run_id} this action started is not in the journal"
-            ))
-        })?;
+        let run =
+            self.store
+                .run_summary(run_id)?
+                .ok_or_else(|| AutomationError::RecordUnreadable {
+                    detail: format!("the run {run_id} this action started is not in the journal"),
+                })?;
         Ok(WorkflowRunResult {
             run_id: run.run_id,
             workflow_id: run.workflow_id,
@@ -1441,14 +1442,22 @@ fn performed_or_recorded<T: serde::de::DeserializeOwned>(acted: Acted<T>) -> Res
 /// Reads back what an earlier submission recorded, for a method whose record carries its result.
 fn recorded<T: serde::de::DeserializeOwned>(record: ActionRecord) -> Result<T> {
     match record {
-        ActionRecord::Done { result } => Ok(serde_json::from_str(&result)?),
-        ActionRecord::Refused { code, detail } => Err(AutomationError::Recorded {
-            code: ErrorCode::from_wire(&code).unwrap_or(ErrorCode::InvalidArgument),
-            detail,
+        ActionRecord::Done { result } => {
+            serde_json::from_str(&result).map_err(|error| AutomationError::RecordUnreadable {
+                detail: format!("the recorded result is not the method's: {error}"),
+            })
+        }
+        ActionRecord::Refused { code, detail } => match ErrorCode::from_wire(&code) {
+            Some(code) => Err(AutomationError::Recorded { code, detail }),
+            None => Err(AutomationError::RecordUnreadable {
+                detail: format!("the recorded refusal is under {code}, a code this build lacks"),
+            }),
+        },
+        ActionRecord::Started { run_id } => Err(AutomationError::RecordUnreadable {
+            detail: format!(
+                "this action started run {run_id}, which is not what the method it names does"
+            ),
         }),
-        ActionRecord::Started { run_id } => Err(AutomationError::InvalidArgument(format!(
-            "this action started run {run_id}, which is not what the method it names does"
-        ))),
     }
 }
 
