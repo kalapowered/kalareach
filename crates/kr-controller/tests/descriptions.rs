@@ -503,6 +503,8 @@ enum Reply {
     Chunked(Vec<u8>),
     /// The whole length declared, half of the body sent, and then nothing until the client leaves.
     HalfThenHold(Vec<u8>),
+    /// The whole length declared, half of the body sent, and the rest once the test lets it go.
+    HalfThenRest(Vec<u8>, Arc<tokio::sync::Notify>),
     /// The request read and no answer, until the client leaves.
     Silent,
 }
@@ -638,6 +640,17 @@ impl Fixture {
                 // Held until the client leaves: reading answers nothing but its end.
                 let _ = stream.read(&mut chunk).await;
                 return;
+            }
+            Some(Reply::HalfThenRest(body, rest)) => {
+                stream
+                    .write_all(ok(body.len() as u64).as_bytes())
+                    .await
+                    .ok();
+                stream.write_all(&body[..body.len() / 2]).await.ok();
+                stream.flush().await.ok();
+                half_sent.notify_one();
+                rest.notified().await;
+                stream.write_all(&body[body.len() / 2..]).await
             }
         };
         let _ = stream.shutdown().await;
@@ -3494,11 +3507,16 @@ async fn a_fetch_is_not_cancelled_while_a_fence_is_owed() {
 /// KR-REQ-26.16, the part about a change affecting authority fencing dispatch: a change to the
 /// configuration that narrows what a grant may carry, whose fence this host could not raise, stops
 /// the cancellation of a running fetch, and the fetch goes on. The refusal is the fence's own: the
-/// change was not acknowledged as in force, and nothing that was admitted dispatches until it is.
+/// change was not acknowledged as in force. The fetch is then let finish: its file is verified, and
+/// it was asked for once, so nothing cancelled it, before or after the refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fetch_is_not_cancelled_after_a_change_to_authority_whose_fence_was_not_raised() {
     let fixture = Fixture::start().await;
-    fixture.reply("/tiny.gguf", Reply::HalfThenHold(WEIGHTS.to_vec()));
+    let rest = Arc::new(tokio::sync::Notify::new());
+    fixture.reply(
+        "/tiny.gguf",
+        Reply::HalfThenRest(WEIGHTS.to_vec(), Arc::clone(&rest)),
+    );
     let environment = Environment::start(Setup {
         catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
         held: false,
@@ -3527,12 +3545,18 @@ async fn a_fetch_is_not_cancelled_after_a_change_to_authority_whose_fence_was_no
         refused.message.contains("could not be raised"),
         "{refused:?}"
     );
-    assert_eq!(
-        environment.setup().await.download,
-        DescriptionDownload::Running,
-        "the refused cancellation changed nothing"
-    );
     fence_support::clear_the_fault(&registry);
+
+    // Let the held response finish: a fetch the refused request cancelled, before or after it was
+    // refused, does not verify.
+    rest.notify_one();
+    environment
+        .setup_until("the fetch verified", |shown| {
+            shown.download == DescriptionDownload::Verified
+        })
+        .await;
+    assert!(environment.marker());
+    assert_eq!(fixture.requests().len(), 1, "the file was fetched once");
     environment.stop().await;
 }
 
