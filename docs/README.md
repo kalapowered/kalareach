@@ -60,6 +60,7 @@ The clients:
 | [client/voice.md](client/voice.md) | The voice client's architecture |
 | [voice/client.md](voice/client.md) | Voice on the client: capture, playback, the capture gate and the device-owner confirmation |
 | [voice/media-stack-survey.md](voice/media-stack-survey.md) | The native media stack chosen for the voice client, and why |
+| [voice/phone-checks.md](voice/phone-checks.md) | The steps a person takes to check a voice call on a phone: the provider choice screen, the lock screen, no network |
 
 Conformance and performance:
 
