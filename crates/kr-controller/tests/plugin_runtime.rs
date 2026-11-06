@@ -550,18 +550,25 @@ fn looks_in_words(looks: &[(Duration, String)]) -> String {
 
 /// What the workers' reports of components say, one binding to a phrase, for a wait that ran out:
 /// whether the binding is `first` (otherwise it is named by the end of its identifier), its state
-/// and its reason.
+/// and its reason, and whether the look that gave them was answered by every worker in time (a
+/// look that was not shows the reports last accepted, which say nothing of the worker now).
 fn reports_in_words(
     reports: &[(
         kr_protocol::ids::BrokerBindingId,
         kr_protocol::admission::ComponentReport,
     )],
     first: kr_protocol::ids::BrokerBindingId,
+    answered: bool,
 ) -> String {
+    let answer = if answered {
+        "every worker answered the look"
+    } else {
+        "a worker did not answer the look in time, so these are the reports last accepted"
+    };
     if reports.is_empty() {
-        return "no binding".to_owned();
+        return format!("no binding ({answer})");
     }
-    reports
+    let words = reports
         .iter()
         .map(|(binding, report)| {
             let identifier = binding.to_string();
@@ -580,7 +587,8 @@ fn reports_in_words(
             )
         })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    format!("{words} ({answer})")
 }
 
 /// A person at a session's terminal: an attachment that holds the input lease and types.
@@ -1212,13 +1220,28 @@ impl World {
         kr_protocol::ids::BrokerBindingId,
         kr_protocol::admission::ComponentReport,
     )> {
+        self.looked().await.1
+    }
+
+    /// [`Self::reported`], and whether every worker answered the asking in time: where one did not,
+    /// the reports are the last ones accepted and say nothing of where its components stand now.
+    async fn looked(
+        &self,
+    ) -> (
+        bool,
+        Vec<(
+            kr_protocol::ids::BrokerBindingId,
+            kr_protocol::admission::ComponentReport,
+        )>,
+    ) {
         let controller = self.controller();
-        controller.refresh_admissions().await;
-        controller
+        let answered = controller.refresh_admissions().await;
+        let reports = controller
             .reported_components()
             .into_iter()
             .map(|(_, binding_id, report)| (binding_id, report))
-            .collect()
+            .collect();
+        (answered, reports)
     }
 
     /// The worker of a session, as the daemon's registry records it, for a daemon this test does
@@ -1669,12 +1692,12 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
         PATIENCE,
         "the second binding's registration to be sent and left unanswered",
         || async {
-            let reports = world.reported().await;
+            let (answered, reports) = world.looked().await;
             reports
                 .iter()
                 .find(|(binding, report)| *binding != first_binding && registering(report))
                 .map(|(binding, _)| *binding)
-                .ok_or_else(|| reports_in_words(&reports, first_binding))
+                .ok_or_else(|| reports_in_words(&reports, first_binding, answered))
         },
     )
     .await;
