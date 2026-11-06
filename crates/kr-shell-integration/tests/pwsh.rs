@@ -1405,6 +1405,55 @@ fn a_publish_refused_for_its_host_leaves_nothing_in_the_prefix() {
     );
 }
 
+/// KR-REQ-07.34, KR-REQ-07.35: the start of its own process that the module names in the hello is
+/// the microsecond the kernel recorded, whichever side of it the runtime's time falls on.
+///
+/// The worker compares the start the hello names with the one it reads from the kernel for the
+/// connecting process, and refuses a shell that differs by one unit as a different process. The
+/// runtime derives its time for a process from the kernel's by arithmetic that leaves it a few
+/// hundred nanoseconds above or below the kernel's value, so the module takes the nearest
+/// microsecond. These are the runtime's times for four shells and the starts the kernel recorded
+/// for them, taken from running shells on macOS: one a little above its microsecond, two a little
+/// below it, and one exact. The module truncated, and named the second and third one microsecond
+/// too early.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_start_time_the_module_names_is_the_nearest_microsecond_of_the_runtimes() {
+    const TIMES: [(u64, u64); 4] = [
+        (17_939_325_722_104_412, 1_793_932_572_210_441),
+        (17_939_325_736_990_098, 1_793_932_573_699_010),
+        (17_939_325_738_553_938, 1_793_932_573_855_394),
+        (17_939_325_725_070_580, 1_793_932_572_507_058),
+    ];
+    let package = shellpkg::Package::built(PWSH);
+    let module = package
+        .directory()
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1")
+        .display()
+        .to_string();
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; Import-Module '{module}'; \
+         $module = Get-Module KalaReach.ShellBridge; \
+         foreach ($ticks in {ticks}) {{ \
+             $start = & $module {{ param($ticks) ConvertTo-KrStartMicroseconds $ticks }} $ticks; \
+             Write-Output \"kr-start[$ticks]=[$start]\" \
+         }}",
+        ticks = TIMES.map(|(ticks, _)| ticks.to_string()).join(", ")
+    );
+    let asked = package.ask(&script);
+    let said = String::from_utf8_lossy(&asked.stdout).into_owned();
+    for (ticks, kernel) in TIMES {
+        assert_eq!(
+            said.lines()
+                .find_map(|line| line.strip_prefix(&format!("kr-start[{ticks}]=[")))
+                .and_then(|rest| rest.strip_suffix(']')),
+            Some(kernel.to_string().as_str()),
+            "the runtime's time {ticks} is not the kernel's microsecond {kernel}:\n{said}\n{}",
+            String::from_utf8_lossy(&asked.stderr)
+        );
+    }
+}
+
 /// KR-REQ-07.73: the module binds only a chord the editor stores under the spelling it was given,
 /// so a key of the person's is never taken over by a chord that means the same key.
 ///
