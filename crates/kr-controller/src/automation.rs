@@ -3157,7 +3157,9 @@ impl AutomationModule {
     /// The answer to a rearm that was performed, when `mutation` is its repeat.
     ///
     /// Anything else, a refusal included, is no answer here: the request goes on to be admitted
-    /// and decided as a new one, which refuses it for the reason it has.
+    /// and decided as a new one, which refuses it for the reason it has. A chain that cannot be
+    /// read is none of these: whether the rearm was performed is not known, and the repeat is told
+    /// so.
     async fn rearmed(
         &self,
         mutation: &MutationRequest,
@@ -3176,6 +3178,12 @@ impl AutomationModule {
         .await;
         match answer {
             Ok(Some(value)) => Some(frame(mutation.request_id, Ok(value))),
+            // A chain whose state cannot be read is not a chain that was not rearmed: the repeat is
+            // told it is not known whether the first request did, and is not decided as a new one.
+            Err(error) if error.code == ErrorCode::StorageUnavailable => Some(frame(
+                mutation.request_id,
+                Err(ControllerError::record_unreadable("workflow chains").to_protocol_error()),
+            )),
             Ok(None) | Err(_) => None,
         }
     }
