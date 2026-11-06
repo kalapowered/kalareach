@@ -611,4 +611,47 @@ final class PairingTests: DeviceTestCase {
         screenshot("handover-confirmed")
         say("PAIRING the hand-over is confirmed with Face ID and the session changes hands")
     }
+
+    /// A second host, paired by the same scan as a guest, which then refuses the phone its inbox
+    /// (13.01). The host in use stays the first. Nothing before the refusal says it happened: the
+    /// guest is served an empty inbox, and the host chooses to refuse after. Then the inbox says
+    /// that host refused to show it, in the host's own words and not as lost contact, beside what
+    /// the host in use holds.
+    func testBASecondHostThatRefusesTheInboxIsToldApartFromOneOutOfContact() {
+        openHosts()
+        begin("second", picture: "second")
+        chooseTheNewestPicture()
+        waitToShow("Invitation from a host")
+        screenshot("second-scanned-summary")
+        press("Pair")
+        waitToShow("Check this value on the host")
+        waitFor("second-value.txt")
+        let host = read("second-value.txt").replacingOccurrences(of: " ", with: "")
+        let spelled = host.map { String($0) }.joined(separator: " ")
+        let first = String(spelled.prefix(7)), second = String(spelled.suffix(7))
+        waitToShow("\(first), \(second)", timeout: 10)
+        touch("second-approve")
+        waitToShow("Paired with", timeout: 120)
+        waitFor("done-second")
+        // The host the phone uses stays the first: a phone that already reaches a host keeps it.
+        openHosts()
+        XCTAssertTrue(app.buttons["Use this host"].firstMatch.waitForExistence(timeout: 60), "the second host is not listed to be used")
+        waitToShow("In use", timeout: 60)
+        screenshot("tab-hosts-two-hosts")
+        say("PAIRING the second host is paired by the same scan and listed beside the first, which stays in use")
+
+        // The second host is read and answers: nothing of it is refused yet.
+        openAttention()
+        eventually("the first host's rows", timeout: 120) { hasRow("Waiting for you", "An approval is waiting for you") }
+        XCTAssertFalse(shows("refused to show its inbox"), "the inbox says a host refused it before any host did")
+        askHost("bound", timeout: 180)
+        eventually("the inbox to say the second host refused it", timeout: 180) { shows("refused to show its inbox") }
+        XCTAssertTrue(shows("offline-validity policy has lapsed"), "the inbox does not give the host's own words for the refusal")
+        XCTAssertTrue(shows("It answered, so contact is not lost"), "the inbox does not say the host answered, so contact is not lost")
+        XCTAssertFalse(shows("is out of contact"), "the inbox calls a host that refused it out of contact")
+        XCTAssertTrue(hasRow("Waiting for you", "An approval is waiting for you"), "the first host's rows are not listed beside the refusal")
+        screenshot("inbox-host-refused")
+        say("PAIRING the inbox shows a host that refused it, in the host's words, above what the host in use holds")
+        XCTAssertEqual(read("bound-result.txt"), "before served items=0\nafter refused PermissionDenied", "the second host did not answer as expected")
+    }
 }

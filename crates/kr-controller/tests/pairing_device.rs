@@ -25,6 +25,8 @@
 //! | `up` | `go-up` | the host starts again on the same address, with every record it kept, and says so with `done-up`; asked again as `down` is |
 //! | `sent` | `go-sent`, then `go-counted` | `sent-first.txt` once the agent in the session was sent the draft the phone wrote (`DRAFT`); `sent-result.txt`, how many times it was, once the script has seen the phone itself say the send is applied and asks for the count |
 //! | `handover` | `go-handover` | a session shared with a second device is to be handed to a third: `handover-asked.txt` once the host asks, `handover-result.txt` with the record of the phone's answer and who holds the session after the transfer |
+//! | `second` | `go-second`, then `second-approve` | a second host, a daemon of its own that the phone reaches at its own address, issues a guest invitation: `second.png`, its QR; `second-value.txt`, the value that host shows once a candidate redeemed; `second-paired.txt` once approved |
+//! | `bound` | `go-bound` | the owner of the second host bounds how long personal remote access stands without its authority feed, which no feed has been reached for, so the bound has lapsed as it is chosen: `bound-result.txt` holds what that host answers the inbox read of another guest of its before and after |
 //!
 //! `KR_HARNESS_PEER` is the name the phone reaches this machine by: `127.0.0.1` for a simulator,
 //! which shares the machine's network, and `10.0.2.2` for an emulator. `KR_HARNESS_SERVICE_PEER` is
@@ -46,7 +48,7 @@ use std::time::{Duration, Instant};
 use image::{GrayImage, ImageFormat};
 use kr_crypto::keys::DeviceKeys;
 use kr_ipc::client::LocalClient;
-use kr_pairing::grants::personal_owner_grant;
+use kr_pairing::grants::{DEFAULT_GUEST_PAIRING_MS, guest_grant, personal_owner_grant};
 use kr_protocol::attention::{AttentionReadParams, AttentionReadResult, AttentionSource};
 use kr_protocol::confirmation::{ConfirmationSubject, TransferControlSubject};
 use kr_protocol::ids::{ActionId, ConfirmationId, EnvironmentId, InvitationId, SessionId};
@@ -56,13 +58,16 @@ use kr_protocol::invitation::{
 };
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{
-    CodeQrPayload, NetworkHint, QrPayload, RendezvousOrigin, group_verification_value,
+    CodeQrPayload, NetworkHint, ProposedGrant, QrPayload, RendezvousOrigin,
+    group_verification_value,
 };
-use kr_protocol::scalars::{Nullable, SecretBytes32, U64};
-use kr_protocol::sharing::{GrantTransferParams, GrantTransferResult, SessionRole};
+use kr_protocol::scalars::{DurationMs, Nullable, SecretBytes32, U64};
+use kr_protocol::sharing::{
+    GrantTransferParams, GrantTransferResult, OfflineValidityPolicy, SessionRole,
+};
 use net_support::pairing::{self as calls, Signer};
 use net_support::worker::{Adopted, Upstream, Worker};
-use net_support::{Device, Host, Stopped, holds, on_the_session, recipient, shared_as};
+use net_support::{Device, Host, Stopped, connect, holds, on_the_session, recipient, shared_as};
 
 /// How long the script is given to take each step the suite waits for.
 const STEP: Duration = Duration::from_secs(300);
@@ -229,6 +234,51 @@ fn the_committed_qr_pictures_are_the_fixtures_drawn_the_way_the_host_draws_them(
     }
 }
 
+/// The files an invitation the phone scans is answered through, besides its picture.
+struct Answers {
+    /// Where the host says the value it shows once the phone redeemed the invitation.
+    value: &'static str,
+    /// What the script writes when the value matched on the phone.
+    approve: &'static str,
+    /// What the host writes once it approved the phone.
+    paired: &'static str,
+}
+
+/// The first host's invitation.
+const FIRST: Answers = Answers {
+    value: "host-value.txt",
+    approve: "approve",
+    paired: "paired.txt",
+};
+
+/// The second host's invitation.
+const SECOND: Answers = Answers {
+    value: "second-value.txt",
+    approve: "second-approve",
+    paired: "second-paired.txt",
+};
+
+/// What `session` is answered when it reads the inbox: how many items it is served, or the code the
+/// host refuses it with.
+async fn inbox_answer(session: &kr_client::session::Session) -> String {
+    let read: Result<AttentionReadResult, kr_client::ClientError> = session
+        .read(
+            Method::AttentionRead,
+            &AttentionReadParams {
+                session_id: Nullable::null(),
+                include_acknowledged: false,
+                max_items: U64::new(50),
+                after: Nullable::null(),
+            },
+        )
+        .await;
+    match read {
+        Ok(page) => format!("served items={}", page.items.len()),
+        Err(kr_client::ClientError::Host(refusal)) => format!("refused {:?}", refusal.code),
+        Err(other) => format!("failed {other}"),
+    }
+}
+
 /// One daemon and the owner the run bootstraps it with.
 struct Run {
     directory: PathBuf,
@@ -249,6 +299,8 @@ struct Run {
     workers: Vec<Worker>,
     /// What the agent in the first session was sent.
     upstream: Arc<Upstream>,
+    /// The second host: a daemon of its own that holds no session.
+    second_host: Box<Adopted>,
 }
 
 impl Run {
@@ -375,35 +427,138 @@ impl Run {
     /// once the script says its value matched.
     async fn direct(&self) {
         let mut client = self.host().await.client().await;
-        let client = &mut client;
-        let invited = self.invite(client).await;
+        self.scanned(
+            &mut client,
+            self.environment,
+            &self.owner,
+            "direct",
+            (InviteGrantKind::PersonalOwner, &personal_owner_grant()),
+            &FIRST,
+        )
+        .await;
+    }
+
+    /// A direct invitation of the host `client` reaches, which `owner` issues and approves, offered as
+    /// `<name>.png`: the host says the value it shows once the phone redeemed it, and approves the
+    /// phone once the script says that value matched.
+    async fn scanned(
+        &self,
+        client: &mut LocalClient,
+        environment: EnvironmentId,
+        owner: &DeviceKeys,
+        name: &str,
+        (kind, proposal): (InviteGrantKind, &ProposedGrant),
+        answers: &Answers,
+    ) {
+        let signer = Signer::OwnerDevice(owner);
+        let invited = calls::invite_direct(environment, client, kind, proposal, &signer)
+            .await
+            .expect("a direct invitation");
         let payload = payload_for(&invited, &self.peer);
         let secret = *payload.secret.expose();
         let text = text_of(payload);
         write_private(
-            &self.directory.join("secrets-direct.txt"),
+            &self.directory.join(format!("secrets-{name}.txt")),
             secret_forms(&text, &secret).as_bytes(),
         );
-        self.say("direct-length.txt", &format!("{}\n", text.len()));
-        write_private(&self.directory.join("direct.png"), &qr_picture(&text));
+        self.say(&format!("{name}-length.txt"), &format!("{}\n", text.len()));
+        write_private(
+            &self.directory.join(format!("{name}.png")),
+            &qr_picture(&text),
+        );
         let value = self
             .candidate_value(client, invited.invitation_id)
             .await
             .expect("the phone redeemed the invitation");
-        self.say("host-value.txt", &format!("{value}\n"));
+        self.say(answers.value, &format!("{value}\n"));
         assert!(
-            appears(&self.directory.join("approve"), STEP).await,
+            appears(&self.directory.join(answers.approve), STEP).await,
             "the script never approved the phone"
         );
-        calls::confirm_candidate(
-            self.environment,
-            client,
-            invited.invitation_id,
-            &Signer::OwnerDevice(&self.owner),
+        calls::confirm_candidate(environment, client, invited.invitation_id, &signer)
+            .await
+            .expect("the owner approves the phone");
+        self.say(answers.paired, "paired=1\n");
+    }
+
+    /// The second host, a daemon of its own that holds no session, issues the phone a guest
+    /// invitation at its own address. A guest sees no session.
+    async fn second(&self) {
+        let adopted = &self.second_host;
+        let guest = guest_grant(
+            kr_ipc::now_ms().get(),
+            DEFAULT_GUEST_PAIRING_MS,
+            adopted.host.environment_id,
+        )
+        .expect("a guest grant");
+        let mut client = adopted.host.client().await;
+        self.scanned(
+            &mut client,
+            adopted.host.environment_id,
+            &adopted.owner,
+            "second",
+            (InviteGrantKind::SessionInvitation, &guest),
+            &SECOND,
+        )
+        .await;
+    }
+
+    /// The owner of the second host chooses a bounded offline validity for personal remote access,
+    /// with no synchronisation of its authority feed to measure from, so the bound has lapsed as it is
+    /// chosen and no clock is waited on. From then on the host refuses every read of a device that
+    /// reaches it, the phone's inbox read among them. Another guest of that host, paired here, is
+    /// read before and after, so that the run records what the host itself answered.
+    async fn bound(&self) {
+        let second = &self.second_host;
+        let host = &second.host;
+        let guest = Device::create().await;
+        let proposal = guest_grant(
+            kr_ipc::now_ms().get(),
+            DEFAULT_GUEST_PAIRING_MS,
+            host.environment_id,
+        )
+        .expect("a guest grant");
+        let signer = Signer::OwnerDevice(&second.owner);
+        let mut client = host.client().await;
+        let invited = calls::invite_direct(
+            host.environment_id,
+            &mut client,
+            InviteGrantKind::SessionInvitation,
+            &proposal,
+            &signer,
         )
         .await
-        .expect("the owner approves the phone");
-        self.say("paired.txt", "paired=1\n");
+        .expect("a guest invitation");
+        let (connection, _candidate, _value) = calls::redeem(&guest.candidate(), &invited).await;
+        let confirmed = calls::confirm_candidate(
+            host.environment_id,
+            &mut client,
+            invited.invitation_id,
+            &signer,
+        )
+        .await
+        .expect("the owner approves the guest");
+        connection.close(0u32.into(), b"paired");
+        let record = host.record_of(confirmed.device_id);
+
+        let served = connect(host, &guest, &record).await;
+        let before = inbox_answer(&served).await;
+        served.close();
+        host.controller()
+            .update_policy(|policy| {
+                policy.set_offline_validity(Some(OfflineValidityPolicy {
+                    maximum_offline_ms: DurationMs::new(60_000),
+                    last_synchronised_at_ms: Nullable::null(),
+                }));
+            })
+            .expect("the owner's choice is recorded");
+        let refused = connect(host, &guest, &record).await;
+        let after = inbox_answer(&refused).await;
+        refused.close();
+        self.say(
+            "bound-result.txt",
+            &format!("before {before}\nafter {after}\n"),
+        );
     }
 
     /// A code QR that names another service: a listener of this suite, which counts what reaches it.
@@ -838,6 +993,10 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         workers,
     } = Adopted::start(1).await;
     let environment = host.environment_id;
+    // The second host a phone is paired with after the first: a daemon of its own that holds no
+    // session. It is started here, beside the first, and not when the phone asks for it, so that the
+    // test's own stack holds one daemon's start at a time.
+    let second = Box::new(Adopted::start(0).await);
     // An agent is in the first session, so that a prompt written on the phone has a conversation to
     // be written for and to be sent to.
     let upstream = Arc::new(Upstream::default());
@@ -864,6 +1023,7 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         environment,
         workers,
         upstream,
+        second_host: second,
     };
     run.say(
         "ready.json",
@@ -898,6 +1058,8 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
                     "up" => run.up().await,
                     "sent" => run.sent().await,
                     "handover" => run.handover().await,
+                    "second" => run.second().await,
+                    "bound" => run.bound().await,
                     _ => run.device().await,
                 }
                 if !again {
@@ -920,9 +1082,12 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         phase("down"),
         phase("up"),
         phase("sent"),
-        phase("handover")
+        phase("handover"),
+        phase("second"),
+        phase("bound")
     );
     accepting.abort();
+    run.second_host.stop().await;
     if let Some(host) = run.host.write().await.take() {
         host.stop().await;
     }

@@ -785,6 +785,67 @@ def paired_host_used(phone: Phone, directory: Path) -> None:
         phone.run("shell", "locksettings", "clear", "--old", SCREEN_LOCK_PIN)
 
 
+def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
+    """A second host, paired by the same scan as a guest, which then refuses the phone its inbox
+    (13.01): the inbox of the host in use says that host refused to show its inbox, in the host's own
+    words and without calling it lost, beside what the host in use holds. Nothing before the refusal
+    says it did: the guest is served an empty inbox, and the host chooses to refuse after."""
+    start_on(phone, "Hosts")
+    phone.wait(lambda each: each == "Pair with a host", "the pairing screen")
+    touch(directory, "go-second")
+    opener = "Scan code"
+    stale = lambda each: owner_card(each) or each == "Use another pairing service?"
+    for _ in range(3):
+        scan(phone, directory, "second", port, another_card, "the second host's invitation", stale=stale, opener=opener)
+        phone.shot("second-scanned-summary")
+        phone.press("Pair")
+        outcome = phone.wait(
+            lambda each: each == "Check this value on the host" or each.startswith("The invitation did not work"),
+            "the value or a refusal",
+            90,
+        )
+        if outcome["label"] == "Check this value on the host":
+            break
+        opener = "Scan again"
+    wait_for_file(directory, "second-value.txt")
+    host = read(directory, "second-value.txt").replace(" ", "")
+    spelled = ", ".join(" ".join(group) for group in (host[:4], host[4:]))
+    phone.wait(lambda each: each == spelled, f"the second host's value {host} on the phone", 15)
+    touch(directory, "second-approve")
+    phone.wait(lambda each: each.startswith("Paired with"), "the paired screen of the second host", 120)
+    wait_for_file(directory, "done-second")
+    phone.press("Done")
+    phone.wait(lambda each: each == "Pair with a host", "the pairing screen after the second host")
+    # The host the phone uses stays the first: a phone that already reaches a host keeps it.
+    phone.wait(lambda each: each == "Use this host", "the second host listed to be used", 60)
+    phone.wait(lambda each: each == "In use", "the first host still in use", 60)
+    phone.shot("tab-hosts-two-hosts")
+    say("the second host is paired by the same scan and listed beside the first, which stays in use")
+
+    # The second host is read and answers: nothing of it is refused yet.
+    open_tab(phone, "Attention")
+    phone.wait(lambda each: each.startswith("Waiting for you. ") and "An approval is waiting for you" in each, "the first host's rows", 120, nudging=True)
+    if phone.find(lambda each: "refused to show its inbox" in each) is not None:
+        phone.give_up("the inbox says a host refused it before any host did")
+    ask_host(directory, "bound", 180)
+    wait_after_touch(
+        phone, lambda each: "refused to show its inbox" in each, "the inbox to say the second host refused it", 180, at=(0.5, 0.07)
+    )
+    # The host's own words, which the row gives after its title.
+    if phone.find(lambda each: "offline-validity policy has lapsed" in each) is None:
+        phone.give_up("the inbox does not give the host's own words for the refusal")
+    if phone.find(lambda each: "It answered, so contact is not lost" in each) is None:
+        phone.give_up("the inbox does not say the host answered, so contact is not lost")
+    if phone.find(lambda each: "is out of contact" in each) is not None:
+        phone.give_up("the inbox calls a host that refused it out of contact")
+    if phone.find(lambda each: each.startswith("Waiting for you. An approval is waiting for you")) is None:
+        phone.give_up("the first host's rows are not listed beside the refusal")
+    phone.shot("inbox-host-refused")
+    say("the inbox shows a host that refused it, in the host's words, above what the host in use holds")
+    if read(directory, "bound-result.txt") != "before served items=0\nafter refused PermissionDenied":
+        raise SystemExit(f"the second host did not answer as expected: {read(directory, 'bound-result.txt')}")
+
+
 def picker_on_a_paired_phone(phone: Phone) -> None:
     """The attachment picker on a phone paired with a host, with the camera refused for good.
 
@@ -929,6 +990,7 @@ def drive(adb: str, serial: str, directory: Path, shots: Path, port: str) -> Non
     picker_on_a_paired_phone(phone)
     owner_confirmations(phone, directory)
     paired_host_used(phone, directory)
+    a_host_that_refuses(phone, directory, port)
 
 
 # ---- The release build's verified TLS ----------------------------------------------------------

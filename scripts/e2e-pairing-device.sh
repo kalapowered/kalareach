@@ -37,6 +37,15 @@
 #                          draft once (13.03, 13.13, 13.01); the host asks the phone to confirm the
 #                          hand-over of a session to another device, which the phone shows by the role
 #                          and each kind of action and confirms with its ceremony (18.15)
+#   a host that refuses    a second host, a daemon of its own, issues the phone a guest invitation that
+#                          the phone scans as it did the first; the host in use stays the first. The
+#                          second host's owner then bounds how long personal remote access stands
+#                          without its authority feed, with none reached, so the bound has lapsed as it
+#                          is chosen: the host answers the phone and refuses its inbox read, and the
+#                          inbox says that host refused to show it, in the host's words and not as lost
+#                          contact, beside what the host in use holds (KR-REQ-13.01). The host also
+#                          records what it answered another guest of its before the bound (the inbox,
+#                          empty) and after (refused)
 #
 # A simulator or an emulator only inside the Mac's device lease, and the builds inside a build slot:
 #
@@ -200,6 +209,8 @@ required_checks=(
     "the inbox shows the host as out of contact above what it last read from it"
     "the draft was kept across the views and the host being out of contact, and sent once"
     "the hand-over is shown with the role and each kind of action it allows"
+    "the second host is paired by the same scan and listed beside the first, which stays in use"
+    "the inbox shows a host that refused it, in the host's words, above what the host in use holds"
 )
 # What only one platform's run shows: the scanner has a camera on the emulator and none on the
 # simulator, and the phone's ceremony is Face ID on one and the screen lock on the other.
@@ -331,6 +342,19 @@ judge() { # <driver output>
             say "check=the host took the phone's presence for the hand-over and the session changed hands ok=1" ;;
         *) say "check=the host took the phone's presence for the hand-over and the session changed hands ok=0 detail=${result:-no record}"; bad=1 ;;
     esac
+    if [ -s "$harness/second-value.txt" ] && [ -s "$harness/second-paired.txt" ]; then
+        say "check=the second host showed its value and approved the phone ok=1 detail=value $(host_file second-value.txt)"
+    else
+        say "check=the second host showed its value and approved the phone ok=0 detail=no record"
+        bad=1
+    fi
+    result="$(host_file bound-result.txt)"
+    if [ "$result" = "before served items=0after refused PermissionDenied" ]; then
+        say "check=the second host served a guest's inbox, empty, and refused it once its owner bounded offline validity ok=1 detail=$result"
+    else
+        say "check=the second host served a guest's inbox, empty, and refused it once its owner bounded offline validity ok=0 detail=${result:-no record}"
+        bad=1
+    fi
     result="$(host_file connections.txt)"
     if [ "$result" = "1" ]; then
         say "check=the other service took one connection in all ok=1"
