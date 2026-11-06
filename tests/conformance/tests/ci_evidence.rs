@@ -853,17 +853,25 @@ fn the_linux_runs_of_the_workspace_tests_require_a_user_service_manager() {
     );
 }
 
-/// The names of a workflow's jobs, in file order: the keys at two spaces below `jobs:`.
+/// The names of a workflow's jobs, in file order: the keys at two spaces in the `jobs:` block, which
+/// ends at the next line at the left margin. A key there that is not a name and a colon alone (an
+/// anchor or a mapping on the same line) is a layout this file's reading does not hold, and fails.
 fn jobs_of(workflow: &str) -> Vec<String> {
     workflow
         .lines()
         .skip_while(|line| without_comment(line) != "jobs:")
         .skip(1)
-        .filter_map(|line| {
-            let name = without_comment(line)
-                .strip_prefix("  ")?
-                .strip_suffix(':')?;
-            (!name.is_empty() && !name.starts_with([' ', '#'])).then(|| name.to_owned())
+        .take_while(|line| line.is_empty() || line.starts_with([' ', '#']))
+        .map(without_comment)
+        .filter(|line| {
+            line.starts_with("  ") && !line.starts_with("   ") && !line.trim().is_empty()
+        })
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .map(|line| {
+            line.strip_prefix("  ")
+                .and_then(|key| key.strip_suffix(':'))
+                .unwrap_or_else(|| panic!("a job header the case cannot read: {line:?}"))
+                .to_owned()
         })
         .collect()
 }
