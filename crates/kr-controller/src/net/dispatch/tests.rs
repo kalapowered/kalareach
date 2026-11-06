@@ -6939,10 +6939,11 @@ async fn a_copy_of_a_close_with_no_route_that_arrives_after_its_work_has_ended_i
     world.serving.abort();
 }
 
-/// A close whose route cannot be recorded goes on, and its work ends. Once storage records routes
-/// again, another request claims the identifier. An exact copy of the close that arrives after that
-/// is told the outcome is unknown, and not that the identifier was used with a different request:
-/// the close was carried out before the identifier was taken.
+/// A close whose route cannot be recorded goes on. Once storage records routes again, another
+/// request claims the identifier. An exact copy of the close that arrives after that, while the
+/// close runs or after it ended, is told the outcome is unknown, and not that the identifier was
+/// used with a different request: the close was carried out, or is being, and the identifier was
+/// taken after it began.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_conflicting_route_does_not_hide_a_close_that_went_on_without_a_route() {
     use kr_protocol::envelope::ControlFrame;
@@ -6952,83 +6953,92 @@ async fn a_conflicting_route_does_not_hide_a_close_that_went_on_without_a_route(
 
     use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
 
-    let script = Scripted::new();
-    let world = scripted::scripted(&script).await;
-    let controller = &world.controller;
-    let record = paired(controller, 91, |grant| {
-        grant.actions = [ActionRight::SessionView, ActionRight::SessionClose]
-            .into_iter()
-            .collect();
-    });
-    let first = super::RemoteConnection::for_test(controller, record.clone());
-    let second = super::RemoteConnection::for_test(controller, record);
-    let close = device_mutation(
-        &world,
-        &first,
-        Method::SessionClose,
-        103,
-        ParamsValue::from_typed(&SessionCloseParams {
-            session_id: world.session_id,
-        })
-        .expect("encodes"),
-    );
-    let registry = rusqlite::Connection::open(controller.paths.registry_database())
-        .expect("the registry opens beside the daemon's own handle");
-    registry
-        .execute_batch(
-            "CREATE TRIGGER the_route_is_not_kept BEFORE INSERT ON network_actions
-             BEGIN SELECT RAISE(ABORT, 'the registry keeps no route'); END;",
-        )
-        .expect("the registry is made to refuse the write that records a route");
-
-    let (arrived, go) = script.hold_the_next_close();
-    let mut asking = Box::pin(first.answer_now(ControlFrame::Mutation(Box::new(close.clone()))));
-    tokio::select! {
-        arrived = arrived => arrived.expect("the worker holds the close"),
-        answered = &mut asking => panic!("the close was answered before the worker took it: {answered:?}"),
-    }
-    drop(asking);
-    go.send(()).expect("the worker goes on");
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        while controller.arrivals().entered() != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the close leaves the calls that have not claimed when its work has ended");
-    assert_eq!(script.closes_taken(), 1, "the worker took the close once");
-
-    // Storage records routes again, and another request takes the identifier.
-    registry
-        .execute_batch("DROP TRIGGER the_route_is_not_kept;")
-        .expect("the registry records routes again");
-    let mut other = close.clone();
-    other.params = ParamsValue::from_typed(&kr_protocol::describe::SessionRenameParams {
-        session_id: world.session_id,
-        title: Nullable::some("a name".to_owned()),
-    })
-    .expect("encodes");
-    assert!(
-        first
-            .claim_route(
-                &other,
-                Some(world.session_id),
-                &super::forwarding::OwnClaim::none()
+    for while_it_runs in [true, false] {
+        let script = Scripted::new();
+        let world = scripted::scripted(&script).await;
+        let controller = &world.controller;
+        let record = paired(controller, 91, |grant| {
+            grant.actions = [ActionRight::SessionView, ActionRight::SessionClose]
+                .into_iter()
+                .collect();
+        });
+        let first = super::RemoteConnection::for_test(controller, record.clone());
+        let second = super::RemoteConnection::for_test(controller, record);
+        let close = device_mutation(
+            &world,
+            &first,
+            Method::SessionClose,
+            103,
+            ParamsValue::from_typed(&SessionCloseParams {
+                session_id: world.session_id,
+            })
+            .expect("encodes"),
+        );
+        let registry = rusqlite::Connection::open(controller.paths.registry_database())
+            .expect("the registry opens beside the daemon's own handle");
+        registry
+            .execute_batch(
+                "CREATE TRIGGER the_route_is_not_kept BEFORE INSERT ON network_actions
+                 BEGIN SELECT RAISE(ABORT, 'the registry keeps no route'); END;",
             )
-            .is_ok(),
-        "another request holds the route of the identifier"
-    );
+            .expect("the registry is made to refuse the write that records a route");
 
-    let copy = second
-        .answer_now(ControlFrame::Mutation(Box::new(close.clone())))
-        .await
-        .expect("the copy is answered");
-    assert_eq!(
-        error_of(copy.frame()).code,
-        ErrorCode::OutcomeUnknown,
-        "the close was carried out before the identifier was taken"
-    );
-    world.serving.abort();
+        let (arrived, go) = script.hold_the_next_close();
+        let mut asking =
+            Box::pin(first.answer_now(ControlFrame::Mutation(Box::new(close.clone()))));
+        tokio::select! {
+            arrived = arrived => arrived.expect("the worker holds the close"),
+            answered = &mut asking => panic!("the close was answered before the worker took it: {answered:?}"),
+        }
+        drop(asking);
+        if !while_it_runs {
+            go.send(()).expect("the worker goes on");
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while controller.arrivals().entered() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the close leaves the calls that have not claimed when its work has ended");
+            assert_eq!(script.closes_taken(), 1, "the worker took the close once");
+        }
+
+        // Storage records routes again, and another request takes the identifier.
+        registry
+            .execute_batch("DROP TRIGGER the_route_is_not_kept;")
+            .expect("the registry records routes again");
+        let mut other = close.clone();
+        other.params = ParamsValue::from_typed(&kr_protocol::describe::SessionRenameParams {
+            session_id: world.session_id,
+            title: Nullable::some("a name".to_owned()),
+        })
+        .expect("encodes");
+        assert!(
+            first
+                .claim_route(
+                    &other,
+                    Some(world.session_id),
+                    &super::forwarding::OwnClaim::none()
+                )
+                .is_ok(),
+            "another request holds the route of the identifier"
+        );
+
+        let copy = second
+            .answer_now(ControlFrame::Mutation(Box::new(close.clone())))
+            .await
+            .expect("the copy is answered");
+        assert_eq!(
+            error_of(copy.frame()).code,
+            ErrorCode::OutcomeUnknown,
+            "the close was carried out before the identifier was taken (while it runs: \
+             {while_it_runs})"
+        );
+        if while_it_runs {
+            go.send(()).expect("the worker goes on");
+        }
+        world.serving.abort();
+    }
 }
 
 /// A close whose route cannot be recorded goes on, and its work does nothing: the deadline it was
