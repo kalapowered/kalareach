@@ -108,14 +108,15 @@ async fn ended(identity: &ProcessStartIdentity, what: &str) {
     }
 }
 
-/// A session whose root program is `program`, with a terminal attached to it, and the identity of
-/// the worker its descriptor records.
+/// A session whose root program is `program`, with a terminal attached to it, the identity of the
+/// worker its descriptor records, and the identity of the root shell as the worker reports it.
 async fn opened(
     host: &WorkerHost,
     program: &str,
 ) -> (
     kr_protocol::ids::SessionId,
     WorkerTerminal,
+    ProcessStartIdentity,
     ProcessStartIdentity,
 ) {
     let (session, dimensions) = host
@@ -130,25 +131,32 @@ async fn opened(
         .find(|descriptor| descriptor.session_id == session)
         .expect("the session's descriptor is published")
         .process_start_identity;
-    let typist = WorkerTerminal::attach(&environment, session, dimensions).await;
-    (session, typist, worker)
+    let mut typist = WorkerTerminal::attach(&environment, session, dimensions).await;
+    let root = typist
+        .root_process()
+        .await
+        .expect("the worker reports the session's root shell");
+    (session, typist, worker, root)
 }
 
 /// What a closed session leaves to show that nothing started its shell again.
 ///
-/// The root shell the closure names and the worker are each gone. A second session is then opened
-/// and closed, and the daemon lists exactly the two sessions, both closed, the first with the
-/// display number it had and the second with a number of its own.
+/// The root shell the closure names is the one the worker reported before the closure, and the
+/// worker, asked again, names no other. Then the terminal is let go, and the root shell and the
+/// worker are each gone. A second session is opened and closed, and the daemon lists exactly the
+/// two sessions, both closed, the first with the display number it had and the second with a
+/// number of its own.
 async fn nothing_started_the_closed_session_again(
     host: &WorkerHost,
-    session: kr_protocol::ids::SessionId,
-    terminal: WorkerTerminal,
-    worker: &ProcessStartIdentity,
+    (session, mut terminal, worker, root): (
+        kr_protocol::ids::SessionId,
+        WorkerTerminal,
+        ProcessStartIdentity,
+        ProcessStartIdentity,
+    ),
     closed: &Value,
 ) {
-    // The terminal is let go, so the worker has nobody left to send the closure to.
-    drop(terminal);
-    let root: ProcessStartIdentity = closed["closure"]["terminated"]
+    let named: ProcessStartIdentity = closed["closure"]["terminated"]
         .as_array()
         .and_then(|named| {
             named
@@ -160,35 +168,61 @@ async fn nothing_started_the_closed_session_again(
                 .unwrap_or_else(|error| panic!("the root shell's identity ({error}): {closed}"))
         })
         .unwrap_or_else(|| panic!("the closure names the root shell: {closed}"));
+    assert_eq!(
+        named, root,
+        "the shell the closure names is the one the session started with: {closed}"
+    );
+    let now = terminal.root_process().await;
+    assert!(
+        now.as_ref().is_none_or(|reported| *reported == root),
+        "no other shell took the root's place: the worker reports {now:?}, the session started with {root:?}"
+    );
+    // The terminal is let go, so the worker has nobody left to send the closure to.
+    drop(terminal);
     ended(&root, "the root shell").await;
-    ended(worker, "the worker").await;
+    ended(&worker, "the worker").await;
 
-    let (next, mut next_terminal, next_worker) = opened(host, &system32("cmd.exe")).await;
+    let (next, mut next_terminal, next_worker, _) = opened(host, &system32("cmd.exe")).await;
     next_terminal.type_line("exit 0").await;
     let second = closed_session(host, &next.to_string()).await;
     drop(next_terminal);
     ended(&next_worker, "the second session's worker").await;
 
     let sessions = all_sessions(host).await;
+    let mut listed: Vec<String> = sessions
+        .iter()
+        .map(|entry| entry["session_id"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    listed.sort();
+    let mut made = vec![session.to_string(), next.to_string()];
+    made.sort();
     assert_eq!(
-        sessions.len(),
-        2,
-        "the two sessions made are the two listed: {sessions:?}"
+        listed, made,
+        "exactly the two sessions made are listed: {sessions:?}"
     );
     assert!(
-        sessions.iter().all(|listed| listed["state"] == "closed"),
+        sessions.iter().all(|entry| entry["state"] == "closed"),
         "no session is live again: {sessions:?}"
     );
-    let first = sessions
-        .iter()
-        .find(|listed| listed["session_id"] == session.to_string())
-        .unwrap_or_else(|| panic!("the first session is listed: {sessions:?}"));
+    let number_of = |id: &str| {
+        sessions
+            .iter()
+            .find(|entry| entry["session_id"] == id)
+            .map(|entry| entry["display_number"].clone())
+            .unwrap_or_else(|| panic!("session {id} is listed: {sessions:?}"))
+    };
     assert_eq!(
-        first["display_number"], closed["display_number"],
+        number_of(&session.to_string()),
+        closed["display_number"],
         "the closed session keeps its number: {sessions:?}"
     );
+    assert_eq!(
+        number_of(&next.to_string()),
+        second["display_number"],
+        "the second session is listed with its own number: {sessions:?}"
+    );
     assert_ne!(
-        first["display_number"], second["display_number"],
+        closed["display_number"], second["display_number"],
         "a display number is never used twice: {sessions:?}"
     );
 }
@@ -204,14 +238,14 @@ async fn nothing_started_the_closed_session_again(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_typed_exit_closes_the_session_with_the_shells_status_and_nothing_starts_it_again() {
     let host = WorkerHost::start().await;
-    let (session, mut typist, worker) = opened(&host, &system32("cmd.exe")).await;
+    let (session, mut typist, worker, root) = opened(&host, &system32("cmd.exe")).await;
 
     typist.type_line("exit 7").await;
     let closed = closed_session(&host, &session.to_string()).await;
     assert_eq!(closed["closure"]["reason"], "root_exit", "{closed}");
     assert_eq!(closed["closure"]["exit_code"], 7, "{closed}");
 
-    nothing_started_the_closed_session_again(&host, session, typist, &worker, &closed).await;
+    nothing_started_the_closed_session_again(&host, (session, typist, worker, root), &closed).await;
 }
 
 /// KR-REQ-07.52: the end of the root shell's input closes the session just as the shell's own exit
@@ -221,11 +255,11 @@ async fn a_typed_exit_closes_the_session_with_the_shells_status_and_nothing_star
 /// input ends and then ends with status 0. The end of input a console gives is Ctrl-Z at the start
 /// of a line, and in a session of the native-compatible mode it is the program's own: it reaches
 /// the program as typed. The line is typed once the program has shown its prompt, so a program
-/// that ended by itself before it was asked to would not pass for one that ended on its input.
+/// that ended before it had a prompt does not pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_end_of_the_shells_input_closes_the_session_and_nothing_starts_it_again() {
     let host = WorkerHost::start().await;
-    let (session, mut typist, worker) = opened(&host, &system32("nslookup.exe")).await;
+    let (session, mut typist, worker, root) = opened(&host, &system32("nslookup.exe")).await;
 
     typist
         .shown(">", "the program shows the prompt it reads its commands at")
@@ -235,5 +269,5 @@ async fn the_end_of_the_shells_input_closes_the_session_and_nothing_starts_it_ag
     assert_eq!(closed["closure"]["reason"], "root_exit", "{closed}");
     assert_eq!(closed["closure"]["exit_code"], 0, "{closed}");
 
-    nothing_started_the_closed_session_again(&host, session, typist, &worker, &closed).await;
+    nothing_started_the_closed_session_again(&host, (session, typist, worker, root), &closed).await;
 }

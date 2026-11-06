@@ -170,6 +170,26 @@ impl WorkerTerminal {
         self.sequence += 1;
     }
 
+    /// The session's root shell as its worker reports it now, by the identity it was started under,
+    /// or nothing when the worker reports none.
+    pub async fn root_process(&mut self) -> Option<kr_protocol::identity::ProcessStartIdentity> {
+        let snapshot: kr_protocol::recovery::EventsSnapshotResult = self
+            .client
+            .request(
+                kr_protocol::method::Method::EventsSnapshot,
+                &kr_protocol::recovery::EventsSnapshotParams {
+                    session_id: self.session_id,
+                    agent_resources_from: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker answers the snapshot")
+            .to_typed()
+            .expect("decodes");
+        snapshot.session.root_process.as_ref().cloned()
+    }
+
     /// What the session has written so far, with its control sequences and line breaks taken out,
     /// so text the console wrapped or redrew reads as one run.
     pub fn text(&self) -> String {
