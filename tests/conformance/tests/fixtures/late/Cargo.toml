@@ -1,0 +1,16 @@
+# A tree the conformance report's own tests read and run. It is a workspace of its own, so the
+# repository's workspace never builds it.
+#
+# The library embeds a file that a macro writes into the build script's output directory while the
+# library compiles, as Tauri's context macro does with an application's icon and front end.
+[package]
+name = "late"
+version = "0.1.0"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+[dependencies]
+embed = { path = "embed" }
+
+[workspace]
