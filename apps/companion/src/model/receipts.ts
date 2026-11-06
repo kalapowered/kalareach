@@ -63,7 +63,11 @@ export interface Submission {
   readonly storedDraftId?: string
   /** The conversation the prompt was sent to: a draft that has been sent to another one is not the prompt's. */
   readonly sentTo?: { readonly applicationInstanceId: string | null; readonly agentBindingRevision: string | null }
-  /** When it was created. */
+  /**
+   * The stamp that puts this prompt in order against the host's refusals this window keeps
+   * (`ReceiptReads.stamp`), which is never below an earlier stamp and so can be ahead of the clock.
+   * It is zero for a prompt kept from an earlier run. It is not a time to show.
+   */
   readonly createdAtMs: number
   /** The failure, when it has one. */
   readonly error: { readonly code: string; readonly message: string } | null
