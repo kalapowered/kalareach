@@ -459,9 +459,8 @@ const CLASSES: [ClassOfTest; 10] = [
         runner: &["runs-on: macos-15"],
         runs_on: "macos-15",
         job_when: Some("github.event_name != 'workflow_dispatch' || inputs.macos"),
-        // The whole text of the step's command line, to its end: the step after it that runs the
-        // timed cases starts with the shorter words, and with the same condition, so a prefix
-        // would hold the class with the whole-workspace step deleted.
+        // The whole text of the step's command line, to its end, so that the whole-workspace step
+        // holds the class and not a step that starts with the same words.
         tool: "cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --",
         when: Some("${{ !cancelled() && matrix.part == 'tests' }}"),
     },

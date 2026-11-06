@@ -5,8 +5,8 @@
 //!
 //! * `rust`: the workspace's tests, as the landing workflow runs them on this platform. On Linux
 //!   that is the whole workspace. On macOS it is the same command with the cases this platform's
-//!   runner cannot host left out by name, each with its reason, and the timed cases run one at a
-//!   time. On Windows it is the suites qualified there, one command each.
+//!   runner cannot host left out by name, each with its reason. On Windows it is the suites
+//!   qualified there, one command each.
 //! * `end-to-end`: the suites `scripts/end-to-end.sh` runs, with the flags it runs them with.
 //! * `performance`: the measurements `scripts/performance.sh` takes and the two release-build
 //!   throughput and scheduling suites, with the flags the landing workflow runs them with.
@@ -354,14 +354,6 @@ const MACOS_SKIPS: &[(&str, &str)] = &[
         "a_volume_whose_disk_is_held_is_detached_once_it_is_let_go",
         "needs a second filesystem, which the landing workflow's macOS job attaches for it",
     ),
-    (
-        "kr_req_11_38_every_export_is_stopped_by_its_own_deadline",
-        "a timed case, which runs in a step of its own, one at a time",
-    ),
-    (
-        "kr_req_11_38_a_worker_is_told_when_the_queue_overflowed",
-        "a timed case, which runs in a step of its own, one at a time",
-    ),
 ];
 
 /// Why a package no macOS step runs is left out there.
@@ -665,31 +657,6 @@ fn rust(platform: Platform) -> Vec<Step> {
                 ],
             )
             .skipping(MACOS_SKIPS),
-            Step::cargo(
-                Group::Rust,
-                "the timed cases, one at a time",
-                &[
-                    "test",
-                    "--locked",
-                    "--workspace",
-                    "--exclude",
-                    "kr-sync-integration",
-                    "--no-fail-fast",
-                    "--test",
-                    "service",
-                    "--test",
-                    "execution",
-                    "--",
-                    "--exact",
-                    "--test-threads=1",
-                    "kr_req_11_38_a_worker_is_told_when_the_queue_overflowed",
-                    "kr_req_11_38_every_export_is_stopped_by_its_own_deadline",
-                ],
-            )
-            .filtered(
-                "kr_req_11_38_",
-                "this step runs only the two timed cases; the step before it runs the rest",
-            ),
         ],
         Platform::Windows => windows(),
     }

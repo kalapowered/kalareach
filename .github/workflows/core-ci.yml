@@ -2639,14 +2639,12 @@ jobs:
       #   nothing without one. The rust job runs each leg against the deployment it names.
       # - The container cases, which need podman, and this runner has none. The rust job's runner
       #   has it, and its test step runs them.
-      # - The cases that need another filesystem, and the cases whose verdicts are timings, which
-      #   the two steps after this one run.
+      # - The cases that need another filesystem, which the step after this one runs.
       #
       # The step builds the workspace's tests and then runs them, and it grows with the tests. On a
       # hosted runner it has taken 108 to 141 minutes when it passed, and on a runner 15 to 30 per
       # cent slower in every suite it ran into a limit of 145 minutes with 38 suites not started.
-      # Its limit is 197 minutes, the most that this job's limit leaves once the other steps of
-      # this part have theirs: the limits of the part add up to 354 of the job's 355 minutes.
+      # Its limit is 197 minutes: the limits of the part add up to 344 of the job's 355 minutes.
       # That is under twice the longest it has taken.
       - name: Test
         if: ${{ !cancelled() && matrix.part == 'tests' }}
@@ -2680,8 +2678,6 @@ jobs:
           --skip a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers
           --skip a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers
           --skip a_volume_whose_disk_is_held_is_detached_once_it_is_let_go
-          --skip kr_req_11_38_every_export_is_stopped_by_its_own_deadline
-          --skip kr_req_11_38_a_worker_is_told_when_the_queue_overflowed
 
       # The lowest free space while the tests built and ran is the figure that says how much room
       # the step needs: the cases that stage a release refuse to start with less than their own
@@ -2813,32 +2809,6 @@ jobs:
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the cases that need another filesystem"
 
-      # The cases whose verdicts are timings: a queue that must overflow before a slow component
-      # drains it, and every export stopped at its own deadline. They run here one at a time, as the
-      # rust job runs its timed suites serially, so that no other case of their suites shares this
-      # runner's three processors with them. A case that did not pass here by name fails the step.
-      - name: The timed cases, one at a time
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 10
-        run: |
-          set -euo pipefail
-          cases=(
-            kr_req_11_38_a_worker_is_told_when_the_queue_overflowed
-            kr_req_11_38_every_export_is_stopped_by_its_own_deadline
-          )
-          log="$RUNNER_TEMP/timed-cases.log"
-          status=0
-          cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast \
-            --test service --test execution -- \
-            --exact --test-threads=1 "${cases[@]}" 2>&1 | tee "$log" || status=$?
-          for case in "${cases[@]}"; do
-            if ! grep -q "^test $case \.\.\. ok\$" "$log"; then
-              echo "$case did not pass here" >&2
-              status=1
-            fi
-          done
-          exit "$status"
-
       # Real processes, real sockets and real terminals, the suites the script names and nothing
       # else, each of which must demonstrate something, and no process of the run left behind. This
       # leg builds the suites' test programs itself, which the other leg's test step did before the
@@ -2939,7 +2909,7 @@ jobs:
   # The PowerShell package's cases on the macOS runner. The package's reader counts the input the
   # runtime has taken through .NET internals that differ by platform, and the shell-packages job
   # runs these cases on Linux only. They take far longer than the macos job has left to give: its
-  # limits add up to 354 of its 355 minutes. So they run here, in a job that has the Rust
+  # limits add up to 344 of its 355 minutes. So they run here, in a job that has the Rust
   # toolchain and PowerShell and nothing else of that one. PowerShell is the release the
   # shell-packages job pins, from the macOS archive and checked against the digest its release
   # publishes: the package refuses a release that a published advisory affects, and the .NET
