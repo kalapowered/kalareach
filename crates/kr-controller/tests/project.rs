@@ -4040,12 +4040,14 @@ async fn a_copy_of_an_action_with_an_open_claim_is_told_the_outcome_is_unknown_w
             "the registration this was admitted under has been withdrawn",
         ))
     };
+    let given = host
+        .controller
+        .project()
+        .write(&actor, &racing, Method::ProjectInit, settling, None)
+        .await;
+    assert!(given.is_copied(), "the answer is the record's");
     let answered: ProjectInitResult = typed(
-        &host
-            .controller
-            .project()
-            .write(&actor, &racing, Method::ProjectInit, settling, None)
-            .await
+        &given
             .into_answer()
             .expect("the copy is answered with the record the first copy left"),
     );
