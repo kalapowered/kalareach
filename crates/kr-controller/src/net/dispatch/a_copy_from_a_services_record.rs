@@ -402,7 +402,7 @@ async fn a_deduplicated_create_that_failed_is_told_as_a_kept_answer() {
         .copied()
         .filter(|right| *right != ActionRight::SessionView)
         .collect();
-    for (rights, may_read) in [(EVERY_RIGHT, true), (without_viewing.as_slice(), false)] {
+    for (rights, may_read) in [(without_viewing.as_slice(), false), (EVERY_RIGHT, true)] {
         let world = fake::fake_worker(None).await;
         let controller = &world.controller;
         let (connection, _) = paired_connection(controller, 86, rights);

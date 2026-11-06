@@ -980,6 +980,7 @@ async fn a_confirmation_whose_identifier_is_spent_meanwhile_spends_no_confirmati
         .expect("a revision");
 
     let action = ActionId::new(kr_ipc::new_uuid());
+    let copied = AtomicBool::new(false);
     let refused = pairing.confirm(
         &caller,
         &params,
@@ -987,9 +988,15 @@ async fn a_confirmation_whose_identifier_is_spent_meanwhile_spends_no_confirmati
         revision,
         &racing_request(pairing, &caller, action),
         &life(),
-        &AtomicBool::new(false),
+        &copied,
     );
     assert!(is_id_conflict(&refused), "{refused:?}");
+    // The lookup that found the identifier spent is the service reading the record of the action,
+    // as every early lookup is, and says so.
+    assert!(
+        copied.load(Ordering::Acquire),
+        "an answer read from the record of the identifier is flagged as one"
+    );
     let committed = pairing
         .confirm(
             &caller,
