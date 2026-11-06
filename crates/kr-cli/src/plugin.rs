@@ -283,10 +283,10 @@ const ASK_WITHIN: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 /// How long past the challenge's own deadline the host may take over a repeated request it began
 /// to perform: the answer may have been spent on the last poll, and an installation fetches what
 /// it installs.
-const PERFORM_WITHIN: tokio::time::Duration = tokio::time::Duration::from_secs(300);
+pub(crate) const PERFORM_WITHIN: tokio::time::Duration = tokio::time::Duration::from_secs(300);
 
 /// What is left of a challenge that ends at `expires_at_ms` when this clock reads `now_ms`.
-const fn time_left(expires_at_ms: u64, now_ms: u64) -> tokio::time::Duration {
+pub(crate) const fn time_left(expires_at_ms: u64, now_ms: u64) -> tokio::time::Duration {
     tokio::time::Duration::from_millis(expires_at_ms.saturating_sub(now_ms))
 }
 
@@ -311,7 +311,7 @@ const fn time_left(expires_at_ms: u64, now_ms: u64) -> tokio::time::Duration {
 /// stopped the request, and waiting on would only end at the deadline with a cause that is not
 /// the real one. A host that does not say what it lists is not waited on either, and the earlier
 /// refusal, which is its real word, ends the wait.
-async fn wait_for_an_owner_device<T>(
+pub(crate) async fn wait_for_an_owner_device<T>(
     deadline: tokio::time::Instant,
     grace: tokio::time::Duration,
     poll: tokio::time::Duration,
@@ -421,7 +421,7 @@ async fn still_listed(
 
 /// Whether the host's answer to the list of pending challenges lists `request`. An answer the host
 /// did not give lists nothing.
-fn listed_in(
+pub(crate) fn listed_in(
     answer: Result<OwnerConfirmationPendingResult>,
     request: &kr_protocol::pairing::OwnerConfirmationRequest,
 ) -> bool {
