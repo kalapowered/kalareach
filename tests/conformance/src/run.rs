@@ -5,9 +5,11 @@
 //! its verdict lands with the result. A `cargo test` step is built once with `--no-run` first,
 //! which is how the report learns which package and target each test binary is: two packages can
 //! both have a test target called `fixtures`, and only the executable tells them apart. The calls
-//! after the build, the listing and the run, have nothing to build: a file that a macro wrote while
-//! a crate compiled is dated before the build began, as `date_before` says, or Cargo would compile
-//! the crate again in the listing. A listing that builds anyway says so in the log.
+//! after the build, the listing and the run, have nothing to build unless a macro wrote a file while
+//! a crate compiled: Cargo takes that file for newer than the compile and builds the crate again in
+//! the listing. The build dates such a file before it began when `date_before` can tell that no two
+//! compiles of the crate read it at once. When it cannot, it leaves the file to Cargo, which builds
+//! the crate again, and the log says why. A listing that builds anyway says so in the log.
 //!
 //! What the build names is what the run is held to. Every test binary it built is listed, by the
 //! step's own command with this program as Cargo's runner, and has to be run and read; a listing

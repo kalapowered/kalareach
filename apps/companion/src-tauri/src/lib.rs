@@ -173,8 +173,25 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .run(context())
         .expect("the companion window could not be created");
+}
+
+/// The application's context: its configuration, its capabilities and the front end it embeds.
+///
+/// The framework's macro reads them when this library compiles, and writes the files it embeds into
+/// the build script's output directory as it does, directly and not through a rename. The library's
+/// unit tests start no window, so their build leaves the macro out: with it, two compiles of this
+/// crate would write and read the same files at once, and a compile can embed part of a file.
+#[cfg(not(test))]
+fn context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
+}
+
+/// No unit test starts the application, so none asks for its context.
+#[cfg(test)]
+fn context() -> tauri::Context<tauri::Wry> {
+    unreachable!("the library's unit tests start no window")
 }
 
 /// The entry point the phone's own runtime calls.

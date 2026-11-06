@@ -13,9 +13,12 @@ publish.workspace = true
 name = "companion_tauri"
 crate-type = ["lib", "cdylib", "staticlib"]
 
+# `main` calls the library and nothing else, so the program has no tests of its own: a unit-test
+# build of it would compile the same source a second time.
 [[bin]]
 name = "kalareach-companion"
 path = "src/main.rs"
+test = false
 
 # Opens real windows to hold what the web view does with the navigation handlers, so it has its own
 # main thread.
