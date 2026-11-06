@@ -127,7 +127,12 @@ impl Arrival {
             .unrouted
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if !unrouted.iter().any(|(kept, _)| *kept == self.request) {
+        // One entry for each call that carried the request, so that a copy among them still meets
+        // the entry of the call that settled before it.
+        if !unrouted
+            .iter()
+            .any(|(kept, call)| *kept == self.request && *call == self.call)
+        {
             unrouted.push_back((self.request.clone(), self.call));
         }
         while unrouted.len() > UNROUTED_KEPT {
@@ -189,6 +194,23 @@ mod tests {
         assert!(
             !arrivals.another_carries(&request(2), Some(&copy)),
             "another request is not met"
+        );
+    }
+
+    /// Two calls carry one close and neither records a route. Each settles when its work ends, and
+    /// the call whose entry goes first still meets the other's.
+    #[test]
+    fn each_call_that_carried_a_close_meets_the_entries_of_the_others() {
+        let arrivals = Arc::new(Arrivals::default());
+        let carried = request(1);
+        let first = arrivals.arrive(carried.clone());
+        let second = arrivals.arrive(carried.clone());
+        second.settle_without_a_route();
+        first.settle_without_a_route();
+        drop(first);
+        assert!(
+            arrivals.another_carries(&carried, Some(&second)),
+            "the second call meets what the first kept"
         );
     }
 
