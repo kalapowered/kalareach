@@ -1196,7 +1196,13 @@ async fn a_mute_from_the_phones_own_controls_is_told_to_the_service_in_order() {
 /// drawn on the screen; a call that has played nothing has none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_audio_played_out_is_the_calls_figure_and_only_the_first() {
-    let mut scene = scene().await;
+    // No sign of life is asked for during the case, so that only native code's news writes the
+    // view and the later state it reads is the news that comes after the second playout.
+    let timings = Timings {
+        tick: Duration::from_secs(3600),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
     scene.start().await;
     let running = scene
         .state_where("an attached control", |state| {
