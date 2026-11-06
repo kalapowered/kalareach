@@ -15,10 +15,17 @@
 //! For an operation performed for a caller bounded by a grant the profile allows no read it does
 //! not name. It names the directories the operation owns, the paths the invocation is lent, Git's
 //! program, the device nodes, and the libraries the system does not supply (the support set).
-//! Git's helper directory is named for execution only. The system's own libraries need no rule: the loader maps them from its
-//! shared cache without opening the files they would be in. One more read is named because the
-//! loader will not start a program without it: the root directory itself, which lists the names at
-//! the top of the filesystem and nothing beneath them.
+//! Git's helper directory is named for execution only. The system's own libraries need no rule:
+//! the loader maps them from its shared cache without opening the files they would be in.
+//!
+//! Three reads go past those names, and each tells a name or an attribute and no content. The
+//! root directory is read, because the loader will not start a program without it; it lists the
+//! names at the top of the filesystem and nothing beneath them. A symbolic link may be read
+//! wherever it is, which tells what it points at, because a name that goes through one is resolved
+//! by reading it. The directories above each granted path may be examined, which tells that they
+//! exist and what their attributes are, because Git resolves a name one directory at a time. The
+//! profile also allows `sysctl-read` without a filter, as the owner's profile does: it is a
+//! question to the kernel and not the read of a file, and this boundary does not narrow it.
 //!
 //! A profile judges the path a file has, not the name it was opened by, so every path it names is
 //! resolved first, and a link inside a granted directory that leads outside it is refused at the
@@ -27,10 +34,13 @@
 //!
 //! The rules are names, not objects, which is the difference from the Linux boundary: a granted
 //! directory that is renamed or replaced by a writer under the same account while Git runs is read
-//! under the name the profile holds. The identities this host confirms before and after the run
-//! detect that; nothing here prevents it. A filesystem mounted beneath a granted directory would
-//! be read under a granted name too, so such an invocation is refused, from the table of mounted
-//! filesystems read just before the child starts.
+//! under the name the profile holds. After the run this host opens again the directories the
+//! operation owns and reports one that is not the object it started against; a change made and
+//! undone between the two readings is not told from none. The paths the invocation is lent and the
+//! support set are held by name alone, so one of them replaced while Git runs is read under its
+//! name and nothing detects it. Nothing here prevents any of it. A filesystem mounted beneath a
+//! granted directory would be read under a granted name too, so such an invocation is refused,
+//! from the table of mounted filesystems read just before the child starts.
 //!
 //! ## What applies it
 //!

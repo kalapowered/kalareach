@@ -123,8 +123,8 @@ those would fail an operation for a reason that has nothing to do with safety. T
 holds the account's authority over the owner's own files, so what such an operation can reach by
 reading is what the account the service runs as can reach, as it was before. An operation performed
 for a caller bounded by a grant is confined on Linux and on macOS and refused elsewhere, and the
-section on that caller below says what it is promised. Windows confines reading with everything else, and what an
-invocation reads outside the directories the operation owns is granted by name.
+section on that caller below says what it is promised. Windows confines reading with everything
+else, and what an invocation reads outside the directories the operation owns is granted by name.
 
 ## Which mechanism holds which guarantee
 
@@ -137,8 +137,8 @@ two and why. The table below describes what is written for that platform, not wh
 | Execution | A sandbox profile permitting `process-exec` on this invocation's own execution list and nothing else, applied by the system's own launcher before it runs Git | Landlock, with the execute right on this invocation's own execution list, on Git's helper directory and on the system's program loader, and nowhere else | An application container granted read and write on the repository, and **refused** the execute right there, so a permission inherited from the same directory cannot add it back, though one written on a file itself can |
 | Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that makes a socket only of what the boundary can account for: a connected pair of local ones for any operation, the internet families for a remote one and on those only a TCP stream socket, and nothing else at all, listening included | The container's capabilities: none at all for a local operation, and the client capability for a remote one, which does not bound ports (one of the two reasons the service refuses here) |
 | Writes | The same profile, which permits `file-write` under the operation's own directories and nowhere else | Landlock's write rights, attached to the opened objects rather than to their names, and never carrying the execute right | The container's grants on those directories |
-| Reads | The whole filesystem for the owner. For a caller bounded by a grant, the same profile with no rule on the whole filesystem: read on the objects the invocation is granted, named by their resolved paths, and on the support set named for this host's Git, and a refusal when a filesystem is mounted beneath a granted directory | The whole filesystem for the owner. For a caller bounded by a grant, Landlock with no rule on the whole filesystem: read rights only on the objects the invocation is granted and on the support set named for this host's Git, and a refusal when a filesystem is mounted beneath a granted directory | The container's grants on those directories, and read grants by name on what it is lent |
-| Inherited descriptors | Every descriptor the service opens is closed when a child executes | The same, and after the rules are applied the child marks every descriptor from the fourth on to close when it executes Git; a kernel that cannot mark them fails the spawn | An explicit list of the three standard handles, and no other |
+| Reads | The whole filesystem for the owner. For a caller bounded by a grant, the same profile with read rules only for the objects the invocation is granted, named by their resolved paths, and for the support set named for this host's Git, and a refusal when a filesystem is mounted beneath a granted directory; beyond those, only the names and attributes of the root directory, of symbolic links and of the directories above a granted path | The whole filesystem for the owner. For a caller bounded by a grant, Landlock with no rule on the whole filesystem: read rights only on the objects the invocation is granted and on the support set named for this host's Git, and a refusal when a filesystem is mounted beneath a granted directory | The container's grants on those directories, and read grants by name on what it is lent |
+| Inherited descriptors | Every descriptor the service opens is closed when a child executes, and the child marks every other descriptor from the fourth on to close when it executes the launcher; a system that cannot list them fails the spawn | The same, and after the rules are applied the child marks every descriptor from the fourth on to close when it executes Git; a kernel that cannot mark them fails the spawn | An explicit list of the three standard handles, and no other |
 | Descendants | The child leads its own process group, and ending it ends the group | The same | A job object the process is created inside, which it cannot leave and which ends everything in it |
 
 ## What a platform refuses rather than pretends
@@ -201,19 +201,18 @@ On Linux and on macOS each Git invocation of such an operation runs inside one b
 confines what the program reads. The paragraph below describes Linux's, and the one after it
 macOS's.
 
-On Linux it is one Landlock ruleset that confines
-what the program reads. It may read the directories the operation owns and the ones it is lent, such
-as a clone's source, along with Git's own program and helper directory, the profile's own empty
-directories and the four device nodes. It may also read a support set named for this host's Git:
-the loader each of Git's programs names for itself, and the directories holding the libraries that
-loader resolves for them. Nothing else the account can read is readable, and nothing in `/proc`,
-`/dev/shm` or `/etc` is. The invocation writes only the operation's own directories and the device
-nodes. It executes only the installed Git, never anything in the location, which it may read and
-write but not execute. It reaches no network, and a remote clone is refused for such a caller.
-Before Git executes, every descriptor the child holds from the fourth on is marked to close, so a
-descriptor the service left open is no way round the rules. The configuration audit runs inside the
-same boundary, so a configuration that includes a file outside the location fails when it is read
-rather than being noticed afterwards.
+On Linux it is one Landlock ruleset that confines what the program reads. It may read the
+directories the operation owns and the ones it is lent, such as a clone's source, along with Git's
+own program and helper directory, the profile's own empty directories and the four device nodes. It
+may also read a support set named for this host's Git: the loader each of Git's programs names for
+itself, and the directories holding the libraries that loader resolves for them. Nothing else the
+account can read is readable, and nothing in `/proc`, `/dev/shm` or `/etc` is. The invocation writes
+only the operation's own directories and the device nodes. It executes only the installed Git, never
+anything in the location, which it may read and write but not execute. It reaches no network, and a
+remote clone is refused for such a caller. Before Git executes, every descriptor the child holds
+from the fourth on is marked to close, so a descriptor the service left open is no way round the
+rules. The configuration audit runs inside the same boundary, so a configuration that includes a
+file outside the location fails when it is read rather than being noticed afterwards.
 
 On macOS it is a sandbox profile that denies by default and names what the program may read: the
 directories the operation owns and the ones it is lent, Git's own program, the profile's own empty
@@ -225,7 +224,11 @@ mapped from a shared cache without opening files, so a Git that links only those
 support set, and the Git that comes with Xcode is one. A Git that brings libraries of its own, as
 Homebrew's does, has the directory of each. They are found by reading the load commands of Git and
 of each program in its helper directory, then of every library those name, following `@rpath`,
-`@loader_path` and `@executable_path`.
+`@loader_path` and `@executable_path`. Each program is followed on its own, since what those names
+mean to a library depends on the program that loaded it; a helper that is a link is the program the
+link leads to, which is what the loader names it by. Only this machine's own kind of program is
+read: a Git built for the other kind of Mac, which the system could run under translation, is
+refused and says so.
 
 The system judges the path a file has, not the name Git opened it by, so every path in the profile
 is resolved first. A link in the tree to a file outside is refused at the file it leads to, and so
@@ -235,18 +238,26 @@ Three reads go beyond the grants, and each tells a name or an attribute and no c
 directory lists the names at the top of the filesystem and nothing beneath them; the loader opens it
 to start any program. A symbolic link may be read wherever it is, which tells where it points. The
 directories above a granted path may be examined, which tells that they exist and what their
-attributes are; Git resolves a name one directory at a time and asks about each.
+attributes are; Git resolves a name one directory at a time and asks about each. The profile also
+allows `sysctl-read` without a filter, as the owner's profile does: it is a question to the kernel
+and not the read of a file, and this boundary does not narrow it.
 
 The profile names paths where the Linux ruleset holds objects. A granted directory that a writer
 under the same account renames or replaces while Git runs is read under the name the profile holds.
-The identities this host reads again after the run detect that, and nothing prevents it. The other
-limits are Linux's: the invocation writes only the operation's own directories, executes only the
-installed Git and reaches no network, and a remote clone is refused for such a caller.
+After the run this host opens again the directories the operation owns and reports one that is not
+the object it started against, and it cannot tell a change made and undone between the two readings
+from none. The paths the invocation is lent, a clone's source for one, and the support set are held
+by name alone: one of them replaced while Git runs is read under its name and nothing detects it.
+Nothing prevents any of it. The other limits are Linux's: the invocation writes only the operation's
+own directories, executes only the installed Git and reaches no network, and a remote clone is
+refused for such a caller.
 
 The mount check reads the table of mounted filesystems from the kernel without asking any
 filesystem to answer for itself, so a share that has stopped answering cannot hold an invocation. It
 refuses what any program of this account can attach to a directory it owns: a disk image, a network
-share or a user-space volume.
+share or a user-space volume. The table gives a mount the name the profile holds, so a mount carried
+beneath a granted directory by moving a directory above it, and one made through the data volume's
+own name for a path, are refused as one made at the granted directory's own name.
 
 So the boundary bounds what the caller's own request can reach, repository content included. A
 symbolic link to a file outside, an object store borrowing another repository's objects, a
@@ -281,12 +292,12 @@ not try a read outside the grants: the profile has no rule that would allow one.
 
 What is left is stated rather than implied.
 
-**A descriptor opened before the profile is applied is read through whatever the profile says.**
-Every descriptor this service opens is closed when a child executes, on every platform. The child
-also marks every other descriptor from the fourth on before it executes, on Linux with Git and on
-macOS with the sandbox launcher, so a descriptor some library in the service's process opened
-without that mark does not reach Git. A system that cannot list the child's descriptors fails the
-start.
+**The support set is named once and kept.** It is named when the first invocation for such a
+caller needs it, and kept until the service restarts, a refusal as well as an answer. A Git replaced
+in place leaves it naming what is no longer there: on macOS a package manager that upgrades a
+library moves it to a directory that carries the version. Every invocation for such a caller and
+each `host.doctor` proof then fails closed until the daemon restarts, and so does one after a
+library that was missing has been restored.
 
 **A substitution inside a granted subtree is outside the guarantee.** The tree Git works in is the
 object this service opened, so nothing can redirect that. What a substitution can still reach is a

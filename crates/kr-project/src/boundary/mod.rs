@@ -90,7 +90,7 @@
 //!
 //! | Platform | Execution | Network | Writes | Reads for a caller bounded by a grant |
 //! | --- | --- | --- | --- | --- |
-//! | macOS | A per-invocation sandbox profile, applied by the system's own launcher before it runs Git | The same profile | The same profile | The same profile, with no rule on the whole filesystem: the granted paths, resolved, and the named support set only |
+//! | macOS | A per-invocation sandbox profile, applied by the system's own launcher before it runs Git | The same profile | The same profile | The same profile: the granted paths, resolved, and the named support set, and beyond them only the names and attributes of the root directory, of symbolic links and of the directories above a granted path |
 //! | Linux | Landlock, with the execute right only on Git's own program and helper directory | Landlock's TCP rules for a remote operation, and a system-call filter that makes a socket only of what the boundary can account for | Landlock, from the opened directory handles | Landlock, with no rule on the whole filesystem: the granted objects and the named support set only |
 //! | Windows: **refused, and never run** | An application container whose grants on the repository carry no execute right | The container's capabilities: none at all for a local operation | The container's grants, inside a job object that ends every descendant | Refused, as every invocation is |
 //!
@@ -506,8 +506,11 @@ pub enum Reads {
     Everywhere,
     /// Only what the invocation is granted, for an operation performed for a caller bounded by a
     /// grant: the directories the operation owns, the ones it is lent to read, Git's own program
-    /// and helper directory, the device nodes every process needs, and the support set named for
-    /// this host's Git. Nothing else the account can read is readable.
+    /// and, on Linux, its helper directory (on macOS that directory is executed from and not
+    /// read), the device nodes every process needs, and the support set named for this host's Git.
+    /// Nothing else the account can read is readable. On macOS the profile also lets through the
+    /// names and attributes of the root directory, of symbolic links and of the directories above
+    /// a granted path, which tell no content; its module lists them.
     ///
     /// A support set is named only where the platform confines what a process reads, so an
     /// invocation bounded this way exists only there.
