@@ -71,8 +71,11 @@ The call screen puts the capture state first, because that is what decides wheth
 counted. Muting the microphone and silencing the voice are local controls that contact no service,
 and ending the session never waits for one: the device's own call closes first and the host is told
 after, and the screen says which of the two happened rather than reporting a revoked grant it has no
-answer for. The application's own process holds no call, so there its mute commands refuse and its
-stop command tells the host and reports that nothing was closed locally.
+answer for. On a computer the application's own process holds no call, so there its mute commands
+refuse and its stop command tells the host and reports that nothing was closed locally. On a phone
+the application holds the call, and the mute, the silence and the stop work as described above,
+whether or not the voice service answers; the screen reads the control's state (`connecting`,
+`connected` or `unreachable`) from the call itself.
 
 Cancelling what the agent is doing is a separate control, under its own heading, with its own
 confirmation. It needs the turn the agent is on, named by the host; no host answer names one to

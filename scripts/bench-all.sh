@@ -18,7 +18,10 @@
 #                                                             its budget
 #
 # KR-PERF-010 needs a paired phone with a connected media path to the voice provider, so a run names
-# it as not run here, with that reason.
+# it as not run here, with that reason. A figure of the first audio played out, taken against a
+# stand-in voice service and a peer inside the application on a simulator or an emulator, is a
+# different thing: `scripts/e2e-voice-call-device.sh <ios|android> outage` writes it to
+# kr-voice-first-audio.md as an estimate that asserts nothing, and it is not the row's figure.
 #
 # Every measurement writes its figures under KR_TEST_ARTIFACTS_DIR as Markdown sections headed by
 # the identifier they measure (`## KR-PERF-007 ...`), each with a verdict. For each identifier this
@@ -751,7 +754,8 @@ if selected descriptions; then
 fi
 if [ -z "$only" ]; then
   section "KR-PERF-010 voice, not run here" \
-    "reason            first audio and delegation latency need a paired phone with a connected media path to the voice provider, and the voice service records what starting each call took; neither is taken on a host"
+    "reason            first audio and delegation latency need a paired phone with a connected media path to the voice provider, and the voice service records what starting each call took; neither is taken on a host" \
+    "stand-in          scripts/e2e-voice-call-device.sh <ios|android> outage takes a figure of the first audio played out against a stand-in voice service and records it as an estimate that asserts nothing; delegation latency is unavailable there, because no delegation reaches a host action in this version"
 fi
 
 # Which identifiers each step measures.

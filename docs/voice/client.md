@@ -162,6 +162,32 @@ reach the screen from the host, not from the provider's channel.
 Whenever capture is in any state other than `capturing`, the UI displays:
 > "Nothing spoken while the microphone was not carrying your voice can authorise an action."
 
+## What a call's media has carried
+
+Native code reads the connection's statistics and reports what the call's media has carried as an
+optional `media` object in what it holds: the audio packets received, the audio packets sent, and the
+samples the speaker side has taken to play. A figure the statistics did not hold is left out of the
+object and is never sent as zero, so a count of none and a count that could not be read stay apart.
+The object is read when the application asks what native code holds, and not at each sign of life,
+because the read waits for the statistics. It is absent once the call has ended.
+
+Native code tells the application once per call, with a `playout` news item, that audio was played out
+of the device for the first time. A remote track being added is not that news: a track arrives before
+any sound does. The observation is an estimate, and the application labels it so.
+
+- On Android it is the first buffer handed to the speaker side with a sample above a floor of 128 (about
+  48 decibels below full scale) while playback is on, unmuted and uninterrupted.
+- On iOS the system hands the application no playout buffer, so it is the first reading of the
+  connection's statistics in which the inbound audio energy and the playout sample count both grew,
+  with playback on and the reading not spanning a change of that state. A missing or stale reading
+  counts as none.
+
+The application keeps `first_audio_ms` for the call: the milliseconds from the entry of the call's
+start in the application to the application's receipt of the `playout` news, not to the observation
+itself and not from the person's press. It is absent until the news comes and for a call that never
+plays any sound, it is serialised only when set, and the screen does not draw it. It is a figure for
+device runs and has no target here.
+
 ## Context requests and admission
 
 `VoiceContextFrame::new` (`crates/kr-client/src/services/voice.rs`) refuses an append over
@@ -198,6 +224,43 @@ The call controls keep them strictly separated:
   the host, after a deliberate confirmation step ("Cancel this turn"). It needs the turn the agent
   is on from the host; while no host answer names one, the control stays off and the screen says
   why.
+
+## Device runs
+
+`scripts/e2e-voice-call-device.sh <ios|android> [native-failure|outage]` runs a whole call on a
+simulator or an emulator, with the real application, the real platform plugin and a real host. The
+voice service is a stand-in on the machine's loopback interface, and the script holds the machine's
+device lease for as long as it runs. The result is exit 0 when every check passed, 2 when one failed,
+3 when the device is not available, and 4 when every check that measured passed and some check could
+not measure what it asks about; the run names those checks. A check that could not measure is neither
+a pass nor a failure of what it asks about.
+
+In the default mode, `native-failure`, the stand-in's answer leads nowhere. The connection fails after
+about half a minute, native code ends the call, and the checks read the end: the media stopped on the
+device, the host revoked the grant, and the voice service was told the call is over.
+
+In the `outage` mode the call has a peer. A debug build starts a peer inside the application when
+`kr-probe/peer.json` names a loopback port and a token, and a release build has no peer and reads no
+file. The stand-in asks the peer for the answer to each offer, so the call connects and carries audio.
+The peer is a second WebRTC factory whose audio device makes a tone for its microphone and counts what
+it is played, and it opens neither the audio session nor a microphone of the machine. It is a full ICE
+agent that answers with the provider's marks, not an ICE-lite one, and it is not the provider, so the
+run shows that the call connects to such an answer and carries audio, and not that the provider's own
+answer does.
+
+The checks judge audio by counters crossing a floor, never by elapsed time: about a second of audio
+packets in each direction, and a fifth of a second of samples played. A direction the machine cannot
+make is reported as not measured. A simulator has no microphone to send from, so its send direction is
+not measured unless the call's capture reads `capturing`. When the application has read its figure of
+the first audio, the script takes the voice service away. The checks then expect the control to read
+`unreachable`, the microphone's mute and the speaker's silence to work with the media still
+connected, a stop to return without waiting for the service, the media to stop on the device, the host
+to revoke the grant, and the service's closure to be reported as not confirmed. On iOS the machine also
+reads the system's lock-screen state through the peer while the call is held and after it ends.
+
+The emulator starts with `-audio none` in this mode unless `KR_EMULATOR_AUDIO_ARGS` says otherwise;
+the default mode starts it with `-no-audio`, and a call there reads its capture as `unavailable`. The
+input driver should be `none` wherever it works, so that no microphone of the machine is opened.
 
 ## Unlocked-screen ceremony
 
