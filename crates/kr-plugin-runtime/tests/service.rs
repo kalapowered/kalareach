@@ -1497,7 +1497,7 @@ async fn a_loss_owed_to_a_removed_binding_is_neither_told_to_nor_made_up_by_a_la
     };
     let request = components::request("hostile-decoder", 14);
     register_on(&client, &request, &component).await;
-    let deadline = core::time::Duration::from_millis(500);
+    let deadline = core::time::Duration::from_secs(20);
 
     // A document taken off the queue and held at the writer when privacy mode is acknowledged, so
     // that it is withheld and owed.
@@ -1547,20 +1547,42 @@ async fn a_loss_owed_to_a_removed_binding_is_neither_told_to_nor_made_up_by_a_la
         .await
         .expect("the unbind ran");
     register_on(&client, &request, &component).await;
+    // A fault of the new registration waits in the queue behind the report in the writer's hand.
+    // Once the worker reads it the writer is past the report, and so is whatever the report asked
+    // of the new registration: a redraw is a command the registration's thread has in its input
+    // before the call below, which runs after it.
+    client
+        .decode(
+            request.binding_id,
+            &components::native_request("se-3", "9", "!trap"),
+            deadline,
+        )
+        .await
+        .expect_err("a decode that traps is refused");
     hold.release();
+    let told = tokio::time::timeout(HANG_GUARD, async {
+        let mut told = Vec::new();
+        loop {
+            let notice = client.notice().await.expect("the connection is open");
+            let fault = matches!(notice, Notice::Fault { .. });
+            told.push(notice);
+            if fault {
+                return told;
+            }
+        }
+    })
+    .await
+    .expect("the fault was never written");
+    assert!(
+        matches!(told.as_slice(), [Notice::Fault { .. }]),
+        "the new registration was told what the removed one was owed: {told:?}"
+    );
 
-    // The new registration's first document is the one its caller asks for, and the notices up to
-    // it are that document alone.
+    // The new registration's first document is the one its caller asks for.
     let drawn = snapshot_drawn(&client, &request, deadline).await;
     assert_eq!(
         drawn, 1,
         "the new registration drew a document nobody asked it for"
-    );
-    let shown = notices_through(&client, request.binding_id, "snapshot", drawn).await;
-    assert_eq!(
-        shown.len(),
-        1,
-        "the new registration was shown what the removed one was owed: {shown:?}"
     );
 }
 
@@ -1706,6 +1728,65 @@ async fn a_client_shows_a_later_registration_nothing_its_queue_held_for_the_bind
     );
     drop(client);
     serving.await.expect("the host program ended");
+}
+
+// A caller that registers an identifier again before the host has answered the removal of its
+// previous registration cannot be given an exact account of the client's queue: the host removes the
+// binding from its runtime first and waits for its thread after, so the new registration can bind and
+// write its first notices before the old one's removal is answered, and nothing in a notice says
+// which registration it is from. The client keeps what its queue holds then, and does not empty it
+// of the new registration's notices with the old one's.
+//
+// The first registration's thread stands at a stopped pass, so its removal waits. The identifier is
+// registered again, and the case waits until the new registration's first document is in the
+// client's queue, unread. Then the pass is let go and the removal answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_keeps_what_the_new_registration_wrote_before_the_removal_of_the_old_one_was_answered()
+ {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let served = Served::start_unbinding_within(HANG_GUARD).await;
+    let client = Arc::new(served.client().await.unbinding_within(HANG_GUARD));
+    let (path, digest, bytes) = served.install("well-behaved", &wasm);
+    let component = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let request = components::request("well-behaved", 1);
+    register_on(&client, &request, &component).await;
+    notices_through(&client, request.binding_id, "bind", 1).await;
+    let stop = overflow_behind_a_stopped_pass(&served, &client, &request).await;
+
+    let removing = tokio::spawn({
+        let client = Arc::clone(&client);
+        let binding_id = request.binding_id;
+        async move { client.unbind(binding_id).await }
+    });
+    health_until(&client, |health| health.live_bindings == 0).await;
+    register_on(&client, &request, &component).await;
+    tokio::time::timeout(HANG_GUARD, async {
+        while client.held_notice_bytes().await == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the new registration's first document never reached the client's queue");
+
+    stop.release();
+    let existed = tokio::time::timeout(HANG_GUARD, removing)
+        .await
+        .expect("the unbind was answered")
+        .expect("the unbind task ended")
+        .expect("the unbind ran");
+    assert!(existed, "the removed binding was not there to remove");
+    let bound = notices_through(&client, request.binding_id, "bind", 1).await;
+    assert_eq!(
+        bound.len(),
+        1,
+        "the new registration's first document was not kept: {bound:?}"
+    );
 }
 
 // An unbind is about the registration the connection holds under the identifier when the request

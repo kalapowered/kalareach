@@ -116,6 +116,55 @@ impl core::fmt::Debug for WriterHold {
     }
 }
 
+/// A binding's removal the host has not answered yet.
+#[derive(Debug, Default)]
+struct Removal {
+    /// How many requests to remove the binding are waiting for their answers.
+    asking: usize,
+    /// Whether the identifier was registered again while one of them waited.
+    registered_again: bool,
+}
+
+/// One request to remove a binding, counted until its answer has been read or it is dropped.
+struct Removing<'a> {
+    removals: &'a Mutex<HashMap<Uuid, Removal>>,
+    binding_id: Uuid,
+}
+
+impl<'a> Removing<'a> {
+    fn begin(removals: &'a Mutex<HashMap<Uuid, Removal>>, binding_id: Uuid) -> Self {
+        if let Ok(mut removals) = removals.lock() {
+            removals.entry(binding_id).or_default().asking += 1;
+        }
+        Self {
+            removals,
+            binding_id,
+        }
+    }
+
+    /// Returns true when the identifier was registered again since a removal of it was asked for.
+    fn registered_again(&self) -> bool {
+        self.removals.lock().is_ok_and(|removals| {
+            removals
+                .get(&self.binding_id)
+                .is_some_and(|removal| removal.registered_again)
+        })
+    }
+}
+
+impl Drop for Removing<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut removals) = self.removals.lock()
+            && let Some(removal) = removals.get_mut(&self.binding_id)
+        {
+            removal.asking = removal.asking.saturating_sub(1);
+            if removal.asking == 0 {
+                removals.remove(&self.binding_id);
+            }
+        }
+    }
+}
+
 /// What an event handed over without waiting became.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Handoff {
@@ -307,6 +356,8 @@ pub struct PluginClient {
     register_deadline: core::time::Duration,
     /// How long an unbind is waited for.
     unbind_deadline: core::time::Duration,
+    /// The identifiers whose removal the host has not answered yet.
+    removals: Mutex<HashMap<Uuid, Removal>>,
     next_request: AtomicU64,
     descriptor: HostDescriptor,
     reader_task: tokio::task::JoinHandle<()>,
@@ -403,6 +454,7 @@ impl PluginClient {
             offer_hold,
             register_deadline: REGISTER_DEADLINE,
             unbind_deadline: DEFAULT_DEADLINE,
+            removals: Mutex::new(HashMap::new()),
             next_request: AtomicU64::new(1),
             descriptor,
             reader_task,
@@ -457,6 +509,11 @@ impl PluginClient {
         executable: &str,
         component: &ComponentSource,
     ) -> ServiceResult<Registration> {
+        if let Ok(mut removals) = self.removals.lock()
+            && let Some(removal) = removals.get_mut(&binding_id.get())
+        {
+            removal.registered_again = true;
+        }
         let body = self
             .request_within(
                 RequestBody::RegisterBinding(Box::new(BindingRegistration {
@@ -562,6 +619,13 @@ impl PluginClient {
     #[must_use]
     pub fn hold_offered_writes(&self) -> HoldHandle {
         self.offer_hold.set()
+    }
+
+    /// Returns how many bytes of notices this client's queue holds and nobody has read, for the
+    /// tests of a crate that drives this client.
+    #[cfg(feature = "testing")]
+    pub async fn held_notice_bytes(&self) -> u64 {
+        self.notices.lock().await.held_bytes()
     }
 
     /// Takes the connection's writer, as a task in the middle of writing a frame holds it, and
@@ -713,11 +777,18 @@ impl PluginClient {
     /// after it, so what the queue holds when the answer comes is the removed registration's, and
     /// none of it is shown to the identifier's next one.
     ///
+    /// That holds for a caller that registers the identifier again only after this returns, which
+    /// is what a worker does. A caller that registers it again while this waits has the host's
+    /// word for nothing more than that the old registration's notices came before the answer, and
+    /// the new registration's first notices can have come before it too, with nothing to tell the
+    /// two apart. Such a caller keeps everything its queue holds.
+    ///
     /// # Errors
     ///
     /// Returns [`ServiceError::Protocol`] for the host's refusal, which is an answer and not a
     /// failure to get one, and [`ServiceError::Unavailable`] when the host is gone.
     pub async fn unbind(&self, binding_id: BindingId) -> ServiceResult<bool> {
+        let removing = Removing::begin(&self.removals, binding_id.get());
         let body = self
             .request_within(
                 RequestBody::Unbind {
@@ -726,12 +797,17 @@ impl PluginClient {
                 self.unbind_deadline,
             )
             .await?;
+        // What the queue holds for the identifier is the removed registration's only if the
+        // identifier was not registered again before the host answered: the host can write the new
+        // registration's first notices before it answers the removal of the old one, and nothing
+        // in a notice says which registration it is from. A caller that registers again before it
+        // has the answer keeps what its queue holds.
+        let forget = !removing.registered_again();
         match body {
             ResponseBody::Unbound { existed } => {
                 // An answer that found nothing removed nothing: the host held no registration of
-                // the identifier when it read the request, and what the queue holds for it may be
-                // a newer registration's.
-                if existed {
+                // the identifier when it read the request.
+                if existed && forget {
                     self.forget(binding_id);
                 }
                 Ok(existed)
@@ -739,7 +815,9 @@ impl PluginClient {
             ResponseBody::Refused {
                 detail, disabled, ..
             } => {
-                self.forget(binding_id);
+                if forget {
+                    self.forget(binding_id);
+                }
                 Err(refused(detail, disabled))
             }
             other => Err(protocol_error(&other)),

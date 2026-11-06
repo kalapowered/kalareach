@@ -187,7 +187,7 @@ struct Queued {
     /// draws a document in one call, but the pieces reach this queue one at a time. Remembering
     /// which document went is what keeps a straggler from being queued after its own document was
     /// dropped, which would show a reader the last piece of something it never received the rest
-    /// of. An entry goes when that document's last piece is seen, when its binding goes, or when
+    /// of. An entry goes when that document's last piece is seen, when its registration goes, or when
     /// there are more of them than this queue will keep.
     gone: std::collections::HashSet<(Subject, u64)>,
     /// The order those were recorded in, so the oldest is the first to go if there are too many.
@@ -281,14 +281,15 @@ impl NoticeSink {
         self.remove(|subject| subject.binding_id == binding_id);
     }
 
-    /// Takes out of this queue everything one registration put in it, and keeps nothing more of
-    /// what it sends: the notices waiting, the losses it owes, the documents it dropped whose last
-    /// piece had not come, and the documents it withheld.
+    /// Takes out of this queue everything one registration has put in it: the notices waiting, the
+    /// losses it owes, the documents it dropped whose last piece had not come, and the documents it
+    /// withheld.
     ///
     /// Called when a registration goes, by whoever stops its producer from sending more, so that no
-    /// later registration of the identifier is given what the one that went left behind. What a
-    /// reader already took from the queue is not the queue's to take back; it is for the reader to
-    /// leave unwritten, as [`Delivered`] lets it.
+    /// later registration of the identifier is given what the one that went left behind. The queue
+    /// goes on taking what the origin sends: it is the producer that stops. What a reader already
+    /// took from the queue is not the queue's to take back; it is for the reader to leave
+    /// unwritten, as [`Delivered`] lets it.
     pub fn retract(&self, origin: Origin) {
         self.remove(|subject| subject.origin == Some(origin));
     }
@@ -307,7 +308,7 @@ impl NoticeSink {
     /// piece of a document that is withheld and is not its last is remembered as a dropped one is,
     /// so that the rest of that document is dropped when it arrives after documents are no longer
     /// withheld, and a reader is never given the end of a document it did not receive the start of.
-    /// When documents are no longer withheld, one loss of documents for each binding that had one
+    /// When documents are no longer withheld, one loss of documents for each registration that had one
     /// withheld is reported as a gap, which is how the reader learns to expect a fresh document and
     /// how the component is asked to draw one.
     pub fn withhold_documents(&self, withhold: bool) {

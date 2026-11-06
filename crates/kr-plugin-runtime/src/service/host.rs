@@ -980,6 +980,7 @@ impl PluginHost {
         // Forgets the registration if it does not finish, wherever it stops.
         let registering = Registering {
             registered: &served.registered,
+            notices: &served.notices,
             binding_id,
             incarnation,
             kept: false,
@@ -1217,10 +1218,11 @@ impl PluginHost {
         })
         .await;
         match carried_out {
-            Ok(Ok(removed)) => Ok(ResponseBody::Unbound {
-                // A registration that was still being made is a binding the worker asked for, and
-                // there is nothing of it in the runtime to find.
-                existed: removed.existed() || leaving.being_registered,
+            Ok(Ok(_removed)) => Ok(ResponseBody::Unbound {
+                // Whether this request is the one that ended the connection's registration. Which
+                // of two requests about one registration found its entry in the runtime first is
+                // for scheduling to say, and a registration still being made has no entry yet.
+                existed: leaving.retired,
             }),
             Ok(Err(error)) => Err(self.detached(
                 served,
@@ -1630,9 +1632,10 @@ struct BindingPlaces {
 /// A registration that failed leaves an identifier nothing is preparing any more, and a redraw owed
 /// to it is owed to nobody. Forgetting it here is what keeps that record from growing, and the
 /// connection stops standing behind it, so that nothing its thread still produces reaches the
-/// queue, and the notice writer writes nothing it left there.
+/// queue, and what it left there goes.
 struct Registering<'a> {
     registered: &'a Registered,
+    notices: &'a NoticeSink,
     binding_id: Uuid,
     incarnation: Incarnation,
     kept: bool,
@@ -1649,7 +1652,10 @@ impl Drop for Registering<'_> {
         if !self.kept
             && let Ok(mut held) = self.registered.lock()
         {
-            held.retire(self.incarnation);
+            if held.retire(self.incarnation) {
+                // Under the record the forwarder sends under, so nothing follows it.
+                self.notices.retract(origin_of(self.incarnation));
+            }
             held.gave_up(self.binding_id, self.incarnation);
             held.ends.remove(&self.incarnation);
         }
@@ -1734,21 +1740,7 @@ async fn write_notices(
         }
         let written = tokio::time::timeout(WRITE_DEADLINE, async {
             let mut writer = writer.lock().await;
-            // Looked at under the writer, which the answer to an unbind is written under: what a
-            // registration the connection no longer stands behind left in the queue or in this
-            // writer's hands is not written, and what was written before the connection stopped
-            // standing behind it is before the answer to the unbind that did.
-            if let Some(origin) = origin
-                && !registered
-                    .lock()
-                    .is_ok_and(|held| held.stands_behind(origin))
-            {
-                return Ok(());
-            }
-            // Looked at under the writer, which `set_privacy` holds while it sets the flag: a
-            // document is written before the answer that says documents are withheld or is not
-            // written at all, whichever of the two tasks took the lock first.
-            if notices.skips_withheld(origin, &notice) {
+            if leaves_unwritten(&notices, &registered, origin, &notice) {
                 return Ok(());
             }
             writer.write_message(&Frame::Notice(notice)).await
@@ -1766,6 +1758,35 @@ async fn write_notices(
     if notices.overflowed() {
         conversation.end();
     }
+}
+
+/// Says whether the notice writer, holding the connection's writer, leaves a notice unwritten.
+///
+/// Looked at under the writer, which the answer to an unbind is written under: what a registration
+/// the connection no longer stands behind left in the queue or in this writer's hands is not
+/// written, and what was written before the connection stopped standing behind it is before the
+/// answer to the unbind that did. The connection's record is held for the whole of the look, so a
+/// removal cannot retract the registration between the check and the record of a withheld piece,
+/// which would leave the record behind with nothing to clear it.
+///
+/// Looked at under the writer also because `set_privacy` holds it while it sets the flag: a
+/// document is written before the answer that says documents are withheld or is not written at
+/// all, whichever of the two tasks took the lock first.
+fn leaves_unwritten(
+    notices: &NoticeStream,
+    registered: &Registered,
+    origin: Option<Origin>,
+    notice: &Notice,
+) -> bool {
+    let Ok(held) = registered.lock() else {
+        return true;
+    };
+    if let Some(origin) = origin
+        && !held.stands_behind(origin)
+    {
+        return true;
+    }
+    notices.skips_withheld(origin, notice)
 }
 
 /// Writes one answer, and says whether the connection is still usable.
@@ -1936,8 +1957,9 @@ struct Leaving {
     incarnation: Incarnation,
     /// Whether the registration was live.
     was_live: bool,
-    /// Whether the registration was still being made, with nothing in the runtime to find.
-    being_registered: bool,
+    /// Whether this request is the one that stopped the connection standing behind the
+    /// registration, which a second request about it, read before the removal finished, is not.
+    retired: bool,
     /// When the registration's forwarder has ended, once it has started.
     ended: Option<Ended>,
 }
@@ -1960,14 +1982,14 @@ fn leave(served: &Served, binding_id: Uuid) -> Option<Leaving> {
         .live
         .get(&binding_id)
         .is_some_and(|handle| handle.incarnation() == incarnation);
-    let being_registered = held.preparing.get(&binding_id) == Some(&incarnation);
-    if held.retire(incarnation) {
+    let retired = held.retire(incarnation);
+    if retired {
         served.notices.retract(origin_of(incarnation));
     }
     Some(Leaving {
         incarnation,
         was_live,
-        being_registered,
+        retired,
         ended: held.ended_of(incarnation),
     })
 }
