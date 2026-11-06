@@ -445,3 +445,67 @@ async fn a_restarted_host_reads_back_every_paired_key_grant_and_revision() {
     session.close();
     host.stop().await;
 }
+
+/// KR-REQ-09.09: a retry of a declaration whose record the host cannot read is told that what
+/// became of the declaration is not known. The completion ran, so a transient word, which says
+/// nothing took effect, would have the device declare again as though it had not. Once the record
+/// can be read the retry is answered from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_of_a_completion_whose_record_cannot_be_read_is_told_the_outcome_is_unknown() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = Device::create().await;
+    let record = net_support::pair_with(&host, &device, &owner, net_support::proposal(OWNER)).await;
+    as_an_earlier_host_wrote_it(&host, record.device_id);
+
+    let params = declaration(record.device_id, device.keys().public_keys(), device.keys());
+    let action = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let target = ActionTarget::environment(host.environment_id);
+
+    let first_connection = RawDevice::connect(&host, &device, &record).await;
+    first_connection.claim();
+    let window = first_connection.action_window_id();
+    let first = first_connection
+        .mutate_in(
+            window.clone(),
+            Method::DeviceKeysComplete,
+            action,
+            target.clone(),
+            &params,
+        )
+        .await
+        .expect("the declaration completes the record");
+    first_connection.close();
+
+    // The table that holds the outcome of every declaration is moved aside, as a registry that
+    // fails to read it would leave it.
+    let registry = rusqlite::Connection::open(host.registry_database()).expect("the registry");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    registry
+        .execute_batch("ALTER TABLE network_key_declarations RENAME TO declarations_aside;")
+        .expect("the outcomes cannot be read");
+    let later_connection = RawDevice::connect(&host, &device, &record).await;
+    later_connection.claim();
+    let told = later_connection
+        .mutate_in(
+            window.clone(),
+            Method::DeviceKeysComplete,
+            action,
+            target.clone(),
+            &params,
+        )
+        .await
+        .expect_err("an outcome that cannot be read does not answer the retry");
+    registry
+        .execute_batch("ALTER TABLE declarations_aside RENAME TO network_key_declarations;")
+        .expect("the outcomes can be read again");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    let replayed = later_connection
+        .mutate_in(window, Method::DeviceKeysComplete, action, target, &params)
+        .await
+        .expect("the retry is answered from its record once it can be read");
+    assert_eq!(replayed, first);
+}

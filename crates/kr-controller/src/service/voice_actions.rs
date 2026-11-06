@@ -65,6 +65,11 @@ impl crate::account::Calls for VoiceCalls {
     }
 }
 
+/// What a repeat of a voice change is told when the result it kept cannot be read back.
+fn unreadable_voice_record() -> ControllerError {
+    ControllerError::record_unreadable("voice changes")
+}
+
 impl Controller {
     /// How long the voice service waits on a worker now.
     pub(crate) fn voice_budgets(&self) -> VoiceBudgets {
@@ -552,10 +557,14 @@ impl Controller {
         mutation: &MutationRequest,
     ) -> Result<Option<ParamsValue>> {
         let digest = self.voice_action_digest(actor_id, mutation)?;
+        // A store that cannot be read is not one that holds no record: an earlier attempt may have
+        // made the change, so the repeat is not told a transient word, which says nothing took
+        // effect. A reused identifier keeps its code.
         match self
             .sharing
             .grants()
-            .recorded_action(actor_id, mutation.action_id, &digest)?
+            .recorded_action(actor_id, mutation.action_id, &digest)
+            .map_err(|error| error.found_unreadable("voice changes"))?
         {
             Some(record) => self
                 .voice_recorded(actor_id, mutation, record)
@@ -610,8 +619,10 @@ impl Controller {
                 detail: "this device is no longer paired with this host".to_owned(),
             });
         };
-        let answered = decoded(kept)?;
-        let receipt: VoiceDelegateResult = parse(&answered)?;
+        // A result this host kept and cannot read back leaves open what the delegation came to.
+        let answered = decoded(kept).map_err(|_| unreadable_voice_record())?;
+        let receipt: VoiceDelegateResult =
+            parse(&answered).map_err(|_| unreadable_voice_record())?;
         // What the first answer recorded the words to ask for, and nothing read from them again.
         if !matches!(receipt.outcome, VoiceDelegationOutcome::Performed { .. }) {
             return Ok(answered);
@@ -645,7 +656,9 @@ impl Controller {
     /// start would be a second metered call.
     fn recorded_voice_action(record: crate::grants::ActionRecord) -> Result<ParamsValue> {
         match record {
-            crate::grants::ActionRecord::Answered { result } => decoded(&result),
+            crate::grants::ActionRecord::Answered { result } => {
+                decoded(&result).map_err(|_| unreadable_voice_record())
+            }
             crate::grants::ActionRecord::Refused { code, detail } => {
                 Err(ControllerError::Refused { code, detail })
             }
