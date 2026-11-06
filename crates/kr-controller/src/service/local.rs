@@ -444,12 +444,22 @@ impl Controller {
             return None;
         }
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        // A reservation that cannot be read is not one that is not there: an earlier copy of this
+        // create may have reserved a session and started it, and this copy is then neither fresh nor
+        // refused for something it did not do.
         let existing = {
             let registry = self.registry.lock().await;
-            registry
-                .reservation_for_token(actor_id, mutation.action_id.get())
-                .ok()
-                .flatten()?
+            match registry.reservation_for_token(actor_id, mutation.action_id.get()) {
+                Ok(Some(existing)) => existing,
+                Ok(None) => return None,
+                Err(error) => {
+                    eprintln!("kr-controller: a create's reservation cannot be looked up: {error}");
+                    return Some(respond(
+                        mutation.request_id,
+                        Err(ControllerError::record_unreadable("sessions")),
+                    ));
+                }
+            }
         };
         if existing.payload_digest != digest {
             return Some(respond(
