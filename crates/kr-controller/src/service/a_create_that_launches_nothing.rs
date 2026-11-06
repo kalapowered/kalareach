@@ -1637,9 +1637,10 @@ async fn a_retry_of_an_admitted_create_is_not_refused_because_its_package_went_a
         kr_protocol::error::ErrorCode::ShellIntegrationUnsupported,
         "a retry is answered from its own reservation rather than refused again: {error}"
     );
-    assert!(
-        error.to_string().contains("already recorded"),
-        "and the answer is the recorded one: {error}"
+    assert_eq!(
+        error.code(),
+        ErrorCode::OutcomeUnknown,
+        "and the answer is the reservation's, a create still under way: {error}"
     );
     assert!(
         asked.lock().expect("the record is not poisoned").is_empty(),
@@ -1700,9 +1701,10 @@ async fn a_retry_of_an_admitted_create_is_not_refused_because_the_document_broke
         ErrorCode::HostNotConfigured,
         "a retry is answered from its own reservation, not refused for the document: {retried}"
     );
-    assert!(
-        retried.to_string().contains("already recorded"),
-        "and the answer is the recorded one: {retried}"
+    assert_eq!(
+        retried.code(),
+        ErrorCode::OutcomeUnknown,
+        "and the answer is the reservation's, a create still under way: {retried}"
     );
     let fresh = create_request(environment_id);
     let refused = controller

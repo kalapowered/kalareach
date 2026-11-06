@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use kr_protocol::error::ErrorCode;
 use kr_protocol::identity::{DesktopBinding, ProcessStartIdentity, WorkerProfile};
 use kr_protocol::ids::{AuthorityRevision, SessionId};
 use kr_protocol::session::{SessionCreateResult, SessionState};
@@ -320,6 +321,41 @@ async fn a_create_asked_again_whose_worker_cannot_be_reached_is_told_the_outcome
         "the session is not known: {told:?}"
     );
     assert!(!gone.closure_is_recorded().await, "no closure was invented");
+}
+
+/// KR-REQ-09.09: whatever stops a known worker from being asked about the session its create made,
+/// the create asked again is told that the session is not known, never a refusal: a cut frame, a
+/// worker that refuses the read and a peer that is not the worker all stop it, and a client takes a
+/// refusal for the host's word that nothing was done. A storage failure keeps the wording of the
+/// record that cannot be read. This reaches the failures a daemon cannot be made to raise from a
+/// worker in a case, and the case above reaches the one it can.
+#[test]
+fn a_failure_to_ask_a_known_worker_about_its_session_is_never_a_refusal() {
+    use super::create::session_not_known;
+
+    for error in [
+        ControllerError::InvalidArgument("a frame was cut".to_owned()),
+        ControllerError::PermissionDenied {
+            detail: "the peer is not the worker".to_owned(),
+        },
+        ControllerError::Refused {
+            code: ErrorCode::InvalidArgument,
+            detail: "the worker refused the read".to_owned(),
+        },
+        ControllerError::supervision("the worker did not answer"),
+    ] {
+        let told = session_not_known(error);
+        assert!(
+            matches!(told, ControllerError::Uncertain { .. }),
+            "the session is not known: {told:?}"
+        );
+    }
+    let storage = session_not_known(ControllerError::registry("the closures cannot be read"));
+    assert_eq!(
+        storage.code(),
+        ErrorCode::StorageUnavailable,
+        "left for the wording of the record: {storage:?}"
+    );
 }
 
 /// KR-REQ-09.12: the same create asked again under its token, whose worker ended before the daemon
