@@ -1042,8 +1042,9 @@ impl Compiled {
 /// compile (`host-<hash>.d` for the program `host-<hash>`, `krate-<hash>.d` for
 /// `libkrate-<hash>.rlib`), or for the crate alone when a library has other crate types too
 /// (`krate.d` for `libkrate.rlib`). A program that Cargo copied out of `deps` has no hash in its
-/// name: then the one dependency file of the crate that this build wrote is it, and when there are
-/// two the file is not told.
+/// name, and on Windows a program has none in `deps` either (`kalareach_companion.d` for
+/// `kalareach_companion.exe`): then the one dependency file of the crate that this build wrote,
+/// with a hash in its name or without, is it, and when there are two the file is not told.
 fn dependency_file(name: &str, outputs: &[PathBuf], began: SystemTime) -> Option<PathBuf> {
     for output in outputs {
         let directory = output.parent()?;
@@ -1068,8 +1069,12 @@ fn dependency_file(name: &str, outputs: &[PathBuf], began: SystemTime) -> Option
             let file = entry.file_name().to_string_lossy().into_owned();
             file.strip_suffix(".d")
                 .and_then(|stem| stem.strip_prefix(name))
-                .and_then(|rest| rest.strip_prefix('-'))
-                .is_some_and(|hash| hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                .is_some_and(|rest| {
+                    rest.is_empty()
+                        || rest.strip_prefix('-').is_some_and(|hash| {
+                            hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                        })
+                })
                 && entry
                     .metadata()
                     .and_then(|found| found.modified())
@@ -1240,8 +1245,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Binary, ERROR_BYTES, LISTING_BEGIN, LISTING_END, Unit, ends_of, file_name, is_count,
-        is_named_by_digest, libtest, may_have_overlapped, read_listing, reconcile, unrecorded,
+        Binary, ERROR_BYTES, LISTING_BEGIN, LISTING_END, Unit, dependency_file, ends_of, file_name,
+        is_count, is_named_by_digest, libtest, may_have_overlapped, read_listing, reconcile,
+        unrecorded,
     };
     use crate::workspace::{TargetId, TargetKind};
 
@@ -1605,5 +1611,33 @@ mod tests {
         assert!(!is_named_by_digest(&format!("g{}", &digest[1..])));
         assert!(!is_named_by_digest("acl-manifests.json"));
         assert!(!is_named_by_digest("push_gateway_origin"));
+    }
+
+    #[test]
+    fn a_programs_dependency_file_is_found_by_the_names_cargo_gives_it_on_each_platform() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let deps = directory.path().join("debug").join("deps");
+        std::fs::create_dir_all(&deps).expect("a deps directory");
+        let began = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+        // A program Cargo copied out of `deps`; Windows has no hash in its names there, Unix has.
+        let copied = [directory.path().join("debug").join("kalareach-companion")];
+        assert_eq!(dependency_file("kalareach_companion", &copied, began), None);
+        std::fs::write(deps.join("kalareach_companion.d"), "x").expect("a file");
+        assert_eq!(
+            dependency_file("kalareach_companion", &copied, began),
+            Some(deps.join("kalareach_companion.d"))
+        );
+        // Two files of the crate that this build wrote are not told apart.
+        std::fs::write(deps.join("kalareach_companion-0123456789abcdef.d"), "x").expect("a file");
+        assert_eq!(dependency_file("kalareach_companion", &copied, began), None);
+        // The one named for the output in `deps` is it.
+        let in_deps = [deps.join("kalareach_companion-0123456789abcdef")];
+        assert_eq!(
+            dependency_file("kalareach_companion", &in_deps, began),
+            Some(deps.join("kalareach_companion-0123456789abcdef.d"))
+        );
+        // A file from before the build is not this build's.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        assert_eq!(dependency_file("kalareach_companion", &copied, later), None);
     }
 }
