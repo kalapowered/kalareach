@@ -1529,6 +1529,19 @@ fn a_catalogue_mutation_names_an_environment_and_never_a_session() {
 // The generated authority table
 // ---------------------------------------------------------------------------------------------
 
+/// KR-REQ-23.28 and KR-REQ-23.29: each of the thirteen catalogue and plugin methods has one
+/// authority entry that this daemon serves, names a resource selector, and requires `host.manage`
+/// wherever the entry classes the method as a write; a new trust root is always confirmed by the
+/// owner, and a catalogue sync only where it would enlarge trust.
+///
+/// For 23.28 the part shown is the `host.manage` requirement of the catalogue's writes and the
+/// owner's confirmation of a new root: the case holds `catalogue.add`, `catalogue.sync`,
+/// `catalogue.pin` and `catalogue.remove` to be writes. For 23.29 it is the `host.manage`
+/// requirement of the changing plugin methods: the case holds `plugin.install`, `plugin.remove`,
+/// `plugin.pin`, `plugin.enable`, `plugin.disable` and `plugin.grant` to be writes. Not shown here:
+/// `host.manage` on a read such as `catalogue.list`, the repository's root, generation and
+/// budget, the package hash, repository ceiling, environment and binding checks, or scoped read
+/// authority for capability queries.
 #[test]
 fn kr_req_23_28_and_23_29_every_method_has_one_exhaustive_authority_entry() {
     use kr_protocol::actor::ActorIngress;
@@ -1577,6 +1590,28 @@ fn kr_req_23_28_and_23_29_every_method_has_one_exhaustive_authority_entry() {
         }
     }
     assert_eq!(seen, 13, "five catalogue methods and eight plugin methods");
+
+    // The methods that change the host are writes, so the check above reaches them: the
+    // catalogue's four and the plugins' six.
+    for name in [
+        "catalogue.add",
+        "catalogue.sync",
+        "catalogue.pin",
+        "catalogue.remove",
+        "plugin.install",
+        "plugin.remove",
+        "plugin.pin",
+        "plugin.enable",
+        "plugin.disable",
+        "plugin.grant",
+    ] {
+        let AuthorityDecision::Listed(listed) =
+            decide(name, MethodVersion::V1, ActorIngress::LocalIpc)
+        else {
+            panic!("{name} is not listed");
+        };
+        assert_eq!(listed.effect, EffectClass::Write, "{name} changes the host");
+    }
 
     // A new trust root always needs the owner; a sync needs one only when it would enlarge.
     let add = kr_protocol::method::REGISTRY
