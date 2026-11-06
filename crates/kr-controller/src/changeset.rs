@@ -240,28 +240,12 @@ impl ChangeSetModule {
         let actor = actor_id.clone();
         let action_id = mutation.action_id.get();
         let name = method.as_str();
-        let outcome = blocking(move || {
-            service
-                .retained_action(&actor, action_id, name, digest)
-                .map_err(ProtocolError::from)
-        })
-        .await;
+        let outcome = blocking(move || kept(&service, &actor, action_id, name, digest)).await;
         match outcome {
             // The blocking task itself failed, which says nothing about the action.
             Err(error) => Some(frame(mutation.request_id, Err(error))),
             Ok(None) => None,
-            Ok(Some(RetainedOutcome::Ok(result))) => Some(frame(
-                mutation.request_id,
-                kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-                    .map(ParamsValue::new)
-                    .map_err(|error| {
-                        ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
-                    }),
-            )),
-            Ok(Some(RetainedOutcome::Error { code, detail })) => Some(frame(
-                mutation.request_id,
-                Err(ProtocolError::new(code, detail)),
-            )),
+            Ok(Some(retained)) => Some(frame(mutation.request_id, recorded(retained))),
         }
     }
 
@@ -387,20 +371,9 @@ impl ChangeSetModule {
         let action_id = mutation.action_id.get();
         let name = method.as_str();
         blocking(move || {
-            if let Some(retained) = service.retained_action(&actor, action_id, name, digest)? {
+            if let Some(retained) = kept(&service, &actor, action_id, name, digest)? {
                 copied.store(true, Ordering::Release);
-                return match retained {
-                    RetainedOutcome::Ok(result) => {
-                        kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-                            .map(ParamsValue::new)
-                            .map_err(|error| {
-                                ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
-                            })
-                    }
-                    RetainedOutcome::Error { code, detail } => {
-                        Err(ProtocolError::new(code, detail))
-                    }
-                };
+                return recorded(retained);
             }
             // The claim is taken before the effect. Two copies of one action that both found no
             // record would otherwise both capture, both materialise or both write a working tree,
@@ -861,6 +834,38 @@ impl kr_changeset::apply::ActionClaim for DeferredClaim<'_> {
     }
 }
 
+/// The records this module's store keeps, as a repeat is told of them when they cannot be read.
+const RECORDS: &str = "change-set actions";
+
+/// The record an action left, read for a repeat of it.
+///
+/// A store that cannot be read is not one that holds no record: the action may have been carried
+/// out, so the repeat is told that what became of it is not known. A reused identifier keeps its
+/// code. The lookup cannot tell a first action from a repeat, so a first action on a store that
+/// cannot be read is told the same.
+fn kept(
+    service: &ChangeSetService,
+    actor: &ActorId,
+    action_id: kr_protocol::scalars::Uuid,
+    method: &str,
+    digest: kr_protocol::scalars::Digest256,
+) -> Answer<Option<RetainedOutcome>> {
+    service
+        .retained_action(actor, action_id, method, digest)
+        .map_err(|error| ControllerError::found_unreadable_on_the_wire(error.into(), RECORDS))
+}
+
+/// The answer a record of an action is: the result it kept, or the refusal it kept. A result that
+/// cannot be decoded leaves open what the action came to.
+fn recorded(retained: RetainedOutcome) -> Answer<ParamsValue> {
+    match retained {
+        RetainedOutcome::Ok(result) => kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
+            .map(ParamsValue::new)
+            .map_err(|_| ControllerError::record_unreadable(RECORDS).to_protocol_error()),
+        RetainedOutcome::Error { code, detail } => Err(ProtocolError::new(code, detail)),
+    }
+}
+
 /// Answers from the record another copy of this action left, or says nothing is known.
 fn answer_from_retained(
     service: &ChangeSetService,
@@ -869,11 +874,8 @@ fn answer_from_retained(
     method: &str,
     digest: kr_protocol::scalars::Digest256,
 ) -> Answer<ParamsValue> {
-    match service.retained_action(actor, action_id, method, digest)? {
-        Some(RetainedOutcome::Ok(result)) => kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-            .map(ParamsValue::new)
-            .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())),
-        Some(RetainedOutcome::Error { code, detail }) => Err(ProtocolError::new(code, detail)),
+    match kept(service, actor, action_id, method, digest)? {
+        Some(retained) => recorded(retained),
         // The claim this action lost to was given back before it could be read.
         None => Err(ProtocolError::new(
             ErrorCode::OutcomeUnknown,

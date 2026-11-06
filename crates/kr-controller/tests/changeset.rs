@@ -1337,3 +1337,108 @@ async fn authority_revoked_after_the_claim_stops_a_reference_move_through_the_da
     host.clients.abort();
     let _ = host.clients.await;
 }
+
+/// A second connection to the change-set store, for a case that puts a fault in it.
+fn beside_the_store(host: &Host) -> rusqlite::Connection {
+    let store = kr_changeset::ChangeSetService::root_of(&host._temp.environment())
+        .join(kr_changeset::store::STORE_FILE_NAME);
+    let connection = rusqlite::Connection::open(store).expect("opens the change-set store");
+    connection
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    connection
+}
+
+/// A capture of a workspace the host does not hold. Its service refuses it for that, once the
+/// record of the action has been looked for.
+fn a_capture_of_no_workspace() -> ChangesetCaptureParams {
+    capture_params(
+        kr_protocol::ids::WorkspaceId::new(kr_protocol::scalars::Uuid::from_bytes([0x5c; 16])),
+        Nullable::null(),
+        "",
+    )
+}
+
+/// KR-REQ-09.09: a change-set action whose record of actions cannot be read is told that what
+/// became of it is not known, and not a transient word, which says nothing took effect: a repeat of
+/// an action that ran cannot be told from a first action when the record cannot be read. Once the
+/// record can be read the action is decided as ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_set_action_whose_record_cannot_be_read_is_told_the_outcome_is_unknown() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let store = beside_the_store(&host);
+    store
+        .execute_batch("ALTER TABLE actions RENAME TO actions_aside;")
+        .expect("the records cannot be read");
+    let told = failure(
+        control
+            .mutate(
+                Method::ChangesetCapture,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &a_capture_of_no_workspace(),
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    store
+        .execute_batch("ALTER TABLE actions_aside RENAME TO actions;")
+        .expect("the records can be read again");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    let decided = failure(
+        control
+            .mutate(
+                Method::ChangesetCapture,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &a_capture_of_no_workspace(),
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_ne!(
+        decided.code,
+        ErrorCode::OutcomeUnknown,
+        "the action is decided once its record can be read: {decided:?}"
+    );
+    host.clients.abort();
+    let _ = host.clients.await;
+}
+
+/// KR-REQ-09.09: the same where the service looks again for the record, after the door found none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_set_action_whose_record_cannot_be_read_by_the_service_is_told_the_outcome_is_unknown()
+ {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let environment_id = host.environment_id;
+    let store = beside_the_store(&host);
+
+    let (arrived, go) = host.controller.pause_retained_lookup();
+    let sending = tokio::spawn(async move {
+        control
+            .mutate(
+                Method::ChangesetCapture,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &a_capture_of_no_workspace(),
+            )
+            .await
+    });
+    arrived.await.expect("the mutation has looked for a record");
+    store
+        .execute_batch("ALTER TABLE actions RENAME TO actions_aside;")
+        .expect("the records cannot be read");
+    let _ = go.send(());
+    let told = sending.await.expect("the mutation ran");
+    store
+        .execute_batch("ALTER TABLE actions_aside RENAME TO actions;")
+        .expect("the records can be read again");
+    let told = failure(told.expect("the call reaches the daemon"));
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    host.clients.abort();
+    let _ = host.clients.await;
+}
