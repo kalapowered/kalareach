@@ -615,29 +615,12 @@ impl TransferModule {
         let actor = actor_id.clone();
         let action_id = mutation.action_id.get();
         let name = method.as_str();
-        let outcome = blocking(move || {
-            Ok(service
-                .retained_action(&actor, action_id, name, digest)
-                .map_err(ProtocolError::from))
-        })
-        .await;
+        let outcome = blocking(move || kept(&service, &actor, action_id, name, digest)).await;
         match outcome {
             // The blocking task itself failed, which says nothing about the action.
             Err(error) => Some(frame(mutation.request_id, Err(error))),
-            Ok(Err(error)) => Some(frame(mutation.request_id, Err(error))),
-            Ok(Ok(None)) => None,
-            Ok(Ok(Some(RetainedOutcome::Ok(result)))) => Some(frame(
-                mutation.request_id,
-                kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-                    .map(ParamsValue::new)
-                    .map_err(|error| {
-                        ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
-                    }),
-            )),
-            Ok(Ok(Some(RetainedOutcome::Error { code, detail }))) => Some(frame(
-                mutation.request_id,
-                Err(ProtocolError::new(code, detail)),
-            )),
+            Ok(None) => None,
+            Ok(Some(retained)) => Some(frame(mutation.request_id, answer_of(retained))),
         }
     }
 
@@ -967,7 +950,7 @@ impl TransferModule {
         #[cfg(feature = "testing")]
         let after_the_outer_check = Arc::clone(&self.after_the_outer_check);
         blocking(move || {
-            if let Some(retained) = service.retained_action(&actor, action_id, name, digest)? {
+            if let Some(retained) = kept(&service, &actor, action_id, name, digest)? {
                 // Found here, after the lookup the local door made before it considered a first
                 // admission: another attempt may have recorded it since. It goes back under the
                 // same check, asked once the answer is in hand.
@@ -990,7 +973,7 @@ impl TransferModule {
                 // A claim moves from open to settled and never back, so one that is not open
                 // now and was when the lookup above found it open has been settled since, and
                 // what it was settled with is the answer.
-                if let Some(retained) = service.retained_action(&actor, action_id, name, digest)? {
+                if let Some(retained) = kept(&service, &actor, action_id, name, digest)? {
                     admission.check_retained()?;
                     return answer_of(retained);
                 }
@@ -1458,9 +1441,30 @@ fn answer_of(retained: RetainedOutcome) -> Answer<ParamsValue> {
     match retained {
         RetainedOutcome::Ok(result) => kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
             .map(ParamsValue::new)
-            .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())),
+            .map_err(|_| ControllerError::record_unreadable(RECORDS).to_protocol_error()),
         RetainedOutcome::Error { code, detail } => Err(ProtocolError::new(code, detail)),
     }
+}
+
+/// The records this module's store keeps, as a repeat is told of them when they cannot be read.
+const RECORDS: &str = "transfer actions";
+
+/// The record an action left, read for a repeat of it.
+///
+/// A store that cannot be read is not one that holds no record: the action may have been carried
+/// out, so the repeat is told that what became of it is not known. A reused identifier keeps its
+/// code. The lookup cannot tell a first action from a repeat, so a first action on a store that
+/// cannot be read is told the same.
+fn kept(
+    service: &TransferService,
+    actor: &ActorId,
+    action_id: kr_protocol::scalars::Uuid,
+    name: &str,
+    digest: kr_protocol::scalars::Digest256,
+) -> Answer<Option<RetainedOutcome>> {
+    service
+        .retained_action(actor, action_id, name, digest)
+        .map_err(|error| ControllerError::found_unreadable_on_the_wire(error.into(), RECORDS))
 }
 
 fn frame(request_id: RequestId, outcome: Answer<ParamsValue>) -> ControlFrame {

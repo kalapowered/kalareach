@@ -2849,3 +2849,91 @@ async fn an_upload_whose_admission_lapses_before_the_services_lock_reserves_noth
     );
     host.stop().await;
 }
+
+/// A second connection to the transfer store, for a case that puts a fault in it.
+fn beside_the_store(host: &Host) -> rusqlite::Connection {
+    let store = kr_transfer::staging::StagingArea::store_path(&host.temp.environment());
+    let connection = rusqlite::Connection::open(store).expect("opens the transfer store");
+    connection
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    connection
+}
+
+/// KR-REQ-09.09: a transfer action whose record of actions cannot be read is told that what became
+/// of it is not known, and not a transient word, which says nothing took effect: a repeat of an
+/// action that ran cannot be told from a first action when the record cannot be read. Once the
+/// record can be read the action is performed once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_action_whose_record_cannot_be_read_is_told_the_outcome_is_unknown() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let params = begin_params(&host, &pattern(64), "kept.bin");
+    let store = beside_the_store(&host);
+    store
+        .execute_batch("ALTER TABLE actions RENAME TO actions_aside;")
+        .expect("the records cannot be read");
+    let told = failure(
+        control
+            .mutate(
+                Method::UploadBegin,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    store
+        .execute_batch("ALTER TABLE actions_aside RENAME TO actions;")
+        .expect("the records can be read again");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    control
+        .mutate(
+            Method::UploadBegin,
+            action,
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("upload.begin is performed once the record can be read");
+    host.stop().await;
+}
+
+/// KR-REQ-09.09: the same where the service looks again for the record, after the door found none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_action_whose_record_cannot_be_read_by_the_service_is_told_the_outcome_is_unknown()
+ {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let environment_id = host.environment_id;
+    let params = begin_params(&host, &pattern(64), "kept.bin");
+    let store = beside_the_store(&host);
+
+    let (arrived, go) = host.controller.pause_retained_lookup();
+    let sending = tokio::spawn(async move {
+        control
+            .mutate(
+                Method::UploadBegin,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &params,
+            )
+            .await
+    });
+    arrived.await.expect("the mutation has looked for a record");
+    store
+        .execute_batch("ALTER TABLE actions RENAME TO actions_aside;")
+        .expect("the records cannot be read");
+    let _ = go.send(());
+    let told = sending.await.expect("the mutation ran");
+    store
+        .execute_batch("ALTER TABLE actions_aside RENAME TO actions;")
+        .expect("the records can be read again");
+    let told = failure(told.expect("the call reaches the daemon"));
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    host.stop().await;
+}
