@@ -7398,7 +7398,11 @@ descends only from another device's share. Paired devices can use `grant.list` t
 have issued.
 
 `grant.list` is the list of grants, each of which includes its expiry date as well as its effective
-end date, which is the earlier of its expiry date and the end of the pairing of the grantee.
+end date, which is the earlier of its expiry date and the end of the pairing of the grantee. A grant
+is listed as pending, active, expired or revoked. It is listed as expired when its end is on record
+or when either of its two deadlines, on the continuous clock or in UTC, has passed, which is how the
+host decides it for every other use of the grant. While the host cannot decide that for a grant, the
+list is refused with `CLOCK_UNTRUSTED` or `STORAGE_UNAVAILABLE`.
 `device.list` is the list of devices, each of which indicates the platform of the device, the end of
 the pairing of the device, whether the pairing of the device has run out as far as the host is
 concerned and whether the pairing opens all sessions of the environment. Note that sharing a session
