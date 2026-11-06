@@ -6,7 +6,7 @@
 mod net_support;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kr_client::error::ClientError;
 use kr_controller::error::ControllerError;
@@ -24,8 +24,8 @@ use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActionId, ActorId};
 use kr_protocol::invitation::{
-    InviteGrantKind, InviteMode, InviteModeKind, PairConfirmParams, PairInviteParams,
-    PairInviteResult, default_rendezvous_origin,
+    InviteGrantKind, InviteMode, InviteModeKind, PairCancelParams, PairConfirmParams,
+    PairInviteParams, PairInviteResult, default_rendezvous_origin,
 };
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{PairStatus, PairingConsumedReason, ProposedGrant, SensitiveAction};
@@ -841,7 +841,7 @@ fn racing_request(
                     },
                     (action, Digest256::from_bytes([9; 32])),
                     &|| Ok(()),
-                    &std::sync::atomic::AtomicBool::new(false),
+                    &AtomicBool::new(false),
                 )
                 .expect("the request records the identifier first");
         }
@@ -987,6 +987,7 @@ async fn a_confirmation_whose_identifier_is_spent_meanwhile_spends_no_confirmati
         revision,
         &racing_request(pairing, &caller, action),
         &life(),
+        &AtomicBool::new(false),
     );
     assert!(is_id_conflict(&refused), "{refused:?}");
     let committed = pairing
@@ -1000,11 +1001,377 @@ async fn a_confirmation_whose_identifier_is_spent_meanwhile_spends_no_confirmati
             revision,
             &admitted,
             &life(),
+            &AtomicBool::new(false),
         )
         .expect("the next action commits the pairing with the same answer");
     assert_eq!(committed.event.invitation_id, invited.invitation_id);
     connection.close(0u32.into(), b"paired");
     host.stop().await;
+}
+
+/// A repeat of a confirmation is answered from the record of the first, and the service says so: it
+/// is a copy of what the first submission recorded, which the door tells a device as it tells any
+/// such answer. The submission that committed the pairing says it is not.
+///
+/// A device never issues an invitation, so none can confirm one through the door: the service is
+/// asked directly, on the host a daemon runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_confirmation_is_answered_as_a_copy_of_its_record() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let grant = viewer();
+    let pairing = host.network().pairing();
+    let caller = Caller::local(ActorId::new("local:test").expect("a principal"));
+    let admitted: Admission = Arc::new(|| Ok(()));
+
+    calls::confirm_subject(
+        environment,
+        &mut client,
+        issue(InviteModeKind::Direct, &grant),
+        &owner,
+    )
+    .await
+    .expect("answered");
+    let invited = pairing
+        .invite(
+            &caller,
+            &direct(&grant),
+            (
+                ActionId::new(kr_ipc::new_uuid()),
+                Digest256::from_bytes([1; 32]),
+            ),
+            host.network().network_config().expect("a configuration"),
+            &admitted,
+            &life(),
+        )
+        .expect("an invitation");
+    let device = Device::create().await;
+    let (connection, _candidate, _value) = calls::redeem(&device.candidate(), &invited).await;
+    let approval = pairing
+        .owner_status(
+            &caller,
+            &PairStatusParams {
+                invitation_id: invited.invitation_id,
+            },
+        )
+        .expect("the owner's view")
+        .owner
+        .0
+        .and_then(|view| view.approval.0)
+        .expect("a bound candidate");
+    calls::confirm_subject(
+        environment,
+        &mut client,
+        ConfirmationSubject::ConfirmDevice {
+            invitation_id: invited.invitation_id,
+        },
+        &owner,
+    )
+    .await
+    .expect("the candidate's confirmation, answered");
+    let params = PairConfirmParams {
+        invitation_id: invited.invitation_id,
+        approval,
+    };
+    let revision = host
+        .controller()
+        .authority_revision()
+        .await
+        .expect("a revision");
+
+    let action = (
+        ActionId::new(kr_ipc::new_uuid()),
+        Digest256::from_bytes([3; 32]),
+    );
+    let performed = AtomicBool::new(false);
+    let first = pairing
+        .confirm(
+            &caller,
+            &params,
+            action,
+            revision,
+            &admitted,
+            &life(),
+            &performed,
+        )
+        .expect("the confirmation commits the pairing");
+    assert!(
+        !performed.load(Ordering::Acquire),
+        "the submission that committed the pairing is not a copy"
+    );
+    let copied = AtomicBool::new(false);
+    let again = pairing
+        .confirm(
+            &caller,
+            &params,
+            action,
+            revision,
+            &admitted,
+            &life(),
+            &copied,
+        )
+        .expect("the repeat is answered");
+    assert_eq!(again, first);
+    assert!(
+        copied.load(Ordering::Acquire),
+        "the repeat is answered from the record of the first"
+    );
+    connection.close(0u32.into(), b"paired");
+    host.stop().await;
+}
+
+/// As a repeated confirmation, for a withdrawal: the repeat is answered with how the invitation
+/// ended, from the record of the submission that ended it, and says it is a copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_withdrawal_is_answered_as_a_copy_of_its_record() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let grant = viewer();
+    let pairing = host.network().pairing();
+    let caller = Caller::local(ActorId::new("local:test").expect("a principal"));
+    let admitted: Admission = Arc::new(|| Ok(()));
+
+    calls::confirm_subject(
+        environment,
+        &mut client,
+        issue(InviteModeKind::Direct, &grant),
+        &owner,
+    )
+    .await
+    .expect("answered");
+    let invited = pairing
+        .invite(
+            &caller,
+            &direct(&grant),
+            (
+                ActionId::new(kr_ipc::new_uuid()),
+                Digest256::from_bytes([1; 32]),
+            ),
+            host.network().network_config().expect("a configuration"),
+            &admitted,
+            &life(),
+        )
+        .expect("an invitation");
+    let withdrawal = PairCancelParams {
+        invitation_id: invited.invitation_id,
+        deny: false,
+    };
+
+    let action = (
+        ActionId::new(kr_ipc::new_uuid()),
+        Digest256::from_bytes([4; 32]),
+    );
+    let performed = AtomicBool::new(false);
+    let first = pairing
+        .cancel(&caller, &withdrawal, action, &admitted, &life(), &performed)
+        .expect("the withdrawal ends the invitation");
+    assert!(
+        !performed.load(Ordering::Acquire),
+        "the submission that ended the invitation is not a copy"
+    );
+    let copied = AtomicBool::new(false);
+    let again = pairing
+        .cancel(&caller, &withdrawal, action, &admitted, &life(), &copied)
+        .expect("the repeat is answered");
+    assert_eq!(again, first);
+    assert!(
+        copied.load(Ordering::Acquire),
+        "the repeat is answered from the record of the first"
+    );
+    host.stop().await;
+}
+
+/// What a service of the host says of an answer it reads from the record of an earlier submission of
+/// the action is what the door tells a device by: the repeat of a request for a confirmation, of a
+/// completion and of the establishment of the clock each say they are copies, and the submission that
+/// performed does not.
+///
+/// A device reaches these lookups only when two copies of an action are served together, and one is
+/// stopped between the door's own lookup and the service's, which no suite on a running daemon can
+/// do; the service is asked directly here, on the host a daemon runs.
+mod a_repeat_the_owner_authority_answers {
+    use super::*;
+
+    /// A resolved action of any kind, which an owner device is asked to confirm.
+    fn resolved(digest: Digest256) -> kr_controller::service::net::owner::Resolved {
+        kr_controller::service::net::owner::Resolved {
+            action: SensitiveAction::TrustRepositoryRoot,
+            digest,
+            destination: None,
+            rights: kr_protocol::scalars::CanonicalSet::new(),
+            display: kr_protocol::confirmation::ConfirmationDisplay::Described(
+                kr_protocol::confirmation::DescribedAction {
+                    action: SensitiveAction::TrustRepositoryRoot,
+                    action_digest: digest,
+                    destination_keys: Nullable::null(),
+                    destination_rights: kr_protocol::scalars::CanonicalSet::new(),
+                },
+            ),
+            bootstrap: false,
+        }
+    }
+
+    fn action(digest: u8) -> (ActionId, Digest256) {
+        (
+            ActionId::new(kr_ipc::new_uuid()),
+            Digest256::from_bytes([digest; 32]),
+        )
+    }
+
+    fn local() -> Caller {
+        Caller::local(ActorId::new("local:test").expect("a principal"))
+    }
+
+    /// KR-REQ-09.09: the repeat of a request for a confirmation is given the challenge the first was
+    /// given, as a copy; the first is not one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_repeated_request_for_a_confirmation_is_answered_as_a_copy_of_its_record() {
+        let owner_keys = keys();
+        let host = Host::start(&owner_keys).await;
+        let pairing = host.network().pairing();
+        let caller = local();
+        let action = action(5);
+        let params = OwnerConfirmationRequestParams {
+            subject: ConfirmationSubject::EstablishClock,
+        };
+
+        let performed = AtomicBool::new(false);
+        let first = pairing
+            .request_confirmation(&caller, &params, action, &|| Ok(()), &performed)
+            .expect("the request is answered with a challenge");
+        assert!(!performed.load(Ordering::Acquire));
+        let copied = AtomicBool::new(false);
+        let again = pairing
+            .request_confirmation(&caller, &params, action, &|| Ok(()), &copied)
+            .expect("the repeat is answered");
+        assert_eq!(again, first);
+        assert!(
+            copied.load(Ordering::Acquire),
+            "the repeat is answered from the record of the first"
+        );
+        host.stop().await;
+    }
+
+    /// KR-REQ-09.09: as the request above, for an action the daemon describes itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_repeated_request_for_a_described_confirmation_is_answered_as_a_copy_of_its_record() {
+        let owner_keys = keys();
+        let host = Host::start(&owner_keys).await;
+        let pairing = host.network().pairing();
+        let caller = local();
+        let action = action(6);
+
+        let performed = AtomicBool::new(false);
+        let first = pairing
+            .request_resolved(
+                &caller,
+                resolved(Digest256::from_bytes([7; 32])),
+                action,
+                &|| Ok(()),
+                &performed,
+            )
+            .expect("the request is answered with a challenge");
+        assert!(!performed.load(Ordering::Acquire));
+        let copied = AtomicBool::new(false);
+        let again = pairing
+            .request_resolved(
+                &caller,
+                resolved(Digest256::from_bytes([7; 32])),
+                action,
+                &|| Ok(()),
+                &copied,
+            )
+            .expect("the repeat is answered");
+        assert_eq!(again, first);
+        assert!(
+            copied.load(Ordering::Acquire),
+            "the repeat is answered from the record of the first"
+        );
+        host.stop().await;
+    }
+
+    /// KR-REQ-09.09: the repeat of a completion is given the acceptance the first was given, as a
+    /// copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_repeated_completion_is_answered_as_a_copy_of_its_record() {
+        let owner_keys = keys();
+        let host = Host::start(&owner_keys).await;
+        let owner = host.network().pairing().owner();
+        let caller = local();
+        let request = owner
+            .challenge(resolved(Digest256::from_bytes([8; 32])))
+            .expect("a challenge");
+        let params = OwnerConfirmationCompleteParams {
+            proof: kr_pairing::confirm::sign_confirmation(
+                &owner_keys.authorisation,
+                &request,
+                kr_protocol::pairing::ConfirmationChannel::OwnerDevicePresence,
+            )
+            .expect("a proof"),
+            bootstrap_signer: Nullable::null(),
+        };
+        let action = action(8);
+
+        let performed = AtomicBool::new(false);
+        let first = owner
+            .complete(&caller, &params, action, &|| Ok(()), &performed)
+            .expect("the proof is accepted");
+        assert!(!performed.load(Ordering::Acquire));
+        let copied = AtomicBool::new(false);
+        let again = owner
+            .complete(&caller, &params, action, &|| Ok(()), &copied)
+            .expect("the repeat is answered");
+        assert_eq!(again, first);
+        assert!(
+            copied.load(Ordering::Acquire),
+            "the repeat is answered from the record of the first"
+        );
+        host.stop().await;
+    }
+
+    /// KR-REQ-09.09: the repeat of the establishment of the clock is given the answer the first was
+    /// given, as a copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_repeated_establishment_of_the_clock_is_answered_as_a_copy_of_its_record() {
+        let owner_keys = keys();
+        let host = Host::start(&owner_keys).await;
+        let mut client = host.client().await;
+        let owner = host.network().pairing().owner();
+        let caller = local();
+        calls::confirm_subject(
+            host.environment_id,
+            &mut client,
+            ConfirmationSubject::EstablishClock,
+            &Signer::OwnerDevice(&owner_keys),
+        )
+        .await
+        .expect("the owner confirms the clock");
+        let action = action(9);
+        let boot = kr_protocol::ids::BootEpoch::new(1);
+        let commit: &kr_controller::service::net::devices::CommitFn = &|commit| commit();
+
+        let performed = AtomicBool::new(false);
+        let first = owner
+            .establish_clock(&caller, action, boot, commit, &performed)
+            .expect("the clock is established");
+        assert!(!performed.load(Ordering::Acquire));
+        let copied = AtomicBool::new(false);
+        let again = owner
+            .establish_clock(&caller, action, boot, commit, &copied)
+            .expect("the repeat is answered");
+        assert_eq!(again, first);
+        assert!(
+            copied.load(Ordering::Acquire),
+            "the repeat is answered from the record of the first"
+        );
+        host.stop().await;
+    }
 }
 
 /// A restart while something the stopped daemon's reference count does not see still holds its
