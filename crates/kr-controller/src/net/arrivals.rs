@@ -31,7 +31,7 @@
 //! restarts has none, and a copy of a close it carried out before the restart is asked as a
 //! request the host never routed.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -61,6 +61,9 @@ pub(crate) struct Arrivals {
     /// The requests of closes whose work has ended and which have no route, with the number of the
     /// call that carried each, newest last.
     unrouted: Mutex<VecDeque<(Carried, u64)>>,
+    /// The numbers of the calls whose entries a close's work holds, because the close goes on
+    /// without a route: the close is being carried out, or may be.
+    working: Mutex<HashSet<u64>>,
     next: AtomicU64,
 }
 
@@ -95,6 +98,31 @@ impl Arrivals {
             .any(|(kept, call)| kept == request && others(call))
     }
 
+    /// Whether a call other than `own` is carrying out a close of `request` with no route, or has:
+    /// the work of such a close holds its entry while it runs, and the set keeps the request after.
+    /// A call that is only waiting its turn does not count, since a route that holds another request
+    /// leaves nothing of it to be carried out.
+    pub(crate) fn another_close_went_on_without_a_route(
+        &self,
+        request: &Carried,
+        own: Option<&Arrival>,
+    ) -> bool {
+        let others = |call: &u64| own.is_none_or(|own| own.call != *call);
+        let running = self.held().get(request).is_some_and(|calls| {
+            let working = self.working.lock().unwrap_or_else(PoisonError::into_inner);
+            calls
+                .iter()
+                .any(|call| others(call) && working.contains(call))
+        });
+        running
+            || self
+                .unrouted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|(kept, call)| kept == request && others(call))
+    }
+
     fn held(&self) -> std::sync::MutexGuard<'_, HashMap<Carried, Vec<u64>>> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -115,6 +143,16 @@ pub(crate) struct Arrival {
 }
 
 impl Arrival {
+    /// Notes that a close's work holds this entry because the close goes on without a route, from
+    /// here until the entry is let go.
+    pub(crate) fn goes_on_without_a_route(&self) {
+        self.arrivals
+            .working
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(self.call);
+    }
+
     /// Whether this entry is the one of `request`.
     pub(crate) fn carries(&self, request: &Carried) -> bool {
         self.request == *request
@@ -144,6 +182,11 @@ impl Arrival {
 
 impl Drop for Arrival {
     fn drop(&mut self) {
+        self.arrivals
+            .working
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.call);
         let mut held = self.arrivals.held();
         if let Some(calls) = held.get_mut(&self.request) {
             calls.retain(|call| *call != self.call);
@@ -212,6 +255,45 @@ mod tests {
         assert!(
             arrivals.another_carries(&carried, Some(&second)),
             "the second call meets what the first kept"
+        );
+    }
+
+    /// A call that waits its turn is not a close that went on without a route. The work of one is,
+    /// from the moment it takes the entry and for as long as it runs, and the set keeps the request
+    /// after. A close that did nothing keeps nothing.
+    #[test]
+    fn only_a_close_that_went_on_without_a_route_is_one_to_a_copy() {
+        let arrivals = Arc::new(Arrivals::default());
+        let carried = request(1);
+        let close = arrivals.arrive(carried.clone());
+        let copy = arrivals.arrive(carried.clone());
+        assert!(
+            !arrivals.another_close_went_on_without_a_route(&carried, Some(&copy)),
+            "a call that waits its turn is not one"
+        );
+        close.goes_on_without_a_route();
+        assert!(
+            arrivals.another_close_went_on_without_a_route(&carried, Some(&copy)),
+            "its work is running"
+        );
+        assert!(
+            !arrivals.another_close_went_on_without_a_route(&carried, Some(&close)),
+            "a call does not count itself"
+        );
+        close.settle_without_a_route();
+        drop(close);
+        assert!(
+            arrivals.another_close_went_on_without_a_route(&carried, Some(&copy)),
+            "the set keeps it after the work"
+        );
+        assert!(!arrivals.another_close_went_on_without_a_route(&request(2), Some(&copy)));
+
+        let nothing = arrivals.arrive(request(3));
+        nothing.goes_on_without_a_route();
+        drop(nothing);
+        assert!(
+            !arrivals.another_close_went_on_without_a_route(&request(3), None),
+            "a close that did nothing keeps nothing"
         );
     }
 
