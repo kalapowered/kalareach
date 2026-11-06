@@ -1279,9 +1279,17 @@ impl RemoteConnection {
                             "a rename names the session it renames".to_owned(),
                         )),
                     };
-                    let kept = controller.settle_claim(&hold, &outcome);
+                    // A receipt that cannot be kept does not change what the rename did, and the
+                    // device is told that, not that the registry failed: the claim stays
+                    // unfinished, and a retry is told the outcome is not known and does not rename
+                    // again.
+                    if let Err(unrecorded) = controller.settle_claim(&hold, &outcome) {
+                        eprintln!(
+                            "kr-controller: a rename's receipt could not be kept: {unrecorded}"
+                        );
+                    }
                     drop(hold);
-                    kept.and(outcome)
+                    outcome
                 });
                 settled(request_id, self.controller.within_effect_wait(effect).await)
             }

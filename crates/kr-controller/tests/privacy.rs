@@ -2530,6 +2530,103 @@ async fn kr_req_24_28_a_repeated_clearing_is_answered_from_its_record_without_ge
     environment.stop().await;
 }
 
+/// KR-REQ-09.08, the part about an action that has no acknowledgement on record not being
+/// dispatched again: a rename a paired device made is answered as applied when this host cannot
+/// keep its receipt, and the same action presented again is told its outcome is not known and does
+/// not rename a second time. The control: a rename whose receipt is kept is answered the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_rename_a_device_made_is_answered_as_applied_when_its_receipt_cannot_be_kept() {
+    let environment = Environment::start().await;
+    let session_id = environment.worker.session_id;
+    let device = environment
+        .raw_device(proposal(&[
+            ActionRight::SessionRename,
+            ActionRight::SessionView,
+        ]))
+        .await;
+    let window = device.connection.action_window_id();
+    let target = environment.worker.target(environment.environment_id());
+    let renaming = |title: &str| SessionRenameParams {
+        session_id,
+        title: Nullable::some(title.to_owned()),
+    };
+    let title_now = || async { environment.describe(session_id).await.title };
+
+    let kept = device
+        .connection
+        .mutate_in(
+            window.clone(),
+            Method::SessionRename,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &renaming("Kept"),
+        )
+        .await
+        .expect("the control: a rename whose receipt is kept is answered");
+    assert_eq!(renamed(kept).title, "Kept");
+
+    // The store takes no write of a receipt, as on a full disk.
+    let registry =
+        rusqlite::Connection::open(environment.host.tree().environment().registry_database())
+            .expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_receipts BEFORE UPDATE ON authority_receipts
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    let unkept = ActionId::new(kr_ipc::new_uuid());
+    let applied = device
+        .connection
+        .mutate_in(
+            window.clone(),
+            Method::SessionRename,
+            unkept,
+            target.clone(),
+            &renaming("Applied"),
+        )
+        .await
+        .expect("the rename was applied, and that is what the device is told");
+    assert_eq!(renamed(applied).title, "Applied");
+    assert_eq!(title_now().await, "Applied");
+    registry
+        .execute_batch("DROP TRIGGER refuse_receipts;")
+        .expect("the fault is cleared");
+
+    // Another action renames again. The one whose receipt was lost is told its outcome is not
+    // known when it is presented again, and does not rename a second time.
+    device
+        .connection
+        .mutate_in(
+            window.clone(),
+            Method::SessionRename,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &renaming("Later"),
+        )
+        .await
+        .expect("a later rename is answered");
+    let told = device
+        .connection
+        .mutate_in(
+            window,
+            Method::SessionRename,
+            unkept,
+            target,
+            &renaming("Applied"),
+        )
+        .await
+        .expect_err("an action with no acknowledgement on record is not answered");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert_eq!(title_now().await, "Later", "the retry renamed nothing");
+
+    device.connection.close();
+    environment.stop().await;
+}
+
 /// KR-REQ-23.34: a device that may rename a session and may not view it renames it, and does not
 /// learn what its action came to by presenting the action again. A retained answer, a name or a
 /// refusal, goes back only under present view authority over the session it names; a device that
