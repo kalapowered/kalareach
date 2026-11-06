@@ -4154,6 +4154,35 @@ impl ProjectService {
         Ok(Some(outcome_of(&record)))
     }
 
+    /// Whether this action has claimed an effect that has no recorded outcome yet.
+    ///
+    /// A claim is written beside the state its action changes, before the action is carried out,
+    /// and settled with the outcome. One that is not settled belongs to an attempt that is still
+    /// carrying the action out, or that ended without recording what it did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::IdConflict`] when the identifier was used for a different request,
+    /// and [`ProjectError::StoreUnavailable`] when the read fails.
+    pub fn claim_is_open(
+        &self,
+        actor_id: &ActorId,
+        action_id: Uuid,
+        method: &str,
+        payload_digest: kr_protocol::scalars::Digest256,
+    ) -> Result<bool> {
+        let Some(record) = self.locked()?.retained_action(actor_id, action_id)? else {
+            return Ok(false);
+        };
+        if record.method != method || record.payload_digest != payload_digest {
+            return Err(ProjectError::IdConflict {
+                action: action_id.to_string().into(),
+                method: record.method.into(),
+            });
+        }
+        Ok(record.result.is_none() && record.error_code.is_none())
+    }
+
     /// Records one action's outcome, leaving an existing row alone.
     ///
     /// # Errors

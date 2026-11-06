@@ -239,6 +239,20 @@ impl ControllerError {
         }
     }
 
+    /// What a repeat is told of the failure of the read of its first attempt's record, on a path
+    /// that answers in wire errors.
+    ///
+    /// As [`Self::found_unreadable`], for a service whose own errors have already become the wire's.
+    /// A reused identifier and every other word the service decided keep their codes.
+    #[must_use]
+    pub fn found_unreadable_on_the_wire(error: ProtocolError, records: &str) -> ProtocolError {
+        if error.code == ErrorCode::StorageUnavailable {
+            Self::record_unreadable(records).to_protocol_error()
+        } else {
+            error
+        }
+    }
+
     /// Builds a rendezvous refusal.
     pub fn rendezvous(detail: impl std::fmt::Display) -> Self {
         Self::RendezvousRefused {
