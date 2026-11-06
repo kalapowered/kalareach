@@ -412,6 +412,14 @@ run_android() {
     # The emulator this script started is the one that answered: its process is still there.
     { [ "$booted" = 1 ] && kill -0 "$emulator_pid" 2>/dev/null; } || { say "the emulator did not come up"; return 3; }
 
+    # Only Wi-Fi carries the run. The emulator's simulated mobile network drops and returns every
+    # minute or so, and a loss the run did not make would be read as part of what it measures.
+    # KR_EMULATOR_MOBILE_DATA=on leaves it as the emulator starts it.
+    if [ "${KR_EMULATOR_MOBILE_DATA:-off}" != on ]; then
+        "$adb" -s "$serial" shell svc data disable >/dev/null 2>&1
+        say "mobile data is off on the emulator"
+    fi
+
     "$adb" -s "$serial" uninstall "$app_id" >/dev/null 2>&1
     "$adb" -s "$serial" install -r "$apk" >/dev/null || { say "the package did not install"; return 2; }
     "$adb" -s "$serial" shell pm grant "$app_id" android.permission.RECORD_AUDIO
