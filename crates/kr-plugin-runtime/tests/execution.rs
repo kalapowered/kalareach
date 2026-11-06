@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use kr_plugin_runtime::RuntimeError;
 use kr_plugin_runtime::runtime::binding::{
-    BindingEvent, BindingOwner, DEFAULT_EVENT_QUEUE, Runtime, RuntimeConfig,
+    BindingEvent, BindingOwner, DEFAULT_EVENT_QUEUE, Incarnation, Runtime, RuntimeConfig, Unbound,
 };
 use kr_plugin_runtime::runtime::bindings::{
     ActionToken, Argument, EffectClass, Fault, NamedArgument, PreparedOperation, RequestSnapshot,
@@ -1299,6 +1299,7 @@ async fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
         .runtime
         .instantiate(
             host.owner,
+            Incarnation::next(),
             components::request("slow-compile", 4),
             &compiled,
             events,
@@ -1994,6 +1995,7 @@ async fn kr_req_11_38_three_faults_in_a_minute_disable_the_binding() {
         .runtime
         .instantiate(
             host.owner,
+            Incarnation::next(),
             components::request("infinite-loop", 5),
             &compiled,
             events,
@@ -2071,6 +2073,7 @@ async fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
         .runtime
         .instantiate(
             host.owner,
+            Incarnation::next(),
             components::request("well-behaved", 6),
             &compiled,
             events,
@@ -2172,6 +2175,7 @@ async fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() 
         .runtime
         .instantiate(
             host.owner,
+            Incarnation::next(),
             request.clone(),
             &compiled,
             first_events,
@@ -2189,6 +2193,7 @@ async fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() 
         .runtime
         .instantiate(
             host.owner,
+            Incarnation::next(),
             request.clone(),
             &compiled,
             other_events,
@@ -2221,6 +2226,7 @@ async fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() 
         .runtime
         .instantiate(
             host.owner,
+            Incarnation::next(),
             second.clone(),
             &compiled,
             second_events,
@@ -2253,10 +2259,92 @@ async fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() 
 
     assert!(
         host.runtime
-            .unbind(host.owner, request.binding_id)
+            .unbind(host.owner, request.binding_id, handle.incarnation())
             .existed()
     );
-    assert!(host.runtime.unbind(host.owner, second.binding_id).existed());
+    assert!(
+        host.runtime
+            .unbind(host.owner, second.binding_id, upgraded_handle.incarnation())
+            .existed()
+    );
+    assert_eq!(host.runtime.live_bindings(), 0);
+}
+
+// A removal names the registration it is for. An identifier is registered, removed and registered
+// again, and a removal that is left waiting -- for a thread of a pool that other work keeps busy,
+// say -- runs after the identifier has been registered again by the same owner. It finds nothing to
+// remove, and the registration that is there stays, with its place among the owner's bindings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_left_for_a_registration_that_has_gone_leaves_the_identifier_registered_again_alone()
+ {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let host = host();
+    let compiled = host
+        .runtime
+        .compile(Payload::new(Arc::clone(&wasm)))
+        .expect("a compile")
+        .wait(COMPILE_WAIT)
+        .await
+        .expect("the component compiles");
+    let request = components::request("well-behaved", 8);
+    let binding_id = request.binding_id;
+
+    let (first_events, _first_received) = events();
+    let first = host
+        .runtime
+        .instantiate(
+            host.owner,
+            Incarnation::next(),
+            request.clone(),
+            &compiled,
+            first_events,
+            COMPILE_WAIT,
+        )
+        .await
+        .expect("the component instantiates");
+    assert_eq!(
+        host.runtime
+            .detach(host.owner, binding_id, first.incarnation()),
+        Unbound::Stopped
+    );
+
+    let (second_events, _second_received) = events();
+    let second = host
+        .runtime
+        .instantiate(
+            host.owner,
+            Incarnation::next(),
+            request.clone(),
+            &compiled,
+            second_events,
+            COMPILE_WAIT,
+        )
+        .await
+        .expect("the identifier registers again");
+    assert_ne!(first.incarnation(), second.incarnation());
+
+    // The removal that was left for the first registration.
+    assert_eq!(
+        host.runtime
+            .unbind(host.owner, binding_id, first.incarnation()),
+        Unbound::Absent
+    );
+    assert_eq!(host.runtime.live_bindings(), 1);
+    assert!(
+        host.runtime
+            .binding(host.owner, binding_id)
+            .is_some_and(|held| Arc::ptr_eq(&held, &second)),
+        "the removal of the first registration took the second"
+    );
+
+    // The registration that is there is removed by its own incarnation.
+    assert_eq!(
+        host.runtime
+            .unbind(host.owner, binding_id, second.incarnation()),
+        Unbound::Stopped
+    );
     assert_eq!(host.runtime.live_bindings(), 0);
 }
 

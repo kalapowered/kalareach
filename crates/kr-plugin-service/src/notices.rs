@@ -196,11 +196,16 @@ impl NoticeSink {
         offered
     }
 
-    /// Forgets everything this queue was holding for one binding.
+    /// Forgets the records this queue was holding for one binding: the documents it dropped whose
+    /// last piece had not come, and the documents it withheld.
     ///
-    /// Called when a binding goes. A binding that has gone sends nothing more, so the record of a
-    /// document it lost has nothing left to catch, and an identifier used again starts with a queue
-    /// that knows nothing about its predecessor.
+    /// Called when a registration of the binding's identifier goes, by whoever stops standing
+    /// behind it. The host's forwarder passes notices on only while its registration stands, so the
+    /// host offers its queue nothing more of that registration after this, and the records have
+    /// nothing left to catch from it; the identifier's next registration starts with a queue that
+    /// knows nothing about its predecessor. What was already waiting in a queue is not taken out;
+    /// it is delivered in order, and a client's queue can still be given notices the host queued
+    /// before it forgot.
     pub fn forget(&self, binding_id: Uuid) {
         if let Ok(mut queue) = self.shared.queue.lock() {
             queue.gone.retain(|(held, _document)| *held != binding_id);
