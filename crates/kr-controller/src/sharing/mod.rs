@@ -647,8 +647,9 @@ impl SharingService {
     /// # Errors
     ///
     /// Returns an error when the store cannot be read, `CLOCK_UNTRUSTED` when an expiring grant
-    /// has no anchor in this boot and the clock cannot give it one, and a `STORAGE_UNAVAILABLE`
-    /// refusal while an end found cannot be written down.
+    /// with no end on record has no anchor in this boot and the clock cannot give it one, and a
+    /// `STORAGE_UNAVAILABLE` refusal while the clock floor a grant's expiry is decided on is owed
+    /// its record, and while an end found cannot be written down.
     pub fn list_for_issuer(
         &self,
         issuer_device_id: DeviceId,
@@ -703,12 +704,20 @@ impl SharingService {
         Ok(GrantListResult { grants })
     }
 
-    /// Whether a grant that is not revoked has run out, on both of its deadlines and the end on
-    /// record. A grant that does not expire reads no clock, and a revoked one is revoked whatever
-    /// its time says.
+    /// Whether a grant that is not revoked has run out: its end is on record, or one of its two
+    /// deadlines has passed. A grant that does not expire reads no clock, and a revoked one is
+    /// revoked whatever its time says. An end on record is read first and stands whatever the
+    /// clocks say, as it does for every other reader: an object that ended never revives.
     fn has_run_out(&self, record: &GrantRecord, now_ms: u64) -> Result<bool> {
         if record.revoked_at_ms.is_some() || record.grant.expiry == GrantExpiry::Never {
             return Ok(false);
+        }
+        if self
+            .grants
+            .grant_expired_at(record.grant.grant_id)?
+            .is_some()
+        {
+            return Ok(true);
         }
         self.grants.lapsed(record, now_ms)
     }
