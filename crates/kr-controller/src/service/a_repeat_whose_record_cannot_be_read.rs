@@ -80,3 +80,70 @@ async fn a_repeat_of_an_authority_change_the_registry_cannot_be_asked_about_is_t
         "{not_waiting:?}"
     );
 }
+
+/// A `voice.stop` under a fresh action.
+fn voice_stop_request(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
+    MutationRequest {
+        request_id: RequestId::new(1),
+        method: Method::VoiceStop.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget::environment(temp.environment_id()),
+        expected: ParamsValue::empty(),
+        action_window_id: ActionWindowId::new("local:test").expect("a window"),
+        requested_ttl_ms: DurationMs::new(30_000),
+        params: ParamsValue::from_typed(&kr_protocol::voice::VoiceStopParams {
+            voice_session_id: kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid()),
+        })
+        .expect("encodes"),
+    }
+}
+
+/// KR-REQ-09.09: a repeat of a voice change asked of a store that cannot read the claim, or that
+/// holds a result it cannot read back, is told the outcome is unknown. The change may have been
+/// made, and a transient word, or a refusal of the argument, would say it was not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_of_a_voice_change_whose_record_cannot_be_read_is_told_the_outcome_is_unknown() {
+    let (temp, controller) = daemon().await;
+    let actor_id = ActorId::new("local:test").expect("a principal");
+    let mutation = voice_stop_request(&temp);
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("the registry opens beside the daemon's own handle");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+
+    registry
+        .execute_batch("ALTER TABLE authority_receipts RENAME TO authority_receipts_aside;")
+        .expect("the claims cannot be read");
+    let unread = controller
+        .voice_answered(&actor_id, &mutation)
+        .await
+        .expect_err("a claim that cannot be read does not answer the repeat");
+    registry
+        .execute_batch("ALTER TABLE authority_receipts_aside RENAME TO authority_receipts;")
+        .expect("the claims can be read again");
+    assert_eq!(unread.code(), ErrorCode::OutcomeUnknown, "{unread}");
+
+    // The claim holds a result that is not an encoding of anything.
+    let digest = kr_protocol::digest::mutation_digest(&mutation, &actor_id).expect("digests it");
+    registry
+        .execute(
+            "INSERT INTO authority_receipts
+                 (actor_id, action_id, payload_digest, claimed_at_ms, result, recorded_at_ms,
+                  refusal_code, refusal_detail)
+             VALUES (?1, ?2, ?3, 1, x'ff', 1, NULL, NULL)",
+            rusqlite::params![
+                actor_id.as_str(),
+                mutation.action_id.get().as_bytes().to_vec(),
+                digest.as_bytes().to_vec(),
+            ],
+        )
+        .expect("the claim is written");
+    let undecoded = controller
+        .voice_answered(&actor_id, &mutation)
+        .await
+        .expect_err("a result that cannot be read back does not answer the repeat");
+    assert_eq!(undecoded.code(), ErrorCode::OutcomeUnknown, "{undecoded}");
+}

@@ -422,7 +422,12 @@ impl Controller {
                     declaration_answer(mutation, &digest, recorded),
                 )),
                 Ok(None) => None,
-                Err(error) => Some(respond(mutation.request_id, Err(error))),
+                // A row that cannot be read, or whose outcome cannot be decoded, is not one that
+                // is absent: the declaration may have been made.
+                Err(error) => Some(respond(
+                    mutation.request_id,
+                    Err(error.found_unreadable("device key declarations")),
+                )),
             };
         }
         // A voice change is claimed in the same store and answered the same way: section 9 keeps
