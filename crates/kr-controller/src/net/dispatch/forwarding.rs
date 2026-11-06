@@ -722,6 +722,16 @@ impl RemoteConnection {
         if self.admitted_to_answer(validated).is_err() {
             return Err(outcome_not_shown());
         }
+        // A reused identifier is this host's word about the identifier and names no result, so it
+        // is no read of a record and is shown as it is, whoever asks.
+        if let ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        }) = &kept
+            && error.code == ErrorCode::IdConflict
+        {
+            return Ok(kept);
+        }
         // The answer is a read of what an earlier submission produced, and is written under the
         // decision that read is ([`Self::read_of_retained`]). A create's answer is a read of the
         // reservation its token holds, whichever way the first attempt ended, and the session that
