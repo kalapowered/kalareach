@@ -885,9 +885,13 @@ impl RemoteConnection {
                 self.output().on_delivery(request_id, tell);
                 let observer = self.expiry_observer();
                 // The close runs on a task that outlives this connection, so it takes the standing
-                // the feed's refusal is asked of with it.
+                // the feed's refusal is asked of with it, and, when its route could not be recorded,
+                // the call's entry among those that have not claimed: a copy that arrives while the
+                // close runs finds the entry, as it would find the route.
                 let standing = self.feed_standing(&decided.acting.grant);
+                let entered = own_claim.shared_with_the_work();
                 tokio::spawn(async move {
+                    let _entered = entered;
                     controller
                         .close_remote_session(
                             &mutation,
