@@ -9,7 +9,6 @@
 /* Begin PBXBuildFile section */
 		0136D075C0906D197FCC7A72 /* ExtensionProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95A67B2C4E3E055F8FF0B3D2 /* ExtensionProbe.swift */; };
 		06B3AB8BA52A0737BE652DAC /* PreviewEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */; };
-		0CD461FC7BB7D06F4C456C1E /* AudioPeer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0B395222C741E5336631067 /* AudioPeer.swift */; };
 		0D98162CEC30F1D818006E25 /* VoiceCeremony.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B391808796597DF04323FC2 /* VoiceCeremony.swift */; };
 		0EDC15DCA7A4E554312092F4 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 02888BA271562F5FA7DF24C8 /* CoreGraphics.framework */; };
 		10783ADDD4C4372BD229CE42 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = AEC884C5D046E9A2F1550FC0 /* WebRTC */; };
@@ -83,6 +82,7 @@
 		9A413361FB06362D40F546A0 /* VoiceMedia.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8404189ED710E6E93F818190 /* VoiceMedia.swift */; };
 		9CB0B7A7B35D0E96041B2AD9 /* PushReceiverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE2CD7F1E48AE0A0740DC275 /* PushReceiverTests.swift */; };
 		9F96FAB734A2805527D6C967 /* PreviewKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */; };
+		A12D69417C95B9E39B6C26DE /* AudioPeer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0B395222C741E5336631067 /* AudioPeer.swift */; };
 		A172223FB1A7B16D66A12CE6 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8E0CA9FEDBBA8EFF556A6DD /* NotificationService.swift */; };
 		A223AB1550608EDAD2B5FFC9 /* PreviewKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */; };
 		A4D50746AA44675D26153C18 /* ProofTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 090833DCE614DBBC5B713F32 /* ProofTests.swift */; };
@@ -421,7 +421,6 @@
 		3B506588AC88ABCEFBB10E36 /* KalaReachApp */ = {
 			isa = PBXGroup;
 			children = (
-				E0B395222C741E5336631067 /* AudioPeer.swift */,
 				FD0612CF62D2027ADF40D1D6 /* AudioProbe.swift */,
 				6A195DBBD19A2188DF699148 /* DeviceProbe.swift */,
 				5D97820B51FD28859F00F528 /* KRNativeLaunch.swift */,
@@ -494,6 +493,7 @@
 		759ED3EAF99DD6D22AC770CE /* KalaReachNative */ = {
 			isa = PBXGroup;
 			children = (
+				E0B395222C741E5336631067 /* AudioPeer.swift */,
 				2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */,
 				EA5D9E4FFFEAF3A1AAD81FC2 /* CallAdapter.swift */,
 				6A3EA6CD9738D5D1BE903051 /* ChallengeAnswerer.swift */,
@@ -1004,7 +1004,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				0CD461FC7BB7D06F4C456C1E /* AudioPeer.swift in Sources */,
+				7E132B9F4CEC4E1545EF9FDA /* AudioPeer.swift in Sources */,
 				3252BCEEDA8457318E549049 /* AudioReceiveTests.swift in Sources */,
 				9611CBDD46D19D11C8953D90 /* AudioSession.swift in Sources */,
 				3B54940743475B9B46645F23 /* CallAdapter.swift in Sources */,
@@ -1058,7 +1058,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				7E132B9F4CEC4E1545EF9FDA /* AudioPeer.swift in Sources */,
+				A12D69417C95B9E39B6C26DE /* AudioPeer.swift in Sources */,
 				E207DB4DBA3F0AF906B5BF2F /* AudioProbe.swift in Sources */,
 				CAB2C7432861A6D02761B7AB /* AudioSession.swift in Sources */,
 				775C842B6036D89F350BCB1B /* CallAdapter.swift in Sources */,
