@@ -627,16 +627,7 @@ fn refuse_mounts_beneath(directories: &[PathBuf]) -> Result<()> {
         )
     })?;
     match mount_beneath(&table, directories) {
-        Some((point, directory)) => Err(ProjectError::GitFailed {
-            detail: format!(
-                "a filesystem is mounted at {}, beneath {}, which this invocation would be granted; \
-                 an invocation for a caller bounded by a grant is not run over a directory with \
-                 another filesystem inside it",
-                crate::git::redact(&point.display().to_string()),
-                crate::git::redact(&directory.display().to_string())
-            )
-            .into(),
-        }),
+        Some((point, directory)) => Err(super::mounted_beneath(&point, directory)),
         None => Ok(()),
     }
 }
@@ -644,15 +635,10 @@ fn refuse_mounts_beneath(directories: &[PathBuf]) -> Result<()> {
 /// Returns the first mount point a mount table names beneath one of these directories, and that
 /// directory. A directory that is itself a mount point has nothing mounted beneath it by that.
 fn mount_beneath<'a>(table: &[u8], directories: &'a [PathBuf]) -> Option<(PathBuf, &'a Path)> {
-    table
-        .split(|byte| *byte == b'\n')
-        .filter_map(mount_point)
-        .find_map(|point| {
-            directories
-                .iter()
-                .find(|directory| point != **directory && point.starts_with(directory))
-                .map(|directory| (point.clone(), directory.as_path()))
-        })
+    super::first_mount_beneath(
+        table.split(|byte| *byte == b'\n').filter_map(mount_point),
+        directories,
+    )
 }
 
 /// Returns the mount point one line of the mount table names, with the table's escapes undone.
