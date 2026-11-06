@@ -1022,38 +1022,55 @@ fn paste_probe_in_the_console() {
     let _console = reading.stops();
 }
 
+/// The variable that makes this test binary, started in the session's console, read key records
+/// there and print them.
+const RECORD_READER: &str = "KR_ATTACH_RECORD_READER";
+
 /// KR-REQ-08.56: a character an input method composed, a dead key and the character it composes,
-/// and AltGr reach the application as the records the console reported, each with its own key code,
-/// character and modifier state, and not as the text a console would have spelled for them.
+/// and AltGr reach the session's application as the records the console reported, each with its
+/// own virtual key, scan code, character and control-key state.
 ///
-/// The session's root shell starts PowerShell, which reads four key-down events with the console's
-/// own call and prints what each was: the virtual key, the character and the control-key state. The
-/// console that `kr attach` runs in is written, in the documented record sequence, what a keyboard
-/// with an input method and a dead key gives it: the hiragana letter A composed by the input method
-/// (no virtual key, no scan code), the circumflex as a dead key (a virtual key and a scan code and
-/// no character), the `ê` that composes with it, and `@` typed with AltGr (right Alt with left Ctrl
-/// held). Spelled as text, the composed letter carries no key, the dead key is not an event at all
-/// and AltGr is no modifier; an application that is given all four as written was given the records.
+/// The session's root shell starts this test binary, which reads the key records of the session's
+/// console with the same reader `kr attach` uses and prints the six numbers of each key that went
+/// down. The console that `kr attach` runs in is written, in the documented record sequence, what a
+/// keyboard with an input method and a dead key gives it: the hiragana letter A composed by the
+/// input method (no virtual key, no scan code), the circumflex as a dead key (a virtual key and a
+/// scan code and no character), the `ê` that composes with it, and `@` typed with AltGr (right Alt
+/// with left Ctrl held). Spelled as text, the composed letter carries no key, the dead key is not an
+/// event at all and AltGr is no modifier; an application that is given all four as written was given
+/// the records.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_composed_character_a_dead_key_and_alt_graph_reach_the_application_as_the_console_reported_them()
  {
+    if std::env::var_os(RECORD_READER).is_some() {
+        record_reader_in_the_session();
+        return;
+    }
+
     let host = WorkerHost::start().await;
-    let (mut typist, session_id, dimensions) = session_waiting_for_keys(
-        &host,
-        "Write-Host ('kr-rea' + 'dy.'); \
-         $seen = @(); \
-         while ($seen.Count -lt 4) { \
-           $key = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown'); \
-           $seen += ('{0}/{1}/{2}' -f $key.VirtualKeyCode, [int]$key.Character, [int]$key.ControlKeyState) }; \
-         Write-Host (('kr-events:' + ($seen -join ',') + ':kr-') + 'end'); \
-         Start-Sleep -Seconds 300",
-    )
-    .await;
+    let (session_id, dimensions) = host
+        .kr_new(&["--shell-mode", "native_compat", "--shell", &command_shell()])
+        .await
+        .session();
+    let environment = host.tree.environment();
+    let mut typist = WorkerTerminal::attach(&environment, session_id, dimensions).await;
+    let reader = std::env::current_exe().expect("this test binary");
+    typist
+        .type_line(&format!(
+            "set {RECORD_READER}=1&& \"{}\" --exact \
+             a_composed_character_a_dead_key_and_alt_graph_reach_the_application_as_the_console_reported_them \
+             --nocapture --test-threads=1",
+            reader.display()
+        ))
+        .await;
+    typist
+        .shown("kr-rec-ready", "the session's console is being read")
+        .await;
 
     let mut console = Attached::start(&host, &session_id.to_string(), dimensions);
     console.shows(
         "the session's screen",
-        |text| text.matches("kr-ready.").count(),
+        |text| text.matches("kr-rec-ready").count(),
         1,
     );
     // The hiragana letter A as the input method composed it: no virtual key, no scan code.
@@ -1065,16 +1082,57 @@ async fn a_composed_character_a_dead_key_and_alt_graph_reach_the_application_as_
     // `@` typed with AltGr: the 2 key, right Alt (1) with left Ctrl (8) held.
     console.press(b"\x1b[50;3;64;1;9;1_");
     let seen = typist
-        .shown(":kr-end", "the application printed the events it was given")
+        .shown(
+            "kr-rec-end",
+            "the application printed the records it was given",
+        )
         .await;
-    assert!(
-        seen.contains("kr-events:0/12354/0,221/0/0,69/234/0,50/64/9:kr-end"),
-        "the application was given the composed letter, the dead key, the letter it composed and \
-         AltGr as the console reported them: {seen:?}"
-    );
+    // virtual key : scan code : character : control-key state : repeat count
+    let mut from = 0;
+    for expected in [
+        "kr-rec:0:0:12354:0:1",
+        "kr-rec:221:26:0:0:1",
+        "kr-rec:69:18:234:0:1",
+        "kr-rec:50:3:64:9:1",
+    ] {
+        match seen[from..].find(expected) {
+            Some(at) => from += at + expected.len(),
+            None => panic!(
+                "the application was not given {expected:?} after the records before it: the \
+                 session shows {seen:?}"
+            ),
+        }
+    }
 
     let _ = console.child.kill();
     drop(typist);
+}
+
+/// The session half of the test above: reads the key records of this console and prints the six
+/// numbers of each key that went down, until it has four.
+fn record_reader_in_the_session() {
+    use kr_cli::platform::ControllingTerminal;
+    use kr_cli::windows::records::{ConsoleEvent, RecordReader};
+
+    let console = ControllingTerminal::open().expect("this process has a console");
+    let mut reader =
+        RecordReader::over(console.handle().try_clone().expect("a handle on the input"));
+    println!("kr-rec-ready");
+    let mut printed = 0;
+    while printed < 4 {
+        for event in reader.read().expect("the console's records") {
+            if let ConsoleEvent::Key(key) = event
+                && key.key_down
+            {
+                println!(
+                    "kr-rec:{}:{}:{}:{}:{}",
+                    key.virtual_key, key.scan_code, key.unicode, key.control_keys, key.repeat
+                );
+                printed += 1;
+            }
+        }
+    }
+    println!("kr-rec-end");
 }
 
 /// The variable that makes this test binary, started in a console of its own, run the console half
@@ -1135,10 +1193,17 @@ async fn the_console_an_attachment_ran_in_is_given_back_in_the_modes_it_had() {
             .find_map(|line| line.find(which).map(|at| &line[at..]))
             .unwrap_or_else(|| panic!("the probe said nothing of {which}: {shown:?}"));
         let mut fields = line[which.len()..].trim().split(':');
+        // A field is its leading hexadecimal digits; the console may follow the line with a
+        // sequence of its own.
         let mut next = || {
             fields
                 .next()
-                .and_then(|word| u32::from_str_radix(word.trim(), 16).ok())
+                .map(|word| {
+                    word.chars()
+                        .take_while(char::is_ascii_hexdigit)
+                        .collect::<String>()
+                })
+                .and_then(|digits| u32::from_str_radix(&digits, 16).ok())
                 .unwrap_or_else(|| panic!("the modes in {line:?}"))
         };
         (next(), next())
