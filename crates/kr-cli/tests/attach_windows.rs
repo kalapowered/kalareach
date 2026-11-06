@@ -420,6 +420,12 @@ struct Probe {
 impl Probe {
     /// Starts the test `name` of this binary, which runs its console half.
     fn start(name: &str) -> Self {
+        Self::start_marked(name, SPELL_PROBE, &[])
+    }
+
+    /// Starts the test `name` of this binary with `marker` set, which makes it run its console
+    /// half, and `environment` as well.
+    fn start_marked(name: &str, marker: &str, environment: &[(&str, String)]) -> Self {
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -430,7 +436,10 @@ impl Probe {
             .expect("opens a console");
         let mut command = CommandBuilder::new(std::env::current_exe().expect("this test binary"));
         command.args(["--exact", name, "--nocapture", "--test-threads=1"]);
-        command.env(SPELL_PROBE, "1");
+        command.env(marker, "1");
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         let writer: Arc<Mutex<Box<dyn Write + Send>>> =
             Arc::new(Mutex::new(pty.master.take_writer().expect("a writer")));
         let output = ConsoleOutput::collect(
@@ -1011,6 +1020,182 @@ fn paste_probe_in_the_console() {
             .count()
     );
     let _console = reading.stops();
+}
+
+/// KR-REQ-08.56: a character an input method composed, a dead key and the character it composes,
+/// and AltGr reach the application as the records the console reported, each with its own key code,
+/// character and modifier state, and not as the text a console would have spelled for them.
+///
+/// The session's root shell starts PowerShell, which reads four key-down events with the console's
+/// own call and prints what each was: the virtual key, the character and the control-key state. The
+/// console that `kr attach` runs in is written, in the documented record sequence, what a keyboard
+/// with an input method and a dead key gives it: the hiragana letter A composed by the input method
+/// (no virtual key, no scan code), the circumflex as a dead key (a virtual key and a scan code and
+/// no character), the `ê` that composes with it, and `@` typed with AltGr (right Alt with left Ctrl
+/// held). Spelled as text, the composed letter carries no key, the dead key is not an event at all
+/// and AltGr is no modifier; an application that is given all four as written was given the records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_composed_character_a_dead_key_and_alt_graph_reach_the_application_as_the_console_reported_them()
+ {
+    let host = WorkerHost::start().await;
+    let (mut typist, session_id, dimensions) = session_waiting_for_keys(
+        &host,
+        "Write-Host ('kr-rea' + 'dy.'); \
+         $seen = @(); \
+         while ($seen.Count -lt 4) { \
+           $key = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown'); \
+           $seen += ('{0}/{1}/{2}' -f $key.VirtualKeyCode, [int]$key.Character, [int]$key.ControlKeyState) }; \
+         Write-Host (('kr-events:' + ($seen -join ',') + ':kr-') + 'end'); \
+         Start-Sleep -Seconds 300",
+    )
+    .await;
+
+    let mut console = Attached::start(&host, &session_id.to_string(), dimensions);
+    console.shows(
+        "the session's screen",
+        |text| text.matches("kr-ready.").count(),
+        1,
+    );
+    // The hiragana letter A as the input method composed it: no virtual key, no scan code.
+    console.press(b"\x1b[0;0;12354;1;0;1_");
+    // The circumflex as a dead key: virtual key 0xDD, scan code 0x1a, no character.
+    console.press(b"\x1b[221;26;0;1;0;1_");
+    // The `ê` it composes with: the letter E's key and the composed character.
+    console.press(b"\x1b[69;18;234;1;0;1_");
+    // `@` typed with AltGr: the 2 key, right Alt (1) with left Ctrl (8) held.
+    console.press(b"\x1b[50;3;64;1;9;1_");
+    let seen = typist
+        .shown(":kr-end", "the application printed the events it was given")
+        .await;
+    assert!(
+        seen.contains("kr-events:0/12354/0,221/0/0,69/234/0,50/64/9:kr-end"),
+        "the application was given the composed letter, the dead key, the letter it composed and \
+         AltGr as the console reported them: {seen:?}"
+    );
+
+    let _ = console.child.kill();
+    drop(typist);
+}
+
+/// The variable that makes this test binary, started in a console of its own, run the console half
+/// of the test of the console's modes.
+const RESTORE_PROBE: &str = "KR_ATTACH_RESTORE_PROBE";
+
+/// KR-REQ-08.56: when an attachment ends, the console it ran in is given back in the modes it had.
+///
+/// This test binary is started in a pseudo-console of its own, as the outer console of a person's
+/// attachment, and there it reads the console's input and output modes, starts the real `kr attach`
+/// for a session in that console, and reads the modes again once the command has taken the console
+/// over. The test, outside, closes the session, which ends the attachment, and the probe reads the
+/// modes a third time once `kr attach` has gone. The modes while the command was attached are not
+/// the modes before it (a command that changed nothing would pass the last check without
+/// restoring anything), and the modes after it are the ones before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_console_an_attachment_ran_in_is_given_back_in_the_modes_it_had() {
+    if std::env::var_os(RESTORE_PROBE).is_some() {
+        restore_probe_in_the_console();
+        return;
+    }
+
+    let host = WorkerHost::start().await;
+    let (session_id, _) = host
+        .kr_new(&["--shell-mode", "native_compat", "--shell", &command_shell()])
+        .await
+        .session();
+    let mut probe = Probe::start_marked(
+        "the_console_an_attachment_ran_in_is_given_back_in_the_modes_it_had",
+        RESTORE_PROBE,
+        &[
+            (
+                "KR_RUNTIME_DIR",
+                host.tree.paths().runtime_root().display().to_string(),
+            ),
+            (
+                "KR_STATE_DIR",
+                host.tree.paths().state_root().display().to_string(),
+            ),
+            ("KR_PROBE_SESSION", session_id.to_string()),
+            ("KR_PROBE_KR", kr().display().to_string()),
+        ],
+    );
+    probe.waits_for("kr-probe:inside:");
+    let closed = host.kr(&["close", &session_id.to_string()], &[]).await;
+    assert!(
+        closed.status.success(),
+        "kr close: {}{}",
+        String::from_utf8_lossy(&closed.stdout),
+        String::from_utf8_lossy(&closed.stderr)
+    );
+    probe.waits_for("kr-probe:after:");
+    probe.report();
+    let shown = probe.shown();
+    let modes = |which: &str| -> (u32, u32) {
+        let line = shown
+            .lines()
+            .find_map(|line| line.find(which).map(|at| &line[at..]))
+            .unwrap_or_else(|| panic!("the probe said nothing of {which}: {shown:?}"));
+        let mut fields = line[which.len()..].trim().split(':');
+        let mut next = || {
+            fields
+                .next()
+                .and_then(|word| u32::from_str_radix(word.trim(), 16).ok())
+                .unwrap_or_else(|| panic!("the modes in {line:?}"))
+        };
+        (next(), next())
+    };
+    let before = modes("kr-probe:before:");
+    let inside = modes("kr-probe:inside:");
+    let after = modes("kr-probe:after:");
+    assert_ne!(
+        inside, before,
+        "the attachment did not change the console's modes, so there was nothing to give back"
+    );
+    assert_eq!(
+        after, before,
+        "the console's input and output modes after the attachment are not the ones before it \
+         (before {before:x?}, inside {inside:x?}, after {after:x?}): {shown:?}"
+    );
+}
+
+/// The console half of the test of the console's modes, run in a console of its own.
+fn restore_probe_in_the_console() {
+    use kr_cli::platform::ControllingTerminal;
+
+    let console = ControllingTerminal::open().expect("this process has a console");
+    let before = console.modes().expect("the console's modes");
+    println!("kr-probe:before:{:x}:{:x}", before.input, before.output);
+    let variable = |name: &str| {
+        std::env::var_os(name).unwrap_or_else(|| panic!("{name} is set for the probe"))
+    };
+    let mut attach = std::process::Command::new(variable("KR_PROBE_KR"))
+        .arg("attach")
+        .arg(variable("KR_PROBE_SESSION"))
+        .spawn()
+        .expect("starts kr attach");
+    // The command has taken the console over once its modes are not the ones this process saw.
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
+    let inside = loop {
+        let now = console.modes().expect("the console's modes");
+        if now != before {
+            break now;
+        }
+        assert!(
+            attach.try_wait().expect("the command's state").is_none(),
+            "kr attach ended before it changed the console's modes"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "kr attach did not change the console's modes"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    println!("kr-probe:inside:{:x}:{:x}", inside.input, inside.output);
+    let status = attach.wait().expect("kr attach ends");
+    let after = console.modes().expect("the console's modes");
+    println!(
+        "kr-probe:after:{:x}:{:x}:attach {status}",
+        after.input, after.output
+    );
 }
 
 /// `bytes` as lower-case hexadecimal.
