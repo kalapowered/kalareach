@@ -12,9 +12,9 @@
 //!
 //! The cases run on Windows as well as on Unix, by the way the command is used there: the kit is
 //! named with `--kit-file` or piped, and a plan is confirmed with `--confirm-plan`. A case that
-//! needs what only Unix has (a terminal that is asked, a signal, a file's mode, a link, a pipe on
-//! the file system, the rename of a folder a run holds open) is Unix's alone, and the file says so
-//! at each.
+//! needs what only Unix has (a terminal that is asked, a signal, a file's mode, a link made with
+//! Unix's call, a pipe on the file system, the rename of a folder a run holds open) is Unix's
+//! alone, and the file says so at each.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -493,8 +493,7 @@ impl Rig {
         }
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
         variables.push(("PATH", format!(r"{root}\System32")));
-        // The folders a program keeps its data in are the host's own below its home, so nothing of
-        // the account running the test is read or written.
+        // The folders a program keeps its data in are the host's own below its home.
         variables.push(("USERPROFILE", self.home.display().to_string()));
         variables.push((
             "LOCALAPPDATA",
@@ -2117,6 +2116,12 @@ fn sha(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Whether reading a file failed because another process holds it open without sharing it, which
+/// is a Windows error (a sharing violation or a lock violation).
+fn held_open(error: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
+}
+
 /// Every file below `root`, by relative path.
 fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, at: &Path, into: &mut BTreeMap<String, Vec<u8>>) {
@@ -2128,20 +2133,23 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
             if path.is_dir() {
                 walk(root, &path, into);
             } else if path.is_file() {
-                // A lock file holds no content, and on Windows the daemon's cannot be opened for
-                // reading while it holds it.
-                if path
-                    .extension()
-                    .is_some_and(|extension| extension == "lock")
-                {
-                    continue;
-                }
                 // A regular file that exists and cannot be read would leave a scan of the tree
-                // vacuous, so it fails the case; one removed since the folder was listed is gone,
-                // and a socket or a pipe is not a file and is not read.
+                // vacuous, so it fails the case. Three kinds are not read: one removed since the
+                // folder was listed; a socket or a pipe, which is not a file; and, on Windows, a
+                // lock file another process holds open without sharing it, as the daemon holds its
+                // own (it records the daemon's process id, which holds no secret). A lock file
+                // nothing holds is read, and so is every lock file on Unix.
                 let bytes = match std::fs::read(&path) {
                     Ok(bytes) => bytes,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error)
+                        if held_open(&error)
+                            && path
+                                .extension()
+                                .is_some_and(|extension| extension == "lock") =>
+                    {
+                        continue;
+                    }
                     Err(error) => panic!("{} cannot be read: {error}", path.display()),
                 };
                 // Named with `/` between its parts on every platform, so a case compares a name
@@ -3021,7 +3029,7 @@ async fn a_service_that_keeps_asking_for_quiet_stops_the_run_after_five_waits_an
 
 /// A folder other accounts may write in and a link to a folder are each refused before a kit is
 /// read or the service is asked; a folder a group may write in is the person's own choice, and goes
-/// ahead. A file's mode and a link are Unix's.
+/// ahead. A file's mode is Unix's, and the link is made here with Unix's call.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_folder_that_other_accounts_write_in_or_a_link_is_refused_before_anything_is_read() {
