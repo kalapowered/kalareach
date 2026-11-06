@@ -99,6 +99,59 @@ fn the_reader_reports_itself_idle_only_once_its_editor_has_the_cursors_reply() {
     shellpkg::a_reader_reports_itself_idle_only_once_its_editor_has_the_cursors_reply(PWSH);
 }
 
+/// KR-REQ-08.48, KR-REQ-08.49: the editor does not start its read until the worker has answered
+/// the entry of the read, so the worker's hold on its answers is in place before the editor asks
+/// where the cursor is.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn the_editor_does_not_start_its_read_until_the_worker_has_answered_its_entry() {
+    shellpkg::the_editor_does_not_start_its_read_until_the_worker_has_answered_its_entry(PWSH);
+}
+
+/// KR-REQ-08.48, KR-REQ-08.49: the host's answers that are in the terminal's input when a read
+/// begins are taken out of it before the editor asks where the cursor is.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn host_answers_in_the_terminal_when_a_read_begins_are_taken_out_before_the_editor_asks() {
+    shellpkg::host_answers_in_the_terminal_when_a_read_begins_are_taken_out_before_the_editor_asks(
+        PWSH,
+    );
+}
+
+/// KR-REQ-08.48: the keys a person typed ahead of a read reach the editor whole and in order, with
+/// the host's answers among them taken out.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn keys_typed_ahead_of_a_read_reach_the_editor_whole_and_in_order_among_the_hosts_answers() {
+    shellpkg::keys_typed_ahead_of_a_read_reach_the_editor_whole_and_in_order_among_the_hosts_answers(
+        PWSH,
+    );
+}
+
+/// KR-REQ-08.48: a chord the person bound on an Escape runs when its keys were typed ahead of a read.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_chord_the_person_bound_on_an_escape_runs_when_it_was_typed_ahead_of_a_read() {
+    shellpkg::a_chord_the_person_bound_on_an_escape_runs_when_it_was_typed_ahead_of_a_read(PWSH);
+}
+
+/// KR-REQ-08.48: in the Windows edit mode the keys typed ahead of a read are the person's own.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn keys_typed_ahead_of_a_read_in_the_windows_edit_mode_are_the_persons_own() {
+    shellpkg::keys_typed_ahead_of_a_read_in_the_windows_edit_mode_are_the_persons_own(PWSH);
+}
+
+/// KR-REQ-08.49: a read that the module queues no key for reports itself idle only once its editor
+/// has the cursor's reply.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_read_with_no_key_of_the_modules_own_reports_idle_only_once_its_editor_has_the_cursors_reply() {
+    shellpkg::a_read_with_no_key_of_the_modules_own_reports_idle_only_once_its_editor_has_the_cursors_reply(
+        PWSH,
+    );
+}
+
 /// KR-REQ-07.40: the module holds no secret bytes once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
