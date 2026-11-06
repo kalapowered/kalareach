@@ -1951,10 +1951,12 @@ impl<'c> Journal<'c> {
                 detail: detail.unwrap_or_default(),
             },
             _ => {
-                return Err(AutomationError::InvalidArgument(format!(
-                    "the record of action {} says more than one thing about how it ended",
-                    key.action_id
-                )));
+                return Err(AutomationError::RecordUnreadable {
+                    detail: format!(
+                        "the record of action {} says more than one thing about how it ended",
+                        key.action_id
+                    ),
+                });
             }
         };
         Ok(Some(record))

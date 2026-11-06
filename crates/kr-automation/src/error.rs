@@ -61,6 +61,17 @@ pub enum AutomationError {
     #[error("the grant store could not be read: {0}")]
     AuthorityUnavailable(String),
 
+    /// The journal's record of an action cannot be read, or says something this build cannot
+    /// make sense of.
+    ///
+    /// This is not a refusal of the action. The action may have been carried out, so a caller is
+    /// told that what became of it is not known, and not a word that says nothing took effect.
+    #[error("the record of this action cannot be read: {detail}")]
+    RecordUnreadable {
+        /// What was found, for the host's own log.
+        detail: String,
+    },
+
     /// One action identifier was reused for a different action.
     #[error("action {action_id} was submitted before, carrying something else")]
     ActionIdentifierReused {
@@ -282,6 +293,7 @@ impl AutomationError {
             Self::DatabaseError(_)
                 | Self::JsonError(_)
                 | Self::AuthorityUnavailable(_)
+                | Self::RecordUnreadable { .. }
                 | Self::Lapsed { .. }
                 | Self::Recorded { .. }
                 | Self::ActionIdentifierReused { .. }
@@ -322,6 +334,13 @@ impl From<&AutomationError> for ProtocolError {
             AutomationError::AuthorityUnavailable(message) => Self::new(
                 ErrorCode::StorageUnavailable,
                 format!("this host could not read the grant this workflow names: {message}"),
+            ),
+            // The detail is the host's to log: what a record held is not for a caller.
+            AutomationError::RecordUnreadable { .. } => Self::new(
+                ErrorCode::OutcomeUnknown,
+                "this host's record of its workflow actions cannot be read now, so whether an \
+                 earlier attempt at this action was carried out is not known; asking again under \
+                 the same action says what it did once the record can be read",
             ),
             AutomationError::ActionIdentifierReused { action_id } => Self::new(
                 ErrorCode::IdConflict,
