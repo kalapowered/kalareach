@@ -6991,8 +6991,12 @@ async fn a_conflicting_route_does_not_hide_a_close_that_went_on_without_a_route(
             answered = &mut asking => panic!("the close was answered before the worker took it: {answered:?}"),
         }
         drop(asking);
+        let mut held = Some(go);
         if !while_it_runs {
-            go.send(()).expect("the worker goes on");
+            held.take()
+                .expect("the close is held")
+                .send(())
+                .expect("the worker goes on");
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 while controller.arrivals().entered() != 0 {
                     tokio::task::yield_now().await;
@@ -7034,7 +7038,7 @@ async fn a_conflicting_route_does_not_hide_a_close_that_went_on_without_a_route(
             "the close was carried out before the identifier was taken (while it runs: \
              {while_it_runs})"
         );
-        if while_it_runs {
+        if let Some(go) = held {
             go.send(()).expect("the worker goes on");
         }
         world.serving.abort();
