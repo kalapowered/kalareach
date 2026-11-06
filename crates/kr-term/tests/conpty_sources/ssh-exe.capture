@@ -1,0 +1,17 @@
+# A recording of what a pseudo-console's output pipe produced while a source of
+# mode 9001 ran in it. One chunk line for each read of the pipe, in order.
+# source: ssh-exe
+# command: ssh.exe -tt -i <the account's own key> -o BatchMode=yes -o StrictHostKeyChecking=accept-new <the account>@127.0.0.1 "echo kr-capture-ssh"
+# marker: kr-capture-ssh
+# windows: Microsoft Windows [Version 10.0.26100.33438]
+# exit: Some(0)
+chunk \x1b[6n
+chunk \x1b[?9001h\x1b[?1004h
+chunk \x1b[m\x1b]0;C:\\Windows\\System32\\OpenSSH\\ssh.exe\x07\x1b[?25h
+chunk Warning: Permanently added '127.0.0.1' (ED25519) to the list of known hosts.\x0d\x0a
+chunk \x1b[?1004h
+chunk \x1b[?25l\x1b[2J
+chunk \x1b[H\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x0d\x0a\x1b[K\x1b[H\x1b]0;C:\\Windows\\system32\\conhost.exe\x07\x1b[?25h
+chunk kr-capture-ssh\x0d\x0a
+chunk Connection to 127.0.0.1 closed.\x0d\x0a
+chunk \x1b[?9001l\x1b[?1004l

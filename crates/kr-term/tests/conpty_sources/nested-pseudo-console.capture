@@ -1,0 +1,14 @@
+# A recording of what a pseudo-console's output pipe produced while a source of
+# mode 9001 ran in it. One chunk line for each read of the pipe, in order.
+# source: nested-pseudo-console
+# command: this test binary, which runs `cmd.exe /c echo kr-capture-nested` in a pseudo-console of its own and writes what that produced to the outer one
+# marker: kr-capture-nested
+# windows: Microsoft Windows [Version 10.0.26100.33438]
+# exit: Some(0)
+chunk \x1b[6n
+chunk \x1b[?9001h\x1b[?1004h
+chunk \x1b[m\x1b]0;C:\\kala\\target\\debug\\deps\\conpty_sources_windows-4b0a41c4b7296738.exe\x07\x1b[?25h
+chunk \x0d\x0arunning 1 test\x0d\x0atest the_pseudo_console_inside_the_pseudo_console ... 
+chunk \x1b]0;C:\\Windows\\System32\\cmd.exe\x07
+chunk \x1b[?25lkr-capture-nested\x0d\x0aok\x1b[6;1Htest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.07s\x1b[8;1H\x1b[?25h
+chunk \x1b[?9001l\x1b[?1004l
