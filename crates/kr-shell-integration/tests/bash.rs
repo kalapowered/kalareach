@@ -95,6 +95,22 @@ fn an_escape_and_a_hosts_answer_in_one_delivery_leave_vi_insert_mode() {
     shellpkg::an_escape_and_a_hosts_answer_in_one_delivery_leave_vi_insert_mode(BASH);
 }
 
+/// KR-REQ-08.48: text pasted in vi replace mode, which Readline reads again key by key, reaches
+/// the line whole.
+#[test]
+#[ignore = "drives this tree's built Bash package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_paste_read_again_in_vi_replace_mode_reaches_the_line_whole() {
+    shellpkg::a_paste_read_again_in_vi_replace_mode_reaches_the_line_whole(BASH);
+}
+
+/// KR-REQ-08.48: the rest of a paste whose first byte Readline takes as a search target reaches the
+/// editor's keys whole.
+#[test]
+#[ignore = "drives this tree's built Bash package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_rest_of_a_paste_read_as_a_search_target_reaches_the_keys_whole() {
+    shellpkg::the_rest_of_a_paste_read_as_a_search_target_reaches_the_keys_whole(BASH);
+}
+
 /// KR-REQ-07.40: the bridge holds no copy of the bootstrap secret once the handshake is accepted.
 #[test]
 #[ignore = "drives this tree's built Bash package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]

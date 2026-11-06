@@ -210,8 +210,11 @@ go backwards, so a caller that checks first and
 then reads is never sent to wait for a key that was an answer. `_rl_nchars_available` counts the
 bytes the reader holds with the terminal's, and the bracketed paste prefix reader reads them, so a
 paste whose opening was read ahead is still found whole in a search or a command name.
-`_rl_kr_buffered` also counts the full ring correctly. A `read -e` is declined by the prompt
-context.
+`_rl_kr_buffered` also counts the full ring correctly. The reader's buffer keeps, for each byte,
+whether Readline put it back after it collected a bracketed paste, to read the text again key by
+key (`rl_vi_overstrike_bracketed_paste` and `_rl_bracketed_read_key`). The Escape of such a byte is
+not offered to the bridge, and the run the bridge follows ends before such a byte. A `read -e` is
+declined by the prompt context.
 
 ## What fish changes
 

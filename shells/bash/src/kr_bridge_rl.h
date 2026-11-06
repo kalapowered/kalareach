@@ -67,7 +67,8 @@ void kr_rl_source (int source);
  * answer that begins at a later Escape, behind the person's own, is taken too: the call returns
  * zero, the Escape is the key, and the bytes between stay in the typeahead. Otherwise it returns
  * zero with every byte it looked at back in the reader's typeahead, in order, for the key lookup.
- * It never waits for a byte the terminal has not delivered.
+ * It never waits for a byte the terminal has not delivered. An Escape that is a byte of pasted
+ * text Readline put back to read again is not offered to it at all.
  */
 int kr_rl_host_reply_dropped (void);
 
@@ -127,8 +128,14 @@ void kr_bash_launch (char **launch, char **environment, char **base);
 /* Counts Readline holds privately, for the fence proof. */
 int _rl_kr_buffered (void);
 
-/* The next byte already delivered, from the typeahead and then the terminal's queue, or -1. */
+/* The next byte already delivered, from the typeahead and then the terminal's queue, or -1. It
+   stops at a byte of pasted text that Readline put back to read again: no answer runs into one. */
 int _rl_kr_delivered_byte (void);
 int _rl_kr_macro_remaining (void);
+
+/* Puts a byte of pasted text, which Readline collected and will read again as a key, at the front
+   of the typeahead. The byte is marked, and the reader does not examine an Escape that is marked
+   when Readline takes it, nor follow a run into it. Returns non-zero if the byte went in. */
+int _rl_kr_unget_pasted_char (int key);
 
 #endif /* KR_BRIDGE_RL_H */

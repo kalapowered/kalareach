@@ -825,12 +825,17 @@ it was given.
   completion question) do not go through `getkeybuf`, so they still take an answer. Bash drops it
   at those reads too. With `BAUD` set, Zsh redraws the line only when no input is waiting, so text
   typed in the same delivery as an answer is drawn with the next key, as it was before the answer
-  was dropped.
+  was dropped. A vi user's Escape can arrive in one delivery with only the first part of an
+  answer. The reader gives that part back to its buffer, so Readline takes the Escape for the start
+  of a key. If the rest of the answer arrives in the moment before Readline reads the next key, the
+  reader takes the answer out and the Escape waits for the next key before it leaves insert mode.
 - **Pastes.** Inside a bracketed paste the reader leaves the bytes alone, and so it does in a
-  quoted insertion. Readline reads text pasted in vi replace mode, and the target of a character
-  search, again key by key without that exemption, so an answer-shaped run in text pasted there is
-  dropped. A paste into a Readline search or a command name (`C-r`, `M-p`, `M-x`) is found whole:
-  the bytes of its opening that the reader read ahead are counted with the terminal's.
+  quoted insertion. Readline reads some pasted text again key by key: text pasted in vi replace
+  mode, and the rest of a paste whose first byte is the target of a character search, a
+  replacement or a key after a numeric argument. The patch marks that text as pasted when Readline
+  puts it back; the reader examines no Escape in marked text and follows no run into it. A paste
+  into a Readline search or a command name (`C-r`, `M-p`, `M-x`) is found whole: the bytes of its
+  opening that the reader read ahead are counted with the terminal's.
 - **Where it applies.** The root shell of a session, at the prompts the shell draws, primary and
   continuation. In `vared` and `select` (Zsh) and in `read -e` (Bash) the program that is reading
   may have asked, so the reader leaves the bytes alone. A Zsh `read -k` in a widget never goes

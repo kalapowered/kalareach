@@ -1051,6 +1051,85 @@ pub fn an_escape_and_a_hosts_answer_in_one_delivery_leave_vi_insert_mode(kind: S
     );
 }
 
+/// KR-REQ-08.48: text pasted in vi replace mode, which Readline reads again key by key, reaches
+/// the line whole, a run shaped like the host's answer inside it included.
+///
+/// A bracketed paste is data, and the reader leaves its bytes alone while Readline collects it.
+/// In vi replace mode Readline puts the collected text back among its keys and reads it again, so
+/// the bytes are read a second time as keys, and the reader must not take an answer-shaped run of
+/// them for an answer then either. The case switches to vi bindings, presses Escape and `R`, and
+/// pastes a line that prints a string with an answer in the middle of it, through `od` and `tr`
+/// (some `od` pad their columns), so the bytes the shell was given show as hex that no echo of the
+/// typed line can draw.
+///
+/// # Panics
+///
+/// Panics when the line does not print the string with the answer in it.
+#[cfg(unix)]
+pub fn a_paste_read_again_in_vi_replace_mode_reaches_the_line_whole(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    assert!(
+        session.run(
+            "set -o vi; printf '%s%s\\n' kr-vi- replace",
+            "kr-vi-replace"
+        ),
+        "the editor did not switch to vi bindings:\n{}",
+        session.terminal_output()
+    );
+    let _ = session.next_prompt();
+    let line = format!(
+        "\x1bR\x1b[200~printf '%s' 'x{}y' | od -An -tx1 | tr -s ' '\x1b[201~",
+        HOST_ANSWERS[0]
+    );
+    assert!(
+        session.run(&line, "78 1b 5b 3f 36 32 3b 32 32 63 79"),
+        "the answer inside the text pasted in replace mode did not reach the line:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// KR-REQ-08.48: the rest of a paste whose first byte Readline takes as a search target reaches the
+/// editor's keys whole, a run shaped like the host's answer inside it included.
+///
+/// A character search reads the target from the keys, and when the target is the start of a
+/// bracketed paste Readline takes the paste's first byte for it and puts the rest back among its
+/// keys. Those bytes are the person's paste and not the host's, so the reader must not take a run
+/// of them for an answer. The case binds, to a command that prints a word, the key sequence that is
+/// the shape of an answer, presses the editor's character-search key, and pastes a letter followed
+/// by that sequence: the bytes behind the letter are keys, and the word is printed only if the
+/// sequence reached the editor whole.
+///
+/// # Panics
+///
+/// Panics when the bound command does not run.
+#[cfg(unix)]
+pub fn the_rest_of_a_paste_read_as_a_search_target_reaches_the_keys_whole(kind: ShellKind) {
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let binding = format!(
+        "bind -x '\"\\e[?62;22c\": printf \"%s%s\\n\" kr-ke ys'; {}",
+        print_assembled(kind, "kr-bound")
+    );
+    assert!(
+        session.run(&binding, "kr-bound"),
+        "the line that binds the key sequence did not run:\n{}",
+        session.terminal_output()
+    );
+    let _ = session.next_prompt();
+    let start = session.written();
+    // The search key, then a paste of a letter and the sequence.
+    session.type_bytes(b"\x1d\x1b[200~x\x1b[?62;22c\x1b[201~");
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-keys", deadline),
+        "the bytes of the paste behind its first byte did not reach the editor's keys whole:\n{}",
+        shown_since(&session, start)
+    );
+}
+
 /// KR-REQ-08.48: the end-of-input gesture a person makes after an Escape sequence the editor does
 /// not know is still the gesture.
 ///
