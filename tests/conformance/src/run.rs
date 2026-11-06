@@ -147,7 +147,7 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
         let prepared = build_first(step, place, &log_path, packages)
             .and_then(|(built, map)| {
                 executed.built = built;
-                let listed = list(step, place, &map, packages)?;
+                let listed = list(step, place, &log_path, &map, packages)?;
                 executables = map;
                 Ok(listed)
             })
@@ -548,10 +548,13 @@ fn host(place: &Place<'_>) -> Result<String, String> {
 /// # Errors
 ///
 /// Returns the listing that failed, and a listing [`read_listing`] cannot read: a binary that
-/// lists nothing would have its tests judged from the run alone.
+/// lists nothing would have its tests judged from the run alone. A listing that failed leaves its
+/// standard output and standard error in the step's log, and the end of its standard error is
+/// named in the error.
 fn list(
     step: &Step,
     place: &Place<'_>,
+    log_path: &Path,
     executables: &BTreeMap<String, TargetId>,
     packages: &[Package],
 ) -> Result<BTreeMap<TargetId, BTreeSet<String>>, String> {
@@ -577,16 +580,85 @@ fn list(
         .output()
         .map_err(|error| format!("the step's tests could not be listed: {error}"))?;
     if !output.status.success() {
+        let command = command.join(" ");
+        let code = output
+            .status
+            .code()
+            .map_or_else(|| "by a signal".to_owned(), |code| code.to_string());
+        let standard_error = String::from_utf8_lossy(&output.stderr);
+        let kept = keep_failed_listing(
+            log_path,
+            &format!("`{command}` (exit {code})"),
+            &String::from_utf8_lossy(&output.stdout),
+            &standard_error,
+        )
+        .map_or_else(|error| error, |()| "the log has all of it".to_owned());
         return Err(format!(
-            "`{}` did not list the step's tests (exit {})",
-            command.join(" "),
-            output
-                .status
-                .code()
-                .map_or_else(|| "by a signal".to_owned(), |code| code.to_string())
+            "`{command}` did not list the step's tests (exit {code}); {} ({kept})",
+            ends_of(&libtest::plain(&standard_error), place.root)
         ));
     }
     read_listing(&String::from_utf8_lossy(&output.stdout), executables, &own)
+}
+
+/// How many of the last lines of a failed listing's standard error the step's error names.
+const ERROR_LINES: usize = 6;
+
+/// How many bytes of those lines the step's error keeps at most.
+const ERROR_BYTES: usize = 800;
+
+/// The end of a failed listing's standard error as the step's error names it: its last
+/// [`ERROR_LINES`] lines that say anything, on one line, the last [`ERROR_BYTES`] bytes of them at
+/// most, with the checkout's path left out of them (a result names none).
+fn ends_of(standard_error: &str, root: &Path) -> String {
+    let lines: Vec<&str> = standard_error
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return "it wrote nothing to its standard error".to_owned();
+    }
+    let mut ends = lines[lines.len().saturating_sub(ERROR_LINES)..].join(" | ");
+    let root = root.to_string_lossy();
+    for spelling in [
+        root.to_string(),
+        root.replace('\\', "/"),
+        root.replace('/', "\\"),
+    ] {
+        if !spelling.is_empty() {
+            ends = ends.replace(&spelling, "<root>");
+        }
+    }
+    if ends.len() > ERROR_BYTES {
+        let mut from = ends.len() - ERROR_BYTES;
+        while !ends.is_char_boundary(from) {
+            from += 1;
+        }
+        ends = format!("...{}", &ends[from..]);
+    }
+    format!("its standard error ends: {ends}")
+}
+
+/// Appends what a failed listing wrote to the step's log, whole: the log is where the next failure
+/// of the same kind is read.
+fn keep_failed_listing(
+    log_path: &Path,
+    what: &str,
+    standard_output: &str,
+    standard_error: &str,
+) -> Result<(), String> {
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|error| format!("{} could not be opened: {error}", log_path.display()))?;
+    write!(
+        log,
+        "== the listing failed: {what}\n== its standard output\n{standard_output}\n\
+         == its standard error\n{standard_error}\n"
+    )
+    .map_err(|error| format!("{} could not be written: {error}", log_path.display()))
 }
 
 /// Reads what a step's listing printed into the tests each binary of the build's listed; `own`

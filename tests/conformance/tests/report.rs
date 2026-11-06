@@ -1320,12 +1320,13 @@ fn a_binary_that_left_no_record_that_can_be_used_is_not_read_from_its_output() {
 }
 
 /// A program to stand where the report's own does as Cargo's runner when a step's tests cannot be
-/// listed: it writes `earlier` lines and then `last` to its standard error, and fails.
+/// listed: it writes `earlier` lines and then `last` (which the shell expands) to its standard
+/// error, and fails.
 #[cfg(unix)]
 fn runner_that_cannot_list(directory: &Path, earlier: usize, last: &str) -> PathBuf {
     let path = directory.join("runner-that-cannot-list");
     let script = format!(
-        "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt {earlier} ]; do\n  echo \"an earlier line $i\" >&2\n  i=$((i + 1))\ndone\necho '{last}' >&2\nexit 3\n"
+        "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt {earlier} ]; do\n  echo \"an earlier line $i\" >&2\n  i=$((i + 1))\ndone\necho \"{last}\" >&2\nexit 3\n"
     );
     kr_ipc::testing::place_script(&path, script);
     path
@@ -1335,7 +1336,13 @@ fn runner_that_cannot_list(directory: &Path, earlier: usize, last: &str) -> Path
 #[test]
 fn a_listing_that_fails_leaves_what_it_said_in_the_log_and_the_end_of_it_in_the_steps_error() {
     let directory = tempfile::tempdir().expect("a directory");
-    let lister = runner_that_cannot_list(directory.path(), 200, "the volume is full");
+    // Cargo gives a test binary's runner the manifest directory of its package, which is inside
+    // the checkout.
+    let lister = runner_that_cannot_list(
+        directory.path(),
+        200,
+        "cannot write in $CARGO_MANIFEST_DIR: the volume is full",
+    );
     let (document, evidence) = run_step_through(
         "forms",
         &["test", "--locked", "--workspace", "--no-fail-fast"],
@@ -1355,20 +1362,22 @@ fn a_listing_that_fails_leaves_what_it_said_in_the_log_and_the_end_of_it_in_the_
     );
     assert!(error.len() < 2_000, "{} bytes: {error}", error.len());
     let log = std::fs::read_to_string(evidence.path().join(&step.log)).expect("the step's log");
-    for expected in [
-        "an earlier line 0",
-        "an earlier line 199",
-        "the volume is full",
-    ] {
+    for expected in ["an earlier line 0", "an earlier line 199"] {
         assert!(
             log.lines().any(|line| line == expected),
             "the log lacks {expected:?}:\n{log}"
         );
     }
+    let root = tree("forms").to_string_lossy().into_owned();
+    assert!(
+        log.lines()
+            .any(|line| line.contains(&root) && line.ends_with("the volume is full")),
+        "the log lacks the last line, with the checkout's path in it:\n{log}"
+    );
     let text = serde_json::to_string(&document).expect("serialises");
     assert!(
-        !text.contains(&*tree("forms").to_string_lossy()),
-        "the result names the checkout's path"
+        !text.contains(&root),
+        "the result names the checkout's path: {error}"
     );
     assert!(!document.passed());
 }
