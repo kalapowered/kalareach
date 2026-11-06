@@ -2032,6 +2032,17 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
+        package: "kr-cli",
+        target: "--test desktop_sign_out_windows",
+        cases: &[
+            "a_desktop_bound_session_is_made_and_the_account_signed_out",
+            "after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost",
+        ],
+        runs: Runs::ByHand {
+            why: "the first signs the account that runs it out, so it runs only where KR_ALLOW_SIGN_OUT=1 says the account is a disposable standard account that a run signs in over remote desktop; the second reads what the first left, in the account's next sign-in",
+        },
+    },
+    IgnoredRun {
         package: "kr-conformance",
         target: "--test applications",
         cases: &[],
