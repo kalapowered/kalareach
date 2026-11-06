@@ -978,11 +978,15 @@ impl Controller {
                 Some(Refusal::SupportSet | Refusal::Invocation) => DoctorStatus::Warning,
             },
             match refusal {
-                None => Sentence::new().stated(
+                None => Sentence::new().stated(if cfg!(target_os = "macos") {
+                    "Git runs for a paired device inside a boundary that confines what it reads: \
+                     the libraries it needs that the system does not supply are named and one \
+                     invocation under the boundary ran here"
+                } else {
                     "Git runs for a paired device inside a boundary that confines what it reads: \
                      the loaders and libraries it needs are named and one invocation under the \
-                     boundary ran here",
-                ),
+                     boundary ran here"
+                }),
                 Some(refusal) => Sentence::new()
                     .stated(refusal.text())
                     .stated(", so a paired device is refused repository operations"),
@@ -1011,12 +1015,14 @@ impl Controller {
         if cfg!(target_os = "macos") {
             // No setting of this host narrows the ways a filesystem can come to be mounted beneath
             // a directory the owner authorised: any program of the account can attach a disk image
-            // or a share to a directory it owns. What the host does is refuse an invocation that
-            // starts over one, and the sentence says what that leaves.
+            // or a share to a directory it owns. That is the state the other platforms' check
+            // reports as a warning, here with no remedy because there is nothing to restrict. What
+            // the host does is refuse an invocation that starts over one, and the sentence says
+            // what that leaves.
             checks.push(DoctorCheck::new(
                 "device-repository-mounts",
                 "What a paired device's repository operations could reach through a mount",
-                DoctorStatus::Ok,
+                DoctorStatus::Warning,
                 Sentence::new().stated(
                     "A disk image, a network share or a user-space volume that a program running \
                      as this account attaches beneath a directory the owner authorised is refused \

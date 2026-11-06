@@ -3,8 +3,8 @@
 //! On Linux such an invocation runs inside one Landlock ruleset with no rule on the whole
 //! filesystem. On macOS it runs inside a sandbox profile that denies by default and names what it
 //! may read. On both it reads the directories the operation owns, the ones it is lent, Git's own
-//! program and helper directory, the device nodes and the support set named for this host's Git,
-//! and nothing else the account can read. Each refusal here sits beside its control: the same
+//! program, the device nodes and the support set named for this host's Git, and on Linux its
+//! helper directory, and nothing else the account can read. Each refusal here sits beside its control: the same
 //! operation on the same objects with exactly one restriction lifted, which reads what the refusal
 //! did not. Where the refusal is the system's, it is shown in the child's own words, as a refusal
 //! to open the object, rather than as an exit code.
@@ -953,7 +953,13 @@ mod confined {
             /// Makes a small image in `scratch` and attaches it at `directory`, or says so and
             /// returns nothing on a host that will not.
             fn at(directory: &Path, scratch: &Path) -> Option<Self> {
-                let image = scratch.join("image.dmg");
+                Self::spelled(directory, directory, scratch)
+            }
+
+            /// Attaches it at `spelled`, which is another name for `directory`, and detaches it
+            /// by `directory`.
+            fn spelled(directory: &Path, spelled: &Path, scratch: &Path) -> Option<Self> {
+                let image = scratch.join(format!("{}.dmg", uuid::Uuid::new_v4().simple()));
                 let made = Command::new("/usr/bin/hdiutil")
                     .args([
                         "create", "-size", "2m", "-fs", "APFS", "-volname", "krreads",
@@ -970,7 +976,7 @@ mod confined {
                 }
                 let attached = Command::new("/usr/bin/hdiutil")
                     .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
-                    .arg(directory)
+                    .arg(spelled)
                     .arg(&image)
                     .output()
                     .ok()?;
@@ -1067,6 +1073,20 @@ mod confined {
                 "the owner's reads open it and Git objects to what it holds: {}",
                 owner.stderr
             );
+            // The control: lent, it is opened by a bounded invocation too, so the refusal above is
+            // the file's own path and not the link `/etc` is.
+            let lent = read_as_configuration(
+                &fixture,
+                &location,
+                hosts,
+                vec![hosts.to_owned()],
+                bounded_reads(&fixture),
+            );
+            assert!(
+                lent.stderr.contains("bad config line") && !lent.stderr.contains(REFUSED),
+                "lent, a bounded invocation opens it: {}",
+                lent.stderr
+            );
         }
 
         /// The same file, reached by its name through the firmlink that presents the data volume
@@ -1099,6 +1119,21 @@ mod confined {
                 bounded_reads(&fixture),
             );
             assert_refused(&confined, "by-the-volume-name", "the data volume's name");
+            // The control: the same file lent by its own name is read by the volume's name too, so
+            // the refusal above is the profile holding the file's own path.
+            let lent = read_as_configuration(
+                &fixture,
+                &location,
+                &through_the_volume,
+                vec![secret],
+                bounded_reads(&fixture),
+            );
+            assert!(
+                lent.stdout.contains("secret.value=by-the-volume-name"),
+                "lent, it is read through the volume's name: {} {}",
+                lent.stdout,
+                lent.stderr
+            );
         }
 
         /// A disk image this account attaches beneath the operation's own location lets Git read
@@ -1144,6 +1179,90 @@ mod confined {
                 .expect("the owner's status starts");
             assert!(owner.success, "the owner's status runs: {}", owner.stderr);
 
+            drop(attached);
+            let after = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect("a bounded status after the image is detached runs");
+            assert!(after.success, "and succeeds: {}", after.stderr);
+        }
+
+        /// A mount reached by another name for the same place is refused as one made at the
+        /// place's own name. A disk image attached beneath a directory outside the location and
+        /// carried into it by moving a directory above the mount point, and one attached through
+        /// the data volume's own name for a path, are both beneath the location when an invocation
+        /// starts, and the mount table gives each the name the profile holds.
+        #[test]
+        fn a_mount_reached_by_another_name_for_the_same_place_is_refused() {
+            let fixture = Fixture::create();
+            let profile = fixture.service().profile();
+            let scratch = tempfile::TempDir::new().expect("a directory for the images");
+            let location = support::ordinary_repository(fixture.work(), "location");
+            let repository = OpenedRepository::open(profile, fixture.environment_id(), &location)
+                .expect("the repository opens");
+            let status: [&OsStr; 2] = [OsStr::new("status"), OsStr::new("--porcelain")];
+            let location = std::fs::canonicalize(&location).expect("the location's own name");
+
+            // The control: a bounded status of the location with nothing attached runs.
+            let before = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect("a bounded status with nothing attached runs");
+            assert!(before.success, "and succeeds: {}", before.stderr);
+
+            // Attached beneath a directory outside the location, which does not affect it, and then
+            // carried inside it by moving the directory above the mount point.
+            let outside = fixture.work().join("outside");
+            let held = outside.join("held");
+            std::fs::create_dir_all(held.join("mounted")).expect("a directory to attach at");
+            let Some(attached) = Attached::at(&held.join("mounted"), scratch.path()) else {
+                return;
+            };
+            let unaffected = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect("a mount outside the location does not stop a bounded status");
+            assert!(unaffected.success, "and it succeeds: {}", unaffected.stderr);
+            std::fs::rename(&held, location.join("held")).expect("the directory moves");
+            let refusal = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect_err("a bounded status over a location with a mount carried into it");
+            let said = refusal.to_string();
+            assert!(
+                said.contains(&format!(
+                    "a filesystem is mounted at {}",
+                    location.join("held").join("mounted").display()
+                )),
+                "the refusal names the mount point by the name it has now: {said}"
+            );
+            // Detaching finds the image where it was attached.
+            std::fs::rename(location.join("held"), &held).expect("the directory moves back");
+            drop(attached);
+            let after = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect("a bounded status after the image is detached runs");
+            assert!(after.success, "and succeeds: {}", after.stderr);
+
+            // Attached through the data volume's name for a path beneath the location.
+            let mounted = location.join("mounted");
+            std::fs::create_dir(&mounted).expect("a directory to attach at");
+            let spelled = Path::new("/System/Volumes/Data").join(
+                mounted
+                    .strip_prefix("/")
+                    .expect("an absolute path has a root"),
+            );
+            if !spelled.is_dir() {
+                println!("not exercised: this host presents no data volume under /System");
+                return;
+            }
+            let Some(attached) = Attached::spelled(&mounted, &spelled, scratch.path()) else {
+                return;
+            };
+            let refusal = profile
+                .run(&repository.read(&status).admitted(bounded()))
+                .expect_err("a bounded status over a location with a mount made by that name");
+            let said = refusal.to_string();
+            assert!(
+                said.contains(&format!("a filesystem is mounted at {}", mounted.display())),
+                "the refusal names the mount point by the name the table gives it: {said}"
+            );
             drop(attached);
             let after = profile
                 .run(&repository.read(&status).admitted(bounded()))

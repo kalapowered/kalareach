@@ -6754,9 +6754,9 @@ async fn host_doctor_says_whether_a_paired_device_is_served_repository_operation
     host.stop().await;
 }
 
-/// KR-REQ-23.42 and KR-REQ-23.43: a macOS host proves the read-confined sandbox profile when it starts, and
-/// `host.doctor` says so and says what the mount check leaves. The cases that need a qualified host
-/// skip one that is not, so this one fails on a Mac that does not qualify.
+/// KR-REQ-23.42 and KR-REQ-23.43: a macOS host proves the read-confined sandbox profile when it
+/// starts, and `host.doctor` says so and says what the mount check leaves. The cases that need a
+/// qualified host skip one that is not, so this one fails on a Mac that does not qualify.
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_macos_host_proves_the_read_confined_profile_and_the_doctor_says_so() {
@@ -6788,7 +6788,18 @@ async fn a_macos_host_proves_the_read_confined_profile_and_the_doctor_says_so() 
         detail.contains("confines what it reads"),
         "the report says why: {detail}"
     );
-    let (_, mounts) = check("device-repository-mounts");
+    let (status, mounts) = check("device-repository-mounts");
+    // Nothing on a Mac narrows what a mount can reach, which is the state another platform's check
+    // reports as a warning; there is no setting to name, so it carries no remedy.
+    assert_eq!(status, DoctorStatus::Warning, "{mounts}");
+    assert!(
+        doctor
+            .checks
+            .iter()
+            .find(|check| check.id() == "device-repository-mounts")
+            .is_some_and(|check| check.remedy().is_none()),
+        "and there is nothing to tell the person to change"
+    );
     assert!(
         mounts.contains("disk image") && mounts.contains("does not close it"),
         "the report names what a Mac leaves open: {mounts}"

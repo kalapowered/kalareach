@@ -4768,7 +4768,8 @@ pub(crate) fn new_uuid() -> Uuid {
 pub enum Refusal {
     /// This platform does not confine what Git reads.
     Platform,
-    /// This host cannot name the loaders and libraries Git needs.
+    /// This host cannot name what Git needs in order to run under the rules for such a caller: on
+    /// Linux the loaders and libraries, on macOS the libraries the system does not supply.
     SupportSet,
     /// An invocation of Git under the rules for such a caller did not run here. On Linux: the
     /// kernel has no Landlock at the version the rules need, the machine is one this host holds no
@@ -4786,8 +4787,13 @@ impl Refusal {
         match self {
             Self::Platform => "this platform does not confine what Git reads",
             Self::SupportSet => {
-                "this host cannot name the loaders and libraries its Git needs, so it cannot name \
-                 the files an invocation for such a caller may read"
+                if cfg!(target_os = "macos") {
+                    "this host cannot name the libraries its Git needs, so it cannot name the \
+                     files an invocation for such a caller may read"
+                } else {
+                    "this host cannot name the loaders and libraries its Git needs, so it cannot \
+                     name the files an invocation for such a caller may read"
+                }
             }
             Self::Invocation => {
                 if cfg!(target_os = "macos") {
