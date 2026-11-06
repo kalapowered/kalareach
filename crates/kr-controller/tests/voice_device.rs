@@ -402,10 +402,10 @@ async fn a_phone_is_paired_and_runs_a_call_against_a_real_host() {
             stand_in.go_down();
             went_down = true;
         }
-        if let Some(peer) = &audio {
-            if relay.lock().expect("the relay's log").answered > 0 {
-                figures.push(read_figures(peer, started).await);
-            }
+        if let Some(peer) = &audio
+            && relay.lock().expect("the relay's log").answered > 0
+        {
+            figures.push(read_figures(peer, started).await);
         }
         tokio::time::sleep(Duration::from_millis(750)).await;
     }

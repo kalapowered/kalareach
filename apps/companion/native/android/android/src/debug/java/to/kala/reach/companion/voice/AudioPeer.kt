@@ -48,6 +48,14 @@ internal class AudioPeer private constructor(context: Context, private val token
     private val errors = CopyOnWriteArrayList<String>()
     private var phase = 0.0
 
+    init {
+        // The library is initialised before any factory is made, as the call does for its own.
+        PeerConnectionFactory.initialize(
+            PeerConnectionFactory.InitializationOptions.builder(context.applicationContext)
+                .createInitializationOptions(),
+        )
+    }
+
     private val module: JavaAudioDeviceModule =
         JavaAudioDeviceModule.builder(context)
             .setAudioRecordErrorCallback(
@@ -270,30 +278,33 @@ internal class AudioPeer private constructor(context: Context, private val token
         private const val TONE_PEAK = 9_000.0
         private const val DESCRIPTION_SECONDS = 30L
 
-        @Volatile
-        private var running: AudioPeer? = null
+        private var started = false
 
-        /** Starts the peer when the run asked for one: `kr-probe/peer.json` holds a port and a token. */
+        /**
+         * Starts the peer when the run asked for one: `kr-probe/peer.json` holds a port and a token.
+         * It starts on a thread of its own and never takes the application down: a peer that cannot
+         * start leaves the run's checks to report that the call had none.
+         */
         @Synchronized
         fun startIfRequested(context: Context) {
-            if (running != null) return
+            if (started) return
+            started = true
             val file = File(context.dataDir, "kr-probe/peer.json")
             val request = try {
                 JSONObject(file.readText())
             } catch (_: Exception) {
                 return
             }
-            val peer = AudioPeer(context.applicationContext, request.getString("token"))
-            val listener = ServerSocket(request.getInt("port"), 8, InetAddress.getByName("127.0.0.1"))
-            running = peer
             Thread({
-                while (true) {
-                    val socket = try {
-                        listener.accept()
-                    } catch (_: Exception) {
-                        return@Thread
+                try {
+                    val peer = AudioPeer(context.applicationContext, request.getString("token"))
+                    val listener = ServerSocket(request.getInt("port"), 8, InetAddress.getByName("127.0.0.1"))
+                    while (true) {
+                        val socket = listener.accept()
+                        Thread({ peer.serve(socket) }, "kr-peer-connection").start()
                     }
-                    Thread({ peer.serve(socket) }, "kr-peer-connection").start()
+                } catch (failure: Exception) {
+                    android.util.Log.w("KalaReachPeer", "the device run's peer stopped: $failure")
                 }
             }, "kr-peer-server").start()
         }

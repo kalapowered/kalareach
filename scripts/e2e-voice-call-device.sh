@@ -466,7 +466,8 @@ run_android() {
     printf '%s\n' "$text" >"$artefacts/$result_name"
     # What the application said while it ran, kept for a run that wrote no result.
     if [ -n "$pid" ]; then
-        "$adb" -s "$serial" logcat -d --pid="$pid" 2>/dev/null | tail -300 >"$artefacts/logcat.log"
+        "$adb" -s "$serial" logcat -d --pid="$pid" 2>/dev/null \
+            | grep -v -E 'avc: |AssetManager|HWUI|vulkan|glBind|Tauri/Plugin' | tail -1500 >"$artefacts/logcat.log"
     else
         "$adb" -s "$serial" logcat -d 2>/dev/null | tail -300 >"$artefacts/logcat.log"
     fi

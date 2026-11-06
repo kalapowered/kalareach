@@ -424,10 +424,20 @@ async fn start<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> Optio
     };
     let made = &started["value"]["outcome"]["started"]["session"];
     let id = made["voice_session_id"].as_str().map(str::to_owned);
+    let started_ok = id.is_some() && made["answer_sdp"] == "";
     checks.push(Check::found(
         "the host started the call",
-        id.is_some() && made["answer_sdp"] == "",
-        "the host made the call and kept the provider's answer from the page",
+        started_ok,
+        if started_ok {
+            "the host made the call and kept the provider's answer from the page".to_owned()
+        } else {
+            // What the host answered, without the provider's answer or any credential.
+            let mut outcome = started["value"]["outcome"].clone();
+            if let Some(session) = outcome.pointer_mut("/started/session") {
+                session["answer_sdp"] = Value::Null;
+            }
+            format!("the host's outcome was {outcome}")
+        },
     ));
     id
 }
