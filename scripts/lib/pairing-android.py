@@ -790,6 +790,11 @@ def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
     (13.01): the inbox of the host in use says that host refused to show its inbox, in the host's own
     words and without calling it lost, beside what the host in use holds. Nothing before the refusal
     says it did: the guest is served an empty inbox, and the host chooses to refuse after."""
+    # The picker case took the camera's permission away for good. A person who scans a second host
+    # allows it again, in the system's settings.
+    camera = "android.permission.CAMERA"
+    phone.run("shell", "pm", "clear-permission-flags", APP, camera, "user-fixed", "user-set")
+    phone.run("shell", "pm", "grant", APP, camera)
     start_on(phone, "Hosts")
     phone.wait(lambda each: each == "Pair with a host", "the pairing screen")
     touch(directory, "go-second")
