@@ -13,8 +13,12 @@
 //! returned, with the bytes spelled so that a person can read them: printable ASCII as itself, a
 //! backslash doubled, and every other byte as `\xNN`.
 //!
-//! The pseudo-console is the stand-in for a terminal that the worker is to the programs of a
-//! session: it answers the console's one question (where the cursor is) and nothing else.
+//! The pseudo-console is the terminal library's (portable-pty 0.9.0), opened with the three flags
+//! that library sets: inherit the cursor, the resize quirk and win32 input mode. It inherits the
+//! cursor, so it asks where the cursor is when it starts, and a thread answers that one question
+//! and nothing else. The worker opens the console of a session with no flags, so its console asks
+//! no such question and is not asked for win32 input mode by a flag; what the program inside sends
+//! into either console is the program's own.
 
 #![cfg(windows)]
 
@@ -185,6 +189,9 @@ fn write_recording(name: &str, command: &str, marker: &str, recorded: &Recorded)
     text.push_str(&format!("# command: {command}\n"));
     text.push_str(&format!("# marker: {marker}\n"));
     text.push_str(&format!("# windows: {}\n", windows_build()));
+    text.push_str(
+        "# console: portable-pty 0.9.0, flags: inherit cursor, resize quirk, win32 input mode\n",
+    );
     text.push_str(&format!("# exit: {:?}\n", recorded.exit));
     for chunk in &recorded.chunks {
         text.push_str(&format!("chunk {}\n", spelled(chunk)));
@@ -220,6 +227,7 @@ fn assert_the_source_ran(name: &str, marker: &str, recorded: &Recorded) {
 /// It opens a pseudo-console of its own, runs a command in it, and writes what that produced to its
 /// own output, which is the outer pseudo-console's input from the program.
 #[test]
+#[ignore = records!()]
 fn the_pseudo_console_inside_the_pseudo_console() {
     if std::env::var_os(INNER_VARIABLE).is_none() {
         return;
@@ -253,6 +261,7 @@ fn record_a_plain_program_and_a_nested_pseudo_console() {
 
     let mut nested = CommandBuilder::new(std::env::current_exe().expect("this test binary"));
     nested.args([
+        "--ignored",
         "--exact",
         "the_pseudo_console_inside_the_pseudo_console",
         "--nocapture",
@@ -342,7 +351,15 @@ fn is_in_administrators() -> bool {
         .args(["/groups", "/fo", "csv", "/nh"])
         .output()
         .expect("whoami runs");
-    String::from_utf8_lossy(&output.stdout).contains("S-1-5-32-544")
+    assert!(output.status.success(), "whoami /groups failed");
+    let listing = String::from_utf8_lossy(&output.stdout);
+    // Every account's listing names the integrity level it runs at, so a listing without one is not
+    // one, and an account is not taken for a standard one on the strength of an answer that is empty.
+    assert!(
+        listing.contains("Mandatory Label"),
+        "whoami /groups listed no integrity level: {listing:?}"
+    );
+    listing.contains("S-1-5-32-544")
 }
 
 /// Runs a program of the system directory and fails when it does not succeed.

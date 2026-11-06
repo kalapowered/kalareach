@@ -4,6 +4,7 @@
 # command: cmd.exe /c echo kr-capture-plain
 # marker: kr-capture-plain
 # windows: Microsoft Windows [Version 10.0.26100.33438]
+# console: portable-pty 0.9.0, flags: inherit cursor, resize quirk, win32 input mode
 # exit: Some(0)
 chunk \x1b[6n
 chunk \x1b[?9001h\x1b[?1004h
