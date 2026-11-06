@@ -561,6 +561,18 @@ async fn the_copy_of_a_second_mutation_behind(
             break refused;
         }
     };
+    // The second mutation has claimed no route, so what told the copy is what the daemon holds of
+    // the call and not a route, which only the daemon's own wait for the stopped mutation would
+    // give it.
+    assert!(
+        rig.host
+            .controller()
+            .devices()
+            .action_route(&record.principal(), behind)
+            .expect("the routes are readable")
+            .is_none(),
+        "the second mutation had claimed its route when the copy was refused"
+    );
     (told, held, other)
 }
 

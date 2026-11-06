@@ -23,9 +23,10 @@ async fn a_repeated_request_to_end_exclusive_management_is_answered_as_a_copy_of
         .update_policy(|policy| policy.set_exclusively_managed(true))
         .expect("the host is made exclusively organisation-managed");
     let door = Door::open(&temp, &controller).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
     let request = door.mutation(
         Method::OwnerConfirmationRequest,
-        ActionId::new(kr_ipc::new_uuid()),
+        action,
         30_000,
         &OwnerConfirmationRequestParams {
             subject: ConfirmationSubject::SetExclusiveManagement { exclusive: false },
@@ -61,5 +62,35 @@ async fn a_repeated_request_to_end_exclusive_management_is_answered_as_a_copy_of
         again.into_answer().expect("the repeat is answered"),
         first,
         "with the challenge the first was given"
+    );
+
+    // The identifier reused for another request is this host's word about the identifier, and no
+    // copy of the record.
+    let other = door.mutation(
+        Method::OwnerConfirmationRequest,
+        action,
+        30_000,
+        &OwnerConfirmationRequestParams {
+            subject: ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+        },
+    );
+    let reused = controller
+        .pairing_write(
+            Caller::local(door.actor_id().clone()),
+            Method::OwnerConfirmationRequest,
+            &other,
+            controller.pairing_admission(door.connection_id(), revision, deadline),
+            controller.pairing_guard(door.connection_id(), revision, deadline),
+            controller.pairing_life(deadline),
+        )
+        .await;
+    assert!(
+        !reused.is_copied(),
+        "a reused identifier is not answered from the record of the first"
+    );
+    let refused = reused.into_answer().expect_err("the reuse is refused");
+    assert_eq!(
+        refused.to_protocol_error().code,
+        kr_protocol::error::ErrorCode::IdConflict
     );
 }
