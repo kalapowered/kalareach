@@ -13,7 +13,7 @@
 //! not the one it was opened by, and because Git and the libraries it loads open further modules
 //! from the same directory while they run.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use object::macho;
 use object::read::macho::{FatArch as _, LoadCommandVariant, MachHeader as _};
-use object::{Architecture, Endianness, FileKind};
+use object::{Endianness, FileKind};
 
 use crate::error::{ProjectError, Result};
 
@@ -70,6 +70,7 @@ struct Image {
 }
 
 /// What one image names.
+#[derive(Clone)]
 struct Named {
     /// Each library it loads, and whether the loader may go on without it.
     libraries: Vec<(PathBuf, bool)>,
@@ -80,8 +81,13 @@ struct Named {
 /// Names the directories of the libraries the programs given, and every program in Git's helper
 /// directory, load and the system does not supply, each resolved to the directory it is.
 ///
-/// A file that is not a program, such as a script, names nothing and is passed over. One object
-/// reached by several names is read once.
+/// Each program is followed on its own, from where the loader would start it: what `@rpath`
+/// entries and `@executable_path` mean to a library depends on the program that loaded it, so two
+/// programs that load one library each get the dependencies that library has for them. A file that
+/// is not a program, such as a script, names nothing and is passed over. A program reached through
+/// links is the file they lead to, which is what the loader names it by; one reached by another
+/// name that is not a link is a program of its own, and each file is read once however often it
+/// is reached.
 ///
 /// # Errors
 ///
@@ -99,8 +105,8 @@ pub fn support_set(programs: &[&Path], helper_directory: &Path) -> Result<Vec<Pa
         let entry = entry.map_err(|error| unnamed(helper_directory, &error))?;
         candidates.push((entry.path(), false));
     }
+    let mut reader = Reader::default();
     let mut seen = HashSet::new();
-    let mut loaded = HashSet::new();
     let mut directories = BTreeSet::new();
     for (candidate, required) in &candidates {
         let metadata = match std::fs::metadata(candidate) {
@@ -109,18 +115,23 @@ pub fn support_set(programs: &[&Path], helper_directory: &Path) -> Result<Vec<Pa
             Err(_) if !required => continue,
             Err(error) => return Err(unnamed(candidate, &error)),
         };
-        if !metadata.is_file() || !seen.insert((metadata.dev(), metadata.ino())) {
+        if !metadata.is_file() {
             continue;
         }
         let file = std::fs::canonicalize(candidate).map_err(|error| unnamed(candidate, &error))?;
+        if !seen.insert(file.clone()) {
+            continue;
+        }
         let executable_directory = file.parent().unwrap_or(&file).to_owned();
+        // A library is loaded once for a program, by the first image that names it.
+        let mut loaded = HashSet::new();
         let mut pending = vec![Image {
             file,
             executable_directory,
             inherited: Vec::new(),
         }];
         while let Some(image) = pending.pop() {
-            let Some(named) = read(&image.file)? else {
+            let Some(named) = reader.named(&image.file)? else {
                 continue;
             };
             let own: Vec<PathBuf> = named
@@ -161,6 +172,25 @@ pub fn support_set(programs: &[&Path], helper_directory: &Path) -> Result<Vec<Pa
     Ok(directories.into_iter().collect())
 }
 
+/// What each object names, read once however many programs load it: the libraries and `@rpath`
+/// entries of a file are the file's own, and only what they lead to depends on who loads it.
+#[derive(Default)]
+struct Reader(HashMap<(u64, u64), Option<Named>>);
+
+impl Reader {
+    /// Returns what the file names, or nothing for a file that is not a program or a library.
+    fn named(&mut self, file: &Path) -> Result<Option<Named>> {
+        let metadata = std::fs::metadata(file).map_err(|error| unnamed(file, &error))?;
+        let key = (metadata.dev(), metadata.ino());
+        if let Some(named) = self.0.get(&key) {
+            return Ok(named.clone());
+        }
+        let named = read(file)?;
+        self.0.insert(key, named.clone());
+        Ok(named)
+    }
+}
+
 /// What the loader finds for one name.
 enum Found {
     /// The system supplies it from its shared cache.
@@ -187,9 +217,15 @@ fn find(name: &Path, image: &Image, search: &[PathBuf]) -> Option<Found> {
     } else {
         Vec::new()
     };
+    // A name under a system path is in the shared cache or it is not there at all, and what is in
+    // the cache is not known here. So the search goes on past it: a later candidate that is a file
+    // is granted, and the system supplies the name only when no later one is. When the cache did
+    // hold the name, the extra directory this grants is one the program's own search path names.
+    let mut system = false;
     for candidate in candidates {
         if supplied_by_the_system(&candidate) {
-            return Some(Found::System);
+            system = true;
+            continue;
         }
         if let Ok(resolved) = std::fs::canonicalize(&candidate)
             && resolved.is_file()
@@ -197,7 +233,7 @@ fn find(name: &Path, image: &Image, search: &[PathBuf]) -> Option<Found> {
             return Some(Found::File(resolved));
         }
     }
-    None
+    system.then_some(Found::System)
 }
 
 /// Returns whether a path is one the system supplies its libraries from.
@@ -228,7 +264,9 @@ fn expand(rpath: &Path, image: &Image) -> Option<PathBuf> {
 
 /// Reads the load commands of one file, or nothing for a file that is not a program or a library.
 ///
-/// A universal file is read at the slice for the machine this host runs on.
+/// A universal file is read at the slice for the machine this host runs on, and a file of one
+/// architecture is read only when it is that one: a program of another, which the system could run
+/// under translation, loads the libraries of its own architecture, and this host reads no others.
 fn read(file: &Path) -> Result<Option<Named>> {
     let data = std::fs::read(file).map_err(|error| unnamed(file, &error))?;
     let unread = |why: &str| ProjectError::GitFailed {
@@ -247,7 +285,7 @@ fn read(file: &Path) -> Result<Option<Named>> {
             let arch = fat
                 .arches()
                 .iter()
-                .find(|arch| arch.architecture() == this_machine())
+                .find(|arch| arch.cputype() == this_machine())
                 .ok_or_else(|| unread("a universal file with nothing for this machine"))?;
             arch.data(data.as_slice())
                 .map_err(|_| unread("a universal file whose slice this host cannot read"))?
@@ -258,7 +296,7 @@ fn read(file: &Path) -> Result<Option<Named>> {
             let arch = fat
                 .arches()
                 .iter()
-                .find(|arch| arch.architecture() == this_machine())
+                .find(|arch| arch.cputype() == this_machine())
                 .ok_or_else(|| unread("a universal file with nothing for this machine"))?;
             arch.data(data.as_slice())
                 .map_err(|_| unread("a universal file whose slice this host cannot read"))?
@@ -272,6 +310,11 @@ fn read(file: &Path) -> Result<Option<Named>> {
     let endian = header
         .endian()
         .map_err(|_| unread("a program whose headers this host cannot read"))?;
+    if header.cputype(endian) != this_machine() {
+        return Err(unread(
+            "a program built for another kind of machine than this one",
+        ));
+    }
     let mut commands = header
         .load_commands(endian, slice, 0)
         .map_err(|_| unread("a program whose load commands this host cannot read"))?;
@@ -291,10 +334,16 @@ fn read(file: &Path) -> Result<Option<Named>> {
                 let name = command
                     .string(endian, dylib.dylib.name)
                     .map_err(|_| unread("a program that names a library this host cannot read"))?;
-                named.libraries.push((
-                    PathBuf::from(OsStr::from_bytes(name)),
-                    command.cmd() == macho::LC_LOAD_WEAK_DYLIB,
-                ));
+                // Linked weakly either by the command that says so or by the flag the newer
+                // encoding of a load command carries.
+                let flags = command
+                    .dylib_use_flags(endian, dylib)
+                    .map_err(|_| unread("a program that names a library this host cannot read"))?;
+                let weak = command.cmd() == macho::LC_LOAD_WEAK_DYLIB
+                    || flags.is_some_and(|flags| flags & macho::DYLIB_USE_WEAK_LINK != 0);
+                named
+                    .libraries
+                    .push((PathBuf::from(OsStr::from_bytes(name)), weak));
             }
             LoadCommandVariant::Rpath(rpath) => {
                 let path = command
@@ -308,12 +357,12 @@ fn read(file: &Path) -> Result<Option<Named>> {
     Ok(Some(named))
 }
 
-/// Returns the architecture of the machine this host runs on.
-fn this_machine() -> Architecture {
+/// Returns the processor type of the machine this host runs on, as a file names it.
+fn this_machine() -> u32 {
     if cfg!(target_arch = "aarch64") {
-        Architecture::Aarch64
+        macho::CPU_TYPE_ARM64
     } else {
-        Architecture::X86_64
+        macho::CPU_TYPE_X86_64
     }
 }
 
@@ -336,8 +385,15 @@ fn library_directory(library: &Path, named: &Path) -> Result<PathBuf> {
 }
 
 /// Returns whether a support object lies in, or holds, a tree no support object may, or holds a
-/// tree a support directory may only lie in.
+/// tree a support directory may only lie in, or is the top of one: a directory directly in such a
+/// tree is a person's home, a volume, a package prefix or a bundle, and holds a great deal besides
+/// libraries.
 fn broad(object: &Path) -> bool {
+    let directly_in = |trees: &[&str]| {
+        object
+            .parent()
+            .is_some_and(|parent| trees.iter().any(|tree| parent == Path::new(tree)))
+    };
     NEVER_SUPPORT
         .iter()
         .map(Path::new)
@@ -346,6 +402,12 @@ fn broad(object: &Path) -> bool {
             .iter()
             .map(Path::new)
             .any(|tree| tree.starts_with(object))
+        || directly_in(NEVER_OVER)
+        // What a person keeps at the top of a home: the documents, the keychains, the library.
+        || object
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|homes| homes == Path::new("/Users"))
 }
 
 /// Returns the name a library is loaded by, as a message repeats it.
@@ -384,14 +446,28 @@ mod tests {
             "/private/tmp/kr-1",
             "/private/etc",
             "/dev",
+            // A person's home, what is kept at the top of it, the shared directory and the top of
+            // a volume or of a package prefix hold more than a library.
+            "/Users/someone",
+            "/Users/someone/Library",
+            "/Users/someone/Documents",
+            "/Users/Shared",
+            "/Volumes/Tools",
+            "/opt/homebrew",
+            "/usr/local",
+            "/Applications/Tool.app",
         ] {
             assert!(broad(Path::new(broad_path)), "{broad_path} is broad");
         }
         for fine in [
             "/opt/homebrew/Cellar/gettext/1.0/lib",
+            "/opt/homebrew/lib",
             "/usr/local/Cellar/pcre2/10.4/lib",
+            "/usr/local/lib",
             "/Users/someone/.local/git/lib",
+            "/Users/someone/tools/lib",
             "/Library/Developer/CommandLineTools/usr/lib",
+            "/Applications/Xcode.app/Contents/Developer/usr/lib",
             "/Volumes/Tools/git/lib",
         ] {
             assert!(
@@ -399,5 +475,32 @@ mod tests {
                 "{fine} is a directory of libraries"
             );
         }
+    }
+
+    #[test]
+    fn a_name_under_a_system_path_that_is_not_there_does_not_stop_the_search() {
+        let root = tempfile::TempDir::new().expect("a directory");
+        let own = std::fs::canonicalize(root.path()).expect("the directory's own name");
+        std::fs::write(own.join("libkr.dylib"), "").expect("a library");
+        let image = Image {
+            file: own.join("program"),
+            executable_directory: own.clone(),
+            inherited: Vec::new(),
+        };
+        let name = Path::new("@rpath/libkr.dylib");
+        let missing = PathBuf::from("/usr/lib/kr-no-such-directory");
+
+        let found = find(name, &image, &[missing.clone(), own.clone()]);
+        assert!(
+            matches!(&found, Some(Found::File(file)) if *file == own.join("libkr.dylib")),
+            "the library after the system path is found"
+        );
+        // The controls: with no other candidate the system supplies the name, and with none at
+        // all it is not found.
+        assert!(matches!(
+            find(name, &image, std::slice::from_ref(&missing)),
+            Some(Found::System)
+        ));
+        assert!(find(name, &image, &[]).is_none());
     }
 }

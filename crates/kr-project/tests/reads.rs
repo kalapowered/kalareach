@@ -1257,6 +1257,66 @@ mod confined {
             );
         }
 
+        /// A helper that is a link to a program is the program the link leads to: its libraries
+        /// that are named relative to the program are read where the program is, which is where the
+        /// loader looks for them when the link is run. The link is deeper in the tree than the
+        /// program, so the two names for the program's own directory differ.
+        #[test]
+        fn a_helper_that_is_a_link_to_a_program_is_read_and_run_where_the_link_leads() {
+            let fixture = Fixture::create();
+            let Some(built) = Built::under(Path::new(env!("CARGO_TARGET_TMPDIR"))) else {
+                return;
+            };
+            let helpers = built.root.join("far").join("away");
+            std::fs::create_dir_all(&helpers).expect("a helper directory");
+            let link = helpers.join("probe");
+            std::os::unix::fs::symlink("../../bin/probe", &link).expect("a link to the program");
+            let named = kr_project::boundary::support_set(&[], &helpers)
+                .expect("the set of a helper that is a link is named");
+            assert_eq!(
+                named.libraries(),
+                built.library_directories,
+                "the libraries are those of the program the link leads to"
+            );
+
+            let location = fixture.work().join("location");
+            std::fs::create_dir_all(&location).expect("a location");
+            let run = |reads: Reads| {
+                run_enclosed(
+                    &fixture,
+                    &location,
+                    Enclosed {
+                        program: Path::new("/bin/bash"),
+                        arguments: vec![OsString::from("-c"), link.as_os_str().to_owned()],
+                        // The program the link leads to is on the execution list, as Git's own
+                        // helpers that are links to Git are.
+                        helpers: vec![built.program.clone()],
+                        readable: Vec::new(),
+                        reads,
+                        exec_path: Some(helpers.clone()),
+                    },
+                )
+            };
+            let ran = run(Reads::Bounded(std::sync::Arc::new(named)));
+            assert_eq!(
+                ran.status,
+                Some(0),
+                "the link runs under its set: {}",
+                ran.stderr
+            );
+            let without = run(bounded_reads(&fixture));
+            assert_ne!(
+                without.status,
+                Some(0),
+                "and does not run under a set that lacks its libraries"
+            );
+            assert!(
+                without.stderr.contains("Library not loaded"),
+                "the loader could not open the first of them: {}",
+                without.stderr
+            );
+        }
+
         /// The compiler, when the developer tools are installed. The system's `clang` is a
         /// stand-in that offers to install them when they are not, so it is asked for only after
         /// `xcode-select` has said they are.
@@ -1565,6 +1625,276 @@ mod confined {
             assert!(
                 refusal.to_string().contains("libkrprobe.dylib"),
                 "the refusal names it: {refusal}"
+            );
+        }
+
+        /// Mach-O files written by hand, to name libraries and kinds of command a compiler on this
+        /// host would not make. The support set is read from the load commands and not from what a
+        /// file would do, so a file with nothing to run in it is enough.
+        mod crafted {
+            /// The processor type of this machine, and of the other one a Mac is shipped with.
+            pub const THIS: u32 = if cfg!(target_arch = "aarch64") {
+                0x0100_000c
+            } else {
+                0x0100_0007
+            };
+            pub const OTHER: u32 = if cfg!(target_arch = "aarch64") {
+                0x0100_0007
+            } else {
+                0x0100_000c
+            };
+            /// The command that names a library, and the one that names it as one the loader may
+            /// go without.
+            pub const LOAD: u32 = 0x0c;
+            pub const LOAD_WEAK: u32 = 0x8000_0018;
+
+            fn little(words: &[u32]) -> Vec<u8> {
+                words.iter().flat_map(|word| word.to_le_bytes()).collect()
+            }
+
+            /// A command naming a library. With flags it is written in the newer form, which
+            /// carries what kind of link it is in a flag and not in the command.
+            pub fn library(command: u32, name: &str, flags: Option<u32>) -> Vec<u8> {
+                let offset: u32 = if flags.is_some() { 28 } else { 24 };
+                let mut path = name.as_bytes().to_vec();
+                path.push(0);
+                let size = (offset as usize + path.len()).next_multiple_of(8);
+                let marker = if flags.is_some() { 0x1a74_1800 } else { 2 };
+                let mut bytes = little(&[
+                    command,
+                    u32::try_from(size).expect("a small command"),
+                    offset,
+                    marker,
+                    0x0001_0000,
+                    0x0001_0000,
+                ]);
+                if let Some(flags) = flags {
+                    bytes.extend(little(&[flags]));
+                }
+                bytes.extend(path);
+                bytes.resize(size, 0);
+                bytes
+            }
+
+            /// A file of one processor type with these load commands.
+            pub fn thin(cputype: u32, commands: &[Vec<u8>]) -> Vec<u8> {
+                let size: usize = commands.iter().map(Vec::len).sum();
+                let mut bytes = little(&[
+                    0xfeed_facf,
+                    cputype,
+                    0,
+                    2,
+                    u32::try_from(commands.len()).expect("a few commands"),
+                    u32::try_from(size).expect("a small file"),
+                    0,
+                    0,
+                ]);
+                for command in commands {
+                    bytes.extend(command);
+                }
+                bytes
+            }
+
+            /// A universal file holding these slices, one for each processor type.
+            pub fn fat(slices: &[(u32, Vec<u8>)]) -> Vec<u8> {
+                let mut offsets = Vec::new();
+                let mut next = (8 + 20 * slices.len()).next_multiple_of(16);
+                for (_, slice) in slices {
+                    offsets.push(next);
+                    next = (next + slice.len()).next_multiple_of(16);
+                }
+                let big = |word: usize| u32::try_from(word).expect("a small file").to_be_bytes();
+                let mut bytes = Vec::new();
+                bytes.extend(0xcafe_babe_u32.to_be_bytes());
+                bytes.extend(big(slices.len()));
+                for ((cputype, slice), offset) in slices.iter().zip(&offsets) {
+                    bytes.extend(cputype.to_be_bytes());
+                    bytes.extend(big(0));
+                    bytes.extend(big(*offset));
+                    bytes.extend(big(slice.len()));
+                    bytes.extend(big(4));
+                }
+                for ((_, slice), offset) in slices.iter().zip(&offsets) {
+                    bytes.resize(*offset, 0);
+                    bytes.extend(slice);
+                }
+                bytes
+            }
+        }
+
+        /// A directory to write files in, whose own name is a directory that may be granted.
+        fn scratch() -> (tempfile::TempDir, PathBuf) {
+            let directory = tempfile::Builder::new()
+                .prefix("kr-reads-")
+                .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+                .expect("a directory to write in");
+            let root = std::fs::canonicalize(directory.path()).expect("the directory's own name");
+            (directory, root)
+        }
+
+        /// A library linked weakly is one the loader goes without, whichever way the command that
+        /// names it says so, and one that is not linked weakly and is not there refuses the set.
+        #[test]
+        fn a_library_linked_weakly_by_either_command_may_be_missing_and_another_may_not() {
+            let (_directory, root) = scratch();
+            let helpers = root.join("helpers");
+            std::fs::create_dir(&helpers).expect("an empty helper directory");
+            let gone = "/kr-reads-missing/libgone.dylib";
+            let named = |command: Vec<u8>| {
+                let program = root.join("program");
+                std::fs::write(&program, crafted::thin(crafted::THIS, &[command]))
+                    .expect("a program");
+                kr_project::boundary::support_set(&[program.as_path()], &helpers)
+            };
+            for (how, command) in [
+                (
+                    "by the weak command",
+                    crafted::library(crafted::LOAD_WEAK, gone, None),
+                ),
+                (
+                    "by the flag of the newer form",
+                    crafted::library(crafted::LOAD, gone, Some(1)),
+                ),
+            ] {
+                let set = named(command).unwrap_or_else(|error| {
+                    panic!("a library linked weakly {how} may be missing: {error}")
+                });
+                assert!(set.libraries().is_empty(), "{how}");
+            }
+            for (how, command) in [
+                (
+                    "in the older form",
+                    crafted::library(crafted::LOAD, gone, None),
+                ),
+                (
+                    "in the newer form with no flag",
+                    crafted::library(crafted::LOAD, gone, Some(0)),
+                ),
+            ] {
+                let refusal = named(command)
+                    .expect_err("a library that is required and is not there refuses the set");
+                assert!(
+                    refusal.to_string().contains("libgone.dylib"),
+                    "the refusal names it, {how}: {refusal}"
+                );
+            }
+        }
+
+        /// A program of another kind of machine than this one loads libraries of that kind, which
+        /// this host does not read, so it refuses the set rather than naming the wrong ones. A
+        /// universal file is read at the slice for this machine, whichever slice comes first.
+        #[test]
+        fn a_program_of_another_kind_of_machine_is_refused_and_a_universal_one_is_read_at_this_machines_slice()
+         {
+            let (_directory, root) = scratch();
+            let helpers = root.join("helpers");
+            std::fs::create_dir(&helpers).expect("an empty helper directory");
+            let named = |name: &str, bytes: Vec<u8>| {
+                let program = root.join(name);
+                std::fs::write(&program, bytes).expect("a program");
+                kr_project::boundary::support_set(&[program.as_path()], &helpers)
+            };
+            let refusal = named("foreign", crafted::thin(crafted::OTHER, &[]))
+                .expect_err("a program of another kind of machine is refused");
+            assert!(
+                refusal.to_string().contains("another kind of machine"),
+                "and the refusal says so: {refusal}"
+            );
+
+            let wants = |processor, library: &str| {
+                (
+                    processor,
+                    crafted::thin(processor, &[crafted::library(crafted::LOAD, library, None)]),
+                )
+            };
+            let refusal = named(
+                "universal",
+                crafted::fat(&[
+                    wants(crafted::OTHER, "/kr-reads-missing/libother.dylib"),
+                    wants(crafted::THIS, "/kr-reads-missing/libthis.dylib"),
+                ]),
+            )
+            .expect_err("the library of this machine's slice is not there");
+            let said = refusal.to_string();
+            assert!(
+                said.contains("libthis.dylib") && !said.contains("libother.dylib"),
+                "the refusal names this machine's slice's library and not the other's: {said}"
+            );
+            // The control: with nothing named in this machine's slice, the library the other
+            // slice names, which is not there, does not matter.
+            let set = named(
+                "quiet",
+                crafted::fat(&[
+                    wants(crafted::OTHER, "/kr-reads-missing/libother.dylib"),
+                    (crafted::THIS, crafted::thin(crafted::THIS, &[])),
+                ]),
+            )
+            .expect("the set is named from this machine's slice alone");
+            assert!(set.libraries().is_empty());
+        }
+
+        /// Each program is followed on its own: two that load one library are each given the
+        /// directory that library's `@executable_path` name leads to for them.
+        #[test]
+        fn two_programs_that_load_one_library_are_each_given_what_it_names_for_them() {
+            let (_directory, root) = scratch();
+            let helpers = root.join("helpers");
+            std::fs::create_dir(&helpers).expect("an empty helper directory");
+            let shared = root.join("shared");
+            std::fs::create_dir(&shared).expect("the shared library's directory");
+            let library = shared.join("libshared.dylib");
+            std::fs::write(
+                &library,
+                crafted::thin(
+                    crafted::THIS,
+                    &[crafted::library(
+                        crafted::LOAD,
+                        "@executable_path/../dep/libdep.dylib",
+                        None,
+                    )],
+                ),
+            )
+            .expect("a library that names another relative to the program");
+            let program = |name: &str| {
+                let directory = root.join(name);
+                std::fs::create_dir_all(directory.join("bin")).expect("a program directory");
+                std::fs::create_dir_all(directory.join("dep")).expect("a dependency directory");
+                std::fs::write(directory.join("dep").join("libdep.dylib"), "").expect("a library");
+                let path = directory.join("bin").join("program");
+                std::fs::write(
+                    &path,
+                    crafted::thin(
+                        crafted::THIS,
+                        &[crafted::library(
+                            crafted::LOAD,
+                            &library.display().to_string(),
+                            None,
+                        )],
+                    ),
+                )
+                .expect("a program");
+                path
+            };
+            let (one, two) = (program("one"), program("two"));
+            let named = |programs: &[&Path]| {
+                kr_project::boundary::support_set(programs, &helpers)
+                    .expect("the set is named")
+                    .libraries()
+                    .to_vec()
+            };
+            assert_eq!(
+                named(&[&one]),
+                [root.join("one").join("dep"), shared.clone()],
+                "one program alone is given its own dependency directory"
+            );
+            assert_eq!(
+                named(&[&one, &two]),
+                [
+                    root.join("one").join("dep"),
+                    shared,
+                    root.join("two").join("dep")
+                ],
+                "and two are each given theirs"
             );
         }
     }
