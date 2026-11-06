@@ -469,6 +469,7 @@ impl PluginHost {
             held.preparing.clear();
             held.owed.clear();
             held.standing.clear();
+            held.ends.clear();
         }
 
         // The worker is gone. Its bindings go with it: a binding exists to serve one worker's
@@ -1047,9 +1048,10 @@ impl PluginHost {
             .lock()
             .is_ok_and(|mut held| held.joined(binding_id, incarnation, bound));
         if !kept {
-            // An unbind came between the record of this registration and the runtime's
-            // reservation, found nothing to remove, and answered. What it was about is the
-            // binding that is live now, so it goes, and the worker is told that it did.
+            // An unbind retired this registration between the connection's record of it and now.
+            // Its removal found nothing, or the binding that has just gone live, or removed it
+            // already; what it was about is this binding, so it goes if it is still there, and
+            // the worker is told that it did.
             self.runtime.detach(served.owner, binding, incarnation);
             return Err(refused(format!(
                 "binding {binding} was unbound while it was being registered"
@@ -1098,7 +1100,9 @@ impl PluginHost {
     /// An unbind that was carried out is answered after the binding's thread has ended and after
     /// everything it produced was passed on or dropped, so no notice the registration produced
     /// after the request began follows the answer. A second request about a registration whose
-    /// removal is under way is answered at the same point.
+    /// removal is under way, that arrives while the connection still records the registration, is
+    /// answered at the same point; one that arrives after it is recorded no more finds nothing
+    /// to remove.
     async fn unbind(
         &self,
         binding_id: Uuid,
@@ -1385,9 +1389,9 @@ impl Held {
     }
 
     /// Records a binding, and discharges any redraw it owed from before it existed. Says whether
-    /// the connection still stands behind the registration: when it does not, an unbind came
-    /// between the connection's record of the registration and the runtime's reservation, the
-    /// binding is not recorded, and the caller takes it out of the runtime.
+    /// the connection still stands behind the registration: when it does not, an unbind retired it
+    /// after the connection recorded it, the binding is not recorded, and the caller takes it out
+    /// of the runtime.
     fn joined(
         &mut self,
         binding_id: Uuid,
@@ -1396,8 +1400,10 @@ impl Held {
     ) -> bool {
         // The redraw first: it is taken before the cleanup that would otherwise remove it, because
         // a document lost while this binding was being registered is a document the binding still
-        // has to draw again.
-        let owed = self.owed.remove(&binding_id);
+        // has to draw again. It is owed to the registration that is being made now, which is this
+        // one only while the identifier is recorded as its.
+        let owed =
+            self.preparing.get(&binding_id) == Some(&incarnation) && self.owed.remove(&binding_id);
         self.gave_up(binding_id, incarnation);
         if owed {
             handle.require_snapshot();
@@ -1455,12 +1461,17 @@ impl Held {
     }
 
     /// Returns the registration this connection holds under an identifier now: the binding that is
-    /// live, or else the one being registered.
+    /// live and stood behind, or else the one being registered, or else one that was stood behind
+    /// and is on its way out, for a second request about it. A registration on its way out is
+    /// never preferred to the one that replaces it.
     fn registration_of(&self, binding_id: Uuid) -> Option<Incarnation> {
-        self.live
+        let live = self
+            .live
             .get(&binding_id)
-            .map(|handle| handle.incarnation())
+            .map(|handle| handle.incarnation());
+        live.filter(|incarnation| self.standing.contains(incarnation))
             .or_else(|| self.preparing.get(&binding_id).copied())
+            .or(live)
     }
 
     /// Stops standing behind a registration, and says whether it did: it does not for a
@@ -1813,7 +1824,10 @@ struct Leaving {
 fn leave(served: &Served, binding_id: Uuid) -> Option<Leaving> {
     let mut held = served.registered.lock().ok()?;
     let incarnation = held.registration_of(binding_id)?;
-    let was_live = held.live.contains_key(&binding_id);
+    let was_live = held
+        .live
+        .get(&binding_id)
+        .is_some_and(|handle| handle.incarnation() == incarnation);
     if held.retire(incarnation) {
         served.notices.forget(binding_id);
     }
