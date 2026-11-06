@@ -629,12 +629,13 @@ async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost(
 
 #[test]
 fn an_integrity_level_is_named_by_its_sid_whatever_the_language() {
-    // The words of the first field are translated and the SID is not. The second listing is an
-    // example of a translation, not a recording.
+    // The words of the first field are translated and the SID is not. The level's row has no
+    // attributes. The first listing has the shape `whoami` prints in English; the second is an example
+    // of a translation, not a recording.
     let english = "\"Everyone\",\"Well-known group\",\"S-1-1-0\",\"Mandatory group\"\r\n\
-                   \"Mandatory Label\\Medium Mandatory Level\",\"Label\",\"S-1-16-8192\",\"Mandatory group\"\r\n";
+                   \"Mandatory Label\\Medium Mandatory Level\",\"Label\",\"S-1-16-8192\",\"\"\r\n";
     let translated = "\"Tout le monde\",\"Groupe connu\",\"S-1-1-0\",\"Groupe obligatoire\"\r\n\
-                      \"Etiquette obligatoire\\Niveau moyen\",\"Etiquette\",\"S-1-16-8192\",\"Groupe obligatoire\"\r\n";
+                      \"Etiquette obligatoire\\Niveau moyen\",\"Etiquette\",\"S-1-16-8192\",\"\"\r\n";
     assert!(names_an_integrity_level(english));
     assert!(names_an_integrity_level(translated));
     assert!(

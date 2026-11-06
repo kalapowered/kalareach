@@ -1845,7 +1845,10 @@ impl scanning::Space for Planted {
             .ok_or_else(|| std::io::Error::from_raw_os_error(scanning::BEYOND_THE_ADDRESS_SPACE))
     }
 
-    /// Copies up to the first page that cannot be read, as the system does.
+    /// Copies the bytes up to the first page that cannot be read and returns how many. The system
+    /// says only the number of bytes it transferred, which can be fewer than these; the walk does
+    /// not rely on the count being exact, since it reads on page by page from where the count
+    /// ends.
     fn read(&self, address: usize, buffer: &mut [u8]) -> usize {
         let mut copied = 0;
         while copied < buffer.len() {
@@ -1964,8 +1967,9 @@ exit /b 0\r\n";
 /// and its command line, which the case reads as bytes because the console writes them in its code
 /// page, and the case looks for the credential's text in both and, as ASCII and as UTF-16, in the
 /// committed memory of the program's process. The controls for the memory reading are this test
-/// process, which read the credential file and so holds it, and the program's own environment
-/// block, which its memory must be shown to hold before the absence of the credential counts.
+/// process, which holds both encodings of the credential among its needles and so shows that the
+/// reading finds each in a live process, and the program's own environment block, which its memory
+/// must be shown to hold before the absence of the credential counts.
 #[test]
 fn kr_req_11_23_a_launch_is_bound_to_the_program_it_created_and_the_credential_is_in_none_of_it() {
     let shell = Shell::new();
@@ -2065,7 +2069,7 @@ fn kr_req_11_23_a_launch_is_bound_to_the_program_it_created_and_the_credential_i
     );
     assert!(
         holds(&environment, "NOTE=caf"),
-        "the value that is not ASCII reached the program's environment: {:?}",
+        "the variable with a value that is not ASCII reached the program's environment: {:?}",
         String::from_utf8_lossy(&environment)
     );
     for (what, written) in [
@@ -2090,7 +2094,7 @@ fn kr_req_11_23_a_launch_is_bound_to_the_program_it_created_and_the_credential_i
     let this_process = memory::scan(std::process::id(), &needles).expect("this process is read");
     assert!(
         this_process.found[0] && this_process.found[1],
-        "the control: this process read the credential file and holds it, and the reading finds it"
+        "the control: the reading finds both encodings of the credential in a live process, this one"
     );
     let the_program = memory::scan(program, &needles).expect("the program's process is read");
     assert!(

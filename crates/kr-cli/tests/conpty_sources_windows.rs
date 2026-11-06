@@ -529,12 +529,13 @@ fn record_ssh_exe() {
 
 #[test]
 fn an_integrity_level_is_named_by_its_sid_whatever_the_language() {
-    // The words of the first field are translated and the SID is not. The second listing is an
-    // example of a translation, not a recording.
+    // The words of the first field are translated and the SID is not. The level's row has no
+    // attributes. The first listing has the shape `whoami` prints in English; the second is an example
+    // of a translation, not a recording.
     let english = "\"Everyone\",\"Well-known group\",\"S-1-1-0\",\"Mandatory group\"\r\n\
-                   \"Mandatory Label\\Medium Mandatory Level\",\"Label\",\"S-1-16-8192\",\"Mandatory group\"\r\n";
+                   \"Mandatory Label\\Medium Mandatory Level\",\"Label\",\"S-1-16-8192\",\"\"\r\n";
     let translated = "\"Tout le monde\",\"Groupe connu\",\"S-1-1-0\",\"Groupe obligatoire\"\r\n\
-                      \"Etiquette obligatoire\\Niveau moyen\",\"Etiquette\",\"S-1-16-8192\",\"Groupe obligatoire\"\r\n";
+                      \"Etiquette obligatoire\\Niveau moyen\",\"Etiquette\",\"S-1-16-8192\",\"\"\r\n";
     assert!(names_an_integrity_level(english));
     assert!(names_an_integrity_level(translated));
     assert!(
@@ -585,7 +586,7 @@ fn a_distribution_is_stopped_by_its_complete_name_whatever_the_language() {
     let both = "Ubuntu\r\nUbuntu-24.04\r\n";
     assert!(
         !is_stopped("Ubuntu", both, "Ubuntu\r\n"),
-        "Ubuntu is running, and Ubuntu-24.04's line being stopped does not make it so"
+        "Ubuntu is running, and Ubuntu-24.04 being registered beside it does not make it stopped"
     );
     assert!(
         is_stopped("Ubuntu-24.04", both, "Ubuntu\r\n"),
