@@ -423,8 +423,8 @@ fn run_ok(program: &Path, arguments: &[&str]) {
 }
 
 /// A directory this case made and is to leave no trace of: it is removed, with what is in it, when
-/// this is dropped, whichever way the case ends. A failure that is reported says so and does not
-/// stop the unwinding.
+/// this is dropped, whichever way the case ends. The removal is tried once; a failure of it is
+/// written to the error output, without a panic that would end the process during an unwinding.
 struct Made(PathBuf);
 
 impl Made {
@@ -440,7 +440,13 @@ impl Drop for Made {
         match std::fs::remove_dir_all(&self.0) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => eprintln!("{} is not removed: {error}", self.0.display()),
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{} is not removed: {error}",
+                    self.0.display()
+                );
+            }
         }
     }
 }
