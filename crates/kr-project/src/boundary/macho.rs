@@ -6,9 +6,12 @@
 //! one that a packaging of Git brings with it, such as the gettext and PCRE libraries Homebrew's
 //! Git links.
 //!
-//! They are found the way the loader finds them, by reading each program's load commands and not
-//! by running anything: the libraries a program names, the `@rpath` entries it carries, and the
-//! same of each library found, until nothing new is named. A library is granted by the directory
+//! They are found the way the loader finds them, so far as the load commands show it, by reading
+//! each program's load commands and not by running anything: the libraries a program names, the
+//! `@rpath` entries it carries, and the same of each library found, until nothing new is named.
+//! Where this host differs from the loader it leaves a library ungranted, so that the program does
+//! not start inside the profile, or it refuses the set; both fail closed. The one difference that
+//! grants more is a name under a system path, which `find` explains. A library is granted by the directory
 //! it is in once every link in its name is resolved, because a profile judges the path a file has,
 //! not the one it was opened by, and because Git and the libraries it loads open further modules
 //! from the same directory while they run.
@@ -26,7 +29,8 @@ use object::{Endianness, FileKind};
 use crate::error::{ProjectError, Result};
 
 /// The paths the system supplies its libraries from. A library named under one of them is in the
-/// shared cache, and needs no rule.
+/// shared cache, and needs no rule. A file there that the cache does not hold is not granted
+/// either, and the program that loads it does not start inside the profile.
 const SYSTEM: &[&str] = &["/usr/lib/", "/System/Library/"];
 
 /// The trees a support object may neither lie in nor hold: the devices, the system's
@@ -123,7 +127,9 @@ pub fn support_set(programs: &[&Path], helper_directory: &Path) -> Result<Vec<Pa
             continue;
         }
         let executable_directory = file.parent().unwrap_or(&file).to_owned();
-        // A library is loaded once for a program, by the first image that names it.
+        // A library is loaded once for a program, by the first image that names it, and the loader
+        // goes into the libraries an image names in the order it names them: what a library
+        // names through `@rpath` is found through the search path of whoever named it first.
         let mut loaded = HashSet::new();
         let mut pending = vec![Image {
             file,
@@ -140,6 +146,7 @@ pub fn support_set(programs: &[&Path], helper_directory: &Path) -> Result<Vec<Pa
                 .filter_map(|rpath| expand(rpath, &image))
                 .collect();
             let search: Vec<PathBuf> = own.iter().chain(image.inherited.iter()).cloned().collect();
+            let mut next = Vec::new();
             for (name, weak) in &named.libraries {
                 let Some(found) = find(name, &image, &search) else {
                     if *weak {
@@ -160,13 +167,15 @@ pub fn support_set(programs: &[&Path], helper_directory: &Path) -> Result<Vec<Pa
                 };
                 directories.insert(library_directory(&library, name)?);
                 if loaded.insert(library.clone()) {
-                    pending.push(Image {
+                    next.push(Image {
                         file: library,
                         executable_directory: image.executable_directory.clone(),
                         inherited: search.clone(),
                     });
                 }
             }
+            // The stack is last in, first out, so the first library named is pushed last.
+            pending.extend(next.into_iter().rev());
         }
     }
     Ok(directories.into_iter().collect())
@@ -217,10 +226,12 @@ fn find(name: &Path, image: &Image, search: &[PathBuf]) -> Option<Found> {
     } else {
         Vec::new()
     };
-    // A name under a system path is in the shared cache or it is not there at all, and what is in
-    // the cache is not known here. So the search goes on past it: a later candidate that is a file
-    // is granted, and the system supplies the name only when no later one is. When the cache did
-    // hold the name, the extra directory this grants is one the program's own search path names.
+    // A name under a system path is in the shared cache unless the cache does not hold it, and
+    // what the cache holds is not known here. So the search goes on past such a candidate: a later
+    // candidate that is a file is granted, and the system supplies the name only when no later one
+    // is. Where the cache did hold the name, the loader takes that, and this grants one more
+    // directory, one the program's own search path names, and reads that library's names too,
+    // which can refuse the set for a name the loader would never have looked for.
     let mut system = false;
     for candidate in candidates {
         if supplied_by_the_system(&candidate) {
@@ -386,8 +397,9 @@ fn library_directory(library: &Path, named: &Path) -> Result<PathBuf> {
 
 /// Returns whether a support object lies in, or holds, a tree no support object may, or holds a
 /// tree a support directory may only lie in, or is the top of one: a directory directly in such a
-/// tree is a person's home, a volume, a package prefix or a bundle, and holds a great deal besides
-/// libraries.
+/// tree is a volume, a package prefix or a bundle, and holds a great deal besides libraries. So is
+/// a person's home, the directories directly in it and those directly in its `Library`, where the
+/// keychains and the applications' data are kept.
 fn broad(object: &Path) -> bool {
     let directly_in = |trees: &[&str]| {
         object
@@ -403,11 +415,28 @@ fn broad(object: &Path) -> bool {
             .map(Path::new)
             .any(|tree| tree.starts_with(object))
         || directly_in(NEVER_OVER)
-        // What a person keeps at the top of a home: the documents, the keychains, the library.
         || object
-            .parent()
-            .and_then(Path::parent)
-            .is_some_and(|homes| homes == Path::new("/Users"))
+            .strip_prefix("/Users")
+            .ok()
+            .and_then(|rest| rest.components().next())
+            .is_some_and(|name| near_a_home(object, &Path::new("/Users").join(name)))
+        || std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+            .is_some_and(|home| near_a_home(object, &home))
+}
+
+/// Returns whether an object is a home directory, directly in it, or directly in its `Library`.
+fn near_a_home(object: &Path, home: &Path) -> bool {
+    let Ok(rest) = object.strip_prefix(home) else {
+        return false;
+    };
+    let mut parts = rest.components();
+    match (parts.next(), parts.next(), parts.next()) {
+        (None, ..) | (Some(_), None, _) => true,
+        (Some(first), Some(_), None) => first.as_os_str() == "Library",
+        _ => false,
+    }
 }
 
 /// Returns the name a library is loaded by, as a message repeats it.
@@ -451,6 +480,8 @@ mod tests {
             "/Users/someone",
             "/Users/someone/Library",
             "/Users/someone/Documents",
+            "/Users/someone/Library/Keychains",
+            "/Users/someone/Library/Application Support",
             "/Users/Shared",
             "/Volumes/Tools",
             "/opt/homebrew",
@@ -466,6 +497,7 @@ mod tests {
             "/usr/local/lib",
             "/Users/someone/.local/git/lib",
             "/Users/someone/tools/lib",
+            "/Users/someone/Library/Application Support/tool/lib",
             "/Library/Developer/CommandLineTools/usr/lib",
             "/Applications/Xcode.app/Contents/Developer/usr/lib",
             "/Volumes/Tools/git/lib",
@@ -473,6 +505,33 @@ mod tests {
             assert!(
                 !broad(Path::new(fine)),
                 "{fine} is a directory of libraries"
+            );
+        }
+    }
+
+    #[test]
+    fn a_home_that_is_not_under_the_users_directory_is_broad_at_its_top_as_well() {
+        let home = Path::new("/Volumes/Elsewhere/someone");
+        for top in [
+            "/Volumes/Elsewhere/someone",
+            "/Volumes/Elsewhere/someone/Documents",
+            "/Volumes/Elsewhere/someone/Library",
+            "/Volumes/Elsewhere/someone/Library/Keychains",
+        ] {
+            assert!(
+                near_a_home(Path::new(top), home),
+                "{top} is the top of a home"
+            );
+        }
+        for deeper in [
+            "/Volumes/Elsewhere/someone/Library/Application Support/tool/lib",
+            "/Volumes/Elsewhere/someone/tools/lib",
+            "/Volumes/Elsewhere/other/Library",
+            "/Volumes/Elsewhere",
+        ] {
+            assert!(
+                !near_a_home(Path::new(deeper), home),
+                "{deeper} is not the top of that home"
             );
         }
     }

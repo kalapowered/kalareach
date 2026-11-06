@@ -965,8 +965,11 @@ mod confined {
                         "create", "-size", "2m", "-fs", "APFS", "-volname", "krreads",
                     ])
                     .arg(&image)
-                    .output()
-                    .ok()?;
+                    .output();
+                let Ok(made) = made else {
+                    println!("not exercised: this host cannot run the tool that makes an image");
+                    return None;
+                };
                 if !made.status.success() {
                     println!(
                         "not exercised: this host cannot make a disk image: {}",
@@ -978,8 +981,11 @@ mod confined {
                     .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
                     .arg(spelled)
                     .arg(&image)
-                    .output()
-                    .ok()?;
+                    .output();
+                let Ok(attached) = attached else {
+                    println!("not exercised: this host cannot run the tool that attaches an image");
+                    return None;
+                };
                 if !attached.status.success() {
                     println!(
                         "not exercised: this host cannot attach a disk image: {}",
@@ -990,6 +996,22 @@ mod confined {
                 Some(Self {
                     mount: directory.to_owned(),
                 })
+            }
+        }
+
+        /// A directory moved from one place to another, moved back when it goes, so that a case
+        /// that fails between the two moves still leaves the image attached under it where it was
+        /// attached, and the detach finds it.
+        struct Carried {
+            now: PathBuf,
+            was: PathBuf,
+        }
+
+        impl Drop for Carried {
+            fn drop(&mut self) {
+                if self.now.exists() {
+                    let _ = std::fs::rename(&self.now, &self.was);
+                }
             }
         }
 
@@ -1221,6 +1243,10 @@ mod confined {
                 .expect("a mount outside the location does not stop a bounded status");
             assert!(unaffected.success, "and it succeeds: {}", unaffected.stderr);
             std::fs::rename(&held, location.join("held")).expect("the directory moves");
+            let carried = Carried {
+                now: location.join("held"),
+                was: held.clone(),
+            };
             let refusal = profile
                 .run(&repository.read(&status).admitted(bounded()))
                 .expect_err("a bounded status over a location with a mount carried into it");
@@ -1233,7 +1259,7 @@ mod confined {
                 "the refusal names the mount point by the name it has now: {said}"
             );
             // Detaching finds the image where it was attached.
-            std::fs::rename(location.join("held"), &held).expect("the directory moves back");
+            drop(carried);
             drop(attached);
             let after = profile
                 .run(&repository.read(&status).admitted(bounded()))
@@ -2014,6 +2040,160 @@ mod confined {
                     root.join("two").join("dep")
                 ],
                 "and two are each given theirs"
+            );
+        }
+
+        /// The loader goes into the libraries a program names in the order it names them, and a
+        /// library it loaded once is not loaded again, so what that library names through
+        /// `@rpath` is found through the search path of the library that named it first. Here the
+        /// program names two libraries that both name `libkrl`, each carrying an rpath to its own
+        /// directory of a `libkrm` that `libkrl` loads. The loader takes the one the first leads
+        /// to, so that is the one granted, and the program runs under it.
+        #[test]
+        fn the_library_a_program_names_first_decides_where_a_shared_librarys_names_lead() {
+            let fixture = Fixture::create();
+            let Some(clang) = compiler() else {
+                println!("not exercised: this host has no developer tools to build a library");
+                return;
+            };
+            let (_directory, root) = scratch();
+            for name in ["a", "b", "l", "ma", "mb", "bin", "helpers"] {
+                std::fs::create_dir(root.join(name)).expect("a directory to build in");
+            }
+            let source = |name: &str, text: &str| {
+                std::fs::write(root.join(name), text).expect("a source file");
+            };
+            source("m1.c", "int krm_answer(void) { return 1; }\n");
+            source("m2.c", "int krm_answer(void) { return 2; }\n");
+            source(
+                "l.c",
+                "int krm_answer(void);\nint krl_answer(void) { return krm_answer(); }\n",
+            );
+            source(
+                "ka.c",
+                "int krl_answer(void);\nint kra_answer(void) { return krl_answer(); }\n",
+            );
+            source(
+                "kb.c",
+                "int krl_answer(void);\nint krb_answer(void) { return krl_answer(); }\n",
+            );
+            source(
+                "program.c",
+                "int kra_answer(void);\nint krb_answer(void);\n\
+                 int main(void) { return kra_answer() + krb_answer(); }\n",
+            );
+            let directory = |name: &str| root.join(name);
+            let flag = |prefix: &str, name: &str| {
+                OsString::from(format!("{prefix}{}", directory(name).display()))
+            };
+            // Every file is built for both architectures, as the system's own programs are
+            // shipped, so the slice for this machine is the one that is read.
+            let compile = |arguments: Vec<OsString>| {
+                let output = Command::new(&clang)
+                    .args(["-arch", "arm64", "-arch", "x86_64"])
+                    .args(&arguments)
+                    .output()
+                    .expect("the compiler starts");
+                assert!(
+                    output.status.success(),
+                    "the compiler builds it: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            let library = |directory_name: &str, name: &str, source: &str, extra: Vec<OsString>| {
+                let mut arguments: Vec<OsString> = vec![
+                    "-dynamiclib".into(),
+                    "-install_name".into(),
+                    format!("@rpath/lib{name}.dylib").into(),
+                    "-o".into(),
+                    directory(directory_name)
+                        .join(format!("lib{name}.dylib"))
+                        .into(),
+                    directory(source).into(),
+                ];
+                arguments.extend(extra);
+                compile(arguments);
+            };
+            library("ma", "krm", "m1.c", Vec::new());
+            library("mb", "krm", "m2.c", Vec::new());
+            library("l", "krl", "l.c", vec![flag("-L", "ma"), "-lkrm".into()]);
+            library(
+                "a",
+                "kra",
+                "ka.c",
+                vec![
+                    flag("-L", "l"),
+                    "-lkrl".into(),
+                    flag("-Wl,-rpath,", "ma"),
+                    flag("-Wl,-rpath,", "l"),
+                ],
+            );
+            library(
+                "b",
+                "krb",
+                "kb.c",
+                vec![
+                    flag("-L", "l"),
+                    "-lkrl".into(),
+                    flag("-Wl,-rpath,", "mb"),
+                    flag("-Wl,-rpath,", "l"),
+                ],
+            );
+            let program = directory("bin").join("program");
+            compile(vec![
+                "-o".into(),
+                program.clone().into(),
+                directory("program.c").into(),
+                flag("-L", "a"),
+                "-lkra".into(),
+                flag("-L", "b"),
+                "-lkrb".into(),
+                flag("-Wl,-rpath,", "a"),
+                flag("-Wl,-rpath,", "b"),
+            ]);
+
+            let named =
+                kr_project::boundary::support_set(&[program.as_path()], &directory("helpers"))
+                    .expect("the set of the program is named");
+            assert_eq!(
+                named.libraries(),
+                [
+                    directory("a"),
+                    directory("b"),
+                    directory("l"),
+                    directory("ma")
+                ],
+                "the directory the first library leads to is granted, and the other is not"
+            );
+            let location = fixture.work().join("location");
+            std::fs::create_dir_all(&location).expect("a location");
+            let run = |reads: Reads| {
+                run_enclosed(
+                    &fixture,
+                    &location,
+                    Enclosed {
+                        program: &program,
+                        arguments: Vec::new(),
+                        helpers: Vec::new(),
+                        readable: Vec::new(),
+                        reads,
+                        exec_path: None,
+                    },
+                )
+            };
+            let ran = run(Reads::Bounded(std::sync::Arc::new(named)));
+            assert_eq!(
+                ran.status,
+                Some(2),
+                "both answers come from the `libkrm` the loader took: {}",
+                ran.stderr
+            );
+            let owner = run(Reads::Everywhere);
+            assert_eq!(
+                owner.status,
+                Some(2),
+                "the owner's run is the control: {}",
+                owner.stderr
             );
         }
     }
