@@ -2016,6 +2016,52 @@ pub fn a_chord_the_person_bound_on_an_escape_runs_when_it_was_typed_ahead_of_a_r
     );
 }
 
+/// KR-REQ-08.48: a chord the person bound behind another key runs when its keys were typed ahead of
+/// a read.
+///
+/// The key behind the first key of a chord is the chord's second key, whatever it is, and the
+/// editor's: an Escape there is not the start of a host's answer. The case binds `Ctrl+x,Escape` to
+/// a handler that inserts a line ending in a comment, leaves the entry unanswered, types `Ctrl+x`,
+/// an Escape, a `P`, a backslash (which ends a device control string, so the three keys behind the
+/// first are a whole answer by their shape) and a return, and expects the line to run: a module that
+/// took the Escape for the start of an answer would drop it, and the chord with it.
+///
+/// # Panics
+///
+/// Panics when the person's handler does not run.
+#[cfg(unix)]
+pub fn a_chord_the_person_bound_behind_another_key_runs_when_it_was_typed_ahead_of_a_read(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_configuration: "Set-PSReadLineKeyHandler -Chord 'Ctrl+x,Escape' -ScriptBlock { \
+                [Microsoft.PowerShell.PSConsoleReadLine]::Insert(\
+                'Write-Output (''kr-cho'' + ''rd'') # ') }\n",
+            ..Profile::ORDINARY
+        },
+    );
+    session.commands.hold_entries = true;
+    session.stepping = false;
+    session.first_prompt();
+    assert!(
+        session.wait_for_prompt(),
+        "the shell drew no prompt:\n{}",
+        session.terminal_output()
+    );
+    let start = session.written();
+    session.type_bytes(b"\x18\x1bP\\\r");
+    session.answer_held_entries();
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-chord", deadline),
+        "the person's handler on Ctrl+x,Escape did not run when its keys were typed ahead:\n{}",
+        shown_since(&session, start)
+    );
+}
+
 /// KR-REQ-08.48: a chord the person binds after the module has bound its own runs when its keys were
 /// typed ahead of a read.
 ///

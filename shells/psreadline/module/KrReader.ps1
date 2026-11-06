@@ -405,6 +405,17 @@ function Clear-KrStaleReplies {
         $convert = $script:Rl.Assembly.GetType('Microsoft.PowerShell.PSKeyInfo').GetMethod(
             'FromConsoleKeyInfo', [type[]]@([System.ConsoleKeyInfo]))
         if ($null -eq $convert) { return }
+        $tables = Get-KrBindingTables
+        # Whether a key is the first key of a chord: the key behind it is the second key of that
+        # chord, whatever it is, and the editor's.
+        $startsChord = {
+            param($each)
+            try {
+                $handler = $null
+                $tables.Keys.TryGetValue($convert.Invoke($null, @($each)), [ref]$handler) -and
+                    "$($handler.BriefDescription)" -ceq 'ChordFirstKey'
+            } catch { $false }
+        }.GetNewClosure()
         # The keys the editor is to have, in the order they came in.
         $kept = [System.Collections.Generic.List[object]]::new()
         # Keys taken from the terminal or from `$ahead` that are neither the editor's nor dropped yet.
@@ -424,13 +435,21 @@ function Clear-KrStaleReplies {
             $each
         }.GetNewClosure()
         $dropped = 0
+        $behindChordKey = $false
         try {
             for ($taken = 0; $taken -lt $script:ReplyKeysMax; $taken++) {
                 if (-not (& $waiting)) { break }
                 $key = & $take
+                if ($behindChordKey) {
+                    $behindChordKey = $false
+                    $kept.AddRange($undecided)
+                    $undecided.Clear()
+                    continue
+                }
                 if ([int]$key.KeyChar -ne 0x1B -or -not (& $waiting)) {
                     $kept.AddRange($undecided)
                     $undecided.Clear()
+                    $behindChordKey = & $startsChord $key
                     continue
                 }
                 $next = & $take
