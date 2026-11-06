@@ -2032,6 +2032,125 @@ async fn a_registration_whose_answer_was_lost_is_answered_again_over_a_new_conne
     assert_eq!(reused.code, kr_protocol::error::ErrorCode::IdConflict);
 }
 
+/// KR-REQ-09.09, the answer recorded for a device's push registration: an attempt of the
+/// registration's action that finds it already recorded (the first attempt finished before this one
+/// claimed the action) is given what the first produced only under the admission the attempt carries.
+/// While this host owes a fence it is refused, and the gateway is not asked; the control is the same
+/// attempt with nothing owed, which is answered with the first attempt's result, and again once the
+/// fence is gone. Not shown here: a registration withdrawn, or the repeat the paired door answers
+/// before the call is admitted, which the case above shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_push_registration_recorded_before_an_attempt_claims_it_is_not_given_back_while_a_fence_is_owed()
+ {
+    use kr_protocol::envelope::{MutationRequest, ParamsValue};
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::method::MethodVersion;
+
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let sender = PushSenderRecordId::new(uuid(0x72));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    let params = DevicePushRegisterParams {
+        credential,
+        previews_enabled: true,
+    };
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let target = ActionTarget::environment(environment.environment_id());
+
+    // The first attempt registers the credential and records what it produced under the action.
+    let first: DevicePushRegisterResult = phone
+        .connection
+        .mutate(Method::DevicePushRegister, action, target.clone(), &params)
+        .await
+        .expect("the daemon registers a credential its gateway confirms")
+        .to_typed()
+        .expect("a registration result");
+    let asked = environment
+        .gateway
+        .answers_on("/api/push/deliver/status")
+        .len();
+    assert_eq!(
+        asked, 1,
+        "the gateway was asked once, for the first attempt"
+    );
+
+    // A second attempt of the action, arriving at the service itself: it claims the action and
+    // finds the record. It stands on a connection the daemon holds a registration for.
+    let controller = environment.controller();
+    let owner = environment.host.client().await;
+    let attempt = |carried: kr_controller::authority::AdmittedMutation| {
+        let mutation = MutationRequest {
+            request_id: kr_protocol::ids::RequestId::new(2),
+            method: Method::DevicePushRegister.into(),
+            method_version: MethodVersion::V1,
+            action_id: action,
+            grant_id: Nullable::null(),
+            target: target.clone(),
+            expected: ParamsValue::empty(),
+            action_window_id: kr_protocol::ids::ActionWindowId::new("window-1").expect("a window"),
+            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+            params: ParamsValue::from_typed(&params).expect("encodes"),
+        };
+        let actor_id = kr_transport::listener::device_principal(&phone.device_id());
+        async move {
+            controller
+                .push_register_action(&actor_id, &mutation, carried)
+                .await
+        }
+    };
+    let carried = kr_controller::authority::AdmittedMutation {
+        connection_id: owner.acknowledgement().connection_id,
+        admitted_revision: controller.policy().authority_revision(),
+        deadline: controller
+            .continuous_now()
+            .checked_add(Duration::from_secs(60)),
+    };
+
+    // The control: with nothing owed the attempt is given the first attempt's result.
+    let given = attempt(carried).await;
+    assert!(given.is_copied(), "the attempt found the record");
+    let repeated: DevicePushRegisterResult = given
+        .into_answer()
+        .expect("the recorded result is given back")
+        .to_typed()
+        .expect("a registration result");
+    assert_eq!(repeated, first);
+
+    // A fence this host owes stops the recorded answer.
+    controller.hold_fence(true);
+    let refused = attempt(carried)
+        .await
+        .into_answer()
+        .expect_err("a fence this host owes stops the recorded answer");
+    controller.hold_fence(false);
+    assert_eq!(
+        refused.to_protocol_error().code,
+        ErrorCode::PermissionDenied,
+        "{refused}"
+    );
+
+    // Once the fence is gone the attempt is given the record again, and the gateway was asked no
+    // more than once.
+    let again: DevicePushRegisterResult = attempt(carried)
+        .await
+        .into_answer()
+        .expect("answered again once nothing is owed")
+        .to_typed()
+        .expect("a registration result");
+    assert_eq!(again, first);
+    assert_eq!(
+        environment
+            .gateway
+            .answers_on("/api/push/deliver/status")
+            .len(),
+        asked,
+        "the gateway was not asked again"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Approvals a worker's application raises
 // ---------------------------------------------------------------------------------------------
