@@ -487,12 +487,13 @@ mod tests {
         (ended.code(), limit.take_refusal(), limit.take_refusal())
     }
 
-    /// A process behind the limit that commits more than it allows is refused by the system, and
-    /// the limit says so after the process has gone, so that whoever holds it can tell a process
-    /// the system stopped from one that failed some other way, and forgets it once it has said.
-    /// The child asks as the first thing it does: it was held until it was behind the limit. The
-    /// control is the same request under a limit that allows it, which the system grants and does
-    /// not record.
+    /// KR-REQ-22.11, the resource mechanism on Windows: a process behind the limit that commits
+    /// more than it allows is refused by the system, and the limit says so after the process has
+    /// gone, so that whoever holds it can tell a process the system stopped from one that failed
+    /// some other way, and forgets it once it has said. The child asks as the first thing it does:
+    /// it was held until it was behind the limit. The control is the same request under a limit
+    /// that allows it, which the system grants and does not record. Not shown here: which process
+    /// is held to the limit, the background priority, or the cancellation of a job.
     #[test]
     fn a_process_refused_a_commit_by_the_system_leaves_the_limit_saying_so() {
         // A limit that is not a whole number of pages, as a profile's itemised cost is not.
