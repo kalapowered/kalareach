@@ -647,8 +647,11 @@ final class PairingTests: DeviceTestCase {
         eventually("the first host's rows", timeout: 120) { hasRow("Waiting for you", "An approval is waiting for you") }
         XCTAssertFalse(shows("refused to show its inbox"), "the inbox says a host refused it before any host did")
         askHost("bound", timeout: 180)
-        let refusal = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@ AND label ENDSWITH 'refused to show its inbox'", "environment \(environment)")).firstMatch
-        eventually("the inbox to say the second host refused it", timeout: 180) { refusal.exists }
+        // The tree gives the host's name and the rest of the title as texts of their own. The first host's
+        // rows name the first host, so a text that names the second one is the refusal's.
+        let named = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", "environment \(environment)")).firstMatch
+        let refusal = app.staticTexts.matching(NSPredicate(format: "label ENDSWITH 'refused to show its inbox'")).firstMatch
+        eventually("the inbox to say the second host refused it", timeout: 180) { named.exists && refusal.exists }
         XCTAssertTrue(shows("offline-validity policy has lapsed"), "the inbox does not give the host's own words for the refusal")
         XCTAssertTrue(shows("It answered, so contact is not lost"), "the inbox does not say the host answered, so contact is not lost")
         XCTAssertFalse(shows("is out of contact"), "the inbox calls a host that refused it out of contact")
