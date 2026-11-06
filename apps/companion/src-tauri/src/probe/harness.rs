@@ -432,11 +432,15 @@ async fn start<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> Optio
             "the host made the call and kept the provider's answer from the page".to_owned()
         } else {
             // What the host answered, without the provider's answer or any credential.
-            let mut outcome = started["value"]["outcome"].clone();
-            if let Some(session) = outcome.pointer_mut("/started/session") {
+            let mut answer = started.clone();
+            if let Some(session) = answer.pointer_mut("/value/outcome/started/session") {
                 session["answer_sdp"] = Value::Null;
             }
-            format!("the host's outcome was {outcome}")
+            let text = answer.to_string();
+            format!(
+                "the host answered {}",
+                text.chars().take(600).collect::<String>()
+            )
         },
     ));
     id

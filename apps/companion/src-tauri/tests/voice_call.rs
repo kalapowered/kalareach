@@ -1214,6 +1214,8 @@ async fn the_first_audio_played_out_is_the_calls_figure_and_only_the_first() {
         .await;
     let figure = first["first_audio_ms"].as_u64().expect("a figure");
 
+    // A later figure would be at least this much more, so a figure that moved cannot read as equal.
+    tokio::time::sleep(Duration::from_millis(25)).await;
     scene.platform.tell(CallEvent::Playout);
     scene.platform.tell(CallEvent::Capture {
         state: CaptureState::Capturing,

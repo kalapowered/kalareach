@@ -258,6 +258,8 @@ connected, a stop to return without waiting for the service, the media to stop o
 to revoke the grant, and the service's closure to be reported as not confirmed. On iOS the machine also
 reads the system's lock-screen state through the peer while the call is held and after it ends.
 
+The checks that need a person on a real phone are in [phone-checks.md](phone-checks.md).
+
 The emulator starts with `-audio none` in this mode unless `KR_EMULATOR_AUDIO_ARGS` says otherwise;
 the default mode starts it with `-no-audio`, and a call there reads its capture as `unavailable`. The
 input driver should be `none` wherever it works, so that no microphone of the machine is opened.
