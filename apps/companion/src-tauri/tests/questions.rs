@@ -1345,6 +1345,43 @@ async fn a_kept_answer_whose_earlier_send_the_worker_took_frees_the_link_of_the_
     );
 }
 
+/// KR-REQ-11.63: so does the settling of a session's kept answers, which reads the host's record of
+/// every send and tells a person which answers the host took.
+#[tokio::test(flavor = "multi_thread")]
+async fn settling_a_kept_answer_whose_earlier_send_the_worker_took_frees_the_link_of_the_others() {
+    use kr_protocol::receipt::ReceiptState;
+
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let (mut link, older, newer, _) =
+        with_two_uncertain_sends_on_a_live_link(&mut worker, &page).await;
+
+    let settling = page.call(
+        "question_settle",
+        json!({ "params": { "sessionId": worker.session_id.to_string() } }),
+    );
+    let call = link.expect(Method::QuestionRead).await;
+    link.answer(
+        &call,
+        &reads(&worker, vec![question(&worker, 2, QuestionState::Pending)]),
+    )
+    .await;
+    for (id, state) in [
+        (older, ReceiptState::Unknown),
+        (newer, ReceiptState::Applied),
+    ] {
+        let call = link.expect(Method::ActionRead).await;
+        link.answer(&call, &receipt_at(id, state, 9_000)).await;
+    }
+    let settled = answered(settling).await.expect("the standing");
+    assert_eq!(settled[0]["standing"], "taken", "{settled}");
+    assert_eq!(
+        page.unsettled(worker.session_id).await,
+        Some(vec![]),
+        "the link no longer holds the other send"
+    );
+}
+
 /// KR-REQ-11.63: so does a new answer whose reading finds an earlier send taken.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_answer_whose_earlier_send_the_worker_took_frees_the_link_of_the_others() {
