@@ -38,7 +38,8 @@
 //! operation owns and reports one that is not the object it started against; a change made and
 //! undone between the two readings is not told from none. The paths the invocation is lent and the
 //! support set are held by name alone, so one of them replaced while Git runs is read under its
-//! name and nothing detects it. Nothing here prevents any of it. A filesystem mounted beneath a
+//! name and nothing detects it, and a mount at a lent directory itself is no mount beneath it, so
+//! it is neither refused nor reported. Nothing here prevents any of it. A filesystem mounted beneath a
 //! granted directory would be read under a granted name too, so such an invocation is refused,
 //! from the table of mounted filesystems read just before the child starts.
 //!

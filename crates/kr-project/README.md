@@ -171,8 +171,10 @@ of these falls back to reading the configuration and hoping.
 * **A caller bounded by a grant, on a macOS host that cannot run Git inside the read-confined
   profile.** That is a host with no launcher, one whose Git does not start under the profile, and
   one whose support set cannot be named: a library Git loads is not found, or lies where no support
-  object may, such as the machine's shared temporary directory or `/private/etc`. Each refusal names
-  the object, and the host does not qualify.
+  object may (the machine's shared temporary directory, `/private/etc`, the top of a person's home
+  or of its `Library`, the top of a volume, a package prefix such as `/opt/homebrew` or
+  `/usr/local`, or an application bundle), or a program in Git's helper directory is built for the
+  other kind of Mac. Each refusal names the object, and the host does not qualify.
 * **A caller bounded by a grant, on a Linux host that cannot name the support set** is refused when
   a program in Git's helper directory has a loader, or a library its loader resolves, that cannot be
   named or lies in a system directory such as `/etc`, `/proc` or `/dev`. So is an invocation that
@@ -225,14 +227,17 @@ support set, and the Git that comes with Xcode is one. A Git that brings librari
 Homebrew's does, has the directory of each. They are found by reading the load commands of Git and
 of each program in its helper directory, then of every library those name, following `@rpath`,
 `@loader_path` and `@executable_path`. Each program is followed on its own, since what those names
-mean to a library depends on the program that loaded it; a helper that is a link is the program the
-link leads to, which is what the loader names it by. Only this machine's own kind of program is
-read: a Git built for the other kind of Mac, which the system could run under translation, is
-refused and says so.
+mean to a library depends on the program that loaded it; a helper that is a symbolic link is the
+program the link leads to, which is what the loader names it by, and a hard link is a program of its
+own with its own `@executable_path`. Only this machine's own kind of program is read: a program in
+Git's helper directory built for the other kind of Mac, which the system could run under
+translation, refuses the set and says so.
 
 The system judges the path a file has, not the name Git opened it by, so every path in the profile
 is resolved first. A link in the tree to a file outside is refused at the file it leads to, and so
-is the data volume's own name for that file.
+is the data volume's own name for that file. A rule written with that name grants nothing, since the
+system never matches it, so a directory given by it makes the operation fail and does not widen what
+is read.
 
 Three reads go beyond the grants, and each tells a name or an attribute and no content. The root
 directory lists the names at the top of the filesystem and nothing beneath them; the loader opens it
@@ -247,10 +252,11 @@ under the same account renames or replaces while Git runs is read under the name
 After the run this host opens again the directories the operation owns and reports one that is not
 the object it started against, and it cannot tell a change made and undone between the two readings
 from none. The paths the invocation is lent, a clone's source for one, and the support set are held
-by name alone: one of them replaced while Git runs is read under its name and nothing detects it.
-Nothing prevents any of it. The other limits are Linux's: the invocation writes only the operation's
-own directories, executes only the installed Git and reaches no network, and a remote clone is
-refused for such a caller.
+by name alone: one of them replaced while Git runs is read under its name and nothing detects it. A
+mount at a lent directory itself is no mount beneath it, so the check does not refuse it, and for a
+lent directory nothing reports it. Nothing prevents any of it. The other limits are Linux's: the
+invocation writes only the operation's own directories, executes only the installed Git and reaches
+no network, and a remote clone is refused for such a caller.
 
 The mount check reads the table of mounted filesystems from the kernel without asking any
 filesystem to answer for itself, so a share that has stopped answering cannot hold an invocation. It
@@ -263,21 +269,22 @@ So the boundary bounds what the caller's own request can reach, repository conte
 symbolic link to a file outside, an object store borrowing another repository's objects, a
 configuration including a file outside and a descriptor left open are all refused.
 
-**It does not make the location's tree private.** Git reads the tree as the host presents it,
-and this holds for every directory the invocation is granted, the support set's and the profile's
-own included, not only for the location. Immediately before each invocation this host reads the
-mount table and refuses the operation when it names a mount point beneath a granted directory's
-path. That stops a filesystem, or a second view of another directory, mounted there at that moment.
-It compares paths, though, and a granted directory can have other names: bound somewhere else on the
-host, it can have a filesystem mounted beneath that other name, and a symbolic link in the tree to
-the other name then reaches that filesystem through the granted directory's own rule. The check does
-not see that, and it sees nothing after its own moment either. A filesystem mounted beneath a granted
-directory while Git runs, a directory holding a mount that another program moves beneath one, and an
-automatic mount that Git's own lookup of a path sets off are all read as part of the tree. So is a
-hard link already inside the tree to a file elsewhere on the same filesystem. Another program running
-as this host's user account, or the host's own mount arrangement, can put any of these there. The
-confinement holds against what the caller can reach through repository content; it does not defend
-the location against this host's own user account or the host's own mount arrangement.
+**It does not make the location's tree private.** Git reads the tree as the host presents it, and
+this holds for every directory the invocation is granted, the support set's and the profile's own
+included, not only for the location. Immediately before each invocation this host reads the mount
+table and refuses the operation when it names a mount point beneath a granted directory's path. That
+stops a filesystem, or a second view of another directory, mounted there at that moment. It compares
+paths, though, and a granted directory can have other names: bound somewhere else on the host, it
+can have a filesystem mounted beneath that other name, and a symbolic link in the tree to the other
+name then reaches that filesystem through the granted directory's own rule. The check does not see
+that, and it sees nothing after its own moment either. A filesystem mounted beneath a granted
+directory while Git runs, a directory holding a mount that another program moves beneath one while
+Git runs, and an automatic mount that Git's own lookup of a path sets off are all read as part of
+the tree. So is a hard link already inside the tree to a file elsewhere on the same filesystem.
+Another program running as this host's user account, or the host's own mount arrangement, can put
+any of these there. The confinement holds against what the caller can reach through repository
+content; it does not defend the location against this host's own user account or the host's own
+mount arrangement.
 
 A host that cannot hold this refuses such a caller and says why: on Windows, on a Linux kernel older
 than 6.2, on a macOS host with no launcher or whose Git does not start under the profile, where the
@@ -295,9 +302,9 @@ What is left is stated rather than implied.
 **The support set is named once and kept.** It is named when the first invocation for such a
 caller needs it, and kept until the service restarts, a refusal as well as an answer. A Git replaced
 in place leaves it naming what is no longer there: on macOS a package manager that upgrades a
-library moves it to a directory that carries the version. Every invocation for such a caller and
-each `host.doctor` proof then fails closed until the daemon restarts, and so does one after a
-library that was missing has been restored.
+library moves it to a directory that carries the version. An invocation that needs what moved then
+fails closed, and so does a `host.doctor` proof when it is Git's own program that needs it, until
+the daemon restarts. A library restored after the set was refused is not found either.
 
 **A substitution inside a granted subtree is outside the guarantee.** The tree Git works in is the
 object this service opened, so nothing can redirect that. What a substitution can still reach is a
