@@ -3,7 +3,7 @@
 //
 //  A call the person started keeps running with the screen locked (section 15 paragraph 21), and a
 //  person who cannot unlock the phone can still silence their microphone from the lock screen or
-//  end the call from a headset, a car or Control Center. The system's header has no mute command:
+//  end the call from a headset or a car. The system's header has no mute command:
 //  `pauseCommand` is the one that carries it here. Nothing a remote sends ever opens the
 //  microphone: `playCommand` and `togglePlayPauseCommand` are never offered, so a stray tap, a
 //  headset button or a voice assistant cannot turn on a microphone the person turned off.
@@ -56,12 +56,22 @@ public protocol RemoteControlSurface: AnyObject {
 
 /// The system's own centres.
 public final class SystemRemoteControls: RemoteControlSurface {
+    /// The centres are one thing for the whole process. The surface that registered last holds
+    /// them, and an older one that comes to take its call away late turns off and clears nothing of
+    /// the newer one's. Held across each change, so that none is made on a surface that has just
+    /// lost them.
+    private static let centres = NSLock()
+    private static var holder: ObjectIdentifier?
+
     private let lock = NSLock()
     private var tokens: [(command: MPRemoteCommand, token: Any)] = []
 
     public init() {}
 
     public func install(_ handler: @escaping (RemoteCommand) -> Void) {
+        Self.centres.lock()
+        defer { Self.centres.unlock() }
+        Self.holder = ObjectIdentifier(self)
         let center = MPRemoteCommandCenter.shared()
         // Offered by none of them, whatever else the application or the system does with them.
         center.playCommand.isEnabled = false
@@ -82,15 +92,22 @@ public final class SystemRemoteControls: RemoteControlSurface {
     }
 
     public func offerPause(_ offered: Bool) {
+        Self.centres.lock()
+        defer { Self.centres.unlock() }
+        guard Self.holder == ObjectIdentifier(self) else { return }
         MPRemoteCommandCenter.shared().pauseCommand.isEnabled = offered
     }
 
     public func remove() {
+        Self.centres.lock()
+        defer { Self.centres.unlock() }
         lock.lock()
         let held = tokens
         tokens = []
         lock.unlock()
         for (command, token) in held { command.removeTarget(token) }
+        guard Self.holder == ObjectIdentifier(self) else { return }
+        Self.holder = nil
         let center = MPRemoteCommandCenter.shared()
         center.pauseCommand.isEnabled = false
         center.stopCommand.isEnabled = false
@@ -99,6 +116,9 @@ public final class SystemRemoteControls: RemoteControlSurface {
     }
 
     public func show(_ info: NowPlaying?) {
+        Self.centres.lock()
+        defer { Self.centres.unlock() }
+        guard Self.holder == ObjectIdentifier(self) else { return }
         let center = MPNowPlayingInfoCenter.default()
         guard let info else {
             center.nowPlayingInfo = nil
@@ -202,8 +222,10 @@ public final class LockScreenControls: @unchecked Sendable {
             guard shown else { return }
             shown = false
             generation &+= 1
-            surface.remove()
+            // What is shown goes first: taking the commands away ends this surface's hold of the
+            // system's centres, after which it may change nothing there.
             surface.show(nil)
+            surface.remove()
         }
     }
 

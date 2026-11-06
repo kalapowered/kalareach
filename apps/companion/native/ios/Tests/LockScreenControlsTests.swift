@@ -235,9 +235,9 @@ final class LockScreenControlsTests: XCTestCase {
         XCTAssertFalse(hold.surface.deliver(.pause))
     }
 
-    /// KR-ACC-014: a call that ends by itself, here at its deadline, leaves nothing on the lock
+    /// KR-ACC-014: a call that is stopped from inside, whatever stops it, leaves nothing on the lock
     /// screen either.
-    func testACallThatEndsOnItsOwnLeavesNothingOnTheLockScreen() {
+    func testACallThatIsStoppedLeavesNothingOnTheLockScreen() {
         let hold = permitted()
         hold.control.stop()
         hold.settle()
@@ -246,6 +246,35 @@ final class LockScreenControlsTests: XCTestCase {
         hold.control.stop()
         hold.settle()
         XCTAssertEqual(hold.surface.removals, 1, "the second end takes nothing away twice")
+    }
+
+    /// KR-ACC-014: the system's centres are the process's, not a call's. When an earlier call's
+    /// controls come to take it away after a later call registered, the later call's commands and
+    /// information stay, and its own end takes them away.
+    func testAnEarlierCallsLateEndLeavesTheLaterCallsControls() {
+        let earlier = SystemRemoteControls()
+        let later = SystemRemoteControls()
+        earlier.install { _ in }
+        earlier.offerPause(true)
+        earlier.show(NowPlaying(title: LockScreenControls.title, playbackRate: 1))
+        later.install { _ in }
+        later.offerPause(true)
+        later.show(NowPlaying(title: LockScreenControls.title, playbackRate: 1))
+
+        // The earlier call's end arrives late.
+        earlier.show(nil)
+        earlier.remove()
+        let kept = SystemRemoteControls.reading()
+        XCTAssertTrue(kept.pauseOffered, "the later call's pause stays")
+        XCTAssertTrue(kept.stopOffered, "the later call's stop stays")
+        XCTAssertEqual(kept.title, LockScreenControls.title, "the later call's information stays")
+
+        later.show(nil)
+        later.remove()
+        let gone = SystemRemoteControls.reading()
+        XCTAssertFalse(gone.pauseOffered)
+        XCTAssertFalse(gone.stopOffered)
+        XCTAssertNil(gone.title)
     }
 
     /// KR-ACC-014: a registration that was queued when the call ended registers nothing. The queue
