@@ -425,14 +425,17 @@ fn a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_th
 }
 
 /// KR-REQ-11.63, the thread half of "no answer is automatically inserted into the current terminal
-/// or newly selected agent thread": when the agent moves to another thread, no answer follows it.
-/// A question answered before the switch keeps its answer for the poll of its own call, made with
-/// its own token. A question still unanswered at the switch is ended: a person's answer to it is
-/// refused, so nothing is kept to hand to the new thread, and the agent's own poll reads it as
-/// ended with no answer. The question asked in the newly selected thread is its own: pending, under
-/// the new binding revision, with no answer, and untouched by the answers that went before. The feed
-/// carries the one answer once, on the question it answered. Not shown here: the terminal half,
-/// which is the session's own input staying free of an answer, or the agent's tool call that waits.
+/// or newly selected agent thread", at the question ledger only: when the agent moves to another
+/// thread, no answer follows it into that thread's questions. A question answered before the
+/// switch keeps its answer for the poll of its own call, made with its own token. A question still
+/// unanswered at the switch is ended: a person's answer to it is refused, so nothing is kept to
+/// hand to the new thread, and the agent's own poll reads it as ended with no answer. The question
+/// asked in the newly selected thread is its own: pending, under the new binding revision, with no
+/// answer, and untouched by the answers that went before. The feed carries the one answer once, on
+/// the question it answered. Not shown here: that the worker has no path that delivers an answer
+/// into an agent thread's input, which no case exercises (the ledger holds no thread to deliver
+/// to); the terminal half, which is the session's own input staying free of an answer; or the
+/// agent's tool call that waits.
 #[test]
 fn an_answer_does_not_follow_the_agent_into_a_newly_selected_thread() {
     let instance = ApplicationInstanceId::new(Uuid::from_bytes([13; 16]));
