@@ -3100,6 +3100,34 @@ mod tests {
             answers: mpsc::UnboundedSender<ControlFrame>,
             /// How many times the loop has asked the console to spell its keys.
             asked: Arc<std::sync::atomic::AtomicUsize>,
+            /// The terminal the loop reads its size from, for a case that changes it.
+            sized: Option<Sized>,
+        }
+
+        /// A pseudo-terminal the loop reads its size from, and the signal that tells it the size
+        /// changed.
+        pub struct Sized {
+            master: Box<dyn portable_pty::MasterPty + Send>,
+        }
+
+        impl Sized {
+            /// The person resizes the terminal: its size is set and the loop is told, as the system
+            /// does with a signal.
+            pub fn changes_to(&self, columns: u16, rows: u16) {
+                self.master
+                    .resize(portable_pty::PtySize {
+                        rows,
+                        cols: columns,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .expect("the terminal is resized");
+                rustix::process::kill_process(
+                    rustix::process::getpid(),
+                    rustix::process::Signal::WINCH,
+                )
+                .expect("the loop is told");
+            }
         }
 
         /// One `input.write` the loop sent.
@@ -3160,14 +3188,54 @@ mod tests {
 
             /// The next mutation the loop sends with this method, whatever else it sends first.
             pub async fn next_mutation(&mut self, method: Method) -> ParamsValue {
+                self.next_mutation_asked(method).await.1
+            }
+
+            /// The next mutation the loop sends with this method, whatever else it sends first, and
+            /// the request it is.
+            pub async fn next_mutation_asked(
+                &mut self,
+                method: Method,
+            ) -> (RequestId, ParamsValue) {
                 loop {
                     let frame = self.next_frame().await;
                     if let ControlFrame::Mutation(mutation) = frame
                         && mutation.method == method.into()
                     {
-                        return mutation.params;
+                        return (mutation.request_id, mutation.params);
                     }
                 }
+            }
+
+            /// The host answers the request with `outcome`.
+            pub fn answers_with(&self, request_id: RequestId, outcome: Outcome) {
+                self.answers
+                    .send(ControlFrame::Response(Response {
+                        request_id,
+                        outcome,
+                    }))
+                    .expect("the loop reads the wire");
+            }
+
+            /// The session says something: a batch of output on its stream, the `sequence`th.
+            pub fn says_output(&self, sequence: u64) {
+                self.answers
+                    .send(ControlFrame::Notification(Notification {
+                        stream_id: StreamId::new("session").expect("a stream"),
+                        sequence: EventSequence::new(sequence),
+                        event_type: EventType::new("session.output").expect("an event type"),
+                        payload: ParamsValue::from_typed(&kr_protocol::recovery::OutputEvent {
+                            cursor: kr_protocol::scalars::U64::new(sequence),
+                            bytes: kr_protocol::scalars::Bytes::new(b"x".to_vec()),
+                        })
+                        .expect("an output event"),
+                    }))
+                    .expect("the loop reads the wire");
+            }
+
+            /// The terminal the case changes the size of.
+            pub const fn terminal(&self) -> &Sized {
+                self.sized.as_ref().expect("the case has a sized terminal")
             }
 
             /// The host took the write.
@@ -3256,6 +3324,56 @@ mod tests {
             F: FnOnce(Case) -> Fut,
             Fut: std::future::Future<Output = ()>,
         {
+            run_with(
+                Setup {
+                    holds_lease,
+                    console_will_spell,
+                    owns_geometry: false,
+                    sized: false,
+                },
+                case,
+            )
+            .await
+        }
+
+        /// Runs the loop on a pseudo-terminal whose size the case changes, with the session's
+        /// size the terminal's own or not.
+        pub async fn run_sized<F, Fut>(owns_geometry: bool, case: F) -> Ran
+        where
+            F: FnOnce(Case) -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
+            run_with(
+                Setup {
+                    holds_lease: true,
+                    console_will_spell: true,
+                    owns_geometry,
+                    sized: true,
+                },
+                case,
+            )
+            .await
+        }
+
+        /// How a run is set up.
+        struct Setup {
+            holds_lease: bool,
+            console_will_spell: bool,
+            owns_geometry: bool,
+            sized: bool,
+        }
+
+        async fn run_with<F, Fut>(setup: Setup, case: F) -> Ran
+        where
+            F: FnOnce(Case) -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
+            let Setup {
+                holds_lease,
+                console_will_spell,
+                owns_geometry,
+                sized,
+            } = setup;
             let (sent, written) = mpsc::unbounded_channel();
             let (answers, heard) = mpsc::unbounded_channel();
             let (console, mut input) = mpsc::unbounded_channel();
@@ -3270,7 +3388,39 @@ mod tests {
                 .write(true)
                 .open("/dev/null")
                 .expect("a device to hold the place of a terminal");
-            let terminal = ControllingTerminal::over(device.try_clone().expect("a duplicate"));
+            // A terminal that has a size is a pseudo-terminal the case holds the other end of.
+            let (terminal, sized, _slave, mut changes) = if sized {
+                let pty = portable_pty::native_pty_system()
+                    .openpty(portable_pty::PtySize {
+                        rows: 24,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .expect("opens a terminal");
+                let name = pty.master.tty_name().expect("the terminal has a name");
+                let handle = std::fs::File::options()
+                    .read(true)
+                    .write(true)
+                    .open(name)
+                    .expect("opens the terminal");
+                let changes =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                        .expect("a stream of size changes");
+                (
+                    ControllingTerminal::over(handle),
+                    Some(Sized { master: pty.master }),
+                    Some(pty.slave),
+                    Some(changes),
+                )
+            } else {
+                (
+                    ControllingTerminal::over(device.try_clone().expect("a duplicate")),
+                    None,
+                    None,
+                    None,
+                )
+            };
             let output = Arc::new(device);
             let attaching = Attaching {
                 session_id: SessionId::new(Uuid::from_bytes([1; 16])),
@@ -3282,7 +3432,7 @@ mod tests {
                 dimensions: Dimensions::new(80, 24),
                 lease_epoch: holds_lease.then(|| InputLeaseEpoch::new(5)),
                 geometry_epoch: kr_protocol::ids::GeometryEpoch::new(1),
-                owns_geometry: false,
+                owns_geometry,
             };
             let mut owed = UndeliveredTyping::new(0);
             let mut display = crate::render::ProjectedDisplay::new();
@@ -3307,6 +3457,7 @@ mod tests {
                 written,
                 answers,
                 asked,
+                sized,
             });
             let (outcome, ()) = tokio::join!(
                 super::super::drive(
@@ -3318,7 +3469,7 @@ mod tests {
                     &mut input,
                     &output,
                     &terminal,
-                    None,
+                    changes.as_mut(),
                     &mut display,
                     false,
                     &switch,
@@ -3394,6 +3545,101 @@ mod tests {
                 }
             ),
             "a key pressed and refused by a closing session was typing lost: {outcome:?}"
+        );
+    }
+
+    /// The attach loop, on a terminal whose size changes, asks the session again about a size it did
+    /// not take for now: a viewport report of a terminal that does not own the size goes again with
+    /// the session's next word, and a resize of the owner goes again as the question that says what
+    /// size the session has, answered by a resize if the session is at another. Both cases are one
+    /// test, since a size change is a signal to the whole process.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_size_the_session_did_not_take_for_now_is_asked_about_when_it_says_something() {
+        use kr_protocol::attachment::{
+            AttachmentViewportParams, AttachmentViewportResult, GeometryState,
+            TerminalPresentationMode, TerminalResizeParams,
+        };
+        use kr_protocol::envelope::Outcome;
+        use kr_protocol::error::ProtocolError;
+        use kr_protocol::ids::{AttachmentId, GeometryEpoch};
+        use kr_protocol::scalars::Uuid;
+
+        let not_now = || {
+            Outcome::Error(ProtocolError::new(
+                ErrorCode::ResourceUnavailable,
+                "the session cannot take it now",
+            ))
+        };
+
+        // A terminal that does not own the size reports it. The session refuses the report for
+        // now and rests it; the next thing the session says lets it go again.
+        let ran = wire::run_sized(false, |mut case| async move {
+            case.says_output(0);
+            case.terminal().changes_to(100, 30);
+            let (first, params) = case.next_mutation_asked(Method::AttachmentViewport).await;
+            let params: AttachmentViewportParams = params.to_typed().expect("a report");
+            assert_eq!(params.dimensions, size(100, 30));
+            case.answers_with(first, not_now());
+            case.says_output(1);
+            let (second, params) = case.next_mutation_asked(Method::AttachmentViewport).await;
+            let params: AttachmentViewportParams = params.to_typed().expect("a report");
+            assert_ne!(second, first, "it is another request");
+            assert_eq!(params.dimensions, size(100, 30), "of the size it is owed");
+            case.closes();
+        })
+        .await;
+        assert!(
+            matches!(ran.outcome, AttachOutcome::Closed { .. }),
+            "{:?}",
+            ran.outcome
+        );
+
+        // The owner of the size resizes the session. The session refuses the resize for now, and
+        // the terminal asks what size it has; it is at the old one, so the owner resizes again.
+        let attachment_id = AttachmentId::new(Uuid::from_bytes([3; 16]));
+        let ran = wire::run_sized(true, |mut case| async move {
+            case.says_output(0);
+            case.terminal().changes_to(100, 30);
+            let (resize, params) = case.next_mutation_asked(Method::TerminalResize).await;
+            let params: TerminalResizeParams = params.to_typed().expect("a resize");
+            assert_eq!(params.dimensions, size(100, 30));
+            case.answers_with(resize, not_now());
+            case.says_output(1);
+            let (question, params) = case.next_mutation_asked(Method::AttachmentViewport).await;
+            let params: AttachmentViewportParams = params.to_typed().expect("a report");
+            assert_eq!(params.dimensions, size(100, 30));
+            let at_the_old_size = AttachmentViewportResult {
+                geometry: GeometryState {
+                    owner: Nullable::some(attachment_id),
+                    epoch: GeometryEpoch::new(1),
+                    dimensions: size(80, 24),
+                },
+                presentation: TerminalPresentationMode::Direct,
+                presentation_reason: Nullable::null(),
+                position: Nullable::null(),
+                column: U64::ZERO,
+                window_revision: U64::new(1),
+            };
+            case.answers_with(
+                question,
+                Outcome::Ok(
+                    kr_protocol::envelope::ParamsValue::from_typed(&at_the_old_size)
+                        .expect("an answer"),
+                ),
+            );
+            let (again, params) = case.next_mutation_asked(Method::TerminalResize).await;
+            let params: TerminalResizeParams = params.to_typed().expect("a resize");
+            assert_ne!(again, resize, "it is another request");
+            assert_eq!(params.dimensions, size(100, 30));
+            assert_eq!(params.expected_geometry_epoch, GeometryEpoch::new(1));
+            case.closes();
+        })
+        .await;
+        assert!(
+            matches!(ran.outcome, AttachOutcome::Closed { .. }),
+            "{:?}",
+            ran.outcome
         );
     }
 
@@ -5432,9 +5678,9 @@ mod tests {
         window.answered(request(1), accepted(0, None));
         assert_eq!(window.next(), None, "and only once");
 
-        // Three resizes in a row, and then the session is left as it is.
+        // Three resizes in a row, the first above included, and then the session is left as it is.
         let mut id = 2;
-        for _ in 0..3 {
+        for _ in 0..2 {
             window.took_size(size(100, 30));
             window.resize_not_taken(size(100, 30));
             window.heard();
@@ -5461,7 +5707,7 @@ mod tests {
         );
         window.answered(request(id), accepted(0, None));
         id += 1;
-        for _ in 0..3 {
+        for _ in 0..2 {
             window.took_size(size(90, 20));
             window.resize_not_taken(size(90, 20));
             window.heard();
