@@ -14,6 +14,7 @@
 //! pause named, a process marked) and fails at a bound that is generous for a machine under load;
 //! what must not happen is shown by a later event that would have been preceded by it.
 
+mod fence_support;
 mod net_support;
 
 use std::collections::BTreeMap;
@@ -3487,6 +3488,51 @@ async fn a_fetch_is_not_cancelled_while_a_fence_is_owed() {
             shown.download == DescriptionDownload::Cancelled
         })
         .await;
+    environment.stop().await;
+}
+
+/// KR-REQ-26.16, the part about a change affecting authority fencing dispatch: a change to the
+/// configuration that narrows what a grant may carry, whose fence this host could not raise, stops
+/// the cancellation of a running fetch, and the fetch goes on. The refusal is the fence's own: the
+/// change was not acknowledged as in force, and nothing that was admitted dispatches until it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_is_not_cancelled_after_a_change_to_authority_whose_fence_was_not_raised() {
+    let fixture = Fixture::start().await;
+    fixture.reply("/tiny.gguf", Reply::HalfThenHold(WEIGHTS.to_vec()));
+    let environment = Environment::start(Setup {
+        catalogue: Some(catalogue_at(1, fixture.url("/tiny.gguf"), WEIGHTS)),
+        held: false,
+        ..Setup::new()
+    })
+    .await;
+
+    let started = environment.download(DescriptionDownloadAction::Start).await;
+    assert_eq!(started.download, DescriptionDownload::Running);
+    fixture.until_half_sent().await;
+
+    let registry = fence_support::owe_a_fence(
+        environment.controller(),
+        &environment.host.tree().environment(),
+    )
+    .await;
+    let refused = environment
+        .download_refusal(DescriptionDownloadAction::Cancel)
+        .await;
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused:?}"
+    );
+    assert!(
+        refused.message.contains("could not be raised"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        environment.setup().await.download,
+        DescriptionDownload::Running,
+        "the refused cancellation changed nothing"
+    );
+    fence_support::clear_the_fault(&registry);
     environment.stop().await;
 }
 
