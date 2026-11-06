@@ -154,6 +154,8 @@ struct Host {
     watching: Mutex<Option<AnswerDrafts>>,
     /// What the host was told of the earlier sends before each send.
     learned: Mutex<Vec<Earlier>>,
+    /// The sends the client told the host it stops accounting for, one entry for each time it said.
+    settled_earlier: Mutex<Vec<Vec<ActionId>>>,
     reads: AtomicUsize,
     /// How often the record was asked whether the session ended.
     records: AtomicUsize,
@@ -177,6 +179,7 @@ impl Host {
             recorded_first: Mutex::new(Vec::new()),
             watching: Mutex::new(None),
             learned: Mutex::new(Vec::new()),
+            settled_earlier: Mutex::new(Vec::new()),
             reads: AtomicUsize::new(0),
             records: AtomicUsize::new(0),
             receipt_reads: AtomicUsize::new(0),
@@ -432,6 +435,18 @@ impl QuestionHost for Host {
 
     fn learned(&self, earlier: &Earlier) {
         self.learned.lock().expect("the lock").push(earlier.clone());
+    }
+
+    fn settle_earlier(
+        &self,
+        _session_id: SessionId,
+        sends: &[ActionId],
+    ) -> impl Future<Output = ()> + Send {
+        self.settled_earlier
+            .lock()
+            .expect("the lock")
+            .push(sends.to_vec());
+        std::future::ready(())
     }
 }
 
@@ -1752,6 +1767,133 @@ async fn a_send_the_host_took_for_another_command_is_named_by_the_next_reading()
         }]
     );
     assert!(drafts.drafts().expect("reads").is_empty());
+}
+
+/// KR-REQ-11.63: when the host took a send, the question is answered and none of the answer's other
+/// sends can take effect, so the client stops accounting for all of them, the ones whose outcome the
+/// host could not establish included. It says so wherever it finds the taken send: in the reading
+/// before an answer goes, in the reading before a kept answer is sent, after a send the host
+/// refused because the question was answered, and when a reconnect reads the record.
+#[tokio::test]
+async fn a_send_the_host_took_lets_go_of_the_answers_other_sends_wherever_it_is_found() {
+    let uncertain = action(0x31);
+    let taken = action(0x32);
+    let recorded = vec![uncertain, taken];
+
+    // The reading before an answer goes.
+    let (_directory, drafts) = store();
+    let asked = question(80);
+    let kept = answer_offline(&drafts, &asked).await;
+    begin_with(&drafts, &kept, uncertain);
+    begin_with(&drafts, &kept, taken);
+    let host = Host::with(vec![asked.clone()]);
+    host.holds(uncertain, ReceiptState::Unknown);
+    host.holds(taken, ReceiptState::Applied);
+    host.resolve(asked.question_id, QuestionState::Answered);
+    let outcome = answer_via(&host, &drafts, &asked, no(), 6_000)
+        .await
+        .outcome
+        .expect("the host took an earlier send");
+    assert!(matches!(outcome, Answered::Taken(id) if id == taken), "{outcome:?}");
+    assert_eq!(
+        *host.settled_earlier.lock().expect("the lock"),
+        vec![recorded.clone()],
+        "answering"
+    );
+
+    // The reading before a kept answer is sent.
+    let (_directory, drafts) = store();
+    let asked = question(81);
+    let kept = answer_offline(&drafts, &asked).await;
+    begin_with(&drafts, &kept, uncertain);
+    begin_with(&drafts, &kept, taken);
+    let host = Host::with(vec![asked.clone()]);
+    host.holds(uncertain, ReceiptState::Unknown);
+    host.holds(taken, ReceiptState::Applied);
+    let outcome = send_via(&host, &drafts, asked.question_id)
+        .await
+        .outcome
+        .expect("the host took an earlier send");
+    assert!(matches!(outcome, Answered::Taken(id) if id == taken), "{outcome:?}");
+    assert_eq!(
+        *host.settled_earlier.lock().expect("the lock"),
+        vec![recorded.clone()],
+        "sending a kept answer"
+    );
+
+    // A send the host refused because the question was answered, by an earlier send that landed
+    // late: the sends this call carried are let go, and the refused one is not among them.
+    let (_directory, drafts) = store();
+    let asked = question(82);
+    let kept = answer_offline(&drafts, &asked).await;
+    begin_with(&drafts, &kept, uncertain);
+    begin_with(&drafts, &kept, taken);
+    let host = Host::with(vec![asked.clone()]);
+    host.holds(uncertain, ReceiptState::Unknown);
+    let late = kept
+        .submission(Some(&asked))
+        .expect("the question is pending");
+    *host.late.lock().expect("the lock") = Some((taken, late));
+    let outcome = answer_via(&host, &drafts, &asked, no(), 6_000)
+        .await
+        .outcome
+        .expect("the earlier send was taken");
+    assert!(
+        matches!(outcome, Answered::TakenAfterRefusal { taken: id, .. } if id == taken),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        *host.settled_earlier.lock().expect("the lock"),
+        vec![recorded.clone()],
+        "after a refusal"
+    );
+
+    // A reconnect reads the record.
+    let (_directory, drafts) = store();
+    let asked = question(83);
+    let kept = answer_offline(&drafts, &asked).await;
+    begin_with(&drafts, &kept, uncertain);
+    begin_with(&drafts, &kept, taken);
+    let host = Host::with(vec![asked.clone()]);
+    host.holds(uncertain, ReceiptState::Unknown);
+    host.holds(taken, ReceiptState::Applied);
+    host.resolve(asked.question_id, QuestionState::Answered);
+    let reconciled = reconcile(&host, &drafts).await.expect("reconciles");
+    assert_eq!(
+        reconciled,
+        vec![Reconciled::Taken {
+            draft: kept,
+            action_id: taken
+        }]
+    );
+    assert_eq!(
+        *host.settled_earlier.lock().expect("the lock"),
+        vec![recorded],
+        "reconciling"
+    );
+}
+
+/// KR-REQ-11.63: the control. A send the host has and has not finished with is not a send it took:
+/// the client lets go of none of the answer's sends while it waits.
+#[tokio::test]
+async fn no_send_is_let_go_of_while_the_host_is_still_working_on_one() {
+    let (_directory, drafts) = store();
+    let asked = question(84);
+    let kept = answer_offline(&drafts, &asked).await;
+    begin_with(&drafts, &kept, action(0x33));
+    begin_with(&drafts, &kept, action(0x34));
+    let host = Host::with(vec![asked.clone()]);
+    host.holds(action(0x33), ReceiptState::Unknown);
+    host.holds(action(0x34), ReceiptState::Dispatching);
+    let waiting = send_via(&host, &drafts, asked.question_id)
+        .await
+        .outcome
+        .expect("nothing sent");
+    assert!(matches!(waiting, Answered::Waiting(_)), "{waiting:?}");
+    assert!(
+        host.settled_earlier.lock().expect("the lock").is_empty(),
+        "a send the host has and has not finished with is not let go of"
+    );
 }
 
 /// KR-REQ-11.63: a retirement decided from a reading of the pair that another command has since
