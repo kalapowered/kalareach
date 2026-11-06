@@ -550,6 +550,29 @@ pub fn bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(k
     }
 }
 
+/// KR-REQ-08.49: three answers a terminal gives to a device-attributes query, alone in a Fish
+/// reader's terminal, are input the reader has not taken.
+///
+/// The case for every reader but PowerShell puts three plain keys behind the answers, because a
+/// reader of Zsh or Bash takes a whole answer out of its keys as it reads them and it is the keys
+/// that are waiting when that reader meets the request. A Fish reader that counted the keys and
+/// nothing else would pass that case, so this one puts the answers into the terminal with nothing
+/// behind them, and what the reader reports on meeting the request is a count of the answers
+/// themselves. Once it has read them a later exchange says the queues are drained.
+///
+/// # Panics
+///
+/// Panics when the reader says its terminal's typeahead is drained with the answers unread, or
+/// says it is not after it has taken them.
+#[cfg(unix)]
+pub fn three_answers_alone_in_the_terminal_are_input_the_fish_reader_has_not_taken() {
+    unread_input_is_not_drained(
+        ShellKind::Fish,
+        b"\x1b[?62;22c\x1b[?62;22c\x1b[?62;22c",
+        b"",
+    );
+}
+
 /// KR-REQ-08.49: the first byte of a character the terminal delivered in two parts is input the
 /// reader has not taken, although it has read it.
 ///
