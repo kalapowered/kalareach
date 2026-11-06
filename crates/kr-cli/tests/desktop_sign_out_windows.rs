@@ -63,6 +63,14 @@ fn system32(program: &str) -> PathBuf {
         .join(program)
 }
 
+/// The system clock in milliseconds since the epoch, the scale a closure's time is on.
+fn now_ms() -> u64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch");
+    u64::try_from(elapsed.as_millis()).expect("a time in milliseconds")
+}
+
 /// Where the first half leaves what the second reads: in the account's own temporary directory,
 /// which a sign-out keeps.
 fn record_path() -> PathBuf {
@@ -75,7 +83,15 @@ fn in_administrators() -> bool {
         .args(["/groups", "/fo", "csv", "/nh"])
         .output()
         .expect("whoami runs");
-    String::from_utf8_lossy(&output.stdout).contains("S-1-5-32-544")
+    assert!(output.status.success(), "whoami /groups failed");
+    let listing = String::from_utf8_lossy(&output.stdout);
+    // Every account's listing names the integrity level it runs at, so a listing without one is not
+    // one, and an account is not taken for a standard one on the strength of an answer that is empty.
+    assert!(
+        listing.contains("Mandatory Label"),
+        "whoami /groups listed no integrity level: {listing:?}"
+    );
+    listing.contains("S-1-5-32-544")
 }
 
 /// The Windows command shell, which a session's root program may be on any machine.
@@ -254,6 +270,7 @@ async fn a_desktop_bound_session_is_made_and_the_account_signed_out() {
         "root": root,
         "task": definition.name,
         "tree": host.tree.root(),
+        "signing_out_at_ms": now_ms(),
     });
     std::fs::write(
         record_path(),
@@ -271,15 +288,17 @@ async fn a_desktop_bound_session_is_made_and_the_account_signed_out() {
         .status()
         .expect("logoff runs");
     assert!(signed_out.success(), "logoff: {signed_out}");
-    // The end of the session ends this process, and nothing after this line runs.
-    tokio::time::sleep(LIVENESS_DEADLINE).await;
-    panic!("login session {login} was not ended within {LIVENESS_DEADLINE:?} of the sign-out");
+    // The end of the session ends this process, and nothing after this line runs. There is nothing
+    // else to wait for, and a sign-out that does not come is read by the run that signed the account
+    // in, which bounds its wait and finds the account's session and processes still there.
+    std::future::pending::<()>().await;
 }
 
 /// A daemon hosted on a state directory an earlier process left, as the daemon of the account's next
 /// sign-in would be.
 struct Reopened {
     root: PathBuf,
+    environment: kr_ipc::paths::EnvironmentPaths,
     serving: Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
     controller: Option<Arc<kr_controller::service::Controller>>,
 }
@@ -340,6 +359,7 @@ impl Reopened {
         ];
         Self {
             root,
+            environment,
             serving,
             controller: Some(controller),
         }
@@ -390,12 +410,13 @@ impl Drop for Reopened {
 /// KR-REQ-03.23, the second half: after the sign-out, the session closes with `desktop_lost`.
 ///
 /// Run in the account's next sign-in, by what the half before recorded. The worker and the root
-/// shell, by the identity each was started under, are ended: the sign-out took them, and the worker
-/// had no chance to write a closure of its own. The platform reads the login the session recorded
-/// as ended, and a daemon started on the state the first half left, which is what the next sign-in
-/// does, gives the session's closure as `desktop_lost` and not as a crash of the worker. A session
-/// made in this login is the control: it is bound to a different login than the old one, the
-/// platform reads it as present, and the old one still as ended.
+/// shell, by the identity each was started under, are ended: the sign-out took them. The platform
+/// reads the login the session recorded as ended, and a daemon started on the state the first half
+/// left, which is what the next sign-in does, gives the session's closure as `desktop_lost` and not
+/// as a crash of the worker, recorded after the sign-out began. A session made in this login is
+/// the control: it is bound to a different login than the old one, the platform reads it as
+/// present, and the old one still as ended. The control session is closed and its processes shown
+/// ended before the first half's task and tree are removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = follows_a_sign_out!()]
 async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost() {
@@ -457,8 +478,17 @@ async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost(
     // Once: asked again, it is the same record.
     let (_, again) = daemon.json(&["attach", &session_id.to_string()]).await;
     assert_eq!(again["closure"], document["closure"], "{again}");
+    let signing_out_at = record["signing_out_at_ms"].as_u64().expect("a time");
+    let closed_at = document["closure"]["closed_at_ms"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the closure says when it was recorded: {document}"));
+    assert!(
+        closed_at >= signing_out_at,
+        "the closure ({closed_at}) was recorded before the sign-out began ({signing_out_at}): {document}"
+    );
     eprintln!(
-        "after the sign-out: session {session_id} is closed with {}",
+        "after the sign-out: session {session_id} is closed with {} at {closed_at} ms, the sign-out \
+         having begun at {signing_out_at} ms",
         document["closure"]["reason"]
     );
 
@@ -491,9 +521,37 @@ async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost(
         "after the sign-out: a session made in login session {now} is bound to {fresh_binding:?}, \
          which reads as present"
     );
-    let fresh_id = fresh["session_id"].as_str().expect("a session identifier");
-    let (status, closed) = daemon.json(&["close", fresh_id]).await;
+    // The control session is closed, and what it started is shown ended before anything is removed
+    // under it. A case that fails before this point leaves the control session to the sign-out and
+    // the account's removal that follow every run.
+    let fresh_id: SessionId = fresh["session_id"]
+        .as_str()
+        .expect("a session identifier")
+        .parse()
+        .expect("parses");
+    let fresh_worker = worker_of(&daemon.environment, fresh_id);
+    let fresh_root = listed(&daemon.environment, fresh_id)
+        .await
+        .root_process
+        .as_ref()
+        .cloned()
+        .expect("the control session names its root shell");
+    let (status, closed) = daemon.json(&["close", &fresh_id.to_string()]).await;
     assert_eq!(status, Some(0), "kr close: {closed}");
+    let waited = tokio::time::Instant::now();
+    for (what, process) in [
+        ("the control session's worker", &fresh_worker),
+        ("the control session's root shell", &fresh_root),
+    ] {
+        while kr_ipc::identity::process_state(process) != kr_ipc::identity::ProcessState::Ended {
+            assert!(
+                waited.elapsed() < LIVENESS_DEADLINE,
+                "{what} (process {}) is still there after the session was closed",
+                process.pid.get()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
 
     // What the first half left in the account's temporary directory goes, the entry with it.
     drop(daemon);
@@ -503,6 +561,7 @@ async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost(
         .status()
         .expect("schtasks runs");
     assert!(removed.success(), "the entry {name} is removed: {removed}");
-    let _ = std::fs::remove_dir_all(&tree);
+    std::fs::remove_dir_all(&tree)
+        .unwrap_or_else(|error| panic!("{} is removed: {error}", tree.display()));
     std::fs::remove_file(&path).expect("the record is removed");
 }
