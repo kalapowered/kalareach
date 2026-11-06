@@ -78,6 +78,9 @@ $script:Kr = @{
     AcceptAnswered     = $false
     TokenPresent       = $false
     Token              = ''
+    # The entry of the read that is about to start, and whether the worker has answered it.
+    EnterId            = [uint64]0
+    EnterAnswered      = $true
     # The question last asked about a command, and the answer to it.
     ResolveId          = [uint64]0
     ResolveAnswered    = $false
@@ -757,7 +760,39 @@ function Send-KrEditorEnter {
         reader_revision   = $reader.reader_revision
         prompt_generation = $reader.prompt_generation
     }
+    $script:Kr.EnterId = $script:Kr.LastEventId
+    $script:Kr.EnterAnswered = $false
     Invoke-KrService
+}
+
+# Waits for the worker's answer to the entry just sent, so that the editor does not start its read
+# before the worker has applied the entry.
+#
+# Outside Windows the editor asks the terminal where the cursor is as it starts, and the worker
+# holds every other answer it writes for the terminal back until it has written the reply to that
+# question. It holds them only once it has applied the entry. The entry and the terminal's output
+# reach the worker by two paths in no fixed order, so a read that started at once could ask its
+# question before the entry was applied, and the worker would let the question go by.
+#
+# The wait is the length of one answer budget at most, and is not made again while an earlier
+# answer is owed: a worker that has stopped answering costs this once.
+function Wait-KrEntryAnswered {
+    if ($IsWindows -or -not $script:Kr.Registered) { return }
+    $id = $script:Kr.EnterId
+    if ($id -eq 0 -or $script:Kr.EnterAnswered) { return }
+    Read-KrAnswers
+    if ($script:Kr.EnterAnswered) { return }
+    if ($script:Kr.Owed -ne 0) {
+        Write-KrTrace "entry ${id}: not waited for: event $($script:Kr.Owed) is still unanswered"
+        return
+    }
+    Write-KrTrace "entry ${id}: waiting for the worker's answer"
+    $deadline = (Get-KrTickMs) + $script:KR_ANSWER_WAIT_MS
+    if (Wait-KrAnswer $id { $script:Kr.EnterAnswered } $deadline) {
+        Write-KrTrace "entry ${id}: answered"
+    } else {
+        Write-KrTrace "entry ${id}: no answer; the read starts"
+    }
 }
 
 function Send-KrEditorLeave {
@@ -1282,6 +1317,11 @@ function Read-KrEventResult {
     # The worker answers in the order it was asked, so this answer, or a later one, is the owed one
     # having come.
     if ($script:Kr.Owed -ne 0 -and $Id -ge $script:Kr.Owed) { $script:Kr.Owed = [uint64]0 }
+    if ($Id -ne 0 -and $Id -eq $script:Kr.EnterId -and -not $script:Kr.EnterAnswered) {
+        # Whatever the worker says of the entry, it has dealt with it: the read may start.
+        $script:Kr.EnterAnswered = $true
+        return
+    }
     $variant = Get-KrVariant $Result
     if ($null -eq $variant) { return }
     $detach = $script:Kr.DetachIds.IndexOf($Id)
@@ -1400,6 +1440,7 @@ function Read-KrAnswers {
                 return
             }
             if (($id -eq $script:Kr.AcceptId -and -not $script:Kr.AcceptAnswered) -or
+                ($id -eq $script:Kr.EnterId -and -not $script:Kr.EnterAnswered) -or
                 ($id -eq $script:Kr.ResolveId -and -not $script:Kr.ResolveAnswered)) {
                 Read-KrEventResult $id $variant.Payload['result']
                 $taken = $true
