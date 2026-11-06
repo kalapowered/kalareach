@@ -776,20 +776,26 @@ function Write-KrHint {
 # twice and a return among the keys is not the editor's Enter. So the program is started with all
 # three streams redirected, which leaves the terminal as the editor has it, and the terminal is
 # given to `stty` by the system shell, which opens it by path as `stty`'s input: that works for the
-# BSD `stty` and for the GNU one, which name a terminal by different options. The shell is started
-# by its absolute path, so that no program of the current directory is found in its place, and it
-# finds `stty` on the path as the person's own shell would, not as a function or an alias of theirs.
+# BSD `stty` and for the GNU one, which name a terminal by different options.
+#
+# `stty` is found by PowerShell's own lookup of a program on the path, as a command line would
+# find it, and not as a function or an alias of the person's. That lookup skips an empty entry of
+# the path, which the system shell reads as the current directory, so the shell is given the
+# program's absolute path to run and never searches the path itself, and it is started by its own
+# absolute path. A relative entry of the path is made absolute where PowerShell found it.
+#
 # The terminal it reads is the controlling one, which is the terminal the editor reads in a terminal
 # emulator, a multiplexer or a login with a terminal. A shell whose input is another terminal than
 # its controlling one gets the controlling terminal's character, and one with no controlling
-# terminal gets none, and the gesture is then not enabled. The program starts in the directory the
-# shell is in, as the program of a command line would, so that a relative entry of the path means
-# what it means at the prompt.
+# terminal gets none, and the gesture is then not enabled.
 function Read-KrTerminalSettings {
+    $program = Get-Command -CommandType Application -Name stty -TotalCount 1 -ErrorAction Ignore
+    if ($null -eq $program) { return $null }
     $start = [System.Diagnostics.ProcessStartInfo]::new('/bin/sh')
-    foreach ($argument in '-c', 'exec stty -a </dev/tty') { $start.ArgumentList.Add($argument) }
-    $directory = Get-KrFileSystemDirectory
-    if ($directory) { $start.WorkingDirectory = $directory }
+    # The shell reads the program as `$0`, after its command text.
+    foreach ($argument in '-c', 'exec "$0" -a </dev/tty', [System.IO.Path]::GetFullPath($program.Source)) {
+        $start.ArgumentList.Add($argument)
+    }
     $start.UseShellExecute = $false
     $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true

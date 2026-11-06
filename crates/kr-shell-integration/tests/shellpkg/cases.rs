@@ -2149,10 +2149,9 @@ const HELD_STTY: &str = "#!/bin/sh\n\
 /// a program runs that has the terminal for any of its three standard streams, and a terminal in
 /// line mode shows every key itself and hands the editor a line feed where the return was, which
 /// the editor does not take for Enter. The case puts a `stty` first on the shell's path that
-/// says what mode the terminal is in while it runs and waits, moves the shell to the directory it
-/// lives in (the path names it by a relative entry), runs a line so that the next read is the one
-/// it waits in, expects the terminal to be raw, types a line and a return while it waits, lets it
-/// go, and expects the line to run.
+/// says what mode the terminal is in while it runs and waits, runs a line so that the next read is
+/// the one it waits in, expects the terminal to be raw, types a line and a return while it waits,
+/// lets it go, and expects the line to run.
 ///
 /// # Panics
 ///
@@ -2168,7 +2167,7 @@ pub fn keys_typed_while_the_module_asks_the_terminal_for_its_settings_are_the_pe
         .prefix("kr-stty-")
         .tempdir()
         .expect("a directory for the held program");
-    let programs = fixture.path().join("kr-stty-bin");
+    let programs = fixture.path().join("bin");
     let hold = fixture.path().join("hold");
     std::fs::create_dir(&programs).expect("a directory for the held program's path");
     std::fs::create_dir(&hold).expect("a directory for the held program's state");
@@ -2195,10 +2194,11 @@ pub fn keys_typed_while_the_module_asks_the_terminal_for_its_settings_are_the_pe
         .expect("an executable held program");
 
     let package = Package::built(kind);
-    // The held program is named on the path by a relative entry, and the shell is moved to the
-    // directory that holds it: the module has to look for `stty` where the shell is, which is not
-    // the directory the shell was started in.
-    let path = format!("kr-stty-bin:{}", std::env::var("PATH").unwrap_or_default());
+    let path = format!(
+        "{}:{}",
+        programs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let mut session = Session::start_with(
         &package,
         &[
@@ -2208,19 +2208,14 @@ pub fn keys_typed_while_the_module_asks_the_terminal_for_its_settings_are_the_pe
     );
     session.first_prompt();
     session.stepping = false;
-    // The program waits in the read that follows the next line, which moves the shell.
+    // The program waits in the read that follows the next line.
     std::fs::write(hold.join("armed"), b"").expect("the file that arms the held program");
     // Counted from before the line runs: the program can say it is running before the line's own
     // check has returned.
     let waiting = session.written();
-    let moving = format!(
-        "Set-Location '{}'; {}",
-        fixture.path().display(),
-        print_assembled(kind, "kr-armed")
-    );
     assert!(
-        session.run(&moving, "kr-armed"),
-        "the line that moves the shell did not run:\n{}",
+        session.answered("kr-armed"),
+        "a line did not run:\n{}",
         session.terminal_output()
     );
     let deadline = session.deadline_for(REPLY);
@@ -2243,6 +2238,76 @@ pub fn keys_typed_while_the_module_asks_the_terminal_for_its_settings_are_the_pe
         session.wait_for_output_after_by(start, "kr-held", deadline),
         "the line typed while the module asked the terminal for its settings did not run:\n{}",
         shown_since(&session, start)
+    );
+}
+
+/// A `stty` for a case that must never run it: it leaves a file where the case looks, then does
+/// what `stty` does.
+#[cfg(unix)]
+const MARKING_STTY: &str = "#!/bin/sh\n\
+    : > \"$KR_STTY_RAN\"\n\
+    if [ -x /bin/stty ]; then exec /bin/stty \"$@\"; fi\n\
+    exec /usr/bin/stty \"$@\"\n";
+
+/// KR-REQ-07.73: the module never runs a program of the shell's current directory to read the
+/// terminal's settings, whatever the path holds.
+///
+/// An empty entry of the path (a leading or a trailing colon, or two together) is the current
+/// directory to a POSIX shell, and a lookup that skips it is the one a command line here makes.
+/// The case puts a `stty` that leaves a file where the case looks in the directory the shell is
+/// in, gives the shell a path with an empty entry at each end, lets the module read the terminal's
+/// settings for the read that follows, and expects the file not to be there.
+///
+/// # Panics
+///
+/// Panics when the program of the current directory ran.
+#[cfg(unix)]
+pub fn a_program_of_the_current_directory_is_not_run_for_an_empty_entry_of_the_path(
+    kind: ShellKind,
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = tempfile::Builder::new()
+        .prefix("kr-stty-")
+        .tempdir()
+        .expect("a directory for the program");
+    let here = fixture.path().join("here");
+    std::fs::create_dir(&here).expect("a directory for the shell to stand in");
+    let ran = fixture.path().join("ran");
+    let program = here.join("stty");
+    std::fs::write(&program, MARKING_STTY).expect("the program of the current directory");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("an executable program");
+
+    let package = Package::built(kind);
+    let path = format!(":{}:", std::env::var("PATH").unwrap_or_default());
+    let mut session = Session::start_with(
+        &package,
+        &[
+            ("PATH".to_owned(), path),
+            ("KR_STTY_RAN".to_owned(), ran.display().to_string()),
+        ],
+    );
+    session.first_prompt();
+    session.stepping = false;
+    let entries = session.commands.entries.len();
+    let moving = format!(
+        "Set-Location '{}'; {}",
+        here.display(),
+        print_assembled(kind, "kr-moved")
+    );
+    assert!(
+        session.run(&moving, "kr-moved"),
+        "the line that moves the shell did not run:\n{}",
+        session.terminal_output()
+    );
+    // The entry of the read that follows is sent after the module has read the settings.
+    session.until("the entry of the read after the line", |commands| {
+        commands.entries.len() > entries
+    });
+    assert!(
+        !ran.exists(),
+        "the module ran the program of the shell's current directory for an empty entry of the path"
     );
 }
 

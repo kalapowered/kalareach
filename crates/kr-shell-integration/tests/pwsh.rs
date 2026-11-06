@@ -162,6 +162,13 @@ fn keys_typed_while_the_module_asks_the_terminal_for_its_settings_are_the_person
     );
 }
 
+/// KR-REQ-07.73: a program of the current directory is not run for an empty entry of the path.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_program_of_the_current_directory_is_not_run_for_an_empty_entry_of_the_path() {
+    shellpkg::a_program_of_the_current_directory_is_not_run_for_an_empty_entry_of_the_path(PWSH);
+}
+
 /// KR-REQ-08.48: in the Windows edit mode the keys typed ahead of a read are the person's own.
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
