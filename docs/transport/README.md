@@ -538,6 +538,11 @@ through.
   the same frames over a local socket.
 * Inactivity: 30 seconds without traffic declares the transport unavailable. A mobile suspension
   that trips it is a normal disconnect.
+* Datagrams: an endpoint sends one UDP datagram per send and never a segmented batch (UDP
+  segmentation offload is off). A kernel without transmit checksum offload on the outgoing device
+  refuses a segmented send, and a connection already open when that first happens would keep
+  asking for batches, so its stream data would stop while keepalives still passed and the
+  inactivity threshold never tripped; the connection then recovers only by being replaced.
 * Reconnect: jittered exponential backoff from 250 ms to 30 seconds, drawn with full jitter so a
   fleet that lost the same relay does not return in step. The ladder resets after a connection that
   lasted at least the inactivity threshold; a connection that died immediately does not reset it.

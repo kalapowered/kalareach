@@ -749,6 +749,13 @@ fn transport_config() -> QuicTransportConfig {
         // than only by the application's own accounting: past this, a write waits instead of
         // handing more bytes to a queue nothing can drain.
         .send_window(MAX_SEND_QUEUE_BYTES as u64)
+        // One datagram per send. Some kernels refuse a segmented send on a device without
+        // transmit checksum offload (the Android emulator's Wi-Fi, some phones' cellular and Wi-Fi
+        // drivers, some Linux NICs). The socket layer then stops batching, but iroh 1.4.1 reads its
+        // limit once, when a connection is created, so a connection already open keeps asking for
+        // batches that are all refused: its stream data stops while pings still pass. Remove this
+        // once iroh reads the limit at every send (iroh issue 4555).
+        .enable_segmentation_offload(false)
         .build()
 }
 
@@ -819,6 +826,24 @@ mod tests {
     fn the_keepalive_and_idle_timeout_are_the_specified_values() {
         assert_eq!(KEEPALIVE, Duration::from_secs(10));
         assert_eq!(IDLE_TIMEOUT, Duration::from_secs(30));
+    }
+
+    /// An endpoint hands the network one datagram at a time, never a segmented batch.
+    ///
+    /// A network device with no transmit checksum offload makes some kernels refuse a segmented
+    /// send (the Android emulator's Wi-Fi interface does). The socket layer then stops batching
+    /// on that socket, but a connection that is already open goes on asking for batches, every
+    /// one is refused, and its stream data stops while single datagrams (acknowledgements,
+    /// keepalives) still pass, so the idle timeout never fires. The setting is the behaviour, and
+    /// a socket that refuses a batch cannot be made in a process, so the transport
+    /// configuration's own description is what is read.
+    #[test]
+    fn an_endpoint_never_asks_for_segmented_datagrams() {
+        let described = format!("{:?}", transport_config());
+        assert!(
+            described.contains("enable_segmentation_offload: false"),
+            "{described}"
+        );
     }
 
     /// KR-REQ-10.02: without a selected relay the endpoint relays nothing.
