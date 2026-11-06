@@ -3702,6 +3702,11 @@ async fn the_application_printed(runtime: &kr_worker::runtime::SessionRuntime, t
 /// terminal's writer, the notice that the lease moved, goes to the writer with the install and not
 /// with whatever writes next. The application here prints nothing after the paste opened, so there
 /// is no later write to carry it.
+///
+/// KR-REQ-08.49, source loss with no successor only: the lease a revision takes while a paste is
+/// open ends the paste at the application, with no reply and no new actor behind it. Not shown
+/// here: the order of that end against a reply or a new actor's first byte, which the takeover
+/// and the lost-holder cases show.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revision_that_takes_a_lease_with_a_paste_open_has_the_paste_closed_at_once() {
     let kept = tempfile::tempdir().expect("a directory for what the application keeps");
