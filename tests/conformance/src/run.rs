@@ -5,9 +5,9 @@
 //! its verdict lands with the result. A `cargo test` step is built once with `--no-run` first,
 //! which is how the report learns which package and target each test binary is: two packages can
 //! both have a test target called `fixtures`, and only the executable tells them apart. The calls
-//! after the build, the listing and the run, build nothing: a file that a macro wrote while a crate
-//! compiled is dated before the build began, as `date_before` says, or Cargo would compile the
-//! crate again in the listing.
+//! after the build, the listing and the run, have nothing to build: a file that a macro wrote while
+//! a crate compiled is dated before the build began, as `date_before` says, or Cargo would compile
+//! the crate again in the listing. A listing that builds anyway says so in the log.
 //!
 //! What the build names is what the run is held to. Every test binary it built is listed, by the
 //! step's own command with this program as Cargo's runner, and has to be run and read; a listing
@@ -625,35 +625,55 @@ const ERROR_BYTES: usize = 800;
 
 /// The end of a failed listing's standard error as the step's error names it: its last
 /// [`ERROR_LINES`] lines that say anything, on one line, the last [`ERROR_BYTES`] bytes of them at
-/// most, with the checkout's path left out of them (a result names none).
+/// most, with the checkout's path left out of them (a result names none). Cargo's own account of
+/// which targets failed ("error: test failed, to rerun pass ...", and the list of targets it ends
+/// with when it was told to go on after a failure) is left out: it says which program failed and
+/// not why, and it would take the place of the lines that say.
 fn ends_of(standard_error: &str, root: &Path) -> String {
     let lines: Vec<&str> = standard_error
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && !cargo_accounts_for_a_failure(line))
         .collect();
     if lines.is_empty() {
         return "it wrote nothing to its standard error".to_owned();
     }
     let mut ends = lines[lines.len().saturating_sub(ERROR_LINES)..].join(" | ");
+    // The root as it is given may be relative, and the paths in the output are not: the working
+    // directory the lines were written in is the root itself.
+    let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     let root = root.to_string_lossy();
+    let backslashes = root.replace('/', "\\");
+    // A path that rustc quotes in a note (a failed link, for one) has each backslash doubled.
     for spelling in [
-        root.to_string(),
+        backslashes.replace('\\', "\\\\"),
+        backslashes,
         root.replace('\\', "/"),
-        root.replace('/', "\\"),
+        root.to_string(),
     ] {
-        if !spelling.is_empty() {
+        if spelling.len() > 1 {
             ends = ends.replace(&spelling, "<root>");
         }
     }
     if ends.len() > ERROR_BYTES {
-        let mut from = ends.len() - ERROR_BYTES;
+        // Three bytes of the limit are the dots.
+        let mut from = ends.len() - (ERROR_BYTES - 3);
         while !ends.is_char_boundary(from) {
             from += 1;
         }
         ends = format!("...{}", &ends[from..]);
     }
     format!("its standard error ends: {ends}")
+}
+
+/// Whether `line` (trimmed) is Cargo's account of which targets failed, as opposed to what they
+/// wrote.
+fn cargo_accounts_for_a_failure(line: &str) -> bool {
+    line.starts_with("error: test failed, to rerun pass")
+        || line.starts_with("error: doctest failed, to rerun pass")
+        || (line.starts_with("error: ") && line.contains(" target") && line.ends_with(" failed:"))
+        || line.starts_with("`-p ")
+        || line.starts_with("`--")
 }
 
 /// Appends what a failed listing wrote to the step's log, whole: the log is where the next failure
@@ -881,8 +901,8 @@ fn build_first(
         let _ = append_to_log(
             log_path,
             &format!(
-                "== {dated} files written while a crate compiled were dated before the build \
-                 began, so that Cargo does not compile the crate again\n{}",
+                "== files named by a digest that the build wrote were dated before it began, so \
+                 that Cargo does not compile their crate again: {dated}\n{}",
                 failed
                     .iter()
                     .map(|file| format!("{file}\n"))
@@ -893,19 +913,25 @@ fn build_first(
     Ok((built, executables))
 }
 
-/// Gives each file under `directories` that was written after `began` a time a second before it.
+/// Gives each content-addressed file under `directories` that was written after `began` a time a
+/// second before it.
 ///
 /// Cargo takes a crate for out of date when a file the compile read is newer than the start of that
 /// compile. The macros of some crates write a file into the build script's output directory while
-/// the crate compiles and read it back at once (Tauri's context macro does it with an application's
-/// icon and front end), and that file is newer than the start of the compile that read it. The
-/// build is complete and the file is what the compile read, but the next call of Cargo compiles the
-/// crate again and links its test programs again, which on a cold target is a second build of the
-/// biggest crate of a step. A time only goes back, to before the build, and only for a file that
-/// the build wrote in the output directory of one of its build scripts: no source file, and no file
-/// an earlier build wrote, looks older than it is, and a file that changed after the compile read
-/// it is not one the build wrote. Returns how many files were given a time, and those that could
-/// not be.
+/// the crate compiles and read it back at once (Tauri's context macro does it with an
+/// application's icon and front end), and that file is newer than the start of the compile that
+/// read it. The build is complete and the file is what the compile read, but the next call of
+/// Cargo compiles the crate again and links its test programs again, which on a cold target is a
+/// second build of the biggest crate of a step.
+///
+/// A file is dated only when its name is a 256-bit digest in hexadecimal digits, with an extension
+/// or none ([`is_named_by_digest`]). Tauri names what its macros write by a digest of the
+/// content, and writes a file only when it is absent, so a file with such a name never holds other
+/// bytes than the ones the compile read, and its time cannot be the only sign of a change. Any
+/// other file keeps its time: a source file, a file a build script wrote (that ends before its
+/// crate compiles, so it is older than the compile), and a file another kind of writer may write
+/// again with other bytes. A time only goes back, to before the build, and only for a file the
+/// build wrote. Returns how many files were given a time, and those that could not be.
 fn date_before(directories: &[PathBuf], began: SystemTime) -> (usize, Vec<String>) {
     let before = began.checked_sub(Duration::from_secs(1)).unwrap_or(began);
     let mut dated = 0;
@@ -925,10 +951,11 @@ fn date_before(directories: &[PathBuf], began: SystemTime) -> (usize, Vec<String
             }
             let path = entry.path();
             let written_after = kind.is_file()
+                && is_named_by_digest(&entry.file_name().to_string_lossy())
                 && entry
                     .metadata()
                     .and_then(|found| found.modified())
-                    .is_ok_and(|written| written > before);
+                    .is_ok_and(|written| written > began);
             if !written_after {
                 continue;
             }
@@ -945,6 +972,12 @@ fn date_before(directories: &[PathBuf], began: SystemTime) -> (usize, Vec<String
         }
     }
     (dated, failed)
+}
+
+/// Whether a file name is 64 hexadecimal digits, with an extension or without one.
+fn is_named_by_digest(name: &str) -> bool {
+    let stem = name.split_once('.').map_or(name, |(stem, _)| stem);
+    stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Runs `command` at `place`, its standard output and error both appended to `log`, and returns
@@ -976,10 +1009,11 @@ fn run_logged(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::path::Path;
 
     use super::{
-        Binary, LISTING_BEGIN, LISTING_END, file_name, is_count, libtest, read_listing, reconcile,
-        unrecorded,
+        Binary, LISTING_BEGIN, LISTING_END, ends_of, file_name, is_count, is_named_by_digest,
+        libtest, read_listing, reconcile, unrecorded,
     };
     use crate::workspace::{TargetId, TargetKind};
 
@@ -1223,5 +1257,55 @@ mod tests {
             "fixtures-4bfa.exe"
         );
         assert_eq!(file_name("fixtures-4bfa"), "fixtures-4bfa");
+    }
+
+    #[test]
+    fn the_end_of_a_standard_error_leaves_out_the_checkout_and_cargos_account_of_a_failure() {
+        // Each way the output can spell the root: as given, with the other separator, and as a
+        // note of rustc's quotes it, with each backslash doubled.
+        let root = std::env::temp_dir().join("checkout");
+        let given = root.to_string_lossy().into_owned();
+        let backslashes = given.replace('/', "\\");
+        let text = format!(
+            "{given}/a\n{}\\b\n{}\\c\n{}\n\
+             error: test failed, to rerun pass `-p t --test x`\n\
+             error: 2 targets failed:\n    `-p t --lib`\n    `-p t --test x`\n",
+            backslashes,
+            backslashes.replace('\\', "\\\\"),
+            "the volume is full",
+        );
+        let ends = ends_of(&text, &root);
+        assert!(ends.contains("the volume is full"), "{ends}");
+        assert!(
+            !ends.contains("targets failed") && !ends.contains("rerun pass"),
+            "{ends}"
+        );
+        assert!(!ends.contains("checkout"), "{ends}");
+        assert!(ends.contains("<root>"), "{ends}");
+        // A relative root names the working directory, and "." is not a path to leave out.
+        assert_eq!(
+            ends_of("disk. (os error 112)", Path::new(".")),
+            "its standard error ends: disk. (os error 112)"
+        );
+        assert_eq!(
+            ends_of("\n  \n", &root),
+            "it wrote nothing to its standard error"
+        );
+        // A cut inside a character moves to the next one, and the whole stays within the bound.
+        let long = format!("{}\n", "\u{e9}".repeat(900));
+        let ends = ends_of(&long, &root);
+        assert!(ends.len() < 900, "{}", ends.len());
+        assert!(ends.contains("...\u{e9}"), "{ends}");
+    }
+
+    #[test]
+    fn only_a_name_that_is_a_digest_marks_a_file_a_macro_writes() {
+        let digest = "aa2e526f1f88fa0a23217584974aaaabd32d47342c168c8cf921633943ea0b60";
+        assert!(is_named_by_digest(digest));
+        assert!(is_named_by_digest(&format!("{digest}.html")));
+        assert!(!is_named_by_digest(&digest[1..]));
+        assert!(!is_named_by_digest(&format!("g{}", &digest[1..])));
+        assert!(!is_named_by_digest("acl-manifests.json"));
+        assert!(!is_named_by_digest("push_gateway_origin"));
     }
 }

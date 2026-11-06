@@ -7,8 +7,9 @@
 //! standard error, `known` has a test that records a known difference, `refused` names a row past the
 //! end of section 21's table and a bare section, `expansions`, which is read and never built,
 //! calls cases through macros and attributes the report cannot see into, and `conventions`, read
-//! and never built as well, steps outside the conventions a helper key relies on. The runs build
-//! into a target directory of their own under the platform's temporary directory.
+//! and never built as well, steps outside the conventions a helper key relies on, and `late`, whose
+//! macro writes a file while its library compiles. The runs build into a target directory of their
+//! own under the platform's temporary directory.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1352,6 +1353,10 @@ fn a_listing_that_fails_leaves_what_it_said_in_the_log_and_the_end_of_it_in_the_
     let step = &document.steps[0];
     let error = step.error.as_deref().unwrap_or_default();
     assert!(error.contains("did not list the step's tests"), "{error}");
+    assert!(
+        !error.contains("targets failed") && !error.contains("rerun pass"),
+        "Cargo's account of the failed targets stands in the place of what they said: {error}"
+    );
     assert!(
         error.contains("the volume is full"),
         "the error does not name what the listing said last: {error}"
