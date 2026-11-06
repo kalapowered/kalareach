@@ -571,23 +571,24 @@ hold first kept it is dropped then.
 
 What the rule does not reach is out of the lane's hands: a reply that has left the lane for the
 writer, which takes a batch as soon as it is queued unless a fence frame holds it, and a reply that
-is already in the terminal's input when the editor asks. The PowerShell module narrows both itself,
-in the Emacs edit mode. Its read-line entry waits for the worker's answer to the entry before the
-editor starts, so the hold is in place before the editor asks and a question that the worker parsed
-first cannot be answered ahead of it (if the answer does not come within the module's budget the
-read starts without it), and then reads the host's answers that are in the terminal's input and
-drops them; it reports the reader idle only after the editor has asked, so the hold does not end
-early. The shell-integration document says how. An answer that reaches the terminal during or after
-that read, and a reply the writer cannot write because the terminal's input is full, are still out
-of reach. In a read where the module queues no key of its own, the first idle report comes from the
-first key that reaches one of its boundaries, so an editor that never asks where the cursor is (a
-terminal with no capability for it) leaves the hold in force until then, or until it leaves. Two
-limits come with the rule: a cursor report that is not queued for the terminal (the lane is full or
-its budget is spent, the report lapsed behind a shut gate, or the writer's bounds refuse it) leaves
-the hold in force until the editor is reading keys, leaves, the integration is lost or the session
-closes, and the lane's bound of 128 KiB applies to what it keeps. A report that was queued and then
-lapsed in the writer ends the hold all the same. The shell-integration document says how the module
-is arranged around each.
+is already in the terminal's input when the editor asks. The PowerShell module narrows both itself.
+Outside Windows its read-line entry waits for the worker's answer to the entry before the editor
+starts, so the hold is in place before the editor asks and a question that the worker parsed first
+cannot be answered ahead of it (if the answer does not come within the module's budget the read
+starts without it), and it reports the reader idle only after the editor has asked, so the hold does
+not end early. In the Emacs edit mode it then reads the host's answers that are in the terminal's
+input and drops them; in the Vi and Windows edit modes it leaves the input alone. The
+shell-integration document says how. An answer that reaches the terminal during or after that read,
+and a reply the writer cannot write because the terminal's input is full, are still out of reach. In
+a read where the module queues no key of its own, the first idle report comes from the first key
+that reaches one of its boundaries, so an editor that never asks where the cursor is (a terminal
+with no capability for it) leaves the hold in force until then, or until it leaves. Two limits come
+with the rule: a cursor report that is not queued for the terminal (the lane is full or its budget
+is spent, the report lapsed behind a shut gate, or the writer's bounds refuse it) leaves the hold in
+force until the editor is reading keys, leaves, the integration is lost or the session closes, and
+the lane's bound of 128 KiB applies to what it keeps. A report that was queued and then lapsed in
+the writer ends the hold all the same. The shell-integration document says how the module is
+arranged around each.
 
 #### Where a reply is attributed to nothing
 

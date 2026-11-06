@@ -382,18 +382,20 @@ function Skip-KrReply {
 #
 # What is taken is what the chords take in the editor, and only where those chords are the module's:
 # in the Emacs edit mode, for an introducer whose chord (`Escape,[`, `Escape,]` or `Escape,P`) the
-# module bound. In the Vi and Windows edit modes, and where the person has bound the chord, an
-# Escape and the key behind it are theirs, so nothing is taken there. The introducer is compared as
-# typed: `Escape,p` is another chord. An Escape that is followed at once by an introducer is the
-# start of an answer, taken to the end of the sequence, and one that is followed by another Escape
-# starts again at the later one, so an Escape the person pressed does not hide an answer behind it.
-# Nothing is waited for: only keys the terminal has delivered are read, and every other key, the
-# Escape of a key that is no answer included, is put into the editor's queue in the order it came in,
-# behind the module's own key, even when the read fails part way. A key typed ahead is therefore met
-# by the editor as it would have been in the terminal.
+# module bound and the editor still holds, read from the editor's tables at each read. In the Vi and
+# Windows edit modes, and where the person has bound the chord or the Escape key since, an Escape and
+# the key behind it are theirs, so nothing is read there. The introducer is compared as typed:
+# `Escape,p` is another chord. An Escape that is followed at once by an introducer is the start of an
+# answer, taken to the end of the sequence, and one that is followed by another Escape starts again
+# at the later one, so an Escape the person pressed does not hide an answer behind it. Nothing is
+# waited for: only keys the terminal has delivered are read, and every other key, the Escape of a key
+# that is no answer included, is put into the editor's queue in the order it came in, behind the
+# module's own key. When the read fails part way, the keys it had finished with are put there; the
+# ones of the answer it was reading are lost. A key typed ahead is therefore met by the editor as it
+# would have been in the terminal.
 function Clear-KrStaleReplies {
     if ($IsWindows -or -not $script:Kr.Registered -or $script:State.EditMode -cne 'Emacs') { return }
-    $introducers = @(@($script:Hooks.Replies) | ForEach-Object { "$_" -creplace '^Escape,', '' })
+    $introducers = @(Get-KrOwnReplyIntroducers)
     if ($introducers.Count -eq 0) { return }
     try {
         $queue = Get-KrKeyQueue

@@ -135,6 +135,24 @@ fn a_chord_the_person_bound_on_an_escape_runs_when_it_was_typed_ahead_of_a_read(
     shellpkg::a_chord_the_person_bound_on_an_escape_runs_when_it_was_typed_ahead_of_a_read(PWSH);
 }
 
+/// KR-REQ-08.48: a chord the person binds after the first prompt runs when it was typed ahead of a read.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_chord_the_person_binds_after_the_first_prompt_runs_when_it_was_typed_ahead_of_a_read() {
+    shellpkg::a_chord_the_person_binds_after_the_first_prompt_runs_when_it_was_typed_ahead_of_a_read(
+        PWSH,
+    );
+}
+
+/// KR-REQ-08.48: an Escape the person binds alone after the first prompt leaves the keys behind it theirs.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn an_escape_the_person_binds_after_the_first_prompt_leaves_the_keys_behind_it_theirs() {
+    shellpkg::an_escape_the_person_binds_after_the_first_prompt_leaves_the_keys_behind_it_theirs(
+        PWSH,
+    );
+}
+
 /// KR-REQ-08.48: in the Windows edit mode the keys typed ahead of a read are the person's own.
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
