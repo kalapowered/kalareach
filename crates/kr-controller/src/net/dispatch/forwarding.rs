@@ -166,6 +166,35 @@ pub(super) fn request_of(
 }
 
 impl RemoteConnection {
+    /// Enters a mutation the connection has read ahead of the request it is answering, and holds
+    /// behind it, among the calls that have not claimed the route of their action: it is on this
+    /// host and will be carried out when its turn comes, although no door has served it yet.
+    pub(super) fn hold_ahead(&self, frame: &ControlFrame) {
+        let ControlFrame::Mutation(mutation) = frame else {
+            return;
+        };
+        if let Some(request) = request_of(&self.device.principal(), mutation) {
+            let arrival = self.controller.arrivals().arrive(request);
+            self.held_ahead
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(mutation.request_id, arrival);
+        }
+    }
+
+    /// The entry of `mutation` among the calls that have not claimed, when it was held ahead and
+    /// its turn has come, and otherwise a new one: the call is entered once, when it arrives.
+    pub(super) fn arrival_of(&self, mutation: &MutationRequest) -> Option<Arrival> {
+        self.held_ahead
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&mutation.request_id)
+            .or_else(|| {
+                request_of(&self.device.principal(), mutation)
+                    .map(|request| self.controller.arrivals().arrive(request))
+            })
+    }
+
     /// The standing work decided under `acting` takes with it: this connection's pairing grant,
     /// `acting`, and the shares it has decided a request under.
     pub(super) fn feed_standing(&self, acting: &kr_protocol::grant::Grant) -> FeedStanding {
@@ -224,7 +253,8 @@ impl RemoteConnection {
     /// action, and so has left no route to be read.
     ///
     /// Read before the route is: a call writes its route before it leaves the set, so a reader that
-    /// finds the set without the copy finds the copy's route.
+    /// finds the set without the copy finds the copy's route. A close whose route could not be
+    /// recorded has neither once its connection has ended ([`Arrivals`]).
     fn another_copy_has_not_claimed(
         &self,
         own_claim: &OwnClaim,
