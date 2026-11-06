@@ -3552,7 +3552,8 @@ such a device the outcome is unknown. A request whose route the daemon cannot re
 whose reservation the daemon cannot read, of an action whose record it cannot read in the attention
 store, the workflow journal, the registry's receipts of authority changes or its record of pairing
 actions, or of a rearm whose chain or grant it cannot read, is told `OUTCOME_UNKNOWN` and nothing is
-performed: a record that cannot be read is not one that is absent.
+performed: a record that cannot be read is not one that is absent. Where the daemon cannot read
+such a record it cannot tell a first action from a repeat, and tells both the same.
 The services behind the door check the registration again where they write, and a copy of an
 action that meets a fence owed there is refused in their words. A service that answers a copy of an
 action from its own record while it carries the action out, because the first copy finished
