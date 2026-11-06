@@ -1001,8 +1001,8 @@ mod tests {
     ///
     /// KR-ACC-018, the parts about select/other and confirm/other: the free-text answer is accepted
     /// on a select and on a confirm, within 16 KiB, and on no input question, and the free-text
-    /// option is never answered as a listed choice. This is the validation of the answer; no case
-    /// answers a confirm with it through the tools.
+    /// option is never answered as a listed choice. This is the validation of the answer; the case
+    /// that answers a confirm with it through the tools is in kr-cli's contact tests.
     #[test]
     fn an_answer_is_one_arm_of_the_union_and_at_most_sixteen_kibibytes() {
         let input = question(QuestionKind::Input, &[]);

@@ -473,7 +473,7 @@ async fn a_select_is_answered_with_free_text_and_the_agent_reads_it_as_free_text
 ///
 /// KR-ACC-018, the parts about text and confirm: a text answer reaches the agent as input text, a
 /// confirm carries "Something else", and a no reaches the agent as a decision of false. Not shown
-/// here: an `other` answer to a confirm.
+/// here: an `other` answer to a confirm, which the next case shows.
 #[tokio::test(flavor = "multi_thread")]
 async fn text_and_confirm_answers_reach_the_agent() {
     // KR-REQ-01.18: text and yes-or-no answers reach the agent that asked.
@@ -548,6 +548,66 @@ async fn text_and_confirm_answers_reach_the_agent() {
         .await;
     assert_eq!(waited["answer"]["kind"], "decision");
     assert_eq!(waited["answer"]["decided"], json!(false));
+}
+
+/// A confirm, answered with the free-text option from the command line.
+///
+/// This is the scripted end-to-end run for a yes-or-no question: the agent asks, a person answers
+/// `--other` with a text that begins with a yes, and the agent's wait returns that text as free text
+/// and not as a decision.
+///
+/// KR-ACC-018, the part about confirm/other: a confirm carries "Something else", and a person's
+/// free-text answer to it reaches the agent as free text, neither folded into a yes nor into a no.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_confirm_is_answered_with_free_text_and_the_agent_reads_it_as_neither_yes_nor_no() {
+    // KR-REQ-11.59: a confirm carries "Something else", and the free-text answer reaches the agent
+    // as free text.
+    let hosted = hosted().await;
+    let (created, failed) = hosted
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "ask-confirm-other",
+                "context": "the branch has two remotes",
+                "question": "delete the branch?",
+                "type": "confirm"
+            }),
+        )
+        .await;
+    assert!(!failed, "the question was created: {created}");
+    assert_eq!(created["state"], "pending");
+    assert_eq!(created["choices"][0]["choice_id"], "something_else");
+    let question_id = created["question_id"].as_str().expect("an identifier");
+    let token = created["caller_token"].as_str().expect("a token");
+
+    let answered = hosted.kr(&[
+        "question",
+        "answer",
+        question_id,
+        "--other",
+        "yes, but only the remote one",
+        "--json",
+    ]);
+    assert!(
+        answered.status.success(),
+        "kr question answer: {}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+
+    let (waited, failed) = hosted
+        .call(
+            "wait_for_answer",
+            json!({"question_id": question_id, "caller_token": token, "wait_seconds": 20}),
+        )
+        .await;
+    assert!(!failed, "the wait answered: {waited}");
+    assert_eq!(waited["state"], "answered");
+    assert_eq!(waited["answer"]["kind"], "other");
+    assert_eq!(waited["answer"]["text"], "yes, but only the remote one");
+    assert!(
+        waited["answer"].get("decided").is_none(),
+        "the free text was not turned into a decision: {waited}"
+    );
 }
 
 /// Two clients answering at once: one wins, and the other is told the question is resolved.
