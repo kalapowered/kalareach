@@ -2890,7 +2890,7 @@ async fn a_transfer_action_whose_record_cannot_be_read_is_told_the_outcome_is_un
         .expect("the records can be read again");
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
 
-    control
+    let first = control
         .mutate(
             Method::UploadBegin,
             action,
@@ -2900,6 +2900,45 @@ async fn a_transfer_action_whose_record_cannot_be_read_is_told_the_outcome_is_un
         .await
         .expect("the call reaches the daemon")
         .expect("upload.begin is performed once the record can be read");
+
+    // A result the store reads and cannot decode is the same: the action was performed, and what it
+    // came to is not known.
+    let kept: Vec<u8> = store
+        .query_row(
+            "SELECT result FROM actions WHERE method = 'upload.begin'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the action's result");
+    store
+        .execute("UPDATE actions SET result = x'ff'", [])
+        .expect("the result cannot be decoded");
+    let undecoded = failure(
+        control
+            .mutate(
+                Method::UploadBegin,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    store
+        .execute("UPDATE actions SET result = ?1", [&kept])
+        .expect("the result can be decoded again");
+    assert_eq!(undecoded.code, ErrorCode::OutcomeUnknown, "{undecoded:?}");
+    let again = control
+        .mutate(
+            Method::UploadBegin,
+            action,
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the repeat is answered once the result can be decoded");
+    assert_eq!(again, first, "the action was performed once");
     host.stop().await;
 }
 
