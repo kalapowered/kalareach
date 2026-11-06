@@ -91,6 +91,10 @@ struct State {
     creation: Arc<Gate>,
     /// The closing of a call, which a test can hold.
     closing: Arc<Gate>,
+    /// The upgrade of a control socket, which a test can hold.
+    upgrades: Arc<Gate>,
+    /// How many control upgrades reached the service's gate, whatever became of them.
+    upgrade_attempts: usize,
     /// Whether closing a call over HTTP also ends the call's control, as the service does.
     control_follows_close: bool,
     seen: Vec<Seen>,
@@ -124,14 +128,18 @@ enum CloseFault {
 /// A voice service and its control route on a loopback port.
 pub struct StandIn {
     origin: String,
+    address: std::net::SocketAddr,
     route: Arc<ControlRoute>,
     state: Arc<Mutex<State>>,
-    task: tokio::task::JoinHandle<()>,
+    /// The task that accepts connections, until a test closes the port.
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Drop for StandIn {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = self.task.lock().expect("the stand-in's task").take() {
+            task.abort();
+        }
     }
 }
 
@@ -190,11 +198,14 @@ impl StandIn {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a loopback port");
-        let origin = format!("http://{}", listener.local_addr().expect("an address"));
+        let address = listener.local_addr().expect("an address");
+        let origin = format!("http://{address}");
         let route = Arc::new(ControlRoute::detached(origin.clone(), None));
         let state = Arc::new(Mutex::new(State {
             creation: Arc::default(),
             closing: Arc::default(),
+            upgrades: Arc::default(),
+            upgrade_attempts: 0,
             control_follows_close: false,
             seen: Vec::new(),
             tokens: Vec::new(),
@@ -206,22 +217,13 @@ impl StandIn {
             phone_close_gate: Arc::default(),
             down: false,
         }));
-        let (serving_route, serving_state) = (Arc::clone(&route), Arc::clone(&state));
-        let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                if serving_state.lock().expect("the stand-in's state").down {
-                    drop(stream);
-                    continue;
-                }
-                let (route, state) = (Arc::clone(&serving_route), Arc::clone(&serving_state));
-                tokio::spawn(async move { serve(stream, &route, &state).await });
-            }
-        });
+        let task = accepting(listener, Arc::clone(&route), Arc::clone(&state));
         Self {
             origin,
+            address,
             route,
             state,
-            task,
+            task: Mutex::new(Some(task)),
         }
     }
 
@@ -291,6 +293,68 @@ impl StandIn {
     pub fn go_down(&self) {
         self.state.lock().expect("the stand-in's state").down = true;
         self.route.drop_sockets();
+    }
+
+    /// Holds the upgrade of every control socket: the request is read and counted
+    /// ([`Self::upgrade_attempts`]) and answered, or dropped if the service has gone down meanwhile,
+    /// once [`Self::release_upgrades`] lets it.
+    pub fn hold_upgrades(&self) {
+        let gate = Arc::clone(&self.state.lock().expect("the stand-in's state").upgrades);
+        gate.hold();
+    }
+
+    /// Lets the held upgrades go on.
+    pub fn release_upgrades(&self) {
+        let gate = Arc::clone(&self.state.lock().expect("the stand-in's state").upgrades);
+        gate.release();
+    }
+
+    /// How many control upgrades reached the service, whatever became of them.
+    pub fn upgrade_attempts(&self) -> usize {
+        self.state
+            .lock()
+            .expect("the stand-in's state")
+            .upgrade_attempts
+    }
+
+    /// Waits until `count` control upgrades have reached the service.
+    pub async fn until_upgrade_attempts(&self, count: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while self.upgrade_attempts() < count {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no control upgrade reached the stand-in"));
+    }
+
+    /// Takes the service away as a host that is off the network is: its port is closed, so a
+    /// connection is refused outright, and every control socket that is open is dropped. A request
+    /// made to it was never carried out. [`Self::go_down`] is the other way down: the service takes
+    /// the connection and ends it, so a request may have been carried out.
+    pub async fn refuse_connections(&self) {
+        let task = self.task.lock().expect("the stand-in's task").take();
+        if let Some(task) = task {
+            task.abort();
+            // The listener is dropped when the aborted task is, which is waited for here so that
+            // the very next connection is refused.
+            let _ = task.await;
+        }
+        self.route.drop_sockets();
+    }
+
+    /// Brings the service back after [`Self::go_down`] or [`Self::refuse_connections`], on the port
+    /// it had. Fails the case if the port cannot be bound again.
+    pub async fn come_up(&self) {
+        self.state.lock().expect("the stand-in's state").down = false;
+        if self.task.lock().expect("the stand-in's task").is_some() {
+            return;
+        }
+        let listener = TcpListener::bind(self.address)
+            .await
+            .unwrap_or_else(|error| panic!("the stand-in's port was not free again: {error}"));
+        let task = accepting(listener, Arc::clone(&self.route), Arc::clone(&self.state));
+        *self.task.lock().expect("the stand-in's task") = Some(task);
     }
 
     /// Has a call closed over HTTP end the call's control with a closure, as the service does when
@@ -386,6 +450,24 @@ impl StandIn {
     }
 }
 
+/// Accepts connections on `listener` until the task is ended or the listener fails.
+fn accepting(
+    listener: TcpListener,
+    route: Arc<ControlRoute>,
+    state: Arc<Mutex<State>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            if state.lock().expect("the stand-in's state").down {
+                drop(stream);
+                continue;
+            }
+            let (route, state) = (Arc::clone(&route), Arc::clone(&state));
+            tokio::spawn(async move { serve(stream, &route, &state).await });
+        }
+    })
+}
+
 /// Reads one request's head, and what was read with it.
 async fn read_head(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
     let mut bytes = Vec::new();
@@ -430,6 +512,17 @@ async fn serve(mut stream: TcpStream, route: &ControlRoute, state: &Arc<Mutex<St
     };
     let authorization = header(&head, "authorization");
     if header(&head, "upgrade").is_some_and(|value| value.eq_ignore_ascii_case("websocket")) {
+        let gate = {
+            let mut state = state.lock().expect("the stand-in's state");
+            state.upgrade_attempts += 1;
+            Arc::clone(&state.upgrades)
+        };
+        gate.pass().await;
+        // An upgrade held while the service went down is dropped, as the service drops what it
+        // accepts when it is down.
+        if state.lock().expect("the stand-in's state").down {
+            return;
+        }
         let disposition = {
             let state = state.lock().expect("the stand-in's state");
             authorization

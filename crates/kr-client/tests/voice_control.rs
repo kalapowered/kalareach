@@ -941,12 +941,40 @@ async fn an_answer_that_may_pass_is_tried_again() {
     route.refuse_next(&[429, 502, 408, 503]);
     let (_control, mut news) = open(&route, &Tokens::new());
 
+    // The first refusal is told, the three that follow are the same outage and are not.
+    assert!(matches!(next(&mut news).await, ControlNews::Detached));
     let (reattached, _) = attached(&mut news).await;
 
     assert!(!reattached, "it was never attached before");
     let report = route.report();
     assert_eq!(report.refused_upgrades, 4);
     assert_eq!(report.upgrades.len(), 1);
+}
+
+/// A control that has never attached says so on the first attempt that fails, once for the outage,
+/// so the owner shows the service as unreachable without waiting out the absent window; the loss of
+/// a socket it did serve is the same news, and the outage after it is told again.
+#[tokio::test]
+async fn a_control_that_cannot_attach_says_so_once_for_the_outage_and_again_for_the_next() {
+    let route = ControlRoute::start().await;
+    route.refuse_next(&[503, 503, 503]);
+    let (_control, mut news) = open(&route, &Tokens::new());
+
+    assert!(
+        matches!(next(&mut news).await, ControlNews::Detached),
+        "the first failed attempt is told"
+    );
+    // `attached` fails the case if a second `Detached` comes first.
+    let (reattached, _) = attached(&mut news).await;
+    assert!(!reattached);
+    assert_eq!(route.report().refused_upgrades, 3);
+
+    route.refuse_next(&[503, 503]);
+    route.drop_sockets();
+    assert!(matches!(next(&mut news).await, ControlNews::Detached));
+    let (reattached, _) = attached(&mut news).await;
+    assert!(reattached, "the second outage ends in a reattachment");
+    assert_eq!(route.report().refused_upgrades, 5);
 }
 
 #[tokio::test]
@@ -982,6 +1010,7 @@ async fn no_account_token_ends_the_control_and_a_service_that_is_down_does_not()
         ErrorCode::UpstreamUnavailable,
     ]);
     let (_control, mut news) = open(&route, &tokens);
+    assert!(matches!(next(&mut news).await, ControlNews::Detached));
     attached(&mut news).await;
     assert_eq!(tokens.scopes().len(), 3);
 }

@@ -29,7 +29,8 @@ pub struct VoiceCallState {
     /// Whether the model's voice is coming out of this device.
     pub playing: bool,
     /// The call's own control channel to the voice service: `none` when it holds none,
-    /// `connected`, or `unreachable`.
+    /// `connecting` while it opens its first socket, `connected`, or `unreachable` once an attempt
+    /// has failed and until a socket is held again.
     pub control: String,
     /// Whether the host this call belongs to is being reached: `none` with no call, `reachable`,
     /// or `lost`.

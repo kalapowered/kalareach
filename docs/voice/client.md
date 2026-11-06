@@ -152,8 +152,8 @@ Whenever capture is in any state other than `capturing`, the UI displays:
 
 `VoiceContextFrame::new` (`crates/kr-client/src/services/voice.rs`) refuses an append over
 `VOICE_CONTEXT_BYTES` (500) rather than truncating it. The control client
-above builds every context request, and the companion application's own process does not yet
-open a control socket. Reading what the host selected for a call is a read from the host, and the
+above builds every context request, and the task that owns the call opens the control socket.
+Reading what the host selected for a call is a read from the host, and the
 screen shows it as the host's selection.
 
 A delegation the host admits without performing it is shown as **admission**, never as execution
@@ -164,14 +164,16 @@ receipts remain the sole authority for what ran on a host.
 
 Muting the microphone, silencing the model's voice ("Stop the voice") and hanging up a call are
 local operations of the call's own native media pipeline, and they depend on neither the broker nor
-the network. The companion application's own process holds no call: its mute commands refuse with
-"this device is not holding a voice call", and its stop command asks the host and reports that
-nothing was closed locally.
+the network. A hang-up stops the media and has the host revoke the call's grant at once, and neither
+waits for the voice service.
 
-The call's own report about its control channel (`none`, `connected` or `unreachable`) is the only
-source of whether the voice service is answering, and this application reports `none`. When a call
-reports the service unreachable, the screen says so, and muting the microphone, silencing the voice
-and ending the session stay available, as do the requests that go to the host.
+The call's own report about its control channel is the only source of whether the voice service is
+answering. It is `connecting` while the control opens its first socket, `connected` while it holds
+one, and `unreachable` from the first attempt that fails, or from the loss of a socket it served,
+until a socket is held again. The control tells each outage once, not each attempt, and a call
+whose control stays unreachable for 120 seconds ends. It is `none` when the call holds no control.
+When a call reports the service unreachable, the screen says so, and muting the microphone,
+silencing the voice and ending the session stay available, as do the requests that go to the host.
 
 ## Speech interruption vs task cancellation
 

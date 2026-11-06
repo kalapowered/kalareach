@@ -356,7 +356,11 @@ pub enum ControlNews {
         /// [`VOICE_KNOWN_DELEGATIONS`] of them: the newest are kept.
         delegations: Vec<String>,
     },
-    /// The socket was lost. The control is opening it again until the absent window has passed.
+    /// No socket is held, and the control is opening one until the absent window has passed.
+    ///
+    /// Told once for each outage: when a socket that was served is lost, and, for a control that
+    /// has not attached yet, when its first attempt fails. The attempts that follow in the same
+    /// outage are not told again, and an attachment ends the outage, so the next loss is told.
     Detached,
     /// A frame from the service that is not `ready` and not the closure.
     ///
@@ -1008,6 +1012,8 @@ impl Driver {
     async fn keep_attached(&mut self) -> Option<ControlEnd> {
         let mut lost_at = Instant::now();
         let mut failures = 0_u32;
+        // Whether the owner has been told that no socket is held, for the outage that is on.
+        let mut detached_told = false;
         loop {
             // The window bounds the attempt as well as the wait between attempts, so a service
             // that answers slowly cannot hold the control open past it.
@@ -1028,10 +1034,17 @@ impl Driver {
                 Ok(Ok(attached)) => attached,
                 Ok(Err(Attempt::End(end))) => return Some(end),
                 Ok(Err(Attempt::Retry)) => {
+                    if !detached_told {
+                        detached_told = true;
+                        if self.tell(ControlNews::Detached).await.is_err() {
+                            return None;
+                        }
+                    }
                     self.back_off(&mut failures, deadline).await?;
                     continue;
                 }
             };
+            detached_told = false;
             let attached_at = Instant::now();
             let (socket, delegations) = attached;
             self.set_known(&delegations);
@@ -1052,6 +1065,7 @@ impl Driver {
                     // read before the owner is told: a slow owner does not move it.
                     lost_at = Instant::now();
                     let served = lost_at.saturating_duration_since(attached_at);
+                    detached_told = true;
                     if self.tell(ControlNews::Detached).await.is_err() {
                         return None;
                     }

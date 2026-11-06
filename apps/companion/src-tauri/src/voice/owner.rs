@@ -834,7 +834,9 @@ impl Owner {
         self.view(|state| {
             state.running = true;
             state.session = Some(shown);
-            state.control = "none".to_owned();
+            // The control is opening its first socket: `unreachable` follows the first attempt that
+            // fails, and `connected` the attachment.
+            state.control = "connecting".to_owned();
             state.host = "reachable".to_owned();
             state.capture = "idle".to_owned();
         });

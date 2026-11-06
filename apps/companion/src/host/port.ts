@@ -1061,8 +1061,10 @@ export interface VoiceCallState {
   /** Whether the model's voice is coming out of this device. */
   readonly playing: boolean
   /**
-   * The call's own control channel to the voice service: `none` when it holds none, `connected`,
-   * or `unreachable`. Whether the voice service is answering is read from here and nowhere else.
+   * The call's own control channel to the voice service: `none` when it holds none, `connecting`
+   * while it opens its first socket, `connected`, or `unreachable` once an attempt has failed and
+   * until a socket is held again. Whether the voice service is answering is read from here and
+   * nowhere else.
    */
   readonly control: string
   /**
