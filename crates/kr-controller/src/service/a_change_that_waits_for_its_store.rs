@@ -1091,6 +1091,7 @@ async fn asked_after_a_create(private: bool) -> Vec<(SessionId, i64)> {
     controller
         .session_create(&actor_id, &create_request(temp.environment_id()), carried)
         .await
+        .into_answer()
         .expect_err("this test starts no workers");
     let asked = asked.lock().expect("the record is not poisoned");
     asked.clone()
@@ -1146,6 +1147,7 @@ async fn a_create_whose_admission_lapses_while_it_waits_for_the_record(lapse: La
             controller
                 .session_create(&actor_id, &mutation, carried)
                 .await
+                .into_answer()
         }
     });
     // The create has reserved its session, which it does before it waits for the record. Where it
@@ -1239,6 +1241,7 @@ async fn a_create_whose_obligation_cannot_be_written_starts_nothing() {
     let refused = controller
         .session_create(&actor_id, &create_request(temp.environment_id()), carried)
         .await
+        .into_answer()
         .expect_err("a create whose obligation cannot be recorded starts nothing");
     assert!(
         refused.to_string().contains("refused the obligation"),
@@ -1330,6 +1333,7 @@ async fn a_create_that_cannot_say_what_it_started_leaves_a_launch_forgotten_unle
         controller
             .session_create(&actor_id, &create_request(temp.environment_id()), carried)
             .await
+            .into_answer()
             .expect_err("a create that cannot say what it started fails");
         let spawned = controller
             .registry
