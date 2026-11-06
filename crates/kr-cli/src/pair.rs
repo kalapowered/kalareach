@@ -574,18 +574,33 @@ async fn confirmed(
         "Confirm this on an owner device. Waiting {}.",
         remaining(expires_at_ms, kr_ipc::now_ms().get())
     ));
-    loop {
-        match perform(client, target.clone(), effect).await? {
-            Ok(answer) => return Ok(answer),
-            Err(error)
-                if error.code == ErrorCode::OwnerConfirmationRequired
-                    && kr_ipc::now_ms().get() < expires_at_ms =>
-            {
-                tokio::time::sleep(OWNER_DEVICE_POLL).await;
-            }
-            Err(error) => return Err(CliError::Refused(error)),
-        }
-    }
+    // The wait is the one every owner-device ceremony shares, so a refusal for now, a refusal in
+    // the host's definite word, and an answer the host did not give each end it the same way. Its
+    // deadline is the host's own expiry, measured once on this process's monotonic clock.
+    let deadline = tokio::time::Instant::now()
+        + crate::plugin::time_left(expires_at_ms, kr_ipc::now_ms().get());
+    let client = tokio::sync::Mutex::new(client);
+    crate::plugin::wait_for_an_owner_device(
+        deadline,
+        crate::plugin::PERFORM_WITHIN,
+        OWNER_DEVICE_POLL,
+        async || match perform(&mut **client.lock().await, target.clone(), effect).await? {
+            Ok(answer) => Ok(answer),
+            Err(refused) => Err(CliError::Refused(refused)),
+        },
+        async || {
+            crate::plugin::listed_in(
+                bind::read(
+                    &mut **client.lock().await,
+                    Method::OwnerConfirmationPending,
+                    &OwnerConfirmationPendingParams {},
+                )
+                .await,
+                &challenge.request,
+            )
+        },
+    )
+    .await
 }
 
 /// What the host lists as the description of `request`, which the owner device is shown for it.
