@@ -196,8 +196,8 @@ must-arrive events' and presentation may not take them. The two the service keep
 per connection, one in the worker's client) are bounded in bytes, and that bound covers the record
 of what has already been dropped as well as what is waiting. In those two, losses coalesce into one
 record per registration of a binding, so a reader that stopped reading cannot be given a backlog of
-gaps either, and a
-document is dropped whole: every piece of it that is waiting goes together, and the pieces of it
+gaps either, and a document is dropped whole: every piece of it that is waiting goes together, and
+the pieces of it
 that have not arrived yet are dropped as they arrive, whether they were dropped to make room or
 refused for want of it. Half a document would tell a reader it had a whole one. The queue remembers
 which documents went until their last piece has been accounted for or until their registration goes. That
@@ -221,11 +221,16 @@ notice and with each loss it records, the registration that produced it, and two
 one identifier never share a record. Removing a binding takes out of the queue everything its
 registration put there. The notice writer asks, while it holds the connection's writer, whether the
 connection still stands behind the registration a notice came from, and writes nothing when it does
-not. That covers a notice the writer had already taken off the queue, and the report of a lost
-document, which would otherwise ask the identifier's next registration to draw again. The host
-writes everything a registration produced before it answers that registration's unbind, and nothing
-after, so the worker's client empties its own queue of the binding's notices when the answer says a
-binding was removed. The next registration of the identifier is shown none of the old one's.
+not. That covers a notice the writer had already taken off the queue. The report of a lost document
+is checked a step earlier, before the writer is taken, because it also asks a component to draw
+again, and it asks only the registration that suffered the loss. The host writes everything a
+registration produced before it answers that registration's unbind, and nothing after, so the
+worker's client empties its own queue of the binding's notices when the answer says a binding was
+removed. That is exact for a worker, which registers the identifier again only after the answer. A
+caller that registers it again while the unbind waits could have the new registration's first
+notices written before the answer, with nothing in a notice to tell them from the old ones, so its
+client keeps what its queue holds. The next registration of the identifier is shown none of the old
+one's.
 
 A binding also holds a bounded number of unanswered calls. A caller whose deadline ran out has
 stopped waiting, but its request is still on the binding's thread until that thread reaches it, and
@@ -466,7 +471,8 @@ arrives before the host has read or compiled the component is about it: the host
 binding existed, and refuses the registration when it gets further. An unbind removes the
 registration the connection held under the identifier when the request was read, so a second unbind
 of an identifier that was registered again in the meantime finds nothing and leaves the new
-registration alone.
+registration alone. The answer says that a binding existed to the request that ended the
+registration, and to no other request about it.
 
 A document travels as its own frames, chunked so each fits one, and every piece names the document it
 belongs to; only the last is marked as the last. That is how a reader knows which notices go together
