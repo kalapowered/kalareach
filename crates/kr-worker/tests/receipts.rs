@@ -6070,14 +6070,25 @@ async fn a_reconnect_discards_unsent_keystrokes_rather_than_replaying_them() {
 // ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-09.20, the connection identity of the input stream: the lease record names the
-/// connection that holds it, and a client that goes away and comes back is a connection of its own,
-/// so the lease it takes records another identity, a later epoch and a sequence that starts again
-/// at zero. The record is read in the answer to the acquisition and from the worker's own lease.
+/// connection that holds it, and a client that comes back as a connection of its own takes the
+/// lease with another identity, a later epoch and a sequence that starts again at zero. It takes
+/// the lease while the first connection still holds it, as a host that has not yet counted the
+/// first connection gone sees it, and the record is read in the answer to the acquisition and from
+/// the worker's own lease. When the first connection then goes, the lease still names the second.
 /// Not shown here: that the old stream's unsent keystrokes are discarded, which the case above
 /// shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_lease_names_the_connection_that_holds_it_and_a_reconnect_is_another() {
     let host = host().await;
+    let lease_connection = |host: &Host| {
+        host.service
+            .runtime()
+            .session()
+            .lease()
+            .connection_id
+            .as_ref()
+            .copied()
+    };
     let mut first = cli(&host).await;
     let first_connection = first.acknowledgement().connection_id;
     let attachment = attach(&mut first, &host).await;
@@ -6093,18 +6104,12 @@ async fn the_lease_names_the_connection_that_holds_it_and_a_reconnect_is_another
             .expect("an in-order write is accepted");
     }
     assert_eq!(
-        host.service
-            .runtime()
-            .session()
-            .lease()
-            .connection_id
-            .as_ref(),
-        Some(&first_connection),
+        lease_connection(&host),
+        Some(first_connection),
         "and the worker's own lease says so too"
     );
 
-    // The client goes away and comes back as a connection of its own.
-    drop(first);
+    // The client comes back as a connection of its own while the first still holds the lease.
     let mut second = cli(&host).await;
     let second_connection = second.acknowledgement().connection_id;
     assert_ne!(
@@ -6118,7 +6123,6 @@ async fn the_lease_names_the_connection_that_holds_it_and_a_reconnect_is_another
         Some(&second_connection),
         "the new stream is under the new connection's identity"
     );
-    assert_ne!(next.connection_id, held.connection_id);
     assert!(
         next.epoch.get() > held.epoch.get(),
         "and under a later epoch"
@@ -6128,15 +6132,17 @@ async fn the_lease_names_the_connection_that_holds_it_and_a_reconnect_is_another
         0,
         "and starts again at sequence zero"
     );
+    assert_eq!(lease_connection(&host), Some(second_connection));
+
+    // The first connection goes, and the lease it no longer holds still names the second.
+    drop(first);
+    write_input(&mut second, &host, reattached, next.epoch, 0, b"b")
+        .await
+        .expect("the new stream's first position is accepted");
     assert_eq!(
-        host.service
-            .runtime()
-            .session()
-            .lease()
-            .connection_id
-            .as_ref(),
-        Some(&second_connection),
-        "the worker's own lease no longer names the first connection"
+        lease_connection(&host),
+        Some(second_connection),
+        "the first connection going leaves the lease with the second"
     );
 }
 
@@ -6222,6 +6228,10 @@ async fn write_input(
         .expect("reaches the worker")
         .map(|value| value.to_typed().expect("decodes"))
 }
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.23: the bound on an input batch
+// ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-09.23: an input batch beyond the frame bound is refused rather than truncated, so the
 /// parser is never told about bytes the host decided not to carry.
