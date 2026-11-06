@@ -8,8 +8,9 @@
 //! end of section 21's table and a bare section, `expansions`, which is read and never built,
 //! calls cases through macros and attributes the report cannot see into, and `conventions`, read
 //! and never built as well, steps outside the conventions a helper key relies on, and `late`, whose
-//! macro writes a file while its library compiles. The runs build into a target directory of their
-//! own under the platform's temporary directory.
+//! macro writes a file while its library compiles (its package `racy` has two test programs that
+//! do). The runs build into a target directory of their own under the platform's temporary
+//! directory.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1438,6 +1439,45 @@ fn a_file_a_macro_writes_while_a_crate_compiles_does_not_have_the_listing_build_
         "the run built what the build before it had built:\n{log}"
     );
     assert!(document.passed());
+}
+
+/// Two test programs of one package that expand the macro are independent of each other, so Cargo
+/// may compile them at the same time, and one may read the file while the other writes it. Nothing
+/// then says which read it whole, but the file's time, so the build leaves it as it is and the
+/// next call compiles them again, as it did before.
+#[test]
+fn a_file_two_test_programs_may_write_and_read_at_once_keeps_its_time() {
+    let evidence = tempfile::tempdir().expect("an evidence directory");
+    let target = tempfile::tempdir().expect("a target directory");
+    let options = Options {
+        root: tree("late"),
+        evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
+        selection: Some(vec![Group::Rust]),
+        all_terminals: false,
+        platform: Platform::current(),
+        case_tables: &[],
+        lanes: &[],
+        ignored_runs: None,
+        applications: None,
+        steps: Some(vec![Step::cargo(
+            Group::Rust,
+            "the package's tests",
+            &["test", "--locked", "-p", "racy", "--no-fail-fast"],
+        )]),
+        lister: lister(),
+        environment: vec![(
+            "CARGO_TARGET_DIR".to_owned(),
+            target.path().to_string_lossy().into_owned(),
+        )],
+    };
+    let document = report::run(&options, &mut |_| {}).expect("runs");
+    let step = &document.steps[0];
+    assert!(step.error.is_none(), "{step:?}");
+    let log = std::fs::read_to_string(evidence.path().join(&step.log)).expect("the step's log");
+    assert!(
+        log.lines().any(|line| line.contains("is left to Cargo")),
+        "the build dated a file that two compiles read:\n{log}"
+    );
 }
 
 #[test]

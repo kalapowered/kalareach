@@ -12,15 +12,21 @@ pub fn embed(_input: TokenStream) -> TokenStream {
     let directory = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("a build script"));
     let file = directory.join(NAME);
     if !file.exists() {
-        std::fs::write(&file, b"written").expect("the file is written");
+        // Written beside the file and put in place whole, so that no compile that runs at the
+        // same time reads a part of it.
+        let beside = directory.join(format!("writing-{}", std::process::id()));
+        std::fs::write(&beside, b"written").expect("the file is written");
         // A file system whose times are whole seconds would give this file and the start of the
         // compile the same time. This file is newer than the compile by a minute on any of them.
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         std::fs::File::options()
             .write(true)
-            .open(&file)
+            .open(&beside)
             .and_then(|written| written.set_modified(later))
             .expect("the file is dated");
+        let placed = std::fs::rename(&beside, &file);
+        let _ = std::fs::remove_file(&beside);
+        assert!(placed.is_ok() || file.exists(), "the file is put in place");
     }
     format!("include_bytes!({:?})", file.to_string_lossy())
         .parse()

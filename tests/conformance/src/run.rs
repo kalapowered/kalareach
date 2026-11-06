@@ -626,31 +626,39 @@ const ERROR_BYTES: usize = 800;
 /// The end of a failed listing's standard error as the step's error names it: its last
 /// [`ERROR_LINES`] lines that say anything, on one line, the last [`ERROR_BYTES`] bytes of them at
 /// most, with the checkout's path left out of them (a result names none). Cargo's own account of
-/// which targets failed ("error: test failed, to rerun pass ...", and the list of targets it ends
-/// with when it was told to go on after a failure) is left out: it says which program failed and
+/// which targets failed ([`what_the_targets_said`]) is left out: it says which program failed and
 /// not why, and it would take the place of the lines that say.
 fn ends_of(standard_error: &str, root: &Path) -> String {
-    let lines: Vec<&str> = standard_error
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !cargo_accounts_for_a_failure(line))
-        .collect();
+    let lines = what_the_targets_said(standard_error);
     if lines.is_empty() {
-        return "it wrote nothing to its standard error".to_owned();
+        return if standard_error.trim().is_empty() {
+            "it wrote nothing to its standard error".to_owned()
+        } else {
+            "it wrote only Cargo's account of the failed targets to its standard error".to_owned()
+        };
     }
     let mut ends = lines[lines.len().saturating_sub(ERROR_LINES)..].join(" | ");
-    // The root as it is given may be relative, and the paths in the output are not: the working
-    // directory the lines were written in is the root itself.
-    let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
-    let root = root.to_string_lossy();
-    let backslashes = root.replace('/', "\\");
-    // A path that rustc quotes in a note (a failed link, for one) has each backslash doubled.
-    for spelling in [
-        backslashes.replace('\\', "\\\\"),
-        backslashes,
-        root.replace('\\', "/"),
-        root.to_string(),
-    ] {
+    // The root as it is given may be relative, or have `..` or a link in it, and the paths in the
+    // output are the working directory's own.
+    let given = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut spellings = vec![given.to_string_lossy().into_owned()];
+    // On Windows the physical path has a `\\?\` prefix that no output carries.
+    #[cfg(unix)]
+    {
+        if let Ok(physical) = std::fs::canonicalize(root) {
+            spellings.push(physical.to_string_lossy().into_owned());
+        }
+    }
+    for spelling in spellings.clone() {
+        let backslashes = spelling.replace('/', "\\");
+        // A path that rustc quotes in a note (a failed link, for one) has each backslash doubled.
+        spellings.push(backslashes.replace('\\', "\\\\"));
+        spellings.push(backslashes);
+        spellings.push(spelling.replace('\\', "/"));
+    }
+    // A longer spelling first, so that one that contains another is not cut in two.
+    spellings.sort_by_key(|spelling| std::cmp::Reverse(spelling.len()));
+    for spelling in spellings {
         if spelling.len() > 1 {
             ends = ends.replace(&spelling, "<root>");
         }
@@ -666,14 +674,51 @@ fn ends_of(standard_error: &str, root: &Path) -> String {
     format!("its standard error ends: {ends}")
 }
 
-/// Whether `line` (trimmed) is Cargo's account of which targets failed, as opposed to what they
-/// wrote.
-fn cargo_accounts_for_a_failure(line: &str) -> bool {
-    line.starts_with("error: test failed, to rerun pass")
-        || line.starts_with("error: doctest failed, to rerun pass")
-        || (line.starts_with("error: ") && line.contains(" target") && line.ends_with(" failed:"))
-        || line.starts_with("`-p ")
-        || line.starts_with("`--")
+/// The lines of `text`, trimmed, that are not Cargo's account of which targets failed: the line
+/// "error: test failed, to rerun pass ..." (or "error: doctest failed ...") after each failed
+/// program, and, when Cargo was told to go on after a failure, the header "error: N targets
+/// failed:" with the indented, backquoted command lines that follow it. A similar line anywhere
+/// else is kept.
+fn what_the_targets_said(text: &str) -> Vec<&str> {
+    let mut said = Vec::new();
+    let mut in_the_account = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("error: test failed, to rerun pass")
+            || trimmed.starts_with("error: doctest failed, to rerun pass")
+        {
+            in_the_account = false;
+            continue;
+        }
+        if names_the_targets_that_failed(trimmed) {
+            in_the_account = true;
+            continue;
+        }
+        if in_the_account {
+            if line.starts_with(char::is_whitespace)
+                && trimmed.starts_with('`')
+                && trimmed.ends_with('`')
+            {
+                continue;
+            }
+            in_the_account = false;
+        }
+        said.push(trimmed);
+    }
+    said
+}
+
+/// Whether `line` is "error: 1 target failed:" or "error: 3 targets failed:".
+fn names_the_targets_that_failed(line: &str) -> bool {
+    line.strip_prefix("error: ")
+        .and_then(|rest| rest.strip_suffix(" failed:"))
+        .and_then(|rest| rest.split_once(' '))
+        .is_some_and(|(count, noun)| {
+            count.parse::<u32>().is_ok() && matches!(noun, "target" | "targets")
+        })
 }
 
 /// Appends what a failed listing wrote to the step's log, whole: the log is where the next failure
@@ -858,19 +903,26 @@ fn build_first(
     let mut built = Vec::new();
     let mut executables = BTreeMap::new();
     let mut outputs = Vec::new();
+    let mut compiled = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        // The output directory of a build script of a crate of this tree (a path, not a registry).
-        if message["reason"] == "build-script-executed"
-            && message["package_id"]
-                .as_str()
-                .is_some_and(|package| package.starts_with("path+"))
-            && let Some(directory) = message["out_dir"].as_str()
-        {
-            outputs.push(PathBuf::from(directory));
-            continue;
+        // The output directory of a build script of a crate of this tree (a path, not a registry),
+        // and what this build compiled of such a crate.
+        let tree_package = message["package_id"]
+            .as_str()
+            .filter(|package| package.starts_with("path+"));
+        if let Some(package) = tree_package {
+            if message["reason"] == "build-script-executed"
+                && let Some(directory) = message["out_dir"].as_str()
+            {
+                outputs.push((package.to_owned(), PathBuf::from(directory)));
+                continue;
+            }
+            if message["reason"] == "compiler-artifact" && message["fresh"] != true {
+                compiled.extend(Compiled::from_artifact(package, &message));
+            }
         }
         // A test binary is a target built with the test profile; a program the tests launch is
         // built too, as itself, and is not one.
@@ -896,14 +948,16 @@ fn build_first(
             }
         }
     }
-    let (dated, failed) = date_before(&outputs, began);
-    if dated > 0 || !failed.is_empty() {
+    let dating = date_before(&outputs, &compiled, began);
+    if dating.dated > 0 || !dating.left.is_empty() {
         let _ = append_to_log(
             log_path,
             &format!(
                 "== files named by a digest that the build wrote were dated before it began, so \
-                 that Cargo does not compile their crate again: {dated}\n{}",
-                failed
+                 that Cargo does not compile their crate again: {}\n{}",
+                dating.dated,
+                dating
+                    .left
                     .iter()
                     .map(|file| format!("{file}\n"))
                     .collect::<String>()
@@ -913,8 +967,104 @@ fn build_first(
     Ok((built, executables))
 }
 
-/// Gives each content-addressed file under `directories` that was written after `began` a time a
-/// second before it.
+/// What a compile of a crate of this tree was, for deciding whether two of them could have run
+/// beside each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unit {
+    /// The package's library.
+    Library,
+    /// The package's library built with its unit tests, which does not wait for the library.
+    LibraryTests,
+    /// A program or a test program of the package, which links the library and so waits for it.
+    Other,
+}
+
+/// A crate of this tree that a build compiled (and did not find fresh), with the files its compile
+/// read.
+#[derive(Debug)]
+struct Compiled {
+    /// The package it is of, as Cargo names it in its messages.
+    package: String,
+    /// What it is.
+    unit: Unit,
+    /// Rustc's dependency file for it: every file the compile read, when that file could be read.
+    read: Option<String>,
+}
+
+impl Compiled {
+    /// The unit a `compiler-artifact` message of Cargo's describes, unless it is a build script.
+    fn from_artifact(package: &str, message: &serde_json::Value) -> Option<Self> {
+        let kinds: Vec<&str> = message["target"]["kind"]
+            .as_array()?
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        if kinds.contains(&"custom-build") {
+            return None;
+        }
+        let tests = message["profile"]["test"] == true;
+        let library = kinds
+            .iter()
+            .any(|kind| matches!(*kind, "lib" | "rlib" | "dylib" | "cdylib" | "staticlib"));
+        let unit = match (library, tests) {
+            (true, false) => Unit::Library,
+            (true, true) => Unit::LibraryTests,
+            (false, _) => Unit::Other,
+        };
+        // The dependency file lies beside the outputs: `host-<hash>.d` for the executable
+        // `host-<hash>`, `krate-<hash>.d` for `libkrate-<hash>.rlib`.
+        let stem = if let Some(executable) = message["executable"].as_str() {
+            Some(PathBuf::from(executable))
+        } else {
+            message["filenames"]
+                .as_array()?
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .find(|name| name.ends_with(".rlib"))
+                .map(PathBuf::from)
+        }
+        .and_then(|path| {
+            let name = path.file_stem()?.to_str()?.to_owned();
+            let name = if message["executable"].is_null() {
+                name.strip_prefix("lib").map_or(name.clone(), str::to_owned)
+            } else {
+                name
+            };
+            Some(path.with_file_name(format!("{name}.d")))
+        });
+        Some(Self {
+            package: package.to_owned(),
+            unit,
+            read: stem.and_then(|path| std::fs::read_to_string(path).ok()),
+        })
+    }
+}
+
+/// Whether the compiles in `readers` could have run beside each other.
+///
+/// Cargo compiles a unit as soon as the ones it needs are done. A program and a test program of a
+/// package link its library, so they wait for it; the library's unit tests, and each of two
+/// programs or test programs, do not wait for the library or for each other.
+fn may_have_overlapped(readers: &[Unit]) -> bool {
+    let others = readers
+        .iter()
+        .filter(|unit| **unit != Unit::Library)
+        .count();
+    others > 1 || (readers.contains(&Unit::LibraryTests) && readers.contains(&Unit::Library))
+}
+
+/// What [`date_before`] did.
+#[derive(Debug, Default)]
+struct Dating {
+    /// How many files were given a time.
+    dated: usize,
+    /// The files it left as they were, and why, and the files it could not give a time.
+    left: Vec<String>,
+}
+
+/// Gives each content-addressed file in `outputs`, the output directories of the build scripts of
+/// this tree's packages, that the build wrote and that no two compiles can have read at once, a
+/// time a second before `began`.
 ///
 /// Cargo takes a crate for out of date when a file the compile read is newer than the start of that
 /// compile. The macros of some crates write a file into the build script's output directory while
@@ -924,54 +1074,79 @@ fn build_first(
 /// Cargo compiles the crate again and links its test programs again, which on a cold target is a
 /// second build of the biggest crate of a step.
 ///
-/// A file is dated only when its name is a 256-bit digest in hexadecimal digits, with an extension
-/// or none ([`is_named_by_digest`]). Tauri names what its macros write by a digest of the
-/// content, and writes a file only when it is absent, so a file with such a name never holds other
-/// bytes than the ones the compile read, and its time cannot be the only sign of a change. Any
-/// other file keeps its time: a source file, a file a build script wrote (that ends before its
-/// crate compiles, so it is older than the compile), and a file another kind of writer may write
-/// again with other bytes. A time only goes back, to before the build, and only for a file the
-/// build wrote. Returns how many files were given a time, and those that could not be.
-fn date_before(directories: &[PathBuf], began: SystemTime) -> (usize, Vec<String>) {
+/// That the file is newer is also what shows that a compile read a file another compile was still
+/// writing: Tauri's macro writes a file directly, not through a rename, so a compile that finds it
+/// present can read part of it. So a file is dated only when it is named by a digest of 64
+/// hexadecimal digits, with an extension or none ([`is_named_by_digest`]: Tauri names what its
+/// macros write so, and a complete file holds the bytes its name stands for), and only when the
+/// compiles that read it (rustc's dependency files say which) cannot have run beside each other
+/// ([`may_have_overlapped`]): then the compile that wrote it is the one that read it, or the one
+/// that read it started after the writer was done. Any other file keeps its time, and Cargo
+/// compiles the crate again in the next call, as it did before. A time only goes back, to before
+/// the build, and only for a file the build wrote. The compile that wrote the file is told by
+/// nothing but the dependency files, so a package with a compile whose dependency file cannot be
+/// read is left alone whole.
+fn date_before(outputs: &[(String, PathBuf)], compiled: &[Compiled], began: SystemTime) -> Dating {
     let before = began.checked_sub(Duration::from_secs(1)).unwrap_or(began);
-    let mut dated = 0;
-    let mut failed = Vec::new();
-    let mut pending = directories.to_vec();
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
+    let mut dating = Dating::default();
+    for (package, directory) in outputs {
+        let units: Vec<&Compiled> = compiled
+            .iter()
+            .filter(|unit| unit.package == *package)
+            .collect();
+        let unreadable = units.iter().any(|unit| unit.read.is_none());
+        let mut pending = vec![directory.clone()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
                 continue;
             };
-            if kind.is_dir() {
-                pending.push(entry.path());
-                continue;
-            }
-            let path = entry.path();
-            let written_after = kind.is_file()
-                && is_named_by_digest(&entry.file_name().to_string_lossy())
-                && entry
-                    .metadata()
-                    .and_then(|found| found.modified())
-                    .is_ok_and(|written| written > began);
-            if !written_after {
-                continue;
-            }
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .and_then(|file| file.set_modified(before))
-            {
-                Ok(()) => dated += 1,
-                Err(error) => {
-                    failed.push(format!("{} could not be dated: {error}", path.display()))
+            for entry in entries.flatten() {
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    pending.push(entry.path());
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let written_after = kind.is_file()
+                    && is_named_by_digest(&name)
+                    && entry
+                        .metadata()
+                        .and_then(|found| found.modified())
+                        .is_ok_and(|written| written > began);
+                if !written_after {
+                    continue;
+                }
+                let path = entry.path();
+                let readers: Vec<Unit> = units
+                    .iter()
+                    .filter(|unit| unit.read.as_ref().is_some_and(|read| read.contains(&name)))
+                    .map(|unit| unit.unit)
+                    .collect();
+                if unreadable || readers.is_empty() || may_have_overlapped(&readers) {
+                    dating.left.push(format!(
+                        "{} is left to Cargo: the compiles that read it cannot be told apart in \
+                         time ({} of them)",
+                        path.display(),
+                        readers.len()
+                    ));
+                    continue;
+                }
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_modified(before))
+                {
+                    Ok(()) => dating.dated += 1,
+                    Err(error) => dating
+                        .left
+                        .push(format!("{} could not be dated: {error}", path.display())),
                 }
             }
         }
     }
-    (dated, failed)
+    dating
 }
 
 /// Whether a file name is 64 hexadecimal digits, with an extension or without one.
@@ -1012,8 +1187,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Binary, LISTING_BEGIN, LISTING_END, ends_of, file_name, is_count, is_named_by_digest,
-        libtest, read_listing, reconcile, unrecorded,
+        Binary, ERROR_BYTES, LISTING_BEGIN, LISTING_END, Unit, ends_of, file_name, is_count,
+        is_named_by_digest, libtest, may_have_overlapped, read_listing, reconcile, unrecorded,
     };
     use crate::workspace::{TargetId, TargetKind};
 
@@ -1282,10 +1457,14 @@ mod tests {
         );
         assert!(!ends.contains("checkout"), "{ends}");
         assert!(ends.contains("<root>"), "{ends}");
-        // A relative root names the working directory, and "." is not a path to leave out.
+        // A relative root names the working directory: the paths in the output are the
+        // directory's own, and a dot is not a path to leave out.
+        let here = std::env::current_dir().expect("a working directory");
+        let text = format!("disk. (os error 112) {}", here.join("target").display());
         assert_eq!(
-            ends_of("disk. (os error 112)", Path::new(".")),
-            "its standard error ends: disk. (os error 112)"
+            ends_of(&text, Path::new(".")),
+            "its standard error ends: disk. (os error 112) <root>/target"
+                .replace('/', std::path::MAIN_SEPARATOR_STR)
         );
         assert_eq!(
             ends_of("\n  \n", &root),
@@ -1294,8 +1473,74 @@ mod tests {
         // A cut inside a character moves to the next one, and the whole stays within the bound.
         let long = format!("{}\n", "\u{e9}".repeat(900));
         let ends = ends_of(&long, &root);
-        assert!(ends.len() < 900, "{}", ends.len());
+        assert!(
+            ends.len() <= "its standard error ends: ".len() + ERROR_BYTES,
+            "{}",
+            ends.len()
+        );
         assert!(ends.contains("...\u{e9}"), "{ends}");
+    }
+
+    #[test]
+    fn only_cargos_own_account_of_the_failed_targets_is_left_out_of_the_end() {
+        // A line that looks like the account but is not stays, with the reason a target failed.
+        let text = "`--list` is not supported by this runner\n\
+                    error: 3 failures happened\n\
+                    error: test failed, to rerun pass `-p t --lib`\n\
+                    error: 1 target failed:\n    `-p t --lib`\n";
+        let ends = ends_of(text, Path::new("/nowhere"));
+        assert_eq!(
+            ends,
+            "its standard error ends: `--list` is not supported by this runner | error: 3 failures happened"
+        );
+        // Nothing else was said: the end says so, and does not call the standard error empty.
+        let ends = ends_of(
+            "error: test failed, to rerun pass `-p t --lib`\nerror: 1 target failed:\n    `-p t --lib`\n",
+            Path::new("/nowhere"),
+        );
+        assert!(ends.contains("only Cargo's account"), "{ends}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_with_a_dotdot_or_a_link_in_it_is_left_out_by_its_physical_path() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let real = directory.path().join("real");
+        std::fs::create_dir_all(real.join("checkout")).expect("a checkout");
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("a link");
+        let physical = std::fs::canonicalize(real.join("checkout")).expect("a physical path");
+        for root in [
+            link.join("checkout"),
+            real.join("checkout").join("..").join("checkout"),
+        ] {
+            let text = format!("cannot write in {}: no room", physical.display());
+            let ends = ends_of(&text, &root);
+            assert_eq!(
+                ends,
+                "its standard error ends: cannot write in <root>: no room",
+                "{}",
+                root.display()
+            );
+        }
+    }
+
+    #[test]
+    fn compiles_of_a_package_that_could_have_run_beside_each_other_are_told() {
+        // Programs and test programs link the library, so they wait for it.
+        assert!(!may_have_overlapped(&[Unit::Library]));
+        assert!(!may_have_overlapped(&[Unit::Library, Unit::Other]));
+        assert!(!may_have_overlapped(&[Unit::Other]));
+        assert!(!may_have_overlapped(&[Unit::LibraryTests]));
+        // The library's unit tests do not wait for it, nor do two programs wait for each other.
+        assert!(may_have_overlapped(&[Unit::Library, Unit::LibraryTests]));
+        assert!(may_have_overlapped(&[
+            Unit::Library,
+            Unit::Other,
+            Unit::Other
+        ]));
+        assert!(may_have_overlapped(&[Unit::Other, Unit::Other]));
+        assert!(may_have_overlapped(&[Unit::LibraryTests, Unit::Other]));
     }
 
     #[test]

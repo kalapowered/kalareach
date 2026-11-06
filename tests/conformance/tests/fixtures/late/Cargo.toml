@@ -2,7 +2,8 @@
 # repository's workspace never builds it.
 #
 # The library embeds a file that a macro writes into the build script's output directory while the
-# library compiles, as Tauri's context macro does with an application's icon and front end.
+# library compiles, as Tauri's context macro does with an application's icon and front end. The
+# package `racy` has two test programs that do it, which Cargo may compile at the same time.
 [package]
 name = "late"
 version = "0.1.0"
@@ -20,3 +21,4 @@ doctest = false
 embed = { path = "embed" }
 
 [workspace]
+members = ["racy"]
