@@ -3,11 +3,11 @@
 //! On Linux such an invocation runs inside one Landlock ruleset with no rule on the whole
 //! filesystem. On macOS it runs inside a sandbox profile that denies by default and names what it
 //! may read. On both it reads the directories the operation owns, the ones it is lent, Git's own
-//! program, the device nodes and the support set named for this host's Git, and on Linux its
-//! helper directory, and nothing else the account can read. Each refusal here sits beside its control: the same
-//! operation on the same objects with exactly one restriction lifted, which reads what the refusal
-//! did not. Where the refusal is the system's, it is shown in the child's own words, as a refusal
-//! to open the object, rather than as an exit code.
+//! program, the device nodes and the support set named for this host's Git, and on Linux its helper
+//! directory, and nothing else the account can read. Each refusal here sits beside its control: the
+//! same operation on the same objects with exactly one restriction lifted, which reads what the
+//! refusal did not. Where the refusal is the system's, it is shown in the child's own words, as a
+//! refusal to open the object, rather than as an exit code.
 //!
 //! Elsewhere no platform confines what Git reads, and such an invocation is refused with the
 //! reason.

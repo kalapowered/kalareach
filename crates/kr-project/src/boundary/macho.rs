@@ -11,10 +11,10 @@
 //! `@rpath` entries it carries, and the same of each library found, until nothing new is named.
 //! Where this host differs from the loader it leaves a library ungranted, so that the program does
 //! not start inside the profile, or it refuses the set; both fail closed. The one difference that
-//! grants more is a name under a system path, which `find` explains. A library is granted by the directory
-//! it is in once every link in its name is resolved, because a profile judges the path a file has,
-//! not the one it was opened by, and because Git and the libraries it loads open further modules
-//! from the same directory while they run.
+//! grants more is a name under a system path, which `find` explains. A library is granted by the
+//! directory it is in once every link in its name is resolved, because a profile judges the path a
+//! file has, not the one it was opened by, and because Git and the libraries it loads open further
+//! modules from the same directory while they run.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
