@@ -2692,9 +2692,11 @@ async fn one_more_actor_than_the_store_admits_is_refused() {
     host.stop().await;
 }
 
-/// A daemon whose store was taken from it refuses each action as unavailable rather than
-/// answering it as done: the write that finds out is refused, and every later one is refused
-/// before the store performs anything.
+/// A daemon whose store was taken from it refuses each action rather than answering it as done:
+/// the write that finds out is refused as unavailable, and every later one is refused before the
+/// store performs anything. A later one cannot be told from a repeat of an action the store holds
+/// a record of, since the store cannot be asked, so it is told that what became of it is not
+/// known.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_action_the_store_can_no_longer_record_is_refused() {
     let owner_keys = DeviceKeys::generate().expect("owner keys");
@@ -2750,7 +2752,7 @@ async fn an_action_the_store_can_no_longer_record_is_refused() {
         .await
         .expect("the call reaches the daemon")
         .expect_err("a store this daemon knows it lost records nothing");
-    assert_eq!(refused.code, ErrorCode::StorageUnavailable);
+    assert_eq!(refused.code, ErrorCode::OutcomeUnknown);
     host.stop().await;
 }
 
