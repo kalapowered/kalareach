@@ -67,8 +67,12 @@ struct Scene {
     /// Set when the outage mode has read the figure of the first audio played out, after which the
     /// script takes the voice service away.
     figure_read: Arc<AtomicBool>,
-    /// Set when the script has taken the voice service away.
+    /// Set when the script is about to take the voice service away, before it does.
     service_gone: Arc<AtomicBool>,
+    /// Set when the task that moves the counters exists, and when it has carried a value after it
+    /// saw `service_gone`, so that none is carried after the service drops.
+    producer: Arc<AtomicBool>,
+    producer_saw_the_service_gone: Arc<AtomicBool>,
     /// The checks reported so far, by name.
     reported: Arc<std::sync::Mutex<Vec<&'static str>>>,
     _data: tempfile::TempDir,
@@ -123,6 +127,8 @@ async fn scene() -> Scene {
         looked: Arc::default(),
         figure_read: Arc::default(),
         service_gone: Arc::default(),
+        producer: Arc::default(),
+        producer_saw_the_service_gone: Arc::default(),
         reported: Arc::default(),
         _data: data,
     }
@@ -239,21 +245,29 @@ impl Scene {
             platform.tell(CallEvent::Playout);
         }
         let gone = Arc::clone(&self.service_gone);
+        let saw = Arc::clone(&self.producer_saw_the_service_gone);
+        self.producer.store(true, Ordering::SeqCst);
         let mut counted = from;
         tokio::spawn(async move {
             loop {
+                // The flag is read once for the round: a round that saw it carries a value that
+                // no later round moves, and says so after it has carried it.
+                let leaving = gone.load(Ordering::SeqCst);
+                let grows = match moves {
+                    Moves::Always => true,
+                    Moves::Never => false,
+                    Moves::UntilTheServiceIsGone => !leaving,
+                };
+                if grows {
+                    counted += 100;
+                }
                 platform.carry(Media {
                     packets_received: Some(counted),
                     packets_sent: Some(counted),
                     played_samples: Some(counted * 480),
                 });
-                let grows = match moves {
-                    Moves::Always => true,
-                    Moves::Never => false,
-                    Moves::UntilTheServiceIsGone => !gone.load(Ordering::SeqCst),
-                };
-                if grows {
-                    counted += 100;
+                if leaving {
+                    saw.store(true, Ordering::SeqCst);
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -270,8 +284,19 @@ impl Scene {
         })
         .await
         .expect("the figure was read");
-        self.stand_in.go_down();
+        // The counters stop first, and the service drops after the task that moves them has said it
+        // carried its last value.
         self.service_gone.store(true, Ordering::SeqCst);
+        if self.producer.load(Ordering::SeqCst) {
+            tokio::time::timeout(WATCHDOG, async {
+                while !self.producer_saw_the_service_gone.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the counters were frozen");
+        }
+        self.stand_in.go_down();
     }
 
     /// Ends the call once it runs, the way a connection that leads nowhere does.

@@ -801,9 +801,6 @@ async fn outage<R: Runtime>(
         unreachable,
         trace.text(),
     ));
-    // The media's baseline is taken now, with the service gone, so that packets that arrived before
-    // the loss do not count towards the media going on after it.
-    let before = packets_received(platform).await;
 
     // What works without the service: the microphone's mute and the speaker's silence are local.
     let mut local = Vec::new();
@@ -835,12 +832,20 @@ async fn outage<R: Runtime>(
     for (name, ok, detail) in local {
         checks.push(Check::found(name, ok, detail));
     }
+    // The media's baseline is taken now, with the service gone and the mute and the silence done,
+    // so that packets that arrived before them do not count towards the media going on after them.
+    let before = packets_received(platform).await;
     let after = match before {
-        Some(before) => until(MEDIA_GOES_ON_WITHIN, || async move {
-            packets_received(platform).await.filter(|now| *now > before)
-        })
-        .await
-        .or(packets_received(platform).await),
+        Some(before) => {
+            let grown = until(MEDIA_GOES_ON_WITHIN, || async move {
+                packets_received(platform).await.filter(|now| *now > before)
+            })
+            .await;
+            match grown {
+                Some(grown) => Some(grown),
+                None => packets_received(platform).await,
+            }
+        }
         None => None,
     };
     checks.push(match (before, after) {
