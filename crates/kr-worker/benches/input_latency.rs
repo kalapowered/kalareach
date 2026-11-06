@@ -1112,7 +1112,8 @@ fn paste_prefix_recogniser_deadline() {
 /// arrival all the same: aggregate figures cannot hide a wait for the next key. This is the
 /// measurement that shows it, and it is asserted to the same bound as the holds taken alone.
 struct BesideMutations {
-    /// One entry per prefix of each delimiter, as in [`Recogniser`].
+    /// One entry per prefix of each delimiter, as in [`Recogniser`], and one more, written while a
+    /// mutation was stopped in its commit with the session held.
     holds: Vec<MutatedHold>,
     /// How long the split delimiter took to be recognised once its second half arrived, in the
     /// offer whose second half reached the recogniser inside its deadline.
@@ -1188,8 +1189,9 @@ impl BesideMutations {
         );
         assert!(
             self.holds.iter().any(MutatedHold::met_a_mutation),
-            "no keystroke met a mutation holding the session, on its way in or at its forward, so \
-             the figure says nothing about a keystroke behind a mutation"
+            "no keystroke met a mutation holding the session, on its way in or at its forward, \
+             not even the one written while a mutation was stopped in its commit, so the figure \
+             says nothing about a keystroke behind a mutation"
         );
         for hold in &self.holds {
             let (what, held) = (&hold.what, &hold.held);
@@ -1337,6 +1339,40 @@ impl Mutating {
     }
 }
 
+/// A mutation stopped inside the commit of its dispatch marker, which it makes with the session
+/// held, until this is dropped.
+///
+/// The stop is the host's own, for its tests: the next mutation to reach that commit waits there.
+/// It is let go when this goes out of scope, on every path out of a measurement, so a failure
+/// never leaves the worker holding its session.
+struct StoppedMutation {
+    reached: tokio::sync::oneshot::Receiver<()>,
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+impl StoppedMutation {
+    /// Stops the next mutation at its marker's commit.
+    fn arm(hosted: &Hosted) -> Result<Self, String> {
+        let mut session = hosted.runtime.session();
+        let journal = session
+            .journal_mut()
+            .ok_or_else(|| "this session keeps no journal".to_owned())?;
+        let (reached, release) = journal.stall_next_marker();
+        Ok(Self {
+            reached,
+            _release: release,
+        })
+    }
+
+    /// Waits until a mutation is stopped there, and so holds the session.
+    async fn until_reached(&mut self) -> Result<(), String> {
+        tokio::time::timeout(Duration::from_secs(30), &mut self.reached)
+            .await
+            .map_err(|_| "no mutation reached the commit it was to be stopped in".to_owned())?
+            .map_err(|_| "the stop was dropped before a mutation reached it".to_owned())
+    }
+}
+
 /// A root program that passes what it reads to a named pipe, with bracketed paste enabled.
 ///
 /// What reached the application is read from the pipe, which touches nothing of the worker's and
@@ -1434,7 +1470,9 @@ async fn measure_recogniser_beside_mutations(
          reaching the application, which the root program passes to a pipe the test reads, so \
          the observation waits behind nothing the mutations hold or sync. Where the write was \
          taken and where the timer forwarded it are the worker's own instants, set against the \
-         spans in which a mutation held the session.",
+         spans in which a mutation held the session. The last hold is written once a mutation is \
+         stopped in its dispatch marker's commit with the session held, so that one hold meets a \
+         mutation whatever the machine made of the others.",
         if beside_a_disk_writer {
             ", and a writer that writes four megabytes to the same disk and syncs them, over and over"
         } else {
@@ -1455,14 +1493,25 @@ async fn measure_recogniser_beside_mutations(
         milliseconds(beside.split)
     ));
     lines.extend(late_offers(&beside.late_splits));
+    // The last hold is the one written while a mutation was stopped in its commit; the others are
+    // the ten the machine places.
+    let natural = beside.holds.len().saturating_sub(1);
     lines.push(format!(
-        "  mutations         {} completed beside the {} holds; {} of them met a mutation holding \
-         the session",
+        "  mutations         {} completed beside the {} holds; {} of the {natural} the machine \
+         placed met a mutation holding the session, and {} of the 1 written while a mutation \
+         was stopped in its commit",
         beside.mutations,
         beside.holds.len(),
         beside
             .holds
             .iter()
+            .take(natural)
+            .filter(|hold| hold.met_a_mutation())
+            .count(),
+        beside
+            .holds
+            .iter()
+            .skip(natural)
             .filter(|hold| hold.met_a_mutation())
             .count()
     ));
@@ -1565,6 +1614,64 @@ async fn recogniser_beside_mutations(
             };
             measured.push((what, held, trace.offset(started)));
         }
+    }
+    // One more hold, taken while a mutation is stopped inside its dispatch marker's commit with the
+    // session held. Whether any of the holds above fell inside a mutation's hold of the session is
+    // for the machine to bring about, since the mutations run on a connection of their own; this
+    // one is written once a mutation is known to be stopped in it, and the mutation is let go once
+    // the byte has reached the application.
+    {
+        let mut stopped = StoppedMutation::arm(hosted)?;
+        stopped.until_reached().await?;
+        expected.extend_from_slice(b"\x1b");
+        // The write is sent and its answer is not waited for: the mutation is not let go before the
+        // byte has reached the application, and a write that waited for the session the mutation
+        // holds would wait for ever. The answer is read after the release.
+        let started = Instant::now();
+        let key = send_key(
+            hosted,
+            &mut client,
+            attachment_id,
+            epoch,
+            &mut sequence,
+            b"\x1b",
+        )
+        .await?;
+        let held = receipt
+            .arrival(&expected, started, arrival_limit())
+            .await
+            .ok_or_else(|| {
+                "a lone Escape written while a mutation was stopped in its commit never reached \
+                 the application on its own"
+                    .to_owned()
+            })?;
+        drop(stopped);
+        let kr_protocol::envelope::Outcome::Ok(value) =
+            Answers::default().until(&mut client, key).await?
+        else {
+            return Err(
+                "a lone Escape written while a mutation was stopped in its commit was refused"
+                    .to_owned(),
+            );
+        };
+        let accepted: InputWriteResult = value
+            .to_typed()
+            .map_err(|error| format!("the answer did not decode: {error}"))?;
+        if accepted.held_prefix_bytes.get() != 1 {
+            return Err(format!(
+                "a lone Escape written while a mutation was stopped in its commit was not held: \
+                 {} held, {} forwarded",
+                accepted.held_prefix_bytes.get(),
+                accepted.forwarded_bytes.get()
+            ));
+        }
+        measured.push((
+            "a lone Escape, with a journalled mutation that is stopped in its commit and holds the \
+             session"
+                .to_owned(),
+            held,
+            trace.offset(started),
+        ));
     }
     // A delimiter split across two frames, recognised once. An offer whose second part came after
     // the first had run out of time says nothing of the requirement and is offered again.
@@ -1674,7 +1781,8 @@ async fn recogniser_beside_mutations(
 /// journalled mutation, and writes the prefix right behind it without waiting for the answer. What
 /// the worker did with the key is read from the order the two answers came back in, and from where
 /// its own record puts the key's acceptance against the hold of the session of the report it
-/// followed.
+/// followed. One more hold is taken with its report stopped in its commit, which settles that a key
+/// does not wait for the report of its own connection.
 struct OnItsOwnConnection {
     holds: Vec<OwnHold>,
     /// How long the split delimiter took to be recognised once its second half arrived, in the
@@ -1776,8 +1884,9 @@ impl OnItsOwnConnection {
         let upper = upper_bound_withheld(&self.conditions).is_empty();
         assert!(
             self.holds.iter().any(|hold| hold.answered_first),
-            "no key was answered before the mutation sent just ahead of it on its connection, so \
-             the figure says nothing about a key behind a mutation of its own connection"
+            "no key was answered before the mutation sent just ahead of it on its connection, \
+             not even the one written while that mutation was stopped in its commit, so the figure \
+             says nothing about a key behind a mutation of its own connection"
         );
         for hold in &self.holds {
             let (what, held) = (&hold.what, &hold.held);
@@ -1950,7 +2059,10 @@ async fn measure_recogniser_on_its_own_connection(
          reaching the application, which the root program passes to a pipe the test reads. \
          Whether the key was answered before the report it followed is read from the order the two \
          answers came back in; where the worker took the write is its own instant, set against the \
-         hold of the session of the report sent just ahead of the key.",
+         hold of the session of the report sent just ahead of the key. The last hold is written \
+         once its report is stopped in its dispatch marker's commit with the session held, and \
+         the report is let go once the key's byte has reached the application, so that one key is \
+         answered first unless it waits for its report.",
         if beside_a_disk_writer {
             ", and a writer that writes four megabytes to the same disk and syncs them, over and over"
         } else {
@@ -1975,13 +2087,26 @@ async fn measure_recogniser_on_its_own_connection(
         milliseconds(own.split)
     ));
     lines.extend(late_offers(&own.late_splits));
+    // The last hold is the one written behind a report stopped in its commit; the others are the
+    // ten the machine places.
+    let natural = own.holds.len().saturating_sub(1);
     lines.push(format!(
         "  viewport reports  {} sent and answered beside the {} holds; the key was answered \
-         before the report in {} of them, and taken before the report took the session in {}, \
-         while it held it in {} and after it released it in {}",
+         before the report in {} of the {natural} holds the machine placed, and in {} of the 1 \
+         written behind a report stopped in its commit; taken before the report took the session \
+         in {}, while it held it in {} and after it released it in {}, of all of them",
         own.viewports,
         own.holds.len(),
-        own.holds.iter().filter(|hold| hold.answered_first).count(),
+        own.holds
+            .iter()
+            .take(natural)
+            .filter(|hold| hold.answered_first)
+            .count(),
+        own.holds
+            .iter()
+            .skip(natural)
+            .filter(|hold| hold.answered_first)
+            .count(),
         own.holds
             .iter()
             .filter(|hold| matches!(hold.accepted, AgainstReport::Before))
@@ -2088,6 +2213,58 @@ async fn recogniser_on_its_own_connection(
                 trace.offset(started),
             ));
         }
+    }
+    // One more hold, behind a report stopped inside its dispatch marker's commit with the session
+    // held. Whether the key reaches the worker before the report is finished, in the holds above,
+    // is for the machine to bring about, since the report and the key are two writes; here the key
+    // is written once the report is known to be stopped in its commit, and the report is let go
+    // only once the key's byte has reached the application, so a key that does not wait for its
+    // report is answered first, and one that does is a failure.
+    {
+        let mut stopped = StoppedMutation::arm(hosted)?;
+        let before_report = Instant::now();
+        let viewport = send_viewport(hosted, &mut client, attachment_id).await?;
+        stopped.until_reached().await?;
+        expected.extend_from_slice(b"\x1b");
+        let started = Instant::now();
+        let key = send_key(
+            hosted,
+            &mut client,
+            attachment_id,
+            epoch,
+            &mut sequence,
+            b"\x1b",
+        )
+        .await?;
+        let held = receipt
+            .arrival(&expected, started, arrival_limit())
+            .await
+            .ok_or_else(|| {
+                "a lone Escape written behind a report stopped in its commit never reached the \
+                 application on its own"
+                    .to_owned()
+            })?;
+        drop(stopped);
+        let (accepted, answered_first) =
+            both_answered(&mut client, &mut answers, viewport, key).await?;
+        viewports.fetch_add(1, Ordering::AcqRel);
+        if accepted.held_prefix_bytes.get() != 1 {
+            return Err(format!(
+                "a lone Escape written behind a report stopped in its commit was not held: {} \
+                 held, {} forwarded",
+                accepted.held_prefix_bytes.get(),
+                accepted.forwarded_bytes.get()
+            ));
+        }
+        measured.push((
+            "a lone Escape, behind a viewport report that is stopped in its commit and holds the \
+             session"
+                .to_owned(),
+            held,
+            answered_first,
+            trace.offset(before_report),
+            trace.offset(started),
+        ));
     }
     // A delimiter split across two frames, recognised once, the second half behind a report too.
     // An offer whose second part came after the first had run out of time says nothing of the
