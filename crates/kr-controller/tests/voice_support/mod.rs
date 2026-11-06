@@ -41,6 +41,8 @@ pub struct Seen {
     pub authorization: Option<String>,
     /// Its JSON body, or null.
     pub body: serde_json::Value,
+    /// When it was read in full, in milliseconds since the Unix epoch.
+    pub at_ms: u128,
 }
 
 /// What the control makes of a token.
@@ -597,6 +599,9 @@ async fn serve(mut stream: TcpStream, route: &ControlRoute, state: &Arc<Mutex<St
             path: path.clone(),
             authorization: authorization.clone(),
             body: parsed.clone(),
+            at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis()),
         });
         // The service accepts the host's token for its routes, and the phone's own for the close
         // route a phone may reach it by.

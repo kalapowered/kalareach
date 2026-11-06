@@ -133,6 +133,8 @@ struct PeerLog {
     answered: usize,
     /// Why an answer was not got.
     errors: Vec<String>,
+    /// When each offer was relayed and each answer came back, in seconds since the run began.
+    times: Vec<(String, u64)>,
 }
 
 /// The document an operator writes to name the voice service.
@@ -295,6 +297,7 @@ async fn a_phone_is_paired_and_runs_a_call_against_a_real_host() {
     let end = Instant::now() + Duration::from_secs(seconds);
     let left = || end.saturating_duration_since(Instant::now());
 
+    let began = Instant::now();
     let window = record::Window::open_without_speed();
     let stand_in = StandIn::start().await;
     let audio = AudioPeer::named();
@@ -305,13 +308,21 @@ async fn a_phone_is_paired_and_runs_a_call_against_a_real_host() {
             stand_in.answer_offers_with(move |offer| {
                 let (peer, relay) = (peer.clone(), Arc::clone(&relay));
                 async move {
-                    relay.lock().expect("the relay's log").relayed += 1;
+                    {
+                        let mut log = relay.lock().expect("the relay's log");
+                        log.relayed += 1;
+                        log.times
+                            .push(("offer relayed".to_owned(), began.elapsed().as_secs()));
+                    }
                     match peer
                         .ask("POST", "/answer", &offer, Duration::from_secs(45))
                         .await
                     {
                         Ok((200, answer)) => {
-                            relay.lock().expect("the relay's log").answered += 1;
+                            let mut log = relay.lock().expect("the relay's log");
+                            log.answered += 1;
+                            log.times
+                                .push(("answer back".to_owned(), began.elapsed().as_secs()));
                             answer
                         }
                         Ok((status, text)) => {
@@ -453,12 +464,20 @@ async fn a_phone_is_paired_and_runs_a_call_against_a_real_host() {
             .collect::<Vec<_>>(),
         "token": TOKEN,
         "went_down": went_down,
+        // When each request reached the voice service, for reading a run's delays against the
+        // phone's own log.
+        "requests": stand_in
+            .seen()
+            .iter()
+            .map(|request| serde_json::json!({ "path": request.path, "at_ms": request.at_ms.to_string() }))
+            .collect::<Vec<_>>(),
         "peer": audio.as_ref().map(|_| {
             let log = relay.lock().expect("the relay's log");
             serde_json::json!({
                 "relayed": log.relayed,
                 "answered": log.answered,
                 "errors": log.errors,
+                "times": log.times,
                 "figures": figures,
             })
         }),

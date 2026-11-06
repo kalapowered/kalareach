@@ -243,6 +243,14 @@ async fn signed_in(origin: &str, token: &str) -> Result<Arc<Account>, String> {
     )))
 }
 
+/// The time now, in milliseconds since the Unix epoch, to set a run's steps beside the voice service's
+/// own record of when its requests came.
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis())
+}
+
 /// Looks until `look` finds something or `within` passes.
 async fn until<T, Fut: Future<Output = Option<T>>>(
     within: Duration,
@@ -393,9 +401,10 @@ async fn start<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> Optio
     checks.push(Check::found(
         "a call is prepared",
         true,
-        "what a call would be was read",
+        format!("what a call would be was read; at {}", now_ms()),
     ));
 
+    let (began, began_ms) = (Instant::now(), now_ms());
     let started = commands::voice_start(
         app.clone(),
         app.state(),
@@ -429,7 +438,10 @@ async fn start<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> Optio
         "the host started the call",
         started_ok,
         if started_ok {
-            "the host made the call and kept the provider's answer from the page".to_owned()
+            format!(
+                "the host made the call and kept the provider's answer from the page; the start began at {began_ms} and took {} s",
+                began.elapsed().as_secs()
+            )
         } else {
             // What the host answered, without the provider's answer or any credential.
             let mut answer = started.clone();
@@ -438,7 +450,8 @@ async fn start<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> Optio
             }
             let text = answer.to_string();
             format!(
-                "the host answered {}",
+                "the start began at {began_ms} and took {} s; the host answered {}",
+                began.elapsed().as_secs(),
                 text.chars().take(600).collect::<String>()
             )
         },

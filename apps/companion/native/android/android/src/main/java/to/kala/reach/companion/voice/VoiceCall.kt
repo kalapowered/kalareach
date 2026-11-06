@@ -109,6 +109,9 @@ class VoiceCall private constructor(
     /** Says once that a buffer with sound reached the speaker side. */
     private val playout = PlayoutDetector()
 
+    /** The samples handed to the speaker side so far, which the statistics do not always report. */
+    private val speakerSamples = java.util.concurrent.atomic.AtomicLong()
+
     /** The provider's events channel, which this end creates before the offer and only reads. */
     private var events: DataChannel? = null
 
@@ -177,6 +180,7 @@ class VoiceCall private constructor(
             .setPlaybackSamplesReadyCallback { samples ->
                 // On the audio thread, for every buffer handed to the speaker side. A track that is
                 // disabled, as when the voice is silenced or the audio interrupted, plays silence.
+                speakerSamples.addAndGet((samples.data.size / (2 * maxOf(1, samples.channelCount))).toLong())
                 if (playout.buffer(samples.data, control.isPlaybackOn)) {
                     handler.post { observer.onPlayout() }
                 }
@@ -218,6 +222,12 @@ class VoiceCall private constructor(
         var counters: MediaCounters? = null
         open.getStats { report ->
             counters = MediaCounters.from(report.statsMap.values.map { it.type to it.members })
+                .let { read ->
+                    // The statistics of some devices carry no playout entry; the samples handed to the
+                    // speaker side are the same figure, counted here.
+                    val handed = speakerSamples.get()
+                    if (read.playedSamples == null && handed > 0) read.copy(playedSamples = handed) else read
+                }
             latch.countDown()
         }
         return if (latch.await(1, TimeUnit.SECONDS)) counters else null
