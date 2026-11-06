@@ -1961,11 +1961,11 @@ exit /b 0\r\n";
 /// over the backend's named pipe, and the broker registers the program with the digest of the file
 /// the kernel says the program runs from and the program's own process identity, and not the
 /// launcher's. The program, a copy of `cmd.exe` running a batch file, writes its whole environment
-/// and its command line, and the case looks for the credential's text, as ASCII and as UTF-16, in
-/// both and in the committed memory of the program's process. The controls for the memory reading are
-/// this test process, which read the credential file and so holds it, and the program's own
-/// environment block, which its memory must be shown to hold before the absence of the credential
-/// counts.
+/// and its command line, which the case reads as bytes because the console writes them in its code
+/// page, and the case looks for the credential's text in both and, as ASCII and as UTF-16, in the
+/// committed memory of the program's process. The controls for the memory reading are this test
+/// process, which read the credential file and so holds it, and the program's own environment
+/// block, which its memory must be shown to hold before the absence of the credential counts.
 #[test]
 fn kr_req_11_23_a_launch_is_bound_to_the_program_it_created_and_the_credential_is_in_none_of_it() {
     let shell = Shell::new();
@@ -1979,12 +1979,14 @@ fn kr_req_11_23_a_launch_is_bound_to_the_program_it_created_and_the_credential_i
     ];
     let root = shell.placed.host.root();
     let answer = shell.establish_answered(&typed, &typed, &[], root);
+    // A value that is not ASCII, as an environment can hold: the batch file's `set` writes it in the
+    // console's code page, which is not UTF-8 on an ordinary machine.
     let mut launcher = shell.launcher(
         &shell.executable.clone(),
         &typed,
         &answer,
         "bound",
-        &[],
+        &[("NOTE", "caf\u{e9}")],
         root,
     );
     let report = shell.report_from("bound", &mut launcher);
@@ -2045,19 +2047,33 @@ fn kr_req_11_23_a_launch_is_bound_to_the_program_it_created_and_the_credential_i
     .trim()
     .to_owned();
     assert_eq!(credential.len(), 64, "the credential is 32 bytes in hex");
-    let environment = std::fs::read_to_string(shell.reports.join("bound.set")).expect("the set");
+    // What the batch file wrote is in the console's code page, which need not be UTF-8, so it is
+    // read as bytes. The credential is ASCII, which a code page keeps.
+    let environment = std::fs::read(shell.reports.join("bound.set")).expect("the set");
     let command_line =
-        std::fs::read_to_string(shell.reports.join("bound.cmdline")).expect("the command line");
+        std::fs::read(shell.reports.join("bound.cmdline")).expect("the command line");
+    let holds = |written: &[u8], text: &str| {
+        let (written, text) = (written.to_ascii_lowercase(), text.to_ascii_lowercase());
+        written
+            .windows(text.len())
+            .any(|window| window == text.as_bytes())
+    };
     assert!(
-        environment.contains("KR_REGISTRATION="),
-        "the program's environment was written: {environment:?}"
+        holds(&environment, "KR_REGISTRATION="),
+        "the program's environment was written: {:?}",
+        String::from_utf8_lossy(&environment)
     );
-    for (what, text) in [
+    assert!(
+        holds(&environment, "NOTE=caf"),
+        "the value that is not ASCII reached the program's environment: {:?}",
+        String::from_utf8_lossy(&environment)
+    );
+    for (what, written) in [
         ("environment", &environment),
         ("command line", &command_line),
     ] {
         assert!(
-            !text.to_lowercase().contains(&credential.to_lowercase()),
+            !holds(written, &credential),
             "the credential is in the program's {what}"
         );
     }
