@@ -523,6 +523,84 @@ async fn a_step_is_performed_once_and_a_retry_is_answered_from_its_receipt() {
     host.stop().await;
 }
 
+/// KR-REQ-03.07: of the actions a step is sent under, only one applies. The first action has
+/// claimed the step and is stopped before its write. A repeat of it is told that what became of it
+/// is not known yet, and does not perform it again. A second action against the same record, as a
+/// client composes one when it cannot tell a running first action from one that ended without
+/// recording what it did, waits behind the first, and once the first has moved the record it is
+/// refused for the record it no longer matches: the record moves once, to the first action's group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn of_the_actions_a_step_is_sent_under_only_one_applies() {
+    let host = Host::start_unowned().await;
+    let mut client = host.client().await;
+    let minted = group_of(&mut client).await;
+    let mut repeating = host.client().await;
+    let mut second = host.client().await;
+
+    let first_into = some_group(0xc1);
+    let first = composed_join(&host, &mut client, first_into, &minted).await;
+    let repeat = first.clone();
+    let second_params = MachineJoinParams {
+        machine_id: some_group(0xc2),
+        expected: expecting(&minted),
+    };
+    let at = target(&host);
+    let waiting = std::cell::RefCell::new(None);
+
+    let applied = held(
+        host.controller(),
+        Point::BeforeTheWrite,
+        async move {
+            let answer = client.repeat(&first).await;
+            (client, answer)
+        },
+        async {
+            let told = repeating
+                .repeat(&repeat)
+                .await
+                .expect("reaches the daemon")
+                .expect_err("the first action has not finished");
+            assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+            // The second action queues behind the first, which holds the step lock.
+            *waiting.borrow_mut() = Some(tokio::spawn(async move {
+                let answer = second
+                    .mutate(Method::MachineJoin, action(), at, &second_params)
+                    .await;
+                (second, answer)
+            }));
+        },
+    )
+    .await
+    .expect("the first action's connection stands");
+    let (mut client, answer) = applied;
+    let first_result: MachineStepResult = typed(
+        &answer
+            .expect("reaches the daemon")
+            .expect("the first action applies"),
+    );
+    assert_eq!(first_result.machine.machine_id, first_into);
+    assert_eq!(first_result.machine.revision, U64::new(2));
+
+    let queued = waiting
+        .borrow_mut()
+        .take()
+        .expect("the second action was sent");
+    let (second, refused) = queued.await.expect("the second action ends");
+    let refused = refused
+        .expect("reaches the daemon")
+        .expect_err("the record is no longer the one the second action was approved against");
+    assert_eq!(refused.code, ErrorCode::DraftConflict, "{refused:?}");
+    assert_eq!(
+        group_of(&mut client).await,
+        first_result.machine,
+        "the record moved once, to the first action's group"
+    );
+
+    drop(second);
+    drop(client);
+    host.stop().await;
+}
+
 /// KR-REQ-03.07: the same holds at the device door, which answers an exact duplicate from the
 /// receipt on a connection of its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
