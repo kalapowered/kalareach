@@ -409,18 +409,28 @@ async fn still_listed(
     daemon: &mut Daemon,
     request: &kr_protocol::pairing::OwnerConfirmationRequest,
 ) -> bool {
-    match ask_within(daemon.read::<_, OwnerConfirmationPendingResult>(
-        Method::OwnerConfirmationPending,
-        &OwnerConfirmationPendingParams {},
-    ))
-    .await
-    {
-        Ok(pending) => pending
+    listed_in(
+        ask_within(daemon.read::<_, OwnerConfirmationPendingResult>(
+            Method::OwnerConfirmationPending,
+            &OwnerConfirmationPendingParams {},
+        ))
+        .await,
+        request,
+    )
+}
+
+/// Whether the host's answer to the list of pending challenges lists `request`. An answer the host
+/// did not give lists nothing.
+fn listed_in(
+    answer: Result<OwnerConfirmationPendingResult>,
+    request: &kr_protocol::pairing::OwnerConfirmationRequest,
+) -> bool {
+    answer.is_ok_and(|pending| {
+        pending
             .pending
             .iter()
-            .any(|listed| listed.request == *request),
-        Err(_) => false,
-    }
+            .any(|listed| listed.request == *request)
+    })
 }
 
 /// Asks the host for the challenge that confirms the exact request `params` names, says that an
@@ -1308,6 +1318,61 @@ mod tests {
             tokio::time::Duration::from_millis(25),
             "the wait ended at the deadline and the bound beyond it, on the paused clock"
         );
+    }
+
+    fn a_challenge(byte: u8) -> kr_protocol::pairing::OwnerConfirmationRequest {
+        use kr_protocol::ids::{ConfirmationId, DeviceId};
+        use kr_protocol::pairing::SensitiveAction;
+        use kr_protocol::scalars::{
+            CanonicalSet, Digest256, EndpointKey, Nonce256, TimestampMs, Uuid,
+        };
+        kr_protocol::pairing::OwnerConfirmationRequest {
+            confirmation_id: ConfirmationId::new(Uuid::from_bytes([byte; 16])),
+            action: SensitiveAction::TrustRepositoryRoot,
+            action_digest: Digest256::from_bytes([byte; 32]),
+            destination_keys: Nullable::null(),
+            destination_rights: CanonicalSet::new(),
+            host_device_id: DeviceId::new(Uuid::from_bytes([3; 16])),
+            host_endpoint_id: EndpointKey::from_bytes([5; 32]),
+            nonce: Nonce256::from_bytes([4; 32]),
+            expires_at_ms: TimestampMs::new(1),
+        }
+    }
+
+    /// KR-REQ-07.47: the wait goes on only when the host answers that it still lists the challenge,
+    /// answered or not. A challenge it does not list, one it lists apart from this, and an answer
+    /// it does not give are each no reason to wait on.
+    #[test]
+    fn only_an_answer_that_lists_the_challenge_says_it_stands() {
+        use kr_protocol::confirmation::PendingConfirmation;
+        let ours = a_challenge(1);
+        let listing = |requests: &[&kr_protocol::pairing::OwnerConfirmationRequest],
+                       answered: bool| {
+            Ok(OwnerConfirmationPendingResult {
+                pending: requests
+                    .iter()
+                    .map(|request| PendingConfirmation {
+                        request: (*request).clone(),
+                        display: ConfirmationDisplay::EstablishClock,
+                        answered,
+                    })
+                    .collect(),
+            })
+        };
+        let other = a_challenge(2);
+        assert!(listed_in(listing(&[&other, &ours], false), &ours));
+        assert!(
+            listed_in(listing(&[&ours], true), &ours),
+            "an answer on record that is not yet spent is still listed"
+        );
+        assert!(!listed_in(listing(&[], false), &ours));
+        assert!(!listed_in(listing(&[&other], false), &ours));
+        assert!(!listed_in(
+            Err(CliError::Other(Shown::said(
+                "the host's answer could not be read"
+            ))),
+            &ours
+        ));
     }
 
     /// KR-REQ-07.47: a host that is sent the request and does not answer it ends the wait at the
