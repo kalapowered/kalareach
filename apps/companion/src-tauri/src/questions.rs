@@ -363,7 +363,8 @@ struct Host<'a> {
     taken: Mutex<Option<QuestionResolveResult>>,
     /// Whether a send of this call reached the point where it may be on its way to the host.
     sent: AtomicBool,
-    /// The link the answer the worker took went over, whose book holds the earlier sends of it.
+    /// The link whose book holds the earlier sends of an answer the worker took: the one the answer
+    /// went over, or the one a receipt of an earlier send was read on.
     over: Mutex<Option<Arc<Link>>>,
 }
 
@@ -557,11 +558,18 @@ impl QuestionHost for Host<'_> {
                 action_id,
             ))
             .await;
+        // The sends this call asks about were made on this link, and a send of them the host took
+        // is what lets it stop holding the others.
+        if answer.is_ok() {
+            *self.over.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(Arc::clone(link.link()));
+        }
         self.settle(session_id, link.link(), answer)
     }
 
-    /// Lets the link the answer went over stop holding the earlier sends of an answer the host
-    /// took. A call whose answer the host did not take has no such link, and no link is opened.
+    /// Lets the link whose book holds the earlier sends of an answer the host took stop holding
+    /// them: the link the answer went over, or the link a receipt of an earlier send was read on.
+    /// A call that sent nothing and read no receipt has no such link, and no link is opened.
     async fn settle_earlier(&self, session_id: SessionId, sends: &[ActionId]) {
         let over = self
             .over
@@ -1202,6 +1210,7 @@ pub async fn send(
         Earlier::default()
     };
     if let Some(action_id) = earlier.taken() {
+        host.settle_earlier(draft.session_id, basis.sends()).await;
         return Ok(Answer::Landed {
             action_id,
             refused: None,
@@ -1282,6 +1291,7 @@ pub async fn send(
                     .await
                     .taken()
             {
+                host.settle_earlier(draft.session_id, &carried).await;
                 return Ok(Answer::Landed {
                     action_id,
                     refused: Some(send),
