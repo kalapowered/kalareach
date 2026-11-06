@@ -9,6 +9,7 @@ mod components;
 
 use std::sync::Arc;
 
+use kr_plugin_runtime::runtime::binding::BindingRequest;
 use kr_plugin_runtime::service::host::{HostConfig, MAX_PENDING_UNBINDS, PluginHost};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_service::client::{PluginClient, new_binding_id};
@@ -458,16 +459,48 @@ impl Raw {
             other => panic!("the host answered a health request with {other:?}"),
         }
     }
+
+    /// Registers a binding with the component at `component`, and returns the host's answer.
+    async fn register(
+        &mut self,
+        request: &BindingRequest,
+        component: &ComponentSource,
+    ) -> ResponseBody {
+        self.ask(RequestBody::RegisterBinding(Box::new(
+            kr_plugin_service::protocol::BindingRegistration {
+                binding_id: request.binding_id.get(),
+                identity: request.identity.clone(),
+                facts: kr_plugin_service::vocabulary::wire_facts(&request.facts),
+                executable: request.executable.clone(),
+                component: component.clone(),
+            },
+        )))
+        .await
+    }
+
+    /// Asks the host to remove a binding and waits for its answer for as long as it takes.
+    async fn unbind(&mut self, request: &BindingRequest) -> ResponseBody {
+        tokio::time::timeout(
+            POOL_THREAD,
+            self.ask(RequestBody::Unbind {
+                binding_id: request.binding_id.get(),
+            }),
+        )
+        .await
+        .expect("the host answered the unbind, and did not wait for the pool")
+    }
 }
 
 // An unbind waits for the binding's thread, on the blocking pool. A pool that other work keeps busy
 // leaves it waiting for a thread of its own, and the request is answered at the host's deadline
 // all the same, with its place among the connection's calls given up. The unbind is not taken back:
 // it runs when the pool has a thread, removes the binding and gives the connection its place back.
-// A connection can leave only so many of them behind, and is refused the next one.
+// The host can leave only so many of them behind, whichever connections asked for them: the next is
+// refused without being queued, and a worker that ends its connection and opens another finds the
+// removals it left still counted.
 //
-// The pool has one thread, which the case holds once the binding is registered. A task spawned
-// after the unbind runs after it on that thread, so by the time it has run the unbind has too.
+// The pool has one thread, which the case holds once both bindings are registered. A task spawned
+// after the unbinds runs after them on that thread, so by the time it has run they have too.
 // Nothing in the case is decided by how long anything takes: it waits for the host's answer.
 #[test]
 fn an_unbind_a_busy_blocking_pool_holds_up_is_refused_in_time_and_runs_when_the_pool_has_a_thread()
@@ -483,30 +516,27 @@ fn an_unbind_a_busy_blocking_pool_holds_up_is_refused_in_time_and_runs_when_the_
         .expect("an executor with one blocking thread");
     executor.block_on(async {
         let served = Served::start_unbinding_within(HELD_UNBIND_DEADLINE).await;
-        let mut host = Raw::connect(&served).await;
         let (path, digest, bytes) = served.install("well-behaved", &wasm);
-        let request = components::request("well-behaved", 1);
-        let registered = host
-            .ask(RequestBody::RegisterBinding(Box::new(
-                kr_plugin_service::protocol::BindingRegistration {
-                    binding_id: request.binding_id.get(),
-                    identity: request.identity.clone(),
-                    facts: kr_plugin_service::vocabulary::wire_facts(&request.facts),
-                    executable: request.executable.clone(),
-                    component: ComponentSource {
-                        path,
-                        digest,
-                        bytes,
-                    },
-                },
-            )))
-            .await;
-        assert!(
-            matches!(registered, ResponseBody::Registered { .. }),
-            "the binding was answered with {registered:?}"
-        );
+        let component = ComponentSource {
+            path,
+            digest,
+            bytes,
+        };
+        // The first connection is the worker that leaves its removals behind; the second is
+        // another, that has asked for nothing.
+        let mut host = Raw::connect(&served).await;
+        let mut other = Raw::connect(&served).await;
+        let first = components::request("well-behaved", 1);
+        let second = components::request("well-behaved", 2);
+        for (connection, request) in [(&mut host, &first), (&mut other, &second)] {
+            let registered = connection.register(request, &component).await;
+            assert!(
+                matches!(registered, ResponseBody::Registered { .. }),
+                "the binding was answered with {registered:?}"
+            );
+        }
         let health = host.health().await;
-        assert_eq!((health.live_bindings, health.connection_bindings), (1, 1));
+        assert_eq!((health.live_bindings, health.connection_bindings), (2, 1));
 
         // The pool's only thread is held by work that ends when the case drops `release`.
         let (running, occupied) = tokio::sync::oneshot::channel::<()>();
@@ -520,63 +550,76 @@ fn an_unbind_a_busy_blocking_pool_holds_up_is_refused_in_time_and_runs_when_the_
             .expect("the pool's thread was held")
             .expect("the held work started");
 
-        let unbind = async |host: &mut Raw| {
-            tokio::time::timeout(
-                POOL_THREAD,
-                host.ask(RequestBody::Unbind {
-                    binding_id: request.binding_id.get(),
-                }),
-            )
-            .await
-            .expect("the host answered the unbind, and did not wait for the pool")
-        };
-        let answered = unbind(&mut host).await;
+        let answered = host.unbind(&first).await;
         assert!(
             matches!(&answered, ResponseBody::Refused { detail, .. }
                 if detail.contains(&format!("{} ms", HELD_UNBIND_DEADLINE.as_millis()))),
             "the unbind was answered with {answered:?}"
         );
-        // A caller that stops waiting leaves its removal behind, and a connection may leave only so
-        // many: each of the unbinds up to that number is answered at the deadline, and the one
+        // A caller that stops waiting leaves its removal behind, and the host may have only so many
+        // waiting: each of the unbinds up to that number is answered at the deadline, and the one
         // after them is refused without being queued.
         for _ in 1..MAX_PENDING_UNBINDS {
-            let answered = unbind(&mut host).await;
+            let answered = host.unbind(&first).await;
             assert!(
                 matches!(&answered, ResponseBody::Refused { detail, .. }
                     if detail.contains(&format!("{} ms", HELD_UNBIND_DEADLINE.as_millis()))),
                 "the unbind was answered with {answered:?}"
             );
         }
-        let answered = unbind(&mut host).await;
+        let answered = host.unbind(&first).await;
         assert!(
             matches!(&answered, ResponseBody::Refused { detail, .. }
                 if detail.contains("unbinds it may have waiting")),
-            "the unbind past the number a connection may leave behind was answered with {answered:?}"
+            "the unbind past the number the host may have waiting was answered with {answered:?}"
         );
-        // The host answered, and the removal is still to be run: the binding is there.
+        // The host answered, and the removals are still to be run: the binding is there.
         let health = host.health().await;
-        assert_eq!((health.live_bindings, health.connection_bindings), (1, 1));
+        assert_eq!((health.live_bindings, health.connection_bindings), (2, 1));
 
-        // The pool gets its thread back. The unbind runs on it ahead of this task.
+        // The worker's connection ends. Its removals are still on the pool, so the other
+        // connection, which has asked for none, is refused its unbind for the places they hold, and
+        // the refusal queues nothing: its binding is there.
+        drop(host);
+        let answered = other.unbind(&second).await;
+        assert!(
+            matches!(&answered, ResponseBody::Refused { detail, .. }
+                if detail.contains("unbinds it may have waiting")),
+            "an unbind on another connection, with the host's places held, was answered with {answered:?}"
+        );
+        let health = other.health().await;
+        assert_eq!((health.live_bindings, health.connection_bindings), (2, 1));
+
+        // The pool gets its thread back. The unbinds run on it ahead of this task.
         drop(release);
         blocker.await.expect("the held work ended");
         tokio::time::timeout(POOL_THREAD, tokio::task::spawn_blocking(|| ()))
             .await
             .expect("work ran on the pool's thread once it was free")
             .expect("the work ended");
-        let health = host.health().await;
+        let health = other.health().await;
         assert_eq!(
             (health.live_bindings, health.connection_bindings),
-            (0, 0),
-            "the unbind the caller stopped waiting for was not carried out"
+            (1, 1),
+            "the unbind the caller stopped waiting for was not carried out, or the one that was refused was"
         );
         // The removals that ran gave their places back: one more unbind is not refused for want of
         // one. It is answered at the deadline or with what it found, and either is right here.
-        let answered = unbind(&mut host).await;
+        let answered = other.unbind(&second).await;
         assert!(
             !matches!(&answered, ResponseBody::Refused { detail, .. }
                 if detail.contains("unbinds it may have waiting")),
-            "a connection whose removals have all run was refused for the removals it has waiting"
+            "a host whose removals have all run refused an unbind for the removals it has waiting: {answered:?}"
+        );
+        tokio::time::timeout(POOL_THREAD, tokio::task::spawn_blocking(|| ()))
+            .await
+            .expect("work ran on the pool's thread")
+            .expect("the work ended");
+        let health = other.health().await;
+        assert_eq!(
+            (health.live_bindings, health.connection_bindings),
+            (0, 0),
+            "the unbind that was asked again was not carried out"
         );
     });
     executor.shutdown_timeout(POOL_THREAD);
