@@ -436,6 +436,9 @@ public final class VoiceCallControl: @unchecked Sendable {
     private var playbackMuted = false
     private var interrupted = false
     private var stopped = false
+    /// Whether the speaker side is switched on now: the device runs, the person has not silenced
+    /// the voice and nothing has interrupted the audio.
+    private var playbackOn = false
 
     /// - Parameter hearingConfirmedByReadings: true where the platform tells whether audio is
     ///   arriving only through readings, which ``recorderHeard(atMs:)`` then reports.
@@ -461,6 +464,10 @@ public final class VoiceCallControl: @unchecked Sendable {
 
     /// Whether the call has ended. It never starts again.
     public var isStopped: Bool { entered { stopped } }
+
+    /// Whether the voice can be heard from this device now: playback is on, unmuted and
+    /// uninterrupted.
+    public var isPlaybackOn: Bool { entered { playbackOn } }
 
     /// Takes the host's answer to the start: the voice session and the moment the service closes
     /// the call, in milliseconds since the epoch.
@@ -600,7 +607,8 @@ public final class VoiceCallControl: @unchecked Sendable {
         let shown = gate.displayed(nowMs: now)
         switches.setAudioDevice(live)
         switches.setMicrophone(gate.captureEnabled(nowMs: now))
-        switches.setPlayback(live && !playbackMuted && !interrupted)
+        playbackOn = live && !playbackMuted && !interrupted
+        switches.setPlayback(playbackOn)
         platform.publish(shown, mutedByPerson: gate.isMutedByPerson)
     }
 
@@ -613,6 +621,7 @@ public final class VoiceCallControl: @unchecked Sendable {
         switches.setMicrophone(false)
         switches.setPlayback(false)
         switches.setAudioDevice(false)
+        playbackOn = false
         deviceOn = false
         if sessionOpen {
             platform.deactivate()

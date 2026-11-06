@@ -35,6 +35,11 @@ pub struct VoiceCallState {
     /// Whether the host this call belongs to is being reached: `none` with no call, `reachable`,
     /// or `lost`.
     pub host: String,
+    /// Milliseconds from the start of the call to this device's receipt of the news that audio was
+    /// played out of it for the first time. An estimate that is taken for the device runs and not
+    /// drawn by the screen; absent until that news comes, and for a call that never plays any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_audio_ms: Option<u64>,
     /// The call, as the host described it with the provider's answer left out, while it runs.
     pub session: Option<VoiceSessionDescriptor>,
     /// How the last call ended, until another starts.
@@ -79,6 +84,7 @@ impl VoiceCallState {
             playing: false,
             control: "none".to_owned(),
             host: "none".to_owned(),
+            first_audio_ms: None,
             session: None,
             ended: None,
             delegations: Vec::new(),

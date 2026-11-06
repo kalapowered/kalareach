@@ -63,11 +63,11 @@
     }
   },
   {
-    "name": "the first audio",
+    "name": "audio played out for the first time",
     "frame": {
       "call": "c1",
       "seq": 8,
-      "kind": "first_audio"
+      "kind": "playout"
     }
   },
   {

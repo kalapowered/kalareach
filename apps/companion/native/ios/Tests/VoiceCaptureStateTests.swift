@@ -614,7 +614,7 @@ final class VoiceCallControlTests: XCTestCase {
         final class Silent: VoiceCallObserver {
             func voiceCall(_: VoiceCall, connectionChanged _: RTCPeerConnectionState) {}
             func voiceCall(_: VoiceCall, receivedProviderEvent _: Data) {}
-            func voiceCallReceivedFirstAudio(_: VoiceCall) {}
+            func voiceCallPlayedAudio(_: VoiceCall) {}
         }
         let observer = Silent()
         var first: VoiceCall? = try VoiceCall(observer: observer)

@@ -118,12 +118,21 @@ class VoiceCallBridge(context: Context) : CallBridge {
 
     override fun alive(call: String): HeldCall {
         named(call).watch.sign()
-        return held()
+        // A sign of life is frequent and cheap, so it carries no reading of the media.
+        return heldNow(withMedia = false)
     }
 
-    override fun held(): HeldCall =
+    override fun held(): HeldCall = heldNow(withMedia = true)
+
+    private fun heldNow(withMedia: Boolean): HeldCall =
         synchronized(lock) { held }?.let {
-            HeldCall(it.name, it.reporter.capture, it.call.isMutedByPerson, !it.call.isPlaybackMuted)
+            HeldCall(
+                it.name,
+                it.reporter.capture,
+                it.call.isMutedByPerson,
+                !it.call.isPlaybackMuted,
+                media = if (withMedia) it.call.mediaCounters() else null,
+            )
         } ?: HeldCall(null, VoiceCaptureState.IDLE, microphoneMuted = false, playing = false)
 
     /** What one call tells the bridge, which queues it for Rust. */
@@ -143,7 +152,7 @@ class VoiceCallBridge(context: Context) : CallBridge {
 
         override fun onProviderEvent(bytes: ByteArray) = tell(CallEvent.ProviderEvent(bytes))
 
-        override fun onFirstAudio() = tell(CallEvent.FirstAudio)
+        override fun onPlayout() = tell(CallEvent.Playout)
 
         override fun onConnectionState(state: String) {
             tell(CallEvent.Connection(state))

@@ -79,12 +79,42 @@ class CallWireTest {
     fun `what the call is doing is what Rust reads`() {
         same(
             cases("callState")[0].getJSONObject("response"),
-            CallWire.held(HeldCall("c1", VoiceCaptureState.MUTED_BY_PERSON, microphoneMuted = true, playing = true)),
+            CallWire.held(
+                HeldCall(
+                    "c1",
+                    VoiceCaptureState.MUTED_BY_PERSON,
+                    microphoneMuted = true,
+                    playing = true,
+                    media = MediaCounters(packetsReceived = 1200, packetsSent = 1180, playedSamples = 960000),
+                ),
+            ),
         )
         same(
             cases("callState")[1].getJSONObject("response"),
             CallWire.held(HeldCall(null, VoiceCaptureState.IDLE, microphoneMuted = false, playing = false)),
         )
+    }
+
+    @Test
+    fun `a figure the statistics did not hold is left out and nothing measured says nothing`() {
+        same(
+            cases("callState")[2].getJSONObject("response"),
+            CallWire.held(
+                HeldCall(
+                    "c1",
+                    VoiceCaptureState.CAPTURING,
+                    microphoneMuted = false,
+                    playing = true,
+                    media = MediaCounters(packetsReceived = 40),
+                ),
+            ),
+        )
+        val none = JSONObject(
+            CallWire.held(
+                HeldCall("c1", VoiceCaptureState.CAPTURING, false, true, media = MediaCounters()),
+            ),
+        )
+        assertFalse("counters that hold nothing are not sent", none.has("media"))
     }
 
     @Test
@@ -109,7 +139,7 @@ class CallWireTest {
             CallEvent.Connection("failed"),
             CallEvent.Connection("closed"),
             CallEvent.ProviderEvent("""{"type":"session.created"}""".toByteArray()),
-            CallEvent.FirstAudio,
+            CallEvent.Playout,
             CallEvent.Capture(VoiceCaptureState.CAPTURING),
             CallEvent.Capture(VoiceCaptureState.MUTED_BY_PERSON),
             CallEvent.Capture(VoiceCaptureState.FOCUS_LOST),
@@ -159,7 +189,7 @@ class CallWireTest {
             "provider" -> CallEvent.ProviderEvent(byteArrayOf(1))
             "connection" -> CallEvent.Connection("connected")
             "capture" -> CallEvent.Capture(VoiceCaptureState.CAPTURING)
-            "first_audio" -> CallEvent.FirstAudio
+            "playout" -> CallEvent.Playout
             "ended" -> CallEvent.Ended
             else -> error("the fixture names news of a kind $kind")
         }
@@ -173,7 +203,7 @@ class CallWireTest {
                     is CallEvent.ProviderEvent -> "provider"
                     is CallEvent.Connection -> "connection"
                     is CallEvent.Capture -> "capture"
-                    CallEvent.FirstAudio -> "first_audio"
+                    CallEvent.Playout -> "playout"
                     CallEvent.Ended -> "ended"
                     CallEvent.Lost -> error("a loss is never queued as news")
                 }
@@ -202,7 +232,7 @@ class CallWireTest {
         val sent = mutableListOf<String>()
         val queue = CallNewsQueue("c1", { sent += it })
         val later = ArrayDeque<Runnable>()
-        queue.offer(CallEvent.FirstAudio) { later.addLast(it) }
+        queue.offer(CallEvent.Playout) { later.addLast(it) }
         queue.offer(CallEvent.Ended) { later.addLast(it) }
         assertEquals("one drain is asked for, not two", 1, later.size)
         assertTrue(sent.isEmpty())

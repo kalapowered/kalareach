@@ -21,6 +21,7 @@
 //! | A delegation is answered to the model that nothing was done, once | `a_delegation_is_answered_to_the_model_that_nothing_was_done_once` |
 //! | A mute silences the microphone here and is told to the service | `muting_the_microphone_silences_it_here_and_tells_the_service` |
 //! | A mute from the phone's own controls is told to the service in order | `a_mute_from_the_phones_own_controls_is_told_to_the_service_in_order` |
+//! | The first audio played out is the call's figure, for the first and no later one | `the_first_audio_played_out_is_the_calls_figure_and_only_the_first` |
 //! | What the system does to capture in a call is told, and ends nothing | `the_systems_changes_to_capture_are_told_and_do_not_end_the_call` |
 //! | A voice call is not a shell session: hanging up leaves the session a worker runs live | `hanging_up_a_call_leaves_the_terminal_session_it_was_made_over_running` |
 //! | A voice service that is down in the call or at the hang-up leaves mute, silence, the media's stop and the grant's revocation with this device and the host | `a_service_that_goes_down_in_the_call_leaves_mute_and_silence_with_native_code`, `a_service_that_is_down_at_the_hang_up_still_stops_the_media_and_revokes_the_grant` |
@@ -1185,6 +1186,47 @@ async fn a_mute_from_the_phones_own_controls_is_told_to_the_service_in_order() {
         told(&scene),
         ["mute", "unmute", "mute", "unmute"],
         "each change is told once, in order"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// KR-PERF-010: the first audio played out of the device is the call's figure, taken from the start
+/// of the call to the device's receipt of the news, kept for the first and no later one, and not
+/// drawn on the screen; a call that has played nothing has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_audio_played_out_is_the_calls_figure_and_only_the_first() {
+    let mut scene = scene().await;
+    scene.start().await;
+    let running = scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    assert!(
+        running.get("first_audio_ms").is_none(),
+        "a call that has played nothing has no figure: {running}"
+    );
+
+    scene.platform.tell(CallEvent::Playout);
+    let first = scene
+        .state_where("the figure", |state| state["first_audio_ms"].is_u64())
+        .await;
+    let figure = first["first_audio_ms"].as_u64().expect("a figure");
+
+    scene.platform.tell(CallEvent::Playout);
+    scene.platform.tell(CallEvent::Capture {
+        state: CaptureState::Capturing,
+    });
+    scene
+        .state_where("the later news read", |state| {
+            state["capture"] == "capturing"
+        })
+        .await;
+    assert_eq!(
+        scene.state()["first_audio_ms"].as_u64(),
+        Some(figure),
+        "a later playout does not move the figure"
     );
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;

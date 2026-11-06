@@ -44,7 +44,7 @@ class VoiceNegotiationTest {
             events.add(bytes)
         }
 
-        override fun onFirstAudio() {}
+        override fun onPlayout() {}
     }
 
     /** A peer in this process that answers an offer and reads the channel the offer names. */

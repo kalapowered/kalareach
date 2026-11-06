@@ -118,6 +118,9 @@ class VoiceCallControl(
     @Volatile
     private var stopped = false
 
+    @Volatile
+    private var playbackOn = false
+
     init {
         switches.setMicrophone(false)
         switches.setPlayback(false)
@@ -135,6 +138,13 @@ class VoiceCallControl(
     /** Whether the call has ended. It never starts again. Never waits for a change. */
     val isStopped: Boolean
         get() = stopped
+
+    /**
+     * Whether the voice can be heard from this device now: the device runs, the person has not
+     * silenced it and the audio is not interrupted. Never waits for a change.
+     */
+    val isPlaybackOn: Boolean
+        get() = playbackOn
 
     /**
      * Takes the host's answer to the start: the voice session and the moment the service closes
@@ -270,7 +280,8 @@ class VoiceCallControl(
         val shown = gate.displayed(now)
         switches.setAudioDevice(live)
         switches.setMicrophone(gate.captureEnabled(now))
-        switches.setPlayback(live && !playbackMuted && !focusLost)
+        playbackOn = live && !playbackMuted && !focusLost
+        switches.setPlayback(playbackOn)
         publishLocked(shown)
     }
 
@@ -284,6 +295,7 @@ class VoiceCallControl(
         switches.setMicrophone(false)
         switches.setPlayback(false)
         switches.setAudioDevice(false)
+        playbackOn = false
         deviceOn = false
         if (focusHeld) {
             platform.releaseFocus()

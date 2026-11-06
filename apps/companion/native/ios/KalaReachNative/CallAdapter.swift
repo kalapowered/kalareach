@@ -28,6 +28,8 @@ public protocol CallEngine: AnyObject {
     func setPlaybackMuted(_ muted: Bool)
     var isPlaybackMuted: Bool { get }
     var isMutedByPerson: Bool { get }
+    /// What the call's media has carried, or nil when it cannot be read.
+    func media() async -> MediaCounters?
     func stop()
 }
 
@@ -51,6 +53,7 @@ private final class BridgedCall: CallEngine {
     func setPlaybackMuted(_ muted: Bool) { call.setPlaybackMuted(muted) }
     var isPlaybackMuted: Bool { call.isPlaybackMuted }
     var isMutedByPerson: Bool { call.isMutedByPerson }
+    func media() async -> MediaCounters? { await call.mediaCounters() }
     func stop() { call.stop() }
 }
 
@@ -69,7 +72,7 @@ public protocol CallDevice {
 public protocol CallReporting: AnyObject {
     func connection(_ state: String)
     func providerEvent(_ data: Data)
-    func firstAudio()
+    func playout()
     func capture(_ state: VoiceCaptureState)
     func ended()
 }
@@ -91,7 +94,7 @@ private final class ObserverBridge: VoiceCallObserver {
 
     func voiceCall(_: VoiceCall, receivedProviderEvent data: Data) { reporting.providerEvent(data) }
 
-    func voiceCallReceivedFirstAudio(_: VoiceCall) { reporting.firstAudio() }
+    func voiceCallPlayedAudio(_: VoiceCall) { reporting.playout() }
 
     func voiceCall(_: VoiceCall, captureChanged state: VoiceCaptureState) { reporting.capture(state) }
 
@@ -141,7 +144,7 @@ struct CallRefusal: Error {
 enum CallItem {
     case connection(String)
     case providerEvent(Data)
-    case firstAudio
+    case playout
     case capture(VoiceCaptureState)
     case ended
     /// Some news was dropped here. Never queued as news: it marks a place in the queue.
@@ -388,8 +391,8 @@ enum CallWire {
         case .providerEvent(let data):
             frame["kind"] = "provider_event"
             frame["bytes"] = data.base64EncodedString()
-        case .firstAudio:
-            frame["kind"] = "first_audio"
+        case .playout:
+            frame["kind"] = "playout"
         case .capture(let state):
             frame["kind"] = "capture"
             frame["state"] = captureWord(state)
@@ -541,12 +544,13 @@ public final class CallAdapter: NSObject {
             }
             return "{}"
         case "callState":
-            return await state()
+            return await state(withMedia: true)
         case "callAlive":
             // The owner is there. The call is named, so a sign for a call that has ended says so.
+            // A sign is frequent and cheap, so it carries no reading of the media.
             _ = try engine(CallWire.decode(CallWire.Call.self, arguments).call)
             queue.sync { watch?.sign() }
-            return await state()
+            return await state(withMedia: false)
         default:
             throw CallRefusal(code: CallRefusal.engine, message: "this build takes no such command")
         }
@@ -569,17 +573,23 @@ public final class CallAdapter: NSObject {
         }
     }
 
-    private func state() async -> String {
+    private func state(withMedia: Bool) async -> String {
         let seen = queue.sync { held.map { (id: $0.id, engine: $0.engine, capture: $0.capture) } }
         // The engine's mutes are read on the engine queue: a read can wait behind a stop there.
         let mutes = await onTheEngineQueue { (person: seen?.engine.isMutedByPerson ?? false,
                                               playback: seen?.engine.isPlaybackMuted ?? true) }
-        return CallWire.text([
+        var state: [String: Any] = [
             "call": seen.map { $0.id as Any } ?? NSNull(),
             "capture": CallWire.captureWord(seen?.capture ?? .idle),
             "microphoneMuted": mutes.person,
             "playing": seen != nil && !mutes.playback,
-        ])
+        ]
+        // What the media carried, when it can be read: a call that is held, and statistics that
+        // came back. Nothing measured is nothing said, never a zero.
+        if withMedia, let engine = seen?.engine, let media = await engine.media(), !media.wire.isEmpty {
+            state["media"] = media.wire
+        }
+        return CallWire.text(state)
     }
 
     private func open(_ call: String, news: News?) async throws -> String {
@@ -631,7 +641,7 @@ public final class CallAdapter: NSObject {
 
         func connection(_ state: String) { adapter?.report(call, .connection(state)) }
         func providerEvent(_ data: Data) { adapter?.report(call, .providerEvent(data)) }
-        func firstAudio() { adapter?.report(call, .firstAudio) }
+        func playout() { adapter?.report(call, .playout) }
         func capture(_ state: VoiceCaptureState) { adapter?.report(call, .capture(state)) }
         func ended() { adapter?.report(call, .ended) }
     }

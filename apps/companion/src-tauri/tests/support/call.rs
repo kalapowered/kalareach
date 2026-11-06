@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use companion_platform::call::{
     Answered, CallEvent, CallFailure, CallFuture, CallId, CallPlatform, CaptureState,
-    ConnectionState, EventFrame, EventSink, FailureKind, Held, Mute, OpenedCall, Permission,
+    ConnectionState, EventFrame, EventSink, FailureKind, Held, Media, Mute, OpenedCall, Permission,
     event_queue,
 };
 
@@ -33,6 +33,8 @@ struct Inner {
     capture: CaptureState,
     muted: bool,
     playing: bool,
+    /// What native code's statistics say the media carried, when a test gives it.
+    media: Option<Media>,
     microphone_refused: bool,
     permit_refused: bool,
     stop_never_returns: bool,
@@ -70,6 +72,7 @@ impl ScriptedCalls {
                 capture: CaptureState::Idle,
                 muted: false,
                 playing: true,
+                media: None,
                 microphone_refused: false,
                 permit_refused: false,
                 stop_never_returns: false,
@@ -209,6 +212,11 @@ impl ScriptedCalls {
         }
     }
 
+    /// What native code's statistics say the media carried from now on.
+    pub fn carry(&self, media: Media) {
+        self.inner().media = Some(media);
+    }
+
     /// The person mutes or unmutes the microphone from one of the phone's own controls, the lock
     /// screen or the notification, and not through the page: native code changes what it holds and
     /// tells the capture news, and the page gave it no command.
@@ -236,7 +244,7 @@ impl ScriptedCalls {
             sink.deliver(EventFrame {
                 call: call.clone(),
                 seq: *seq,
-                event: CallEvent::FirstAudio,
+                event: CallEvent::Playout,
             });
         }
     }
@@ -277,6 +285,7 @@ impl ScriptedCalls {
             capture: inner.capture,
             microphone_muted: inner.muted,
             playing: inner.playing,
+            media: inner.media.clone(),
         }
     }
 }

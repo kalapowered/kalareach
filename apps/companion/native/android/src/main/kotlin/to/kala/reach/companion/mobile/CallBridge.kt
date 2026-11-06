@@ -39,6 +39,8 @@ data class HeldCall(
     val capture: VoiceCaptureState,
     val microphoneMuted: Boolean,
     val playing: Boolean,
+    /** What the media has carried, when it was read; only the state command reads it. */
+    val media: MediaCounters? = null,
 )
 
 /**
@@ -73,7 +75,10 @@ interface CallBridge {
     /** Ends the call and gives the microphone back. */
     fun stop(call: String)
 
-    /** What the call this device holds is doing, if it holds one. */
+    /**
+     * What the call this device holds is doing, if it holds one, with what its media has carried
+     * when the statistics could be read.
+     */
     fun held(): HeldCall
 
     /**
@@ -292,8 +297,11 @@ sealed interface CallEvent {
     /** The provider sent [bytes] on its read-only channel. */
     class ProviderEvent(val bytes: ByteArray) : CallEvent
 
-    /** The first remote audio track arrived. */
-    data object FirstAudio : CallEvent
+    /**
+     * Audio was played out of this device for the first time in the call: a buffer with sound
+     * reached the speaker side while playback was on. Told once.
+     */
+    data object Playout : CallEvent
 
     /** The microphone's state changed. */
     data class Capture(val state: VoiceCaptureState) : CallEvent
@@ -384,13 +392,22 @@ object CallWire {
     fun nothing(): String = "{}"
 
     /** What the call this device holds is doing, as the state command answers. */
-    fun held(held: HeldCall): String =
-        JSONObject()
+    fun held(held: HeldCall): String {
+        val state = JSONObject()
             .put("call", held.call ?: JSONObject.NULL)
             .put("capture", capture(held.capture))
             .put("microphoneMuted", held.microphoneMuted)
             .put("playing", held.playing)
-            .toString()
+        // A figure that was not measured is left out, so that Rust never reads it as zero.
+        held.media?.takeUnless { it.isEmpty }?.let { media ->
+            val counters = JSONObject()
+            media.packetsReceived?.let { counters.put("packetsReceived", it) }
+            media.packetsSent?.let { counters.put("packetsSent", it) }
+            media.playedSamples?.let { counters.put("playedSamples", it) }
+            state.put("media", counters)
+        }
+        return state.toString()
+    }
 
     /** The wire's word for what the microphone is doing. */
     fun capture(state: VoiceCaptureState): String =
@@ -412,7 +429,7 @@ object CallWire {
             is CallEvent.ProviderEvent ->
                 frame.put("kind", "provider_event")
                     .put("bytes", Base64.getEncoder().encodeToString(event.bytes))
-            CallEvent.FirstAudio -> frame.put("kind", "first_audio")
+            CallEvent.Playout -> frame.put("kind", "playout")
             is CallEvent.Capture -> frame.put("kind", "capture").put("state", capture(event.state))
             CallEvent.Ended -> frame.put("kind", "ended")
             CallEvent.Lost -> frame.put("kind", "lost")

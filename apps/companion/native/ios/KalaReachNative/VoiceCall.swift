@@ -27,8 +27,9 @@ public protocol VoiceCallObserver: AnyObject {
     func voiceCall(_ call: VoiceCall, connectionChanged state: RTCPeerConnectionState)
     /// The provider sent something on its read-only channel.
     func voiceCall(_ call: VoiceCall, receivedProviderEvent data: Data)
-    /// The first remote audio track arrived. It reports a track, not audible playback.
-    func voiceCallReceivedFirstAudio(_ call: VoiceCall)
+    /// Audio was played out of the device for the first time. An estimate from the connection's
+    /// statistics, told once: see ``PlayoutWatch``.
+    func voiceCallPlayedAudio(_ call: VoiceCall)
     /// What the microphone is doing changed: the call's gate decided it.
     func voiceCall(_ call: VoiceCall, captureChanged state: VoiceCaptureState)
     /// The call ended, whatever ended it, and its audio is given back.
@@ -71,7 +72,8 @@ public final class VoiceCall: NSObject {
     private let connection: RTCPeerConnection
     private let microphone: RTCAudioTrack
     private weak var observer: VoiceCallObserver?
-    private var announcedFirstAudio = false
+    /// Watches the statistics for the first audio played out. Touched on ``queue`` only.
+    private var playout = PlayoutWatch()
     /// The call's own queue: its timer, and every report from the audio session and WebRTC.
     private let queue: DispatchQueue
     /// The provider's events channel, which this end creates before the offer and only reads.
@@ -222,15 +224,91 @@ public final class VoiceCall: NSObject {
     /// was asked in.
     private func readCapturedAudio() {
         guard let generation = recorderReader.request() else { return }
+        let playbackAtRequest = control.isPlaybackOn
         connection.statistics { [weak self] report in
             let source = report.statistics.values.first {
                 $0.type == "media-source" && ($0.values["kind"] as? String) == "audio"
             }
             let seconds = (source?.values["totalSamplesDuration"] as? NSNumber)?.doubleValue
+            let reading = VoiceCall.reading(from: report)
             self?.queue.async { [weak self] in
-                self?.recorderReader.reading(capturedSeconds: seconds, generation: generation, atMs: VoiceCall.nowMs())
+                guard let self else { return }
+                self.recorderReader.reading(capturedSeconds: seconds, generation: generation, atMs: VoiceCall.nowMs())
+                if self.playout.reading(
+                    reading,
+                    playbackOnAtRequest: playbackAtRequest,
+                    playbackOnAtAnswer: self.control.isPlaybackOn
+                ) {
+                    self.observer?.voiceCallPlayedAudio(self)
+                }
             }
         }
+    }
+
+    /// What the call's media has carried, read from the connection's statistics now, or nil when
+    /// the call has ended or the statistics did not come back within a second.
+    public func mediaCounters() async -> MediaCounters? {
+        guard await !onTheCallQueue({ self.control.isStopped }) else { return nil }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<MediaCounters?, Never>) in
+            let once = Once()
+            connection.statistics { report in
+                once.run { continuation.resume(returning: VoiceCall.counters(from: report)) }
+            }
+            queue.asyncAfter(deadline: .now() + 1) {
+                once.run { continuation.resume(returning: nil) }
+            }
+        }
+    }
+
+    /// Runs its body the first time only.
+    private final class Once: @unchecked Sendable {
+        private let lock = NSLock()
+        private var ran = false
+
+        func run(_ body: () -> Void) {
+            lock.lock()
+            let first = !ran
+            ran = true
+            lock.unlock()
+            if first { body() }
+        }
+    }
+
+    /// The counters in a statistics report: the audio packets received and sent, and the samples
+    /// the speaker side has taken. A figure the report does not hold is left out.
+    fileprivate static func counters(from report: RTCStatisticsReport) -> MediaCounters? {
+        var counters = MediaCounters()
+        for stats in report.statistics.values {
+            let audio = (stats.values["kind"] as? String) == "audio"
+            switch stats.type {
+            case "inbound-rtp" where audio:
+                counters.packetsReceived = (stats.values["packetsReceived"] as? NSNumber)?.int64Value
+            case "outbound-rtp" where audio:
+                counters.packetsSent = (stats.values["packetsSent"] as? NSNumber)?.int64Value
+            case "media-playout":
+                counters.playedSamples = (stats.values["totalSamplesCount"] as? NSNumber)?.int64Value
+            default:
+                break
+            }
+        }
+        return counters
+    }
+
+    /// The reading ``PlayoutWatch`` compares: the inbound audio's energy and the speaker side's
+    /// samples. A figure the report does not hold is nil.
+    fileprivate static func reading(from report: RTCStatisticsReport) -> MediaReading {
+        var reading = MediaReading(audioEnergy: nil, playedSamples: nil)
+        for stats in report.statistics.values {
+            switch stats.type {
+            case "inbound-rtp" where (stats.values["kind"] as? String) == "audio":
+                reading.audioEnergy = (stats.values["totalAudioEnergy"] as? NSNumber)?.doubleValue
+            case "media-playout":
+                reading.playedSamples = (stats.values["totalSamplesCount"] as? NSNumber)?.doubleValue
+            default:
+                break
+            }
+        }
+        return reading
     }
 
     /// Opens the microphone for a call the host started.
@@ -434,12 +512,6 @@ extension VoiceCall: RTCPeerConnectionDelegate {
         guard receiver.track is RTCAudioTrack else { return }
         // A track arrives playing; the control decides whether it may.
         queue.async { [weak self] in self?.control.refresh() }
-        guard !announcedFirstAudio else { return }
-        announcedFirstAudio = true
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.observer?.voiceCallReceivedFirstAudio(self)
-        }
     }
 
     public func peerConnection(_: RTCPeerConnection, didOpen channel: RTCDataChannel) {

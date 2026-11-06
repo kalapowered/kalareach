@@ -21,6 +21,8 @@ import org.webrtc.RtpReceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import org.webrtc.audio.JavaAudioDeviceModule
+import to.kala.reach.companion.mobile.MediaCounters
+import to.kala.reach.companion.mobile.PlayoutDetector
 import to.kala.reach.companion.mobile.VoiceAnswer
 import to.kala.reach.companion.mobile.VoiceCallControl
 import to.kala.reach.companion.mobile.VoiceCallPlatform
@@ -78,10 +80,10 @@ class VoiceCall private constructor(
         fun onProviderEvent(bytes: ByteArray)
 
         /**
-         * The first remote audio track arrived. It reports a track, not audible playback. On the
-         * call's own thread.
+         * Audio was played out of the device for the first time: a buffer with sound reached the
+         * speaker side while playback was on. Told once, on the call's own thread.
          */
-        fun onFirstAudio()
+        fun onPlayout()
 
         /**
          * The media connection changed state: `new`, `connecting`, `connected`, `disconnected`,
@@ -104,7 +106,8 @@ class VoiceCall private constructor(
     private val lock = Any()
     private var connection: PeerConnection? = null
     private var microphone: AudioTrack? = null
-    private var announcedFirstAudio = false
+    /** Says once that a buffer with sound reached the speaker side. */
+    private val playout = PlayoutDetector()
 
     /** The provider's events channel, which this end creates before the offer and only reads. */
     private var events: DataChannel? = null
@@ -171,6 +174,13 @@ class VoiceCall private constructor(
                     }
                 },
             )
+            .setPlaybackSamplesReadyCallback { samples ->
+                // On the audio thread, for every buffer handed to the speaker side. A track that is
+                // disabled, as when the voice is silenced or the audio interrupted, plays silence.
+                if (playout.buffer(samples.data, control.isPlaybackOn)) {
+                    handler.post { observer.onPlayout() }
+                }
+            }
             .setAudioBufferCallback { buffer, _, _, _, bytesRead, captureTimeNs ->
                 // On the audio thread, for every frame, before it reaches the encoder. Answered
                 // from the gate alone, so no switch is set from here.
@@ -195,6 +205,23 @@ class VoiceCall private constructor(
 
     /** Every decision about the microphone, the speaker and the end of this call. */
     private val control = VoiceCallControl(Platform(), Switches())
+
+    /**
+     * What the call's media has carried, from the connection's statistics: null when the call has
+     * ended or the statistics did not come back within a second. It waits for them, so it is never
+     * called on the call's own thread or on a WebRTC thread.
+     */
+    fun mediaCounters(): MediaCounters? {
+        if (control.isStopped) return null
+        val open = synchronized(lock) { connection } ?: return null
+        val latch = CountDownLatch(1)
+        var counters: MediaCounters? = null
+        open.getStats { report ->
+            counters = MediaCounters.from(report.statsMap.values.map { it.type to it.members })
+            latch.countDown()
+        }
+        return if (latch.await(1, TimeUnit.SECONDS)) counters else null
+    }
 
     /** Whether the person has muted their own microphone. */
     val isMutedByPerson: Boolean
@@ -564,9 +591,6 @@ class VoiceCall private constructor(
             if (receiver.track() !is AudioTrack) return
             // A track arrives playing; the control decides whether it may.
             handler.post { control.refresh() }
-            if (announcedFirstAudio) return
-            announcedFirstAudio = true
-            handler.post { observer.onFirstAudio() }
         }
 
         override fun onConnectionChange(newState: PeerConnection.PeerConnectionState) {

@@ -236,6 +236,8 @@ pub(super) struct Owner {
     stops: Vec<oneshot::Sender<Closed>>,
     /// Seconds of call the start asked for.
     requested: u32,
+    /// When the start was taken: the figure for the first audio runs from it.
+    started: Instant,
     /// When the owner gives native code a sign while a step runs.
     signs: tokio::time::Interval,
     /// What would have ended the call while the host was still being asked what became of its
@@ -319,6 +321,7 @@ impl Owner {
             silent_signs: 0,
             stops: Vec::new(),
             requested: 0,
+            started: Instant::now(),
             signs: {
                 let mut signs = tokio::time::interval(timings.tick);
                 signs.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -504,6 +507,7 @@ impl Owner {
     /* ------------------------------------------------------------------------------------- */
 
     pub(super) async fn start(&mut self, request: StartRequest) -> Result<Outcome> {
+        self.started = Instant::now();
         self.requested = request.duration_seconds;
         let host = self.reach.in_use()?;
         self.host = Some(host.clone());
@@ -1130,9 +1134,15 @@ impl Owner {
                 }
                 None
             }
-            Some(Heard::Event(
-                CallEvent::FirstAudio | CallEvent::ProviderEvent { .. } | CallEvent::Lost,
-            )) => None,
+            Some(Heard::Event(CallEvent::Playout)) => {
+                // The first audio played out, from the start of the call to this receipt.
+                let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                self.view(|state| {
+                    state.first_audio_ms.get_or_insert(elapsed);
+                });
+                None
+            }
+            Some(Heard::Event(CallEvent::ProviderEvent { .. } | CallEvent::Lost)) => None,
             // News was lost, and what was lost can be the end of the call: ask native code what
             // it holds rather than carry on as if nothing had been missed.
             Some(Heard::Lost) => self.verify_native().await,

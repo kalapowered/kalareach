@@ -93,7 +93,7 @@ fn words(heard: &[Heard]) -> String {
             Heard::Event(CallEvent::ProviderEvent { bytes }) => {
                 format!("provider_event:{}", bytes.len())
             }
-            Heard::Event(CallEvent::FirstAudio) => "first_audio".to_owned(),
+            Heard::Event(CallEvent::Playout) => "playout".to_owned(),
             Heard::Event(CallEvent::Capture { state }) => format!("capture:{state:?}"),
             Heard::Event(CallEvent::Ended) => "ended".to_owned(),
             Heard::Event(CallEvent::Lost) => "lost".to_owned(),
@@ -679,6 +679,7 @@ mod tests {
                     capture: *self.capture.lock().unwrap(),
                     microphone_muted: *self.muted.lock().unwrap(),
                     playing: false,
+                    media: None,
                 })
             })
         }

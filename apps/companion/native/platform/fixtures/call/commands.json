@@ -42,12 +42,17 @@
   {
     "command": "callState",
     "request": {},
-    "response": { "call": "c1", "capture": "muted_by_person", "microphoneMuted": true, "playing": true }
+    "response": { "call": "c1", "capture": "muted_by_person", "microphoneMuted": true, "playing": true, "media": { "packetsReceived": 1200, "packetsSent": 1180, "playedSamples": 960000 } }
   },
   {
     "command": "callState",
     "request": {},
     "response": { "call": null, "capture": "idle", "microphoneMuted": false, "playing": false }
+  },
+  {
+    "command": "callState",
+    "request": {},
+    "response": { "call": "c1", "capture": "capturing", "microphoneMuted": false, "playing": true, "media": { "packetsReceived": 40 } }
   },
   {
     "command": "callAlive",

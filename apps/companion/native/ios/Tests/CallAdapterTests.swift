@@ -47,6 +47,8 @@ private final class FakeEngine: CallEngine {
     var permitted = true
     var isPlaybackMuted = false
     var isMutedByPerson = false
+    /// What the call's statistics say the media carried, when a test gives it.
+    var counters: MediaCounters?
     /// Where a real call reports its end, which a stop is followed by.
     var reporting: CallReporting?
 
@@ -62,6 +64,7 @@ private final class FakeEngine: CallEngine {
     }
 
     func accept(answerSdp: String) async throws { record("accept \(answerSdp.count)") }
+    func media() async -> MediaCounters? { counters }
     var answerUsesDtx: Bool? { usesDtx }
 
     func permit(voiceSessionId: String, closesAtEpochMs: UInt64) -> Bool {
@@ -211,6 +214,7 @@ final class CallAdapterTests: XCTestCase {
 
         // The gate shows the microphone muted, as it reports to the call.
         maker.reporting?.capture(.mutedByPerson)
+        maker.engine.counters = MediaCounters(packetsReceived: 1200, packetsSent: 1180, playedSamples: 960_000)
         let state = try Fixtures.command("callState", 0)
         let held = await ask(adapter, "callState", state.request)
         XCTAssertEqual(held.result, state.response)
@@ -223,6 +227,30 @@ final class CallAdapterTests: XCTestCase {
         let idle = try Fixtures.command("callState", 1)
         let after = await ask(adapter, "callState", idle.request)
         XCTAssertEqual(after.result, idle.response, "a call that has ended is not held")
+    }
+
+    /// A figure the statistics did not hold is absent from the call's state, never a zero, a sign of
+    /// life carries no reading of the media, and a call that measured nothing says nothing of it.
+    func testTheStateOfAHeldCallCarriesTheMediaOnlyWhereItWasMeasured() async throws {
+        let maker = FakeMaker()
+        let adapter = CallAdapter(maker: maker, device: FakeDevice(), watches: false)
+        _ = await ask(adapter, "callOpen", #"{"call":"c1","events":"__CHANNEL__:7"}"#, told: Told())
+        maker.reporting?.capture(.capturing)
+
+        maker.engine.counters = MediaCounters(packetsReceived: 40)
+        let partial = try Fixtures.command("callState", 2)
+        let some = await ask(adapter, "callState", partial.request)
+        XCTAssertEqual(some.result, partial.response)
+
+        let alive = await ask(adapter, "callAlive", #"{"call":"c1"}"#)
+        XCTAssertNil(alive.result?["media"], "a sign of life reads no statistics")
+
+        maker.engine.counters = MediaCounters()
+        let none = await ask(adapter, "callState", "{}")
+        XCTAssertNil(none.result?["media"], "nothing measured is nothing said")
+        maker.engine.counters = nil
+        let unread = await ask(adapter, "callState", "{}")
+        XCTAssertNil(unread.result?["media"], "statistics that did not come back are nothing said")
     }
 
     func testASignOfLifeNamesACallAndIsAnsweredWithWhatTheCallIsDoing() async throws {
@@ -401,7 +429,7 @@ final class CallAdapterTests: XCTestCase {
         let items: [CallItem] = [
             .connection("new"), .connection("connecting"), .connection("connected"),
             .connection("disconnected"), .connection("failed"), .connection("closed"),
-            .providerEvent(Data(#"{"type":"session.created"}"#.utf8)), .firstAudio,
+            .providerEvent(Data(#"{"type":"session.created"}"#.utf8)), .playout,
             .capture(.capturing), .capture(.mutedByPerson), .capture(.interrupted),
             .capture(.routeChanging), .capture(.suspendedBySystem), .capture(.unavailable),
             .capture(.idle), .lost, .ended,
@@ -425,14 +453,14 @@ final class CallAdapterTests: XCTestCase {
         reporting.connection("connecting")
         reporting.connection("connected")
         reporting.providerEvent(Data(#"{"type":"session.created"}"#.utf8))
-        reporting.firstAudio()
+        reporting.playout()
         reporting.capture(.routeChanging)
         reporting.ended()
 
         await fulfillment(of: [told.expectation(frames: 6)], timeout: 10)
         XCTAssertEqual(
             told.news.map { $0["kind"] as? String },
-            ["connection", "connection", "provider_event", "first_audio", "capture", "ended"])
+            ["connection", "connection", "provider_event", "playout", "capture", "ended"])
         XCTAssertEqual(told.news.map { $0["seq"] as? Int }, [1, 2, 3, 4, 5, 6])
     }
 
@@ -444,7 +472,7 @@ final class CallAdapterTests: XCTestCase {
             case "provider": return .providerEvent(Data([1]))
             case "connection": return .connection("connected")
             case "capture": return .capture(.capturing)
-            case "first_audio": return .firstAudio
+            case "playout": return .playout
             case "ended": return .ended
             default: preconditionFailure("the fixture names news of a kind \(kind)")
             }
@@ -458,7 +486,7 @@ final class CallAdapterTests: XCTestCase {
                 case .providerEvent: return "provider"
                 case .connection: return "connection"
                 case .capture: return "capture"
-                case .firstAudio: return "first_audio"
+                case .playout: return "playout"
                 case .ended: return "ended"
                 case .lost: preconditionFailure("a loss is never queued as news")
                 }
@@ -504,10 +532,10 @@ final class CallAdapterTests: XCTestCase {
 
         early.ended()
         early.connection("failed")
-        maker.reporting?.firstAudio()
+        maker.reporting?.playout()
 
         await fulfillment(of: [told.expectation(frames: 1)], timeout: 10)
-        XCTAssertEqual(told.news.map { $0["kind"] as? String }, ["first_audio"])
+        XCTAssertEqual(told.news.map { $0["kind"] as? String }, ["playout"])
         XCTAssertEqual(told.news.first?["call"] as? String, "c2")
         XCTAssertEqual(told.news.first?["seq"] as? Int, 1, "the new call's news is counted from one")
     }
@@ -543,7 +571,7 @@ final class CallAdapterTests: XCTestCase {
             sent.take(text)
         }
 
-        queue.offer(.firstAudio)  // taken by the sender, which waits
+        queue.offer(.playout)  // taken by the sender, which waits
         taken.wait()
         queue.offer(.providerEvent(Data([1])))  // waits in the buffer
         queue.offer(.ended)  // takes the place of the provider event
@@ -551,6 +579,6 @@ final class CallAdapterTests: XCTestCase {
         for _ in 0..<3 { release.signal() }
 
         await fulfillment(of: [sent.expectation(frames: 3)], timeout: 10)
-        XCTAssertEqual(sent.news.map { $0["kind"] as? String }, ["first_audio", "lost", "ended"])
+        XCTAssertEqual(sent.news.map { $0["kind"] as? String }, ["playout", "lost", "ended"])
     }
 }

@@ -4,7 +4,7 @@
 //! call is a native object, and this module is the only way anything else touches it. [`CallPlatform`]
 //! is what a caller asks of it (open a call, make its offer, apply the provider's answer, permit it,
 //! mute it, stop it), and [`CallEvents`] is what native code tells back (the connection's state,
-//! what the provider sent on its read-only channel, the first audio, what the microphone is doing,
+//! what the provider sent on its read-only channel, the first audio played out, what the microphone is doing,
 //! the end). Native code reports facts and carries out requests; every decision about them is the
 //! caller's.
 //!
@@ -129,8 +129,12 @@ pub enum CallEvent {
         #[serde(with = "base64_bytes")]
         bytes: Vec<u8>,
     },
-    /// The first remote audio track arrived. It reports a track, not audible playback.
-    FirstAudio,
+    /// Audio was played out of this device for the first time in the call: a non-silent buffer
+    /// reached the speaker's side with playback on, uninterrupted and unmuted. It is told once.
+    /// On Android it is read from the buffers handed to the speaker; on iOS it is estimated from
+    /// the connection's statistics, which are read a few times a second, and it can come late by
+    /// that long.
+    Playout,
     /// The microphone's state changed.
     Capture {
         /// What it is doing now.
@@ -520,6 +524,26 @@ pub struct Held {
     /// Whether the person has left the model's voice on: false once they silenced it, and false
     /// when no call is held. It says nothing of whether audio is flowing.
     pub playing: bool,
+    /// What the call's media has carried, when native code could read it. Absent is not measured,
+    /// never zero. Given by a read of the call's state, not by a sign of life.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<Media>,
+}
+
+/// What a call's media has carried, from the connection's statistics. A figure native code could
+/// not read is absent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Media {
+    /// Audio packets received from the other end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packets_received: Option<u64>,
+    /// Audio packets sent to the other end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packets_sent: Option<u64>,
+    /// Samples the device's speaker side has taken to play.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub played_samples: Option<u64>,
 }
 
 /// What a caller asks of the voice call native code holds.
@@ -1132,13 +1156,32 @@ mod tests {
                 call: Some(call.clone()),
                 capture: CaptureState::MutedByPerson,
                 microphone_muted: true,
-                playing: true
+                playing: true,
+                media: Some(Media {
+                    packets_received: Some(1200),
+                    packets_sent: Some(1180),
+                    played_samples: Some(960_000)
+                })
             }
         );
         let idle: Held = serde_json::from_value(of("callState", 1).response).expect("a state");
         assert_eq!(idle.call, None);
         assert_eq!(idle.capture, CaptureState::Idle);
         assert!(!idle.microphone_muted);
+        assert_eq!(
+            idle.media, None,
+            "a call that is not held has measured nothing"
+        );
+        // A figure native code could not read is absent, and is never read as zero.
+        let partial: Held = serde_json::from_value(of("callState", 2).response).expect("a state");
+        assert_eq!(
+            partial.media,
+            Some(Media {
+                packets_received: Some(40),
+                packets_sent: None,
+                played_samples: None
+            })
+        );
 
         let alive = of("callAlive", 0);
         assert_eq!(json(&CallRequest { call: &call }), alive.request);
@@ -1551,7 +1594,7 @@ mod tests {
             "capture" => CallEvent::Capture {
                 state: CaptureState::Capturing,
             },
-            "first_audio" => CallEvent::FirstAudio,
+            "playout" => CallEvent::Playout,
             "ended" => CallEvent::Ended,
             other => panic!("the fixture names news of a kind {other}"),
         }
@@ -1564,7 +1607,7 @@ mod tests {
             Some(Entry::Event(CallEvent::ProviderEvent { .. })) => "provider",
             Some(Entry::Event(CallEvent::Connection { .. })) => "connection",
             Some(Entry::Event(CallEvent::Capture { .. })) => "capture",
-            Some(Entry::Event(CallEvent::FirstAudio)) => "first_audio",
+            Some(Entry::Event(CallEvent::Playout)) => "playout",
             Some(Entry::Event(CallEvent::Ended)) => "ended",
             Some(Entry::Event(CallEvent::Lost)) => panic!("a loss is never queued as news"),
         }
@@ -1604,14 +1647,11 @@ mod tests {
     async fn news_is_read_in_order() {
         let call = CallId("c1".to_owned());
         let (sink, mut events) = event_queue(call.clone());
-        sink.deliver(frame(&call, 1, CallEvent::FirstAudio));
-        sink.deliver(frame(&call, 1, CallEvent::FirstAudio));
+        sink.deliver(frame(&call, 1, CallEvent::Playout));
+        sink.deliver(frame(&call, 1, CallEvent::Playout));
         sink.deliver(frame(&call, 2, CallEvent::Ended));
 
-        assert_eq!(
-            events.recv().await,
-            Some(Heard::Event(CallEvent::FirstAudio))
-        );
+        assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Playout)));
         assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Ended)));
         drop(sink);
         assert_eq!(events.recv().await, None, "the repeat was not queued");
@@ -1624,7 +1664,7 @@ mod tests {
         let call = CallId("c1".to_owned());
         let (sink, mut events) = event_queue(call.clone());
         sink.deliver(frame(&call, 1, CallEvent::Ended));
-        sink.deliver(frame(&call, 3, CallEvent::FirstAudio));
+        sink.deliver(frame(&call, 3, CallEvent::Playout));
         sink.deliver(frame(&call, 4, CallEvent::Lost));
         sink.deliver_json("not news");
         drop(sink);
@@ -1644,12 +1684,12 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!reader.is_finished(), "a sink is left, so the reader waits");
 
-        other.deliver(frame(&call, 1, CallEvent::FirstAudio));
+        other.deliver(frame(&call, 1, CallEvent::Playout));
         drop(other);
 
         assert_eq!(
             reader.await.expect("the reader ends"),
-            Some(Heard::Event(CallEvent::FirstAudio))
+            Some(Heard::Event(CallEvent::Playout))
         );
     }
 
@@ -1659,7 +1699,7 @@ mod tests {
     async fn news_is_not_kept_for_a_reader_that_is_gone() {
         let call = CallId("c1".to_owned());
         let (sink, events) = event_queue(call.clone());
-        sink.deliver(frame(&call, 1, CallEvent::FirstAudio));
+        sink.deliver(frame(&call, 1, CallEvent::Playout));
         let kept = || sink.shared.state().buffer.pop().is_some();
 
         drop(events);
@@ -1679,13 +1719,10 @@ mod tests {
     async fn a_gap_in_the_numbers_is_reported_as_lost() {
         let call = CallId("c1".to_owned());
         let (sink, mut events) = event_queue(call.clone());
-        sink.deliver(frame(&call, 1, CallEvent::FirstAudio));
+        sink.deliver(frame(&call, 1, CallEvent::Playout));
         sink.deliver(frame(&call, 3, CallEvent::Ended));
 
-        assert_eq!(
-            events.recv().await,
-            Some(Heard::Event(CallEvent::FirstAudio))
-        );
+        assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Playout)));
         assert_eq!(events.recv().await, Some(Heard::Lost));
         assert_eq!(
             events.recv().await,
@@ -1723,14 +1760,11 @@ mod tests {
         let other = CallId("c0".to_owned());
         let (sink, mut events) = event_queue(call.clone());
         sink.deliver(frame(&other, 1, CallEvent::Ended));
-        sink.deliver(frame(&call, 1, CallEvent::FirstAudio));
+        sink.deliver(frame(&call, 1, CallEvent::Playout));
         sink.deliver_json("not json");
         sink.deliver(frame(&call, 2, CallEvent::Ended));
 
-        assert_eq!(
-            events.recv().await,
-            Some(Heard::Event(CallEvent::FirstAudio))
-        );
+        assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Playout)));
         assert_eq!(events.recv().await, Some(Heard::Lost));
         assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Ended)));
     }
@@ -1753,14 +1787,11 @@ mod tests {
     async fn a_loss_native_code_reports_is_a_loss_to_the_reader() {
         let call = CallId("c1".to_owned());
         let (sink, mut events) = event_queue(call.clone());
-        sink.deliver(frame(&call, 1, CallEvent::FirstAudio));
+        sink.deliver(frame(&call, 1, CallEvent::Playout));
         sink.deliver(frame(&call, 2, CallEvent::Lost));
         sink.deliver(frame(&call, 3, CallEvent::Ended));
 
-        assert_eq!(
-            events.recv().await,
-            Some(Heard::Event(CallEvent::FirstAudio))
-        );
+        assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Playout)));
         assert_eq!(events.recv().await, Some(Heard::Lost));
         assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Ended)));
     }

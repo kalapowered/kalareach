@@ -1068,6 +1068,11 @@ export interface VoiceCallState {
    */
   readonly control: string
   /**
+   * Milliseconds from the start of the call to the device's receipt of the news that audio was
+   * played out of it for the first time. An estimate for the device runs, never drawn.
+   */
+  readonly first_audio_ms?: number
+  /**
    * Whether the host the call belongs to is being reached: `none` with no call, `reachable`, or
    * `lost`. A different fact from this application's own connection, which follows the host the
    * person chose to browse.

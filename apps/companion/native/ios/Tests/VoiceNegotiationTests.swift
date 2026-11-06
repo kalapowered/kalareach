@@ -31,7 +31,7 @@ private final class Told: VoiceCallObserver {
         event.fulfill()
     }
 
-    func voiceCallReceivedFirstAudio(_: VoiceCall) {}
+    func voiceCallPlayedAudio(_: VoiceCall) {}
 }
 
 /// A peer in this process that answers an offer and reads the channel the offer names.
