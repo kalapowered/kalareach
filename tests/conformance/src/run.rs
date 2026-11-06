@@ -1611,6 +1611,9 @@ mod tests {
         ]));
         assert!(may_have_overlapped(&[Unit::Other, Unit::Other]));
         assert!(may_have_overlapped(&[Unit::LibraryTests, Unit::Other]));
+        // Two compiles of the library itself are two variants of it, as `panic = "abort"` makes
+        // beside the library the tests link, and nothing makes one wait for the other.
+        assert!(may_have_overlapped(&[Unit::Library, Unit::Library]));
     }
 
     #[test]
