@@ -31,20 +31,21 @@
 //!   tells a repeat that meets a first action still running the word it tells one whose first
 //!   attempt ended without recording what it did, so the two are not told apart, and at most one
 //!   action of a step applies), while a step composed now is refused for what the environment
-//!   refused it for, unless the environment could not write, answer or finish it, which stay sent; one step on, the plan takes the record as showing the step was taken once the
-//!   environment has confirmed that the record survives a crash, which it does before it claims any
-//!   step, so a step it refuses after it claimed it, for the record it now holds, is taken, while
-//!   an answer it kept for an action sent again was made earlier and confirms nothing, and one
-//!   refused any other way may have come before that confirmation: it is composed again under a new
-//!   action to ask if it was sent before, and stays sent if it was composed now; an environment
-//!   that could not say whether its change survives a crash, or whose action is still running,
-//!   leaves the step sent; and anywhere else it can never apply and is given its refusal. A step
-//!   whose outcome the environment does not know, or could not confirm, or could not write, is not
-//!   given a result it was not given: it stays sent. An environment that reports no record takes no
-//!   step, and what it refuses a step for says nothing of an earlier action of that step, which it
-//!   may have taken: the first action sent for a step that the environment refuses is refused with
-//!   `STORAGE_UNAVAILABLE`, and a step sent before stays sent, under any action, until the
-//!   environment can read its record. A step saved before it was sent counts as sent. An
+//!   refused it for, unless the environment could not write, answer or finish it, which stay sent;
+//!   one step on, the plan takes the record as showing the step was taken once the environment has
+//!   confirmed that the record survives a crash, which it does before it claims any step, so a step
+//!   it refuses after it claimed it, for the record it now holds, is taken, while an answer it kept
+//!   for an action sent again was made earlier and confirms nothing, and one refused any other way
+//!   may have come before that confirmation: it is composed again under a new action to ask if it
+//!   was sent before, and stays sent if it was composed now; once the record has moved on, an
+//!   environment that could not say whether its change survives a crash, or whose action is still
+//!   running, leaves the step sent; and anywhere else it can never apply and is given its refusal.
+//!   A step whose outcome the environment does not know, or could not confirm, or could not write,
+//!   is not given a result it was not given: it stays sent. An environment that reports no record
+//!   takes no step, and what it refuses a step for says nothing of an earlier action of that step,
+//!   which it may have taken: the first action sent for a step that the environment refuses is
+//!   refused with `STORAGE_UNAVAILABLE`, and a step sent before stays sent, under any action, until
+//!   the environment can read its record. A step saved before it was sent counts as sent. An
 //!   environment that cannot be reached stays pending.
 //! - `undo` moves each environment the plan moved back into the group it left, by a step of its own
 //!   against the record the first one left, sent by the next `finish` or at once. A step that was
