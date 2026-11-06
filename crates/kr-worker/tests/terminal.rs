@@ -1462,28 +1462,41 @@ async fn screen_previewed(
         .expect("decodes")
 }
 
-/// KR-REQ-10.50: the preview of a shared live screen is the text of the buffer that is showing and
-/// nothing behind it. The application printed a line on the primary screen, switched to the
-/// alternate one and printed another: the preview carries the second and not the first, which a
-/// recipient would see only if the application went back.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_10_50_a_screen_preview_is_the_buffer_that_is_showing_and_not_the_one_behind_it() {
-    let host = host(
-        "printf 'on the primary screen\\n'; printf '\\033[?1049h'; \
-         printf 'on the alternate screen\\n'; read -r _",
-    )
-    .await;
-    // A Windows pseudo-console draws the alternate screen itself, one row at a time, and clears
-    // the rest of a row before it ends the line, so the line arrives as the text, the clear and
-    // then the line ending.
-    let line: &[u8] = if cfg!(windows) {
-        b"on the alternate screen\x1b[K\r\n"
-    } else {
-        b"on the alternate screen\r\n"
-    };
-    produced(&host.runtime, line).await;
+/// Waits until the worker's own grid shows a line that reads `text`.
+///
+/// The grid is what the preview is made from, so this waits for the screen and not for the bytes
+/// that draw it. A Windows pseudo-console redraws a screen by what changed, and one line reaches
+/// the host with the rest of its row cleared before the line ending, or with no clear at all, so
+/// no one run of bytes is the line.
+async fn screen_shows(host: &Host, text: &str) {
+    let started = tokio::time::Instant::now();
+    loop {
+        // Whether the session had closed is read before its screen is, so that what a closed
+        // session drew is there to be judged.
+        let closed = host.runtime.state() == kr_protocol::session::SessionState::Closed;
+        let shown = host.runtime.session().engine().visible_text().lines;
+        if shown.iter().any(|line| line == text) {
+            return;
+        }
+        assert!(
+            !closed,
+            "the session closed before its screen showed {text:?}; it shows {shown:?}"
+        );
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {:?} for the screen to show {text:?}; it shows {shown:?}",
+            started.elapsed()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
 
-    let preview = screen_previewed(&host, true)
+/// Asserts that the preview of `host`'s screen, once the alternate screen shows its line, is that
+/// line and nothing of the primary screen behind it.
+async fn assert_the_preview_is_the_alternate_screen(host: &Host) {
+    screen_shows(host, "on the alternate screen").await;
+
+    let preview = screen_previewed(host, true)
         .await
         .screen
         .0
@@ -1500,6 +1513,100 @@ async fn kr_req_10_50_a_screen_preview_is_the_buffer_that_is_showing_and_not_the
         !preview.lines.iter().any(|line| line.contains("primary")),
         "the buffer that is not showing is not previewed: {preview:?}"
     );
+}
+
+/// KR-REQ-10.50: the preview of a shared live screen is the text of the buffer that is showing and
+/// nothing behind it. The application printed a line on the primary screen, switched to the
+/// alternate one and printed another: the preview carries the second and not the first, which a
+/// recipient would see only if the application went back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_50_a_screen_preview_is_the_buffer_that_is_showing_and_not_the_one_behind_it() {
+    let host = host(
+        "printf 'on the primary screen\\n'; printf '\\033[?1049h'; \
+         printf 'on the alternate screen\\n'; read -r _",
+    )
+    .await;
+    assert_the_preview_is_the_alternate_screen(&host).await;
+}
+
+/// The shell line that writes `bytes` as they are, one octal escape to the byte.
+#[cfg(unix)]
+fn printing(bytes: &[u8]) -> String {
+    let escaped: String = bytes.iter().map(|byte| format!("\\{byte:03o}")).collect();
+    format!("printf '{escaped}'")
+}
+
+/// A row a Windows pseudo-console cleared and ended.
+#[cfg(unix)]
+const CLEARED_ROW: &[u8] = b"\x1b[K\r\n";
+
+/// What a Windows pseudo-console writes to the host before it draws the rows of an alternate
+/// screen: its own modes and a cleared screen, the application's primary line, the title the
+/// shell set, and the switch. Recorded on the Windows runner.
+#[cfg(unix)]
+fn console_opening() -> Vec<u8> {
+    [
+        &b"\x1b[?9001h\x1b[?1004h\x1b[?25l\x1b[2J\x1b[m\x1b[H"[..],
+        b"on the primary screen\r\n",
+        b"\x1b]0;C:\\Program Files\\Git\\usr\\bin\\sh.exe\x07",
+        b"\x1b[?25h\x1b[?1049h\x1b[?25l\x1b[H",
+    ]
+    .concat()
+}
+
+/// The alternate screen of the case above as a Windows pseudo-console drew it on one run: the
+/// rest of the line's row is cleared before the line ends.
+#[cfg(unix)]
+fn console_drew_the_line_with_an_erase_before_its_end() -> Vec<u8> {
+    [
+        &console_opening()[..],
+        CLEARED_ROW,
+        b"on the alternate screen\x1b[K\r\n",
+        &CLEARED_ROW.repeat(21),
+        b"\x1b[K\x1b[3;1H\x1b[?25h",
+    ]
+    .concat()
+}
+
+/// The same screen as a Windows pseudo-console drew it on another run: every row is cleared
+/// first, and the line follows on its own, with no clear before its end.
+#[cfg(unix)]
+fn console_drew_the_line_alone() -> Vec<u8> {
+    [
+        &console_opening()[..],
+        &CLEARED_ROW.repeat(23),
+        b"\x1b[K\x1b[2;1H\x1b[?25hon the alternate screen\r\n",
+    ]
+    .concat()
+}
+
+/// Starts a host whose application writes `bytes` as they are and waits for a key, and asserts the
+/// preview of its screen.
+#[cfg(unix)]
+async fn assert_the_preview_after_a_console_wrote(bytes: &[u8]) {
+    let host = host(&format!("{}; read -r _", printing(bytes))).await;
+    assert_the_preview_is_the_alternate_screen(&host).await;
+}
+
+/// KR-REQ-10.50: the preview is the screen the host's grid holds, whichever run of bytes drew it.
+/// A Windows pseudo-console draws by what changed, and the line of the case above has reached the
+/// host with the rest of its row cleared before the line ending. The recorded bytes are written
+/// here by an application, and this platform's terminal carries them on with a carriage return
+/// added to each line ending, which leaves the screen as it was. A Windows host would pass them
+/// through a console again, so the case above is the Windows one.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_50_a_screen_preview_shows_a_line_a_console_drew_with_an_erase_before_its_end() {
+    assert_the_preview_after_a_console_wrote(&console_drew_the_line_with_an_erase_before_its_end())
+        .await;
+}
+
+/// KR-REQ-10.50: the same screen drawn with no clear before the line ending, as a Windows
+/// pseudo-console has also drawn it, is previewed the same.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_50_a_screen_preview_shows_a_line_a_console_drew_alone() {
+    assert_the_preview_after_a_console_wrote(&console_drew_the_line_alone()).await;
 }
 
 /// KR-REQ-10.50: what has scrolled off the screen is not previewed. The application printed sixty
