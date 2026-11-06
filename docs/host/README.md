@@ -3516,11 +3516,14 @@ it cannot tell a result from a refusal. A repeat is an action the daemon has alr
 device, asked again with the same request, whether the route was there when the request arrived or a
 copy claimed it while the request waited. A copy that has arrived and not yet claimed counts too:
 the daemon keeps in memory the calls it is serving that have not yet written their route, among them
-a mutation it has read ahead of the request it is answering and holds behind it, and a refusal of a
-request that meets another such call carrying the same request is told as a repeat's. A close whose
-route cannot be recorded goes on without one, because a stop is let through when storage fails, and
-its call stays among them until the work it started has ended, so a copy that arrives while the
-close runs is told as a repeat's. The daemon writes the route before it dispatches the action and
+a mutation the transport has read from the device's stream, whether it waits in the connection's
+queue or is read ahead and held behind the request being answered, and a refusal of a request that
+meets another such call carrying the same request is told as a repeat's. A close whose route cannot
+be recorded goes on without one, because a stop is let through when storage fails, and its call
+stays among them until the work it started has ended, so a copy that arrives while the close runs is
+told as a repeat's. The daemon then keeps the request, in memory, as a close it carried out with no
+route, so a copy that arrives later is told the same; it keeps the last 256 and none after a
+restart. The daemon writes the route before it dispatches the action and
 keeps no word of whether a dispatch followed, so it cannot show that the earlier copy did not run. A
 refusal it makes of a repeat on its own account is therefore told as unknown too, wherever the check
 sits: a registration withdrawn, a grant gone or narrowed, a connection opened for the host or for
@@ -3529,8 +3532,12 @@ ended, a worker refusal that the worker did not read from a receipt, or a route 
 read. A repeated close is the one the daemon can still answer without its worker: the closure record
 answers it for a device that may read the session's receipts, as it answers a close made after the
 closure. A request the daemon never routed is refused as any request is, and so is a reused
-identifier that carries another request; a request whose route the daemon cannot read counts as a
-repeat. The services behind the door check the registration again where they write, and a copy of an
+identifier that carries another request, whether the daemon finds it at the route or in a service's
+record: it is the daemon's word about the identifier and names no result, so a device that may not
+read the record is told it as it is. A request whose route the daemon cannot read counts as a
+repeat. A repeat of a create whose reservation the daemon cannot read, or of an attention action
+whose store it cannot ask, is told `OUTCOME_UNKNOWN` and nothing is performed: a record that cannot
+be read is not one that is absent. The services behind the door check the registration again where they write, and a copy of an
 action that meets a fence owed there is refused in their words. A service that answers a copy of an
 action from its own record while it carries the action out, because the first copy finished
 meanwhile, flags the answer to the door as read from a record. The door then tells it as it tells
