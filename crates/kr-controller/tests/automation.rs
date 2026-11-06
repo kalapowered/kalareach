@@ -1409,6 +1409,50 @@ async fn a_repeat_whose_record_in_the_journal_cannot_be_read_is_told_the_outcome
         .expect("the record can be read again");
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
 
+    // A record whose answer is not text the journal can read is the same.
+    let kept: String = journal
+        .query_row(
+            "SELECT result_json FROM action_records WHERE result_json IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the action's answer");
+    journal
+        .execute("UPDATE action_records SET result_json = 'not json'", [])
+        .expect("the answer cannot be read");
+    let unreadable = failure(
+        client(&host)
+            .await
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(unreadable.code, ErrorCode::OutcomeUnknown, "{unreadable:?}");
+
+    // A refusal the journal recorded is told as it was recorded, whatever its code: the repeat is
+    // answered, and the host does not say it cannot read what it holds.
+    journal
+        .execute(
+            "UPDATE action_records SET result_json = NULL, error_code = 'STORAGE_UNAVAILABLE',
+                                       error_detail = 'the journal could not be written'",
+            [],
+        )
+        .expect("the action is recorded as refused");
+    let refused = failure(
+        client(&host)
+            .await
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    journal
+        .execute(
+            "UPDATE action_records SET result_json = ?1, error_code = NULL, error_detail = NULL",
+            [&kept],
+        )
+        .expect("the answer is restored");
+    assert_eq!(refused.code, ErrorCode::StorageUnavailable, "{refused:?}");
+
     let again: WorkflowInstallResult = typed(
         &client(&host)
             .await
