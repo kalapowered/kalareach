@@ -629,6 +629,15 @@ const ERROR_BYTES: usize = 800;
 /// which targets failed ([`what_the_targets_said`]) is left out: it says which program failed and
 /// not why, and it would take the place of the lines that say.
 fn ends_of(standard_error: &str, root: &Path) -> String {
+    #[cfg(unix)]
+    let resolved = std::fs::canonicalize(root).ok();
+    #[cfg(not(unix))]
+    let resolved = None;
+    ends_of_root_resolved(standard_error, root, resolved.as_deref())
+}
+
+/// [`ends_of`] with the checkout's physical path, `resolved`, given.
+fn ends_of_root_resolved(standard_error: &str, root: &Path, resolved: Option<&Path>) -> String {
     let lines = what_the_targets_said(standard_error);
     if lines.is_empty() {
         return if standard_error.trim().is_empty() {
@@ -643,11 +652,8 @@ fn ends_of(standard_error: &str, root: &Path) -> String {
     let given = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     let mut spellings = vec![given.to_string_lossy().into_owned()];
     // On Windows the physical path has a `\\?\` prefix that no output carries.
-    #[cfg(unix)]
-    {
-        if let Ok(physical) = std::fs::canonicalize(root) {
-            spellings.push(physical.to_string_lossy().into_owned());
-        }
+    if let Some(physical) = resolved {
+        spellings.push(physical.to_string_lossy().into_owned());
     }
     for spelling in spellings.clone() {
         let backslashes = spelling.replace('/', "\\");
@@ -1245,9 +1251,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Binary, ERROR_BYTES, LISTING_BEGIN, LISTING_END, Unit, dependency_file, ends_of, file_name,
-        is_count, is_named_by_digest, libtest, may_have_overlapped, read_listing, reconcile,
-        unrecorded,
+        Binary, ERROR_BYTES, LISTING_BEGIN, LISTING_END, Unit, dependency_file, ends_of,
+        ends_of_root_resolved, file_name, is_count, is_named_by_digest, libtest,
+        may_have_overlapped, read_listing, reconcile, unrecorded,
     };
     use crate::workspace::{TargetId, TargetKind};
 
@@ -1592,6 +1598,33 @@ mod tests {
                 "{}",
                 root.display()
             );
+        }
+    }
+
+    #[test]
+    fn a_root_resolved_through_a_junction_or_with_a_verbatim_prefix_is_left_out_on_every_platform() {
+        // Windows resolves a junction, and writes `\\?\` before the physical path; what Cargo
+        // prints has neither the link nor the prefix.
+        let root = Path::new("link");
+        for (resolved, printed) in [
+            (r"\\?\D:\real\checkout", r"D:\real\checkout"),
+            (r"\\?\UNC\server\share\checkout", r"\\server\share\checkout"),
+        ] {
+            for text in [
+                format!(r"cannot write in {printed}\src\lib.rs: no room"),
+                format!(r"cannot write in {resolved}\src\lib.rs: no room"),
+                format!(
+                    "cannot write in {}/src/lib.rs: no room",
+                    printed.replace('\\', "/")
+                ),
+            ] {
+                let ends = ends_of_root_resolved(&text, root, Some(Path::new(resolved)));
+                assert!(ends.contains("<root>"), "{ends}");
+                assert!(
+                    !ends.contains("checkout") && !ends.contains("share"),
+                    "{ends}"
+                );
+            }
         }
     }
 
