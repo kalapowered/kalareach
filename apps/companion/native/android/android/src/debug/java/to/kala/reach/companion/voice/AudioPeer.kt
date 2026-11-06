@@ -96,7 +96,11 @@ internal class AudioPeer private constructor(context: Context, private val token
             }
             .setPlaybackSamplesReadyCallback { samples -> played.addAndGet((samples.data.size / 2).toLong()) }
             .createAudioDeviceModule()
-            .also { it.setAudioRecordEnabled(false) }
+            .also {
+                it.setAudioRecordEnabled(false)
+                // What the peer is played is counted and not heard: no output route of the device sounds it.
+                it.setSpeakerMute(true)
+            }
 
     private val factory: PeerConnectionFactory =
         PeerConnectionFactory.builder().setAudioDeviceModule(module).createPeerConnectionFactory()
@@ -227,7 +231,16 @@ internal class AudioPeer private constructor(context: Context, private val token
         return out.toString()
     }
 
+    /** One connection: nothing it does, a timeout or a peer that went away included, ends the process. */
     private fun serve(socket: Socket) {
+        try {
+            serveChecked(socket)
+        } catch (failure: Throwable) {
+            errors.add("connection: $failure")
+        }
+    }
+
+    private fun serveChecked(socket: Socket) {
         socket.use {
             socket.soTimeout = 60_000
             val input = socket.getInputStream()
@@ -243,6 +256,7 @@ internal class AudioPeer private constructor(context: Context, private val token
                 it.substringBefore(':').lowercase() to it.substringAfter(':').trim()
             }
             val length = headers["content-length"]?.toIntOrNull() ?: 0
+            if (length !in 0..MAX_BODY_BYTES) return
             val body = ByteArray(length)
             var read = 0
             while (read < length) {
@@ -277,6 +291,7 @@ internal class AudioPeer private constructor(context: Context, private val token
         private const val TONE_HERTZ = 440.0
         private const val TONE_PEAK = 9_000.0
         private const val DESCRIPTION_SECONDS = 30L
+        private const val MAX_BODY_BYTES = 262_144
 
         private var started = false
 

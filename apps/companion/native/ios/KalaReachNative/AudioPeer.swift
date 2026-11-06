@@ -430,7 +430,7 @@ final class PeerServer {
                 headers[line[..<colon].lowercased()] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
             }
         }
-        let length = Int(headers["content-length"] ?? "0") ?? 0
+        let length = max(0, min(Int(headers["content-length"] ?? "0") ?? 0, 262_144))
         let body = data[end.upperBound...]
         guard body.count >= length else { return nil }
         let request = PeerRequest(method: String(first[0]), path: String(first[1]), body: Data(body.prefix(length)))

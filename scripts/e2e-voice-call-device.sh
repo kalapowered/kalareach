@@ -27,8 +27,10 @@
 # the application has read its figure of the first audio, and the application then shows the
 # control unreachable, exercises the local mute and silence, stops the call without the service
 # and finds the closure not confirmed. The peer is a full ICE agent and not the provider's lite
-# one, plays nothing out, and stands in for no provider: what is proved is that the call connects
-# to an answer marked as the provider's and carries audio, not that the provider's own does.
+# one, sends nothing to a speaker of this machine (the emulator's audio is off in this mode and the
+# simulator's synthetic device only drains what it is played), and stands in for no provider: what
+# is proved is that the call connects to an answer marked as the provider's and carries audio, not
+# that the provider's own does.
 #
 # The emulator's audio: the outage mode starts it with `-audio none` unless `KR_EMULATOR_AUDIO_ARGS`
 # says otherwise (it may be set to an empty string); a run may also pass `QEMU_AUDIO_OUT_DRV`,
@@ -46,9 +48,9 @@
 #   scripts/e2e-voice-call-device.sh android [native-failure|outage]
 #
 # Exit codes: 0 every check passed, 2 bad usage or a failed check, 3 the device is not available,
-# 4 every check that measured passed and some check could not measure (a direction of audio a
-# simulator has no microphone to send, a lock screen the call was never permitted to publish); the
-# run says which, and is partial evidence.
+# 4 every check that measured passed and some check could not measure (a direction of audio that
+# nothing counted, a lock screen the peer heard no call to have published); the run says which, and
+# is partial evidence.
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -86,6 +88,8 @@ peer_token="$(uuidgen)"
 emulator_pid=""
 emulator_serial=""
 emulator_adb=""
+# Set once this run has made its adb forward of the peer's port, so that only that forward is removed.
+peer_forward=""
 
 say() { printf '== [voice-call-device] %s\n' "$*" | tee -a "$log"; }
 
@@ -107,7 +111,7 @@ finish() {
         kill -0 "$harness_pid" 2>/dev/null && kill "$harness_pid" 2>/dev/null
     fi
     if [ -n "$emulator_pid" ] && kill -0 "$emulator_pid" 2>/dev/null; then
-        "$emulator_adb" -s "$emulator_serial" forward --remove "tcp:$peer_port" >/dev/null 2>&1
+        [ -z "$peer_forward" ] || "$emulator_adb" -s "$emulator_serial" forward --remove "tcp:$peer_port" >/dev/null 2>&1
         "$emulator_adb" -s "$emulator_serial" emu kill >/dev/null 2>&1
         local stopped=0
         while kill -0 "$emulator_pid" 2>/dev/null && [ "$stopped" -lt 30 ]; do
@@ -361,6 +365,8 @@ run_ios() {
     xcrun simctl spawn "$udid" log show --last 15m --style compact \
         --predicate 'process == "KalaReach"' 2>/dev/null | tail -300 >"$artefacts/application.log"
     xcrun simctl terminate "$udid" "$app_id" >/dev/null 2>&1
+    # A later launch of the installed application must not find this run's request or start its peer.
+    rm -f "${directory:?}/request.json" "${directory:?}/peer.json"
     local app_rc=0 host_rc=0
     judge "$artefacts/$result_name" || app_rc=$?
     judge_host || host_rc=$?
@@ -434,8 +440,10 @@ run_android() {
     # The other way: the application's peer listens on the emulator's loopback interface, and this
     # machine reaches it on the same port number.
     if [ "$mode" = outage ]; then
-        "$adb" -s "$serial" forward "tcp:$peer_port" "tcp:$peer_port" >/dev/null \
+        # Without a rebind, so that a port someone else forwarded since it was chosen is not taken over.
+        "$adb" -s "$serial" forward --no-rebind "tcp:$peer_port" "tcp:$peer_port" >/dev/null \
             || { say "the application's peer could not be forwarded to this machine"; return 2; }
+        peer_forward=1
     fi
 
     local request="$harness/request.json" remote="/data/local/tmp/kr-request-$run.json"
