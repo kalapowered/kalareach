@@ -1250,6 +1250,58 @@ async fn kr_req_19_08_the_phone_holds_no_more_links_than_its_limits() {
     adopted.stop().await;
 }
 
+/// KR-REQ-11.63: on a paired host the links held for a session are the ones the host's connections
+/// gave it, the link its screen opened and its ambient link, and not this application's own slot
+/// for the session, which a phone has none of. A session the phone holds nothing for has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_63_the_links_held_for_a_session_on_a_paired_host_are_its_openings_and_ambient_link()
+ {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(2).await;
+    let session = adopted.workers[0].session_id;
+    let other = adopted.workers[1].session_id;
+    adopted.workers[0].ask("held");
+    let phone = phone_under(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::QuestionRespond]),
+    )
+    .await;
+    let companion = &phone.companion;
+    let state = companion.app.state::<companion_tauri::AppState>();
+    let links = companion.app.state::<companion_tauri::agent::WorkerLinks>();
+    assert_eq!(
+        links.held_for_count(&state, session),
+        0,
+        "nothing is held yet"
+    );
+
+    // A read that names no opening goes over the session's ambient link.
+    companion
+        .call(
+            "question_read",
+            json!({
+                "params": {
+                    "session_id": session.to_string(),
+                    "question_id": null,
+                    "include_resolved": false,
+                },
+            }),
+        )
+        .expect("the question is read");
+    assert_eq!(links.held_for_count(&state, session), 1, "the ambient link");
+
+    open(companion, session, None, "screen").expect("opens");
+    assert_eq!(
+        links.held_for_count(&state, session),
+        2,
+        "the screen's link and the ambient link"
+    );
+    assert_eq!(links.held_for_count(&state, other), 0, "another session's");
+    assert_eq!(links.held(), 0, "none through this application's own slots");
+    adopted.stop().await;
+}
+
 /// KR-REQ-19.08: the rights the phone is told are the ones the host decided, on the main connection
 /// and on a screen's link alike, and not the ones its pairing proposed: a host whose configuration
 /// takes a right away shows the phone one less.
