@@ -229,8 +229,8 @@ The call controls keep them strictly separated:
 
 `scripts/e2e-voice-call-device.sh <ios|android> [native-failure|outage]` runs a whole call on a
 simulator or an emulator, with the real application, the real platform plugin and a real host. The
-voice service is a stand-in on the machine's loopback interface, and the script holds the machine's
-device lease for as long as it runs. The result is exit 0 when every check passed, 2 when one failed,
+voice service is a stand-in on the machine's loopback interface, and the script is run inside the
+machine's device lease. The result is exit 0 when every check passed, 2 when one failed,
 3 when the device is not available, and 4 when every check that measured passed and some check could
 not measure what it asks about; the run names those checks. A check that could not measure is neither
 a pass nor a failure of what it asks about.
@@ -249,9 +249,12 @@ run shows that the call connects to such an answer and carries audio, and not th
 answer does.
 
 The checks judge audio by counters crossing a floor, never by elapsed time: about a second of audio
-packets in each direction, and a fifth of a second of samples played. A direction the machine cannot
-make is reported as not measured. A simulator has no microphone to send from, so its send direction is
-not measured unless the call's capture reads `capturing`. When the application has read its figure of
+packets in each direction, and a fifth of a second of samples played. A direction that nothing
+counted, or that stayed under its floor with no microphone to send from, is reported as not measured.
+On a simulator the call's capture does not read `capturing`, so the packets it sends carry whatever its
+audio unit delivers, silence included, and say nothing of speech; the run grants the machine no
+permission, and what the Simulator does with the machine's input device is its own. When the
+application has read its figure of
 the first audio, the script takes the voice service away. The checks then expect the control to read
 `unreachable`, the microphone's mute and the speaker's silence to work with the media still
 connected, a stop to return without waiting for the service, the media to stop on the device, the host

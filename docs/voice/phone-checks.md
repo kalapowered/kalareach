@@ -14,7 +14,7 @@ Open the voice screen for the session, and before you press the start button tak
 
 Press the start button, say something, wait for the voice model to respond, and then lock your phone. Continue the conversation, and check that it is ongoing. When you unlock your phone, the call should still be going on the call screen.
 
-On an iPhone, the lock screen shows the call as the current now playing, with a pause button. Pause mutes your microphone, and the call screen then shows the microphone as muted. A play button never appears, so nothing on the lock screen turns the microphone back on. iOS draws no stop button, so you end the call from the call screen. A headset or car system that sends a stop command ends it.
+On an iPhone, the lock screen shows the call as the current now playing, with a pause button. Pause mutes your microphone, and the call screen then shows the microphone as muted. Nothing on the lock screen turns the microphone back on: if iOS draws a play button while the microphone is muted, it does nothing. iOS draws no stop button, so you end the call from the call screen. A headset or car system that sends a stop command ends it.
 
 On an Android phone, the call notification provides the ability to mute and unmute your end of the microphone.
 
