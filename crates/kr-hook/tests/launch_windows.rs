@@ -1537,7 +1537,7 @@ mod memory {
         reason = "reading another process's memory has no safe interface"
     )]
 
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQueryEx,
@@ -1549,27 +1549,108 @@ mod memory {
     /// How much of a region is read at once.
     const CHUNK: usize = 1 << 20;
 
+    /// The size of the pages a short read is gone over one by one.
+    const PAGE: usize = 0x1000;
+
+    /// The system's answer to a query beyond the last region of the address space.
+    const BEYOND_THE_ADDRESS_SPACE: i32 = 87;
+
     /// What a reading of a process's memory found.
     pub struct Scan {
         /// For each needle, whether it is in the committed, readable memory that was read.
         pub found: Vec<bool>,
-        /// The bytes of committed, readable regions that a read did not return. A region of a
-        /// running process can be released between the query that describes it and the read of it,
-        /// so this is reported and not refused: what shows the reading reached the memory that
-        /// matters is a needle the process is known to hold.
-        pub unread: usize,
+        /// The bytes that the system still describes as committed and readable, after a read of
+        /// them failed and was made again page by page, and that no read returned. A page that
+        /// the process released between the query that described it and the read is not one: it is
+        /// not there to be searched.
+        pub unresolved: usize,
+    }
+
+    /// The needles looked for, and what has been found of them in the bytes fed so far.
+    struct Matcher<'a> {
+        needles: &'a [Vec<u8>],
+        found: Vec<bool>,
+        /// The end of the bytes fed last, as long as the longest needle less one, so that a needle
+        /// that straddles two reads is found.
+        kept: Vec<u8>,
+    }
+
+    impl Matcher<'_> {
+        fn feed(&mut self, bytes: &[u8]) {
+            self.kept.extend_from_slice(bytes);
+            for (needle, seen) in self.needles.iter().zip(&mut self.found) {
+                if !*seen {
+                    *seen = self
+                        .kept
+                        .windows(needle.len())
+                        .any(|window| window == needle.as_slice());
+                }
+            }
+            let longest = self.needles.iter().map(Vec::len).max().unwrap_or(1);
+            let from = self.kept.len().saturating_sub(longest - 1);
+            self.kept.drain(..from);
+        }
+
+        /// Memory that is not next to what was fed last.
+        fn gap(&mut self) {
+            self.kept.clear();
+        }
+    }
+
+    /// Describes the region that holds `address`, or says with the system's error why not.
+    fn describe(
+        process: HANDLE,
+        address: usize,
+    ) -> Result<MEMORY_BASIC_INFORMATION, std::io::Error> {
+        // SAFETY: an all-zero description is a valid value for this plain structure.
+        let mut region: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is open for the call, and the structure is this function's own with its
+        // true size passed.
+        let described = unsafe {
+            VirtualQueryEx(
+                process,
+                address as *const _,
+                &raw mut region,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if described == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(region)
+        }
+    }
+
+    /// Whether a region is committed and can be read.
+    fn readable(region: &MEMORY_BASIC_INFORMATION) -> bool {
+        region.State == MEM_COMMIT && region.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
+    }
+
+    /// Reads up to `buffer.len()` bytes at `address` and returns how many came back, which is what
+    /// a read that stopped short copied.
+    fn read(process: HANDLE, address: usize, buffer: &mut [u8]) -> usize {
+        let mut copied = 0_usize;
+        // SAFETY: the buffer is the caller's own and its length is passed; the handle is open for
+        // the call.
+        unsafe {
+            ReadProcessMemory(
+                process,
+                address as *const _,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &raw mut copied,
+            );
+        }
+        copied.min(buffer.len())
     }
 
     /// Reads the committed, readable memory of process `pid` and says which of `needles` it holds.
     ///
-    /// A needle that straddles two reads is found, because the end of each read is kept for the
-    /// next. The reading ends when the system says there is no region beyond the last one; any
-    /// other answer is an error.
+    /// The reading ends when the system says there is no region beyond the last one; any other
+    /// answer is an error. A read that stops short is searched for what it returned, and the rest
+    /// is read again a page at a time; what the system still describes as readable and cannot be
+    /// read is counted as unresolved.
     pub fn scan(pid: u32, needles: &[Vec<u8>]) -> Result<Scan, String> {
-        /// The system's answer to a query beyond the last region of the address space.
-        const BEYOND_THE_ADDRESS_SPACE: i32 = 87;
-
-        let longest = needles.iter().map(Vec::len).max().unwrap_or(1);
         // SAFETY: the call takes plain integers and returns a handle or null, which is checked.
         let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
         if process.is_null() {
@@ -1578,82 +1659,64 @@ mod memory {
                 std::io::Error::last_os_error()
             ));
         }
-        let mut found = vec![false; needles.len()];
-        let mut unread = 0_usize;
+        let mut matcher = Matcher {
+            needles,
+            found: vec![false; needles.len()],
+            kept: Vec::new(),
+        };
+        let mut unresolved = 0_usize;
         let mut address = 0_usize;
-        loop {
-            // SAFETY: an all-zero description is a valid value for this plain structure.
-            let mut region: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-            // SAFETY: the handle is open for the call, and the structure is this function's own
-            // with its true size passed.
-            let described = unsafe {
-                VirtualQueryEx(
-                    process,
-                    address as *const _,
-                    &raw mut region,
-                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-                )
-            };
-            if described == 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(BEYOND_THE_ADDRESS_SPACE) {
-                    // SAFETY: the handle was opened above and is closed once.
-                    unsafe { CloseHandle(process) };
-                    return Err(format!(
+        let outcome = loop {
+            let region = match describe(process, address) {
+                Ok(region) => region,
+                Err(error) if error.raw_os_error() == Some(BEYOND_THE_ADDRESS_SPACE) => {
+                    break Ok(());
+                }
+                Err(error) => {
+                    break Err(format!(
                         "process {pid}: the region at {address:#x} is not described: {error}"
                     ));
                 }
-                break;
-            }
+            };
             let base = region.BaseAddress as usize;
             let size = region.RegionSize;
-            if region.State == MEM_COMMIT && region.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
+            if readable(&region) {
+                matcher.gap();
                 let mut offset = 0;
-                let mut kept: Vec<u8> = Vec::new();
                 while offset < size {
                     let want = (size - offset).min(CHUNK);
                     let mut buffer = vec![0_u8; want];
-                    let mut read = 0_usize;
-                    // SAFETY: the buffer is this function's own and `want` is its length; the handle
-                    // is open for the call.
-                    let ok = unsafe {
-                        ReadProcessMemory(
-                            process,
-                            (base + offset) as *const _,
-                            buffer.as_mut_ptr().cast(),
-                            want,
-                            &raw mut read,
-                        )
-                    };
-                    if ok != 0 && read > 0 {
-                        buffer.truncate(read);
-                        unread += want - read;
-                        kept.extend_from_slice(&buffer);
-                        for (needle, seen) in needles.iter().zip(&mut found) {
-                            if !*seen {
-                                *seen = kept
-                                    .windows(needle.len())
-                                    .any(|window| window == needle.as_slice());
-                            }
+                    let got = read(process, base + offset, &mut buffer);
+                    matcher.feed(&buffer[..got]);
+                    let mut at = got;
+                    while at < want {
+                        matcher.gap();
+                        let here = base + offset + at;
+                        let step = (PAGE - here % PAGE).min(want - at);
+                        let returned = read(process, here, &mut buffer[at..at + step]);
+                        matcher.feed(&buffer[at..at + returned]);
+                        if returned < step
+                            && describe(process, here).is_ok_and(|now| readable(&now))
+                        {
+                            unresolved += step - returned;
                         }
-                        let from = kept.len().saturating_sub(longest - 1);
-                        kept.drain(..from);
-                    } else {
-                        unread += want;
-                        kept.clear();
+                        at += step;
                     }
                     offset += want;
                 }
             }
             let next = base.saturating_add(size);
             if next <= address {
-                break;
+                break Ok(());
             }
             address = next;
-        }
+        };
         // SAFETY: the handle was opened above and is closed once.
         unsafe { CloseHandle(process) };
-        Ok(Scan { found, unread })
+        outcome.map(|()| Scan {
+            found: matcher.found,
+            unresolved,
+        })
     }
 }
 
@@ -1794,21 +1857,25 @@ fn kr_req_11_23_a_launch_is_bound_to_the_program_it_created_and_the_credential_i
     let the_program = memory::scan(program, &needles).expect("the program's process is read");
     assert!(
         the_program.found[2],
-        "the reading of the program's memory reaches its environment block ({} bytes of committed \
-         memory were not returned)",
-        the_program.unread
+        "the reading of the program's memory reaches its environment block"
+    );
+    assert_eq!(
+        the_program.unresolved, 0,
+        "bytes of the program's memory that are committed and readable could not be read"
     );
     assert!(
         !the_program.found[0] && !the_program.found[1],
         "the credential is in the memory of the program the launcher created"
     );
-    let launcher_holds =
-        memory::scan(launcher.id(), &needles).map(|scan| scan.found[0] || scan.found[1]);
+    // Not asserted: where the launcher keeps the credential is the launcher's own affair. Its
+    // environment holds `REPORT` too, so a reading of it that found nothing at all is told apart.
+    let launcher_holds = memory::scan(launcher.id(), &needles)
+        .map(|scan| (scan.found[0] || scan.found[1], scan.found[2]));
     eprintln!(
         "the credential is in this process, and in none of the program's environment, command line \
-         or memory (its environment block was read; {} bytes of committed memory were not \
-         returned); the launcher (process {}) holds it in memory: {launcher_holds:?}",
-        the_program.unread,
+         or memory (its environment block was read, and every committed readable byte was); the \
+         launcher (process {}) holds the credential and the program's environment text in memory: \
+         {launcher_holds:?}",
         launcher.id()
     );
 }
