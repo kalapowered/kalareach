@@ -405,6 +405,26 @@ async fn start<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> Optio
     ));
 
     let (began, began_ms) = (Instant::now(), now_ms());
+    // What the connection to the host did while the start waited, one word per change.
+    let watched = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let watcher = {
+        let (app, watched) = (app.clone(), std::sync::Arc::clone(&watched));
+        tokio::spawn(async move {
+            let mut last = None;
+            loop {
+                let state = app.state::<AppState>().connection_state();
+                let word = format!("connected {} {:?}", state.connected, state.reason);
+                if last.as_ref() != Some(&word) {
+                    watched
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(format!("{}s {word}", began.elapsed().as_secs()));
+                    last = Some(word);
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    };
     let started = commands::voice_start(
         app.clone(),
         app.state(),
@@ -419,6 +439,11 @@ async fn start<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> Optio
             .map(str::to_owned),
     )
     .await;
+    watcher.abort();
+    let connection = watched
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .join("; ");
     let started = match started.map(|started| serde_json::to_value(started).unwrap_or(Value::Null))
     {
         Ok(started) => started,
@@ -439,7 +464,7 @@ async fn start<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> Optio
         started_ok,
         if started_ok {
             format!(
-                "the host made the call and kept the provider's answer from the page; the start began at {began_ms} and took {} s",
+                "the host made the call and kept the provider's answer from the page; the start began at {began_ms} and took {} s; the connection to the host: {connection}",
                 began.elapsed().as_secs()
             )
         } else {
@@ -450,7 +475,7 @@ async fn start<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) -> Optio
             }
             let text = answer.to_string();
             format!(
-                "the start began at {began_ms} and took {} s; the host answered {}",
+                "the start began at {began_ms} and took {} s; the connection to the host: {connection}; the host answered {}",
                 began.elapsed().as_secs(),
                 text.chars().take(600).collect::<String>()
             )
