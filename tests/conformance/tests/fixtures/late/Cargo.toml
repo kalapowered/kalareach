@@ -10,6 +10,12 @@ edition = "2024"
 publish = false
 build = "build.rs"
 
+# Cargo compiles a library's own test target beside the library, and both would expand the macro at
+# once against one file; the tree has no unit test or documentation test.
+[lib]
+test = false
+doctest = false
+
 [dependencies]
 embed = { path = "embed" }
 
