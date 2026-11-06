@@ -42,6 +42,17 @@ use voice_support::StandIn;
 /// The token the phone's account holds, which the stand-in's control accepts.
 const TOKEN: &str = "harness-account-token";
 
+/// How the counters the scripted platform reports move.
+#[derive(Clone, Copy)]
+enum Moves {
+    /// They grow all the time.
+    Always,
+    /// They stand still.
+    Never,
+    /// They grow until the voice service is gone and stand still after.
+    UntilTheServiceIsGone,
+}
+
 /// A host, a stand-in voice service and a phone that is paired with nothing and is given the
 /// stand-in's origin and token, as the device run gives them.
 struct Scene {
@@ -56,6 +67,8 @@ struct Scene {
     /// Set when the outage mode has read the figure of the first audio played out, after which the
     /// script takes the voice service away.
     figure_read: Arc<AtomicBool>,
+    /// Set when the script has taken the voice service away.
+    service_gone: Arc<AtomicBool>,
     /// The checks reported so far, by name.
     reported: Arc<std::sync::Mutex<Vec<&'static str>>>,
     _data: tempfile::TempDir,
@@ -109,6 +122,7 @@ async fn scene() -> Scene {
         harness,
         looked: Arc::default(),
         figure_read: Arc::default(),
+        service_gone: Arc::default(),
         reported: Arc::default(),
         _data: data,
     }
@@ -210,17 +224,21 @@ impl Scene {
         .expect("the call runs");
     }
 
-    /// What native code's statistics say the media carried, and the news that audio was played out,
-    /// once the call runs; the counters grow while `grows` says so and stand still otherwise.
-    /// Returns the task that moves them.
+    /// What native code's statistics say the media carried, and, when `playout` says so, the news
+    /// that audio was played out, once the call runs; the counters move as `moves` says. Returns the
+    /// task that moves them.
     async fn carry_audio_once_the_call_runs(
         &self,
-        grows: bool,
+        moves: Moves,
         from: u64,
+        playout: bool,
     ) -> tokio::task::JoinHandle<()> {
         self.call_runs().await;
         let platform = Arc::clone(&self.platform);
-        platform.tell(CallEvent::Playout);
+        if playout {
+            platform.tell(CallEvent::Playout);
+        }
+        let gone = Arc::clone(&self.service_gone);
         let mut counted = from;
         tokio::spawn(async move {
             loop {
@@ -229,6 +247,11 @@ impl Scene {
                     packets_sent: Some(counted),
                     played_samples: Some(counted * 480),
                 });
+                let grows = match moves {
+                    Moves::Always => true,
+                    Moves::Never => false,
+                    Moves::UntilTheServiceIsGone => !gone.load(Ordering::SeqCst),
+                };
                 if grows {
                     counted += 100;
                 }
@@ -248,6 +271,7 @@ impl Scene {
         .await
         .expect("the figure was read");
         self.stand_in.go_down();
+        self.service_gone.store(true, Ordering::SeqCst);
     }
 
     /// Ends the call once it runs, the way a connection that leads nowhere does.
@@ -363,7 +387,7 @@ async fn a_call_that_carries_audio_is_followed_through_the_loss_of_the_voice_ser
             &mut report,
         ),
         scene.approve(invitation),
-        scene.carry_audio_once_the_call_runs(true, 100),
+        scene.carry_audio_once_the_call_runs(Moves::Always, 100, true),
         scene.take_the_service_away_once_the_figure_is_read(),
     );
     moving.abort();
@@ -408,7 +432,7 @@ async fn audio_that_does_not_move_fails_the_checks_and_audio_nobody_counted_is_n
             &mut report,
         ),
         scene.approve(invitation),
-        scene.carry_audio_once_the_call_runs(false, 100),
+        scene.carry_audio_once_the_call_runs(Moves::Never, 100, true),
         scene.take_the_service_away_once_the_figure_is_read(),
     );
     moving.abort();
@@ -439,7 +463,7 @@ async fn audio_that_does_not_move_fails_the_checks_and_audio_nobody_counted_is_n
             &mut report,
         ),
         scene.approve(invitation),
-        scene.carry_audio_once_the_call_runs(false, 10),
+        scene.carry_audio_once_the_call_runs(Moves::Never, 10, true),
         scene.take_the_service_away_once_the_figure_is_read(),
     );
     moving.abort();
@@ -499,6 +523,74 @@ async fn audio_that_does_not_move_fails_the_checks_and_audio_nobody_counted_is_n
             .iter()
             .filter(|check| check.measured)
             .all(|check| check.ok),
+        "{:#?}",
+        failed(&checks)
+    );
+    scene.host.stop().await;
+}
+
+/// Packets that arrived before the service went away do not make the media go on without it: a
+/// counter that stood still from the loss on fails the check, whatever it had grown to before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn media_that_stops_when_the_service_goes_away_does_not_stay_connected() {
+    let scene = scene().await;
+    let (text, invitation) = scene.invitation().await;
+    let mut report = scene.reporting();
+    let run = scene.harness_for(&text, Mode::Outage);
+    let (checks, (), moving, ()) = tokio::join!(
+        call_check(
+            scene.companion.app.handle(),
+            &*scene.platform,
+            &run,
+            &mut report,
+        ),
+        scene.approve(invitation),
+        scene.carry_audio_once_the_call_runs(Moves::UntilTheServiceIsGone, 100, true),
+        scene.take_the_service_away_once_the_figure_is_read(),
+    );
+    moving.abort();
+
+    assert_eq!(
+        failed(&checks)
+            .iter()
+            .filter_map(|line| line.strip_prefix("check="))
+            .filter_map(|line| line.split(" ok=").next())
+            .collect::<Vec<_>>(),
+        ["the media stays connected with the service gone"],
+        "{:#?}",
+        failed(&checks)
+    );
+    scene.host.stop().await;
+}
+
+/// Audio that arrived and samples that were played, with no news of audio played out, are a
+/// detector that did not tell: the figure's check fails and is not said to be unmeasured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audio_that_played_with_no_news_of_it_fails_the_figure_check() {
+    let scene = scene().await;
+    let (text, invitation) = scene.invitation().await;
+    let mut report = scene.reporting();
+    let run = scene.harness_for(&text, Mode::Outage);
+    let (checks, (), moving, ()) = tokio::join!(
+        call_check(
+            scene.companion.app.handle(),
+            &*scene.platform,
+            &run,
+            &mut report,
+        ),
+        scene.approve(invitation),
+        scene.carry_audio_once_the_call_runs(Moves::Always, 100, false),
+        scene.take_the_service_away_once_the_figure_is_read(),
+    );
+    moving.abort();
+
+    assert_eq!(
+        failed(&checks)
+            .iter()
+            .filter_map(|line| line.strip_prefix("check="))
+            .filter_map(|line| line.split(" ok=").next())
+            .collect::<Vec<_>>(),
+        ["the first audio played out"],
         "{:#?}",
         failed(&checks)
     );

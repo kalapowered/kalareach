@@ -77,6 +77,10 @@ const UNREACHABLE_WITHIN: Duration = Duration::from_secs(90);
 /// tries it, and gives it up.
 const UNCONFIRMED_WITHIN: Duration = Duration::from_secs(180);
 
+/// How long the media is given to carry packets again after the service is gone and the local
+/// controls have run: a counter that has not moved by then did not go on.
+const MEDIA_GOES_ON_WITHIN: Duration = Duration::from_secs(5);
+
 /// The audio packets a direction must have carried, about a second of them, for the call to be
 /// said to carry audio that way.
 const AUDIO_FLOOR: u64 = 50;
@@ -650,6 +654,14 @@ async fn media_of(platform: &dyn CallPlatform) -> Option<(Option<Media>, Capture
     Some((held.media, held.capture))
 }
 
+/// The audio packets the call has received, as native code counts them.
+async fn packets_received(platform: &dyn CallPlatform) -> Option<u64> {
+    media_of(platform)
+        .await
+        .and_then(|(media, _)| media)
+        .and_then(|media| media.packets_received)
+}
+
 /// Whether the audio of all three kinds has crossed its floor.
 fn all_crossed(media: &Media) -> bool {
     media.packets_received.is_some_and(|n| n >= AUDIO_FLOOR)
@@ -752,6 +764,13 @@ async fn outage<R: Runtime>(
         call_state(app).await["first_audio_ms"].as_u64()
     })
     .await;
+    // Audio that arrived and samples that were played, with no news of audio played out, is a
+    // detector that failed to tell: that is a failure. With either of the two unmeasured or under
+    // its floor, the figure is only not measured.
+    let played = media.as_ref().is_some_and(|media| {
+        media.packets_received.is_some_and(|n| n >= AUDIO_FLOOR)
+            && media.played_samples.is_some_and(|n| n >= PLAYED_FLOOR)
+    });
     checks.push(match figure {
         Some(ms) => Check::found(
             "the first audio played out",
@@ -760,12 +779,16 @@ async fn outage<R: Runtime>(
                 "figure first_audio_ms={ms}; from the entry of the start to the receipt of the news"
             ),
         ),
+        None if played => Check::found(
+            "the first audio played out",
+            false,
+            "native code told of no audio played out, though audio arrived and samples were played",
+        ),
         None => Check::not_measured(
             "the first audio played out",
             "native code told of no audio played out",
         ),
     });
-    let before = media.as_ref().and_then(|media| media.packets_received);
 
     // The script takes the voice service away. The call tells the person it cannot reach it.
     let unreachable = until(UNREACHABLE_WITHIN, || async {
@@ -778,6 +801,9 @@ async fn outage<R: Runtime>(
         unreachable,
         trace.text(),
     ));
+    // The media's baseline is taken now, with the service gone, so that packets that arrived before
+    // the loss do not count towards the media going on after it.
+    let before = packets_received(platform).await;
 
     // What works without the service: the microphone's mute and the speaker's silence are local.
     let mut local = Vec::new();
@@ -809,10 +835,14 @@ async fn outage<R: Runtime>(
     for (name, ok, detail) in local {
         checks.push(Check::found(name, ok, detail));
     }
-    let after = media_of(platform)
+    let after = match before {
+        Some(before) => until(MEDIA_GOES_ON_WITHIN, || async move {
+            packets_received(platform).await.filter(|now| *now > before)
+        })
         .await
-        .and_then(|(media, _)| media)
-        .and_then(|media| media.packets_received);
+        .or(packets_received(platform).await),
+        None => None,
+    };
     checks.push(match (before, after) {
         (Some(before), Some(after)) => Check::found(
             "the media stays connected with the service gone",
