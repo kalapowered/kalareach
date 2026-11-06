@@ -4373,10 +4373,12 @@ fn encode_answer(answer: &Answered, reading: HostReading) -> Vec<u8> {
         .unwrap_or_default()
 }
 
+/// Reads the answer an action's record keeps. The action was performed, and an answer that cannot
+/// be read leaves open what it came to, which a transient word would have the caller send again.
 fn decode_answer(bytes: &[u8]) -> Answer<ParamsValue> {
     kr_cbor::decode(bytes, &kr_cbor::Limits::DEFAULT)
         .map(ParamsValue::new)
-        .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string()))
+        .map_err(|_| ControllerError::record_unreadable("attention actions").to_protocol_error())
 }
 
 fn frame(request_id: RequestId, answer: Answer<ParamsValue>) -> ControlFrame {

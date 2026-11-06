@@ -1466,6 +1466,24 @@ async fn a_repeat_of_an_attention_action_whose_record_cannot_be_read_is_told_the
         .expect("the record can be read again");
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
 
+    // A record the store reads but whose answer cannot be decoded is the same: the action was
+    // performed, and what it came to is not known.
+    let kept: Vec<u8> = store
+        .query_row("SELECT answer FROM attention_actions", [], |row| row.get(0))
+        .expect("the action's answer");
+    store
+        .execute("UPDATE attention_actions SET answer = x'ff'", [])
+        .expect("the answer cannot be decoded");
+    let undecoded = control
+        .repeat(&original)
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("an answer that cannot be decoded does not answer the repeat");
+    store
+        .execute("UPDATE attention_actions SET answer = ?1", [&kept])
+        .expect("the answer can be decoded again");
+    assert_eq!(undecoded.code, ErrorCode::OutcomeUnknown, "{undecoded:?}");
+
     let again: AttentionQuietHoursResult = control
         .repeat(&original)
         .await
