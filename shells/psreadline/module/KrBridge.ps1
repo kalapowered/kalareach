@@ -502,6 +502,7 @@ function Receive-KrPipeAvailable {
                 $pending = $Pipe.ReadAsync(
                     $script:Kr.PipeBuffer, 0, $script:Kr.PipeBuffer.Length)
             } catch {
+                if ($taken -gt 0) { return $true }
                 Disconnect-KrEndpoint
                 return $false
             }
@@ -556,6 +557,7 @@ function Receive-KrAvailable {
             for ($i = 0; $i -lt $count; $i++) { $script:Kr.Incoming.Add($buffer[$i]) }
         } catch [System.Net.Sockets.SocketException] {
             if ($_.Exception.SocketErrorCode -eq [System.Net.Sockets.SocketError]::WouldBlock) { break }
+            if ($collected) { break }
             Disconnect-KrEndpoint
             return $false
         } catch {
