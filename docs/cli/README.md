@@ -331,7 +331,13 @@ changed size or a key moved the window while the report was on its way. Otherwis
 session's next word, up to three times in a row, and after that with the terminal's next resize or
 key. A move, or the return to the live screen that typing asks for, which the session refuses for
 now or cannot say what became of, is settled as not taken and is not made again: press the key
-again.
+again. If the terminal owes a size after such a return, or the question a refused resize leaves
+owed, it sends it at the live screen, where the typing wanted the window, until a screen says where
+the window is. A resize that the terminal makes as the owner of the session's size, and that the
+session refuses for now or cannot say what became of, is asked about with the session's next word:
+the answer says what size the session has, and the terminal resizes again if the session is at
+another. It does this for at most three such resizes in a row, and after that the session stays at
+the size it has until the terminal is resized again.
 
 A read is one of those keys or it is the session's, whole and unchanged. That is the rule rather
 than a reader that looks inside a batch, because looking inside is how a command starts altering
@@ -1780,7 +1786,12 @@ pairing.
 Issuing an invitation and approving a device each need a fresh owner confirmation naming exactly
 that action, and `kr` asks the host for one first. On a host that has an owner, an owner device
 confirms it in its own ceremony: `kr` says so on standard error and waits, asking the host again
-every second, until the confirmation arrives or the challenge runs out after two minutes.
+every second, until the confirmation arrives or the challenge runs out after two minutes. The wait
+is the one the plugin commands use. A host that says it cannot take the request now, with a
+transient code, is asked again, and a request refused for now after the host spent the owner
+device's answer ends the wait with that refusal. A host that does not answer, or a connection that
+ends after the request was sent, leaves the outcome unknown: the command says so, with
+`OUTCOME_UNKNOWN`, and exits 1.
 
 ### A host's first owner
 
