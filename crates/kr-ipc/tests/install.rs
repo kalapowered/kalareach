@@ -1461,9 +1461,18 @@ fn a_program_that_asks_what_it_runs_after_its_release_was_removed_is_refused() {
 /// program that only replaces a link and flushes the directory after each replace, as the switch
 /// does, shows it, so the store and its locks are not needed for it. What the switch decides is
 /// what the link names, and that is read whole.
+///
+/// There are more readers than processors, so that some are taken off a processor in the middle of a
+/// read. On macOS a read that is still going when the switch after the next takes away the link it
+/// looked up finds no link, though `current` was a link at every moment; the store's read of
+/// `current` reads again, and this is where that shows.
 #[test]
 fn current_names_a_whole_release_at_every_moment_of_a_switch() {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    let readers = 2 * std::thread::available_parallelism()
+        .map_or(3, usize::from)
+        .clamp(3, 8);
 
     let test = TestStore::create();
     let one = release("0.1.0+aaaaaaaaaaaa");
@@ -1474,7 +1483,7 @@ fn current_names_a_whole_release_at_every_moment_of_a_switch() {
     let finished = AtomicBool::new(false);
     let reads = AtomicU32::new(0);
     std::thread::scope(|scope| {
-        for _ in 0..3 {
+        for _ in 0..readers {
             scope.spawn(|| {
                 while !finished.load(Ordering::SeqCst) {
                     let named = test

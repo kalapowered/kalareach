@@ -1259,13 +1259,17 @@ impl Store {
 
     /// The release `current` names, where it names one.
     ///
+    /// A read that finds no link, or no `current`, reads again (three times in all) before it says
+    /// so, since a switch that runs while the read is under way can take away the link the read
+    /// had looked up.
+    ///
     /// # Errors
     ///
     /// Returns [`InstallError::Io`] when the link cannot be read, and [`InstallError::Replaced`]
     /// when it names something other than a release of this store.
     pub fn current(&self) -> Result<Option<ReleaseName>> {
         let link = self.current_link();
-        let target = match std::fs::read_link(&link) {
+        let target = match read_link_again_if_gone(&link) {
             Ok(target) => target,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(InstallError::io("read the link", &link, error)),
@@ -1526,8 +1530,15 @@ impl Store {
     /// holds it, so removing it at once made those readers fail in the background scheduling class
     /// (13 to 23 reads in about 420,000). With the old link kept, the same loops failed none of
     /// about 1.2 million reads in that class and none at normal priority. The next switch takes the
-    /// kept link away, as it takes away one a crash left. A file system that cannot exchange names
-    /// gets the rename, as it did before.
+    /// kept link away, as it takes away one a crash left.
+    ///
+    /// A single read can still outlast that: one that is taken off its processor after it looked
+    /// `current` up, and resumes after the next switch has taken away the link it looked up, finds
+    /// no link (`EINVAL`) or no name (`ENOENT`) though `current` was a link at every moment. With
+    /// twelve readers in the background scheduling class, 65 and 47 reads failed that way in about
+    /// 3.2 million each, and none in about 3.6 and 3.8 million when the next switch left the link
+    /// alone. [`Store::current`] reads again. A file system that cannot exchange names gets the
+    /// rename, as it did before.
     #[cfg(target_os = "macos")]
     fn put_in_place_of_current(&self, temporary: &Path) -> std::io::Result<()> {
         use rustix::fs::{CWD, RenameFlags, renameat_with};
@@ -1966,6 +1977,15 @@ pub struct RecordedDocument {
     /// The record that says so.
     pub record: PathBuf,
 }
+
+/// How many times [`Store::current`] reads the link before it believes that it is not one. `current`
+/// is a link at every moment of a switch, but one read of it can still meet a link that is gone:
+/// on macOS, a read that was taken off its processor after it looked the link up, and that resumes
+/// after the switch after next has taken that link away (the one the previous switch swapped out),
+/// answers that the name is no link or is not there. The read that follows starts from the name
+/// again and finds the link that is there; the count only keeps a `current` that really is no link
+/// from being read for ever.
+const CURRENT_READ_ATTEMPTS: usize = 3;
 
 /// How many times [`Store::hold_current`] reads `current` again for a release that was removed
 /// before it could be held. A release goes only once it is not current, so a second read finds
@@ -2540,6 +2560,28 @@ impl Pin {
     /// Runs `command` with the release held until the program has ended: see `Hold::run`.
     pub fn run(self, command: &mut std::process::Command) -> std::io::Error {
         self.hold.run(command)
+    }
+}
+
+/// Reads the link at `link`, and reads it again, `CURRENT_READ_ATTEMPTS` times in all, when the answer
+/// is that the name is no link or is not there. Any other answer, and the last of these, is returned
+/// as it came.
+fn read_link_again_if_gone(link: &Path) -> std::io::Result<PathBuf> {
+    let mut attempt = 1;
+    loop {
+        match std::fs::read_link(link) {
+            Err(error)
+                if attempt < CURRENT_READ_ATTEMPTS
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+                    ) =>
+            {
+                attempt += 1;
+                std::thread::yield_now();
+            }
+            read => return read,
+        }
     }
 }
 

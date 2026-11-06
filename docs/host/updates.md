@@ -250,6 +250,12 @@ away: removing it at once failed a reader that had resolved `current` just befor
 failed none of about 1.2 million reads. The kept link names a release's directory and holds
 nothing, so the release it names is removed as any other.
 
+A read of `current` that is held up for the length of two switches, because the machine has more
+runnable threads than processors, can still find the link it looked up gone, and then answers that
+`current` is no link or is not there. The read that follows finds the link. The store's own read of
+`current` therefore reads again, up to three times in all, before it says so; a program that reads
+`current` by another way (a shell, a service manager) can meet the one answer, and reads again too.
+
 An update that is held waits. It starts again every daemon it stopped, from the release still
 current, keeps the new release staged for the next attempt, which replaces it by the copy it checks
 then, and exits with 9. When a daemon it stopped does not start again, it exits with 1 instead,
