@@ -470,7 +470,7 @@ impl Controller {
         // Whether this host runs Git for a paired device is proved once here, before anything is
         // served, and again at each `host.doctor`.
         let qualification = project.qualify().await;
-        // A platform that confines nothing is not news; a Linux host that could not prove it is.
+        // A platform that confines nothing is not news; a Linux or macOS host that could not prove it is.
         if matches!(
             qualification.refusal(),
             Some(

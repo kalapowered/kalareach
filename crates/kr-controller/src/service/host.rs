@@ -992,15 +992,40 @@ impl Controller {
                     "This daemon's own log says what it could not do. A paired device is refused \
                      until a later check proves it.",
                 ),
-                Some(Refusal::Invocation) => Some(
+                Some(Refusal::Invocation) => Some(if cfg!(target_os = "macos") {
+                    "This daemon's own log says what it could not do, such as a missing sandbox \
+                     launcher, a Git that does not start inside the profile, or a filesystem \
+                     mounted beneath a directory the profile grants. A paired device is refused \
+                     until a later check proves it."
+                } else {
                     "This daemon's own log says what it could not do, such as the kernel's \
                      interface version or a machine it holds no system-call numbers for. A paired \
-                     device is refused until a later check proves it.",
-                ),
+                     device is refused until a later check proves it."
+                }),
                 Some(Refusal::Platform) | None => None,
             },
         )];
         if refusal == Some(Refusal::Platform) {
+            return checks;
+        }
+        if cfg!(target_os = "macos") {
+            // No setting of this host narrows the ways a filesystem can come to be mounted beneath
+            // a directory the owner authorised: any program of the account can attach a disk image
+            // or a share to a directory it owns. What the host does is refuse an invocation that
+            // starts over one, and the sentence says what that leaves.
+            checks.push(DoctorCheck::new(
+                "device-repository-mounts",
+                "What a paired device's repository operations could reach through a mount",
+                DoctorStatus::Ok,
+                Sentence::new().stated(
+                    "A disk image, a network share or a user-space volume that a program running \
+                     as this account attaches beneath a directory the owner authorised is refused \
+                     when an invocation starts. One attached while Git runs is read as part of the \
+                     tree. This narrows what a paired device's repository operations can reach \
+                     and does not close it, and nothing on this host narrows it further.",
+                ),
+                None,
+            ));
             return checks;
         }
         // What a host shows of how a filesystem could come to be mounted beneath a directory the
