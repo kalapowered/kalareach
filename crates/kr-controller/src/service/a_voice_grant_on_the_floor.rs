@@ -581,6 +581,16 @@ async fn the_grant_list_says_a_voice_grant_ended_that_the_continuous_clock_ended
         Some(GrantState::Expired),
         "the list says what the host has found, and not what the wall clock alone would say"
     );
+
+    // It stays ended when the wall clock reads past the expiry and is wound back again.
+    wall.store(now + 120_000, Ordering::SeqCst);
+    assert_eq!(listed(), Some(GrantState::Expired));
+    wall.store(now + 10_000, Ordering::SeqCst);
+    assert_eq!(
+        listed(),
+        Some(GrantState::Expired),
+        "a grant that ended never revives"
+    );
 }
 
 /// The ordinary grant a device was paired under is decided the same way: once it ran out, no
