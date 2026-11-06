@@ -3096,17 +3096,17 @@ impl AutomationModule {
             // A journal whose record of the action cannot be read is not one that holds none: an
             // earlier copy may have performed it, and a transient word would have the caller send
             // the action again. A reused identifier keeps its code.
-            Err(error) => {
-                let told = ProtocolError::from(&error);
-                Some(frame(
-                    mutation.request_id,
-                    Err(if told.code == ErrorCode::StorageUnavailable {
+            Err(error) => Some(frame(
+                mutation.request_id,
+                Err(match error {
+                    kr_automation::AutomationError::DatabaseError(_)
+                    | kr_automation::AutomationError::JsonError(_)
+                    | kr_automation::AutomationError::AuthorityUnavailable(_) => {
                         ControllerError::record_unreadable("workflow actions").to_protocol_error()
-                    } else {
-                        told
-                    }),
-                ))
-            }
+                    }
+                    other => other.into(),
+                }),
+            )),
         }
     }
 
