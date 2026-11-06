@@ -622,7 +622,17 @@ impl Controller {
                     detail: short.detail,
                 });
             }
-            registry.reserve(actor_id, token, digest, &intent, kr_ipc::now_ms())?
+            registry
+                .reserve(actor_id, token, digest, &intent, kr_ipc::now_ms())
+                .map_err(|error| {
+                    // The token was read a moment ago under this lock: one that has a reservation
+                    // is a repeat, and a repeat is told the same of a record it cannot read.
+                    if known {
+                        error.found_unreadable("sessions")
+                    } else {
+                        error
+                    }
+                })?
         };
         let reservation = admission.reservation;
         if admission.deduplicated {
