@@ -442,28 +442,12 @@ impl ProjectModule {
         let actor = actor_id.clone();
         let action_id = mutation.action_id.get();
         let name = method.as_str();
-        let outcome = blocking(move || {
-            service
-                .retained_action(&actor, action_id, name, digest)
-                .map_err(ProtocolError::from)
-        })
-        .await;
+        let outcome = blocking(move || kept(&service, &actor, action_id, name, digest)).await;
         match outcome {
             // The blocking task itself failed, which says nothing about the action.
             Err(error) => Some(frame(mutation.request_id, Err(error))),
             Ok(None) => None,
-            Ok(Some(RetainedOutcome::Ok(result))) => Some(frame(
-                mutation.request_id,
-                kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-                    .map(ParamsValue::new)
-                    .map_err(|error| {
-                        ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
-                    }),
-            )),
-            Ok(Some(RetainedOutcome::Error { code, detail })) => Some(frame(
-                mutation.request_id,
-                Err(ProtocolError::new(code, detail)),
-            )),
+            Ok(Some(retained)) => Some(frame(mutation.request_id, recorded(retained))),
         }
     }
 
@@ -576,29 +560,19 @@ impl ProjectModule {
             .await;
         }
         blocking(move || {
-            if let Some(retained) = service.retained_action(&actor, action_id, name, digest)? {
+            if let Some(retained) = kept(&service, &actor, action_id, name, digest)? {
                 copied.store(true, Ordering::Release);
-                return match retained {
-                    RetainedOutcome::Ok(result) => {
-                        kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-                            .map(ParamsValue::new)
-                            .map_err(|error| {
-                                ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
-                            })
-                    }
-                    RetainedOutcome::Error { code, detail } => {
-                        Err(ProtocolError::new(code, detail))
-                    }
-                };
+                return recorded(retained);
             }
             // Nothing retained, so this is a first admission and it is about to act. The
             // admission is asked about here rather than before the blocking task started: the
             // task had to be scheduled and this store had to be opened, both of which wait, and a
             // first admission may not begin under a deadline that has passed or a registration
-            // that has been withdrawn. A retry never reaches this, because the record above
-            // answered it: section 9 keeps a receipt readable after the freshness that admitted it
-            // is gone.
-            admission()?;
+            // that has been withdrawn. A retry whose record settled never reaches this, because
+            // the record above answered it: section 9 keeps a receipt readable after the freshness
+            // that admitted it is gone. One whose first attempt has not settled its claim does,
+            // and is not refused as though it were a first admission.
+            admitted_to_begin(&service, &actor, action_id, name, digest, &admission)?;
             // The action this mutation is performed under. Each of these methods commits it beside
             // the state it changes, which is what makes a second copy of one action find the claim
             // rather than starting a second clone.
@@ -725,13 +699,65 @@ impl ProjectModule {
     }
 }
 
+/// The records this module's store keeps, as a repeat is told of them when they cannot be read.
+const RECORDS: &str = "project actions";
+
+/// The record an action left, read for a repeat of it.
+///
+/// A journal that cannot be read is not one that holds no record: the action may have been carried
+/// out, so the repeat is told that what became of it is not known. A reused identifier keeps its
+/// code. The lookup cannot tell a first action from a repeat, so a first action on a journal that
+/// cannot be read is told the same.
+fn kept(
+    service: &ProjectService,
+    actor: &ActorId,
+    action_id: kr_protocol::scalars::Uuid,
+    name: &str,
+    digest: kr_protocol::scalars::Digest256,
+) -> Answer<Option<RetainedOutcome>> {
+    service
+        .retained_action(actor, action_id, name, digest)
+        .map_err(|error| ControllerError::found_unreadable_on_the_wire(error.into(), RECORDS))
+}
+
+/// Asks the admission an action begins under, for an action that found no settled record.
+///
+/// A claim with no outcome is not a record, so a copy of an action whose first attempt is still
+/// carrying it out, or ended without recording what it did, comes here too. The admission refusing
+/// it is then no word about an action that never began: the first attempt did, so the copy is told
+/// that what became of the action is not known. A first action holds no claim and is refused as
+/// ever.
+fn admitted_to_begin<A>(
+    service: &ProjectService,
+    actor: &ActorId,
+    action_id: kr_protocol::scalars::Uuid,
+    name: &str,
+    digest: kr_protocol::scalars::Digest256,
+    admission: &A,
+) -> Answer<()>
+where
+    A: Fn() -> std::result::Result<(), ProtocolError>,
+{
+    let Err(refusal) = admission() else {
+        return Ok(());
+    };
+    match service.claim_is_open(actor, action_id, name, digest) {
+        Ok(true) => Err(ControllerError::attempt_still_running().to_protocol_error()),
+        Ok(false) => Err(refusal),
+        Err(error) => Err(ControllerError::found_unreadable_on_the_wire(
+            error.into(),
+            RECORDS,
+        )),
+    }
+}
+
 /// The answer a record of an action is: the result it kept, or the refusal it kept. A result that
 /// cannot be decoded leaves open what the action came to.
 fn recorded(retained: RetainedOutcome) -> Answer<ParamsValue> {
     match retained {
         RetainedOutcome::Ok(result) => kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
             .map(ParamsValue::new)
-            .map_err(|error| ProtocolError::new(ErrorCode::OutcomeUnknown, error.to_string())),
+            .map_err(|_| ControllerError::record_unreadable(RECORDS).to_protocol_error()),
         RetainedOutcome::Error { code, detail } => Err(ProtocolError::new(code, detail)),
     }
 }
@@ -780,18 +806,11 @@ where
     // Only a settled answer comes back from here. A claim still open, which a submission in the
     // middle of its confirmation holds, is not an answer: the retry goes on into the service and
     // waits for that submission's transition there, then reads what it recorded.
-    if let Some(retained) = service.retained_action(actor, action_id, name, digest)? {
+    if let Some(retained) = kept(service, actor, action_id, name, digest)? {
         copied.store(true, Ordering::Release);
-        return match retained {
-            RetainedOutcome::Ok(result) => kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-                .map(ParamsValue::new)
-                .map_err(|error| {
-                    ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
-                }),
-            RetainedOutcome::Error { code, detail } => Err(ProtocolError::new(code, detail)),
-        };
+        return recorded(retained);
     }
-    admission()?;
+    admitted_to_begin(service, actor, action_id, name, digest, admission)?;
     let claim = Action {
         actor_id: actor.clone(),
         action_id,

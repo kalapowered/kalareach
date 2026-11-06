@@ -3704,3 +3704,290 @@ async fn an_attachment_proof_for_another_repository_or_location_is_refused() {
     drop(control);
     let _ = owned.stop().await;
 }
+
+/// A second connection to the project journal, for a case that puts a fault in it.
+fn beside_the_journal(host: &Host) -> rusqlite::Connection {
+    let journal = kr_project::ProjectService::root_of(&host.temp.environment())
+        .join(kr_project::store::STORE_FILE_NAME);
+    let connection = rusqlite::Connection::open(journal).expect("opens the project journal");
+    connection
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    connection
+}
+
+/// Moves the table that holds the record of every action aside, as a journal that fails to read it
+/// would leave it.
+fn the_records_cannot_be_read(journal: &rusqlite::Connection) {
+    journal
+        .execute_batch("ALTER TABLE actions RENAME TO actions_aside;")
+        .expect("the records cannot be read");
+}
+
+fn the_records_can_be_read_again(journal: &rusqlite::Connection) {
+    journal
+        .execute_batch("ALTER TABLE actions_aside RENAME TO actions;")
+        .expect("the records can be read again");
+}
+
+/// KR-REQ-09.09: a repeat of a project action whose record in the journal cannot be read is told
+/// that what became of the action is not known. The action ran, and a transient word would say that
+/// nothing took effect and have it sent again as though nothing had. Once the record can be read
+/// the repeat is answered from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_repeat_of_a_project_action_whose_record_cannot_be_read_is_told_the_outcome_is_unknown() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let original = composed(
+        &mut control,
+        host.environment_id,
+        Method::ProjectInit,
+        ActionId::new(kr_ipc::new_uuid()),
+        &ProjectInitParams {
+            destination: host.destination("made"),
+            label: "made".to_owned(),
+            initial_branch: Nullable::null(),
+        },
+    )
+    .await;
+    let first = control
+        .repeat(&original)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("project.init succeeds");
+
+    let journal = beside_the_journal(&host);
+    the_records_cannot_be_read(&journal);
+    let told = failure(
+        control
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    the_records_can_be_read_again(&journal);
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    let again = control
+        .repeat(&original)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the repeat is answered once the record can be read");
+    assert_eq!(again, first, "the action was performed once");
+    let _ = host.stop().await;
+}
+
+/// KR-REQ-09.09: a copy that found no record at the door and meets a journal that cannot be read
+/// where the service looks again is told the same. The service cannot tell it from a repeat of an
+/// action that ran, so a first action is told it too, and asking again performs it once the journal
+/// can be read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_project_action_whose_record_cannot_be_read_by_the_service_is_told_the_outcome_is_unknown()
+ {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let params = ProjectInitParams {
+        destination: host.destination("made"),
+        label: "made".to_owned(),
+        initial_branch: Nullable::null(),
+    };
+    let journal = beside_the_journal(&host);
+
+    // The mutation has looked for a record and found none; the journal then cannot be read where
+    // the service asks for it.
+    let (arrived, go) = host.controller.pause_retained_lookup();
+    let sending = tokio::spawn(async move {
+        let told = control
+            .mutate(
+                Method::ProjectInit,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await;
+        (control, host, told)
+    });
+    arrived.await.expect("the mutation has looked for a record");
+    the_records_cannot_be_read(&journal);
+    let _ = go.send(());
+    let (mut control, host, told) = sending.await.expect("the mutation ran");
+    the_records_can_be_read_again(&journal);
+    let told = failure(told.expect("the call reaches the daemon"));
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert!(
+        !host.work().join("made").exists(),
+        "nothing was made while the record could not be read"
+    );
+
+    // Asked again, the action is performed once the record can be read.
+    control
+        .mutate(
+            Method::ProjectInit,
+            action,
+            ActionTarget::environment(host.environment_id),
+            &ProjectInitParams {
+                destination: host.destination("made"),
+                label: "made".to_owned(),
+                initial_branch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("project.init succeeds once the record can be read");
+    let _ = host.stop().await;
+}
+
+/// KR-REQ-09.09: the same for the owner's confirmed location decisions, which look for their record
+/// before they consider a first admission.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_location_decision_whose_record_cannot_be_read_is_told_the_outcome_is_unknown() {
+    use kr_protocol::project::LocationPurpose;
+
+    let host = host().await;
+    let mut control = client(&host).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let params = location_params(host.environment_id, host.work(), LocationPurpose::Source);
+    let journal = beside_the_journal(&host);
+
+    let (arrived, go) = host.controller.pause_retained_lookup();
+    let environment_id = host.environment_id;
+    let sending = tokio::spawn(async move {
+        let told = submit(
+            &mut control,
+            environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &params,
+        )
+        .await;
+        (control, told)
+    });
+    arrived.await.expect("the mutation has looked for a record");
+    the_records_cannot_be_read(&journal);
+    let _ = go.send(());
+    let (_control, told) = sending.await.expect("the mutation ran");
+    the_records_can_be_read_again(&journal);
+    let told = failure(told);
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    let _ = host.stop().await;
+}
+
+/// Writes the claim a first copy of `mutation` left open: the action began, and its outcome is not
+/// recorded.
+fn an_open_claim(
+    host: &Host,
+    actor: &kr_protocol::ids::ActorId,
+    mutation: &kr_protocol::envelope::MutationRequest,
+    method: Method,
+) {
+    let digest = kr_protocol::digest::mutation_digest(mutation, actor).expect("digests it");
+    beside_the_journal(host)
+        .execute(
+            "INSERT INTO actions (actor_id, action_id, method, payload_digest, subject, result,
+                                  error_code, error_detail, recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, NULL, ?5)",
+            rusqlite::params![
+                actor.as_str(),
+                mutation.action_id.get().as_bytes().to_vec(),
+                method.as_str(),
+                digest.as_bytes().to_vec(),
+                1_i64,
+            ],
+        )
+        .expect("the claim is written");
+}
+
+/// KR-REQ-09.09: a copy of an action whose first copy's claim is open, refused by the admission the
+/// action is performed under, is told that what became of the action is not known: the claim says
+/// the action began. A first action under the same admission is refused as ever. The owner's
+/// confirmed location decisions ask the same admission after the same lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_copy_of_an_action_with_an_open_claim_is_told_the_outcome_is_unknown_when_its_admission_lapses()
+ {
+    use kr_protocol::project::LocationPurpose;
+
+    let host = host().await;
+    let mut control = client(&host).await;
+    let actor = kr_protocol::ids::ActorId::new("local:test").expect("a valid principal");
+    let lapsed = || {
+        Err(ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            "the registration this was admitted under has been withdrawn",
+        ))
+    };
+    let init = |name: &str| ProjectInitParams {
+        destination: host.destination(name),
+        label: name.to_owned(),
+        initial_branch: Nullable::null(),
+    };
+    let claimed = composed(
+        &mut control,
+        host.environment_id,
+        Method::ProjectInit,
+        ActionId::new(kr_ipc::new_uuid()),
+        &init("claimed"),
+    )
+    .await;
+    let fresh = composed(
+        &mut control,
+        host.environment_id,
+        Method::ProjectInit,
+        ActionId::new(kr_ipc::new_uuid()),
+        &init("fresh"),
+    )
+    .await;
+    let authorising = composed(
+        &mut control,
+        host.environment_id,
+        Method::ProjectLocationAuthorise,
+        ActionId::new(kr_ipc::new_uuid()),
+        &location_params(host.environment_id, host.work(), LocationPurpose::Source),
+    )
+    .await;
+    an_open_claim(&host, &actor, &claimed, Method::ProjectInit);
+    an_open_claim(
+        &host,
+        &actor,
+        &authorising,
+        Method::ProjectLocationAuthorise,
+    );
+
+    for (what, mutation, method) in [
+        ("a copy of an init", &claimed, Method::ProjectInit),
+        (
+            "a copy of a location decision",
+            &authorising,
+            Method::ProjectLocationAuthorise,
+        ),
+    ] {
+        let copy = host
+            .controller
+            .project()
+            .write(&actor, mutation, method, lapsed, None)
+            .await
+            .into_answer()
+            .expect_err("the admission lapsed");
+        assert_eq!(copy.code, ErrorCode::OutcomeUnknown, "{what}: {copy:?}");
+    }
+    let first = host
+        .controller
+        .project()
+        .write(&actor, &fresh, Method::ProjectInit, lapsed, None)
+        .await
+        .into_answer()
+        .expect_err("the admission lapsed");
+    assert_eq!(first.code, ErrorCode::PermissionDenied, "{first:?}");
+    let _ = host.stop().await;
+}
