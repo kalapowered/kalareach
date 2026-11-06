@@ -1546,13 +1546,19 @@ fn the_search_the_doctor_makes_names_the_file_the_system_finds_first() {
     for (what, directories) in arrangements {
         let system_finds = where_finds("claude", &directories, &nowhere);
         let found = resolve("claude", &directories);
+        // The same file may be named in its short or its long form, so each is named by what the
+        // file system makes of it.
+        let named = |path: &PathBuf| {
+            std::fs::canonicalize(path)
+                .unwrap_or_else(|error| {
+                    panic!("{what}: {} is not a file ({error})", path.display())
+                })
+                .to_string_lossy()
+                .to_lowercase()
+        };
         assert_eq!(
-            found
-                .as_ref()
-                .map(|path| path.to_string_lossy().to_lowercase()),
-            system_finds
-                .first()
-                .map(|path| path.to_string_lossy().to_lowercase()),
+            found.as_ref().map(named),
+            system_finds.first().map(named),
             "{what}: the doctor's search and the system's differ (the system finds {system_finds:?})"
         );
         let reported = report(
