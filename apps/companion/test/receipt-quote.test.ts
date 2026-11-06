@@ -10,7 +10,7 @@
  */
 
 import type { Receipt } from '@kalareach/protocol'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { ReceiptReads, supersessionFor } from '../src/model/receipt-reads'
 import { queued, type Submission } from '../src/model/receipts'
@@ -144,6 +144,44 @@ describe('the action a later prompt names', () => {
     reads.noteRefusal('action a is not an uncertain outcome of this subject')
     reads.noteRefusal(`the uncertain outcome of this subject is action ${'c2000000-0000-4000-8000-0000000000ff'}`)
     expect(supersessionFor(submissions, reads, TO)?.action_id).toBe(LATER)
+  })
+
+  describe('when the window\'s clock steps back', () => {
+    afterEach(() => {
+      vi.restoreAllMocks()
+    })
+
+    it('keeps the order of the refusals the window kept, so the newest names the action', () => {
+      const reads = new ReceiptReads()
+      reads.note(record(OLDER, { revision: '3' }))
+      reads.note(record(LATER, { revision: '4' }))
+      const now = vi.spyOn(Date, 'now')
+      now.mockReturnValue(10_000)
+      reads.noteRefusal(`the uncertain outcome of this subject is action ${OLDER}, not ${LATER}`)
+      // The clock steps back, and the host's next refusal names the other action.
+      now.mockReturnValue(4_000)
+      reads.noteRefusal(`the uncertain outcome of this subject is action ${LATER}, not ${OLDER}`)
+      expect(supersessionFor([unknown(OLDER), unknown(LATER)], reads, TO)).toEqual({
+        action_id: LATER,
+        revision: '4'
+      })
+    })
+
+    it('puts a prompt made after a refusal above the action the refusal named', () => {
+      const reads = new ReceiptReads()
+      reads.note(record(OLDER, { revision: '3', updated_at_ms: '100' }))
+      const MADE_AFTER = 'c2000000-0000-4000-8000-000000000003'
+      reads.note(record(MADE_AFTER, { revision: '6', updated_at_ms: '100' }))
+      const now = vi.spyOn(Date, 'now')
+      now.mockReturnValue(10_000)
+      reads.noteRefusal(`the uncertain outcome of this subject is action ${OLDER}, not ${LATER}`)
+      now.mockReturnValue(4_000)
+      const madeAt = reads.stamp()
+      expect(madeAt).toBeGreaterThan(10_000)
+      expect(
+        supersessionFor([unknown(OLDER), unknown(MADE_AFTER, '1', madeAt)], reads, TO)?.action_id
+      ).toBe(MADE_AFTER)
+    })
   })
 
   it('keeps the newest revision read, whatever order the reads arrive in', () => {

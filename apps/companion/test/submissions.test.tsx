@@ -9,7 +9,7 @@
 
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { AgentMutationResult, Receipt } from '@kalareach/protocol'
 
@@ -25,6 +25,10 @@ const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const ACTION = '00000000-0000-4000-8000-00000000abcd'
 /** The action of a prompt sent a second time, a new action of its own. */
 const ANOTHER_ACTION = '00000000-0000-4000-8000-00000000abce'
+/** The action of a prompt sent after the host refused a quote, a third of its own. */
+const THIRD_ACTION = '00000000-0000-4000-8000-00000000abcf'
+/** An hour, which the window's clock steps back by in the cases that step it. */
+const STEP_BACK_MS = 3_600_000
 
 afterEach(cleanup)
 
@@ -679,6 +683,97 @@ describe('on the desktop', () => {
       expect(quotes[3]).toEqual({ action_id: ACTION, revision: '3' })
     })
 
+    it('quotes a prompt made after the refusal when the window\'s clock has stepped back since', async () => {
+      const unconfirmed = (action: string): Settled<AgentMutationResult> => ({
+        receipt: null,
+        value: null,
+        action_id: action
+      })
+      const refused = Object.assign(new Error('the quote was not the newest'), {
+        code: 'DRAFT_CONFLICT',
+        message: `DRAFT_CONFLICT: the uncertain outcome of this subject is action ${ACTION}, not ${ANOTHER_ACTION}`,
+        user_action: 'retry'
+      })
+      const recorded: Recorded = { state: 'unknown', revision: '3' }
+      const reads: string[] = []
+      const quotes: (Supersession | undefined)[] = []
+      const real = Date.now.bind(Date)
+      let stepped = 0
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => real() - stepped)
+      try {
+        const { person } = await sentOnce(
+          (attempt) =>
+            attempt === 1
+              ? unconfirmed(ACTION)
+              : attempt === 2
+                ? unconfirmed(ANOTHER_ACTION)
+                : attempt === 3
+                  ? refused
+                  : unconfirmed(THIRD_ACTION),
+          recorded,
+          reads,
+          [],
+          quotes
+        )
+        await waitFor(
+          () => {
+            expect(reads).toContain(ACTION)
+          },
+          { timeout: 3_000 }
+        )
+        await flush()
+        await person.click(await screen.findByTestId('composer-send-anyway'))
+        await waitFor(() => {
+          expect(quotes).toHaveLength(2)
+        })
+        await waitFor(
+          () => {
+            expect(reads).toContain(ANOTHER_ACTION)
+          },
+          { timeout: 3_000 }
+        )
+        await flush()
+        await waitFor(() => {
+          expect(screen.getByTestId('composer-send-anyway')).toBeEnabled()
+        })
+        // The host refuses the quote of the later identifier, naming the other.
+        await person.click(screen.getByTestId('composer-send-anyway'))
+        await waitFor(() => {
+          expect(quotes).toHaveLength(3)
+        })
+        await screen.findAllByText(/the uncertain outcome of this subject is action/)
+
+        // The window's clock steps back. The next press quotes the action the refusal named, and
+        // its prompt is made after that refusal whatever the clock says.
+        stepped = STEP_BACK_MS
+        await waitFor(() => {
+          expect(screen.getByTestId('composer-send-anyway')).toBeEnabled()
+        })
+        await person.click(screen.getByTestId('composer-send-anyway'))
+        await waitFor(() => {
+          expect(quotes).toHaveLength(4)
+        })
+        expect(quotes[3]?.action_id).toBe(ACTION)
+        await waitFor(
+          () => {
+            expect(reads).toContain(THIRD_ACTION)
+          },
+          { timeout: 3_000 }
+        )
+        await flush()
+        await waitFor(() => {
+          expect(screen.getByTestId('composer-send-anyway')).toBeEnabled()
+        })
+        await person.click(screen.getByTestId('composer-send-anyway'))
+        await waitFor(() => {
+          expect(quotes).toHaveLength(5)
+        })
+        expect(quotes[4]).toEqual({ action_id: THIRD_ACTION, revision: '3' })
+      } finally {
+        clock.mockRestore()
+      }
+    })
+
     it('is not offered a way past while the host merely has the action', async () => {
       const recorded = { state: 'dispatching' as Receipt['state'] }
       await sentOnce(WITH_THE_HOST, recorded)
@@ -1057,6 +1152,94 @@ describe('on the phone', () => {
       expect(quotes).toHaveLength(4)
     })
     expect(quotes[3]).toEqual({ action_id: ACTION, revision: '3' })
+  })
+
+  it('quotes a prompt made after the refusal when the window\'s clock has stepped back since', async () => {
+    const unconfirmed = (action: string): Settled<AgentMutationResult> => ({
+      receipt: null,
+      value: null,
+      action_id: action
+    })
+    const refused = Object.assign(new Error('the quote was not the newest'), {
+      code: 'DRAFT_CONFLICT',
+      message: `DRAFT_CONFLICT: the uncertain outcome of this subject is action ${ACTION}, not ${ANOTHER_ACTION}`,
+      user_action: 'retry'
+    })
+    const recorded: Recorded = { state: 'unknown', revision: '3' }
+    const reads: string[] = []
+    const quotes: (Supersession | undefined)[] = []
+    const real = Date.now.bind(Date)
+    let stepped = 0
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => real() - stepped)
+    try {
+      const { person } = await sentOnce(
+        (attempt) =>
+          attempt === 1
+            ? unconfirmed(ACTION)
+            : attempt === 2
+              ? unconfirmed(ANOTHER_ACTION)
+              : attempt === 3
+                ? refused
+                : unconfirmed(THIRD_ACTION),
+        recorded,
+        reads,
+        [],
+        quotes
+      )
+      await waitFor(
+        () => {
+          expect(reads).toContain(ACTION)
+        },
+        { timeout: 3_000 }
+      )
+      await flush()
+      await person.click(await screen.findByRole('button', { name: 'I checked; send anyway' }))
+      await waitFor(() => {
+        expect(quotes).toHaveLength(2)
+      })
+      await waitFor(
+        () => {
+          expect(reads).toContain(ANOTHER_ACTION)
+        },
+        { timeout: 3_000 }
+      )
+      await flush()
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'I checked; send anyway' })).toBeEnabled()
+      })
+      await person.click(screen.getByRole('button', { name: 'I checked; send anyway' }))
+      await waitFor(() => {
+        expect(quotes).toHaveLength(3)
+      })
+      await screen.findAllByText(/the uncertain outcome of this subject is action/)
+
+      stepped = STEP_BACK_MS
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'I checked; send anyway' })).toBeEnabled()
+      })
+      await person.click(screen.getByRole('button', { name: 'I checked; send anyway' }))
+      await waitFor(() => {
+        expect(quotes).toHaveLength(4)
+      })
+      expect(quotes[3]?.action_id).toBe(ACTION)
+      await waitFor(
+        () => {
+          expect(reads).toContain(THIRD_ACTION)
+        },
+        { timeout: 3_000 }
+      )
+      await flush()
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'I checked; send anyway' })).toBeEnabled()
+      })
+      await person.click(screen.getByRole('button', { name: 'I checked; send anyway' }))
+      await waitFor(() => {
+        expect(quotes).toHaveLength(5)
+      })
+      expect(quotes[4]).toEqual({ action_id: THIRD_ACTION, revision: '3' })
+    } finally {
+      clock.mockRestore()
+    }
   })
 
   it('is not offered a way past while the host merely has the action', async () => {
