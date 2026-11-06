@@ -108,9 +108,14 @@ export const UNVERIFIED_WORDS: Readonly<Record<LaunchUnverifiedReason, string>> 
  * What the page says of a launch the session refused or could not confirm.
  *
  * A prompt that moved, and an editor that could not hold the launch, installed nothing. An editor
- * that could not say is not "nothing was typed": the command may be on the prompt.
+ * that could not say is not "nothing was typed": the command may be on the prompt. `unknown` is
+ * whether the failure left the outcome unknown, which the host says by the category of its code as
+ * well as by the code (`leavesOutcomeUnknown`).
  */
-export function pressRefusal(code: string | null, words: string): string {
+export function pressRefusal(code: string | null, words: string, unknown: boolean): string {
+  if (unknown) {
+    return 'The terminal could not confirm whether the launch was installed. Look at the prompt before trying again.'
+  }
   switch (code) {
     case 'DRAFT_CONFLICT':
       return 'The prompt changed before the launch was installed. Nothing was typed.'
@@ -118,8 +123,6 @@ export function pressRefusal(code: string | null, words: string): string {
       return 'The terminal was busy, so the launch was not installed. Nothing was typed.'
     case 'LEASE_LOST':
       return 'This view does not hold the terminal any more. Nothing was typed.'
-    case 'OUTCOME_UNKNOWN':
-      return 'The terminal could not confirm whether the launch was installed. Look at the prompt before trying again.'
     default:
       return words
   }
