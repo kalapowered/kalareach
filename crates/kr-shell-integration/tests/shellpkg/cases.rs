@@ -2099,6 +2099,7 @@ fn keys_typed_ahead_of_a_read_after_a_binding_made_at_the_prompt(
         session.terminal_output()
     );
     session.commands.hold_entries = true;
+    let entries = session.commands.entries.len();
     assert!(
         session.answered("kr-after"),
         "a line did not run after the binding:\n{}",
@@ -2109,6 +2110,15 @@ fn keys_typed_ahead_of_a_read_after_a_binding_made_at_the_prompt(
         "the shell drew no prompt after the line:\n{}",
         session.terminal_output()
     );
+    // The prompt is drawn before the module sends the read's entry, and in between it runs a
+    // program of its own to ask the terminal for its settings. While that program has the
+    // terminal, the runtime gives the terminal back its line mode: a key typed then is shown by
+    // the terminal itself and a return reaches the editor as a line feed, which it does not take
+    // for Enter. Once the read's entry has arrived, that program has ended and the terminal is
+    // the editor's again.
+    session.until("the entry of the read after the line", |commands| {
+        commands.entries.len() > entries
+    });
     let start = session.written();
     session.type_bytes(b"\x1bP\\\r");
     session.answer_held_entries();
