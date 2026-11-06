@@ -1319,6 +1319,60 @@ fn a_binary_that_left_no_record_that_can_be_used_is_not_read_from_its_output() {
     }
 }
 
+/// A program to stand where the report's own does as Cargo's runner when a step's tests cannot be
+/// listed: it writes `earlier` lines and then `last` to its standard error, and fails.
+#[cfg(unix)]
+fn runner_that_cannot_list(directory: &Path, earlier: usize, last: &str) -> PathBuf {
+    let path = directory.join("runner-that-cannot-list");
+    let script = format!(
+        "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt {earlier} ]; do\n  echo \"an earlier line $i\" >&2\n  i=$((i + 1))\ndone\necho '{last}' >&2\nexit 3\n"
+    );
+    kr_ipc::testing::place_script(&path, script);
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn a_listing_that_fails_leaves_what_it_said_in_the_log_and_the_end_of_it_in_the_steps_error() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let lister = runner_that_cannot_list(directory.path(), 200, "the volume is full");
+    let (document, evidence) = run_step_through(
+        "forms",
+        &["test", "--locked", "--workspace", "--no-fail-fast"],
+        lister,
+    )
+    .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let step = &document.steps[0];
+    let error = step.error.as_deref().unwrap_or_default();
+    assert!(error.contains("did not list the step's tests"), "{error}");
+    assert!(
+        error.contains("the volume is full"),
+        "the error does not name what the listing said last: {error}"
+    );
+    assert!(
+        !error.contains("an earlier line 0"),
+        "the error holds the whole of a long standard error: {error}"
+    );
+    assert!(error.len() < 2_000, "{} bytes: {error}", error.len());
+    let log = std::fs::read_to_string(evidence.path().join(&step.log)).expect("the step's log");
+    for expected in [
+        "an earlier line 0",
+        "an earlier line 199",
+        "the volume is full",
+    ] {
+        assert!(
+            log.lines().any(|line| line == expected),
+            "the log lacks {expected:?}:\n{log}"
+        );
+    }
+    let text = serde_json::to_string(&document).expect("serialises");
+    assert!(
+        !text.contains(&*tree("forms").to_string_lossy()),
+        "the result names the checkout's path"
+    );
+    assert!(!document.passed());
+}
+
 #[test]
 fn a_test_that_records_a_known_difference_is_never_counted_as_a_pass() {
     let (document, _evidence) = run("known").unwrap_or_else(|stopped| panic!("{stopped:?}"));
