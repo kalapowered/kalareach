@@ -817,6 +817,13 @@ fn ownership(
     }
 }
 
+/// The size this terminal is looking at, when it has one the host would take.
+fn measured_size(terminal: &ControllingTerminal) -> Option<Dimensions> {
+    let size = terminal.size().ok()?;
+    (size.columns > 0 && size.rows > 0)
+        .then(|| Dimensions::new(u64::from(size.columns), u64::from(size.rows)))
+}
+
 /// How many times in a row a size the session did not take for now goes again with the session's
 /// next word. After that it waits for this terminal to be measured or pressed, so a session that
 /// keeps refusing is not asked once for every word it says.
@@ -911,6 +918,14 @@ struct WindowReports {
     resting: bool,
     /// How many size reports in a row the session did not take for now.
     not_taken_in_a_row: u8,
+    /// How many resizes this terminal made as the owner, one after another, the session did not
+    /// take for now. They end when a resize is taken, or when the person resizes the terminal.
+    owner_not_taken: u8,
+    /// Whether the window may be at the live screen though the record puts it above it: a return
+    /// to the live screen was not taken, or the session could not say what became of it, and may
+    /// have taken it. What goes before a screen says where the window is goes there, which is where
+    /// the key that asked for the return wanted it.
+    live_unsettled: bool,
     /// Moves not yet sent, in runs: neighbouring moves in one direction merge, and a reversal
     /// starts a new run, so a movement the window cannot make at a limit takes nothing else with it.
     runs: std::collections::VecDeque<i64>,
@@ -930,6 +945,8 @@ struct InFlight {
     /// Whether it carries moves, or the return to the live screen: the person's own keys. A report
     /// that carries neither carries the size, or asks the question a refused resize leaves owed.
     moves: bool,
+    /// Whether it is the return to the live screen.
+    returning: bool,
     /// Whether this terminal was measured or pressed after the report went: a word the window does
     /// not rest from, whatever the session answers.
     spoke: bool,
@@ -951,6 +968,8 @@ impl WindowReports {
             size_owed: false,
             resting: false,
             not_taken_in_a_row: 0,
+            owner_not_taken: 0,
+            live_unsettled: false,
             runs: std::collections::VecDeque::new(),
             step: 1,
             closing: false,
@@ -1009,6 +1028,34 @@ impl WindowReports {
         self.spoke();
     }
 
+    /// The person resized this terminal while it owns the size, which gives the session the new
+    /// size as `took_size` does, and is a new start for the resizes the session did not take.
+    const fn resized_as_owner(&mut self, size: Dimensions) {
+        self.owner_not_taken = 0;
+        self.took_size(size);
+    }
+
+    /// A resize this terminal made as the owner was taken.
+    const fn resize_taken(&mut self) {
+        self.owner_not_taken = 0;
+    }
+
+    /// A resize this terminal made as the owner was not taken for now, or the session could not say
+    /// what became of it, and `size` is the size the person is looking at. The session may be at
+    /// the old size, so the question a refused resize leaves owed is owed: its answer says who owns
+    /// the size and what it is, and the owner then resizes if the session is not at its own. It
+    /// goes with the session's next word, and for at most [`RETRIES`] resizes in a row; after that
+    /// the session is left as it is until the person resizes this terminal again.
+    const fn resize_not_taken(&mut self, size: Dimensions) {
+        self.size = size;
+        if self.owner_not_taken >= RETRIES {
+            return;
+        }
+        self.owner_not_taken += 1;
+        self.question_owed = true;
+        self.resting = true;
+    }
+
     /// A resize was refused because somebody else owns the size, or owns it at another epoch.
     const fn owe_question(&mut self, size: Dimensions) {
         self.size = size;
@@ -1033,6 +1080,7 @@ impl WindowReports {
         self.recovering = false;
         if window_revision >= self.answered {
             self.record = Some(above);
+            self.live_unsettled = false;
         }
         if let Some(InFlight {
             awaiting: Some(awaited),
@@ -1052,6 +1100,7 @@ impl WindowReports {
     /// keys are the session's while the stream is its screen.
     fn streamed(&mut self) {
         self.record = Some(None);
+        self.live_unsettled = false;
         self.in_flight = None;
         self.recovering = false;
         self.runs.clear();
@@ -1076,11 +1125,19 @@ impl WindowReports {
             return None;
         }
         let record = self.record?;
-        let place = record.map(|row| ViewportPosition::Row(U64::new(row)));
+        // Where the window is, as far as a report that is not a move can say: not the row the
+        // record keeps while a return that may have been taken is unsettled.
+        let place = if self.live_unsettled {
+            None
+        } else {
+            record.map(|row| ViewportPosition::Row(U64::new(row)))
+        };
         let mut moves = false;
+        let mut returning = false;
         let sending = if self.return_owed {
             self.return_owed = false;
             moves = true;
+            returning = true;
             Sending {
                 dimensions: self.size,
                 position: None,
@@ -1117,6 +1174,7 @@ impl WindowReports {
             request: None,
             awaiting: None,
             moves,
+            returning,
             spoke: false,
         });
         Some(sending)
@@ -1168,6 +1226,7 @@ impl WindowReports {
                 }
                 if direct {
                     self.record = Some(at);
+                    self.live_unsettled = false;
                     self.runs.clear();
                     self.in_flight = None;
                 } else if self
@@ -1191,8 +1250,14 @@ impl WindowReports {
             // A move, or a return to the live screen, is the person's own key and is not made later
             // on their behalf: it is settled as not taken, and the next key asks for it again. A
             // size report made at the old place after an outcome the session could not say would
-            // put the window back where the key took it from.
+            // put the window back where the key took it from. For a return the place is known
+            // enough to say: the person typed, which wants the window at the live screen, so a
+            // size or a question owed meanwhile or since goes there, whether or not the session
+            // took the return.
             self.not_taken_in_a_row = 0;
+            if flight.returning {
+                self.live_unsettled = true;
+            }
             return;
         }
         // A size the session did not take is not settled: the newest size is owed again, whatever
@@ -2212,6 +2277,7 @@ async fn drive(
                             // size rather than taking it, and the attachment carries on.
                             (Outstanding::Resize(_), outcome) => match outcome {
                                 kr_protocol::envelope::Outcome::Ok(value) => {
+                                    window.resize_taken();
                                     if let Ok(result) = value
                                         .to_typed::<kr_protocol::attachment::GeometryResult>()
                                     {
@@ -2230,21 +2296,30 @@ async fn drive(
                                     if error.code == ErrorCode::GeometryNotOwner =>
                                 {
                                     owns_geometry = false;
-                                    let Ok(size) = terminal.size() else {
+                                    // A terminal with no size is one the host would refuse
+                                    // anyway. Asking would swap one refusal for another.
+                                    let Some(size) = measured_size(terminal) else {
                                         continue;
                                     };
-                                    if size.columns == 0 || size.rows == 0 {
-                                        // A terminal with no size is one the host would refuse
-                                        // anyway. Asking would swap one refusal for another.
-                                        continue;
-                                    }
                                     // It goes behind whatever viewport report is in flight, with
                                     // where the window is, whatever its size.
-                                    window.owe_question(Dimensions::new(
-                                        u64::from(size.columns),
-                                        u64::from(size.rows),
-                                    ));
+                                    window.owe_question(size);
                                 }
+                                // The session did not take the resize for now, or could not say
+                                // what became of it, so it may be at the old size while this
+                                // terminal has told it the new one. The same question settles it:
+                                // its answer names the size the session has, and this terminal
+                                // resizes again if it owns the size and the session is at another.
+                                kr_protocol::envelope::Outcome::Error(error)
+                                    if !HostWord::of(error.code).is_definite() =>
+                                {
+                                    let Some(size) = measured_size(terminal) else {
+                                        continue;
+                                    };
+                                    window.resize_not_taken(size);
+                                }
+                                // The session's definite word: the resize did not happen and will
+                                // not, and asking again changes nothing.
                                 kr_protocol::envelope::Outcome::Error(_) => {}
                             },
                             // A viewport report answers with the presentation it produced as well
@@ -2275,20 +2350,10 @@ async fn drive(
                                 // was refused for a stale epoch answers with the epoch it should have
                                 // quoted, and the size it asked for is still the size the person is
                                 // looking at, so it asks again, once, with what the answer said.
-                                let looking_at = terminal
-                                    .size()
-                                    .ok()
-                                    .filter(|size| size.columns > 0 && size.rows > 0)
-                                    .map(|size| {
-                                        Dimensions::new(
-                                            u64::from(size.columns),
-                                            u64::from(size.rows),
-                                        )
-                                    });
                                 let owner = ownership(
                                     &result.geometry,
                                     attachment_id,
-                                    looking_at,
+                                    measured_size(terminal),
                                     &resizes_in_flight(&outstanding),
                                 );
                                 geometry_epoch = owner.epoch;
@@ -2439,7 +2504,7 @@ async fn drive(
                     window.measured(dimensions);
                     continue;
                 }
-                window.took_size(dimensions);
+                window.resized_as_owner(dimensions);
                 let request_id = kr_protocol::ids::RequestId::new(next_request);
                 next_request += 1;
                 let params = kr_protocol::attachment::TerminalResizeParams {
@@ -5267,6 +5332,150 @@ mod tests {
             send(&mut window, 3).map(|sending| sending.position),
             Some(None),
             "the next key asks for the return again"
+        );
+    }
+
+    /// A size measured while a return to the live screen was in flight, and a question owed then,
+    /// go where the person's typing wanted the window once the return was not taken: the session
+    /// may have taken it, and a report at the row the record keeps would take the window back from
+    /// where the key put it. A screen that says where the window is ends the doubt, and a move the
+    /// session did not take leaves the record as it was.
+    #[test]
+    fn a_size_owed_after_a_return_the_session_did_not_take_goes_at_the_live_screen() {
+        let mut window = parked_at_477();
+        window.return_to_live();
+        let back = send(&mut window, 2).expect("the return");
+        assert_eq!(back.position, None);
+        window.measured(size(100, 30));
+        window.answered(request(2), Answer::NotSettled);
+        let sized = send(&mut window, 3).expect("the size goes at once");
+        assert_eq!(
+            (sized.dimensions, sized.position),
+            (size(100, 30), None),
+            "at the live screen, not at the row the window may have left"
+        );
+
+        let mut window = parked_at_477();
+        window.return_to_live();
+        send(&mut window, 2).expect("the return");
+        window.owe_question(size(80, 24));
+        window.answered(request(2), Answer::NotSettled);
+        let question = send(&mut window, 3).expect("the question goes at once");
+        assert_eq!(
+            (question.dimensions, question.position),
+            (size(80, 24), None),
+            "at the live screen as well"
+        );
+
+        // The doubt ends with a screen that says where the window is.
+        let mut window = parked_at_477();
+        window.return_to_live();
+        send(&mut window, 2).expect("the return");
+        window.answered(request(2), Answer::NotSettled);
+        window.installed(2, Some(477));
+        window.measured(size(100, 30));
+        assert_eq!(
+            send(&mut window, 3).map(|sending| sending.position),
+            Some(row(477)),
+            "the screen put the window at the row, and that is where it is"
+        );
+
+        // A return the session took is told by the screen it caused, as it was.
+        let mut window = parked_at_477();
+        window.return_to_live();
+        send(&mut window, 2).expect("the return");
+        window.measured(size(100, 30));
+        window.answered(request(2), accepted(2, None));
+        window.installed(2, None);
+        assert_eq!(
+            send(&mut window, 3).map(|sending| sending.position),
+            Some(None),
+            "the window is at the live screen"
+        );
+
+        // The control: a move the session did not take is not a return, and what is owed after it
+        // goes at the row the record keeps.
+        let mut window = parked_at_477();
+        window.pressed(1, 23, size(80, 24));
+        send(&mut window, 2).expect("the next page back");
+        window.measured(size(100, 30));
+        window.answered(request(2), Answer::NotSettled);
+        assert_eq!(
+            send(&mut window, 3).map(|sending| sending.position),
+            Some(row(477)),
+            "a move leaves the record where it was"
+        );
+    }
+
+    /// A resize this terminal made as the owner that the session did not take for now, or could not
+    /// say what became of, leaves the question owed that says what size the session has: it goes
+    /// with the session's next word, and for three resizes in a row at most. A resize taken ends
+    /// the count, and so does the person resizing the terminal.
+    #[test]
+    fn an_owners_resize_the_session_did_not_take_for_now_is_asked_about_with_its_next_word() {
+        let mut window = WindowReports::new(size(80, 24));
+        window.installed(0, None);
+        window.resized_as_owner(size(100, 30));
+        assert_eq!(window.next(), None, "the resize is not a viewport report");
+        window.resize_not_taken(size(100, 30));
+        assert_eq!(
+            window.next(),
+            None,
+            "it rests until the session says something"
+        );
+        window.heard();
+        let question = send(&mut window, 1).expect("the question goes");
+        assert_eq!(
+            (question.dimensions, question.position),
+            (size(100, 30), None)
+        );
+        window.answered(request(1), accepted(0, None));
+        assert_eq!(window.next(), None, "and only once");
+
+        // Three resizes in a row, and then the session is left as it is.
+        let mut id = 2;
+        for _ in 0..3 {
+            window.took_size(size(100, 30));
+            window.resize_not_taken(size(100, 30));
+            window.heard();
+            send(&mut window, id).expect("the question goes");
+            window.answered(request(id), accepted(0, None));
+            id += 1;
+        }
+        window.took_size(size(100, 30));
+        window.resize_not_taken(size(100, 30));
+        window.heard();
+        assert_eq!(
+            window.next(),
+            None,
+            "four in a row, and the session's words no longer bring it"
+        );
+
+        // The person resizing the terminal starts the count again, and so does a resize taken.
+        window.resized_as_owner(size(90, 20));
+        window.resize_not_taken(size(90, 20));
+        window.heard();
+        assert!(
+            send(&mut window, id).is_some(),
+            "a new resize starts the tries again"
+        );
+        window.answered(request(id), accepted(0, None));
+        id += 1;
+        for _ in 0..3 {
+            window.took_size(size(90, 20));
+            window.resize_not_taken(size(90, 20));
+            window.heard();
+            send(&mut window, id).expect("the question goes");
+            window.answered(request(id), accepted(0, None));
+            id += 1;
+        }
+        window.resize_taken();
+        window.took_size(size(90, 20));
+        window.resize_not_taken(size(90, 20));
+        window.heard();
+        assert!(
+            send(&mut window, id).is_some(),
+            "a resize taken ends the count"
         );
     }
 
