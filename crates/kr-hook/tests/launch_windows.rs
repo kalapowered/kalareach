@@ -1530,6 +1530,243 @@ fn a_cold_copy_of_the_largest_agent_is_launched_within_the_deadlines() {
     );
 }
 
+/// Looking for bytes in the memory of a process of this account.
+mod memory {
+    #![expect(
+        unsafe_code,
+        reason = "reading another process's memory has no safe interface"
+    )]
+
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQueryEx,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    };
+
+    /// How much of a region is read at once.
+    const CHUNK: usize = 1 << 20;
+
+    /// Whether any of `needles` is in the committed, readable memory of process `pid`.
+    ///
+    /// A needle that straddles two reads is found, because the end of each read is kept for the
+    /// next.
+    pub fn holds(pid: u32, needles: &[Vec<u8>]) -> Result<bool, String> {
+        let longest = needles.iter().map(Vec::len).max().unwrap_or(1);
+        // SAFETY: the call takes plain integers and returns a handle or null, which is checked.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+        if process.is_null() {
+            return Err(format!(
+                "process {pid} is not opened for reading: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut found = false;
+        let mut address = 0_usize;
+        'regions: loop {
+            // SAFETY: an all-zero description is a valid value for this plain structure.
+            let mut region: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: the handle is open for the call, and the structure is this function's own
+            // with its true size passed.
+            let described = unsafe {
+                VirtualQueryEx(
+                    process,
+                    address as *const _,
+                    &raw mut region,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                )
+            };
+            if described == 0 {
+                break;
+            }
+            let base = region.BaseAddress as usize;
+            let size = region.RegionSize;
+            if region.State == MEM_COMMIT && region.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
+                let mut offset = 0;
+                let mut kept: Vec<u8> = Vec::new();
+                while offset < size {
+                    let want = (size - offset).min(CHUNK);
+                    let mut buffer = vec![0_u8; want];
+                    let mut read = 0_usize;
+                    // SAFETY: the buffer is this function's own and `want` is its length; the handle
+                    // is open for the call.
+                    let ok = unsafe {
+                        ReadProcessMemory(
+                            process,
+                            (base + offset) as *const _,
+                            buffer.as_mut_ptr().cast(),
+                            want,
+                            &raw mut read,
+                        )
+                    };
+                    if ok != 0 && read > 0 {
+                        buffer.truncate(read);
+                        kept.extend_from_slice(&buffer);
+                        if needles.iter().any(|needle| {
+                            kept.windows(needle.len())
+                                .any(|window| window == needle.as_slice())
+                        }) {
+                            found = true;
+                            break 'regions;
+                        }
+                        let from = kept.len().saturating_sub(longest - 1);
+                        kept.drain(..from);
+                    } else {
+                        kept.clear();
+                    }
+                    offset += want;
+                }
+            }
+            let next = base.saturating_add(size);
+            if next <= address {
+                break;
+            }
+            address = next;
+        }
+        // SAFETY: the handle was opened above and is closed once.
+        unsafe { CloseHandle(process) };
+        Ok(found)
+    }
+}
+
+/// The batch file the next case's program runs: it writes the whole of its environment and its own
+/// command line beside the report, then the report, then waits as the shell's script does.
+const DUMP: &str = "@echo off\r\n\
+set > \"%REPORT%.set\"\r\n\
+> \"%REPORT%.cmdline\" echo %CMDCMDLINE%\r\n\
+(\r\n\
+echo variable=%KR_REGISTRATION%\r\n\
+) > \"%REPORT%.part\"\r\n\
+move /y \"%REPORT%.part\" \"%REPORT%\" > NUL\r\n\
+ping -n 600 127.0.0.1 > NUL\r\n\
+exit /b 0\r\n";
+
+/// KR-REQ-11.23: over the endpoint a launch is bound to the program the launcher created, and the
+/// launch's credential stays with the launcher and the broker and is in none of the program.
+///
+/// The launcher presents the credential it reads from the owner-only file beside the registration,
+/// over the backend's named pipe, and the broker registers the program with the digest of the file
+/// the kernel says the program runs from and the program's own process identity, and not the
+/// launcher's. The program, a copy of `cmd.exe` running a batch file, writes its whole environment
+/// and its command line, and the case looks for the credential's text, as ASCII and as UTF-16, in
+/// both and in the committed memory of the program's process. The control for the memory reading is
+/// this test process, which read the credential file and so holds it.
+#[test]
+fn kr_req_11_23_a_launch_is_bound_to_the_program_it_created_and_the_credential_is_in_none_of_it() {
+    let shell = Shell::new();
+    let dump = shell.reports.join("dump.cmd");
+    std::fs::write(&dump, DUMP).expect("the program's batch file");
+    let typed = vec![
+        "gemini".to_owned(),
+        "/d".to_owned(),
+        "/c".to_owned(),
+        dump.display().to_string(),
+    ];
+    let root = shell.placed.host.root();
+    let answer = shell.establish_answered(&typed, &typed, &[], root);
+    let mut launcher = shell.launcher(
+        &shell.executable.clone(),
+        &typed,
+        &answer,
+        "bound",
+        &[],
+        root,
+    );
+    let report = shell.report_from("bound", &mut launcher);
+    assert_eq!(
+        PathBuf::from(&report["variable"]),
+        Shell::registration(&answer),
+        "the program was launched with the registration the shell exported"
+    );
+
+    // The handle: the instance is the program by its whole identity and not the launcher, and its
+    // profile holds the digest of the bytes of the file the kernel names as the program's image.
+    let registered = Shell::registered(&answer);
+    let program: u32 = registered["pid"].parse().expect("a process identifier");
+    assert_ne!(program, launcher.id(), "the program is not the launcher");
+    let program_identity = kr_ipc::identity::process_start_identity(program).expect("the program");
+    let launcher_identity =
+        kr_ipc::identity::process_start_identity(launcher.id()).expect("the launcher");
+    assert!(shell.broker.holds_process(&program_identity));
+    assert!(
+        !shell.broker.holds_process(&launcher_identity),
+        "the launcher presented the credential, and the instance is not the launcher's"
+    );
+    let profile = shell
+        .broker
+        .profile_of(Shell::instance_of(&answer))
+        .expect("the launch's profile is recorded");
+    let image = kr_worker::windows::file::object_of(
+        &kr_worker::windows::file::image_of(program).expect("the program's image"),
+    )
+    .expect("the program's file has an id");
+    let recorded = Path::new(&profile.binary.resolved_path);
+    assert_eq!(
+        kr_worker::windows::file::object_of(
+            &std::fs::File::open(recorded).expect("the recorded path opens")
+        )
+        .expect("the recorded file has an id"),
+        image,
+        "the handle's executable is the file the program runs from"
+    );
+    assert_eq!(
+        profile.binary.digest,
+        Digest256::from_bytes(Sha256::digest(std::fs::read(recorded).expect("its bytes")).into()),
+        "and its digest is the digest of those bytes"
+    );
+
+    // The credential: 64 hexadecimal characters in the owner-only file the launcher read.
+    let credential = std::fs::read_to_string(
+        Shell::registration(&answer)
+            .parent()
+            .expect("the registration's directory")
+            .join("credential"),
+    )
+    .expect("the credential file")
+    .trim()
+    .to_owned();
+    assert_eq!(credential.len(), 64, "the credential is 32 bytes in hex");
+    let environment = std::fs::read_to_string(shell.reports.join("bound.set")).expect("the set");
+    let command_line =
+        std::fs::read_to_string(shell.reports.join("bound.cmdline")).expect("the command line");
+    assert!(
+        environment.contains("KR_REGISTRATION="),
+        "the program's environment was written: {environment:?}"
+    );
+    for (what, text) in [
+        ("environment", &environment),
+        ("command line", &command_line),
+    ] {
+        assert!(
+            !text.to_lowercase().contains(&credential.to_lowercase()),
+            "the credential is in the program's {what}"
+        );
+    }
+    let needles: Vec<Vec<u8>> = vec![
+        credential.as_bytes().to_vec(),
+        credential
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect(),
+    ];
+    assert!(
+        memory::holds(std::process::id(), &needles).expect("this process is read"),
+        "the control: this process read the credential file and holds it, and the reading finds it"
+    );
+    assert!(
+        !memory::holds(program, &needles).expect("the program's process is read"),
+        "the credential is in the memory of the program the launcher created"
+    );
+    eprintln!(
+        "the credential is in this process, and in none of the program's environment, command line \
+         or memory; the launcher (process {}) holds it in memory: {:?}",
+        launcher.id(),
+        memory::holds(launcher.id(), &needles)
+    );
+}
+
 /// KR-REQ-12.02: the profile a launch on Windows records says what the launch started. The
 /// executable is the absolute path of the file the started process runs from, which the kernel's
 /// own record of that process confirms, and not the name that was typed. The version is the one the
