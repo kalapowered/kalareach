@@ -972,9 +972,14 @@ impl Session {
     /// nothing of it, and sending it again under its own identifier is how a client tries the
     /// same send again, which the host performs at most once. The same send goes out as it first
     /// did, with the action window it first carried even when the host has issued a later one,
-    /// because the host keys its record of the action by the request. When that window has ended
-    /// by then, the host refuses it unless it holds an answer for the action, and the caller is
-    /// told the refusal. A send that differs in anything else goes out as composed now.
+    /// because the host keys its record of the action by the request. Sent so, it is a question
+    /// about the action as much as a try: a host that holds an answer for the action gives it
+    /// whatever has become of the window, and one that holds none cannot first-admit the request
+    /// once its window has ended, so it refuses it in its definite word, which settles the send as
+    /// not taken and is the caller's to be told. The library never composes the send anew under a
+    /// later window for the caller, since replacing a window changes the request and is never an
+    /// automatic retry: a caller that still wants the action sends a new request
+    /// ([`Session::mutate`]). A send that differs in anything else goes out as composed now.
     ///
     /// In every other respect this is [`Session::mutate`], including the outstanding bound and the
     /// uncertainty an interrupted send leaves behind.
