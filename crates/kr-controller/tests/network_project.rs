@@ -6598,6 +6598,103 @@ async fn a_filesystem_mounted_beneath_a_granted_directory_refuses_a_devices_clon
     );
 }
 
+/// KR-REQ-23.42: a disk image this account attaches beneath a directory a device's operation is
+/// granted refuses the operation, with the reason and not the place, before Git starts, and the
+/// same clone is made once the image is detached.
+///
+/// A Mac lets an ordinary account attach an image where it likes, so the case attaches one. The
+/// control is the same clone from the same repository before the image is attached, which is made.
+/// A Mac that will not make or attach an image does not exercise it and says so.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_disk_image_attached_beneath_a_granted_directory_refuses_a_devices_clone_with_its_reason()
+{
+    let _place = take_a_place().await;
+    let test =
+        "a_disk_image_attached_beneath_a_granted_directory_refuses_a_devices_clone_with_its_reason";
+    let work = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let root = work.path().join("granted");
+    std::fs::create_dir(&root).expect("a directory to authorise");
+    repository(&root, "src");
+    let mounted = root.join("src/mounted");
+    std::fs::create_dir(&mounted).expect("a directory to attach at");
+    // The control: nothing is attached beneath the repository, and the clone is made.
+    let Some(control) = a_device_clones_from_a_repository_in(&root, "before", test).await else {
+        return;
+    };
+    let cloned: ProjectCloneResult = typed(&control.expect("the clone is made where no mount is"));
+    assert_eq!(cloned.operation.state, OperationState::Completed);
+    assert!(root.join("before/README.md").is_file());
+
+    let image = work.path().join("image.dmg");
+    let hdiutil = |arguments: &[&std::ffi::OsStr]| {
+        std::process::Command::new("/usr/bin/hdiutil")
+            .args(arguments)
+            .output()
+            .expect("hdiutil starts")
+    };
+    let made = hdiutil(&[
+        "create".as_ref(),
+        "-size".as_ref(),
+        "2m".as_ref(),
+        "-fs".as_ref(),
+        "APFS".as_ref(),
+        "-volname".as_ref(),
+        "krproject".as_ref(),
+        image.as_os_str(),
+    ]);
+    let attached = made.status.success()
+        && hdiutil(&[
+            "attach".as_ref(),
+            "-nobrowse".as_ref(),
+            "-noverify".as_ref(),
+            "-mountpoint".as_ref(),
+            mounted.as_os_str(),
+            image.as_os_str(),
+        ])
+        .status
+        .success();
+    if !attached {
+        println!("not exercised: {test} needs a disk image, and this host will not attach one");
+        return;
+    }
+    // Whatever happens next, the image goes: the guard detaches it.
+    struct Detach(PathBuf);
+    impl Drop for Detach {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("/usr/bin/hdiutil")
+                .arg("detach")
+                .arg(&self.0)
+                .arg("-force")
+                .output();
+        }
+    }
+    let detach = Detach(mounted);
+    let Some(refused) = a_device_clones_from_a_repository_in(&root, "inside", test).await else {
+        return;
+    };
+    let refusal = refused.expect_err("a clone from a repository with a mount beneath it");
+    // A device is told the reason in terms of its own location, under the code the refusal has,
+    // and is not told where on this host the filesystem is mounted.
+    assert!(
+        refusal.to_string().starts_with("UPSTREAM_UNAVAILABLE"),
+        "the refusal keeps its code: {refusal}"
+    );
+    assert_eq!(
+        said(&refusal),
+        "a filesystem is mounted inside the location the grant names",
+        "the refusal gives its reason without its place"
+    );
+    assert!(!root.join("inside").exists(), "nothing was cloned");
+
+    drop(detach);
+    let Some(after) = a_device_clones_from_a_repository_in(&root, "after", test).await else {
+        return;
+    };
+    let cloned: ProjectCloneResult = typed(&after.expect("the clone is made once it is detached"));
+    assert_eq!(cloned.operation.state, OperationState::Completed);
+}
+
 /// KR-REQ-23.42: `host.doctor` says whether this host serves a paired device repository
 /// operations, on the terms the door applies, and reports what it shows of the mount residual
 /// where the platform confines Git's reads at all.
@@ -6654,6 +6751,52 @@ async fn host_doctor_says_whether_a_paired_device_is_served_repository_operation
         Some(served)
     );
     session.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.42 and KR-REQ-23.43: a macOS host proves the read-confined sandbox profile when it starts, and
+/// `host.doctor` says so and says what the mount check leaves. The cases that need a qualified host
+/// skip one that is not, so this one fails on a Mac that does not qualify.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_macos_host_proves_the_read_confined_profile_and_the_doctor_says_so() {
+    use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
+
+    let _place = take_a_place().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start_holding_effects(&owner).await;
+    let proved = host.controller().qualification();
+    assert!(
+        proved.qualifies(),
+        "this Mac proves the boundary when its daemon starts: {:?}: {}",
+        proved.refusal(),
+        proved.detail()
+    );
+    let mut control = host.client().await;
+    let doctor: HostDoctorResult = locally(&mut control, Method::HostDoctor, &()).await;
+    let check = |id: &str| {
+        doctor
+            .checks
+            .iter()
+            .find(|check| check.id() == id)
+            .map(|check| (check.status, check.detail().to_owned()))
+            .unwrap_or_else(|| panic!("the doctor reports {id}"))
+    };
+    let (served, detail) = check("device-repositories");
+    assert_eq!(served, DoctorStatus::Ok, "{detail}");
+    assert!(
+        detail.contains("confines what it reads"),
+        "the report says why: {detail}"
+    );
+    let (_, mounts) = check("device-repository-mounts");
+    assert!(
+        mounts.contains("disk image") && mounts.contains("does not close it"),
+        "the report names what a Mac leaves open: {mounts}"
+    );
+    assert!(
+        !mounts.contains("user namespaces") && !mounts.contains("fusermount"),
+        "and none of what only Linux has: {mounts}"
+    );
     host.stop().await;
 }
 
