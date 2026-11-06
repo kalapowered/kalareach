@@ -31,7 +31,9 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::scalars::Uuid;
 
 use kr_plugin_service::launcher::{HostIdentity, LaunchError, LaunchResult};
-use kr_plugin_service::notices::{NoticeSink, NoticeStream, Offered, node_bytes};
+use kr_plugin_service::notices::{
+    Delivered, NoticeSink, NoticeStream, Offered, Origin, node_bytes,
+};
 use kr_plugin_service::protocol::{
     BindingRegistration, CallValue, ComponentSource, DecodeCall, EncodeCall, Frame, HostHealth,
     HostProtocol, Notice, PrepareActionCall, Request, RequestBody, ResponseBody, WireNode,
@@ -189,6 +191,10 @@ pub struct PluginHost {
     /// two.
     #[cfg(feature = "testing")]
     reserving_hold: Arc<kr_plugin_service::hold::Hold>,
+    /// The pause an unbind's task takes when it starts, which a test holds to stand where the
+    /// connection has read an unbind and its task has not yet run.
+    #[cfg(feature = "testing")]
+    unbinding_hold: Arc<kr_plugin_service::hold::Hold>,
 }
 
 impl core::fmt::Debug for PluginHost {
@@ -286,6 +292,8 @@ impl PluginHost {
             notice_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
             #[cfg(feature = "testing")]
             reserving_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
+            #[cfg(feature = "testing")]
+            unbinding_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
         })
     }
 
@@ -343,6 +351,15 @@ impl PluginHost {
     #[must_use]
     pub fn hold_registrations_before_the_runtime(&self) -> kr_plugin_service::hold::HoldHandle {
         self.reserving_hold.set()
+    }
+
+    /// Holds the next unbind at the start of its task, for the tests of what an unbind is about
+    /// when its task runs after other requests were read: until the returned hold is released the
+    /// task stops there, with the connection long past reading the request.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_unbinds_before_they_run(&self) -> kr_plugin_service::hold::HoldHandle {
+        self.unbinding_hold.set()
     }
 
     /// Returns the host's own identity.
@@ -509,7 +526,7 @@ impl PluginHost {
             if immediate(&request.body) {
                 // Answered on the reading task, because none of these enters a component: the
                 // answer is this host's own and it is already known.
-                let body = self.answer(request.body, served).await;
+                let body = self.answer(request.body, Settled::default(), served).await;
                 if !respond(served, reply_to, name, body).await {
                     return;
                 }
@@ -538,11 +555,15 @@ impl PluginHost {
                 }
                 continue;
             };
+            // What the request is about is settled here, as it is read, and not when its task
+            // runs: the requests after it are read before the task starts, and the registrations
+            // they make are not what this one is about.
+            let settled = settle(&request.body, served);
             let host = Arc::clone(&self);
             let served = Arc::clone(served);
             tokio::spawn(async move {
                 let _permit = permit;
-                let body = host.answer(request.body, &served).await;
+                let body = host.answer(request.body, settled, &served).await;
                 // An answer that could not be delivered ends the connection. Leaving the reader
                 // waiting for the next request on a connection whose last answer never arrived
                 // would be serving a worker that cannot hear.
@@ -554,9 +575,14 @@ impl PluginHost {
     }
 
     /// Answers one request, turning a refusal into the answer that carries it.
-    async fn answer(&self, body: RequestBody, served: &Arc<Served>) -> ResponseBody {
+    async fn answer(
+        &self,
+        body: RequestBody,
+        settled: Settled,
+        served: &Arc<Served>,
+    ) -> ResponseBody {
         let name = body.name();
-        self.handle(body, served)
+        self.handle(body, settled, served)
             .await
             .unwrap_or_else(|(detail, disabled)| ResponseBody::Refused {
                 request: name.to_owned(),
@@ -578,6 +604,10 @@ impl PluginHost {
     /// is not overtaken by a notice that passed the check before it, and a document is not left
     /// in the queue without its end.
     ///
+    /// What it passes on says which registration it comes from, so that the notice writer can
+    /// leave unwritten what a registration the connection no longer stands behind left in the
+    /// queue or in its hands.
+    ///
     /// The task goes on receiving, and dropping, what a registration the connection no longer
     /// stands behind sends, so that its thread never waits on a full channel. It ends when the
     /// thread has, which closes the channel, and the place it holds goes then, before it is said
@@ -592,6 +622,7 @@ impl PluginHost {
     ) -> (tokio::sync::mpsc::Sender<BindingEvent>, Ended) {
         let (events, mut pending) = tokio::sync::mpsc::channel::<BindingEvent>(DEFAULT_EVENT_QUEUE);
         let (ending, ended) = Ended::new();
+        let origin = origin_of(incarnation);
         tokio::spawn(async move {
             // Dropped in the reverse order, so the place is back when the task is said to be over.
             let _ending = ending;
@@ -607,7 +638,7 @@ impl PluginHost {
                     }
                     let mut outcome = Offered::Kept;
                     for notice in pieces {
-                        match notices.send(notice) {
+                        match notices.send_from(origin, notice) {
                             // A dropped document is answered where the loss is reported, because
                             // the binding that lost one is not always the binding that made room.
                             Offered::Kept | Offered::Dropped | Offered::Withheld => {}
@@ -637,6 +668,7 @@ impl PluginHost {
     async fn handle(
         &self,
         body: RequestBody,
+        settled: Settled,
         served: &Arc<Served>,
     ) -> Result<ResponseBody, (String, bool)> {
         match body {
@@ -663,7 +695,8 @@ impl PluginHost {
                 Ok(ResponseBody::Verified(Box::new(proof)))
             }
             RequestBody::RegisterBinding(registration) => {
-                self.register(*registration, served).await
+                self.register(*registration, settled.registering, served)
+                    .await
             }
             RequestBody::Event { binding_id, event } => {
                 let binding = self.binding(served.owner, binding_id)?;
@@ -852,7 +885,9 @@ impl PluginHost {
             RequestBody::Privacy { .. } => Err(refused(
                 "privacy is answered by the task that reads this connection".to_owned(),
             )),
-            RequestBody::Unbind { binding_id } => self.unbind(binding_id, served).await,
+            RequestBody::Unbind { binding_id } => {
+                self.unbind(binding_id, settled.leaving, served).await
+            }
             RequestBody::Health => Ok(ResponseBody::Health(Box::new(HostHealth {
                 live_bindings: self.runtime.live_bindings() as u64,
                 connection_bindings: served.bindings.taken() as u64,
@@ -920,15 +955,17 @@ impl PluginHost {
     /// The deadline is absolute across every stage: reading the payload, compiling it, and creating
     /// and binding the instance. Giving each stage the whole figure would let a registration take
     /// three times what the worker was told to expect, and the worker would give up first.
+    ///
+    /// The connection recorded the registration, under `registering`, as it read the request, so an
+    /// unbind that comes in before the payload has been read or compiled is about this
+    /// registration, and the registration finds out when it gets further and is refused. There is
+    /// no incarnation when the identifier already had a registration in flight, which is refused.
     async fn register(
         &self,
         registration: BindingRegistration,
+        registering: Option<Incarnation>,
         served: &Arc<Served>,
     ) -> Result<ResponseBody, (String, bool)> {
-        #[cfg(feature = "testing")]
-        self.hold_at_the_registration_gate().await;
-        let started = std::time::Instant::now();
-        let deadline = self.register_deadline;
         let BindingRegistration {
             binding_id,
             identity,
@@ -936,6 +973,21 @@ impl PluginHost {
             executable,
             component,
         } = registration;
+        let binding = BindingId::new(binding_id);
+        let Some(incarnation) = registering else {
+            return Err(refused(format!("binding {binding} is already live")));
+        };
+        // Forgets the registration if it does not finish, wherever it stops.
+        let registering = Registering {
+            registered: &served.registered,
+            binding_id,
+            incarnation,
+            kept: false,
+        };
+        #[cfg(feature = "testing")]
+        self.hold_at_the_registration_gate().await;
+        let started = std::time::Instant::now();
+        let deadline = self.register_deadline;
         check_facts(&facts).map_err(refused)?;
         // The connection's place for this binding. It is handed to the binding's forwarder once
         // there is one, and given back when the binding's thread has ended; a registration that
@@ -987,7 +1039,6 @@ impl PluginHost {
         }
         let remaining = remaining_of(started, deadline).map_err(refusal)?;
         let compiled = compilation.wait(remaining).await.map_err(refusal)?;
-        let binding = BindingId::new(binding_id);
         let request = BindingRequest {
             binding_id: binding,
             identity,
@@ -997,8 +1048,7 @@ impl PluginHost {
         // This registration's own number, which everything that concerns it is kept and removed
         // by: the notices its thread produces, the place it holds and its entry in the runtime.
         // The identifier names whichever registration holds it now, and that is not always this
-        // one.
-        let incarnation = Incarnation::next();
+        // one. The connection chose it when it read the request.
         let (events, ended) = Self::forward_notices(
             binding,
             incarnation,
@@ -1007,27 +1057,22 @@ impl PluginHost {
             Arc::clone(&served.conversation),
             binding_place,
         );
-        // Recorded before the instance exists, because what `bind` draws reaches the notice queue
-        // before this registration returns: a document lost in that moment has to be an obligation
-        // this connection can still discharge. An identifier has one registration in flight at a
-        // time. Standing behind the registration is what lets its forwarder pass its notices on,
-        // and it is recorded in the same step, so an unbind cannot come between the two.
-        let recorded = served.registered.lock().is_ok_and(|mut held| {
-            let recorded = held.preparing(binding_id, incarnation);
-            if recorded {
-                held.stand(incarnation, ended);
-            }
-            recorded
-        });
-        if !recorded {
-            return Err(refused(format!("binding {binding} is already live")));
+        // Standing behind the registration is what lets its forwarder pass its notices on, and
+        // the forwarder is attached in one step with finding out that the connection still does,
+        // so an unbind cannot come between the two. Recorded before the instance exists, because
+        // what `bind` draws reaches the notice queue before this registration returns: a document
+        // lost in that moment has to be an obligation this connection can still discharge.
+        let standing = served
+            .registered
+            .lock()
+            .is_ok_and(|mut held| held.attach(incarnation, ended));
+        if !standing {
+            // An unbind came in while the payload was being read or compiled. What it was about is
+            // this registration, which has nothing in the runtime yet.
+            return Err(refused(format!(
+                "binding {binding} was unbound while it was being registered"
+            )));
         }
-        let registering = Registering {
-            registered: &served.registered,
-            binding_id,
-            incarnation,
-            kept: false,
-        };
         #[cfg(feature = "testing")]
         self.reserving_hold.pause().await;
         let remaining = remaining_of(started, deadline).map_err(refusal)?;
@@ -1070,10 +1115,11 @@ impl PluginHost {
     /// Removes one binding, and answers inside the time a worker waits for the answer.
     ///
     /// The request is about the registration this connection holds under the identifier when it
-    /// arrives, and it removes that registration and no other: an identifier registered again by
-    /// the time a removal runs is another registration's. A connection that holds none has nothing
-    /// to remove. From the start of the request, nothing the registration's thread produces
-    /// reaches the notice queue.
+    /// is read, which `leaving` is, and it removes that registration and no other: an identifier
+    /// registered again by the time the removal runs is another registration's. A connection that
+    /// holds none has nothing to remove. From the moment the request is read, nothing the
+    /// registration's thread produces reaches the notice queue, and what the queue held of it is
+    /// gone.
     ///
     /// Removing a binding waits for its thread, so it happens off the executor, and the removal is
     /// one task of the blocking pool's. A blocking pool that other work keeps busy can leave that
@@ -1106,10 +1152,13 @@ impl PluginHost {
     async fn unbind(
         &self,
         binding_id: Uuid,
+        leaving: Option<Leaving>,
         served: &Arc<Served>,
     ) -> Result<ResponseBody, (String, bool)> {
         let started = std::time::Instant::now();
-        let Some(leaving) = leave(served, binding_id) else {
+        #[cfg(feature = "testing")]
+        self.unbinding_hold.pause().await;
+        let Some(leaving) = leaving else {
             return Ok(ResponseBody::Unbound { existed: false });
         };
         let incarnation = leaving.incarnation;
@@ -1169,7 +1218,9 @@ impl PluginHost {
         .await;
         match carried_out {
             Ok(Ok(removed)) => Ok(ResponseBody::Unbound {
-                existed: removed.existed(),
+                // A registration that was still being made is a binding the worker asked for, and
+                // there is nothing of it in the runtime to find.
+                existed: removed.existed() || leaving.being_registered,
             }),
             Ok(Err(error)) => Err(self.detached(
                 served,
@@ -1363,14 +1414,16 @@ struct Held {
     /// a loss with nobody to tell, and remembering those would be a record that grew for as long as
     /// the connection lasted.
     owed: std::collections::HashSet<Uuid>,
-    /// The registrations this connection stands behind.
+    /// The registrations this connection stands behind, by the origin their notices carry.
     ///
-    /// A registration is here from the moment its forwarder starts until the connection stops
-    /// standing behind it: a removal began, or it failed to finish registering. A forwarder passes
-    /// nothing on for a registration that is not here, whatever its thread still produces.
-    standing: std::collections::HashSet<Incarnation>,
+    /// A registration is here from the moment the connection reads its request until the
+    /// connection stops standing behind it: a removal began, or it failed to finish registering.
+    /// A forwarder passes nothing on for a registration that is not here, whatever its thread still
+    /// produces, and the notice writer writes nothing that registration left behind.
+    standing: std::collections::HashSet<Origin>,
     /// When each registration's forwarder has ended, for as long as the connection records the
     /// registration, which is after it stops standing behind it and until it is out of the runtime.
+    /// A registration has none until its forwarder starts.
     ends: std::collections::HashMap<Incarnation, Ended>,
 }
 
@@ -1427,32 +1480,56 @@ impl Held {
     ///
     /// A loss for an identifier this connection neither holds nor is registering is a loss with
     /// nobody to tell: the binding has gone, and its next incarnation will draw from scratch.
-    fn redraw(&mut self, binding_id: Uuid) {
-        // A binding the connection has stopped standing behind is on its way out, and the loss
-        // is a registration of the identifier that is being made now, if there is one.
+    ///
+    /// The loss is `origin`'s, and is owed to that registration and to no other: a registration the
+    /// connection no longer stands behind has nobody to draw for, and the identifier's next
+    /// registration will draw from scratch.
+    fn redraw(&mut self, origin: Origin, binding_id: Uuid) {
+        if !self.stands_behind(origin) {
+            return;
+        }
         match self
             .live
             .get(&binding_id)
-            .filter(|handle| self.standing.contains(&handle.incarnation()))
+            .filter(|handle| origin_of(handle.incarnation()) == origin)
         {
             Some(handle) => handle.require_snapshot(),
             None => {
-                if self.preparing.contains_key(&binding_id) {
+                if self
+                    .preparing
+                    .get(&binding_id)
+                    .is_some_and(|incarnation| origin_of(*incarnation) == origin)
+                {
                     self.owed.insert(binding_id);
                 }
             }
         }
     }
 
-    /// Starts standing behind a registration, whose forwarder ends as `ended` says.
-    fn stand(&mut self, incarnation: Incarnation, ended: Ended) {
-        self.standing.insert(incarnation);
-        self.ends.insert(incarnation, ended);
+    /// Starts standing behind a registration the connection has read.
+    fn stand(&mut self, incarnation: Incarnation) {
+        self.standing.insert(origin_of(incarnation));
+    }
+
+    /// Records when a registration's forwarder ends, and says whether the connection still stands
+    /// behind the registration: when it does not, an unbind came first, and the registration is
+    /// not to go on.
+    fn attach(&mut self, incarnation: Incarnation, ended: Ended) -> bool {
+        let stands = self.stands(incarnation);
+        if stands {
+            self.ends.insert(incarnation, ended);
+        }
+        stands
     }
 
     /// Returns true while this connection stands behind the registration.
     fn stands(&self, incarnation: Incarnation) -> bool {
-        self.standing.contains(&incarnation)
+        self.stands_behind(origin_of(incarnation))
+    }
+
+    /// Returns true while this connection stands behind the registration that `origin` names.
+    fn stands_behind(&self, origin: Origin) -> bool {
+        self.standing.contains(&origin)
     }
 
     /// Returns when the registration's forwarder has ended, while this connection records it.
@@ -1469,7 +1546,7 @@ impl Held {
             .live
             .get(&binding_id)
             .map(|handle| handle.incarnation());
-        live.filter(|incarnation| self.standing.contains(incarnation))
+        live.filter(|incarnation| self.stands(*incarnation))
             .or_else(|| self.preparing.get(&binding_id).copied())
             .or(live)
     }
@@ -1480,7 +1557,7 @@ impl Held {
     /// From here nothing that registration's thread produces reaches the notice queue: the
     /// forwarder checks and sends under this record.
     fn retire(&mut self, incarnation: Incarnation) -> bool {
-        self.standing.remove(&incarnation)
+        self.standing.remove(&origin_of(incarnation))
     }
 
     /// Removes one registration's entries once it is out of the runtime: its binding, if it is the
@@ -1553,7 +1630,7 @@ struct BindingPlaces {
 /// A registration that failed leaves an identifier nothing is preparing any more, and a redraw owed
 /// to it is owed to nobody. Forgetting it here is what keeps that record from growing, and the
 /// connection stops standing behind it, so that nothing its thread still produces reaches the
-/// queue.
+/// queue, and the notice writer writes nothing it left there.
 struct Registering<'a> {
     registered: &'a Registered,
     binding_id: Uuid,
@@ -1637,7 +1714,7 @@ async fn write_notices(
     registered: Registered,
     #[cfg(feature = "testing")] hold: Arc<kr_plugin_service::hold::Hold>,
 ) {
-    while let Some(notice) = notices.recv().await {
+    while let Some(Delivered { origin, notice }) = notices.recv_delivered().await {
         #[cfg(feature = "testing")]
         hold.pause().await;
         // A document the worker never received leaves it with a stale view, and the component is
@@ -1650,16 +1727,28 @@ async fn write_notices(
             ..
         } = &notice
             && *documents > 0
+            && let Some(origin) = origin
             && let Ok(mut held) = registered.lock()
         {
-            held.redraw(*binding_id);
+            held.redraw(origin, *binding_id);
         }
         let written = tokio::time::timeout(WRITE_DEADLINE, async {
             let mut writer = writer.lock().await;
+            // Looked at under the writer, which the answer to an unbind is written under: what a
+            // registration the connection no longer stands behind left in the queue or in this
+            // writer's hands is not written, and what was written before the connection stopped
+            // standing behind it is before the answer to the unbind that did.
+            if let Some(origin) = origin
+                && !registered
+                    .lock()
+                    .is_ok_and(|held| held.stands_behind(origin))
+            {
+                return Ok(());
+            }
             // Looked at under the writer, which `set_privacy` holds while it sets the flag: a
             // document is written before the answer that says documents are withheld or is not
             // written at all, whichever of the two tasks took the lock first.
-            if notices.skips_withheld(&notice) {
+            if notices.skips_withheld(origin, &notice) {
                 return Ok(());
             }
             writer.write_message(&Frame::Notice(notice)).await
@@ -1802,23 +1891,66 @@ fn refused(detail: String) -> (String, bool) {
     (detail, false)
 }
 
+/// What the connection settled about a request when it read it, before the request's task ran.
+#[derive(Default)]
+struct Settled {
+    /// For a registration, the incarnation the connection recorded it under; none when the
+    /// identifier already had a registration in flight, which is refused.
+    registering: Option<Incarnation>,
+    /// For an unbind, the registration it is about; none when the connection held none.
+    leaving: Option<Leaving>,
+}
+
+/// Settles what one request is about: the registration a request to register records, and the one
+/// a request to unbind is about.
+fn settle(body: &RequestBody, served: &Served) -> Settled {
+    match body {
+        RequestBody::RegisterBinding(registration) => Settled {
+            registering: begin(served, registration.binding_id),
+            leaving: None,
+        },
+        RequestBody::Unbind { binding_id } => Settled {
+            registering: None,
+            leaving: leave(served, *binding_id),
+        },
+        _ => Settled::default(),
+    }
+}
+
+/// Records a registration the connection has just read, and starts standing behind it.
+///
+/// An identifier has one registration in flight at a time: nothing is recorded, and there is no
+/// incarnation, when it already has one.
+fn begin(served: &Served, binding_id: Uuid) -> Option<Incarnation> {
+    let incarnation = Incarnation::next();
+    let mut held = served.registered.lock().ok()?;
+    if !held.preparing(binding_id, incarnation) {
+        return None;
+    }
+    held.stand(incarnation);
+    Some(incarnation)
+}
+
 /// What an unbind is about: the registration the connection holds under the identifier.
 struct Leaving {
     incarnation: Incarnation,
-    /// Whether the registration was live and not still being registered.
+    /// Whether the registration was live.
     was_live: bool,
-    /// When the registration's forwarder has ended.
+    /// Whether the registration was still being made, with nothing in the runtime to find.
+    being_registered: bool,
+    /// When the registration's forwarder has ended, once it has started.
     ended: Option<Ended>,
 }
 
 /// Finds the registration an unbind is about, and stops standing behind it.
 ///
 /// From here nothing the registration's thread produces reaches the notice queue, and what the
-/// queue held for the identifier is forgotten, so that the next registration of the identifier
+/// registration put in the queue is taken out, so that the next registration of the identifier
 /// starts with a queue that knows nothing about this one. That happens under the record the
 /// forwarder sends under, so no notice follows it, and before the runtime lets the identifier go,
-/// so no later registration has any. Nothing is forgotten when another request stopped standing
-/// behind the registration already: the identifier may be another registration's by now.
+/// so no later registration has any. Nothing is taken out when another request stopped standing
+/// behind the registration already: it has been, and what the identifier holds now may be another
+/// registration's.
 ///
 /// Nothing, when the connection holds none under the identifier.
 fn leave(served: &Served, binding_id: Uuid) -> Option<Leaving> {
@@ -1828,14 +1960,21 @@ fn leave(served: &Served, binding_id: Uuid) -> Option<Leaving> {
         .live
         .get(&binding_id)
         .is_some_and(|handle| handle.incarnation() == incarnation);
+    let being_registered = held.preparing.get(&binding_id) == Some(&incarnation);
     if held.retire(incarnation) {
-        served.notices.forget(binding_id);
+        served.notices.retract(origin_of(incarnation));
     }
     Some(Leaving {
         incarnation,
         was_live,
+        being_registered,
         ended: held.ended_of(incarnation),
     })
+}
+
+/// Names a registration to the notice queue, which does not know what an incarnation is.
+fn origin_of(incarnation: Incarnation) -> Origin {
+    Origin::new(incarnation.number())
 }
 
 /// The refusal for a request that has run out of the time it was given.

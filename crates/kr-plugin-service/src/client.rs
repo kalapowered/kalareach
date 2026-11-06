@@ -706,9 +706,12 @@ impl PluginClient {
     /// Removes a binding.
     ///
     /// Any answer from the host means the binding is gone: it has been removed, or the host took it
-    /// out of its runtime without waiting for the removal to finish and said so in a refusal. A
-    /// worker reads either as gone, and so does this client, which forgets what its queue was
-    /// holding for the binding on both.
+    /// out of its runtime without waiting for the removal to finish and said so in a refusal, or it
+    /// held none. A worker reads each as gone. The client takes out of its queue everything it was
+    /// holding for the binding when the host removed one, either way it says so: the host writes
+    /// what a registration produced before it answers that registration's removal and nothing
+    /// after it, so what the queue holds when the answer comes is the removed registration's, and
+    /// none of it is shown to the identifier's next one.
     ///
     /// # Errors
     ///
@@ -723,16 +726,33 @@ impl PluginClient {
                 self.unbind_deadline,
             )
             .await?;
-        // The host answered, so the binding has gone from it, and what this client's queue was
-        // holding for it has nothing left to catch: the identifier's next incarnation starts clean.
-        self.sink.forget(binding_id.get());
         match body {
-            ResponseBody::Unbound { existed } => Ok(existed),
+            ResponseBody::Unbound { existed } => {
+                // An answer that found nothing removed nothing: the host held no registration of
+                // the identifier when it read the request, and what the queue holds for it may be
+                // a newer registration's.
+                if existed {
+                    self.forget(binding_id);
+                }
+                Ok(existed)
+            }
             ResponseBody::Refused {
                 detail, disabled, ..
-            } => Err(refused(detail, disabled)),
+            } => {
+                self.forget(binding_id);
+                Err(refused(detail, disabled))
+            }
             other => Err(protocol_error(&other)),
         }
+    }
+
+    /// Takes out of the notice queue everything it holds for a binding the host has answered the
+    /// removal of. The host wrote everything it had to say about the registration before it
+    /// answered, so what the queue holds, notices and the records that wait for the rest of a
+    /// document, belongs to the registration that was removed, and the identifier's next
+    /// registration starts with a queue that knows nothing of it.
+    fn forget(&self, binding_id: BindingId) {
+        self.sink.forget(binding_id.get());
     }
 
     /// Asks what the host is doing.

@@ -14,9 +14,9 @@
 //! Presentation gives way first. A document a reader never collected is a document the component
 //! can draw again, so an overflow drops the oldest documents and counts them.
 //!
-//! Losses coalesce rather than accumulate. Every loss against one binding -- observations the
-//! runtime's queue dropped, documents this queue dropped -- folds into one record per binding and
-//! travels as one gap, so a reader that has stopped reading cannot be given a backlog of gaps
+//! Losses coalesce rather than accumulate. Every loss against one registration of a binding --
+//! observations the runtime's queue dropped, documents this queue dropped -- folds into one record
+//! and travels as one gap, so a reader that has stopped reading cannot be given a backlog of gaps
 //! either.
 //!
 //! A fault and a disabling are never dropped: nothing else tells a reader that a binding stopped
@@ -24,6 +24,17 @@
 //! connection is over. A connection whose reliable news cannot be delivered is not one worth
 //! keeping open, and pretending otherwise would be the unbounded growth this bound exists to
 //! prevent.
+//!
+//! # Whose a notice is
+//!
+//! A notice names its binding and nothing else, and an identifier can be registered, removed and
+//! registered again while notices of the first registration are still waiting or in a reader's
+//! hands. A producer that knows which registration a notice comes from says so
+//! ([`NoticeSink::send_from`]), and the queue keeps that with the notice and with every record it
+//! makes on the notice's account: a loss is a loss of one registration, and two registrations of
+//! one identifier never share a record. What the queue hands a reader says whose it is
+//! ([`Delivered`]), so that a reader can leave unwritten what a registration that has gone left
+//! behind, and [`NoticeSink::retract`] takes out of the queue everything one registration put in.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -59,6 +70,30 @@ const NODE_OVERHEAD_BYTES: u64 = crate::vocabulary::NODE_OVERHEAD_BYTES;
 /// the thing that grows. Past it the connection ends, because forgetting one of these records would
 /// mean delivering the end of a document without its beginning.
 const MAX_DROPPED_REMEMBERED: usize = 256;
+
+/// Which registration of a binding produced a notice.
+///
+/// A number the producer chooses for each registration and never uses for another, as long as the
+/// queue lives. The queue compares origins and nothing more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Origin(u64);
+
+impl Origin {
+    /// Names the registration `number` stands for.
+    #[must_use]
+    pub const fn new(number: u64) -> Self {
+        Self(number)
+    }
+}
+
+/// A notice taken from the queue, and the registration it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delivered {
+    /// The registration that produced the notice, where its producer said so.
+    pub origin: Option<Origin>,
+    /// The notice.
+    pub notice: Notice,
+}
 
 /// What became of a notice this queue was offered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,12 +132,38 @@ pub fn node_bytes(node: &WireNode) -> u64 {
     NODE_OVERHEAD_BYTES + (node.node_id.len() + node.body_json.len()) as u64
 }
 
-/// What one binding has lost, waiting to be told.
+/// What one registration of a binding has lost, waiting to be told.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Loss {
     events: u32,
     bytes: u64,
     documents: u64,
+}
+
+/// One registration of a binding, which is whose records the queue keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Subject {
+    binding_id: Uuid,
+    origin: Option<Origin>,
+}
+
+impl Subject {
+    const fn new(binding_id: Uuid, origin: Option<Origin>) -> Self {
+        Self { binding_id, origin }
+    }
+}
+
+/// A notice waiting, and the registration it came from.
+#[derive(Debug)]
+struct Entry {
+    origin: Option<Origin>,
+    notice: Notice,
+}
+
+impl Entry {
+    fn subject(&self) -> Subject {
+        Subject::new(self.notice.binding_id(), self.origin)
+    }
 }
 
 /// The shared state behind a sink and its stream.
@@ -114,12 +175,12 @@ struct Shared {
 
 #[derive(Debug, Default)]
 struct Queued {
-    waiting: VecDeque<Notice>,
+    waiting: VecDeque<Entry>,
     held: u64,
-    /// What each binding has lost, waiting to be reported as one gap.
-    lost: HashMap<Uuid, Loss>,
+    /// What each registration has lost, waiting to be reported as one gap.
+    lost: HashMap<Subject, Loss>,
     /// The order the losses are reported in, so the oldest loss is the first a reader hears about.
-    lost_order: VecDeque<Uuid>,
+    lost_order: VecDeque<Subject>,
     /// The documents this queue has dropped whose last piece it has not seen.
     ///
     /// A document is dropped whole, and its later pieces have not all arrived yet: a component
@@ -128,14 +189,14 @@ struct Queued {
     /// dropped, which would show a reader the last piece of something it never received the rest
     /// of. An entry goes when that document's last piece is seen, when its binding goes, or when
     /// there are more of them than this queue will keep.
-    gone: std::collections::HashSet<(Uuid, u64)>,
+    gone: std::collections::HashSet<(Subject, u64)>,
     /// The order those were recorded in, so the oldest is the first to go if there are too many.
-    gone_order: VecDeque<(Uuid, u64)>,
+    gone_order: VecDeque<(Subject, u64)>,
     /// Whether documents are withheld: none is queued or delivered until this is lifted.
     withhold: bool,
-    /// The bindings a document was withheld for, and how many documents each lost, waiting to be
-    /// reported as losses when documents are no longer withheld.
-    withheld: HashMap<Uuid, u64>,
+    /// The registrations a document was withheld for, and how many documents each lost, waiting to
+    /// be reported as losses when documents are no longer withheld.
+    withheld: HashMap<Subject, u64>,
     closed: bool,
     /// Set when what must arrive would not fit. The connection is over.
     overflowed: bool,
@@ -171,15 +232,26 @@ pub fn channel() -> (NoticeSink, NoticeStream) {
 }
 
 impl NoticeSink {
-    /// Offers one notice, dropping presentation rather than growing or waiting.
+    /// Offers one notice that comes with no word of which registration produced it, dropping
+    /// presentation rather than growing or waiting.
     pub fn send(&self, notice: Notice) -> Offered {
+        self.offer(None, notice)
+    }
+
+    /// Offers one notice that `origin` produced, dropping presentation rather than growing or
+    /// waiting.
+    pub fn send_from(&self, origin: Origin, notice: Notice) -> Offered {
+        self.offer(Some(origin), notice)
+    }
+
+    fn offer(&self, origin: Option<Origin>, notice: Notice) -> Offered {
         let Ok(mut queue) = self.shared.queue.lock() else {
             return Offered::Closed;
         };
         if queue.closed {
             return Offered::Closed;
         }
-        let offered = queue.admit(notice);
+        let offered = queue.admit(origin, notice);
         // Admitting can be what ends the connection -- too many unfinished dropped documents, or
         // something that had to arrive and would not fit. The caller is told by this answer rather
         // than by the next one it happens to make.
@@ -196,23 +268,34 @@ impl NoticeSink {
         offered
     }
 
-    /// Forgets the records this queue was holding for one binding: the documents it dropped whose
-    /// last piece had not come, and the documents it withheld.
+    /// Takes out of this queue everything it holds for one binding, whichever registration
+    /// produced it: the notices waiting, the losses it owes, the documents it dropped whose last
+    /// piece had not come, and the documents it withheld.
     ///
-    /// Called when a registration of the binding's identifier goes, by whoever stops standing
-    /// behind it. The host's forwarder passes notices on only while its registration stands, so the
-    /// host offers its queue nothing more of that registration after this, and the records have
-    /// nothing left to catch from it; the identifier's next registration starts with a queue that
-    /// knows nothing about its predecessor. What was already waiting in a queue is not taken out;
-    /// it is delivered in order, and a client's queue can still be given notices the host queued
-    /// before it forgot.
+    /// For a reader whose notices come with no word of their origin, when the binding's
+    /// registration goes: a client does this once the host has answered the removal, and the host
+    /// wrote everything the registration produced before it answered, so what the queue holds is
+    /// the removed registration's and the identifier's next registration starts with a queue that
+    /// knows nothing about it.
     pub fn forget(&self, binding_id: Uuid) {
+        self.remove(|subject| subject.binding_id == binding_id);
+    }
+
+    /// Takes out of this queue everything one registration put in it, and keeps nothing more of
+    /// what it sends: the notices waiting, the losses it owes, the documents it dropped whose last
+    /// piece had not come, and the documents it withheld.
+    ///
+    /// Called when a registration goes, by whoever stops its producer from sending more, so that no
+    /// later registration of the identifier is given what the one that went left behind. What a
+    /// reader already took from the queue is not the queue's to take back; it is for the reader to
+    /// leave unwritten, as [`Delivered`] lets it.
+    pub fn retract(&self, origin: Origin) {
+        self.remove(|subject| subject.origin == Some(origin));
+    }
+
+    fn remove(&self, doomed: impl Fn(&Subject) -> bool) {
         if let Ok(mut queue) = self.shared.queue.lock() {
-            queue.gone.retain(|(held, _document)| *held != binding_id);
-            queue
-                .gone_order
-                .retain(|(held, _document)| *held != binding_id);
-            queue.withheld.remove(&binding_id);
+            queue.remove(doomed);
         }
     }
 
@@ -270,13 +353,21 @@ impl NoticeSink {
 impl NoticeStream {
     /// Waits for the next notice, or returns nothing once the queue is closed and empty.
     pub async fn recv(&mut self) -> Option<Notice> {
+        self.recv_delivered()
+            .await
+            .map(|delivered| delivered.notice)
+    }
+
+    /// Waits for the next notice and the registration it came from, or returns nothing once the
+    /// queue is closed and empty.
+    pub async fn recv_delivered(&mut self) -> Option<Delivered> {
         let shared = Arc::clone(&self.shared);
         loop {
             // Registered before the queue is looked at, so a notice that arrives between the look
             // and the wait is not one this waits for ever on.
             let waiting = shared.wake.notified();
-            if let Some(notice) = self.try_recv() {
-                return Some(notice);
+            if let Some(delivered) = self.try_recv_delivered() {
+                return Some(delivered);
             }
             if self.is_closed() {
                 return None;
@@ -287,6 +378,11 @@ impl NoticeStream {
 
     /// Takes the next notice if one is waiting.
     pub fn try_recv(&mut self) -> Option<Notice> {
+        self.try_recv_delivered().map(|delivered| delivered.notice)
+    }
+
+    /// Takes the next notice and the registration it came from, if one is waiting.
+    pub fn try_recv_delivered(&mut self) -> Option<Delivered> {
         self.shared
             .queue
             .lock()
@@ -324,7 +420,7 @@ impl NoticeStream {
     /// For the task that writes notices, which asks it holding the connection's writer: documents
     /// are withheld or not at the moment the writer is taken, and a document taken off the queue
     /// before documents were withheld is not written after.
-    pub fn skips_withheld(&self, notice: &Notice) -> bool {
+    pub fn skips_withheld(&self, origin: Option<Origin>, notice: &Notice) -> bool {
         let Ok(mut queue) = self.shared.queue.lock() else {
             return false;
         };
@@ -340,7 +436,7 @@ impl NoticeStream {
         else {
             return false;
         };
-        queue.withhold_piece(*binding_id, *document, *last);
+        queue.withhold_piece(Subject::new(*binding_id, origin), *document, *last);
         true
     }
 
@@ -369,9 +465,9 @@ impl Drop for NoticeStream {
 
 impl Queued {
     /// Admits one notice, making room by dropping presentation.
-    fn admit(&mut self, notice: Notice) -> Offered {
-        // A gap is not queued: it folds into what its binding has already lost, so a reader that
-        // has stopped reading cannot be given a backlog of them either.
+    fn admit(&mut self, origin: Option<Origin>, notice: Notice) -> Offered {
+        // A gap is not queued: it folds into what its registration has already lost, so a reader
+        // that has stopped reading cannot be given a backlog of them either.
         if let Notice::Gap {
             binding_id,
             events,
@@ -380,7 +476,7 @@ impl Queued {
         } = notice
         {
             return self.absorb(
-                binding_id,
+                Subject::new(binding_id, origin),
                 Loss {
                     events,
                     bytes,
@@ -398,13 +494,13 @@ impl Queued {
                 ..
             } = &notice
         {
-            self.withhold_piece(*binding_id, *document, *last);
+            self.withhold_piece(Subject::new(*binding_id, origin), *document, *last);
             return Offered::Withheld;
         }
 
         // A piece of a document this queue has already dropped. Queueing it would leave a reader
         // with part of a document and no way to tell; it belongs to the loss that took the rest.
-        if self.already_dropped(&notice) {
+        if self.already_dropped(origin, &notice) {
             if let Notice::Document {
                 binding_id,
                 document,
@@ -412,7 +508,7 @@ impl Queued {
                 ..
             } = &notice
             {
-                self.gave_up_on(*binding_id, *document, *last);
+                self.gave_up_on(Subject::new(*binding_id, origin), *document, *last);
             }
             return Offered::Dropped;
         }
@@ -422,7 +518,7 @@ impl Queued {
         while self.held + cost > MAX_NOTICE_BYTES && self.evict_oldest_document() {}
         // Making room can drop the very document this piece belongs to, and a piece admitted after
         // its own document went would be the one thing this record exists to prevent.
-        if self.already_dropped(&notice) {
+        if self.already_dropped(origin, &notice) {
             if let Notice::Document {
                 binding_id,
                 document,
@@ -430,7 +526,7 @@ impl Queued {
                 ..
             } = &notice
             {
-                self.gave_up_on(*binding_id, *document, *last);
+                self.gave_up_on(Subject::new(*binding_id, origin), *document, *last);
             }
             return Offered::Dropped;
         }
@@ -447,10 +543,10 @@ impl Queued {
                     ..
                 } = &notice
                 {
-                    self.gave_up_on(*binding_id, *document, *last);
+                    self.gave_up_on(Subject::new(*binding_id, origin), *document, *last);
                 }
                 return self.absorb(
-                    notice.binding_id(),
+                    Subject::new(notice.binding_id(), origin),
                     Loss {
                         documents: 1,
                         ..Loss::default()
@@ -464,7 +560,7 @@ impl Queued {
             return Offered::Overflowed;
         }
         self.held += cost;
-        self.waiting.push_back(notice);
+        self.waiting.push_back(Entry { origin, notice });
         Offered::Kept
     }
 
@@ -474,17 +570,16 @@ impl Queued {
     /// last piece is where that duty ends, so seeing that piece -- queued or rejected -- is what
     /// releases it. Without a release the record would outlive its binding, and an identifier used
     /// again would find its first documents refused by a loss that belonged to somebody else.
-    fn gave_up_on(&mut self, binding_id: Uuid, document: u64, last: bool) {
+    fn gave_up_on(&mut self, subject: Subject, document: u64, last: bool) {
         if last {
             // Its last piece. Whatever this queue was watching for has now been accounted for.
-            if self.gone.remove(&(binding_id, document)) {
-                self.gone_order
-                    .retain(|held| *held != (binding_id, document));
+            if self.gone.remove(&(subject, document)) {
+                self.gone_order.retain(|held| *held != (subject, document));
             }
             return;
         }
-        if self.gone.insert((binding_id, document)) {
-            self.gone_order.push_back((binding_id, document));
+        if self.gone.insert((subject, document)) {
+            self.gone_order.push_back((subject, document));
             if self.gone_order.len() > MAX_DROPPED_REMEMBERED {
                 // Forgetting one would let its remaining pieces be queued afterwards, and a reader
                 // given the end of a document without its beginning is the one thing this record
@@ -497,7 +592,7 @@ impl Queued {
     }
 
     /// Returns true when this notice is a piece of a document this queue has already dropped.
-    fn already_dropped(&self, notice: &Notice) -> bool {
+    fn already_dropped(&self, origin: Option<Origin>, notice: &Notice) -> bool {
         let Notice::Document {
             binding_id,
             document,
@@ -506,27 +601,29 @@ impl Queued {
         else {
             return false;
         };
-        self.gone.contains(&(*binding_id, *document))
+        self.gone
+            .contains(&(Subject::new(*binding_id, origin), *document))
     }
 
-    /// Folds one loss into what its binding has already lost.
-    fn absorb(&mut self, binding_id: Uuid, loss: Loss) -> Offered {
+    /// Folds one loss into what its registration has already lost.
+    fn absorb(&mut self, subject: Subject, loss: Loss) -> Offered {
         let dropped_document = loss.documents > 0;
         let answer = if dropped_document {
             Offered::Dropped
         } else {
             Offered::Kept
         };
-        if self.merge(binding_id, loss) {
+        if self.merge(subject, loss) {
             return answer;
         }
-        // A binding this queue has no loss record for yet. The record is one more thing the queue
-        // holds, so it is charged like anything else.
+        // A registration this queue has no loss record for yet. The record is one more thing the
+        // queue holds, so it is charged like anything else.
         while self.held + NOTICE_OVERHEAD_BYTES > MAX_NOTICE_BYTES && self.evict_oldest_document() {
         }
-        // Making room may have created this binding's record, if what it evicted was this
-        // binding's document. Merging again is what keeps one binding to one record and one charge.
-        if self.merge(binding_id, loss) {
+        // Making room may have created this registration's record, if what it evicted was this
+        // registration's document. Merging again is what keeps one registration to one record and
+        // one charge.
+        if self.merge(subject, loss) {
             return answer;
         }
         if self.held + NOTICE_OVERHEAD_BYTES > MAX_NOTICE_BYTES {
@@ -534,13 +631,13 @@ impl Queued {
             self.overflowed = true;
             return Offered::Overflowed;
         }
-        self.charge_loss(binding_id, loss);
+        self.charge_loss(subject, loss);
         answer
     }
 
     /// Adds one loss to a record this queue already holds, and says whether it did.
-    fn merge(&mut self, binding_id: Uuid, loss: Loss) -> bool {
-        let Some(held) = self.lost.get_mut(&binding_id) else {
+    fn merge(&mut self, subject: Subject, loss: Loss) -> bool {
+        let Some(held) = self.lost.get_mut(&subject) else {
             return false;
         };
         held.events = held.events.saturating_add(loss.events);
@@ -550,21 +647,21 @@ impl Queued {
         true
     }
 
-    /// Starts one binding's loss record, and charges the queue for holding it.
-    fn charge_loss(&mut self, binding_id: Uuid, loss: Loss) {
+    /// Starts one registration's loss record, and charges the queue for holding it.
+    fn charge_loss(&mut self, subject: Subject, loss: Loss) {
         self.held += NOTICE_OVERHEAD_BYTES;
-        self.lost.insert(binding_id, loss);
-        self.lost_order.push_back(binding_id);
+        self.lost.insert(subject, loss);
+        self.lost_order.push_back(subject);
         self.dropped = self.dropped.saturating_add(loss.documents);
     }
 
     /// Records that one piece of a document was withheld.
     ///
-    /// The document is remembered as dropped until its last piece is seen, and the binding is
+    /// The document is remembered as dropped until its last piece is seen, and the registration is
     /// remembered as owed a loss of documents for when they are no longer withheld.
-    fn withhold_piece(&mut self, binding_id: Uuid, document: u64, last: bool) {
-        self.gave_up_on(binding_id, document, last);
-        let lost = self.withheld.entry(binding_id).or_insert(0);
+    fn withhold_piece(&mut self, subject: Subject, document: u64, last: bool) {
+        self.gave_up_on(subject, document, last);
+        let lost = self.withheld.entry(subject).or_insert(0);
         if last {
             *lost = lost.saturating_add(1);
         }
@@ -580,12 +677,12 @@ impl Queued {
             self.purge_documents();
             return;
         }
-        // Each binding that had a document withheld has lost at least one, whatever pieces of it
-        // this queue saw: the reader may hold the start of one.
-        let owed: Vec<(Uuid, u64)> = self.withheld.drain().collect();
-        for (binding_id, documents) in owed {
+        // Each registration that had a document withheld has lost at least one, whatever pieces of
+        // it this queue saw: the reader may hold the start of one.
+        let owed: Vec<(Subject, u64)> = self.withheld.drain().collect();
+        for (subject, documents) in owed {
             let _ = self.absorb(
-                binding_id,
+                subject,
                 Loss {
                     documents: documents.max(1),
                     ..Loss::default()
@@ -597,23 +694,23 @@ impl Queued {
     /// Removes every document that is waiting, and remembers each as withheld.
     fn purge_documents(&mut self) {
         let mut freed = 0;
-        let mut pieces: Vec<(Uuid, u64, bool)> = Vec::new();
-        self.waiting.retain(|notice| match notice {
+        let mut pieces: Vec<(Subject, u64, bool)> = Vec::new();
+        self.waiting.retain(|entry| match &entry.notice {
             Notice::Document {
                 binding_id,
                 document,
                 last,
                 ..
             } => {
-                freed += notice_bytes(notice);
-                pieces.push((*binding_id, *document, *last));
+                freed += notice_bytes(&entry.notice);
+                pieces.push((Subject::new(*binding_id, entry.origin), *document, *last));
                 false
             }
             _ => true,
         });
         self.held = self.held.saturating_sub(freed);
-        for (binding_id, document, last) in pieces {
-            self.withhold_piece(binding_id, document, last);
+        for (subject, document, last) in pieces {
+            self.withhold_piece(subject, document, last);
         }
     }
 
@@ -624,30 +721,25 @@ impl Queued {
     /// surviving would tell it the document was complete. Every frame of the oldest one goes
     /// together, and the loss is counted once.
     fn evict_oldest_document(&mut self) -> bool {
-        let Some((binding_id, document)) = self.waiting.iter().find_map(|notice| match notice {
-            Notice::Document {
-                binding_id,
-                document,
-                ..
-            } => Some((*binding_id, *document)),
+        let Some((subject, document)) = self.waiting.iter().find_map(|entry| match &entry.notice {
+            Notice::Document { document, .. } => Some((entry.subject(), *document)),
             _ => None,
         }) else {
             return false;
         };
         let mut freed = 0;
         let mut ended = false;
-        self.waiting.retain(|notice| {
+        self.waiting.retain(|entry| {
             let theirs = matches!(
-                notice,
+                &entry.notice,
                 Notice::Document {
-                    binding_id: held,
                     document: number,
                     ..
-                } if *held == binding_id && *number == document
+                } if entry.subject() == subject && *number == document
             );
             if theirs {
-                freed += notice_bytes(notice);
-                if matches!(notice, Notice::Document { last: true, .. }) {
+                freed += notice_bytes(&entry.notice);
+                if matches!(entry.notice, Notice::Document { last: true, .. }) {
                     ended = true;
                 }
             }
@@ -657,35 +749,59 @@ impl Queued {
         // Remembered, so the pieces of this document that have not arrived yet are dropped with
         // the ones that had -- unless the piece that ended it was among the ones removed, in which
         // case there is nothing more of it to come and nothing to remember.
-        self.gave_up_on(binding_id, document, ended);
+        self.gave_up_on(subject, document, ended);
         // Counted here rather than through `absorb`, which would try to make room again while it
         // is making room.
         let one = Loss {
             documents: 1,
             ..Loss::default()
         };
-        if !self.merge(binding_id, one) {
-            self.charge_loss(binding_id, one);
+        if !self.merge(subject, one) {
+            self.charge_loss(subject, one);
         }
         true
     }
 
     /// Takes the next notice: a loss first, because a reader has to know before it reads on.
-    fn take(&mut self) -> Option<Notice> {
-        if let Some(binding_id) = self.lost_order.pop_front()
-            && let Some(loss) = self.lost.remove(&binding_id)
+    fn take(&mut self) -> Option<Delivered> {
+        if let Some(subject) = self.lost_order.pop_front()
+            && let Some(loss) = self.lost.remove(&subject)
         {
             self.held = self.held.saturating_sub(NOTICE_OVERHEAD_BYTES);
-            return Some(Notice::Gap {
-                binding_id,
-                events: loss.events,
-                bytes: loss.bytes,
-                documents: loss.documents,
+            return Some(Delivered {
+                origin: subject.origin,
+                notice: Notice::Gap {
+                    binding_id: subject.binding_id,
+                    events: loss.events,
+                    bytes: loss.bytes,
+                    documents: loss.documents,
+                },
             });
         }
-        let notice = self.waiting.pop_front()?;
+        let Entry { origin, notice } = self.waiting.pop_front()?;
         self.held = self.held.saturating_sub(notice_bytes(&notice));
-        Some(notice)
+        Some(Delivered { origin, notice })
+    }
+
+    /// Removes everything held for the registrations `doomed` names, and what holding it cost.
+    fn remove(&mut self, doomed: impl Fn(&Subject) -> bool) {
+        let mut freed = 0;
+        self.waiting.retain(|entry| {
+            let theirs = doomed(&entry.subject());
+            if theirs {
+                freed += notice_bytes(&entry.notice);
+            }
+            !theirs
+        });
+        let losses = self.lost.len();
+        self.lost.retain(|subject, _loss| !doomed(subject));
+        freed += NOTICE_OVERHEAD_BYTES * (losses - self.lost.len()) as u64;
+        self.lost_order.retain(|subject| !doomed(subject));
+        self.gone.retain(|(subject, _document)| !doomed(subject));
+        self.gone_order
+            .retain(|(subject, _document)| !doomed(subject));
+        self.withheld.retain(|subject, _lost| !doomed(subject));
+        self.held = self.held.saturating_sub(freed);
     }
 }
 
@@ -1190,5 +1306,95 @@ mod tests {
             stream.try_recv(),
             Some(Notice::Document { document: 4, .. })
         ));
+    }
+
+    fn gap(binding_id: Uuid, events: u32) -> Notice {
+        Notice::Gap {
+            binding_id,
+            events,
+            bytes: 0,
+            documents: 0,
+        }
+    }
+
+    #[test]
+    fn what_a_registration_put_in_the_queue_goes_when_it_is_retracted_and_nothing_else_does() {
+        let (sink, mut stream) = channel();
+        let (first, second) = (Origin::new(1), Origin::new(2));
+        // One binding, registered twice, and another binding that is not part of it.
+        sink.send_from(first, document(binding(1), 16));
+        sink.send_from(first, gap(binding(1), 3));
+        sink.send_from(first, piece(binding(1), 7, false));
+        sink.send_from(second, document(binding(1), 16));
+        sink.send_from(first, document(binding(2), 16));
+        sink.send(document(binding(1), 16));
+        let others = notice_bytes(&document(binding(1), 16)) * 2;
+
+        sink.retract(first);
+        assert_eq!(
+            stream.held_bytes(),
+            others,
+            "the queue went on holding what the retracted registration put in it"
+        );
+        let mut delivered = Vec::new();
+        while let Some(next) = stream.try_recv_delivered() {
+            delivered.push(next.origin);
+        }
+        assert_eq!(delivered, [Some(second), None]);
+    }
+
+    #[test]
+    fn two_registrations_of_one_binding_do_not_share_a_loss() {
+        let (sink, mut stream) = channel();
+        let (first, second) = (Origin::new(1), Origin::new(2));
+        sink.send_from(first, gap(binding(1), 3));
+        sink.send_from(second, gap(binding(1), 5));
+        sink.send_from(first, gap(binding(1), 1));
+        let mut told = Vec::new();
+        while let Some(Delivered { origin, notice }) = stream.try_recv_delivered() {
+            let Notice::Gap { events, .. } = notice else {
+                panic!("{notice:?} was queued for a loss");
+            };
+            told.push((origin, events));
+        }
+        assert_eq!(told, [(Some(first), 4), (Some(second), 5)]);
+    }
+
+    #[test]
+    fn a_document_is_remembered_as_dropped_for_the_registration_that_lost_it() {
+        let (sink, mut stream) = channel();
+        let (first, second) = (Origin::new(1), Origin::new(2));
+        sink.withhold_documents(true);
+        assert_eq!(
+            sink.send_from(first, piece(binding(1), 1, false)),
+            Offered::Withheld
+        );
+        sink.withhold_documents(false);
+        // The registration after it draws its own first document, numbered from one again.
+        assert_eq!(
+            sink.send_from(second, piece(binding(1), 1, true)),
+            Offered::Kept
+        );
+        let delivered: Vec<_> = std::iter::from_fn(|| stream.try_recv_delivered()).collect();
+        assert!(
+            delivered.iter().any(|next| next.origin == Some(second)
+                && matches!(next.notice, Notice::Document { document: 1, .. })),
+            "the second registration's first document was dropped for the first one's loss"
+        );
+    }
+
+    #[test]
+    fn a_client_forgets_everything_its_queue_holds_for_a_binding() {
+        let (sink, mut stream) = channel();
+        sink.send(document(binding(1), 16));
+        sink.send(gap(binding(1), 2));
+        sink.send(document(binding(2), 16));
+        sink.forget(binding(1));
+        assert_eq!(stream.held_bytes(), notice_bytes(&document(binding(2), 16)));
+        assert!(matches!(
+            stream.try_recv(),
+            Some(Notice::Document { binding_id, .. }) if binding_id == binding(2)
+        ));
+        assert!(stream.try_recv().is_none());
     }
 }
