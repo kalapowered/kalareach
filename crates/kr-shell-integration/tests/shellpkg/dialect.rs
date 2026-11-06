@@ -71,6 +71,17 @@ pub struct Dialect {
     pub ignore_eof_on: Option<&'static str>,
     /// Reports that setting afterwards as `kr-ignoreeof=on`.
     pub ignore_eof_report: Option<&'static str>,
+    /// Makes the editor's own answer to the old end-of-file character at an empty prompt one that
+    /// never waits for the person, printing `kr-quiet-set`.
+    ///
+    /// Zsh binds that character to a command that lists what the empty line completes to, which
+    /// is every command on the search path, and when there are more of them than `LISTMAX` it
+    /// asks "do you wish to see all N possibilities" and waits for a key. A key sequence that is
+    /// waiting for its answer is one the reader rightly reports as still in progress, so a fence
+    /// asked behind it is not drained until someone answers; whether the answer has been given
+    /// by then is a matter of timing. With the limit lifted the list is printed and the command
+    /// ends by itself.
+    pub quiet_own_key: Option<&'static str>,
     /// Opens a continuation reader, and closes it printing `kr-continuation-ok`.
     pub continuation: Option<(&'static str, &'static str)>,
     /// Changes the terminal's own end-of-file character, printing `kr-veof-set`.
@@ -184,6 +195,7 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             ignore_eof_report: Some(
                 "echo kr-ignoreeof=$([[ -o ignoreeof ]] && echo on || echo off)",
             ),
+            quiet_own_key: Some("LISTMAX=1000000; printf '%s%s\\n' kr-quiet- set"),
             continuation: Some((
                 "echo 'kr-continuation",
                 "' >/dev/null; printf '%s%s\\n' kr-continuation- ok",
@@ -206,6 +218,7 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             ignore_eof_report: Some(
                 "case $- in *o*) :;; esac; echo kr-ignoreeof=$(set -o | grep -q 'ignoreeof.*on' && echo on || echo off)",
             ),
+            quiet_own_key: None,
             continuation: Some((
                 "echo 'kr-continuation",
                 "' >/dev/null; printf '%s%s\\n' kr-continuation- ok",
@@ -228,6 +241,7 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             // gesture outside the detach condition is what `delete-or-exit` does with it.
             ignore_eof_on: None,
             ignore_eof_report: None,
+            quiet_own_key: None,
             // Its editor edits a whole command in one buffer, so it starts no continuation reader.
             continuation: None,
             veof_change: Some("stty eof ^G; printf '%s%s\\n' kr-veof- set"),
@@ -248,6 +262,7 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             user_configuration_probe: "\"kr-config=$KR_TEST_USER_CONFIGURATION\"",
             ignore_eof_on: None,
             ignore_eof_report: None,
+            quiet_own_key: None,
             continuation: None,
             // A character changed from inside this editor's host does not outlast the command that
             // changed it, so the gesture cannot be driven by changing it mid-session; the case that

@@ -3684,6 +3684,11 @@ pub fn the_gesture_follows_the_line_discipline(kind: ShellKind) {
     if let Some(command) = speech.ignore_eof_on {
         assert!(session.run(command, "kr-ready"));
     }
+    // And the editor's own answer must end by itself: one that asks the person a question is a key
+    // sequence still being read, which no fence asked behind it can be drained past.
+    if let Some(command) = speech.quiet_own_key {
+        assert!(session.run(command, "kr-quiet-set"));
+    }
 
     // A VEOF reassignment is a user change to the gesture, and it takes effect at a prompt rather
     // than in the middle of a read.
