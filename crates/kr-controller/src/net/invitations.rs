@@ -1342,6 +1342,26 @@ pub fn id_conflict(action_id: ActionId) -> ControllerError {
     }
 }
 
+/// Notes in `copied` that `answer`, found by a lookup of the action's record before the action is
+/// considered, is a copy of what the action's first submission recorded, and returns it.
+///
+/// A reused identifier is not a copy: the refusal is this host's word about the identifier and
+/// names no result, so it is told as it is, to a caller that may not read the record as well, as a
+/// create's is.
+pub fn noted_as_a_copy<T>(answer: Result<T>, copied: &std::sync::atomic::AtomicBool) -> Result<T> {
+    let reused = matches!(
+        &answer,
+        Err(ControllerError::Refused {
+            code: ErrorCode::IdConflict,
+            ..
+        } | ControllerError::IdConflict { .. })
+    );
+    if !reused {
+        copied.store(true, std::sync::atomic::Ordering::Release);
+    }
+    answer
+}
+
 /// Returns the failure of a record whose payload matches but whose subject is another's.
 ///
 /// The digest covers the method and every parameter, so the same payload names the same subject;
