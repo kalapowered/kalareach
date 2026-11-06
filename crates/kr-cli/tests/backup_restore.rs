@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use kr_client::recovery::fresh_locator;
 use kr_client::services::account::{
@@ -617,6 +619,7 @@ enum Input<'a> {
     /// These bytes, then the end of the input.
     Bytes(&'a [u8]),
     /// These bytes, and the pipe left open for the test to hold.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Held(&'a [u8]),
 }
 
