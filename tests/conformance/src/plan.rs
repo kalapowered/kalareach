@@ -1216,9 +1216,10 @@ fn windows() -> Vec<Step> {
             ],
             "launcher::",
         ),
-        // The compile budget's reading of a thread's processor time, which no other case reaches on
+        // The compile budget's reading of a thread's processor time, which no other case checks on
         // this platform, and the rest of the plugin runtime's suites, which run the test components.
-        qualified_only(
+        Step::cargo(
+            Group::Rust,
             "the compile budget's reading of a thread's processor time",
             &[
                 "test",
@@ -1229,7 +1230,10 @@ fn windows() -> Vec<Step> {
                 "execution",
                 thread_time,
             ],
+        )
+        .filtered(
             thread_time,
+            "this step runs only the thread-time case; the steps after it run the rest",
         ),
         Step::cargo(
             Group::Rust,

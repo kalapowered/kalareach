@@ -1175,7 +1175,7 @@ jobs:
       # The compile budget counts the processor time of the thread that compiles, and on this
       # platform that is the thread-times query. The case reads it on two real threads, one that
       # spins and one that waits, and holds the waiting thread to a fraction of what the other used.
-      # No other case reaches that query. This step carries its own limit, and the three below
+      # No other case checks what it reads. This step carries its own limit, and the three below
       # carry theirs, so that a case that hangs ends its step and not the leg.
       - name: Test the compile budget's reading of a thread's processor time
         if: ${{ !cancelled() && matrix.part == 'second' }}
