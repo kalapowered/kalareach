@@ -23,7 +23,9 @@
 //! A close whose route cannot be recorded goes on without one, because a stop is let through when
 //! storage fails, and its work continues on a task of its own after the connection has ended. The
 //! task keeps the call's entry until it ends, so a copy of the close that arrives meanwhile finds
-//! the entry in place of the route.
+//! the entry in place of the route. A copy that arrives after the work has ended finds neither,
+//! and is asked as a request the host never routed, while the route store still refuses writes and
+//! answers reads.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
