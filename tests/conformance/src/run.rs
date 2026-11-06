@@ -1164,13 +1164,26 @@ fn date_before(outputs: &[(String, PathBuf)], compiled: &[Compiled], began: Syst
                     .filter(|unit| unit.read.as_ref().is_some_and(|read| read.contains(&name)))
                     .map(|unit| unit.unit)
                     .collect();
-                if unreadable || readers.is_empty() || may_have_overlapped(&readers) {
-                    dating.left.push(format!(
-                        "{} is left to Cargo: the compiles that read it cannot be told apart in \
-                         time ({} of them)",
-                        path.display(),
-                        readers.len()
-                    ));
+                let why = if unreadable {
+                    let without: Vec<Unit> = units
+                        .iter()
+                        .filter(|unit| unit.read.is_none())
+                        .map(|unit| unit.unit)
+                        .collect();
+                    Some(format!(
+                        "a compile of the package ({without:?}) has no dependency file to read"
+                    ))
+                } else if readers.is_empty() {
+                    Some("no compile's dependency file names it".to_owned())
+                } else if may_have_overlapped(&readers) {
+                    Some(format!("{readers:?} read it and could have overlapped"))
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    dating
+                        .left
+                        .push(format!("{} is left to Cargo: {why}", path.display()));
                     continue;
                 }
                 match std::fs::OpenOptions::new()
