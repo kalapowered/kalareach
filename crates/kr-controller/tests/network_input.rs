@@ -547,7 +547,9 @@ async fn a_copy_of_a_mutation_held_behind_a_stalled_request_is_told_the_outcome_
     let (device, record) = &rig.paired;
     let other = RawDevice::connect(&rig.host, device, record).await;
 
-    let deadline = Instant::now() + LIVENESS_DEADLINE;
+    // The bound is the watchdog's, well under the 30 s the daemon waits for the worker's answer to
+    // the stopped mutation, so that the held mutation has not claimed its route during the poll.
+    let deadline = Instant::now() + WATCHDOG;
     let told = loop {
         let refused = other
             .try_mutate_in(
