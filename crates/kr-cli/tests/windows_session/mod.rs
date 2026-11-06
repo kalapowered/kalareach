@@ -30,25 +30,26 @@ pub fn build() -> BuildId {
 
 /// The session's root shell as its worker reports it now, by the identity it was started under, or
 /// nothing when the worker reports none. The worker is reached on a connection of its own, through
-/// its descriptor, as a command would.
+/// its descriptor, as a command would. It is an error, with the step that failed, when the worker
+/// cannot be reached: a worker that has ended has withdrawn its descriptor.
 pub async fn root_process_of(
     environment: &kr_ipc::paths::EnvironmentPaths,
     session_id: kr_protocol::ids::SessionId,
-) -> Option<kr_protocol::identity::ProcessStartIdentity> {
+) -> Result<Option<kr_protocol::identity::ProcessStartIdentity>, String> {
     let descriptor = kr_ipc::descriptor::read_all(environment)
-        .expect("reads the runtime directory")
+        .map_err(|error| format!("the runtime directory is not read: {error:?}"))?
         .into_iter()
         .filter_map(|entry| entry.descriptor.ok())
         .find(|descriptor| descriptor.session_id == session_id)
-        .expect("the session's descriptor is published");
-    let endpoint = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
+        .ok_or_else(|| "the session has no published descriptor".to_owned())?;
+    let endpoint = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint)
+        .map_err(|error| format!("the descriptor's endpoint: {error:?}"))?;
     let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
         .await
-        .expect("reaches the worker");
-    client
-        .verify_worker(&descriptor)
-        .await
-        .expect("the worker answers the descriptor's challenge");
+        .map_err(|error| format!("the worker is not reached: {error:?}"))?;
+    client.verify_worker(&descriptor).await.map_err(|error| {
+        format!("the worker does not answer the descriptor's challenge: {error:?}")
+    })?;
     let snapshot: kr_protocol::recovery::EventsSnapshotResult = client
         .request(
             kr_protocol::method::Method::EventsSnapshot,
@@ -58,11 +59,11 @@ pub async fn root_process_of(
             },
         )
         .await
-        .expect("the call reaches the worker")
-        .expect("the worker answers the snapshot")
+        .map_err(|error| format!("the snapshot call is not answered: {error:?}"))?
+        .map_err(|error| format!("the worker refuses the snapshot: {error:?}"))?
         .to_typed()
-        .expect("decodes");
-    snapshot.session.root_process.as_ref().cloned()
+        .map_err(|error| format!("the snapshot is not decoded: {error:?}"))?;
+    Ok(snapshot.session.root_process.as_ref().cloned())
 }
 
 /// A terminal attached to a real worker's session, holding its keys: what it types reaches the

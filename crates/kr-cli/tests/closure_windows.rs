@@ -134,6 +134,7 @@ async fn opened(
     let typist = WorkerTerminal::attach(&environment, session, dimensions).await;
     let root = root_process_of(&environment, session)
         .await
+        .unwrap_or_else(|why| panic!("the worker is asked for its root shell: {why}"))
         .expect("the worker reports the session's root shell");
     (session, typist, worker, root)
 }
@@ -171,11 +172,14 @@ async fn nothing_started_the_closed_session_again(
         named, root,
         "the shell the closure names is the one the session started with: {closed}"
     );
-    let now = root_process_of(&host.tree.environment(), session).await;
-    assert!(
-        now.as_ref().is_none_or(|reported| *reported == root),
-        "no other shell took the root's place: the worker reports {now:?}, the session started with {root:?}"
-    );
+    // A worker that is still there names no other shell as the root. One that has already ended
+    // has withdrawn its descriptor and can name none, and what is left of it is checked below.
+    if let Ok(now) = root_process_of(&host.tree.environment(), session).await {
+        assert!(
+            now.as_ref().is_none_or(|reported| *reported == root),
+            "no other shell took the root's place: the worker reports {now:?}, the session started with {root:?}"
+        );
+    }
     // The terminal is let go, so the worker has nobody left to send the closure to.
     drop(terminal);
     ended(&root, "the root shell").await;
