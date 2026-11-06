@@ -3530,9 +3530,10 @@ meets another such call carrying the same request is told as a repeat's. A close
 be recorded goes on without one, because a stop is let through when storage fails, and its call
 stays among them until the work it started has ended, so a copy that arrives while the close runs is
 told as a repeat's. When the work has ended, the daemon keeps the request, in memory, as a close it
-carried out with no route if the close reached the worker, so a copy that arrives later is told the
-same; it keeps the last 256 and none after a restart. A close that never reached the worker did
-nothing and keeps nothing. The daemon writes the route before it dispatches the action and
+carried out with no route if its frame was put to the worker, so a copy that arrives later is told
+the same; it keeps the last 256 and none after a restart. A close that never reached the worker, or
+whose frame the check of the device's standing stopped before the worker had all of it, did nothing
+and keeps nothing. The daemon writes the route before it dispatches the action and
 keeps no word of whether a dispatch followed, so it cannot show that the earlier copy did not run. A
 refusal it makes of a repeat on its own account is therefore told as unknown too, wherever the check
 sits: a registration withdrawn, a grant gone or narrowed, a connection opened for the host or for
@@ -3543,9 +3544,11 @@ answers it for a device that may read the session's receipts, as it answers a cl
 closure. A request the daemon never routed is refused as any request is, and so is a reused
 identifier that carries another request, whether the daemon finds it at the route or in a service's
 record, and whether or not copies of that request wait behind it. A close, which the daemon lets
-through with no route when storage cannot record one, and a voice delegation, whose challenge gives
-its route back, are the exception: a copy of either is told as a repeat's when another request holds
-the identifier. The refusal of a reused identifier is the daemon's word about the identifier and
+through with no route when storage cannot record one, and a voice delegation whose identifier a
+route that names no session holds, which its challenge gives back, are the exception: a copy of
+either is told as a repeat's when another request holds the identifier. A route that names a
+session is not given back, so a copy of a voice delegation under it keeps its refusal. The refusal
+of a reused identifier is the daemon's word about the identifier and
 names no result, so a device that may not read the record is told it as it is; the change-set
 service's lookups of a capture, an apply, a revert and a materialisation are the exception, and tell
 such a device the outcome is unknown. A request whose route the daemon cannot read counts as a repeat. A repeat of a create
