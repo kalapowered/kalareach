@@ -245,6 +245,17 @@ impl Host {
             .unwrap_or_default()
     }
 
+    /// Writes `phase` over the phase of every reservation the registry records, as the damage that
+    /// makes a reservation unreadable: its row is there and this build does not know the phase.
+    fn write_phase(&self, phase: &str) {
+        let connection = rusqlite::Connection::open(self.tree.environment().registry_database())
+            .expect("opens the registry");
+        connection.busy_timeout(PATIENCE).expect("a busy timeout");
+        connection
+            .execute("UPDATE reservations SET phase = ?1", [phase])
+            .expect("writes the phase");
+    }
+
     /// Starts the daemon on the tree and waits until it answers.
     async fn run(&mut self) {
         let environment = self.tree.environment();
@@ -697,6 +708,59 @@ async fn a_repeated_create_token_returns_its_session_and_another_payload_conflic
         .expect("reaches the daemon")
         .expect_err("the same token with another payload is refused");
     assert_eq!(refusal.code, ErrorCode::IdConflict);
+
+    host.close(&first).await;
+}
+
+/// A create asked for again when the reservation its token holds cannot be read is told that what
+/// became of it is not known: the host cannot say the token is new, so the repeat is neither made
+/// as a first request nor refused for something it did not do. No second reservation is made, and
+/// once the reservation can be read again the repeat is answered with the session as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_create_whose_reservation_cannot_be_read_is_told_the_outcome_is_unknown() {
+    let host = Host::start().await;
+    let outside = tempfile::tempdir().expect("a directory on the internal disk");
+    let value = marker_value();
+    let request = host.request(outside.path(), &value);
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let mut client = host.client().await;
+    let mutation = client
+        .compose(Method::SessionCreate, action, host.target(None), &request)
+        .await
+        .expect("composes the request");
+    let first: SessionCreateResult = client
+        .repeat(&mutation)
+        .await
+        .expect("reaches the daemon")
+        .expect("the session is created")
+        .to_typed()
+        .expect("decodes");
+    let held = host.reservations();
+    assert_eq!(held.len(), 1, "the first ask reserved one session");
+
+    host.write_phase("a phase this build does not know");
+    let told = host
+        .client()
+        .await
+        .repeat(&mutation)
+        .await
+        .expect("reaches the daemon")
+        .expect_err("a reservation that cannot be read does not answer the repeat");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    assert_eq!(host.reservations().len(), 1, "no second reservation");
+
+    host.write_phase(&held[0].0);
+    let again: SessionCreateResult = host
+        .client()
+        .await
+        .repeat(&mutation)
+        .await
+        .expect("reaches the daemon")
+        .expect("the repeat is answered once the reservation can be read")
+        .to_typed()
+        .expect("decodes");
+    assert!(again.deduplicated, "the repeat is marked as one");
+    assert_eq!(again.session.session_id, first.session.session_id);
 
     host.close(&first).await;
 }
