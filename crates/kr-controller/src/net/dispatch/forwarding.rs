@@ -250,22 +250,27 @@ impl RemoteConnection {
     /// Whether the route of the action a mutation carries holds another request, which makes the
     /// identifier a reused one that nothing is carried out under for this request.
     ///
-    /// Two kinds of mutation are never decided so. A close goes on without a route when storage
-    /// cannot record one, because a stop is let through, so another request that holds the route
-    /// by the time a copy is refused does not say the close was not carried out. A voice
+    /// Two kinds of mutation are not always decided so. A close goes on without a route when
+    /// storage cannot record one, because a stop is let through, so another request that holds the
+    /// route by the time a copy is refused does not say the close was not carried out. A voice
     /// delegation's challenge gives its route back, so the identifier is free again for the request
-    /// that is signed. A copy of either is told as a repeat's, as it is when it meets no conflict.
+    /// that is signed; only a route that names no session is given back, so a route that names one
+    /// is spent for a voice delegation as for any request. A copy of either is told as a repeat's,
+    /// as it is when it meets no conflict.
     fn identifier_is_spent_on_another_request(&self, mutation: &MutationRequest) -> bool {
-        if matches!(
-            mutation.method.method(),
-            Some(Method::SessionClose | Method::VoiceDelegate)
-        ) {
+        let method = mutation.method.method();
+        if method == Some(Method::SessionClose) {
             return false;
         }
         let actor_id = self.device.principal();
         match self.devices.action_route(&actor_id, mutation.action_id) {
-            Ok(Some(routed)) => kr_protocol::digest::mutation_digest(mutation, &actor_id)
-                .is_ok_and(|digest| routed.payload_digest != Some(digest)),
+            Ok(Some(routed)) => {
+                if method == Some(Method::VoiceDelegate) && routed.session_id.is_none() {
+                    return false;
+                }
+                kr_protocol::digest::mutation_digest(mutation, &actor_id)
+                    .is_ok_and(|digest| routed.payload_digest != Some(digest))
+            }
             Ok(None) | Err(_) => false,
         }
     }
