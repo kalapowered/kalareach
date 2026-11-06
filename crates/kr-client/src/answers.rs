@@ -708,7 +708,12 @@ pub async fn answer_over(
         .map_err(AnswerFailure::unwritten)?;
     match session.send(&composed).await {
         Ok(settled) => {
-            session.settle(dispatch.action_id).await;
+            // A result is the host's word that the action ended. A receipt is not: it says the host
+            // holds the action and has not finished with it, or cannot say what became of it, and
+            // the action stays on the connection's book for the receipt read to settle.
+            if settled.result().is_some() {
+                session.settle(dispatch.action_id).await;
+            }
             Ok(settled.to_typed()?)
         }
         Err(error) => {
