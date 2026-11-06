@@ -197,13 +197,21 @@ function Get-KrProcessIdentity {
     }
     $ticks = ([System.DateTimeOffset]$process.StartTime).UtcTicks -
              [System.DateTimeOffset]::UnixEpoch.UtcTicks
-    # This platform's kernel records microseconds, and reports the value truncated. The truncation
-    # is written out because PowerShell divides whole numbers as doubles and a cast to an integer
-    # rounds the result: a shell started after the half unit would name a start one unit later than
-    # the one the worker read from the kernel, and the handshake would be refused as a different
-    # process.
-    $start = [uint64][Math]::Floor([decimal]$ticks / [decimal]10)
-    @{ pid = [uint64]$process.Id; source = 'macos_proc_bsd_info'; start_value = $start }
+    @{ pid = [uint64]$process.Id; source = 'macos_proc_bsd_info'; start_value = (ConvertTo-KrStartMicroseconds $ticks) }
+}
+
+# The start of a process in the microseconds this platform's kernel records, from the runtime's
+# time for it in hundreds of nanoseconds.
+#
+# The runtime derives its time from the kernel's by arithmetic that leaves it a few hundred
+# nanoseconds above or below the kernel's value: 17939325736990098 is the kernel's 1793932573699010,
+# and truncating it names 1793932573699009. The nearest microsecond is the kernel's, and the worker
+# refuses a shell whose start differs from the one it read by a unit as a different process. Half a
+# unit is added and the rest dropped, with the division written out because PowerShell divides
+# whole numbers as doubles and a cast to an integer rounds the result.
+function ConvertTo-KrStartMicroseconds {
+    param([int64]$Ticks)
+    [uint64][Math]::Floor(([decimal]$Ticks + [decimal]5) / [decimal]10)
 }
 
 function ConvertFrom-KrBase64Url {
