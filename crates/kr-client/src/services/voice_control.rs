@@ -1012,7 +1012,9 @@ impl Driver {
     async fn keep_attached(&mut self) -> Option<ControlEnd> {
         let mut lost_at = Instant::now();
         let mut failures = 0_u32;
-        // Whether the owner has been told that no socket is held, for the outage that is on.
+        // Whether the owner has been told that no socket is held. A control that has not attached
+        // says so at its first failed attempt; one that held a socket says so when it is lost,
+        // and then not again for the attempts that follow.
         let mut detached_told = false;
         loop {
             // The window bounds the attempt as well as the wait between attempts, so a service
@@ -1044,7 +1046,6 @@ impl Driver {
                     continue;
                 }
             };
-            detached_told = false;
             let attached_at = Instant::now();
             let (socket, delegations) = attached;
             self.set_known(&delegations);
