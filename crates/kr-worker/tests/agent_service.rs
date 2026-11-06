@@ -493,9 +493,22 @@ async fn send_until_decided<C: Codec>(
 
 /// Registers the instance every test here acts on, with the capability a prompt needs.
 fn register(host: &Host, dispatch: Option<Arc<dyn UpstreamDispatch>>) {
+    register_launched_as(
+        host,
+        dispatch,
+        ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900),
+    );
+}
+
+/// As [`register`], for an agent the worker launched as `process`: a helper that is `process`, or
+/// below it, is placed under the agent's instance.
+fn register_launched_as(
+    host: &Host,
+    dispatch: Option<Arc<dyn UpstreamDispatch>>,
+    process: ProcessStartIdentity,
+) {
     until_the_journal_is_healthy(host);
     let broker = host.service.broker();
-    let process = ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900);
     broker
         .register_instance(
             instance(),
@@ -4339,6 +4352,228 @@ async fn a_yes_to_a_question_leaves_the_connectors_approval_to_its_own_path() {
     assert_ne!(
         broker.pending(resource_id).map(|resource| resource.state),
         Some(PendingState::Pending)
+    );
+}
+
+/// A transport that answers at once and keeps what it was asked to carry: the conversation each
+/// request acts in, and what the request is.
+#[derive(Debug, Default)]
+struct RecordingUpstream {
+    carried: std::sync::Mutex<
+        Vec<(
+            Option<kr_protocol::ids::AgentThreadId>,
+            kr_worker::broker::UpstreamBody,
+        )>,
+    >,
+}
+
+impl RecordingUpstream {
+    fn carried(
+        &self,
+    ) -> Vec<(
+        Option<kr_protocol::ids::AgentThreadId>,
+        kr_worker::broker::UpstreamBody,
+    )> {
+        self.carried
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl UpstreamDispatch for RecordingUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
+        self.carried
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((request.thread_id.clone(), request.body.clone()));
+        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
+            upstream_request_id: None,
+            turn_id: request.turn_id.clone(),
+            provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+        })))
+    }
+}
+
+/// KR-REQ-11.63, the thread half of the sentence that no answer is automatically inserted into the
+/// current terminal or a newly selected agent thread: an agent the worker launched asks a question
+/// from its own process, the thread that agent's application instance has selected changes,
+/// and the person's answer reaches the question's source by its token and is carried to the thread
+/// by nothing. The transport to the agent is sent no request at all. The control is the path that
+/// does carry text there: a prompt the person writes, naming the new binding, reaches the
+/// transport with its own words as the only request, so a transport that was sent the answer would
+/// show it.
+///
+/// Not shown here: a question bound to a thread by a qualified bridge, which a switch ends before
+/// anyone can answer it, and the terminal half of the sentence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_is_not_inserted_into_the_thread_the_agent_selected_after_asking() {
+    use kr_protocol::question::{
+        QuestionAnswer, QuestionAnswerParams, QuestionCreateParams, QuestionKind,
+        QuestionReadOwnParams, QuestionState,
+    };
+    use kr_worker::broker::UpstreamBody;
+
+    const ANSWER: &str = "an-answer-nobody-typed-5527";
+    const PROMPT: &str = "a prompt the person wrote";
+
+    let host = host().await;
+    let upstream = Arc::new(RecordingUpstream::default());
+    // The worker launched the agent as this test process, so the question this process asks is the
+    // agent's: it belongs to the instance whose thread is about to change.
+    register_launched_as(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+        kr_ipc::identity::current_process_start_identity().expect("a process identity"),
+    );
+    let broker = host.service.broker();
+    let now = kr_worker::questions::Now {
+        utc_ms: kr_ipc::now_ms(),
+        boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+    };
+
+    // The agent asks, as a verified helper asks, and holds the token to read its answer with.
+    let source = kr_worker::questions::VerifiedSource {
+        process: kr_ipc::identity::current_process_start_identity().expect("a process identity"),
+        executable: Some("/bin/agent".to_owned()),
+        session_member: true,
+        ancestry: true,
+        launch_channel: true,
+        connection_id: kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
+    };
+    let (asked, _) = host
+        .service
+        .questions()
+        .create(
+            &source,
+            &QuestionCreateParams {
+                session_id: host.session_id,
+                request_id: "name-the-release".to_owned(),
+                agent_name: Nullable::some("an agent".to_owned()),
+                context: "The build finished.".to_owned(),
+                question: "What should the release be called?".to_owned(),
+                kind: QuestionKind::Input,
+                choices: Vec::new(),
+                requested_expiry_ms: Nullable::null(),
+                wait_ms: Nullable::null(),
+            },
+            now,
+        )
+        .expect("a verified source asks");
+    assert_eq!(
+        asked.question.source.application_instance_id,
+        instance(),
+        "the question is the launched agent's"
+    );
+
+    // The agent's application instance selects another conversation.
+    let thread =
+        kr_protocol::ids::AgentThreadId::new("thread-selected-after-asking").expect("a thread");
+    let revision = broker
+        .advance_binding(instance(), Some(thread.clone()), TimestampMs::new(5))
+        .expect("the binding moves to the new thread");
+    let state = broker
+        .binding_state(instance())
+        .expect("the instance is bound");
+    assert_eq!(state.thread_id.0.as_ref(), Some(&thread));
+    assert_eq!(state.binding_revision, revision);
+    // The new binding's prompt path is live: the capability is qualified again for it (the switch
+    // took the record the first registration made to its second revision), so a request the worker
+    // made to the thread now would be admitted and carried.
+    broker
+        .record_capability(kr_protocol::broker::InstanceCapabilityRecord {
+            capability_id: capability("agent.prompt"),
+            capability_version: "1".to_owned(),
+            application_instance_id: instance(),
+            identity: kr_protocol::broker::InstanceCapabilityIdentity::default(),
+            revision: CapabilityRevision::new(3),
+            state: kr_protocol::broker::InstanceCapabilityState::QualifiedAvailable,
+            source: kr_protocol::broker::InstanceEvidenceSource::HostProbe,
+            invalidated_by: [kr_protocol::broker::InstanceInvalidation::BindingChanged]
+                .into_iter()
+                .collect(),
+            disabled_reason: Nullable::null(),
+            observed_at: TimestampMs::new(6),
+        })
+        .expect("the prompt capability is qualified again for the new binding");
+
+    // The person answers on the worker's own socket.
+    let mut client = cli(&host).await;
+    client
+        .mutate(
+            Method::QuestionAnswer,
+            ActionId::new(kr_ipc::new_uuid()),
+            action_target(&host),
+            &QuestionAnswerParams {
+                session_id: host.session_id,
+                question_id: asked.question.question_id,
+                expected_revision: asked.question.revision,
+                answer: QuestionAnswer::Input {
+                    text: ANSWER.to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("the person answers");
+
+    // The source reads it through its own token, and nothing was carried to the thread.
+    let (own, _) = host
+        .service
+        .questions()
+        .read_own(
+            &source,
+            &QuestionReadOwnParams {
+                session_id: host.session_id,
+                question_id: asked.question.question_id,
+                caller_token: asked.caller_token.clone(),
+                wait_ms: Nullable::null(),
+            },
+            now,
+        )
+        .expect("the source reads its own question");
+    assert_eq!(own.question.state, QuestionState::Answered);
+    assert_eq!(
+        own.question.answer.as_ref().map(|record| &record.answer),
+        Some(&QuestionAnswer::Input {
+            text: ANSWER.to_owned()
+        }),
+        "the source has its answer"
+    );
+    assert_eq!(
+        upstream.carried(),
+        Vec::new(),
+        "the answer was carried to the newly selected thread"
+    );
+
+    // The control: the person's own prompt to the new binding is what the transport carries.
+    let mut prompt = prompt_mutation(&client, &host, 61);
+    prompt.target.agent_binding_revision = Nullable::some(revision);
+    prompt.params = ParamsValue::from_typed(&AgentPromptParams {
+        target: AgentMutationTarget {
+            subject: subject(host.session_id, instance()),
+            binding_revision: revision,
+        },
+        draft_id: Nullable::null(),
+        text: Nullable::some(PromptText::new(PROMPT).expect("valid")),
+    })
+    .expect("encodes");
+    let outcome = send(&mut client, prompt).await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+    assert_eq!(
+        upstream.carried(),
+        vec![(
+            Some(thread),
+            UpstreamBody::Prompt {
+                draft_id: None,
+                text: Some(PROMPT.to_owned()),
+            }
+        )],
+        "the person's prompt is the one request the new thread was sent"
     );
 }
 
