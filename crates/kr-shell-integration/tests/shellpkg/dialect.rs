@@ -75,12 +75,12 @@ pub struct Dialect {
     /// never waits for the person, printing `kr-quiet-set`.
     ///
     /// Zsh binds that character to a command that lists what the empty line completes to, which
-    /// is every command on the search path, and when there are more of them than `LISTMAX` it
-    /// asks "do you wish to see all N possibilities" and waits for a key. A key sequence that is
-    /// waiting for its answer is one the reader rightly reports as still in progress, so a fence
-    /// asked behind it is not drained until someone answers; whether the answer has been given
-    /// by then is a matter of timing. With the limit lifted the list is printed and the command
-    /// ends by itself.
+    /// is every command the shell knows, and when there are as many of them as `LISTMAX` or more
+    /// it asks "do you wish to see all N possibilities" and waits for a key. A key sequence that
+    /// is waiting for its answer is one the reader rightly reports as still in progress: a fence
+    /// asked before the question is drawn is drained, and one asked after it is not until someone
+    /// answers. The character is bound to a command that deletes a character, which asks nothing
+    /// whatever the search path holds.
     pub quiet_own_key: Option<&'static str>,
     /// Opens a continuation reader, and closes it printing `kr-continuation-ok`.
     pub continuation: Option<(&'static str, &'static str)>,
@@ -195,7 +195,7 @@ pub fn dialect(kind: ShellKind) -> Dialect {
             ignore_eof_report: Some(
                 "echo kr-ignoreeof=$([[ -o ignoreeof ]] && echo on || echo off)",
             ),
-            quiet_own_key: Some("LISTMAX=1000000; printf '%s%s\\n' kr-quiet- set"),
+            quiet_own_key: Some("bindkey '^D' delete-char; printf '%s%s\\n' kr-quiet- set"),
             continuation: Some((
                 "echo 'kr-continuation",
                 "' >/dev/null; printf '%s%s\\n' kr-continuation- ok",
