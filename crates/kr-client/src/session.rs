@@ -973,9 +973,8 @@ impl Session {
     /// same send again, which the host performs at most once. The same send goes out as it first
     /// did, with the action window it first carried even when the host has issued a later one,
     /// because the host keys its record of the action by the request. When that window has ended
-    /// by then, the host answers from its record of the action if it has one, and otherwise refuses
-    /// the window, which the caller is told. A send that differs in anything else goes out as
-    /// composed now.
+    /// by then, the host refuses it unless it holds an answer for the action, and the caller is
+    /// told the refusal. A send that differs in anything else goes out as composed now.
     ///
     /// In every other respect this is [`Session::mutate`], including the outstanding bound and the
     /// uncertainty an interrupted send leaves behind.
