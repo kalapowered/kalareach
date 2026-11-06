@@ -3543,7 +3543,12 @@ door as read from a record. The door then tells it as it tells one it found in a
 device that may read the record is given the recorded answer. A device that may not is told the
 outcome is unknown, whatever the answer was, and so is any device when the authority feed refuses
 before the answer is written. The service's refusals that are not copies of a record, such as the
-refusal of a request that reaches no record, are told as a fresh answer is.
+refusal of a request that reaches no record, are told as a fresh answer is. A create is answered
+from the reservation under its token, and the reservation holds a session whether its first attempt
+launched it or failed to. A repeat of a create that failed is therefore a copy of a record, as a
+repeat of one that succeeded is: the session the reservation holds decides whether the device may
+read the answer, and a device that may not is told the outcome is unknown, and not the phase the
+launch ended in.
 
 A transient failure says nothing took effect, so the daemon does not give one for these answers once
 it has dispatched or committed the action. It tells `OUTCOME_UNKNOWN` instead: a decision that could

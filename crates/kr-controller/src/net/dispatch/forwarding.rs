@@ -667,8 +667,8 @@ impl RemoteConnection {
     /// Section 23 wants present view authority over the subject before either half of a retained
     /// result goes back, and the answer is written under that decision, so a lease that loses the
     /// right while it waits is refused where it is written. The subject is the session the request
-    /// names (a rename's, a review's, a visit's) or, for a create, the session its answer names,
-    /// which is in the answer rather than in the request.
+    /// names (a rename's, a review's, a visit's) or, for a create, `reserved`, the session of the
+    /// reservation the create left, which its answer does not name when the create failed.
     ///
     /// An owner confirmation's answer is a challenge. Its entry names only the owner's ceremony,
     /// which the confirmation service checks on a first request and cannot be asked again here, so
@@ -687,7 +687,7 @@ impl RemoteConnection {
         &self,
         method: Method,
         mutation: &MutationRequest,
-        retained: &ControlFrame,
+        reserved: Option<SessionId>,
         acting: &Acting,
     ) -> std::result::Result<Option<Asked>, ProtocolError> {
         if matches!(
@@ -698,12 +698,7 @@ impl RemoteConnection {
                 .ask(None, Method::OwnerConfirmationPending.entry(), false)
                 .map(|read| Some(read.answering(method).kept()));
         }
-        let subject = mutation
-            .target
-            .session_id
-            .as_ref()
-            .copied()
-            .or_else(|| super::routes::answered_session(retained));
+        let subject = mutation.target.session_id.as_ref().copied().or(reserved);
         if subject.is_some() {
             return self.may_read_receipts(subject, method, acting).map(Some);
         }
@@ -738,13 +733,44 @@ impl RemoteConnection {
             return Err(outcome_not_shown());
         }
         // The answer is a read of what an earlier submission produced, and is written under the
-        // decision that read is ([`Self::read_of_retained`]).
-        match self.read_of_retained(method, mutation, &kept, &decided.acting) {
+        // decision that read is ([`Self::read_of_retained`]). A create's answer is a read of the
+        // reservation its token holds, whichever way the first attempt ended, and the session that
+        // reservation holds is its subject.
+        let reserved = if method == Method::SessionCreate {
+            match self.reserved_session(mutation).await {
+                Ok(reserved) => reserved,
+                Err(()) => return Err(outcome_not_shown()),
+            }
+        } else {
+            None
+        };
+        match self.read_of_retained(method, mutation, reserved, &decided.acting) {
             Ok(Some(read)) => *asked = Some(read),
             Ok(None) => {}
             Err(_) => return Err(outcome_not_shown()),
         }
         Ok(kept)
+    }
+
+    /// The session of the reservation under a create's action, when that reservation holds this
+    /// request, which is what the create's answer is about when it is read from the reservation.
+    ///
+    /// `Ok(None)` is a token another request spent: the refusal that says so is this host's word
+    /// about the identifier and names no result, so it is told as it is. `Err` is a reservation that
+    /// cannot be read, which leaves open what the create came to.
+    async fn reserved_session(
+        &self,
+        mutation: &MutationRequest,
+    ) -> std::result::Result<Option<SessionId>, ()> {
+        let actor_id = self.device.principal();
+        let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id).map_err(|_| ())?;
+        let registry = self.controller.registry.lock().await;
+        let reservation = registry
+            .reservation_for_token(&actor_id, mutation.action_id.get())
+            .ok()
+            .flatten()
+            .ok_or(())?;
+        Ok((reservation.payload_digest == digest).then_some(reservation.session_id))
     }
 
     /// Returns this connection's link to one worker, opening it on first use.

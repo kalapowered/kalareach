@@ -16,6 +16,7 @@ use kr_protocol::worker::{EnvironmentOrigin, ReservationId, WorkerReady};
 use tokio::sync::oneshot;
 
 use crate::error::{ControllerError, Result};
+use crate::given::Given;
 use crate::registry::LaunchPhase;
 use crate::supervision::{LaunchOutcome, WorkerLaunch};
 
@@ -377,16 +378,26 @@ impl Controller {
     /// itself. The connection identity travels with it so the registration behind it can be
     /// checked again at the moment the launch becomes possible, rather than only when the request
     /// arrived.
+    ///
+    /// The answer says whether it was read from the reservation an earlier submission of the
+    /// create made ([`Self::create_under`]), the refusals that come before the reservation being
+    /// the answer to this submission.
     pub(super) async fn session_create(
         self: &Arc<Self>,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
-    ) -> Result<ParamsValue> {
+    ) -> Given<Result<ParamsValue>> {
         // Through the gate first, and counted until this create has settled: a daemon making way
         // for an update of the host starts nothing new, and waits for what it has started.
-        let under_way = self.handover.admit()?;
-        let create: SessionCreateParams = parse(&mutation.params)?;
+        let under_way = match self.handover.admit() {
+            Ok(under_way) => under_way,
+            Err(refusal) => return Given::Fresh(Err(refusal)),
+        };
+        let create: SessionCreateParams = match parse(&mutation.params) {
+            Ok(create) => create,
+            Err(refusal) => return Given::Fresh(Err(refusal)),
+        };
         // Before anything reads what is in force, the environment a host-context session is given
         // among it: a document put right since the last acceptance is accepted first, so this
         // create is made under what it now says. Before the registry is locked, because accepting
@@ -394,16 +405,23 @@ impl Controller {
         self.accept_when_unusable().await;
         // Whose environment the session is started with, from where the create came through. A
         // connection that is no longer registered has no door and no create.
-        let door = self.door_of(carried.connection_id).ok_or_else(|| {
-            ControllerError::PermissionDenied {
+        let Some(door) = self.door_of(carried.connection_id) else {
+            return Given::Fresh(Err(ControllerError::PermissionDenied {
                 detail: "the authority this connection was admitted under has been withdrawn; \
                          open a new connection"
                     .to_owned(),
+            }));
+        };
+        let origin = match decide_origin(door, &create) {
+            Ok(origin) => origin,
+            Err(refusal) => return Given::Fresh(Err(refusal)),
+        };
+        let digest = match kr_protocol::digest::mutation_digest(mutation, actor_id) {
+            Ok(digest) => digest,
+            Err(error) => {
+                return Given::Fresh(Err(ControllerError::InvalidArgument(error.to_string())));
             }
-        })?;
-        let origin = decide_origin(door, &create)?;
-        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        };
         // The admission this create carries is asked at the launch transition, against the
         // registry guard that transition holds: the authority revision it was admitted under, the
         // registration behind it, and the deadline.
@@ -439,17 +457,40 @@ impl Controller {
     /// `under_way` is the handover guard the caller took first; it is kept until the create has
     /// settled.
     ///
+    /// The answer is what the request or the host refuses (an invalid request, an unusable
+    /// document, a full environment, a refused admission, a launch that failed or that cannot be
+    /// told) or the session made. It is a copy when the create token already held a reservation,
+    /// and then it is what that reservation leaves, whether its first attempt launched a session or
+    /// failed to.
+    pub(super) async fn create_under(
+        self: &Arc<Self>,
+        under_way: &super::host::UnderWay<'_>,
+        who: CreateFor<'_>,
+        create: SessionCreateParams,
+        launch: Option<HeldLaunch>,
+        admit: &(dyn Fn(&crate::registry::Registry) -> Result<()> + Sync),
+    ) -> Given<Result<ParamsValue>> {
+        let mut copied = false;
+        let answer = self
+            .create_reserving(under_way, who, create, launch, admit, &mut copied)
+            .await;
+        Given::of(answer, copied)
+    }
+
+    /// [`Self::create_under`], setting `copied` when the token already held a reservation and the
+    /// answer is read from it.
+    ///
     /// # Errors
     ///
-    /// Returns what the request or the host refuses: an invalid request, an unusable document, a
-    /// full environment, a refused admission, a launch that failed or that cannot be told.
-    pub(super) async fn create_under(
+    /// Returns what the request or the host refuses.
+    async fn create_reserving(
         self: &Arc<Self>,
         _under_way: &super::host::UnderWay<'_>,
         who: CreateFor<'_>,
         mut create: SessionCreateParams,
         launch: Option<HeldLaunch>,
         admit: &(dyn Fn(&crate::registry::Registry) -> Result<()> + Sync),
+        copied: &mut bool,
     ) -> Result<ParamsValue> {
         let CreateFor {
             actor_id,
@@ -593,6 +634,7 @@ impl Controller {
                 let registry = self.registry.lock().await;
                 admit(&registry)?;
             }
+            *copied = true;
             return self.replay_create(&reservation).await;
         }
 

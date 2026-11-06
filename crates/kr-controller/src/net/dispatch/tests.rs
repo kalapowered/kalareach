@@ -5316,7 +5316,6 @@ async fn kr_req_23_34_a_close_is_made_for_a_caller_that_may_not_read_its_receipt
 /// right gave, which goes on checking where the answer is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_read_it_is() {
-    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
     use kr_protocol::rights::ActionRight;
 
     use crate::service::a_close_a_worker_never_answers as fake;
@@ -5338,10 +5337,6 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
     let on_the_session = |connection: &super::RemoteConnection, method: Method| {
         device_mutation(&world, connection, method, 71, ParamsValue::empty())
     };
-    let empty = ControlFrame::Response(Response {
-        request_id: RequestId::new(71),
-        outcome: Outcome::Ok(ParamsValue::empty()),
-    });
 
     // A mutation that names a session: a rename, a review, a visit.
     for method in [
@@ -5353,7 +5348,7 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
             .read_of_retained(
                 method,
                 &on_the_session(&viewer, method),
-                &empty,
+                None,
                 &viewer.pairing_acting(),
             )
             .expect("a device that may view is answered")
@@ -5363,37 +5358,22 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
             .read_of_retained(
                 method,
                 &on_the_session(&blind, method),
-                &empty,
+                None,
                 &blind.pairing_acting(),
             )
             .expect_err("a device that may not view is not");
         assert_eq!(denied.code, kr_protocol::error::ErrorCode::PermissionDenied);
     }
 
-    // A create names no session in its request, and the answer names the one it made.
+    // A create names no session in its request, and the reservation it left holds the one it made.
     let mut create = on_the_session(&viewer, Method::SessionCreate);
     create.target.session_id = Nullable::null();
-    let made = ControlFrame::Response(Response {
-        request_id: RequestId::new(71),
-        outcome: Outcome::Ok(
-            ParamsValue::from_typed(&kr_protocol::session::SessionCreateResult {
-                session: crate::service::a_close_a_worker_never_answers::read_result(
-                    world.session_id,
-                )
-                .session,
-                endpoint: Nullable::null(),
-                deduplicated: true,
-                presentation_error: Nullable::null(),
-            })
-            .expect("encodes"),
-        ),
-    });
     assert!(
         viewer
             .read_of_retained(
                 Method::SessionCreate,
                 &create,
-                &made,
+                Some(world.session_id),
                 &viewer.pairing_acting()
             )
             .expect("answered")
@@ -5405,7 +5385,7 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
             .read_of_retained(
                 Method::SessionCreate,
                 &create,
-                &made,
+                Some(world.session_id),
                 &blind.pairing_acting()
             )
             .is_err(),
@@ -5420,19 +5400,14 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
         let mut asked = on_the_session(&owner, method);
         asked.target.session_id = Nullable::null();
         let read = owner
-            .read_of_retained(method, &asked, &empty, &owner.pairing_acting())
+            .read_of_retained(method, &asked, None, &owner.pairing_acting())
             .expect("a device that may manage the host is shown its challenge")
             .expect("under the read of the challenges");
         assert_eq!(read.shown_as, method);
         let mut refused = on_the_session(&nothing_to_manage, method);
         refused.target.session_id = Nullable::null();
         let denied = nothing_to_manage
-            .read_of_retained(
-                method,
-                &refused,
-                &empty,
-                &nothing_to_manage.pairing_acting(),
-            )
+            .read_of_retained(method, &refused, None, &nothing_to_manage.pairing_acting())
             .expect_err("a device that no longer holds the right is not");
         assert_eq!(denied.code, kr_protocol::error::ErrorCode::PermissionDenied);
 
@@ -5442,12 +5417,12 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
         let named = on_the_session(&nothing_to_manage, method);
         assert!(named.target.session_id.is_present());
         let denied = nothing_to_manage
-            .read_of_retained(method, &named, &empty, &nothing_to_manage.pairing_acting())
+            .read_of_retained(method, &named, None, &nothing_to_manage.pairing_acting())
             .expect_err("the session its target names does not decide it");
         assert_eq!(denied.code, kr_protocol::error::ErrorCode::PermissionDenied);
         let named = on_the_session(&owner, method);
         let read = owner
-            .read_of_retained(method, &named, &empty, &owner.pairing_acting())
+            .read_of_retained(method, &named, None, &owner.pairing_acting())
             .expect("a device that may manage the host is shown its challenge")
             .expect("under the read of the challenges");
         assert_eq!(read.shown_as, method);
@@ -5461,7 +5436,7 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
             .read_of_retained(
                 Method::CatalogueAdd,
                 &environment,
-                &empty,
+                None,
                 &owner.pairing_acting()
             )
             .expect("no read is asked of it")
