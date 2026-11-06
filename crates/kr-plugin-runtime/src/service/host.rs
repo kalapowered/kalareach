@@ -168,6 +168,9 @@ pub struct PluginHost {
     /// How many unbinds may be queued or running on the blocking pool at once, across every
     /// connection.
     unbinds: Arc<tokio::sync::Semaphore>,
+    /// How many unbinds found every place taken, for the tests of what one does then.
+    #[cfg(feature = "testing")]
+    unbinds_found_full: std::sync::atomic::AtomicUsize,
     /// The packages directory, opened once. Every payload is opened relative to this handle, which
     /// is what keeps a component's location inside it a property of the open rather than of a
     /// comparison made before it.
@@ -268,6 +271,8 @@ impl PluginHost {
             config,
             payloads: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PAYLOADS)),
             unbinds: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_UNBINDS)),
+            #[cfg(feature = "testing")]
+            unbinds_found_full: std::sync::atomic::AtomicUsize::new(0),
             packages: Arc::new(packages),
             started: std::time::Instant::now(),
             register_deadline: REGISTER_DEADLINE,
@@ -305,6 +310,14 @@ impl PluginHost {
     #[must_use]
     pub fn unbinds_waiting(&self) -> usize {
         MAX_PENDING_UNBINDS.saturating_sub(self.unbinds.available_permits())
+    }
+
+    /// Returns how many unbinds have found every place taken, which they find before they wait for
+    /// one.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn unbinds_found_full(&self) -> usize {
+        self.unbinds_found_full.load(Ordering::Acquire)
     }
 
     /// Holds the notice writers, for the tests of what a connection writes: until the returned hold
@@ -992,6 +1005,10 @@ impl PluginHost {
         let registered = Arc::clone(&served.registered);
         let notices = served.notices.clone();
         let binding = BindingId::new(binding_id);
+        #[cfg(feature = "testing")]
+        if self.unbinds.available_permits() == 0 {
+            self.unbinds_found_full.fetch_add(1, Ordering::Release);
+        }
         // A place among the removals this host may have waiting, held by the task until it has run
         // and not by this request, which stops waiting at its deadline, nor by the connection,
         // which may be over by then.
@@ -1010,9 +1027,14 @@ impl PluginHost {
                 &notices,
                 binding_id,
             );
+            let outcome = match removed {
+                Unbound::Stopped => "the binding was stopped without waiting for its thread",
+                Unbound::Preparing => "the registration of the binding was withdrawn",
+                Unbound::Absent => "the host holds no such binding",
+            };
             return Err(refused(format!(
                 "this host already has the {MAX_PENDING_UNBINDS} unbinds it may have waiting, and \
-                 the binding was stopped without waiting for its thread"
+                 {outcome}"
             )));
         };
         let runtime = Arc::clone(&self.runtime);
@@ -1544,7 +1566,8 @@ fn finish_removal(
         held.parted(binding_id, &removing);
     }
     // The binding has gone, so what the notice queue was holding for it has nothing left to catch,
-    // and the identifier's next incarnation starts clean.
+    // and the identifier's next incarnation starts clean. A thread that was not waited for may still
+    // be finishing a call, and what that call produces reaches the queue after this.
     notices.forget(binding_id);
 }
 
