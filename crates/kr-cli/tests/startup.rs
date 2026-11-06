@@ -1987,6 +1987,92 @@ fn kr_req_26_42_an_ordinary_user_with_no_account_and_no_managed_service_runs_a_h
     host.close(&created);
 }
 
+/// KR-REQ-16.04: `kr host push-gateways` shows, lists and clears the gateways besides the official
+/// one that a paired device's credential may name, each choice one validated revision of the host's
+/// own configuration document that the daemon is asked about straight away, so that it is in force
+/// when the command returns. An origin that is not one, and the official gateway, are refused by
+/// the name of the setting, and write nothing.
+#[test]
+fn kr_host_push_gateways_lists_and_clears_the_gateways_a_credential_may_name() {
+    let host = Standalone::create();
+    host.select_standalone();
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(output.status.success(), "{created}");
+    let push_gateways = |arguments: &[&str]| {
+        let mut command = vec!["--json", "host", "push-gateways"];
+        command.extend_from_slice(arguments);
+        let output = start(host.kr(&command)).finish("kr host push-gateways");
+        let shown = document(&output, "kr host push-gateways");
+        (output.status.success(), shown)
+    };
+
+    let (ok, shown) = push_gateways(&[]);
+    assert!(ok, "{shown}");
+    assert_eq!(shown["push_gateways"], serde_json::json!([]), "{shown}");
+
+    let (ok, shown) = push_gateways(&[
+        "--set",
+        "https://push.builder.example",
+        "http://127.0.0.1:8788",
+    ]);
+    assert!(ok, "{shown}");
+    assert_eq!(
+        shown["push_gateways"],
+        serde_json::json!(["https://push.builder.example", "http://127.0.0.1:8788"]),
+        "{shown}"
+    );
+    let written: Value =
+        serde_json::from_slice(&std::fs::read(host.document()).expect("the document was written"))
+            .expect("the document is JSON");
+    assert_eq!(written["level"], 7, "{written}");
+    assert_eq!(
+        written["push"]["gateways"],
+        serde_json::json!(["https://push.builder.example", "http://127.0.0.1:8788"]),
+        "{written}"
+    );
+    assert_eq!(
+        written["startup"]["controller"], "standalone",
+        "an edit of the section leaves the others as they were: {written}"
+    );
+    let row = host.doctor_row("push.gateways");
+    assert!(
+        row["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("https://push.builder.example")),
+        "{row}"
+    );
+    assert_eq!(row["effect"], "immediately", "{row}");
+
+    // An origin that is not one, and the official gateway, are refused by name and write nothing.
+    let before = std::fs::read(host.document()).expect("the document");
+    for refused in ["push.builder.example", "https://reach.kala.to"] {
+        let (ok, shown) = push_gateways(&["--set", refused]);
+        assert!(!ok, "{refused}: {shown}");
+        assert_eq!(shown["code"], "INVALID_ARGUMENT", "{shown}");
+        assert!(
+            shown["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("push.gateways")),
+            "{shown}"
+        );
+        assert_eq!(
+            std::fs::read(host.document()).expect("the document"),
+            before,
+            "{refused}: nothing was written"
+        );
+    }
+
+    let (ok, shown) = push_gateways(&["--clear"]);
+    assert!(ok, "{shown}");
+    assert_eq!(shown["push_gateways"], serde_json::json!([]), "{shown}");
+    let written: Value =
+        serde_json::from_slice(&std::fs::read(host.document()).expect("the document is there"))
+            .expect("the document is JSON");
+    assert!(written.get("push").is_none(), "{written}");
+    host.close(&created);
+}
+
 /// KR-REQ-08.02: `kr status` reports each terminal attachment's presentation and the reason for it.
 ///
 /// Two terminals attach to a session the started daemon holds: one at the session's own size that
