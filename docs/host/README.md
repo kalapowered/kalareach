@@ -3542,12 +3542,13 @@ read. A repeated close is the one the daemon can still answer without its worker
 answers it for a device that may read the session's receipts, as it answers a close made after the
 closure. A request the daemon never routed is refused as any request is, and so is a reused
 identifier that carries another request, whether the daemon finds it at the route or in a service's
-record, and whether or not copies of that request wait behind it. A close the daemon carried out with no
-route is the exception: a copy of it is told the outcome is unknown when another request has
-claimed the identifier since. That refusal is the daemon's word about the identifier and names no result, so a device that
-may not read the record is told it as it is; the change-set service's lookups of a capture, an
-apply, a revert and a materialisation are the exception, and tell such a device the outcome is
-unknown. A request whose route the daemon cannot read counts as a repeat. A repeat of a create
+record, and whether or not copies of that request wait behind it. A close, which the daemon lets
+through with no route when storage cannot record one, and a voice delegation, whose challenge gives
+its route back, are the exception: a copy of either is told as a repeat's when another request holds
+the identifier. The refusal of a reused identifier is the daemon's word about the identifier and
+names no result, so a device that may not read the record is told it as it is; the change-set
+service's lookups of a capture, an apply, a revert and a materialisation are the exception, and tell
+such a device the outcome is unknown. A request whose route the daemon cannot read counts as a repeat. A repeat of a create
 whose reservation the daemon cannot read, of an action whose record it cannot read in the attention
 store, the workflow journal, the registry's receipts of authority changes or its record of pairing
 actions, or of a rearm whose chain or grant it cannot read, is told `OUTCOME_UNKNOWN` and nothing is

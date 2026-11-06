@@ -26,11 +26,13 @@
 //! - `finish` sends each step that has no result: a step never sent is composed and sent under its
 //!   identity, and a step already sent is sent again as it was composed, so an environment that
 //!   took it answers from its receipt. A step the environment refuses without a receipt is read
-//!   against what the environment reports. At the record the step was approved against nothing was
-//!   applied. A step sent again is then composed again under a new action identity, against the
-//!   same record (an environment tells a repeat that meets a first action still running the word it
-//!   tells one whose first attempt ended without recording what it did, so the two are not told
-//!   apart, and at most one action of a step applies), except that a refusal with
+//!   against what the environment reports, except after an `INVALID_ARGUMENT` refusal, which the
+//!   environment decides against the request itself: that is final, whatever the environment reports
+//!   or can read, and the step is refused with it. At the record the step was approved against
+//!   nothing was applied. A step sent again is then composed again under a new action identity,
+//!   against the same record (an environment tells a repeat that meets a first action still running
+//!   the word it tells one whose first attempt ended without recording what it did, so the two are
+//!   not told apart, and at most one action of a step applies), except that a refusal with
 //!   `RESOURCE_UNAVAILABLE`, which says the environment dispatched nothing, leaves the step sent
 //!   for the next `finish` to send the same action again. A step composed now is refused for what
 //!   the environment refused it for, unless the environment could not write, answer or finish it,
@@ -46,7 +48,7 @@
 //!   `RESOURCE_UNAVAILABLE` leaves it sent. At a record that is neither the one the step was
 //!   approved against nor the one that shows it taken, such as another group or a later revision,
 //!   the step can never apply and is refused with `DRAFT_CONFLICT`, whatever the environment
-//!   refused it for but `INVALID_ARGUMENT`, which is final at any record.
+//!   refused it for.
 //!   An environment that reports no record takes no step, and what it refuses a step for says
 //!   nothing of an earlier action of that step, which it may have taken: the first action sent for
 //!   a step that the environment refuses in its definite word is refused with
