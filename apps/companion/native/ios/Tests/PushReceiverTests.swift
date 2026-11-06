@@ -192,9 +192,9 @@ final class ChallengeAnswererTests: XCTestCase {
     }
 
     /// KR-REQ-16.06, the receiver's side of returning a signed challenge: the answer the signer
-    /// returns is posted to the gateway at the address the decision gave, and the pending
-    /// registration it answers moves to answered. Not shown here: what the signature binds (token
-    /// hash, registration, gateway origin and expiry), which is the Rust half's cases.
+    /// returns is posted to the gateway, to the address and with the body the signer gave, and the
+    /// pending registration it answers moves to answered. Not shown here: what the signature binds
+    /// (token hash, registration, gateway origin and expiry), which is the Rust half's cases.
     func testTheAnswerIsPostedToTheAddressTheDecisionGaveAndTheRecordSaysItWasTaken() throws {
         let record = try pending()
         let gateway = Gateway(.status(200))
