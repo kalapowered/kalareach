@@ -213,11 +213,15 @@ impl Scene {
     /// What native code's statistics say the media carried, and the news that audio was played out,
     /// once the call runs; the counters grow while `grows` says so and stand still otherwise.
     /// Returns the task that moves them.
-    async fn carry_audio_once_the_call_runs(&self, grows: bool) -> tokio::task::JoinHandle<()> {
+    async fn carry_audio_once_the_call_runs(
+        &self,
+        grows: bool,
+        from: u64,
+    ) -> tokio::task::JoinHandle<()> {
         self.call_runs().await;
         let platform = Arc::clone(&self.platform);
         platform.tell(CallEvent::Playout);
-        let mut counted = 100_u64;
+        let mut counted = from;
         tokio::spawn(async move {
             loop {
                 platform.carry(Media {
@@ -359,7 +363,7 @@ async fn a_call_that_carries_audio_is_followed_through_the_loss_of_the_voice_ser
             &mut report,
         ),
         scene.approve(invitation),
-        scene.carry_audio_once_the_call_runs(true),
+        scene.carry_audio_once_the_call_runs(true, 100),
         scene.take_the_service_away_once_the_figure_is_read(),
     );
     moving.abort();
@@ -404,7 +408,7 @@ async fn audio_that_does_not_move_fails_the_checks_and_audio_nobody_counted_is_n
             &mut report,
         ),
         scene.approve(invitation),
-        scene.carry_audio_once_the_call_runs(false),
+        scene.carry_audio_once_the_call_runs(false, 100),
         scene.take_the_service_away_once_the_figure_is_read(),
     );
     moving.abort();
@@ -418,6 +422,42 @@ async fn audio_that_does_not_move_fails_the_checks_and_audio_nobody_counted_is_n
         ["the media stays connected with the service gone"],
         "{:#?}",
         failed(&checks)
+    );
+    scene.host.stop().await;
+
+    // Counters below their floors that do not move: no direction carried audio, and the media does
+    // not stay connected.
+    let scene = self::scene().await;
+    let (text, invitation) = scene.invitation().await;
+    let mut report = scene.reporting();
+    let run = scene.harness_for(&text, Mode::Outage);
+    let (checks, (), moving, ()) = tokio::join!(
+        call_check(
+            scene.companion.app.handle(),
+            &*scene.platform,
+            &run,
+            &mut report,
+        ),
+        scene.approve(invitation),
+        scene.carry_audio_once_the_call_runs(false, 10),
+        scene.take_the_service_away_once_the_figure_is_read(),
+    );
+    moving.abort();
+    let below: Vec<&str> = checks
+        .iter()
+        .filter(|check| check.measured && !check.ok)
+        .map(|check| check.name)
+        .collect();
+    assert_eq!(
+        below,
+        [
+            "audio reaches the call from the peer",
+            "audio leaves the call for the peer",
+            "the call takes audio to the speaker side",
+            "the media stays connected with the service gone",
+        ],
+        "{:#?}",
+        checks.iter().map(|check| check.line()).collect::<Vec<_>>()
     );
     scene.host.stop().await;
 
