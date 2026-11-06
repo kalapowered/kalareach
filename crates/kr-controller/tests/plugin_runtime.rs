@@ -548,25 +548,33 @@ fn looks_in_words(looks: &[(Duration, String)]) -> String {
     format!("; the looks that differed, by the seconds since the wait began: {shown}")
 }
 
+/// One look at the workers' reports of components.
+struct Look {
+    /// What the workers report, one entry to a binding whose package ships a component.
+    reports: Vec<(
+        kr_protocol::ids::BrokerBindingId,
+        kr_protocol::admission::ComponentReport,
+    )>,
+    /// The workers that gave those reports.
+    workers: Vec<SessionId>,
+    /// Whether the controller counted a current report from every worker. Where it did not, the
+    /// reports may be the last ones accepted, which say nothing of where a component stands now.
+    counted: bool,
+}
+
 /// What the workers' reports of components say, one binding to a phrase, for a wait that ran out:
 /// whether the binding is `first` (otherwise it is named by the end of its identifier), its state
-/// and its reason, and whether the look that gave them was answered by every worker in time (a
-/// look that was not shows the reports last accepted, which say nothing of the worker now).
+/// and its reason, and what `counting` says of how current they are.
 fn reports_in_words(
     reports: &[(
         kr_protocol::ids::BrokerBindingId,
         kr_protocol::admission::ComponentReport,
     )],
     first: kr_protocol::ids::BrokerBindingId,
-    answered: bool,
+    counting: &str,
 ) -> String {
-    let answer = if answered {
-        "every worker answered the look"
-    } else {
-        "a worker did not answer the look in time, so these are the reports last accepted"
-    };
     if reports.is_empty() {
-        return format!("no binding ({answer})");
+        return format!("no binding ({counting})");
     }
     let words = reports
         .iter()
@@ -588,7 +596,7 @@ fn reports_in_words(
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("{words} ({answer})")
+    format!("{words} ({counting})")
 }
 
 /// A person at a session's terminal: an attachment that holds the input lease and types.
@@ -1192,8 +1200,8 @@ impl World {
     }
 
     /// Every binding whose package ships a component, as the workers report it after each has
-    /// been asked again, or nothing when a worker did not answer in time and the reports are the
-    /// last ones accepted.
+    /// been asked again, or nothing when the controller could not count a current report from
+    /// every worker and the reports are the last ones accepted.
     async fn reported_fresh(
         &self,
     ) -> Option<
@@ -1202,14 +1210,8 @@ impl World {
             kr_protocol::admission::ComponentReport,
         )>,
     > {
-        let controller = self.controller();
-        controller.refresh_admissions().await.then(|| {
-            controller
-                .reported_components()
-                .into_iter()
-                .map(|(_, binding_id, report)| (binding_id, report))
-                .collect()
-        })
+        let look = self.looked().await;
+        look.counted.then_some(look.reports)
     }
 
     /// Every binding whose package ships a component, as the workers last reported it after each
@@ -1220,28 +1222,55 @@ impl World {
         kr_protocol::ids::BrokerBindingId,
         kr_protocol::admission::ComponentReport,
     )> {
-        self.looked().await.1
+        self.looked().await.reports
     }
 
-    /// [`Self::reported`], and whether every worker answered the asking in time: where one did not,
-    /// the reports are the last ones accepted and say nothing of where its components stand now.
-    async fn looked(
-        &self,
-    ) -> (
-        bool,
-        Vec<(
-            kr_protocol::ids::BrokerBindingId,
-            kr_protocol::admission::ComponentReport,
-        )>,
-    ) {
+    /// The workers' reports after each has been asked again, and whether the controller counted a
+    /// current one from every worker.
+    async fn looked(&self) -> Look {
         let controller = self.controller();
-        let answered = controller.refresh_admissions().await;
-        let reports = controller
-            .reported_components()
-            .into_iter()
-            .map(|(_, binding_id, report)| (binding_id, report))
-            .collect();
-        (answered, reports)
+        let counted = controller.refresh_admissions().await;
+        let mut reports = Vec::new();
+        let mut workers = Vec::new();
+        for (session_id, binding_id, report) in controller.reported_components() {
+            reports.push((binding_id, report));
+            if !workers.contains(&session_id) {
+                workers.push(session_id);
+            }
+        }
+        Look {
+            reports,
+            workers,
+            counted,
+        }
+    }
+
+    /// What a look says of how current its reports are. Where the controller could not count a
+    /// current report from every worker, it also says which workers still have a round out (one
+    /// that has not answered) and what the catalogue noted, which separates a worker that did not
+    /// answer from a view of the reports that the controller did not refresh.
+    async fn counting_in_words(&self, look: &Look) -> String {
+        if look.counted {
+            return "the controller counted a current report from every worker".to_owned();
+        }
+        let controller = self.controller();
+        let out = look
+            .workers
+            .iter()
+            .filter(|worker| controller.admission_round_out(**worker))
+            .count();
+        let notes = controller.catalogue_warnings().await;
+        format!(
+            "the controller could not count a current report from every worker, so these may be \
+             the reports last accepted; {out} of {} workers have a round still out; the \
+             catalogue's notes: {}",
+            look.workers.len(),
+            if notes.is_empty() {
+                "none".to_owned()
+            } else {
+                notes.join(" | ")
+            }
+        )
     }
 
     /// The worker of a session, as the daemon's registry records it, for a daemon this test does
@@ -1692,12 +1721,19 @@ async fn a_plugin_runtime_that_ends_with_a_registration_unanswered_takes_no_work
         PATIENCE,
         "the second binding's registration to be sent and left unanswered",
         || async {
-            let (answered, reports) = world.looked().await;
-            reports
+            let look = world.looked().await;
+            match look
+                .reports
                 .iter()
                 .find(|(binding, report)| *binding != first_binding && registering(report))
-                .map(|(binding, _)| *binding)
-                .ok_or_else(|| reports_in_words(&reports, first_binding, answered))
+            {
+                Some((binding, _)) => Ok(*binding),
+                None => Err(reports_in_words(
+                    &look.reports,
+                    first_binding,
+                    &world.counting_in_words(&look).await,
+                )),
+            }
         },
     )
     .await;
