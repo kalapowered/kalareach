@@ -548,9 +548,9 @@ fn listed_state(
 }
 
 /// KR-REQ-09.17, the part about an expiry-dependent read deciding on the continuous deadline and
-/// not on UTC alone: the grant list says a voice grant has ended when the host has found it ended on
-/// the continuous clock, although the wall clock stands before its expiry, as the voice reads do.
-/// The control: before the clock runs, the list says it is active.
+/// not on UTC alone: the grant list says a voice grant has ended when the continuous clock has
+/// passed its deadline, although the wall clock stands before its expiry, and the voice read agrees
+/// with it. The control: before the clock runs, the list says it is active.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_grant_list_says_a_voice_grant_ended_that_the_continuous_clock_ended() {
     use kr_protocol::sharing::GrantState;
@@ -576,16 +576,10 @@ async fn the_grant_list_says_a_voice_grant_ended_that_the_continuous_clock_ended
     assert_eq!(listed(), Some(GrantState::Active));
 
     // The continuous clock runs past the grant's end and the wall clock stands still, as it does
-    // when it is wound back by what has passed. The voice read finds the grant ended.
+    // when it is wound back by what has passed. Nothing has asked about the grant since, so the
+    // list is the first to find it ended.
     continuous.advance(std::time::Duration::from_secs(61));
     assert_eq!(wall.load(Ordering::SeqCst), now);
-    assert!(
-        authority
-            .standing_voice_grant(device.device_id)
-            .expect("the store answers")
-            .is_none(),
-        "the voice read found the grant ended"
-    );
     assert!(
         controller.settled_utc_now() < now + 60_000,
         "the host's reading of UTC is still before the grant's expiry, so only the continuous \
@@ -594,7 +588,14 @@ async fn the_grant_list_says_a_voice_grant_ended_that_the_continuous_clock_ended
     assert_eq!(
         listed(),
         Some(GrantState::Expired),
-        "the list says what the host has found, and not what the wall clock alone would say"
+        "the list says what the continuous deadline says, and not what the wall clock alone would"
+    );
+    assert!(
+        authority
+            .standing_voice_grant(device.device_id)
+            .expect("the store answers")
+            .is_none(),
+        "the voice read agrees with the list"
     );
 
     // It stays ended when the wall clock reads past the expiry and is wound back again.
