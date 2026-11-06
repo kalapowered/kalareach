@@ -3558,15 +3558,17 @@ store, the workflow journal, the project journal, the change-set store, the tran
 registry's receipts of authority changes and voice changes, its record of device key declarations
 or its record of pairing actions, or of a rearm whose chain or grant it cannot read, is told
 `OUTCOME_UNKNOWN` and nothing is performed: a record that cannot be read is not one that is absent.
-A record that is read and cannot be decoded is told the same, and so is a workflow record that
-makes no sense: a row that says two things about how the action ended, a refusal under a code this
-build does not know, a run record under a method that starts no run, or the record of a run the
-journal does not hold. Where the daemon cannot read such a record it cannot tell a first action
-from a repeat, and tells both the same. That holds as well where the door found no record and the
-store then fails to read it at the point the action is performed. A create asked again whose worker
-has gone, and whose closure cannot be read or is not recorded, is told `OUTCOME_UNKNOWN` once its
-reservation shows that a worker was asked for. A reservation that shows nothing was launched, or
-that the launch produced no worker, is refused as ever.
+A result that is read and cannot be decoded is told the same in the project, change-set, transfer,
+workflow and voice records, and so is a workflow record that makes no sense: a row that says two
+things about how the action ended, a refusal under a code this build does not know, a run record
+under a method that starts no run, or the record of a run the journal does not hold. Where the
+daemon cannot read such a record it cannot tell a first action from a repeat, and tells both the
+same. That holds as well in the attention, project, change-set and transfer stores where the door
+found no record and the store then fails to read it at the point the action is performed. A create
+asked again is told `OUTCOME_UNKNOWN` when its worker is known and cannot be reached, when its
+closure cannot be read, and when its worker has gone with no closure recorded and its reservation
+shows that a worker was asked for or may still be asked for. A reservation that shows the launch
+produced no worker is refused as ever, unless the closure cannot be read.
 The services behind the door check the registration again where they write, and a copy of an
 action that meets a fence owed there is refused in their words. A service that answers a copy of an
 action from its own record while it carries the action out, because the first copy finished
