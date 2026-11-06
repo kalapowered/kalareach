@@ -36,6 +36,14 @@ fn the_reader_counts_what_the_host_put_into_its_terminal_as_input_it_has_not_tak
     shellpkg::bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(FISH);
 }
 
+/// KR-REQ-08.49: the host's answers alone in the terminal, with no key behind them, are input the
+/// reader has not taken.
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn the_reader_counts_the_hosts_answers_alone_as_input_it_has_not_taken() {
+    shellpkg::three_answers_alone_in_the_terminal_are_input_the_fish_reader_has_not_taken();
+}
+
 /// KR-REQ-08.48: the host's answers to a program's questions, written into the terminal in the
 /// middle of what a person types, leave the keys whole and in order.
 #[test]
