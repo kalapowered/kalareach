@@ -65,7 +65,8 @@ tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "p
 windows-sys = { workspace = true, features = ["Win32_System_Diagnostics_Debug", "Win32_System_Memory"] }
 
 # The workspace forbids unsafe code, which a launcher that creates and starts a process cannot
-# honour. This crate denies it instead and allows it in the launcher's Windows module alone.
+# honour. This crate denies it instead and allows it in the launcher's Windows module and in the
+# Windows test cases that call the system's own interfaces.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"

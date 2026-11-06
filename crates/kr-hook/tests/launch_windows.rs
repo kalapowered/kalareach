@@ -1549,11 +1549,26 @@ mod memory {
     /// How much of a region is read at once.
     const CHUNK: usize = 1 << 20;
 
-    /// Whether any of `needles` is in the committed, readable memory of process `pid`.
+    /// What a reading of a process's memory found.
+    pub struct Scan {
+        /// For each needle, whether it is in the committed, readable memory that was read.
+        pub found: Vec<bool>,
+        /// The bytes of committed, readable regions that a read did not return. A region of a
+        /// running process can be released between the query that describes it and the read of it,
+        /// so this is reported and not refused: what shows the reading reached the memory that
+        /// matters is a needle the process is known to hold.
+        pub unread: usize,
+    }
+
+    /// Reads the committed, readable memory of process `pid` and says which of `needles` it holds.
     ///
     /// A needle that straddles two reads is found, because the end of each read is kept for the
-    /// next.
-    pub fn holds(pid: u32, needles: &[Vec<u8>]) -> Result<bool, String> {
+    /// next. The reading ends when the system says there is no region beyond the last one; any
+    /// other answer is an error.
+    pub fn scan(pid: u32, needles: &[Vec<u8>]) -> Result<Scan, String> {
+        /// The system's answer to a query beyond the last region of the address space.
+        const BEYOND_THE_ADDRESS_SPACE: i32 = 87;
+
         let longest = needles.iter().map(Vec::len).max().unwrap_or(1);
         // SAFETY: the call takes plain integers and returns a handle or null, which is checked.
         let process = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
@@ -1563,9 +1578,10 @@ mod memory {
                 std::io::Error::last_os_error()
             ));
         }
-        let mut found = false;
+        let mut found = vec![false; needles.len()];
+        let mut unread = 0_usize;
         let mut address = 0_usize;
-        'regions: loop {
+        loop {
             // SAFETY: an all-zero description is a valid value for this plain structure.
             let mut region: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
             // SAFETY: the handle is open for the call, and the structure is this function's own
@@ -1579,6 +1595,14 @@ mod memory {
                 )
             };
             if described == 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(BEYOND_THE_ADDRESS_SPACE) {
+                    // SAFETY: the handle was opened above and is closed once.
+                    unsafe { CloseHandle(process) };
+                    return Err(format!(
+                        "process {pid}: the region at {address:#x} is not described: {error}"
+                    ));
+                }
                 break;
             }
             let base = region.BaseAddress as usize;
@@ -1603,17 +1627,19 @@ mod memory {
                     };
                     if ok != 0 && read > 0 {
                         buffer.truncate(read);
+                        unread += want - read;
                         kept.extend_from_slice(&buffer);
-                        if needles.iter().any(|needle| {
-                            kept.windows(needle.len())
-                                .any(|window| window == needle.as_slice())
-                        }) {
-                            found = true;
-                            break 'regions;
+                        for (needle, seen) in needles.iter().zip(&mut found) {
+                            if !*seen {
+                                *seen = kept
+                                    .windows(needle.len())
+                                    .any(|window| window == needle.as_slice());
+                            }
                         }
                         let from = kept.len().saturating_sub(longest - 1);
                         kept.drain(..from);
                     } else {
+                        unread += want;
                         kept.clear();
                     }
                     offset += want;
@@ -1627,7 +1653,7 @@ mod memory {
         }
         // SAFETY: the handle was opened above and is closed once.
         unsafe { CloseHandle(process) };
-        Ok(found)
+        Ok(Scan { found, unread })
     }
 }
 
@@ -1651,8 +1677,10 @@ exit /b 0\r\n";
 /// the kernel says the program runs from and the program's own process identity, and not the
 /// launcher's. The program, a copy of `cmd.exe` running a batch file, writes its whole environment
 /// and its command line, and the case looks for the credential's text, as ASCII and as UTF-16, in
-/// both and in the committed memory of the program's process. The control for the memory reading is
-/// this test process, which read the credential file and so holds it.
+/// both and in the committed memory of the program's process. The controls for the memory reading are
+/// this test process, which read the credential file and so holds it, and the program's own
+/// environment block, which its memory must be shown to hold before the absence of the credential
+/// counts.
 #[test]
 fn kr_req_11_23_a_launch_is_bound_to_the_program_it_created_and_the_credential_is_in_none_of_it() {
     let shell = Shell::new();
@@ -1704,12 +1732,16 @@ fn kr_req_11_23_a_launch_is_bound_to_the_program_it_created_and_the_credential_i
     .expect("the program's file has an id");
     let recorded = Path::new(&profile.binary.resolved_path);
     assert_eq!(
+        recorded, shell.executable,
+        "the handle's executable is the one the shell resolved"
+    );
+    assert_eq!(
         kr_worker::windows::file::object_of(
             &std::fs::File::open(recorded).expect("the recorded path opens")
         )
         .expect("the recorded file has an id"),
         image,
-        "the handle's executable is the file the program runs from"
+        "and it is the file the program runs from"
     );
     assert_eq!(
         profile.binary.digest,
@@ -1744,26 +1776,40 @@ fn kr_req_11_23_a_launch_is_bound_to_the_program_it_created_and_the_credential_i
             "the credential is in the program's {what}"
         );
     }
+    let wide = |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+    // The program's own environment block is in its memory as UTF-16 text, and `REPORT` is in it
+    // because the launch put it there. A reading of the program that finds this has reached the
+    // memory the credential would be in, which a reading that read nothing would not.
+    let held_by_the_program = wide(&format!("REPORT={}", shell.reports.join("bound").display()));
     let needles: Vec<Vec<u8>> = vec![
         credential.as_bytes().to_vec(),
-        credential
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect(),
+        wide(&credential),
+        held_by_the_program,
     ];
+    let this_process = memory::scan(std::process::id(), &needles).expect("this process is read");
     assert!(
-        memory::holds(std::process::id(), &needles).expect("this process is read"),
+        this_process.found[0] && this_process.found[1],
         "the control: this process read the credential file and holds it, and the reading finds it"
     );
+    let the_program = memory::scan(program, &needles).expect("the program's process is read");
     assert!(
-        !memory::holds(program, &needles).expect("the program's process is read"),
+        the_program.found[2],
+        "the reading of the program's memory reaches its environment block ({} bytes of committed \
+         memory were not returned)",
+        the_program.unread
+    );
+    assert!(
+        !the_program.found[0] && !the_program.found[1],
         "the credential is in the memory of the program the launcher created"
     );
+    let launcher_holds =
+        memory::scan(launcher.id(), &needles).map(|scan| scan.found[0] || scan.found[1]);
     eprintln!(
         "the credential is in this process, and in none of the program's environment, command line \
-         or memory; the launcher (process {}) holds it in memory: {:?}",
-        launcher.id(),
-        memory::holds(launcher.id(), &needles)
+         or memory (its environment block was read; {} bytes of committed memory were not \
+         returned); the launcher (process {}) holds it in memory: {launcher_holds:?}",
+        the_program.unread,
+        launcher.id()
     );
 }
 
