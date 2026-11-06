@@ -4,9 +4,10 @@
 //! of the Windows Subsystem for Linux and an `ssh` client each send whatever the system they run
 //! on makes them send, so those are recorded: `crates/kr-cli/tests/conpty_sources_windows.rs` runs
 //! each in a pseudo-console on a Windows machine and writes every read of the pseudo-console's
-//! output pipe into `tests/conpty_sources/<source>.capture`, with the build of Windows it was
-//! made on. This file feeds each recording, read by read as it came, to the engine of the owned
-//! ConPTY backend, which is what the worker holds for a session whose program is that source.
+//! output pipe into a file, with the build of Windows it was made on; the files kept here as
+//! `tests/conpty_sources/<source>.capture` are those. This file feeds each recording, read by read
+//! as it came, to the engine of the owned ConPTY backend, which is what the worker holds for a
+//! session whose program is that source.
 //!
 //! Nothing here needs Windows: the recording is bytes, and the rule is about a stream of them.
 
@@ -281,13 +282,20 @@ fn assert_the_boundary_holds(capture: &Capture) {
     );
 }
 
-/// KR-REQ-08.55: the requests and resets for mode 9001 that a program, a nested pseudo-console,
-/// `wsl.exe` and `ssh.exe` really send into the pseudo-console they run in do not cross the
-/// boundary: none is forwarded to a client, none is listed in a snapshot, and the worker's record
-/// of the backend's input encoding is what the last of them said, replayed as the reads came and a
-/// byte at a time.
+/// KR-REQ-08.55: every sequence for mode 9001 in the recordings of a program, a nested
+/// pseudo-console, `wsl.exe` and `ssh.exe` stops at the engine's boundary. Each recording is replayed
+/// as the reads came and a byte at a time: no request or reset for mode 9001 is forwarded to a
+/// client, none is listed in a snapshot, the worker's record of the backend's input encoding is
+/// what the last of them said after each read, and what the source printed is forwarded.
 ///
-/// The recordings were made on the build of Windows each names, one run of each source. Not shown
+/// What the recordings hold, on the build each names (Windows build 26100): one request for
+/// mode 9001 first and one reset last, which are the outer pseudo-console's own, and nothing
+/// else for that mode. A request or reset a source makes inside its own console, a nested
+/// pseudo-console's or the remote console's, does not reach the outer pipe on that build. So the
+/// replay shows the engine stopping the pseudo-console's own pair, whole and a byte at a time, and
+/// it cannot show a source's own request or reset crossing, because none arrives. The recorder's
+/// pseudo-console is the terminal library's, opened with the flags that library sets (inherit the
+/// cursor, the resize quirk, win32 input mode); the worker opens its own with none. Not shown
 /// here: what the outer console does to its own mode when an attachment ends, and a person's
 /// terminal reading the stream.
 #[test]
