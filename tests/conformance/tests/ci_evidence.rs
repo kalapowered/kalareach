@@ -852,3 +852,29 @@ fn the_linux_runs_of_the_workspace_tests_require_a_user_service_manager() {
          own environment"
     );
 }
+
+/// The report builds every suite's test programs in turn into one directory, with no build cache,
+/// and the debug information is the greater part of what that directory holds. A run of the
+/// Windows job that built with it filled the drive near the end, and the last two suites were
+/// reported as not built. Each job of the conformance workflow, like the landing workflow, builds
+/// without it.
+#[test]
+fn every_job_of_the_conformance_workflow_builds_without_debug_information() {
+    let report = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
+        .expect("the conformance workflow");
+    for name in ["linux", "macos", "windows"] {
+        // Among the job's own keys, in its environment ahead of its steps, so that every step that
+        // builds has it.
+        let keys = header(&job(&report, name));
+        for variable in [
+            "CARGO_PROFILE_DEV_DEBUG: \"0\"",
+            "CARGO_PROFILE_TEST_DEBUG: \"0\"",
+        ] {
+            assert!(
+                keys.lines().any(|line| line.trim() == variable),
+                "the {name} job of the conformance workflow does not set {variable} in its own \
+                 environment"
+            );
+        }
+    }
+}
