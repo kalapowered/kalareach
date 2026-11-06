@@ -63,14 +63,6 @@ fn system32(program: &str) -> PathBuf {
         .join(program)
 }
 
-/// The system clock in milliseconds since the epoch, the scale a closure's time is on.
-fn now_ms() -> u64 {
-    let elapsed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("the clock is after the epoch");
-    u64::try_from(elapsed.as_millis()).expect("a time in milliseconds")
-}
-
 /// Where the first half leaves what the second reads: in the account's own temporary directory,
 /// which a sign-out keeps.
 fn record_path() -> PathBuf {
@@ -270,7 +262,7 @@ async fn a_desktop_bound_session_is_made_and_the_account_signed_out() {
         "root": root,
         "task": definition.name,
         "tree": host.tree.root(),
-        "signing_out_at_ms": now_ms(),
+        "signing_out_at_ms": kr_ipc::now_ms().get(),
     });
     std::fs::write(
         record_path(),
@@ -416,7 +408,8 @@ impl Drop for Reopened {
 /// as a crash of the worker, recorded after the sign-out began. A session made in this login is
 /// the control: it is bound to a different login than the old one, the platform reads it as
 /// present, and the old one still as ended. The control session is closed and its processes shown
-/// ended before the first half's task and tree are removed.
+/// ended before the first half's task is deleted and its tree is removed, as far as the system lets
+/// this process remove it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = follows_a_sign_out!()]
 async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost() {
@@ -463,6 +456,7 @@ async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost(
 
     // A daemon on the state the first half left, as the next sign-in's would be.
     let tree = PathBuf::from(record["tree"].as_str().expect("the first half's tree"));
+    let daemon_started_at = kr_ipc::now_ms().get();
     let daemon = Reopened::start(tree.clone()).await;
     let (status, document) = daemon.json(&["attach", &session_id.to_string()]).await;
     assert_eq!(
@@ -486,10 +480,18 @@ async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost(
         closed_at >= signing_out_at,
         "the closure ({closed_at}) was recorded before the sign-out began ({signing_out_at}): {document}"
     );
+    // Said, and not asserted: a closure that was written before the daemon of this sign-in started
+    // is the worker's own; one written after it is the daemon's reading of the login.
     eprintln!(
         "after the sign-out: session {session_id} is closed with {} at {closed_at} ms, the sign-out \
-         having begun at {signing_out_at} ms",
-        document["closure"]["reason"]
+         having begun at {signing_out_at} ms and this sign-in's daemon at {daemon_started_at} ms \
+         (recorded {} the daemon started)",
+        document["closure"]["reason"],
+        if closed_at >= daemon_started_at {
+            "after"
+        } else {
+            "before"
+        }
     );
 
     // The control: a session made in this login is bound to this login, which the platform reads as
@@ -562,8 +564,9 @@ async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost(
         .expect("schtasks runs");
     assert!(removed.success(), "the entry {name} is removed: {removed}");
     // The tree is in the account's own temporary directory, which the run removes with the
-    // account's profile. A file of it that the daemon of this process still holds for a moment
-    // after it is dropped keeps it until then, and is said here and not refused.
+    // account's profile. A file of it that the daemon of this process still holds, which the
+    // aborted tasks of the daemon may do until this process ends, keeps it until then, and is said
+    // here and not refused.
     if let Err(error) = std::fs::remove_dir_all(&tree) {
         eprintln!("{} is not removed yet: {error}", tree.display());
     }
