@@ -118,8 +118,10 @@ fn mode_reports_say_what_the_profile_actually_does() {
 /// change in the delta it serves and in a snapshot, and keeps it through a soft reset. The control
 /// is a pair of modes the profile has no capability for (grapheme clustering and in-band resize):
 /// an application can set them, and they stay unrecognised, unrecorded and untold. Not shown here:
-/// what a client's renderer does with a mode it is told, a Kitty keyboard flag (which is not a mode
-/// report), or any query other than a mode report.
+/// what a client's renderer, or the host's input encoding, does with a mode it is told (only the
+/// paste framing of 2004 is read back); that the capability and the tracked mode are one list
+/// (each mode is in both); a Kitty keyboard flag (which is not a mode report); or any query other
+/// than a mode report.
 #[test]
 fn a_feature_the_profile_has_a_capability_for_is_reported_and_honoured() {
     /// Where a client's screen stands: the cursor and generation it would name as its base.
