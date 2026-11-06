@@ -171,6 +171,13 @@ final class LockScreenControlsTests: XCTestCase {
         let hold = permitted()
         let handler = hold.surface.handler
 
+        // A play or a toggle that reaches the handler by another way does nothing while the
+        // microphone is on.
+        handler?(.play)
+        handler?(.togglePlayPause)
+        hold.settle()
+        XCTAssertFalse(hold.control.isMutedByPerson, "play and toggle change nothing")
+
         XCTAssertTrue(hold.surface.deliver(.pause))
         hold.settle()
         XCTAssertTrue(hold.control.isMutedByPerson)
