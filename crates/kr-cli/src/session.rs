@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::attach::{Attaching, TerminalInput};
 use crate::bridge::link::Link;
 use kr_client::error::{HostWord, refusal};
+use kr_client::retry::{Attempts, Failure, Recovery, RequestClass};
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_protocol::attachment::ViewportPosition;
@@ -734,8 +735,8 @@ impl PointerReports {
 /// wait longer than this would be a keystroke held for a report the person never made.
 const POINTER_DEADLINE: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// Waits until a held report's own deadline, or for ever when nothing is being held.
-async fn pointer_expiry(until: Option<tokio::time::Instant>) {
+/// Waits until `until`, or for ever when there is nothing to wait for.
+async fn wait_until(until: Option<tokio::time::Instant>) {
     match until {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
@@ -1311,21 +1312,63 @@ enum Heard {
 /// is never a second new stream to mistake for it. The sequence is read before anything else about
 /// a notification, which is what lets a first notification that cannot be decoded still open the
 /// new stream.
+///
+/// A session that refuses a new subscription for now has changed nothing, and the subscription is
+/// a read, so it is asked for again by the shared retry policy: after the pause the policy gives,
+/// and for as many times as it gives. The pause is a timer and not the session's next word,
+/// because a session that has sent a resynchronisation marker says nothing more until it is asked
+/// for the screen again.
 #[derive(Debug, Default)]
 struct Subscriptions {
     /// A new subscription has been asked for, and its stream has not begun.
     replacing: bool,
     /// The stream's first delivery other than a gap has not arrived.
     opening: bool,
+    /// What the retry policy has left for the subscription being asked for.
+    attempts: Attempts,
+    /// When the subscription the session refused for now is asked for again.
+    retry_at: Option<tokio::time::Instant>,
 }
 
 impl Subscriptions {
     /// The first subscription, whose first delivery has not arrived.
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             replacing: false,
             opening: true,
+            attempts: Attempts::new(),
+            retry_at: None,
         }
+    }
+
+    /// The session refused the new subscription under `code`, for now. Says whether it is asked for
+    /// again, which the policy decides; when it is not, the attachment ends as it does when the
+    /// session refuses in its definite word.
+    fn refused_for_now(&mut self, code: ErrorCode) -> bool {
+        let decision = self
+            .attempts
+            .decide(Failure::new(code), RequestClass::IdempotentRead);
+        let Recovery::Retry { delay } = decision.recovery else {
+            return false;
+        };
+        self.retry_at = Some(tokio::time::Instant::now() + delay);
+        true
+    }
+
+    /// The session took the new subscription.
+    fn taken(&mut self) {
+        self.attempts = Attempts::new();
+        self.retry_at = None;
+    }
+
+    /// When the subscription the session refused for now is asked for again, if it is owed.
+    const fn retry_at(&self) -> Option<tokio::time::Instant> {
+        self.retry_at
+    }
+
+    /// The subscription the session refused for now is being asked for, or is no longer wanted.
+    const fn asked_again(&mut self) {
+        self.retry_at = None;
     }
 
     /// Asks for a new subscription, unless one is already being asked for; says which.
@@ -2066,7 +2109,22 @@ async fn drive(
             // sent. What comes before even that is a held prefix whose moment has passed: it is
             // the person's own bytes, and a session that keeps printing must not keep them.
             biased;
-            () = pointer_expiry(pointer_deadline) => {
+            // A subscription the session refused for now is asked for again when the retry
+            // policy's pause is over, whether or not the session has said anything: a session
+            // that asked for a new subscription has nothing to say until it gets one.
+            () = wait_until(subscriptions.retry_at()) => {
+                subscriptions.asked_again();
+                if closing {
+                    continue;
+                }
+                let request_id = kr_protocol::ids::RequestId::new(next_request);
+                next_request += 1;
+                if !resubscribe(client, attaching, request_id, attachment_id).await {
+                    return AttachOutcome::Disconnected;
+                }
+                outstanding.insert(request_id, Outstanding::Resubscribe);
+            }
+            () = wait_until(pointer_deadline) => {
                 // Nothing came to finish it, so it was not a report. What was held is the
                 // person's, and it goes to the application now.
                 pointer_deadline = None;
@@ -2479,18 +2537,26 @@ async fn drive(
                             (Outstanding::Input(_), kr_protocol::envelope::Outcome::Ok(_))
                             | (Outstanding::Ignored, _) => {}
                             // The screen follows as ordinary output. A refusal because the session
-                            // is closing is answered by the closure, which is still to come; any
-                            // other means the session no longer has this attachment, which is the
-                            // end of it.
-                            (Outstanding::Resubscribe, outcome) => {
-                                if let kr_protocol::envelope::Outcome::Error(error) = outcome {
-                                    if error.code != ErrorCode::SessionClosed {
-                                        return AttachOutcome::Disconnected;
-                                    }
+                            // is closing is answered by the closure, which is still to come. A
+                            // refusal for now changed nothing: the subscription is asked for again
+                            // after the retry policy's pause, a few times at most, and the stream
+                            // being replaced goes on meanwhile. Any other refusal means the session
+                            // no longer has this attachment, which is the end of it.
+                            (Outstanding::Resubscribe, outcome) => match outcome {
+                                kr_protocol::envelope::Outcome::Ok(_) => subscriptions.taken(),
+                                kr_protocol::envelope::Outcome::Error(error)
+                                    if error.code == ErrorCode::SessionClosed =>
+                                {
                                     closing = true;
                                     window.close();
                                 }
-                            }
+                                kr_protocol::envelope::Outcome::Error(error) => {
+                                    let for_now = HostWord::of(error.code) == HostWord::Transient;
+                                    if !for_now || !subscriptions.refused_for_now(error.code) {
+                                        return AttachOutcome::Disconnected;
+                                    }
+                                }
+                            },
                         }
                     }
                     Ok(_) => {}
@@ -3254,6 +3320,31 @@ mod tests {
                     .expect("the loop reads the wire");
             }
 
+            /// The session says its view of it is no longer continuous, as the `sequence`th thing
+            /// it says: the marker a terminal answers by asking for a new subscription.
+            pub fn says_resync(&self, sequence: u64) {
+                self.answers
+                    .send(ControlFrame::Notification(Notification {
+                        stream_id: StreamId::new("session").expect("a stream"),
+                        sequence: EventSequence::new(sequence),
+                        event_type: EventType::new("session.resync").expect("an event type"),
+                        payload: ParamsValue::empty(),
+                    }))
+                    .expect("the loop reads the wire");
+            }
+
+            /// The next request the loop sends with this method, whatever else it sends first.
+            pub async fn next_request_asked(&mut self, method: Method) -> RequestId {
+                loop {
+                    let frame = self.next_frame().await;
+                    if let ControlFrame::Request(request) = frame
+                        && request.method == method.into()
+                    {
+                        return request.request_id;
+                    }
+                }
+            }
+
             /// The terminal the case changes the size of.
             pub const fn terminal(&self) -> &SizedTerminal {
                 self.sized.as_ref().expect("the case has a sized terminal")
@@ -3567,6 +3658,120 @@ mod tests {
             ),
             "a key pressed and refused by a closing session was typing lost: {outcome:?}"
         );
+    }
+
+    /// A new subscription the session refuses for now has changed nothing: the stream being replaced
+    /// goes on, and the subscription is asked for again after the pause the retry policy gives,
+    /// whether or not the session says anything meanwhile, three times at most, after which the
+    /// attachment ends. A refusal in the session's definite word, or an answer that cannot say what
+    /// became of the request, ends it at the first. The clock is stopped, so the pauses cost
+    /// nothing and the case reads the time that passed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_subscription_the_session_refuses_for_now_is_asked_for_again_after_the_policys_pause()
+    {
+        use kr_client::retry::RETRY_BACKOFF_MIN;
+        use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue};
+        use kr_protocol::error::ProtocolError;
+
+        let refusing = |code| Outcome::Error(ProtocolError::new(code, "refused by the case"));
+        let asked_of = |sent: &[ControlFrame]| {
+            sent.iter()
+                .filter(|frame| {
+                    matches!(frame, ControlFrame::Request(request)
+                        if request.method == Method::EventsSubscribe.into())
+                })
+                .count()
+        };
+
+        // Refused for now, then taken: the session says nothing in between, since a session that
+        // sent a resynchronisation marker says nothing more until it is asked for the screen.
+        let ran = wire::run_switched(true, true, |mut case| async move {
+            case.says_output(0);
+            case.says_resync(1);
+            let first = case.next_request_asked(Method::EventsSubscribe).await;
+            let refused_at = tokio::time::Instant::now();
+            case.answers_with(first, refusing(ErrorCode::ResourceUnavailable));
+            let second = case.next_request_asked(Method::EventsSubscribe).await;
+            assert_ne!(second, first, "it is another request");
+            assert!(
+                refused_at.elapsed() >= RETRY_BACKOFF_MIN,
+                "it is not asked again at once"
+            );
+            case.answers_with(second, Outcome::Ok(ParamsValue::empty()));
+            case.closes();
+        })
+        .await;
+        assert!(
+            matches!(ran.outcome, AttachOutcome::Closed { .. }),
+            "{:?}",
+            ran.outcome
+        );
+        assert_eq!(asked_of(&ran.sent), 2);
+
+        // Refused for now at every asking: three askings after the first, and the attachment ends
+        // at the refusal of the fourth. A subscription the session took gave the policy's budget
+        // back: the same count holds for the next one, after a refusal and a taking before it.
+        let ran = wire::run_switched(true, true, |mut case| async move {
+            case.says_output(0);
+            case.says_resync(1);
+            for _ in 0..4 {
+                let asked = case.next_request_asked(Method::EventsSubscribe).await;
+                case.answers_with(asked, refusing(ErrorCode::ResourceUnavailable));
+            }
+        })
+        .await;
+        assert!(
+            matches!(ran.outcome, AttachOutcome::Disconnected),
+            "{:?}",
+            ran.outcome
+        );
+        assert_eq!(asked_of(&ran.sent), 4);
+
+        let ran = wire::run_switched(true, true, |mut case| async move {
+            case.says_output(0);
+            case.says_resync(1);
+            let refused = case.next_request_asked(Method::EventsSubscribe).await;
+            case.answers_with(refused, refusing(ErrorCode::ResourceUnavailable));
+            let taken = case.next_request_asked(Method::EventsSubscribe).await;
+            case.answers_with(taken, Outcome::Ok(ParamsValue::empty()));
+            // The new stream begins, and later the session asks for a screen again.
+            case.says_output(0);
+            case.says_resync(1);
+            for _ in 0..4 {
+                let asked = case.next_request_asked(Method::EventsSubscribe).await;
+                case.answers_with(asked, refusing(ErrorCode::ResourceUnavailable));
+            }
+        })
+        .await;
+        assert!(
+            matches!(ran.outcome, AttachOutcome::Disconnected),
+            "{:?}",
+            ran.outcome
+        );
+        assert_eq!(
+            asked_of(&ran.sent),
+            6,
+            "two for the first, four for the second"
+        );
+
+        // The controls: the session's definite word, and an answer that cannot say what became of
+        // the request, end the attachment at the first.
+        for code in [ErrorCode::PermissionDenied, ErrorCode::OutcomeUnknown] {
+            let ran = wire::run_switched(true, true, |mut case| async move {
+                case.says_output(0);
+                case.says_resync(1);
+                let asked = case.next_request_asked(Method::EventsSubscribe).await;
+                case.answers_with(asked, refusing(code));
+            })
+            .await;
+            assert!(
+                matches!(ran.outcome, AttachOutcome::Disconnected),
+                "{code:?}: {:?}",
+                ran.outcome
+            );
+            assert_eq!(asked_of(&ran.sent), 1, "{code:?}");
+        }
     }
 
     /// The attach loop, on a terminal whose size changes, asks the session again about a size it did
