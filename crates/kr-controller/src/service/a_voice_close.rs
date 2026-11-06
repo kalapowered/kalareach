@@ -448,8 +448,8 @@ async fn a_close_outlives_the_connection_that_asked_for_it() {
                 receipt = Some(answered);
                 true
             }
-            // The first attempt is still running.
-            Err(error) if error.code() == ErrorCode::ResourceUnavailable => false,
+            // The first attempt is still running, and may complete the effect at any moment.
+            Err(error) if error.code() == ErrorCode::OutcomeUnknown => false,
             Err(error) => panic!("{error}"),
         }
     })
