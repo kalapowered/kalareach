@@ -77,15 +77,19 @@ impl GrantRecord {
         self.activated_at_ms.is_some()
     }
 
-    /// Where this grant stands at `now_ms`.
+    /// Where this grant stands, given whether it has run out.
+    ///
+    /// Whether it has run out is not this record's to say: it is decided on both of the grant's
+    /// deadlines and the end on record ([`GrantDirectory::lapsed`]), and the caller passes the
+    /// answer in.
     ///
     /// A proposal nobody has redeemed reads as `Pending`: it is not active, and calling it expired
     /// or revoked would be saying something untrue about why it authorises nothing.
     #[must_use]
-    pub fn state(&self, now_ms: u64) -> GrantState {
+    pub const fn state(&self, expired: bool) -> GrantState {
         if self.revoked_at_ms.is_some() {
             GrantState::Revoked
-        } else if !self.grant.expiry.is_valid_at(now_ms) {
+        } else if expired {
             // Expiry comes before pending. A proposal whose deadline has passed is finished, and
             // reporting it as still waiting for somebody would be an invitation list that never
             // shrinks.
@@ -97,12 +101,12 @@ impl GrantRecord {
         }
     }
 
-    /// The wire summary of this record.
+    /// The wire summary of this record, standing as `state` says ([`Self::state`]).
     #[must_use]
-    pub fn summary(&self, now_ms: u64) -> GrantSummary {
+    pub fn summary(&self, state: GrantState) -> GrantSummary {
         GrantSummary {
             grant: self.grant.clone(),
-            state: self.state(now_ms),
+            state,
             revoked_at_ms: Nullable(self.revoked_at_ms.map(TimestampMs::new)),
             revoked_by_parent: Nullable(self.revoked_by_parent),
             // The grant's own end. The host lowers it to the end of the recipient's pairing where

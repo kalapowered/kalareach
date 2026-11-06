@@ -521,6 +521,68 @@ async fn a_voice_grant_that_ran_out_does_not_come_back_when_the_wall_clock_is_wo
     );
 }
 
+/// KR-REQ-09.17, the part about an expiry-dependent read deciding on the continuous deadline and
+/// not on UTC alone: the grant list says a voice grant has ended when the host has found it ended on
+/// the continuous clock, although the wall clock stands before its expiry, as the voice reads do.
+/// The control: before the clock runs, the list says it is active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_grant_list_says_a_voice_grant_ended_that_the_continuous_clock_ended() {
+    use kr_protocol::sharing::{GrantListParams, GrantListResult, GrantState};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let (continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let now = wall.load(Ordering::SeqCst);
+    let device = paired(&controller, 44, None);
+    let voice = voice_grant(&controller, &device, now + 60_000);
+    let authority = authority(&controller);
+    let listed = || {
+        let listing: GrantListResult = controller
+            .grant_list(
+                controller.sharing().host_device_id(),
+                &kr_protocol::envelope::ParamsValue::from_typed(&GrantListParams {
+                    session_id: Nullable::null(),
+                    include_resolved: true,
+                })
+                .expect("encodes"),
+            )
+            .expect("the host lists its grants")
+            .to_typed()
+            .expect("a list");
+        listing
+            .grants
+            .into_iter()
+            .find(|summary| summary.grant.grant_id == voice.grant_id)
+            .map(|summary| summary.state)
+    };
+
+    // The voice read takes the grant's anchor on the continuous clock, as a call does.
+    assert!(
+        authority
+            .standing_voice_grant(device.device_id)
+            .expect("the store answers")
+            .is_some()
+    );
+    assert_eq!(listed(), Some(GrantState::Active));
+
+    // The continuous clock runs past the grant's end and the wall clock stands still, as it does
+    // when it is wound back by what has passed. The voice read finds the grant ended.
+    continuous.advance(std::time::Duration::from_secs(61));
+    assert_eq!(wall.load(Ordering::SeqCst), now);
+    assert!(
+        authority
+            .standing_voice_grant(device.device_id)
+            .expect("the store answers")
+            .is_none(),
+        "the voice read found the grant ended"
+    );
+    assert_eq!(
+        listed(),
+        Some(GrantState::Expired),
+        "the list says what the host has found, and not what the wall clock alone would say"
+    );
+}
+
 /// The ordinary grant a device was paired under is decided the same way: once it ran out, no
 /// wall clock brings it back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
