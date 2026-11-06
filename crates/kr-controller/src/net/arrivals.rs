@@ -12,35 +12,53 @@
 //! whose connection ended and whose work was dropped. It is kept in memory only. A daemon that
 //! restarts has no call before its claim, and a call before its claim has dispatched nothing.
 //!
-//! A connection reads some mutations ahead of the request it is answering, to serve the keys that
-//! follow, and holds them behind it ([`RemoteConnection::hold_ahead`]); each is entered when it is
-//! read, since it is on this host and will be carried out when its turn comes.
+//! A mutation is entered when the transport's reader has read it from the device's stream
+//! ([`kr_transport::listener::HostHandler::frame_read`]), and not when the connection's handler
+//! reaches it. It waits in the connection's queue, or is read ahead and held behind the request
+//! being answered, and is on this host either way and will be carried out when its turn comes. The
+//! entry travels with the frame, and leaves with the call or, if the frame is dropped unserved,
+//! with the frame.
 //!
-//! A mutation the host has not read from the device's stream yet has no entry: a connection that
-//! is answering a request keeps reading ahead only for the keys that follow it, and the transport
-//! queues what it has parsed before any of this sees it.
+//! A mutation the device has sent and the reader has not yet read from the stream has no entry.
 //!
 //! A close whose route cannot be recorded goes on without one, because a stop is let through when
 //! storage fails, and its work continues on a task of its own after the connection has ended. The
 //! task keeps the call's entry until it ends, so a copy of the close that arrives meanwhile finds
-//! the entry in place of the route. A copy that arrives after the work has ended finds neither,
-//! and is asked as a request the host never routed, while the route store still refuses writes and
-//! answers reads.
+//! the entry in place of the route. When the work ends, the request is kept as one that was carried
+//! out with no route ([`Arrival::settle_without_a_route`]), so a copy that arrives later still finds
+//! something to read: the last [`UNROUTED_KEPT`] such closes, in memory only. A daemon that
+//! restarts has none, and a copy of a close it carried out before the restart is asked as a
+//! request the host never routed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use kr_protocol::envelope::MutationRequest;
 use kr_protocol::ids::{ActionId, ActorId};
 use kr_protocol::scalars::Digest256;
 
 /// The request a call carries: the actor that sent it, its action identifier, and its payload.
 pub(crate) type Carried = (ActorId, ActionId, Digest256);
 
+/// The request `mutation` is, as the set of calls that have not yet claimed keeps it.
+pub(crate) fn request_of(actor_id: &ActorId, mutation: &MutationRequest) -> Option<Carried> {
+    kr_protocol::digest::mutation_digest(mutation, actor_id)
+        .ok()
+        .map(|digest| (actor_id.clone(), mutation.action_id, digest))
+}
+
+/// How many closes that were carried out with no route recorded are remembered, oldest first out.
+/// Such a close needs storage to refuse a write that a stop is let through despite, so there are
+/// few, and the bound is a ceiling for a store that fails for a long time.
+pub(crate) const UNROUTED_KEPT: usize = 256;
+
 /// The calls that have arrived and have not yet claimed the route of their action.
 #[derive(Debug, Default)]
 pub(crate) struct Arrivals {
     held: Mutex<HashMap<Carried, Vec<u64>>>,
+    /// The requests of closes whose work has ended and which have no route, newest last.
+    unrouted: Mutex<VecDeque<Carried>>,
     next: AtomicU64,
 }
 
@@ -56,13 +74,18 @@ impl Arrivals {
         }
     }
 
-    /// Whether a call other than `own` carries `request` and has not claimed its route.
+    /// Whether a call other than `own` carries `request` and has not claimed its route, or a close
+    /// of it was carried out with no route.
     pub(crate) fn another_carries(&self, request: &Carried, own: Option<&Arrival>) -> bool {
         self.held().get(request).is_some_and(|calls| {
             calls
                 .iter()
                 .any(|call| own.is_none_or(|own| own.call != *call))
-        })
+        }) || self
+            .unrouted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(request)
     }
 
     fn held(&self) -> std::sync::MutexGuard<'_, HashMap<Carried, Vec<u64>>> {
@@ -88,6 +111,22 @@ impl Arrival {
     /// Whether this entry is the one of `request`.
     pub(crate) fn carries(&self, request: &Carried) -> bool {
         self.request == *request
+    }
+
+    /// Keeps the request as one that was carried out with no route recorded, for the copies that
+    /// arrive after the work that carried it out has ended and its entry has gone.
+    pub(crate) fn settle_without_a_route(&self) {
+        let mut unrouted = self
+            .arrivals
+            .unrouted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !unrouted.contains(&self.request) {
+            unrouted.push_back(self.request.clone());
+        }
+        while unrouted.len() > UNROUTED_KEPT {
+            unrouted.pop_front();
+        }
     }
 }
 

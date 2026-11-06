@@ -804,8 +804,10 @@ let listener = kr_transport::listener::register(config, identity, &transport_key
 ```
 
 `HostHandler` is the host's half: where a paired record comes from, what principal a device acts
-under, whether pairing is open, what to do with an authorised connection, and what to do when a
-control stream ends. Everything between an incoming QUIC connection and an authorised control stream
+under, whether pairing is open, what to do with an authorised connection, what to do when a
+control stream ends, and, if it wants one, what to hold for each frame the stream's reader has read
+(`frame_read`: the hold travels with the frame and is dropped with it, so a host can account for a
+request that still waits in the connection's queue). Everything between an incoming QUIC connection and an authorised control stream
 (the handshake, the pairing surface, the keepalive, the window renewal and the revocation that
 follows a lost control stream) happens inside the call. A host that owns a qualified platform time
 adapter uses `register_with_clock` and supplies it.
@@ -825,6 +827,7 @@ makes no call and serves its local endpoint alone.
 | `pairing_surface` | `net::pairing`, over `kr-pairing`'s own state machines. Every host on the network offers it: a host with no owner yet serves exactly the first-owner ceremony, and every confirmation is checked against the owner devices the host has paired |
 | `serve` | `net::dispatch`, one authorised connection at a time |
 | `control_stream_lost` | the connection's registration is withdrawn, which is what stops its lease being renewed |
+| `frame_read` | a mutation is entered among the calls that have not yet claimed the route of their action as soon as its frame is read, and the entry rides the frame to the call that serves it, so a refusal of a copy that arrives while the original waits in the queue is told as a repeat's |
 
 **Admission atomic with registration.** The daemon reads the device record and writes the connection
 into its authority store in one critical section, taking the registry lock and then the connection

@@ -6856,57 +6856,86 @@ async fn a_close_whose_route_cannot_be_recorded_is_among_the_calls_until_its_wor
     world.serving.abort();
 }
 
-/// Two different mutations that a connection reads ahead and holds under one request identifier,
-/// which a device could send, are each among the calls that have not claimed: the entry of one is
-/// not given up for the other's, and each is handed to its own call when its turn comes.
+/// A close whose route cannot be recorded goes on, and its work ends. A copy of it that arrives
+/// after that, while the route still cannot be recorded, and is refused on this host's own account,
+/// is told the outcome is unknown: the session is closed, and the host cannot say the close was not
+/// carried out. Without a route or an entry for it, the copy was refused as a request the host had
+/// never seen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_mutations_held_ahead_under_one_request_identifier_are_each_entered() {
+async fn a_copy_of_a_close_with_no_route_that_arrives_after_its_work_has_ended_is_told_the_outcome_is_unknown()
+ {
     use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::error::ErrorCode;
     use kr_protocol::rights::ActionRight;
+    use kr_protocol::session::SessionCloseParams;
 
     use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
 
     let script = Scripted::new();
     let world = scripted::scripted(&script).await;
     let controller = &world.controller;
-    let connection = super::RemoteConnection::for_test(
-        controller,
-        paired(controller, 86, |grant| {
-            grant.actions = [ActionRight::SessionView, ActionRight::AgentPrompt]
-                .into_iter()
-                .collect();
-        }),
-    );
-    let first = device_mutation(
+    let record = paired(controller, 88, |grant| {
+        grant.actions = [ActionRight::SessionView, ActionRight::SessionClose]
+            .into_iter()
+            .collect();
+    });
+    // The window is issued to the first connection, so the second is refused for it. Both
+    // connections are the one device's.
+    let first = super::RemoteConnection::for_test(controller, record.clone());
+    let second = super::RemoteConnection::for_test(controller, record);
+    let close = device_mutation(
         &world,
-        &connection,
-        Method::AgentPromptSubmit,
-        96,
-        ParamsValue::empty(),
+        &first,
+        Method::SessionClose,
+        99,
+        ParamsValue::from_typed(&SessionCloseParams {
+            session_id: world.session_id,
+        })
+        .expect("encodes"),
     );
-    let mut second = first.clone();
-    second.action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
-    for held in [&first, &second] {
-        connection.hold_ahead(&ControlFrame::Mutation(Box::new(held.clone())));
+    rusqlite::Connection::open(controller.paths.registry_database())
+        .expect("the registry opens beside the daemon's own handle")
+        .execute_batch(
+            "CREATE TRIGGER the_route_is_not_kept BEFORE INSERT ON network_actions
+             BEGIN SELECT RAISE(ABORT, 'the registry keeps no route'); END;",
+        )
+        .expect("the registry is made to refuse the write that records a route");
+
+    let (arrived, go) = script.hold_the_next_close();
+    let mut asking = Box::pin(first.answer_now(ControlFrame::Mutation(Box::new(close.clone()))));
+    tokio::select! {
+        arrived = arrived => arrived.expect("the worker holds the close"),
+        answered = &mut asking => panic!("the close was answered before the worker took it: {answered:?}"),
     }
-    assert_eq!(
-        controller.arrivals().entered(),
-        2,
-        "both mutations are among the calls that have not claimed"
+    drop(asking);
+    go.send(()).expect("the worker goes on");
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while controller.arrivals().entered() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the close leaves the calls that have not claimed when its work has ended");
+    assert_eq!(script.closes_taken(), 1, "the worker took the close once");
+    assert!(
+        controller
+            .devices()
+            .action_route(&second.device.principal(), close.action_id)
+            .expect("the routes are readable")
+            .is_none(),
+        "the close went on without a route, and still has none"
     );
 
-    let entry = connection
-        .arrival_of(&second)
-        .expect("the second mutation has an entry");
-    assert_eq!(controller.arrivals().entered(), 2, "handed over, not made");
-    drop(entry);
-    assert_eq!(controller.arrivals().entered(), 1);
-    let entry = connection
-        .arrival_of(&first)
-        .expect("the first mutation has an entry");
-    assert_eq!(controller.arrivals().entered(), 1, "handed over, not made");
-    drop(entry);
-    assert_eq!(controller.arrivals().entered(), 0);
+    let refused = second
+        .answer_now(ControlFrame::Mutation(Box::new(close.clone())))
+        .await
+        .expect("the copy is answered");
+    let error = error_of(refused.frame());
+    assert_eq!(
+        error.code,
+        ErrorCode::OutcomeUnknown,
+        "a copy of a close that was carried out with no route: {error}"
+    );
     world.serving.abort();
 }
 

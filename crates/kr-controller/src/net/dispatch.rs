@@ -114,12 +114,6 @@ pub struct RemoteConnection {
     /// Notified when this connection's link to its worker ends, whichever way it ends.
     lost: Arc<tokio::sync::Notify>,
     windows: Arc<kr_transport::window::ActionWindowIssuer>,
-    /// The entries of the mutations the connection has read ahead of the request it is answering
-    /// and holds behind it. Each mutation is a call that has not claimed the route of its action,
-    /// and stays among such calls ([`arrivals`](super::arrivals)) until it is served, when dispatch
-    /// takes its entry over, or the connection ends. An entry is found by the request it carries,
-    /// not by the request identifier, which a device could use twice.
-    held_ahead: std::sync::Mutex<Vec<super::arrivals::Arrival>>,
 }
 
 impl std::fmt::Debug for RemoteConnection {
@@ -181,7 +175,6 @@ impl RemoteConnection {
             )),
             lost: Arc::new(tokio::sync::Notify::new()),
             windows: Arc::clone(&session.windows),
-            held_ahead: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -268,7 +261,6 @@ impl RemoteConnection {
                     &controller.clock,
                 )),
             ),
-            held_ahead: std::sync::Mutex::new(Vec::new()),
         }
     }
 
