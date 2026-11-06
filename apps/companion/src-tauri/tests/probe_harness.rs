@@ -289,6 +289,16 @@ impl Scene {
     }
 }
 
+/// The names of the checks that measured what they ask about and found it wrong; a check that could
+/// not measure is not among them.
+fn measured_failures(checks: &[companion_tauri::probe::Check]) -> Vec<&'static str> {
+    checks
+        .iter()
+        .filter(|check| check.measured && !check.ok)
+        .map(|check| check.name)
+        .collect()
+}
+
 fn failed(checks: &[companion_tauri::probe::Check]) -> Vec<String> {
     checks
         .iter()
@@ -551,11 +561,7 @@ async fn media_that_stops_when_the_service_goes_away_does_not_stay_connected() {
     moving.abort();
 
     assert_eq!(
-        failed(&checks)
-            .iter()
-            .filter_map(|line| line.strip_prefix("check="))
-            .filter_map(|line| line.split(" ok=").next())
-            .collect::<Vec<_>>(),
+        measured_failures(&checks),
         ["the media stays connected with the service gone"],
         "{:#?}",
         failed(&checks)
@@ -585,11 +591,7 @@ async fn audio_that_played_with_no_news_of_it_fails_the_figure_check() {
     moving.abort();
 
     assert_eq!(
-        failed(&checks)
-            .iter()
-            .filter_map(|line| line.strip_prefix("check="))
-            .filter_map(|line| line.split(" ok=").next())
-            .collect::<Vec<_>>(),
+        measured_failures(&checks),
         ["the first audio played out"],
         "{:#?}",
         failed(&checks)
