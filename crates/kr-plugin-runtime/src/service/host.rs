@@ -79,8 +79,8 @@ const UNBIND_DEADLINE: core::time::Duration = kr_plugin_service::client::DEFAULT
 /// A request that stops waiting at its deadline does not take its removal back, so a removal is
 /// counted from the request that queued it until it has run, and it is counted for the host: a
 /// worker that closes its connection and opens another leaves its removals behind and finds them
-/// still counted. An unbind that finds this many waiting is refused rather than queued behind them,
-/// so the removals a host leaves on the pool are bounded however many connections asked for them.
+/// still counted. An unbind that finds this many waiting does not queue another task behind them, so
+/// the removals a host leaves on the pool are bounded however many connections asked for them.
 pub const MAX_PENDING_UNBINDS: usize = 16;
 
 /// The file, in the state directory beside the compiled-code cache, that holds every registration
@@ -297,6 +297,14 @@ impl PluginHost {
     pub fn unbinding_within(mut self, deadline: core::time::Duration) -> Self {
         self.unbind_deadline = deadline;
         self
+    }
+
+    /// Returns how many of the places for unbinds the host has taken, for the tests of what an
+    /// unbind does when it finds them all taken.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn unbinds_waiting(&self) -> usize {
+        MAX_PENDING_UNBINDS.saturating_sub(self.unbinds.available_permits())
     }
 
     /// Holds the notice writers, for the tests of what a connection writes: until the returned hold
@@ -956,14 +964,21 @@ impl PluginHost {
     /// may have running, and with it the connection's cleanup, for as long. So the wait is held to
     /// the time a worker gives it. A caller that stops waiting does not take the task back: it runs
     /// when it gets a thread, removes the binding, gives the connection its place back and clears
-    /// the records, as it would for a caller that waited. The tasks the host has waiting are counted
-    /// across its connections, [`MAX_PENDING_UNBINDS`] at most, and an unbind beyond that is refused
-    /// at once.
+    /// the records, as it would for a caller that waited.
+    ///
+    /// The tasks the host has waiting are counted across its connections, [`MAX_PENDING_UNBINDS`] at
+    /// most. A request that finds them all taken waits for a place, in the time it has, as removals
+    /// that many connections ask for at once do. A request that finds none in that time does not
+    /// queue a task: it takes the binding out of the runtime and tells its thread to stop, without
+    /// waiting for the thread, and says why it did not wait. A worker takes any answer to an unbind
+    /// as the binding gone, so a binding left in the runtime would be one its worker could not
+    /// register again.
     async fn unbind(
         &self,
         binding_id: Uuid,
         served: &Arc<Served>,
     ) -> Result<ResponseBody, (String, bool)> {
+        let started = std::time::Instant::now();
         // The handle is taken first so the record can be cleared by identity afterwards: the
         // identifier may have been registered again by then, and that binding's place is not this
         // removal's to take.
@@ -972,45 +987,52 @@ impl PluginHost {
             .lock()
             .ok()
             .and_then(|held| held.live.get(&binding_id).cloned());
-        // A place among the removals this host may have waiting, held by the task until it has run
-        // and not by this request, which stops waiting at its deadline, nor by the connection,
-        // which may be over by then.
-        let Ok(waiting) = Arc::clone(&self.unbinds).try_acquire_owned() else {
-            return Err(refused(format!(
-                "this host already has the {MAX_PENDING_UNBINDS} unbinds it may have waiting"
-            )));
-        };
-        let runtime = Arc::clone(&self.runtime);
-        // Only what the task needs: it is not given the connection's writer, so a connection that is
-        // over does not stay open for the task.
         let owner = served.owner;
         let places = Arc::clone(&served.bindings);
         let registered = Arc::clone(&served.registered);
         let notices = served.notices.clone();
         let binding = BindingId::new(binding_id);
+        // A place among the removals this host may have waiting, held by the task until it has run
+        // and not by this request, which stops waiting at its deadline, nor by the connection,
+        // which may be over by then.
+        let Ok(Ok(waiting)) = tokio::time::timeout(
+            self.unbind_deadline,
+            Arc::clone(&self.unbinds).acquire_owned(),
+        )
+        .await
+        else {
+            let removed = self.runtime.detach(owner, binding);
+            finish_removal(
+                removed,
+                &places,
+                &registered,
+                removing,
+                &notices,
+                binding_id,
+            );
+            return Err(refused(format!(
+                "this host already has the {MAX_PENDING_UNBINDS} unbinds it may have waiting, and \
+                 the binding was stopped without waiting for its thread"
+            )));
+        };
+        let runtime = Arc::clone(&self.runtime);
+        // Only what the task needs: it is not given the connection's writer, so a connection that is
+        // over does not stay open for the task.
         let removal = tokio::task::spawn_blocking(move || {
             let _waiting = waiting;
             let removed = runtime.unbind(owner, binding);
-            // Only a binding that existed had a place of its own. A preparation that was still
-            // running holds its place until it finishes and gives it back itself, so counting it
-            // here as well would let this connection hold more bindings than it may.
-            if matches!(removed, Unbound::Stopped) {
-                places.give_back();
-            }
-            if let Ok(mut held) = registered.lock()
-                && let Some(removing) = removing
-            {
-                // By identity, and nothing else: a registration that started while this unbind was
-                // joining the old thread owns the identifier now, and its state is not this
-                // removal's to clear.
-                held.parted(binding_id, &removing);
-            }
-            // The binding has gone, so what the notice queue was holding for it has nothing left
-            // to catch, and the identifier's next incarnation starts clean.
-            notices.forget(binding_id);
+            finish_removal(
+                removed,
+                &places,
+                &registered,
+                removing,
+                &notices,
+                binding_id,
+            );
             removed
         });
-        let removed = tokio::time::timeout(self.unbind_deadline, removal)
+        let remaining = self.unbind_deadline.saturating_sub(started.elapsed());
+        let removed = tokio::time::timeout(remaining, removal)
             .await
             .map_err(|_elapsed| caller_deadline(self.unbind_deadline))?
             .map_err(|error| (format!("the binding could not be removed: {error}"), false))?;
@@ -1496,6 +1518,34 @@ fn native_request_of(event: &WireSourceEvent) -> Result<ScopedSourceEvent, (Stri
 /// The refusal of a request this host will not run: nothing is disabled by it.
 fn refused(detail: String) -> (String, bool) {
     (detail, false)
+}
+
+/// What is recorded once a binding has been taken out of the runtime, whether its thread was waited
+/// for or not.
+fn finish_removal(
+    removed: Unbound,
+    places: &BindingPlaces,
+    registered: &Registered,
+    removing: Option<Arc<BindingHandle>>,
+    notices: &NoticeSink,
+    binding_id: Uuid,
+) {
+    // Only a binding that existed had a place of its own. A preparation that was still running
+    // holds its place until it finishes and gives it back itself, so counting it here as well
+    // would let this connection hold more bindings than it may.
+    if matches!(removed, Unbound::Stopped) {
+        places.give_back();
+    }
+    if let Ok(mut held) = registered.lock()
+        && let Some(removing) = removing
+    {
+        // By identity, and nothing else: a registration that started while this unbind was joining
+        // the old thread owns the identifier now, and its state is not this removal's to clear.
+        held.parted(binding_id, &removing);
+    }
+    // The binding has gone, so what the notice queue was holding for it has nothing left to catch,
+    // and the identifier's next incarnation starts clean.
+    notices.forget(binding_id);
 }
 
 /// The refusal for a request that has run out of the time it was given.

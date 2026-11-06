@@ -618,6 +618,24 @@ impl Runtime {
     /// this returns. The component's own state goes with it; nothing a decision depends on was in
     /// there, because pending and dispatch state is the worker broker's.
     pub fn unbind(&self, owner: BindingOwner, binding_id: BindingId) -> Unbound {
+        self.remove(owner, binding_id, BindingHandle::stop)
+    }
+
+    /// Removes a binding and tells its thread to stop, without waiting for it.
+    ///
+    /// For a caller that cannot block: the binding is gone from the runtime when this returns, and
+    /// its thread ends on its own after at most one bounded call. What [`Self::unbind`] guarantees
+    /// about the instance having stopped is not given.
+    pub fn detach(&self, owner: BindingOwner, binding_id: BindingId) -> Unbound {
+        self.remove(owner, binding_id, BindingHandle::signal_stop)
+    }
+
+    fn remove(
+        &self,
+        owner: BindingOwner,
+        binding_id: BindingId,
+        stop: impl FnOnce(&BindingHandle),
+    ) -> Unbound {
         let entry =
             self.bindings
                 .lock()
@@ -631,7 +649,7 @@ impl Runtime {
                 state: RegistrationState::Live(handle),
                 ..
             }) => {
-                handle.stop();
+                stop(&handle);
                 Unbound::Stopped
             }
             // A reservation somebody is still preparing. Removing it is the whole of the removal:
