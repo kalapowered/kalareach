@@ -684,6 +684,168 @@ async fn a_retained_failure_carries_none_of_what_the_caller_sent() {
     let _ = host.stop().await;
 }
 
+/// Opens the project journal beside the daemon's own handle and makes it refuse to keep a refusal.
+///
+/// A record of an action that was refused carries an error code, and the claim an action writes
+/// before it begins does not, so the fault reaches the first and leaves the second alone. With
+/// `left`, the same write first leaves that result as the record of its action, as a copy of the
+/// action that finished at that moment would have, and then fails.
+fn the_journal_refuses_to_keep_a_refusal(host: &Host, left: Option<&ParamsValue>) {
+    let journal = kr_project::ProjectService::root_of(&host.temp.environment())
+        .join(kr_project::store::STORE_FILE_NAME);
+    let connection = rusqlite::Connection::open(journal).expect("opens the project journal");
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    let body = match left {
+        Some(result) => {
+            let hex: String = kr_cbor::encode(result.as_value())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!(
+                "INSERT INTO actions (actor_id, action_id, method, payload_digest, subject,
+                                      result, error_code, error_detail, recorded_at_ms)
+                 VALUES (NEW.actor_id, NEW.action_id, NEW.method, NEW.payload_digest, NULL, x'{hex}',
+                         NULL, NULL, NEW.recorded_at_ms);
+                 SELECT RAISE(FAIL, 'the journal keeps no refusal');"
+            )
+        }
+        None => "SELECT RAISE(ABORT, 'the journal keeps no refusal');".to_owned(),
+    };
+    connection
+        .execute_batch(&format!(
+            "CREATE TRIGGER the_refusal_is_not_kept BEFORE INSERT ON actions
+             WHEN NEW.error_code IS NOT NULL
+             BEGIN {body} END;"
+        ))
+        .expect("the journal is made to refuse the write that keeps a refusal");
+}
+
+/// KR-REQ-09.09: a refusal this host decides before it holds the claim for an action can be a word
+/// about what another copy of the action did, such as the destination it made. When the journal then
+/// cannot keep the refusal, it is not told as a definite one, which a client takes for the host's
+/// word that nothing was done: the record the other copy left is the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_refusal_the_journal_cannot_keep_is_answered_by_the_record_another_copy_left() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let params = ProjectInitParams {
+        destination: host.destination("made"),
+        label: "made".to_owned(),
+        initial_branch: Nullable::null(),
+    };
+    // The other copy makes the destination, and its result is what the journal is made to hold for
+    // this attempt's action at the moment it fails to write its own: this attempt passed its
+    // lookups before that copy finished.
+    let made = control
+        .mutate(
+            Method::ProjectInit,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("project.init succeeds");
+    the_journal_refuses_to_keep_a_refusal(&host, Some(&made));
+    let told = control
+        .mutate(
+            Method::ProjectInit,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the answer is what the other copy recorded, not a refusal for the destination");
+    assert_eq!(told, made);
+    let _ = host.stop().await;
+}
+
+/// KR-REQ-09.09: the same refusal, with nothing recorded for the action to be read, is told as an
+/// outcome that is not known, because the host cannot say that no other copy carried the action
+/// out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_refusal_the_journal_cannot_keep_and_nothing_can_vouch_for_is_told_the_outcome_is_unknown()
+ {
+    let host = host().await;
+    let mut control = client(&host).await;
+    std::fs::create_dir(host.work().join("made")).expect("the destination the other copy made");
+    the_journal_refuses_to_keep_a_refusal(&host, None);
+    let told = failure(
+        control
+            .mutate(
+                Method::ProjectInit,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &ProjectInitParams {
+                    destination: host.destination("made"),
+                    label: "made".to_owned(),
+                    initial_branch: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    let _ = host.stop().await;
+}
+
+/// KR-REQ-09.09: a refusal that follows this attempt's own claim for the action is settled in the
+/// claim, so the record read when the journal cannot keep it is the attempt's own refusal, told as
+/// it is and not as an outcome that is not known.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_refusal_after_the_attempts_own_claim_is_told_as_it_is_when_the_journal_cannot_keep_it() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    // A directory that holds no repository, which Git refuses to clone once the claim is written.
+    let empty = host.work().join("not-a-repository");
+    std::fs::create_dir(&empty).expect("a directory that is no repository");
+    the_journal_refuses_to_keep_a_refusal(&host, None);
+    let told = failure(
+        control
+            .mutate(
+                Method::ProjectClone,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &ProjectCloneParams {
+                    destination: host.destination("cloned"),
+                    label: "cloned".to_owned(),
+                    source: CloneSource::Remote {
+                        remote: RemoteSpecification {
+                            remote_name: "origin".to_owned(),
+                            transport: RemoteTransport::LocalPath,
+                            url: empty.display().to_string(),
+                            provider: String::new(),
+                            credential_broker: String::new(),
+                        },
+                    },
+                },
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_ne!(
+        told.code,
+        ErrorCode::OutcomeUnknown,
+        "the attempt's own refusal is told as it is: {told:?}"
+    );
+    let _ = host.stop().await;
+}
+
 /// KR-REQ-24.08: a workspace, its policy and its pins survive the daemon's death, and cleanup
 /// still respects them afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
