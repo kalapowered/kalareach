@@ -6,6 +6,9 @@
 
 use kr_term::engine::{Engine, EngineConfig};
 use kr_term::lane::{LaneGate, LaneLimits};
+use kr_term::modes::ModeKind;
+use kr_term::profile::{CAPABILITIES, Capability};
+use kr_term::snapshot::Viewport;
 use kr_term::terminfo;
 
 /// An engine at the profile default size, which is what an invisible session starts at.
@@ -82,8 +85,8 @@ fn a_cursor_report_describes_the_canonical_grid() {
 /// KR-REQ-08.41, the part about features negotiated outside terminfo: a mode query is answered from
 /// what the profile tracks, and two features the profile has no capability for (grapheme clustering
 /// and in-band resize) are reported as not recognised. Not shown here: a feature the profile has a
-/// capability for (bracketed paste, synchronised output, the Kitty keyboard subset) being reported
-/// or honoured, or any query other than a mode report.
+/// capability for being reported and honoured, which the next case shows, or any query other than a
+/// mode report.
 #[test]
 fn mode_reports_say_what_the_profile_actually_does() {
     let mut engine = engine();
@@ -105,6 +108,115 @@ fn mode_reports_say_what_the_profile_actually_does() {
     );
     // Columns belong to the geometry owner, permanently.
     assert_eq!(replies(&mut engine, b"\x1b[?3$p", 0), [b"\x1b[?3;4$y"]);
+}
+
+/// KR-REQ-08.41, the part about features negotiated outside terminfo: a feature the profile has a
+/// capability for is reported and honoured. Bracketed paste, focus reporting, SGR mouse reporting
+/// and synchronised output are capabilities the profile advertises, and an application negotiates
+/// each as a DEC mode. The mode is reported as recognised before it is set, as set once the
+/// application sets it and as reset once it resets it. The engine records it, tells a client of the
+/// change in the delta it serves and in a snapshot, and keeps it through a soft reset. The control
+/// is a pair of modes the profile has no capability for (grapheme clustering and in-band resize):
+/// an application can set them, and they stay unrecognised, unrecorded and untold. Not shown here:
+/// what a client's renderer does with a mode it is told, a Kitty keyboard flag (which is not a mode
+/// report), or any query other than a mode report.
+#[test]
+fn a_feature_the_profile_has_a_capability_for_is_reported_and_honoured() {
+    /// Where a client's screen stands: the cursor and generation it would name as its base.
+    fn base(engine: &Engine) -> (u64, u64) {
+        (engine.output_cursor(), engine.projection_generation())
+    }
+    /// What a client is told of `mode` since `base`, in a delta and in a snapshot.
+    fn told(engine: &mut Engine, base: (u64, u64), mode: u16) -> (Option<bool>, Option<bool>) {
+        let delta = engine.delta(base.0, base.1).expect("inside the window");
+        let viewport = Viewport {
+            top_row: 0,
+            rows: engine.grid().size().rows,
+            left_col: 0,
+            cols: engine.grid().size().cols,
+        };
+        let (snapshot, _) = engine.snapshot(viewport, 0);
+        let find = |entries: &[kr_term::snapshot::ModeEntry]| {
+            entries
+                .iter()
+                .find(|entry| entry.mode == mode)
+                .map(|entry| entry.enabled)
+        };
+        (find(&delta.modes), find(&snapshot.modes))
+    }
+
+    for (capability, mode) in [
+        (Capability::BracketedPaste, 2004_u16),
+        (Capability::FocusEvents, 1004),
+        (Capability::SgrMouse, 1006),
+        (Capability::SynchronisedOutput, 2026),
+    ] {
+        assert!(
+            CAPABILITIES.contains(&capability),
+            "{capability:?} is a capability of the profile"
+        );
+        let mut engine = engine();
+        engine.feed(b"first line\r\n", 0);
+        let ask = format!("\x1b[?{mode}$p").into_bytes();
+        let report = |status: u8| vec![format!("\x1b[?{mode};{status}$y").into_bytes()];
+
+        // Recognised before the application sets it: reset, and no change for a client to be told.
+        let held = base(&engine);
+        assert_eq!(replies(&mut engine, &ask, 0), report(2), "{mode}");
+        assert!(!engine.modes().is_set(ModeKind::Dec, mode));
+        assert_eq!(
+            told(&mut engine, held, mode),
+            (None, Some(false)),
+            "{mode} is in a snapshot as reset, and a delta carries no change of it"
+        );
+
+        // Set by the application: reported as set, recorded, and told to a client both ways.
+        let held = base(&engine);
+        engine.feed(format!("\x1b[?{mode}h").as_bytes(), 0);
+        assert_eq!(replies(&mut engine, &ask, 0), report(1), "{mode}");
+        assert!(engine.modes().is_set(ModeKind::Dec, mode), "{mode}");
+        assert_eq!(
+            told(&mut engine, held, mode),
+            (Some(true), Some(true)),
+            "{mode} is carried to a client in the delta and in a snapshot"
+        );
+        if mode == 2004 {
+            assert!(engine.bracketed_paste(), "the host frames a paste by it");
+        }
+
+        // A soft reset leaves it as the application set it.
+        engine.feed(b"\x1b[!p", 0);
+        assert_eq!(
+            replies(&mut engine, &ask, 0),
+            report(1),
+            "{mode} after DECSTR"
+        );
+
+        // Reset by the application: reported as reset, and told to a client as reset.
+        let held = base(&engine);
+        engine.feed(format!("\x1b[?{mode}l").as_bytes(), 0);
+        assert_eq!(replies(&mut engine, &ask, 0), report(2), "{mode}");
+        assert_eq!(
+            told(&mut engine, held, mode),
+            (Some(false), Some(false)),
+            "{mode}"
+        );
+    }
+
+    // The control: modes the profile has no capability for, set the same way.
+    let mut engine = engine();
+    engine.feed(b"first line\r\n", 0);
+    let held = base(&engine);
+    engine.feed(b"\x1b[?2027h\x1b[?2048h", 0);
+    assert_eq!(
+        replies(&mut engine, b"\x1b[?2027$p\x1b[?2048$p", 0),
+        [b"\x1b[?2027;0$y".to_vec(), b"\x1b[?2048;0$y".to_vec()],
+        "setting them does not make the profile support them"
+    );
+    for mode in [2027_u16, 2048] {
+        assert!(!engine.modes().is_set(ModeKind::Dec, mode), "{mode}");
+        assert_eq!(told(&mut engine, held, mode), (None, None), "{mode}");
+    }
 }
 
 #[test]
