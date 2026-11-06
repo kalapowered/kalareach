@@ -1966,8 +1966,10 @@ async fn a_machine_group_step_recorded_before_a_late_attempts_claim_is_not_given
 /// while a late attempt holds the machine group's step lock stops the answer it found there. The
 /// attempt has waited for the lock and found its action recorded; the fence is raised with the
 /// lock held and the answer in hand, so only a check made after the record is found, and not one
-/// made before the lock was taken, sees it. The control: the same late attempt, with nothing
-/// raised while it is stopped there, is answered from the receipt.
+/// made before the lock was taken, sees it. It is raised twice: as a fence this host owes, and by
+/// a revocation of this host's authority that is acknowledged while the lock is held. The control:
+/// the same late attempt, with nothing raised while it is stopped there, is answered from the
+/// receipt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_answer_it_found() {
     use kr_protocol::machine::{MachineExpected, MachineSplitParams};
@@ -2038,6 +2040,26 @@ async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_a
         panic!("a fence raised while the step lock was held stops the answer: {refused:?}")
     }));
     controller.hold_fence(false);
+    assert!(
+        !controller.a_machine_step_holds_the_step_lock(),
+        "the refused attempt let the lock go"
+    );
+
+    // A revocation of this host's authority, acknowledged while the lock is held, withdraws the
+    // registration the late attempt was admitted under.
+    let (waiting, release) = stopped_with_the_lock().await;
+    controller
+        .revoke_authority()
+        .await
+        .expect("the revocation is acknowledged");
+    release.send(()).expect("the late attempt goes on");
+    let refused = waiting.await.expect("the late attempt finishes");
+    let withheld = refusal(&refused).unwrap_or_else(|| {
+        panic!(
+            "a revocation acknowledged while the step lock was held stops the answer: {refused:?}"
+        )
+    });
+    assert_eq!(withheld.code, ErrorCode::PermissionDenied, "{withheld:?}");
     assert!(
         !controller.a_machine_step_holds_the_step_lock(),
         "the refused attempt let the lock go"
