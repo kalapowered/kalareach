@@ -1416,6 +1416,67 @@ async fn the_owner_reads_and_acknowledges_the_inbox_at_the_daemon() {
     host.stop().await;
 }
 
+/// KR-REQ-09.09: a repeat of an attention action whose record cannot be read is told that what
+/// became of the action is not known. The store holds the record of every action it performed, so
+/// one it cannot read is not one that holds none: the action may have been carried out, and a
+/// transient word would say that it was not. Once the record can be read the repeat is answered
+/// from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_of_an_attention_action_whose_record_cannot_be_read_is_told_the_outcome_is_unknown()
+ {
+    let owner_keys = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner_keys).await;
+    let mut control = host.client().await;
+    let original = control
+        .compose(
+            Method::AttentionQuietHours,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &AttentionQuietHoursParams {
+                quiet_hours: Nullable::some(night()),
+            },
+        )
+        .await
+        .expect("the mutation is composed");
+    let first: AttentionQuietHoursResult = control
+        .repeat(&original)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the quiet hours are set")
+        .to_typed()
+        .expect("decodes");
+
+    // The table that holds the record of every action is moved aside, as a store that fails to read
+    // it would leave it.
+    let store =
+        rusqlite::Connection::open(host.attention_database()).expect("opens the attention store");
+    store
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    store
+        .execute_batch("ALTER TABLE attention_actions RENAME TO attention_actions_aside;")
+        .expect("the record cannot be read");
+    let told = control
+        .repeat(&original)
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("a record that cannot be read does not answer the repeat");
+    store
+        .execute_batch("ALTER TABLE attention_actions_aside RENAME TO attention_actions;")
+        .expect("the record can be read again");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    let again: AttentionQuietHoursResult = control
+        .repeat(&original)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the repeat is answered once the record can be read")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(again.quiet_hours, first.quiet_hours);
+    host.stop().await;
+}
+
 /// Every method of the group is served at the daemon's own socket, where nothing forwards it to a
 /// worker: review state and its acknowledgement, a visit and the changed view, and the quiet-hours
 /// window.

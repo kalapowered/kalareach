@@ -591,7 +591,13 @@ impl Controller {
             // this actor already made is a retry, and section 9 says a retry is answered from what
             // its first attempt produced; refusing one because the package went away, or the
             // document broke, in between would be refusing an action that already has an outcome.
-            let known = registry.reservation_for_token(actor_id, token)?.is_some();
+            // A token whose reservation cannot be read is not a token that has none: an earlier
+            // attempt may have made the session, so the caller is not told a transient word that
+            // says nothing took effect.
+            let known = registry
+                .reservation_for_token(actor_id, token)
+                .map_err(|error| error.found_unreadable("sessions"))?
+                .is_some();
             // A host that cannot use its configuration document creates no new session: the
             // owner's choice between the two execution contexts is in it, and neither is inside
             // the other. The request cannot say it chose: a client fills in the host's default.

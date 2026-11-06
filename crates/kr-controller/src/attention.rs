@@ -2127,20 +2127,22 @@ impl AttentionModule {
     ) -> Option<ControlFrame> {
         let key = action_key(actor, mutation, method).ok()?;
         // A store that cannot be asked is not one that holds nothing: an earlier copy of this action
-        // may have been performed in it.
+        // may have been performed in it. Nor is one whose record cannot be read, or that is no
+        // longer this daemon's.
+        let unreadable = || {
+            Some(frame(
+                mutation.request_id,
+                Err(ControllerError::record_unreadable("attention actions").to_protocol_error()),
+            ))
+        };
         let held = match self.store() {
             Ok(store) => store.answered(actor, &key.action_id),
-            Err(_) => {
-                return Some(frame(
-                    mutation.request_id,
-                    Err(ControllerError::record_unreadable("attention actions").to_protocol_error()),
-                ));
-            }
+            Err(_) => return unreadable(),
         };
         let record = match held {
             Ok(Some(record)) => record,
             Ok(None) => return None,
-            Err(error) => return Some(frame(mutation.request_id, Err(refusal(error)))),
+            Err(_) => return unreadable(),
         };
         if record.method != key.method || record.digest != key.digest {
             return Some(frame(

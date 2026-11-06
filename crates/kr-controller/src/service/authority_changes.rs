@@ -61,7 +61,10 @@ impl Controller {
                     .await,
             )),
             Ok(None) => None,
-            Err(error) => Some(respond(mutation.request_id, Err(error))),
+            Err(error) => Some(respond(
+                mutation.request_id,
+                Err(error.found_unreadable("authority changes")),
+            )),
         }
     }
 
@@ -84,7 +87,10 @@ impl Controller {
                 .answer_without_fence(actor_id, mutation, &record)
                 .map(|answer| respond(mutation.request_id, answer)),
             Ok(None) => None,
-            Err(error) => Some(respond(mutation.request_id, Err(error))),
+            Err(error) => Some(respond(
+                mutation.request_id,
+                Err(error.found_unreadable("authority changes")),
+            )),
         }
     }
 

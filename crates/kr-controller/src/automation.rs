@@ -3150,7 +3150,20 @@ impl AutomationModule {
             }
             Ok(None) => None,
             Ok(Some(answer)) => Some(frame(mutation.request_id, encode_answer(&answer))),
-            Err(error) => Some(frame(mutation.request_id, Err(error.into()))),
+            // A journal whose record of the action cannot be read is not one that holds none: an
+            // earlier copy may have performed it, and a transient word would have the caller send
+            // the action again. A reused identifier keeps its code.
+            Err(error) => {
+                let told = ProtocolError::from(&error);
+                Some(frame(
+                    mutation.request_id,
+                    Err(if told.code == ErrorCode::StorageUnavailable {
+                        ControllerError::record_unreadable("workflow actions").to_protocol_error()
+                    } else {
+                        told
+                    }),
+                ))
+            }
         }
     }
 
