@@ -47,7 +47,15 @@ jobs:
   floors:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 150
+    # The Intel macOS leg is the slow one. Its jobs took 98, 155, 98, 131, 123 and 163 minutes on
+    # the nights of 2026-11-01 to -06; the former limit of 150 ended two of them, the second night
+    # in the first check after the build and the last in the seventh of its seven builds, so those
+    # two figures are the job's time as it would have gone on. A build from nothing is what the
+    # cache of that leg starts from (the first night, the first of each week and after an
+    # eviction), and the cache is saved only by a job that finishes, so the limit has to hold a
+    # build from nothing at the slowest pace with 30 minutes over: 163 and 30 make 193. With the
+    # cache the same pace takes about 110 minutes. The other five legs took 30 to 88 minutes.
+    timeout-minutes: 210
     strategy:
       # One target's failure says nothing about another's, and each is worth seeing.
       fail-fast: false
@@ -160,14 +168,14 @@ jobs:
       - name: Test the floor check
         run: '"$PYTHON" scripts/check-release-floors.py self-test'
 
-      # What the third-party crates build is the same from one night to the next. This job took 98
-      # to 152 minutes on the Intel runners from nothing (2026-11-01 to -06); the 152 was ended by
-      # the limit in the seventh of the seven builds below, and at its pace the job takes about
-      # 163. With these crates' output kept the seven builds take about a third less (measured on
-      # Linux with four build jobs: 1,646 s from nothing, 1,126 s with the output kept). This
-      # workspace's own crates are built again whatever the cache holds, so what is built of them
-      # is always this commit's. Cargo decides what is current: a crate whose version, features or
-      # build settings differ, and a native build whose compiler variables differ, are built again.
+      # What the third-party crates build is the same from one night to the next. From nothing,
+      # this job took 98 to 163 minutes on the Intel runners (2026-11-01 to -06; see the limit
+      # above). With these crates' output kept the seven builds below take about a third less
+      # (measured on Linux with four build jobs: 1,646 s from nothing, 1,126 s with the output
+      # kept). This workspace's own crates are built again whatever the cache holds, so what is
+      # built of them is always this commit's. Cargo decides what is current: a crate whose
+      # version, features or build settings differ, and a native build whose compiler variables
+      # differ, are built again.
       - name: Restore the third-party crates' build output
         id: cargo-cache
         if: ${{ matrix.cache }}
