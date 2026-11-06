@@ -910,8 +910,8 @@ struct WindowReports {
     /// The size the last report carried.
     size_sent: Dimensions,
     /// Whether the newest size is owed to the session whatever the size last sent was, because a
-    /// report of it was not settled. The session may have the size of that report, so even the
-    /// size last sent has to be said again.
+    /// report of it was not settled, a return to the live screen that carried it included. The
+    /// session may have the size of that report, so even the size last sent has to be said again.
     size_owed: bool,
     /// Whether a size the session did not take for now waits for something to arrive before it
     /// goes again, so that a session that keeps saying so is not asked in a loop.
@@ -947,6 +947,10 @@ struct InFlight {
     moves: bool,
     /// Whether it is the return to the live screen.
     returning: bool,
+    /// Whether it carries a size the session was owed: the return goes before the size and takes
+    /// the newest one with it, so a size measured before it, or one an earlier report left owed,
+    /// rides inside it.
+    sized: bool,
     /// Whether this terminal was measured or pressed after the report went: a word the window does
     /// not rest from, whatever the session answers.
     spoke: bool,
@@ -1134,10 +1138,12 @@ impl WindowReports {
         };
         let mut moves = false;
         let mut returning = false;
+        let mut sized = false;
         let sending = if self.return_owed {
             self.return_owed = false;
             moves = true;
             returning = true;
+            sized = self.size != self.size_sent || self.size_owed;
             Sending {
                 dimensions: self.size,
                 position: None,
@@ -1175,6 +1181,7 @@ impl WindowReports {
             awaiting: None,
             moves,
             returning,
+            sized,
             spoke: false,
         });
         Some(sending)
@@ -1247,16 +1254,30 @@ impl WindowReports {
             return;
         };
         if flight.moves {
-            // A move, or a return to the live screen, is the person's own key and is not made later
-            // on their behalf: it is settled as not taken, and the next key asks for it again. A
-            // size report made at the old place after an outcome the session could not say would
-            // put the window back where the key took it from. For a return the place is known
-            // enough to say: the person typed, which wants the window at the live screen, so a
-            // size or a question owed meanwhile or since goes there, whether or not the session
-            // took the return.
+            // A move, or a return to the live screen, is the person's own key and is not asked for
+            // again by this loop: it is settled as not taken, and the next key asks for it again.
+            // A size report made at the old place after an outcome the session could not say would
+            // put the window back where the key took it from, so a move not taken leaves the
+            // record as it was, and what is owed goes at the row it keeps.
+            //
+            // A return differs in what goes after it, and only in that. The person typed, which
+            // wants the window at the live screen, so a size or a question owed meanwhile or since
+            // goes with no position, whether or not the session took the return, and a report with
+            // no position puts the window at the live screen. That is the return made later, but
+            // only inside a report the session is owed anyway, never as a request of its own.
             self.not_taken_in_a_row = 0;
             if flight.returning {
                 self.live_unsettled = true;
+                // The return took the newest size with it, and the session may not have taken
+                // that either. It is owed again, the way a size report not taken is: when the
+                // session next says something, or at once if this terminal spoke meanwhile. The
+                // return was the first asking of that size, so it counts as one that failed, and
+                // the size goes again three times at most before the terminal speaks.
+                if flight.sized {
+                    self.size_owed = true;
+                    self.resting = !flight.spoke;
+                    self.not_taken_in_a_row = 1;
+                }
             }
             return;
         }
@@ -5650,6 +5671,116 @@ mod tests {
             send(&mut window, 3).map(|sending| sending.position),
             Some(row(477)),
             "a move leaves the record where it was"
+        );
+    }
+
+    /// The return to the live screen goes before the size and takes the newest one with it: the one
+    /// measured before it went, the one an earlier report left owed, and the one measured while
+    /// another report was in flight. When the session does not take the return, it may not have
+    /// taken that size either, so the size is owed again at the live screen, once the session next
+    /// says something, as the size of a report not taken is. A return the session took carried it,
+    /// and one it refused in its definite word is settled like any report refused so.
+    #[test]
+    fn a_size_a_return_the_session_did_not_take_carried_goes_again_at_the_live_screen() {
+        // Measured before the return went.
+        let mut window = parked_at_477();
+        window.measured(size(100, 30));
+        window.return_to_live();
+        let back = send(&mut window, 2).expect("the return");
+        assert_eq!((back.dimensions, back.position), (size(100, 30), None));
+        window.answered(request(2), Answer::NotSettled);
+        assert_eq!(
+            window.next(),
+            None,
+            "it waits for the session to say something, as a size not taken does"
+        );
+        window.heard();
+        let sized = send(&mut window, 3).expect("the size goes again");
+        assert_eq!(
+            (sized.dimensions, sized.position),
+            (size(100, 30), None),
+            "at the live screen, not at the row the window may have left"
+        );
+
+        // Left owed by an earlier report the session did not take, which the return then carried.
+        let mut window = parked_at_477();
+        window.measured(size(100, 30));
+        send(&mut window, 2).expect("the size goes");
+        window.answered(request(2), Answer::NotSettled);
+        window.return_to_live();
+        let back = send(&mut window, 3).expect("the return carries the size");
+        assert_eq!(back.dimensions, size(100, 30));
+        window.answered(request(3), Answer::NotSettled);
+        window.heard();
+        let sized = send(&mut window, 4).expect("the size goes again");
+        assert_eq!(
+            (sized.dimensions, sized.position),
+            (size(100, 30), None),
+            "even though the size is the one last sent"
+        );
+
+        // The return was the first asking of the size: three more follow it with the session's
+        // words, and then it rests until the terminal speaks.
+        let mut id = 5;
+        for _ in 0..2 {
+            window.answered(request(id - 1), Answer::NotSettled);
+            window.heard();
+            send(&mut window, id).expect("and again with the session's next word");
+            id += 1;
+        }
+        window.answered(request(id - 1), Answer::NotSettled);
+        window.heard();
+        assert_eq!(
+            window.next(),
+            None,
+            "four askings of the size in all, the return's included"
+        );
+
+        // Measured while a move was in flight, before the return went.
+        let mut window = parked_at_477();
+        window.pressed(1, 23, size(80, 24));
+        send(&mut window, 2).expect("the next page back");
+        window.measured(size(100, 30));
+        window.return_to_live();
+        window.answered(request(2), accepted(2, Some(454)));
+        window.installed(2, Some(454));
+        let back = send(&mut window, 3).expect("the return");
+        assert_eq!((back.dimensions, back.position), (size(100, 30), None));
+        window.answered(request(3), Answer::NotSettled);
+        window.heard();
+        let sized = send(&mut window, 4).expect("the size goes again");
+        assert_eq!((sized.dimensions, sized.position), (size(100, 30), None));
+
+        // The person pressed a key while the return was in flight: no rest, the size goes at once.
+        let mut window = parked_at_477();
+        window.measured(size(100, 30));
+        window.return_to_live();
+        send(&mut window, 2).expect("the return");
+        window.pressed(1, 23, size(100, 30));
+        window.answered(request(2), Answer::NotSettled);
+        let sized = send(&mut window, 3).expect("no rest: the terminal spoke meanwhile");
+        assert_eq!((sized.dimensions, sized.position), (size(100, 30), None));
+
+        // The controls: a return the session took carried the size, and a definite refusal settles
+        // the return as it settles every report.
+        let mut window = parked_at_477();
+        window.measured(size(100, 30));
+        window.return_to_live();
+        send(&mut window, 2).expect("the return");
+        window.answered(request(2), accepted(2, None));
+        window.installed(2, None);
+        window.heard();
+        assert_eq!(window.next(), None, "the session has the size");
+        let mut window = parked_at_477();
+        window.measured(size(100, 30));
+        window.return_to_live();
+        send(&mut window, 2).expect("the return");
+        window.answered(request(2), Answer::Refused);
+        window.heard();
+        assert_eq!(
+            window.next(),
+            None,
+            "the session's definite word is its last"
         );
     }
 
