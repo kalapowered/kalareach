@@ -6,7 +6,8 @@
 //! is not speaking, and it has to follow that state whichever control changed it, and in order.
 //!
 //! One task keeps it. It is woken whenever the mute may have changed, reads the state native code
-//! holds, and tells the service when that differs from what the service last accepted. It sits
+//! holds, and tells the service when that differs from what the service last accepted, or when what
+//! it holds is unknown because a request may have reached it and was never answered. It sits
 //! off the owner's loop because a request to a service that holds no socket can wait for the
 //! absent window, and the person's mute never waits for it. A wake while a request waits is kept
 //! and read afterwards, so the service ends up told the newest state and never an older one after
@@ -97,7 +98,6 @@ mod tests {
         let unanswered: Result<(), SendError> = Err(SendError::Unanswered);
         let told = told_after(Some(false), true, &unanswered);
         assert_eq!(told, None, "the mute may or may not have been taken");
-        assert_ne!(told, Some(false), "an unmute is told after it");
 
         let lost: Result<(), SendError> = Err(SendError::Lost);
         assert_eq!(told_after(Some(false), true, &lost), None);
