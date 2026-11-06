@@ -22,7 +22,7 @@ import type { LaunchShell, ShellLaunchResult } from '@kalareach/protocol'
 import { useApp } from '../app/state'
 import type { LaunchSurfaceReads } from '../app/launch-surface'
 import { Button, CommitButton } from '../components/ui'
-import { failureCode, failureWords, type LaunchPress } from '../host/port'
+import { failureCode, failureRetry, failureWords, type LaunchPress } from '../host/port'
 import { commandLine } from '../model/command-line'
 import {
   drawing,
@@ -31,6 +31,7 @@ import {
   type LaunchOffer,
   type LaunchOffers
 } from '../model/launch'
+import { leavesOutcomeUnknown } from '../model/receipts'
 
 /** The words of a command as the person would type it, for the shell the session runs. */
 function typed(offer: LaunchOffer, shell: LaunchShell | null): string {
@@ -200,11 +201,15 @@ export function LaunchSurface({
                     },
                     (failure: unknown) => {
                       setPressing(false)
-                      setSettled({
-                        after: newest(),
-                        ended: failureCode(failure) === 'OUTCOME_UNKNOWN' ? 'unconfirmed' : 'refused'
+                      // A launch the host could not confirm is never called refused, whether the
+                      // host says so by the code or by the retry category of its code.
+                      const code = failureCode(failure)
+                      const unknown = leavesOutcomeUnknown({
+                        code: code ?? 'REQUEST_FAILED',
+                        retry: failureRetry(failure)
                       })
-                      say(pressRefusal(failureCode(failure), failureWords(failure)), 'danger')
+                      setSettled({ after: newest(), ended: unknown ? 'unconfirmed' : 'refused' })
+                      say(pressRefusal(code, failureWords(failure), unknown), 'danger')
                       again()
                     }
                   )
