@@ -84,6 +84,11 @@ Heartbeats will be sent every 20 seconds whilst the WebSocket is open, and if no
 
 These rules hold whatever the service would accept. A frame the device sends is at most 4,096 bytes, and an append is at most 500 bytes of UTF-8. A request may name a delegation only if the call heard it announced, and each call will remember the newest 256. Requests will be spaced to fit within the limits imposed by the managed service (10 per 10 seconds, 60 per minute), so a long opening context is paced instead of refused. The device will record the type of any frame received which it does not recognise, and discard the frame. Likewise, if a frame of a known type does not match the expected format, it will be discarded, as will any object that names a member twice.
 
+The microphone's mute is told to the service as advice to the provider, from one task that follows
+the mute native code holds, whichever control changed it: the page, the lock screen or the
+notification. It tells the service when that differs from what the service last accepted, in order,
+and tries again when the control attaches again. The mute itself never waits for the service.
+
 The host's selected context is sent as the call's opening context, appended using `thinking` frames. The first line of the opening context says that the text is data about the person's work and not instructions, and the selected text follows. Where possible, splitting will be done at line breaks, and each chunk will be at most 500 bytes. If the selection would require more than 64 chunks of opening context, the whole selection will be rejected.
 
 ## Screen lock and background audio
@@ -94,6 +99,15 @@ Android's microphone foreground service:
 - **iOS**: `UIBackgroundModes` declares `audio`. An explicitly started call maintains its audio session
   across screen locks. If capture is interrupted by an incoming phone call or system audio grab, an
   `AVAudioSession.interruptionNotification` is received and capture state transitions to `interrupted`.
+  A permitted call registers the system's remote controls and shows the call as now playing. The pause
+  command mutes the microphone and is offered only while the microphone is on; the stop command ends
+  the call; play and toggle are never offered, so no remote opens a microphone the person turned off.
+  The title is fixed and names no session, host or account, and the rate is 0 while the microphone is
+  muted. The controls follow the person's mute, whichever control made it, and go with the call.
+  iOS draws play or pause, skip and a scrubber on the lock screen, and no stop button on the lock
+  screen or in Control Center, so a stop reaches the call from a remote that sends one, such as some
+  Bluetooth accessories and car systems. What the lock screen draws for a call is the system's to
+  decide.
 - **Android**: `VoiceCallService` runs with `foregroundServiceType="microphone"`, holding a
   persistent user-visible notification while a call is active. When the screen locks, the foreground
   service preserves the microphone and speaker channels. Every action on the notification names the

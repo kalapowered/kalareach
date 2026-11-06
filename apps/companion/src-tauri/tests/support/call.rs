@@ -209,6 +209,24 @@ impl ScriptedCalls {
         }
     }
 
+    /// The person mutes or unmutes the microphone from one of the phone's own controls, the lock
+    /// screen or the notification, and not through the page: native code changes what it holds and
+    /// tells the capture news, and the page gave it no command.
+    pub fn mute_from_a_remote(&self, muted: bool) {
+        let state = {
+            let mut inner = self.inner();
+            inner.muted = muted;
+            inner.commands.push(format!("remote-mute:{muted}"));
+            inner.capture = if muted {
+                CaptureState::MutedByPerson
+            } else {
+                CaptureState::Capturing
+            };
+            inner.capture
+        };
+        self.tell(CallEvent::Capture { state });
+    }
+
     /// News that skips a number: what the reader is told as news that was lost.
     pub fn lose_some_news(&self) {
         let mut inner = self.inner();

@@ -323,7 +323,8 @@ final class VoiceCallControlTests: XCTestCase {
             return { [weak self] in self?.timers.removeAll { $0.id == id } }
         }
 
-        func publish(_ state: VoiceCaptureState) { shown.append(state) }
+        func publish(_ state: VoiceCaptureState, mutedByPerson _: Bool) { shown.append(state) }
+        func permitted(mutedByPerson _: Bool) {}
         func ended() { ends += 1 }
 
         /// Runs every timer that is due. A test that stalls the timers simply does not call this.
@@ -705,7 +706,8 @@ final class VoiceRecorderReaderTests: XCTestCase {
         func activate() throws {}
         func deactivate() {}
         func schedule(atMs _: UInt64, _: @escaping () -> Void) -> () -> Void { {} }
-        func publish(_: VoiceCaptureState) {}
+        func publish(_: VoiceCaptureState, mutedByPerson _: Bool) {}
+        func permitted(mutedByPerson _: Bool) {}
         func ended() {}
     }
 

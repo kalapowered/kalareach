@@ -389,8 +389,13 @@ public protocol VoiceCallPlatform: AnyObject {
     /// Runs `task` once at `atMs` on the monotonic clock, on a queue of the call's own rather than
     /// the main queue. The answer cancels it.
     func schedule(atMs: UInt64, _ task: @escaping () -> Void) -> () -> Void
-    /// Tells the screen what the microphone is doing.
-    func publish(_ state: VoiceCaptureState)
+    /// Tells the screen what the microphone is doing, and whether the person has muted it. The mute
+    /// is a fact of its own: the state reads `unavailable` whenever the microphone is not running,
+    /// whatever the person did.
+    func publish(_ state: VoiceCaptureState, mutedByPerson: Bool)
+    /// The host's answer was taken: the call is permitted, the audio session is open, and the
+    /// microphone waits for the recorder. Told once, with the person's mute as it stands.
+    func permitted(mutedByPerson: Bool)
     /// The call has ended: whatever the platform holds for it, the connection first, goes now.
     func ended()
 }
@@ -490,6 +495,7 @@ public final class VoiceCallControl: @unchecked Sendable {
             }
             cancelExpiry = platform.schedule(atMs: deadline) { [weak self] in self?.stop() }
             applyLocked(now)
+            platform.permitted(mutedByPerson: gate.isMutedByPerson)
             return true
         }
     }
@@ -595,7 +601,7 @@ public final class VoiceCallControl: @unchecked Sendable {
         switches.setAudioDevice(live)
         switches.setMicrophone(gate.captureEnabled(nowMs: now))
         switches.setPlayback(live && !playbackMuted && !interrupted)
-        platform.publish(shown)
+        platform.publish(shown, mutedByPerson: gate.isMutedByPerson)
     }
 
     private func stopLocked() {
@@ -612,7 +618,7 @@ public final class VoiceCallControl: @unchecked Sendable {
             platform.deactivate()
             sessionOpen = false
         }
-        platform.publish(.idle)
+        platform.publish(.idle, mutedByPerson: gate.isMutedByPerson)
         platform.ended()
     }
 

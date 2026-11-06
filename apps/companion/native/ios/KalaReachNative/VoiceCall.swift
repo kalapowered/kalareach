@@ -85,6 +85,9 @@ public final class VoiceCall: NSObject {
     /// each answer to the reader, which decides what it means. Both touched only on ``queue``.
     private var recorderTimer: DispatchSourceTimer?
     private var recorderReader: VoiceRecorderReader!
+    /// The call on the lock screen and in the system's other remote controls, from the permit to
+    /// the end.
+    private var lockScreen: LockScreenControls!
 
     /// Whether the person has muted their own microphone.
     public var isMutedByPerson: Bool { control.isMutedByPerson }
@@ -117,7 +120,7 @@ public final class VoiceCall: NSObject {
     /// - Throws: ``VoiceAudioError/callAlreadyRunning`` while another call holds the audio,
     ///   ``VoiceAudioError/answerNotApplicable(_:)`` when the connection cannot be made, and
     ///   ``VoiceAudioError/eventChannelNotOpened`` when the provider's channel cannot be made.
-    public init(observer: VoiceCallObserver) throws {
+    public init(observer: VoiceCallObserver, remote: RemoteControlSurface = SystemRemoteControls()) throws {
         // Before the factory or any connection exists, so the audio unit cannot start by itself.
         AudioSession.shared.holdAudioUntilACallTurnsItOn()
 
@@ -165,6 +168,14 @@ public final class VoiceCall: NSObject {
             connection.close()
             throw VoiceAudioError.callAlreadyRunning
         }
+        // Before the control exists, as the control publishes to it. A remote can only mute the
+        // microphone or end the call, and both go through the control.
+        lockScreen = LockScreenControls(
+            surface: remote,
+            queue: queue,
+            mute: { [weak self] in self?.control.setMutedByPerson(true) },
+            stop: { [weak self] in self?.control.stop() }
+        )
         // The recorder is known here only from readings, so what was heard is vouched for only up
         // to the last reading that saw audio arrive.
         control = VoiceCallControl(
@@ -341,15 +352,22 @@ public final class VoiceCall: NSObject {
             return { work.cancel() }
         }
 
-        func publish(_ state: VoiceCaptureState) {
+        func permitted(mutedByPerson: Bool) {
+            let call = call
+            call.lockScreen.begin(mutedByPerson: mutedByPerson) { !call.control.isStopped }
+        }
+
+        func publish(_ state: VoiceCaptureState, mutedByPerson: Bool) {
             AudioSession.shared.publish(state, for: call)
             // Told on the call's own queue, not on the thread that changed it: the control calls
             // this under its lock, and what an observer does must not wait for that thread.
             let call = call
+            call.lockScreen.follow(mutedByPerson: mutedByPerson)
             call.queue.async { call.observer?.voiceCall(call, captureChanged: state) }
         }
 
         func ended() {
+            call.lockScreen.end()
             call.watchRecorder(false)
             call.connection.close()
             call.events?.delegate = nil

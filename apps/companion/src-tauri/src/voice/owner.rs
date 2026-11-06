@@ -56,6 +56,7 @@ use kr_protocol::voice::{
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+use super::advice::MuteAdvice;
 use super::cause::Cause;
 use super::host::{CallHost, HostReach, Pairing, has_ended, revoke};
 use super::view::{DelegationRow, EndedView, HostEnd, OwedView, VoiceCallState};
@@ -224,6 +225,8 @@ pub(super) struct Owner {
     descriptor: Option<VoiceSessionDescriptor>,
     control: Option<VoiceControl>,
     control_events: Option<ControlEvents>,
+    /// Tells the voice service the person's mute, whichever control changed it.
+    advice: Option<MuteAdvice>,
     attached_before: bool,
     answered: VecDeque<String>,
     deadline: Pin<Box<tokio::time::Sleep>>,
@@ -307,6 +310,7 @@ impl Owner {
             descriptor: None,
             control: None,
             control_events: None,
+            advice: None,
             attached_before: false,
             answered: VecDeque::new(),
             deadline: far_future(),
@@ -821,6 +825,7 @@ impl Owner {
             target,
             Arc::clone(&self.tokens) as Arc<dyn AccountTokenSource>,
         );
+        self.advice = Some(MuteAdvice::start(self.platform(), control.clone()));
         self.control = Some(control);
         self.control_events = Some(control_events);
         let remaining = Duration::from_millis(closes.saturating_sub(now_ms()));
@@ -1065,7 +1070,8 @@ impl Owner {
     }
 
     /// Silences the microphone or the model's voice on this device; the voice service is told of a
-    /// microphone's mute as well, which is advice to the provider and not the mute itself.
+    /// microphone's mute as well, which is advice to the provider and not the mute itself, and which
+    /// follows the mute whichever control made it ([`MuteAdvice`]).
     fn mute(&self, what: Mute, muted: bool, reply: oneshot::Sender<Result<VoiceCallState>>) {
         let Some(call) = self.call.clone() else {
             let _ = reply.send(Err(CommandError::refused(
@@ -1075,7 +1081,7 @@ impl Owner {
         };
         let platform = self.platform();
         let shared = Arc::clone(&self.shared);
-        let control = self.control.clone();
+        let advice = self.advice.as_ref().map(MuteAdvice::waker);
         tokio::spawn(async move {
             match platform.mute(&call, what, muted).await {
                 Err(failure) => {
@@ -1097,14 +1103,9 @@ impl Owner {
                     // The service is told after the person has their answer: it is advice to the
                     // provider, and the mute does not wait for it.
                     if what == Mute::Microphone
-                        && let Some(control) = control
+                        && let Some(advice) = advice
                     {
-                        let command = if muted {
-                            VoiceCommand::Mute
-                        } else {
-                            VoiceCommand::Unmute
-                        };
-                        let _ = control.send(command, None, None).await;
+                        advice.notify_one();
                     }
                 }
             }
@@ -1123,6 +1124,10 @@ impl Owner {
             }
             Some(Heard::Event(CallEvent::Capture { state })) => {
                 self.view(|view| view.capture = capture_word(state));
+                // The change may be the person's own mute from a control of the phone.
+                if let Some(advice) = &self.advice {
+                    advice.changed();
+                }
                 None
             }
             Some(Heard::Event(
@@ -1174,6 +1179,10 @@ impl Owner {
             }
             Some(ControlNews::Attached { delegations, .. }) => {
                 self.view(|state| state.control = "connected".to_owned());
+                // A mute told while no socket was open was lost, and the service starts unmuted.
+                if let Some(advice) = &self.advice {
+                    advice.changed();
+                }
                 self.shared.clear_note();
                 if !self.attached_before {
                     self.attached_before = true;
@@ -1398,6 +1407,8 @@ impl Owner {
             state.running = false;
             state.begin_ending(id);
         });
+        // The mute is no longer advice to anyone once the call is ending.
+        self.advice = None;
         // The control closes the call at the service while the media and the host are dealt with,
         // and its news is read meanwhile: a control that nobody reads stops reading its socket.
         let closing = match (&self.control, cause.service_closed()) {

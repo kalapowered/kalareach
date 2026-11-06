@@ -20,6 +20,7 @@
 //! | A sign of life that native code refuses as ended ends the call | `a_sign_of_life_native_code_refuses_as_ended_ends_the_call` |
 //! | A delegation is answered to the model that nothing was done, once | `a_delegation_is_answered_to_the_model_that_nothing_was_done_once` |
 //! | A mute silences the microphone here and is told to the service | `muting_the_microphone_silences_it_here_and_tells_the_service` |
+//! | A mute from the phone's own controls is told to the service in order | `a_mute_from_the_phones_own_controls_is_told_to_the_service_in_order` |
 //! | What the system does to capture in a call is told, and ends nothing | `the_systems_changes_to_capture_are_told_and_do_not_end_the_call` |
 //! | A voice call is not a shell session: hanging up leaves the session a worker runs live | `hanging_up_a_call_leaves_the_terminal_session_it_was_made_over_running` |
 //! | A voice service that is down in the call or at the hang-up leaves mute, silence, the media's stop and the grant's revocation with this device and the host | `a_service_that_goes_down_in_the_call_leaves_mute_and_silence_with_native_code`, `a_service_that_is_down_at_the_hang_up_still_stops_the_media_and_revokes_the_grant` |
@@ -1086,6 +1087,104 @@ async fn muting_the_microphone_silences_it_here_and_tells_the_service() {
             .count(),
         1,
         "only the microphone's mute is advice to the provider: {tellings:?}"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// KR-REQ-15.35: a mute made from one of the phone's own controls, the lock screen or the
+/// notification, is told to the service as the page's is, in order: the service ends up told the
+/// newest state whichever control changed it last, and is not told what it already holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mute_from_the_phones_own_controls_is_told_to_the_service_in_order() {
+    let mut scene = scene().await;
+    scene.start().await;
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    let told = |scene: &Scene| -> Vec<String> {
+        commands_sent(scene)
+            .into_iter()
+            .filter(|command| command == "mute" || command == "unmute")
+            .collect()
+    };
+
+    scene.platform.mute_from_a_remote(true);
+    scene
+        .stand_in
+        .control()
+        .until("the service was told of the remote mute", |report| {
+            report
+                .frames
+                .iter()
+                .any(|frame| frame.contains(r#""command":"mute""#))
+        })
+        .await;
+    scene
+        .state_where("a muted microphone", |state| {
+            state["capture"] == "muted_by_person"
+        })
+        .await;
+
+    // The page unmutes, and then a remote mutes again: the service is told each change once.
+    scene
+        .call(
+            "voice_set_muted",
+            json!({ "what": "microphone", "muted": false }),
+        )
+        .expect("the microphone is unmuted");
+    scene
+        .stand_in
+        .control()
+        .until("the service was told of the unmute", |report| {
+            report
+                .frames
+                .iter()
+                .any(|frame| frame.contains(r#""command":"unmute""#))
+        })
+        .await;
+    scene.platform.mute_from_a_remote(true);
+    scene
+        .stand_in
+        .control()
+        .until("the service was told of the second mute", |report| {
+            report
+                .frames
+                .iter()
+                .filter(|frame| frame.contains(r#""command":"mute""#))
+                .count()
+                == 2
+        })
+        .await;
+    // Playback is native code's alone and a repeat of the same state tells nothing.
+    scene
+        .call(
+            "voice_set_muted",
+            json!({ "what": "playback", "muted": true }),
+        )
+        .expect("the voice is silenced");
+    scene.platform.mute_from_a_remote(true);
+
+    // A remote unmute after the page's mute: the service ends told unmuted.
+    scene.platform.mute_from_a_remote(false);
+    scene
+        .stand_in
+        .control()
+        .until("the service was told of the last unmute", |report| {
+            report
+                .frames
+                .iter()
+                .filter(|frame| frame.contains(r#""command":"unmute""#))
+                .count()
+                == 2
+        })
+        .await;
+    assert_eq!(
+        told(&scene),
+        ["mute", "unmute", "mute", "unmute"],
+        "each change is told once, in order"
     );
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;

@@ -15,6 +15,7 @@
 //! to the model by a fixed sentence that nothing was done, and the screen is shown a row saying
 //! so.
 
+mod advice;
 mod cause;
 mod host;
 mod kept;

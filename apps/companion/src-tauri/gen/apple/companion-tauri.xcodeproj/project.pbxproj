@@ -52,6 +52,7 @@
 		645EDAE57375A3C4C55AA57D /* PushAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D462F3FFF1B011AD7031A3D /* PushAdapter.swift */; };
 		686C26B6917A4CA5FD67D4D6 /* LaunchHook.m in Sources */ = {isa = PBXBuildFile; fileRef = 2C4D68F5B5A1CA28AA156354 /* LaunchHook.m */; };
 		68AC1753D6FABD0C4BDE7C2D /* PushTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = 99BC854EA5471EB382EFF2F2 /* PushTokens.swift */; };
+		6D2F1B8E4CA05237B9E16F82 /* LockScreenControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C1E0A7D3B9F4126A8D05E71 /* LockScreenControls.swift */; };
 		6EE6D79D43246CA480737C10 /* DeviceProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A195DBBD19A2188DF699148 /* DeviceProbe.swift */; };
 		70CE80D39ED8CF570A2B5323 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3121E24E1630B06FCF24ECAF /* QuartzCore.framework */; };
 		737A1B6B55E6D6F5824A6B8F /* FirebaseMessaging in Frameworks */ = {isa = PBXBuildFile; productRef = 5A4F2DB520835CCE7A05C529 /* FirebaseMessaging */; };
@@ -61,6 +62,7 @@
 		7940EE3C08E1537A5E3E0D2E /* PreviewOpenerJson.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5DDBD93E046A5E1997C1CB3 /* PreviewOpenerJson.swift */; };
 		7A6B27860E765547E301BC04 /* ExtensionProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95A67B2C4E3E055F8FF0B3D2 /* ExtensionProbe.swift */; };
 		7AAC755F1D7FA7682ABAC13B /* PushRegistrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80501AE28B92D372CBA6A15F /* PushRegistrationTests.swift */; };
+		7E30C29F5DB16348CAF27093 /* LockScreenControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C1E0A7D3B9F4126A8D05E71 /* LockScreenControls.swift */; };
 		7F51A81DB5EF05DDD1E9649C /* VoiceAnswerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF4DC9933F524066EFBCAD81 /* VoiceAnswerTests.swift */; };
 		7F6324AEB51F8C80D5C597E8 /* VoiceCall.swift in Sources */ = {isa = PBXBuildFile; fileRef = D607C597A5761B168642D0EB /* VoiceCall.swift */; };
 		833834BD198E6726DA47E772 /* PendingFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 97490480791DB5F59A05788C /* PendingFile.swift */; };
@@ -69,6 +71,7 @@
 		87BC6D4E02E6D862E1D375DC /* VoiceAnswer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E04FEC9E6BD6E0B6EC28B315 /* VoiceAnswer.swift */; };
 		8A6FFBB0B2F8EF1B311DD1B3 /* VoiceCall.swift in Sources */ = {isa = PBXBuildFile; fileRef = D607C597A5761B168642D0EB /* VoiceCall.swift */; };
 		8C8D5305283EBB3006AE42A4 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 529A8B9ADD788615F4718EB0 /* PushRegistration.swift */; };
+		90522E4B7FD38560EC149B25 /* LockScreenControlsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F41D3A06EC27459DB038A14 /* LockScreenControlsTests.swift */; };
 		94997D5DBE6F90518D2BE6DD /* ShareSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BF8072943115F58C78CD7C9 /* ShareSurface.swift */; };
 		9611CBDD46D19D11C8953D90 /* AudioSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */; };
 		997116091FE09A7004D95DF3 /* LaunchPlanTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8D926690334E315AA0773F5 /* LaunchPlanTests.swift */; };
@@ -205,6 +208,7 @@
 		5A5B0AC502F8AC8B058ADE39 /* screen.rs */ = {isa = PBXFileReference; path = screen.rs; sourceTree = "<group>"; };
 		5AAECC7799B8A609EB72D33A /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
 		5B391808796597DF04323FC2 /* VoiceCeremony.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceCeremony.swift; sourceTree = "<group>"; };
+		5C1E0A7D3B9F4126A8D05E71 /* LockScreenControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LockScreenControls.swift; sourceTree = "<group>"; };
 		5D1E24E54ED6AC12D29FB88F /* probe.rs */ = {isa = PBXFileReference; path = probe.rs; sourceTree = "<group>"; };
 		5D97820B51FD28859F00F528 /* KRNativeLaunch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KRNativeLaunch.swift; sourceTree = "<group>"; };
 		5DC0FEC180F00EA2178F4445 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
@@ -235,6 +239,7 @@
 		8A7556962086670CA11B4113 /* LayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LayoutTests.swift; sourceTree = "<group>"; };
 		8B8736AB66D26BDC18C22D52 /* Support.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Support.swift; sourceTree = "<group>"; };
 		8E330FA8B7B00EAFC43E409F /* DelegateMethodsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateMethodsTests.swift; sourceTree = "<group>"; };
+		8F41D3A06EC27459DB038A14 /* LockScreenControlsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LockScreenControlsTests.swift; sourceTree = "<group>"; };
 		9036197802CA380577FAE896 /* mod.rs */ = {isa = PBXFileReference; path = mod.rs; sourceTree = "<group>"; };
 		947244465A6AE6F57BB9FC88 /* drafts.rs */ = {isa = PBXFileReference; path = drafts.rs; sourceTree = "<group>"; };
 		94ED5C071F59B8162444548C /* sync_service.rs */ = {isa = PBXFileReference; path = sync_service.rs; sourceTree = "<group>"; };
@@ -484,6 +489,7 @@
 				12639EB0D5C8EE0E5505664F /* DelegateMethods.swift */,
 				D5BA8B3F99FC67438FEBDEFB /* FirebaseConfiguration.swift */,
 				7F7673A3BC9A13535E7488A9 /* LaunchPlan.swift */,
+				5C1E0A7D3B9F4126A8D05E71 /* LockScreenControls.swift */,
 				051C72A4F29B11CDE86D2A4F /* NotificationRoute.swift */,
 				97490480791DB5F59A05788C /* PendingFile.swift */,
 				060ED951D45DB3BF843619B8 /* PreviewKeySet.swift */,
@@ -606,6 +612,7 @@
 				465801722BC2B2B9CACC69F2 /* ExtensionProbeTests.swift */,
 				A429A2E803729D3C91407DF9 /* FirebaseConfigurationTests.swift */,
 				E8D926690334E315AA0773F5 /* LaunchPlanTests.swift */,
+				8F41D3A06EC27459DB038A14 /* LockScreenControlsTests.swift */,
 				706D722741B57C9A76DDE572 /* PreviewDecisionTests.swift */,
 				BDF21C4FFBBC3A2A3494E9AA /* ProbeSupportTests.swift */,
 				FE2CD7F1E48AE0A0740DC275 /* PushReceiverTests.swift */,
@@ -994,7 +1001,9 @@
 				3B6BDAE2BBAD62D318AAA49E /* FirebaseConfiguration.swift in Sources */,
 				CA6E8A5DA0556B9B6054317D /* FirebaseConfigurationTests.swift in Sources */,
 				1B1725B261E3503461B41CFD /* LaunchPlan.swift in Sources */,
+				7E30C29F5DB16348CAF27093 /* LockScreenControls.swift in Sources */,
 				997116091FE09A7004D95DF3 /* LaunchPlanTests.swift in Sources */,
+				90522E4B7FD38560EC149B25 /* LockScreenControlsTests.swift in Sources */,
 				19CD84293D84161400F02C40 /* NotificationRoute.swift in Sources */,
 				20040B769B0DBD0118B12C78 /* NotificationService.swift in Sources */,
 				833834BD198E6726DA47E772 /* PendingFile.swift in Sources */,
@@ -1042,6 +1051,7 @@
 				CCD9B0A8CD4FBCFE1F2A4A8D /* KRNativeLaunch.swift in Sources */,
 				686C26B6917A4CA5FD67D4D6 /* LaunchHook.m in Sources */,
 				27B4FE203288F26127E58B2C /* LaunchPlan.swift in Sources */,
+				6D2F1B8E4CA05237B9E16F82 /* LockScreenControls.swift in Sources */,
 				E48BB0F8DC681D65CE0D40E3 /* NotificationRoute.swift in Sources */,
 				B8C8E4692B6F76EFEDF9932E /* PendingFile.swift in Sources */,
 				E0323C62307BEB4D7C24ED54 /* PreviewDecision.swift in Sources */,
