@@ -589,15 +589,15 @@ async fn confirmed(
             Err(refused) => Err(CliError::Refused(refused)),
         },
         async || {
-            crate::plugin::listed_in(
+            crate::plugin::challenge_listed(
                 bind::read(
                     &mut **client.lock().await,
                     Method::OwnerConfirmationPending,
                     &OwnerConfirmationPendingParams {},
-                )
-                .await,
+                ),
                 &challenge.request,
             )
+            .await
         },
     )
     .await
