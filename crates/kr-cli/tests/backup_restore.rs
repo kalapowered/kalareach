@@ -13,7 +13,8 @@
 //! The cases run on Windows as well as on Unix, by the way the command is used there: the kit is
 //! named with `--kit-file` or piped, and a plan is confirmed with `--confirm-plan`. A case that
 //! needs what only Unix has (a terminal that is asked, a signal, a file's mode, a link, a pipe on
-//! the file system) is Unix's alone, and the file says so at each.
+//! the file system, the rename of a folder a run holds open) is Unix's alone, and the file says so
+//! at each.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -406,6 +407,11 @@ impl Rig {
         for directory in [&work, &home] {
             std::fs::create_dir(directory).expect("a directory on the internal disk");
         }
+        #[cfg(windows)]
+        for directory in ["Local", "Roaming"] {
+            std::fs::create_dir_all(home.join("AppData").join(directory))
+                .expect("a folder for the host's program data");
+        }
         write_document(&temp, served.origin());
         if sign_in == SignIn::Usable {
             keep_sign_in(&temp, served.origin()).await;
@@ -478,8 +484,6 @@ impl Rig {
             "windir",
             "TEMP",
             "TMP",
-            "LOCALAPPDATA",
-            "APPDATA",
             "ComSpec",
             "PATHEXT",
         ] {
@@ -489,7 +493,25 @@ impl Rig {
         }
         let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
         variables.push(("PATH", format!(r"{root}\System32")));
+        // The folders a program keeps its data in are the host's own below its home, so nothing of
+        // the account running the test is read or written.
         variables.push(("USERPROFILE", self.home.display().to_string()));
+        variables.push((
+            "LOCALAPPDATA",
+            self.home
+                .join("AppData")
+                .join("Local")
+                .display()
+                .to_string(),
+        ));
+        variables.push((
+            "APPDATA",
+            self.home
+                .join("AppData")
+                .join("Roaming")
+                .display()
+                .to_string(),
+        ));
         variables.push((
             "KR_RUNTIME_DIR",
             self.temp.paths().runtime_root().display().to_string(),
@@ -2105,7 +2127,15 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
             let path = entry.path();
             if path.is_dir() {
                 walk(root, &path, into);
-            } else if let Ok(bytes) = std::fs::read(&path) {
+            } else if path.is_file() {
+                // A regular file that exists and cannot be read would leave a scan of the tree
+                // vacuous, so it fails the case; one removed since the folder was listed is gone,
+                // and a socket or a pipe is not a file and is not read.
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => panic!("{} cannot be read: {error}", path.display()),
+                };
                 // Named with `/` between its parts on every platform, so a case compares a name
                 // with the same text wherever it runs.
                 into.insert(
@@ -2981,12 +3011,12 @@ async fn a_service_that_keeps_asking_for_quiet_stops_the_run_after_five_waits_an
 /* The folder                                                                  */
 /* -------------------------------------------------------------------------- */
 
-/// A folder other accounts may write in, a link to a folder, a folder with something in it and one
-/// that is not there are each refused before a kit is read or the service is asked; a folder a
-/// group may write in is the person's own choice, and goes ahead.
+/// A folder other accounts may write in and a link to a folder are each refused before a kit is
+/// read or the service is asked; a folder a group may write in is the person's own choice, and goes
+/// ahead. A file's mode and a link are Unix's.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_folder_that_is_not_the_persons_to_fill_is_refused_before_anything_is_read() {
+async fn a_folder_that_other_accounts_write_in_or_a_link_is_refused_before_anything_is_read() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let fixture = Fixture::new().await;
@@ -3018,10 +3048,33 @@ async fn a_folder_that_is_not_the_persons_to_fill_is_refused_before_anything_is_
     assert_eq!(refused.status.code(), Some(2));
     assert!(text(&refused.stderr).contains("symbolic link"));
 
+    assert_eq!(
+        fixture.bundle_reads(),
+        1,
+        "only the control asked the service"
+    );
+}
+
+/// A folder with something in it, one that is not there and a file are each refused before a kit
+/// is read or the service is asked, and what a file manager adds to a folder is named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folder_with_something_in_it_one_that_is_not_there_and_a_file_are_refused_before_anything_is_read()
+ {
+    let fixture = Fixture::new().await;
+    let preview = |into: String| {
+        let fixture = &fixture;
+        async move {
+            fixture
+                .rig
+                .run(&fixture.line(&into, &["--preview"]), Some(b""))
+                .await
+        }
+    };
+
     // A folder with something in it, and what a file manager adds is named.
     std::fs::write(fixture.into.join(".DS_Store"), b"x").expect("a file");
     let refused = preview(fixture.folder_arg()).await;
-    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
     let said = text(&refused.stderr);
     assert!(
         said.contains("not empty") && said.contains(".DS_Store"),
@@ -3031,19 +3084,15 @@ async fn a_folder_that_is_not_the_persons_to_fill_is_refused_before_anything_is_
     // A folder that is not there, and a file.
     let missing = fixture.rig.temp.root().join("missing");
     let refused = preview(missing.display().to_string()).await;
-    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
     assert!(text(&refused.stderr).contains("does not exist"));
     let file = fixture.rig.temp.root().join("file");
     std::fs::write(&file, b"x").expect("a file");
     let refused = preview(file.display().to_string()).await;
-    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
     assert!(text(&refused.stderr).contains("not a folder"));
 
-    assert_eq!(
-        fixture.bundle_reads(),
-        1,
-        "only the control asked the service"
-    );
+    assert_eq!(fixture.bundle_reads(), 0, "no refusal asked the service");
 }
 
 /// While a member is being read the folder is renamed away and another is put at its path, which
@@ -3560,19 +3609,31 @@ async fn a_bundle_that_names_several_archives_lists_them_and_the_person_chooses_
 /// The folder is checked again when it is opened, so an entry put in after the first check is found;
 /// the probe of how the record is published removes only the names it made, so a name another
 /// writer put in meanwhile stays; and a record published whole leaves nothing to warn about.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_folder_is_checked_again_when_opened_and_the_probe_removes_only_what_it_made() {
     use kr_cli::backup::directory::Destination;
 
     let fixture = Fixture::new().await;
     let destination = Destination::check(&fixture.into).expect("the folder passes");
+    // The path as the operating system names it, in bytes: what the plan's digest holds.
+    #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
         assert_eq!(
             destination.native_bytes(),
             fixture.into.as_os_str().as_bytes()
         );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let wide: Vec<u8> = fixture
+            .into
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(destination.native_bytes(), wide);
     }
     std::fs::write(fixture.into.join("late"), b"x").expect("an entry");
     assert!(
@@ -3605,7 +3666,6 @@ async fn the_folder_is_checked_again_when_opened_and_the_probe_removes_only_what
 
 /// A run that ends without publishing its record removes what it made, however it ended, a panic
 /// included: dropping the held folder is the backstop under the explicit cleanup.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_held_folder_dropped_before_the_record_is_published_is_emptied_of_what_was_made() {
     use kr_cli::backup::directory::Destination;
