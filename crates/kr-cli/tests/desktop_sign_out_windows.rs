@@ -17,6 +17,7 @@
 
 #![cfg(windows)]
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -415,8 +416,9 @@ impl Drop for Reopened {
 }
 
 /// A scheduled task, deleted when this is dropped, so that a failure anywhere after the entry is
-/// known leaves nothing of the account's registered: removing an account does not remove the tasks
-/// it registered.
+/// known does not leave it registered: removing an account does not remove the tasks it registered.
+/// The deletion is tried once; a failure of it is written to the error output, without a panic that
+/// would end the process during an unwinding.
 struct RegisteredTask {
     name: Option<String>,
 }
@@ -448,7 +450,7 @@ impl RegisteredTask {
 impl Drop for RegisteredTask {
     fn drop(&mut self) {
         if let Err(why) = self.delete() {
-            eprintln!("{why}");
+            let _ = writeln!(std::io::stderr(), "{why}");
         }
     }
 }
@@ -477,15 +479,15 @@ async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost(
             )
         }))
         .expect("a record");
+    // The first half's task is deleted whichever way this half ends, after the daemon that uses it
+    // is let go of.
+    let mut task = RegisteredTask::new(record["task"].as_str().expect("a task").to_owned());
     let before_login = record["login"].as_u64().expect("a login session");
     let session_id: SessionId =
         serde_json::from_value(record["session_id"].clone()).expect("a session identifier");
     let binding: DesktopBinding =
         serde_json::from_value(record["binding"].clone()).expect("a binding");
     let now = kr_ipc::starter::current_session().expect("this process's login session");
-    // The first half's task is deleted whichever way this half ends, after the daemon that uses it
-    // is let go of.
-    let mut task = RegisteredTask::new(record["task"].as_str().expect("a task").to_owned());
 
     // What the sign-out ended: the worker and the root shell, by the identity each was started
     // under.
@@ -647,21 +649,38 @@ fn an_integrity_level_is_named_by_its_sid_whatever_the_language() {
     );
 }
 
+/// The names of the tasks the Task Scheduler lists, which `schtasks` writes one to a line as the
+/// first field, a quoted name with the folder in front of it. A listing that does not succeed stops
+/// the case: it says nothing about any task.
+fn listed_tasks() -> Vec<String> {
+    let output = Command::new(system32("schtasks.exe"))
+        .args(["/Query", "/FO", "CSV", "/NH"])
+        .output()
+        .expect("schtasks runs");
+    assert!(
+        output.status.success(),
+        "schtasks /Query did not succeed: {}",
+        output.status
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix('"')?
+                .split("\",")
+                .next()
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
 /// The guard deletes the entry of a task when a step after it is registered fails.
 #[test]
 #[ignore = registers_a_task!()]
 fn a_registered_task_is_deleted_when_the_case_that_holds_it_fails() {
     let name = format!("kr-guard-test-{}", std::process::id());
-    let schtasks = |arguments: &[&str]| {
-        Command::new(system32("schtasks.exe"))
-            .args(arguments)
-            .output()
-            .expect("schtasks runs")
-            .status
-            .success()
-    };
-    assert!(
-        schtasks(&[
+    let listed = format!("\\{name}");
+    let created = Command::new(system32("schtasks.exe"))
+        .args([
             "/Create",
             "/TN",
             &name,
@@ -672,19 +691,28 @@ fn a_registered_task_is_deleted_when_the_case_that_holds_it_fails() {
             "/ST",
             "23:59",
             "/F",
-        ]),
-        "the entry {name} is registered"
-    );
-    assert!(schtasks(&["/Query", "/TN", &name]), "the entry is there");
-    let failed = std::panic::catch_unwind(|| {
+        ])
+        .output()
+        .expect("schtasks runs");
+    // The guard is made as soon as the entry may be there, whatever the system answered.
+    let seen = std::cell::Cell::new(false);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _task = RegisteredTask::new(name.clone());
+        assert!(created.status.success(), "the entry {name} is registered");
+        seen.set(listed_tasks().contains(&listed));
         panic!("a step after the entry was registered fails");
-    });
-    let left = schtasks(&["/Query", "/TN", &name]);
+    }));
+    let left = listed_tasks().contains(&listed);
     if left {
         // A run that is red leaves nothing of its own behind.
-        schtasks(&["/Delete", "/TN", &name, "/F"]);
+        let _ = Command::new(system32("schtasks.exe"))
+            .args(["/Delete", "/TN", &name, "/F"])
+            .output();
     }
     assert!(failed.is_err(), "the step failed");
+    assert!(
+        seen.get(),
+        "the entry {name} was listed while the guard held it"
+    );
     assert!(!left, "the entry {name} is left registered");
 }
