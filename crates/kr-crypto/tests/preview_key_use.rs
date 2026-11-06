@@ -8,20 +8,33 @@
 //! and a mailbox record or an archive key wrap that names a preview key's identifier as its
 //! recipient is refused. They do not show that the bytes of a preview key cannot be handed to a
 //! call that takes the other kind; the types do, and a caller who converts the bytes and names them
-//! under the other purpose has stepped round them.
+//! under the other purpose has stepped round them. The recovery bundle has no recipient to name,
+//! so its case holds the signature of the call in a compile-time check beside the documentation's
+//! compile failure, and shows that a bundle sealed under a preview key's bytes is not one a restore
+//! can open.
+
+use std::any::TypeId;
 
 use kr_crypto::CryptoError;
-use kr_crypto::archive::{encrypt_object, wrap_object_key};
+use kr_crypto::archive::{
+    decrypt_recovery_bundle, encrypt_object, encrypt_recovery_bundle, wrap_object_key,
+};
 use kr_crypto::envelope::{open_notification_envelope, pad_notification_preview, seal_envelope};
+use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{NotificationPreviewKeyPair, StoredEnvelopeKeyPair, key_id};
 use kr_crypto::sealed::seal_notification_preview;
-use kr_protocol::archive::{KeyWrapContext, KeyWrapFormat, KeyWrapPurpose};
+use kr_crypto::secret::SymmetricKey;
+use kr_protocol::archive::{
+    KeyWrapContext, KeyWrapFormat, KeyWrapPurpose, RecoveryBundle, RecoveryContext,
+};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, EnvelopeId};
 use kr_protocol::mailbox::{
     EnvelopePlaintext, EnvelopeRouting, EnvelopeVersion, MailboxPayloadType, SealedEnvelope,
 };
 use kr_protocol::pairing::KeyPurpose;
-use kr_protocol::scalars::{Bytes, Nullable, StoredEnvelopeKey, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{
+    Bytes, CanonicalSet, Nullable, StoredEnvelopeKey, TimestampMs, U64, Uuid,
+};
 
 const NOW_MS: u64 = 1_700_000_000_000;
 const EXPIRES_MS: u64 = 1_700_000_100_000;
@@ -178,5 +191,98 @@ fn an_archive_key_wrap_cannot_name_a_preview_key_as_its_recipient() {
     assert!(
         matches!(refused, CryptoError::BindingMismatch { .. }),
         "{refused:?}"
+    );
+}
+
+/// Whether `$ty` satisfies the bound `$($bound)+`, decided when the file compiles. The inherent
+/// constant of the probe takes the place of the trait's only where the bound holds.
+macro_rules! satisfies {
+    ($ty:ty, $($bound:tt)+) => {{
+        #[allow(dead_code)]
+        trait Otherwise {
+            const YES: bool = false;
+        }
+        impl<T: ?Sized> Otherwise for T {}
+        struct Probe<T: ?Sized>(std::marker::PhantomData<T>);
+        #[allow(dead_code)]
+        impl<T: ?Sized + $($bound)+> Probe<T> {
+            const YES: bool = true;
+        }
+        <Probe<$ty>>::YES
+    }};
+}
+
+/// The bytes of a preview key's public half, made into a symmetric key: what a caller would have
+/// to do to hand the preview key to the call that encrypts a recovery bundle.
+fn forced_into_a_symmetric_key(preview: &NotificationPreviewKeyPair) -> SymmetricKey {
+    SymmetricKey::from_bytes(*preview.public().as_bytes())
+}
+
+/// KR-REQ-16.11: a recovery bundle is not encrypted under a preview key.
+///
+/// The call takes the symmetric key the recovery seed derives for one retrieval context: it is
+/// held to that signature here by naming it as a function of exactly that type, a preview key pair
+/// is a type of its own that neither is that key nor dereferences to it, and a preview key pair
+/// passed where the call takes its key is what the documentation's compile failure holds. The
+/// control is a bundle encrypted under the derived key, which opens under it. A bundle sealed
+/// under the bytes of a preview key is not one a restore can open, because the restore's only key
+/// is the derived one. Not shown here: a refusal at run time, which there is none of (the symmetric
+/// key is any 32 bytes, and a caller who converts a preview key's bytes has stepped round the
+/// types), or the bundle's binding to its origin and locator.
+#[test]
+fn a_recovery_bundle_cannot_be_encrypted_under_a_preview_key() {
+    // The call is the one that takes a symmetric key, and a preview key is not one.
+    let _: fn(&SymmetricKey, &RecoveryBundle) -> kr_crypto::Result<Vec<u8>> =
+        encrypt_recovery_bundle;
+    assert_ne!(
+        TypeId::of::<NotificationPreviewKeyPair>(),
+        TypeId::of::<SymmetricKey>(),
+        "a preview key pair is not a symmetric key"
+    );
+    assert!(
+        !satisfies!(
+            NotificationPreviewKeyPair,
+            std::ops::Deref<Target = SymmetricKey>
+        ),
+        "a preview key pair passed where a symmetric key is taken would be coerced to one"
+    );
+    // The probe finds a bound that does hold, so its answer above is not its default.
+    assert!(satisfies!(
+        Box<SymmetricKey>,
+        std::ops::Deref<Target = SymmetricKey>
+    ));
+
+    let seed = RecoverySeed::generate().expect("a recovery seed");
+    let key = seed
+        .bundle_key_for(&RecoveryContext {
+            service_origin: "https://reach.kala.to".to_owned(),
+            bundle_locator: "opaque-locator".to_owned(),
+        })
+        .expect("a bundle key");
+    let bundle = RecoveryBundle {
+        schema_version: U64::new(1),
+        collections: Vec::new(),
+        trusted_writers: CanonicalSet::new(),
+        trusted_producers: CanonicalSet::new(),
+        checkpoints: CanonicalSet::new(),
+        revision: U64::new(3),
+        written_at_ms: TimestampMs::new(NOW_MS),
+    };
+
+    // The control: the bundle opens under the key the seed derives.
+    let sealed = encrypt_recovery_bundle(&key, &bundle).expect("an encrypted bundle");
+    assert_eq!(
+        decrypt_recovery_bundle(&key, &sealed).expect("the bundle"),
+        bundle
+    );
+
+    // Sealed under the bytes of a preview key, the bundle is not the owner's recovery bundle.
+    let preview = NotificationPreviewKeyPair::generate().expect("a keypair");
+    let forced = forced_into_a_symmetric_key(&preview);
+    let sealed_under_a_preview_key =
+        encrypt_recovery_bundle(&forced, &bundle).expect("any 32 bytes are a symmetric key");
+    assert!(
+        decrypt_recovery_bundle(&key, &sealed_under_a_preview_key).is_err(),
+        "a restore opened a bundle sealed under a preview key"
     );
 }
