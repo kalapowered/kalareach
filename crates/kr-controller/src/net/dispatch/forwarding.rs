@@ -121,10 +121,15 @@ impl OwnClaim {
     /// itself. [`Self::leave`] gives up the call's handle only: the entry leaves the set when the
     /// work lets go of it as well.
     pub(super) fn shared_with_the_work(&self) -> Option<Arc<Arrival>> {
-        self.arrival
+        let entry = self
+            .arrival
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .clone();
+        if let Some(entry) = &entry {
+            entry.goes_on_without_a_route();
+        }
+        entry
     }
 
     /// Whether another call that carries `request` has not yet claimed its route.
@@ -134,6 +139,20 @@ impl OwnClaim {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         arrivals.another_carries(request, own.as_deref())
+    }
+
+    /// Whether another call has carried out, or is carrying out, a close of `request` with no
+    /// route.
+    fn another_close_went_on_without_a_route(
+        &self,
+        arrivals: &Arrivals,
+        request: &Carried,
+    ) -> bool {
+        let own = self
+            .arrival
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        arrivals.another_close_went_on_without_a_route(request, own.as_deref())
     }
 }
 
@@ -224,9 +243,11 @@ impl RemoteConnection {
     /// The route is read now, when the refusal is worded, because a copy of the request can claim it
     /// at any point while this one waits. A route this call made itself does not count, so a first
     /// request refused after its own claim is refused as ever. A route that holds another request
-    /// under the identifier does not either: the identifier is spent, no copy of this request can
-    /// have been carried out under it, and the refusal keeps its code however many copies of this
-    /// request are queued. A code that is already `OUTCOME_UNKNOWN` is told as it is.
+    /// under the identifier does not either: the identifier is spent, this host dispatches nothing
+    /// under it for this request, and the refusal keeps its code however many copies of this request
+    /// are queued. A close that went on without a route is the exception
+    /// ([`Self::identifier_is_spent_on_another_request`]). A code that is already `OUTCOME_UNKNOWN`
+    /// is told as it is.
     pub(super) fn told_of_a_repeat(
         &self,
         own_claim: &OwnClaim,
@@ -235,7 +256,7 @@ impl RemoteConnection {
     ) -> ProtocolError {
         if error.code == ErrorCode::OutcomeUnknown
             || own_claim.is_made()
-            || self.route_holds_another_request(mutation)
+            || self.identifier_is_spent_on_another_request(own_claim, mutation)
             || !(self.another_copy_has_not_claimed(own_claim, mutation)
                 || self.holds_a_route_for(mutation))
         {
@@ -247,13 +268,26 @@ impl RemoteConnection {
 
     /// Whether the route of the action a mutation carries holds another request, which makes the
     /// identifier a reused one that nothing is carried out under for this request.
-    fn route_holds_another_request(&self, mutation: &MutationRequest) -> bool {
+    ///
+    /// A close that went on without a route is the exception: another request can have claimed the
+    /// identifier since, and the close was carried out, or may be, before it did. A call that is
+    /// only waiting its turn is not one, since the route leaves nothing of it to be carried out.
+    fn identifier_is_spent_on_another_request(
+        &self,
+        own_claim: &OwnClaim,
+        mutation: &MutationRequest,
+    ) -> bool {
         let actor_id = self.device.principal();
-        match self.devices.action_route(&actor_id, mutation.action_id) {
+        let held_by_another = match self.devices.action_route(&actor_id, mutation.action_id) {
             Ok(Some(routed)) => kr_protocol::digest::mutation_digest(mutation, &actor_id)
                 .is_ok_and(|digest| routed.payload_digest != Some(digest)),
             Ok(None) | Err(_) => false,
-        }
+        };
+        held_by_another
+            && !request_of(&actor_id, mutation).is_some_and(|request| {
+                own_claim
+                    .another_close_went_on_without_a_route(self.controller.arrivals(), &request)
+            })
     }
 
     /// Whether a copy of this request is being served that has not yet claimed the route of its
@@ -728,9 +762,10 @@ impl RemoteConnection {
         asked: &mut Option<Asked>,
     ) -> std::result::Result<ControlFrame, ProtocolError> {
         // A reused identifier is this host's word about the identifier and names no result, so it
-        // is no read of a record and is shown as it is, whoever asks. It is written under the
-        // decision of the request, not as an answer kept from an earlier submission: a refusal to
-        // write a kept answer is told as an unknown outcome, and nothing was carried out here.
+        // is no read of a record and is shown as it is, to whoever is still registered. It is
+        // written under the decision of the request, not as an answer kept from an earlier
+        // submission: a refusal to write a kept answer is told as an unknown outcome, and nothing
+        // was carried out here.
         let reused = matches!(
             &kept,
             ControlFrame::Response(Response {
