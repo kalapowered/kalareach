@@ -3656,10 +3656,25 @@ mod tests {
             .await
             .expect("the repeat reaches the place it is stopped at")
             .expect("the pause is armed");
-        host.controller
+        let acknowledged = host
+            .controller
             .revoke_device_authority(host.device_id, None, None)
             .await
             .expect("the revocation is acknowledged");
+        assert!(
+            acknowledged
+                .barrier
+                .workers
+                .iter()
+                .all(|worker| worker.state != kr_protocol::action::BarrierState::Pending),
+            "no barrier is pending when the revocation is acknowledged"
+        );
+        assert!(
+            host.controller
+                .admitted_revision(ConnectionId::new(uuid(77)))
+                .is_err(),
+            "the device's registration is withdrawn by the time the revocation is acknowledged"
+        );
         release.send(()).expect("the repeat goes on");
         let withheld = waiting
             .await
@@ -3667,6 +3682,11 @@ mod tests {
             .into_answer()
             .expect_err("a revoked device is not given the receipt");
         assert_eq!(withheld.code(), ErrorCode::PermissionDenied, "{withheld}");
+        assert_eq!(
+            host.revisions().0,
+            2,
+            "the registration was made once, by the first submission"
+        );
     }
 
     /// KR-REQ-09.13: the daemon's entry for a worker replaces the one an answer was given with only
