@@ -517,9 +517,7 @@ impl Roots {
             names.extend(resolved(home)?);
             for name in names {
                 roots.add(&name)?;
-                let library = name.join("Library");
-                roots.add(&library)?;
-                if let Some(moved) = resolved(&library)? {
+                if let Some(moved) = resolved(&name.join("Library"))? {
                     roots.add(&moved)?;
                 }
             }
@@ -865,6 +863,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_home_with_no_library_reached_through_a_link_holds_what_is_above_where_it_is() {
+        let Some((_directory, root)) = scratch() else {
+            return;
+        };
+        let home = root.join("real").join("carol");
+        make(&[home.join(".ssh"), home.join("tools").join("lib")]);
+        std::os::unix::fs::symlink("real/carol", root.join("via")).expect("a link to the home");
+        let roots = Roots::resolving(&[root.join("via")]).expect("the roots are found");
+        for held in [
+            home.clone(),
+            home.join(".ssh"),
+            root.join("real"),
+            root.clone(),
+        ] {
+            assert!(roots.hold(&held), "{} is held", held.display());
+        }
+        assert!(
+            !roots.hold(&home.join("tools").join("lib")),
+            "the controls are not"
+        );
     }
 
     #[test]
