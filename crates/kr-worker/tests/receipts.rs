@@ -1203,6 +1203,11 @@ fn refused_with(frame: ControlFrame) -> ErrorCode {
 /// under another method, one that carries a grant, and a run named by an ingress that is not a
 /// workflow's. None of them closes the session; the close of the right run does, and the same
 /// close sent again before its delivery is confirmed is answered from the first one's receipt.
+///
+/// KR-REQ-09.07, the key's actor and the exact duplicate only: the close is recorded under the
+/// principal the control daemon forwarded for the workflow, not under the daemon's own, and the
+/// retry of the same action is answered with what the first close produced. Not shown here: a
+/// reused identifier with a different payload, or the stored payload digest.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
     let host = host().await;
@@ -1311,14 +1316,20 @@ async fn a_workflow_closes_the_session_its_run_started_and_nothing_else() {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .expect("opens the journal");
-    let principal: String = journal
-        .query_row(
-            "SELECT actor_id FROM receipts WHERE action_id = ?1",
-            [mutation.action_id.get().as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .expect("the close left a receipt");
-    assert_eq!(principal, "workflow:grant");
+    let principals: Vec<String> = journal
+        .prepare("SELECT actor_id FROM receipts WHERE action_id = ?1")
+        .expect("prepares the query")
+        .query_map([mutation.action_id.get().as_bytes().as_slice()], |row| {
+            row.get(0)
+        })
+        .expect("reads the receipts")
+        .collect::<Result<_, _>>()
+        .expect("every row reads");
+    assert_eq!(
+        principals,
+        ["workflow:grant"],
+        "the close left one receipt, under the workflow's principal"
+    );
 }
 
 /// A workflow's close does not travel over a proxy link, whatever run it names. The
@@ -1894,6 +1905,10 @@ async fn an_uncertain_answer_to_one_question_does_not_hold_back_the_answer_to_an
 
 /// A `question.answer` whose parameters do not parse is refused in validation, after its receipt is
 /// written, as it was before an answer was told apart by its question.
+///
+/// KR-REQ-09.03, the rejected state only: a request refused in validation leaves a receipt in the
+/// `rejected` state, which a later read returns. Not shown here: the other states or the
+/// transitions between them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_malformed_answer_is_refused_and_leaves_a_rejected_receipt() {
     let host = host().await;
@@ -2556,6 +2571,10 @@ async fn an_uncertain_cancellation_whose_question_cannot_be_read_holds_back_ever
 
 /// A `question.cancel` whose parameters do not parse is refused in validation, after its receipt is
 /// written, as it was before a cancellation was told apart by its question.
+///
+/// KR-REQ-09.03, the rejected state only: a request refused in validation leaves a receipt in the
+/// `rejected` state, which a later read returns. Not shown here: the other states or the
+/// transitions between them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_malformed_cancellation_is_refused_and_leaves_a_rejected_receipt() {
     let host = host().await;
@@ -4664,6 +4683,10 @@ fn a_migrated_record_keeps_the_subject_its_retained_intent_describes() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// What a migration leaves of an uncertain receipt: each case below names its own rows
+// ---------------------------------------------------------------------------------------------
+
 /// KR-REQ-11.63, KR-REQ-23.24: an uncertain answer a migration left with no subject, because its
 /// envelope could not be read, cannot be told from an answer to any question, so it holds back
 /// every answer of its actor, and no other method. An answer that names it after it was read is
@@ -4744,6 +4767,10 @@ async fn an_uncertain_close_a_migration_left_without_a_subject_holds_back_every_
         "a close that names the uncertain one after it was read is admitted: {admitted:?}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.14, 09.15, 09.16, 09.22: retention, lifetimes, windows and the protocol defaults
+// ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-09.08, KR-REQ-09.09: recovery rejects an intent whose freshness cannot be proved again,
 /// and frees the capacity it was holding.
