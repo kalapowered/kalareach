@@ -268,6 +268,46 @@ describe('the buttons that start something', () => {
     expect(line.textContent).not.toMatch(/refused/)
   })
 
+  // The host says an outcome is unknown by the retry category of its code as well as by the code
+  // itself: a code this page has no word for, in the category the protocol gives only to a host that
+  // cannot say what became of a request.
+  it('say the editor could not confirm when the host says so by the category of its code', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const uncertain: HostPort = {
+      ...port,
+      openTerminalView: async (sessionId, grid, listener, opening) => {
+        const view = await port.openTerminalView(sessionId, grid, listener, opening)
+        return {
+          ...view,
+          launch: () =>
+            Promise.reject({
+              code: 'A_CODE_FROM_A_NEWER_HOST',
+              message: 'The reader could not say.',
+              user_action: 'nothing',
+              retry: 'outcome_unknown'
+            })
+        }
+      }
+    }
+    open(uncertain, 'terminal')
+    await takeControl(person)
+    const surface = await screen.findByTestId('launch-surface')
+    await waitFor(() => {
+      expect(within(surface).getByRole('button', { name: 'Claude Code' })).toBeEnabled()
+    })
+
+    // The surface's own line is read before the read the press asked for lands.
+    controls.hold('launchSurface')
+    await person.click(within(surface).getByRole('button', { name: 'Claude Code' }))
+    const said = await screen.findByText(/could not confirm whether the launch was installed/)
+    expect(said.textContent).not.toMatch(/Nothing was typed/)
+    expect(screen.queryByText('Claude Code started.')).toBeNull()
+    const line = screen.getByTestId('launch-stale')
+    expect(line).toHaveTextContent('could not confirm the last launch')
+    expect(line.textContent).not.toMatch(/refused/)
+  })
+
   // A button is advice from a read, and a refusal says the advice was wrong. A read that answered
   // while the press waited was started before the refusal, so it says nothing of what the refusal
   // found: the buttons stay disabled until a read that started after it has landed.
