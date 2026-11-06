@@ -424,6 +424,99 @@ fn a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_th
     );
 }
 
+/// KR-REQ-11.63, the thread half of "no answer is automatically inserted into the current terminal
+/// or newly selected agent thread": when the agent moves to another thread, no answer follows it.
+/// A question answered before the switch keeps its answer for the poll of its own call, made with
+/// its own token. A question still unanswered at the switch is ended: a person's answer to it is
+/// refused, so nothing is kept to hand to the new thread, and the agent's own poll reads it as
+/// ended with no answer. The question asked in the newly selected thread is its own: pending, under
+/// the new binding revision, with no answer, and untouched by the answers that went before. The feed
+/// carries the one answer once, on the question it answered. Not shown here: the terminal half,
+/// which is the session's own input staying free of an answer, or the agent's tool call that waits.
+#[test]
+fn an_answer_does_not_follow_the_agent_into_a_newly_selected_thread() {
+    let instance = ApplicationInstanceId::new(Uuid::from_bytes([13; 16]));
+    let bridge = Arc::new(Attesting {
+        agent: this_process(),
+        instance,
+        revision: std::sync::Mutex::new(1),
+    });
+    let questions = Questions::open(None, session(), SessionEpoch::V1)
+        .expect("a ledger")
+        .with_agents(Arc::clone(&bridge) as Arc<dyn kr_worker::questions::AgentBindings>);
+    let agent = source(this_process(), 1);
+    let own = |created: &kr_protocol::question::QuestionCreateResult, at: u64| {
+        questions
+            .read_own(
+                &agent,
+                &QuestionReadOwnParams {
+                    session_id: session(),
+                    question_id: created.question.question_id,
+                    caller_token: CallerToken::new(created.caller_token.as_slice().to_vec()),
+                    wait_ms: Nullable::null(),
+                },
+                now(at),
+            )
+            .expect("the agent reads its own question")
+            .0
+            .question
+    };
+
+    // The first thread: one question is answered, and one is still waiting when the agent leaves.
+    let (settled, _) = questions
+        .create(&agent, &ask("settled"), now(1_000))
+        .expect("asked");
+    let (waiting, _) = questions
+        .create(&agent, &ask("waiting"), now(1_000))
+        .expect("asked");
+    questions
+        .answer(&person(), None, &answer(&settled.question), now(1_500))
+        .expect("answered before the switch");
+
+    // The agent moves to another thread, and asks in it.
+    bridge.switch();
+    let (next, _) = questions
+        .create(&agent, &ask("after the switch"), now(3_000))
+        .expect("asked");
+
+    // The answer given before the switch stays the first call's own, read with its own token.
+    let kept = own(&settled, 3_100);
+    assert_eq!(kept.state, QuestionState::Answered);
+    assert_eq!(
+        kept.answer.as_ref().map(|record| &record.answer),
+        Some(&QuestionAnswer::Decision { decided: true })
+    );
+
+    // The question that was still waiting is ended, and an answer to it is refused, so none is
+    // kept for the new thread. The agent's own poll reads it ended, with no answer.
+    let refused = questions
+        .answer(&person(), None, &answer(&waiting.question), now(3_200))
+        .expect_err("an answer to the question the switch ended is refused");
+    assert_eq!(refused.code(), ErrorCode::QuestionExpired);
+    let ended = own(&waiting, 3_300);
+    assert_eq!(ended.state, QuestionState::Expired);
+    assert!(ended.answer.as_ref().is_none());
+
+    // The question asked in the new thread is its own, under the new revision, and has no answer.
+    assert_eq!(
+        next.question.source.agent_binding_revision.as_ref(),
+        Some(&AgentBindingRevision::new(2))
+    );
+    let fresh = own(&next, 3_400);
+    assert_eq!(fresh.state, QuestionState::Pending);
+    assert!(fresh.answer.as_ref().is_none());
+
+    // The feed carries the one answer once, on the question it answered.
+    let answered: Vec<QuestionId> = questions
+        .events_since(0, 64)
+        .expect("the feed")
+        .into_iter()
+        .filter(|(_, event)| event.kind == QuestionEventKind::Answered)
+        .map(|(_, event)| event.question.question_id)
+        .collect();
+    assert_eq!(answered, vec![settled.question.question_id]);
+}
+
 /// A bridge that vouches for one selected thread while it can, as the broker's native bridge does,
 /// and places each request in the thread the test says ran it, as the application's hooks do. Every
 /// helper it knows belongs to its one instance.
