@@ -1217,12 +1217,14 @@ async fn the_first_audio_played_out_is_the_calls_figure_and_only_the_first() {
     // A later figure would be at least this much more, so a figure that moved cannot read as equal.
     tokio::time::sleep(Duration::from_millis(25)).await;
     scene.platform.tell(CallEvent::Playout);
+    // Native code's news reaches the owner in the order it was told, so once a state that changes
+    // the view is read, the second playout before it has been handled too.
     scene.platform.tell(CallEvent::Capture {
-        state: CaptureState::Capturing,
+        state: CaptureState::Interrupted,
     });
     scene
         .state_where("the later news read", |state| {
-            state["capture"] == "capturing"
+            state["capture"] == "interrupted"
         })
         .await;
     assert_eq!(
