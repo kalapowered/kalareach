@@ -14,6 +14,7 @@
 //! | [`status`] | Asking that gateway what became of one, by its identifier |
 //! | [`forget`] | Asking that gateway to delete what it still holds for one, on a person's request |
 //! | [`credentials`] | The bearer this host delivers under |
+//! | [`gateways`] | The gateways a credential may name, and the transports that reach only those |
 //! | [`sender`] | Renewing and revoking it through the gateway's two-step signed exchanges |
 //! | [`external`] | The sender every external destination is handed to, and delivering to a webhook |
 //! | [`chat`] | Delivering to Slack, Discord and Telegram, and the shape of their credentials |
@@ -66,6 +67,7 @@ pub mod client;
 pub mod credentials;
 pub mod external;
 pub mod forget;
+pub mod gateways;
 pub mod mail;
 pub mod mailbox;
 pub mod runtime;
@@ -146,12 +148,13 @@ fn forget_at_start(
 
 /// The origin of the push gateway KalaReach runs, section 16's "Workers push gateway".
 ///
-/// It is the only gateway a paired device may name in a credential it hands this host. The origin
-/// a credential carries is where this host sends every notification, status question and renewal
+/// A paired device may always name it in a credential it hands this host. It may name no other
+/// unless the host's configuration document lists it ([`gateways::AllowedGateways`]). The origin a
+/// credential carries is where this host sends every notification, status question and renewal
 /// under it, so a device that could name any origin could make the host post to an address of its
 /// choosing: its own server, or a service on this host's network. A gateway of an installation's
-/// own is not one a host delivers through.
-pub const OFFICIAL_GATEWAY_ORIGIN: &str = kr_client::services::account::ACCOUNT_ORIGIN;
+/// own is one a host delivers through when its owner lists it.
+pub const OFFICIAL_GATEWAY_ORIGIN: &str = kr_protocol::service::OFFICIAL_GATEWAY_ORIGIN;
 
 /// The gateway this daemon delivers through, read once when it starts.
 ///
@@ -198,13 +201,14 @@ const CREDENTIAL_ISSUE_SKEW_MS: u64 = 5 * 60 * 1000;
 
 /// Checks the credential a paired device hands this host before the gateway is asked about it.
 ///
-/// This is the part of the check that needs no one's word: the gateway is the official one, the
-/// credential lasts no longer than section 16 allows, it is not past its expiry and it was not
-/// issued in the future, and the installation it names is the one the device's own authorisation
-/// key names. That key is the one the host recorded when it paired the device, and an installation
-/// is the hash of the key it authenticates with, so a device cannot hand over another device's
-/// installation. What the gateway holds, the authorisation, this host's key and whether the bearer
-/// still works, only the gateway can say ([`runtime::DeliveryRuntime::confirm`]).
+/// This is the part of the check that needs no one's word: the gateway is the official one or one
+/// the host's configuration lists, the credential lasts no longer than section 16 allows, it is
+/// not past its expiry and it was not issued in the future, and the installation it names is the
+/// one the device's own authorisation key names. That key is the one the host recorded when it
+/// paired the device, and an installation is the hash of the key it authenticates with, so a
+/// device cannot hand over another device's installation. What the gateway holds, the
+/// authorisation, this host's key and whether the bearer still works, only the gateway can say
+/// ([`runtime::DeliveryRuntime::confirm`]).
 ///
 /// # Errors
 ///
@@ -214,12 +218,12 @@ pub fn check_offered_credential(
     credential: &PushDeliveryCredential,
     device_authorisation: &kr_protocol::scalars::AuthorisationKey,
     now_ms: u64,
-    gateway_origin: &str,
+    gateways: &gateways::AllowedGateways,
 ) -> Result<()> {
-    if credential.gateway_origin.as_str() != gateway_origin {
+    if !gateways.allows(credential.gateway_origin.as_str()) {
         return Err(ControllerError::InvalidArgument(
-            "this host delivers notifications through the KalaReach push gateway only, and the \
-             credential names another"
+            "this host delivers notifications through the KalaReach push gateway and the ones \
+             its configuration lists, and the credential names another"
                 .to_owned(),
         ));
     }
@@ -353,6 +357,10 @@ pub struct DeliveryModule {
     /// composition root has one. Until it does, a preview's object is not placed anywhere and the
     /// push is presented as it always was.
     placer: std::sync::OnceLock<std::sync::Arc<dyn mailbox::ObjectPlacer>>,
+    /// The gateways a credential may name, once the composition root has them. A revocation owed
+    /// at an origin outside them is a gateway that was taken out of the list, and is asked for
+    /// until it is made; one owed at an allowed origin is given up as it always was.
+    gateways: std::sync::OnceLock<std::sync::Arc<gateways::AllowedGateways>>,
     /// Where this host's own tests stop a key registration before it asks its admission, and
     /// again once the journal has taken it. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -406,9 +414,18 @@ impl DeliveryModule {
             secrets,
             privacy: crate::privacy::PrivacyState::default(),
             placer: std::sync::OnceLock::new(),
+            gateways: std::sync::OnceLock::new(),
             #[cfg(feature = "testing")]
             key_write: Default::default(),
         })
+    }
+
+    /// Attaches the gateways a credential may name, which decide whether an owed revocation is
+    /// ever given up.
+    ///
+    /// Once. Returns false when they were already attached.
+    pub fn attach_gateways(&self, gateways: std::sync::Arc<gateways::AllowedGateways>) -> bool {
+        self.gateways.set(gateways).is_ok()
     }
 
     /// Attaches what places the encrypted objects previews refer to.
@@ -1116,7 +1133,8 @@ impl DeliveryModule {
     /// time, and given up when the credential it would have ended could no longer be in use:
     /// thirty days, and some attempts. A debt is never given up while the host still keeps what it
     /// kept of the authorisation: it is the only record that an item left in the secret store is
-    /// not to be kept.
+    /// not to be kept. Nor is one owed to a gateway the host's configuration no longer lists: it
+    /// ends when the gateway has revoked the authorisation, or says it holds none.
     ///
     /// Returns how many were settled.
     ///
@@ -1168,7 +1186,15 @@ impl DeliveryModule {
             // whole time has not been refused by anyone, and is asked a few times first. It runs
             // out only for a host that has let go of the authorisation: a debt given up with the
             // item still in the secret store leaves an item nothing names and no start finds.
+            //
+            // Never for a gateway that was taken out of the list: its credentials were let go of
+            // when it was, and the debt is all that is left of what the host owes it.
+            let retired = self
+                .gateways
+                .get()
+                .is_some_and(|allowed| !allowed.allows(&owed.gateway_origin));
             let given_up = forgotten
+                && !retired
                 && matches!(answer, sender::RevocationAnswer::Later(_))
                 && owed.attempts >= REVOCATION_MIN_ATTEMPTS
                 && now_ms.saturating_sub(owed.queued_at_ms) >= REVOCATION_PATIENCE_MS;

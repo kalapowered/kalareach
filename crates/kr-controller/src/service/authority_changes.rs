@@ -9,6 +9,7 @@ use kr_protocol::envelope::{ControlFrame, MutationRequest, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::gateway::{PendingKind, PendingResource};
 use kr_protocol::grant::{Grant, GrantExpiry};
+use kr_protocol::hostinfo::export::{ContentClass, Sentence};
 use kr_protocol::ids::{ActorId, PendingResourceId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::projection::AgentResourceSnapshotContinuation;
@@ -1960,7 +1961,7 @@ impl Controller {
             &offered,
             &recorded.authorisation,
             now_ms,
-            &self.gateway_origin,
+            &self.gateways,
         )?;
         let destination_id = kr_delivery::destination::DestinationId::new(device_id.to_string())
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
@@ -1996,6 +1997,17 @@ impl Controller {
                 },
             })?;
         let registry = self.registry.lock().await;
+        // The gateway is asked again whether it is one the host allows, with the registry held:
+        // the list moves under the registry too, so a gateway taken out of it while this one was
+        // answering has its credentials let go of before this registration is written or after it
+        // is refused, and never between.
+        if !self.gateways.allows(offered.gateway_origin.as_str()) {
+            return Err(ControllerError::InvalidArgument(
+                "this host no longer delivers through that gateway; its installation requests an \
+                 authorisation from another"
+                    .to_owned(),
+            ));
+        }
         // Asked again with the registry held, which is where destinations are written: another
         // device's registration for the same installation can have finished while the gateway was
         // answering this one.
@@ -2071,10 +2083,9 @@ impl Controller {
             .map(|held| held.sender_record_id)
             .filter(|old| *old != offered.sender_record_id);
         let owing_origin = replaced.map(|old| {
-            credentials.held(old).map_or_else(
-                || self.gateway_origin.clone(),
-                |held| held.gateway_origin.as_str().to_owned(),
-            )
+            credentials
+                .held_origin(old)
+                .unwrap_or_else(|| self.gateways.official().to_owned())
         });
         let owing = replaced
             .zip(owing_origin.as_deref())
@@ -2147,6 +2158,19 @@ impl Controller {
         destination_id: &kr_delivery::destination::DestinationId,
         offered: &kr_protocol::push::PushDeliveryCredential,
     ) -> Result<()> {
+        // An authorisation is named by its identifier alone, so a gateway that issues one the host
+        // holds from another is refused: the credential held for it, and the debt owed for it,
+        // would otherwise be this gateway's or that one's by chance.
+        if self
+            .delivery_runtime()
+            .credentials()
+            .held_origin(offered.sender_record_id)
+            .is_some_and(|origin| origin != offered.gateway_origin.as_str())
+        {
+            return Err(ControllerError::InvalidArgument(
+                "that authorisation is held for another gateway".to_owned(),
+            ));
+        }
         self.delivery.with(|producer| {
             let storage = |error: kr_delivery::DeliveryError| ControllerError::Storage {
                 operation: "read the delivery destinations",
@@ -2198,10 +2222,9 @@ impl Controller {
         sender_record_id: kr_protocol::ids::PushSenderRecordId,
         credentials: &crate::push::credentials::HeldCredentials,
     ) -> Result<()> {
-        let origin = credentials.held(sender_record_id).map_or_else(
-            || self.gateway_origin.clone(),
-            |held| held.gateway_origin.as_str().to_owned(),
-        );
+        let origin = credentials
+            .held_origin(sender_record_id)
+            .unwrap_or_else(|| self.gateways.official().to_owned());
         let now_ms = self.settled_now_ms();
         self.delivery.with(|producer| {
             producer
@@ -2227,6 +2250,56 @@ impl Controller {
                  store: {detail}"
             );
         }
+    }
+
+    /// Lets go of every credential held for a gateway this host no longer allows, and writes down
+    /// that the host owes that gateway a revocation of each authorisation.
+    ///
+    /// The debt is written before the credential is let go of, as unpairing writes it, so a host
+    /// that stops between the two still knows what it owes and does not load the credential
+    /// again. The destination stays: its device is still paired, and holds no credential until it
+    /// registers one from a gateway the host allows. The host asks the gateway for the revocations
+    /// at once, and again until it has made them.
+    ///
+    /// Returns why a credential could not be let go of, when the debt for it could not be written
+    /// down. That credential stays held and stays unusable, and the next time the document is put
+    /// into force the host tries again. A secret store that will not give an item up is reported
+    /// and does not hold anything back: the debt asks for it again.
+    pub(super) fn let_go_of_credentials_outside_the_gateways(&self) -> Option<Sentence> {
+        let credentials = std::sync::Arc::clone(self.delivery_runtime().credentials());
+        let outside = credentials.outside();
+        if outside.is_empty() {
+            return None;
+        }
+        let now_ms = self.settled_now_ms();
+        let mut failure = None;
+        for (sender_record_id, origin) in outside {
+            let written = self.delivery.with(|producer| {
+                producer
+                    .journal_mut()
+                    .owe_revocation(sender_record_id, &origin, now_ms)
+                    .map_err(|error| ControllerError::Storage {
+                        operation: "write down a revocation owed to the gateway",
+                        detail: error.to_string(),
+                    })
+            });
+            match written {
+                Ok(()) => self.retire_sender(sender_record_id, &credentials),
+                Err(error) => {
+                    failure.get_or_insert_with(|| {
+                        Sentence::new()
+                            .stated(
+                                "the credentials of a push gateway the document does not list \
+                                 were not let go of, because the revocation they owe could not \
+                                 be written down: ",
+                            )
+                            .withheld(ContentClass::Message, &error.to_string())
+                    });
+                }
+            }
+        }
+        self.delivery_runtime().sweep_revocations_soon();
+        failure
     }
 
     /// Ends a device's push destination, as [`Self::end_push_destination`] does, and says so on

@@ -411,6 +411,16 @@ impl Controller {
         let accepted_policy = accepted_document
             .as_ref()
             .map(|document| crate::config::ceilings::disable_policy(&document.ceilings).value);
+        // The gateways a credential may name, from the document this environment accepted. That is
+        // the list the registry's record states, which a release that does not read the section
+        // drops: so it only decides what may be used until the document on disk is read, and never
+        // what is let go of ([`Controller::apply_push_gateways`]).
+        let gateways = Arc::new(crate::push::gateways::AllowedGateways::new(
+            &crate::push::gateway_origin_for_start(),
+            accepted_document
+                .as_ref()
+                .map_or(&[][..], |document| document.push.gateways()),
+        ));
         let mut accepted_configuration = crate::config::AcceptedState {
             revision: durably_accepted.revision,
             document: accepted_document,
@@ -1005,6 +1015,8 @@ impl Controller {
         let held_credentials = Arc::new(crate::push::credentials::HeldCredentials::persisted(
             destination_secrets,
         ));
+        held_credentials.attach_gateways(Arc::clone(&gateways));
+        delivery.attach_gateways(Arc::clone(&gateways));
         crate::push::load_held_credentials(&delivery, &held_credentials)?;
         // The runtime is built here and started once the daemon exists. Its renewals are proven
         // with this host's own authorisation key, which the installation named when it authorised
@@ -1272,7 +1284,7 @@ impl Controller {
             descriptions,
             delivery,
             delivery_runtime,
-            gateway_origin: crate::push::gateway_origin_for_start(),
+            gateways,
             #[cfg(feature = "testing")]
             effect_wait: crate::testing::effect_wait(),
             devices,
@@ -1467,6 +1479,16 @@ impl Controller {
                      {problem}"
                 )));
             }
+        } else if let Some(problem) = controller
+            .apply_push_gateways(&controller.configuration())
+            .await
+        {
+            // A document that needed no acceptance still names the gateways that may be used, and
+            // a credential held for one it does not list is let go of before anything is
+            // delivered. A host that cannot write down what it owes that gateway does not serve.
+            return Err(ControllerError::Configuration(format!(
+                "this environment's configuration document could not be put into force: {problem}"
+            )));
         }
         controller.start_voice();
         // Every session the attention store reads: the live ones over their workers, and the ones

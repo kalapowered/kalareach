@@ -3164,8 +3164,10 @@ struct RenewingAtTheGate {
 fn credential(expires_at_ms: u64) -> PushDeliveryCredential {
     PushDeliveryCredential {
         expires_at_ms: TimestampMs::new(expires_at_ms),
-        gateway_origin: kr_protocol::service::GatewayOrigin::new("https://reach.invalid")
-            .expect("an origin"),
+        gateway_origin: kr_protocol::service::GatewayOrigin::new(
+            kr_controller::push::OFFICIAL_GATEWAY_ORIGIN,
+        )
+        .expect("an origin"),
         installation_id: InstallationId::new(Uuid::from_bytes([2; 16])),
         issued_at_ms: TimestampMs::new(NOW - 1_000),
         revision: kr_protocol::ids::PushSenderRevision::new(1),

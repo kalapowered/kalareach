@@ -742,9 +742,11 @@ pub struct Controller {
     pub delivery: Arc<crate::push::DeliveryModule>,
     /// The loop that drives it: recovery at start, then a pass on every tick.
     delivery_runtime: Arc<crate::push::runtime::DeliveryRuntime>,
-    /// The only gateway a paired device may name in the credential it hands this host, and the
-    /// origin an owed revocation is asked at when no credential is held for it. Read once at start.
-    gateway_origin: String,
+    /// The gateways a paired device may name in the credential it hands this host: the official
+    /// one, whose origin is also where an owed revocation is asked when no credential is held for
+    /// it, and the ones the configuration document lists. The official origin is read once at
+    /// start, and the list whenever the document is put into force.
+    gateways: Arc<crate::push::gateways::AllowedGateways>,
     /// How a paired device's request waits for its effect before it is told the outcome is
     /// unknown, where a suite gave this host's daemon a wait of its own. Read once at start.
     /// Compiled away in every shipped build.

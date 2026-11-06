@@ -253,9 +253,20 @@ impl Controller {
         owed.fences_dispatch = owes_own || owed_elsewhere;
         let fence_now = owed.fences_dispatch;
         let (sessions, mut failure) = self.apply_session_limit(&resolver, &state).await;
-        for problem in [ceiling_failure, budget_failure, policy_failure]
-            .into_iter()
-            .flatten()
+        // The push gateways the document lists, and what is let go of that it no longer lists.
+        // A reading that decided nothing leaves the list as it is.
+        let gateway_failure = self.apply_push_gateways(&resolver).await;
+        // Read here, while the lock that orders acceptances is held: another acceptance can move
+        // the list as soon as it is let go, and this report is of this reading.
+        let push_gateways = self.gateways.listed();
+        for problem in [
+            ceiling_failure,
+            budget_failure,
+            policy_failure,
+            gateway_failure,
+        ]
+        .into_iter()
+        .flatten()
         {
             failure = Some(match failure {
                 Some(earlier) => earlier.stated("; ").sentence(&problem),
@@ -407,7 +418,33 @@ impl Controller {
             effects_applied,
             not_in_force: failure,
             rights,
+            push_gateways,
         }
+    }
+
+    /// Puts the document's list of push gateways where the delivery service reads it, and lets go
+    /// of the credentials held for a gateway the list no longer allows. Returns why it could not
+    /// let go of them, if it could not.
+    ///
+    /// A document that decided nothing, because it is absent or this build cannot use it, leaves
+    /// the list in force as it was, so a file nobody can read retires nothing. The list comes from
+    /// the document on disk, never from the copy the registry records of the one it accepted: a
+    /// release that does not read the section records that copy without it, and a list taken from
+    /// it after a rollback and a move forward would retire every gateway the owner listed.
+    ///
+    /// Taken with the registry, which a registration holds while it writes its destination and
+    /// keeps its credential: a registration is either written before the list moves, and then
+    /// found and let go of here, or refused after it.
+    pub(super) async fn apply_push_gateways(
+        &self,
+        resolver: &kr_worker::config::Resolver,
+    ) -> Option<Sentence> {
+        let document = resolver.loaded().document.as_ref()?;
+        let registry = self.registry.lock().await;
+        self.gateways.replace(document.push.gateways());
+        let failure = self.let_go_of_credentials_outside_the_gateways();
+        drop(registry);
+        failure
     }
 
     /// The disable policy already in force, for a reading that decided none, or `None` with the

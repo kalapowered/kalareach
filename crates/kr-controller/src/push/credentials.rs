@@ -29,6 +29,18 @@
 //! renewal, to cover an answer that was lost, and after that only in the last week of its life,
 //! so a bearer that reached memory and no further would be lost by a restart.
 //!
+//! # Which gateways a bearer may name
+//!
+//! A bearer is usable only while the gateway it names is allowed ([`AllowedGateways`]): the
+//! official one, or one the host's configuration lists. A store given the set returns none for a
+//! credential that names any other, through [`HeldCredentials::held`] and the trait's `current`,
+//! which is every read a request is made from, so a notification, a status question, a person's
+//! request to forget and a renewal do not start. The store's own bookkeeping reads the map as it
+//! is, and [`HeldCredentials::held_origin`] says where a credential was issued, which the debt
+//! for its revocation is written at. [`HeldCredentials::outside`] lists what the set no longer
+//! allows, for the host to let go of. A store built without a set allows every origin; a daemon
+//! always gives it one.
+//!
 //! # Which bearer is the latest
 //!
 //! The gateway keeps one bearer for an authorisation, and what changes it is a renewal and an
@@ -68,6 +80,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 
+use super::gateways::AllowedGateways;
 use super::{Clock as _, SystemClock};
 use kr_delivery::push::SenderCredentials;
 use kr_protocol::ids::PushSenderRecordId;
@@ -166,6 +179,8 @@ pub struct HeldCredentials {
     waits: Mutex<BTreeMap<PushSenderRecordId, Refusal>>,
     /// The clock the waits are counted on.
     steady: Steady,
+    /// The gateways a held credential may name, once the daemon has given the store them.
+    gateways: std::sync::OnceLock<Arc<AllowedGateways>>,
 }
 
 impl HeldCredentials {
@@ -273,7 +288,23 @@ impl HeldCredentials {
             .changing
             .lock()
             .map_err(|_| "an earlier change of the held credentials failed part way".to_owned())?;
-        let held = self.current(credential.sender_record_id);
+        if !self.allowed(credential.gateway_origin.as_str()) {
+            return Err(
+                "this host delivers through the official gateway and the ones its configuration \
+                 lists, and the credential names another"
+                    .to_owned(),
+            );
+        }
+        let held = self.raw(credential.sender_record_id);
+        if held
+            .as_ref()
+            .is_some_and(|held| held.gateway_origin != credential.gateway_origin)
+        {
+            return Err(
+                "that authorisation is held for another gateway, and a gateway cannot take it over"
+                    .to_owned(),
+            );
+        }
         if held.as_ref().is_some_and(|held| later(held, &credential)) {
             return Ok(());
         }
@@ -322,10 +353,66 @@ impl HeldCredentials {
         }
     }
 
-    /// The credential held for one authorisation, if any, without renewing it.
+    /// The credential held for one authorisation, if any, without renewing it, and none when the
+    /// gateway it names is not one the host allows.
     #[must_use]
     pub fn held(&self, sender_record_id: PushSenderRecordId) -> Option<PushDeliveryCredential> {
         self.current(sender_record_id)
+    }
+
+    /// The origin of the gateway that issued the credential held for one authorisation, whether or
+    /// not the host still allows that gateway. For writing down what the host owes it.
+    #[must_use]
+    pub fn held_origin(&self, sender_record_id: PushSenderRecordId) -> Option<String> {
+        self.raw(sender_record_id)
+            .map(|held| held.gateway_origin.as_str().to_owned())
+    }
+
+    /// The credentials held for a gateway the host does not allow, as authorisation and origin.
+    #[must_use]
+    pub fn outside(&self) -> Vec<(PushSenderRecordId, String)> {
+        self.held
+            .lock()
+            .map(|held| {
+                held.values()
+                    .filter(|credential| !self.allowed(credential.gateway_origin.as_str()))
+                    .map(|credential| {
+                        (
+                            credential.sender_record_id,
+                            credential.gateway_origin.as_str().to_owned(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The credential held for one authorisation as the map has it, for the store's own
+    /// bookkeeping.
+    fn raw(&self, sender_record_id: PushSenderRecordId) -> Option<PushDeliveryCredential> {
+        self.held
+            .lock()
+            .ok()
+            .and_then(|held| held.get(&sender_record_id).cloned())
+    }
+
+    /// Gives this store the gateways a credential may name. Once; returns false when it already
+    /// has them.
+    pub fn attach_gateways(&self, gateways: Arc<AllowedGateways>) -> bool {
+        self.gateways.set(gateways).is_ok()
+    }
+
+    /// The gateways this store was given.
+    #[must_use]
+    pub fn gateways(&self) -> Option<Arc<AllowedGateways>> {
+        self.gateways.get().map(Arc::clone)
+    }
+
+    /// Whether a credential naming this origin may be used.
+    fn allowed(&self, origin: &str) -> bool {
+        self.gateways
+            .get()
+            .is_none_or(|gateways| gateways.allows(origin))
     }
 
     /// Gives this store the renewal it replaces credentials through.
@@ -357,7 +444,7 @@ impl HeldCredentials {
             .unwrap_or_default();
         let mut failed = 0;
         for id in pending {
-            let written = match self.current(id) {
+            let written = match self.raw(id) {
                 Some(credential) => vault.put_push_credential(&credential).is_ok(),
                 // Forgotten since: nothing to keep.
                 None => true,
@@ -400,10 +487,8 @@ impl HeldCredentials {
 
 impl SenderCredentials for HeldCredentials {
     fn current(&self, sender_record_id: PushSenderRecordId) -> Option<PushDeliveryCredential> {
-        self.held
-            .lock()
-            .ok()
-            .and_then(|held| held.get(&sender_record_id).cloned())
+        self.raw(sender_record_id)
+            .filter(|credential| self.allowed(credential.gateway_origin.as_str()))
     }
 
     fn renew(&self, held: &PushDeliveryCredential) -> kr_delivery::Result<PushDeliveryCredential> {
@@ -521,7 +606,7 @@ impl HeldCredentials {
             return;
         };
         if self
-            .current(refused.sender_record_id)
+            .raw(refused.sender_record_id)
             .is_none_or(|held| held.secret != refused.secret)
         {
             return;
@@ -598,6 +683,90 @@ mod tests {
         assert!(
             credentials.renew(&credential(4, 9, NOW + 2 * DAY)).is_err(),
             "and a credential it does not hold is not renewed"
+        );
+    }
+
+    fn at(origin: &str, mut credential: PushDeliveryCredential) -> PushDeliveryCredential {
+        credential.gateway_origin = GatewayOrigin::new(origin).expect("an origin");
+        credential
+    }
+
+    /// KR-REQ-16.04: a credential for a gateway the host does not allow is not kept, is not
+    /// returned for a request, is not renewed, and is listed as one to let go of; the origin it
+    /// was issued at is still known, for the debt that is written for it.
+    #[test]
+    fn a_credential_for_a_gateway_the_host_does_not_allow_is_not_kept_used_or_renewed() {
+        let credentials = HeldCredentials::new();
+        let gateways = Arc::new(super::super::gateways::AllowedGateways::new(
+            "https://reach.invalid",
+            &["https://push.listed.invalid".to_owned()],
+        ));
+        assert!(credentials.attach_gateways(Arc::clone(&gateways)));
+        let renewal = Arc::new(Renewing::default());
+        credentials.attach_renewal(Arc::clone(&renewal) as Arc<dyn CredentialRenewal>);
+
+        // Kept while the origin is allowed: the official gateway and a listed one.
+        let official = credential(3, 9, NOW + 2 * DAY);
+        let listed = at(
+            "https://push.listed.invalid",
+            credential(4, 9, NOW + 2 * DAY),
+        );
+        credentials
+            .keep(official.clone())
+            .expect("the official gateway's");
+        credentials
+            .keep(listed.clone())
+            .expect("a listed gateway's");
+        assert_eq!(
+            credentials.held(listed.sender_record_id),
+            Some(listed.clone())
+        );
+
+        // Refused when it is not, and not kept.
+        let unlisted = at(
+            "https://push.unlisted.invalid",
+            credential(5, 9, NOW + 2 * DAY),
+        );
+        credentials
+            .keep(unlisted.clone())
+            .expect_err("an origin that is not allowed");
+        assert_eq!(credentials.held_origin(unlisted.sender_record_id), None);
+
+        // An authorisation held for one gateway is not another's to replace.
+        let taken = at("https://reach.invalid", credential(4, 8, NOW + 3 * DAY));
+        credentials
+            .keep(taken)
+            .expect_err("held for another gateway");
+        assert_eq!(
+            credentials.held_origin(listed.sender_record_id).as_deref(),
+            Some("https://push.listed.invalid")
+        );
+
+        // Taken out of the list, the credential is held and unusable: nothing returns it for a
+        // request, nothing renews it, and it is listed as one to let go of, with its origin.
+        gateways.replace(&[]);
+        assert_eq!(credentials.held(listed.sender_record_id), None);
+        assert_eq!(credentials.current(listed.sender_record_id), None);
+        assert!(credentials.renew(&listed).is_err());
+        assert_eq!(
+            credentials.renew_due(NOW),
+            1,
+            "only the official gateway's is renewed"
+        );
+        assert_eq!(
+            *renewal.asked.lock().expect("not poisoned"),
+            vec![official.sender_record_id]
+        );
+        assert_eq!(
+            credentials.outside(),
+            vec![(
+                listed.sender_record_id,
+                "https://push.listed.invalid".to_owned()
+            )]
+        );
+        assert_eq!(
+            credentials.held_origin(listed.sender_record_id).as_deref(),
+            Some("https://push.listed.invalid")
         );
     }
 
