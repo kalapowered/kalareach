@@ -673,6 +673,10 @@ fn take(performed: &mut Performed, sent: &Sent) {
 }
 
 /// Reads the host's state for an attempt of this kind, or none when it could not be read.
+///
+/// A host that refuses the list, because it cannot decide where one grant that expires stands, is
+/// not read: the attempt waits out its bound and ends as not known, and never as not done. What
+/// became of a revocation sent by identifier alone is then the host's to say when it can list.
 async fn found(host: &Host, kind: Kind, watch: &Watch) -> Option<Found> {
     let mut client = host.another().await.ok()?;
     let listed: GrantListResult = crate::bind::read(
@@ -1440,22 +1444,44 @@ async fn revoke(
 ) -> Result<Completion> {
     let grant_id: GrantId = crate::daemon::identifier(&arguments.grant, "a grant")?;
     let mut host = Host::open(paths, &arguments.selector, build_id).await?;
-    let known = host.grants(None, true).await?;
-    let Some(entry) = known
-        .grants
-        .iter()
-        .find(|summary| summary.grant.grant_id == grant_id)
-    else {
-        return Err(CliError::refused_in_its_own_words(
-            ErrorCode::ResourceUnavailable,
-            Shown::said("the host holds no such share, so nothing was revoked"),
-        ));
-    };
-    let session_id = match &entry.grant.session_selector {
-        kr_protocol::grant::SessionSelector::These { session_ids } => {
-            session_ids.iter().next().copied()
+    // The list says which session the grant is over, and that the host holds it. A host that
+    // cannot decide where one grant that expires stands refuses the whole list, and revoking takes
+    // authority away whatever the clock says, so the revocation goes on by the identifier alone:
+    // the host refuses it if it holds no such grant.
+    let session_id = match host.grants(None, true).await {
+        Ok(known) => {
+            let Some(entry) = known
+                .grants
+                .iter()
+                .find(|summary| summary.grant.grant_id == grant_id)
+            else {
+                return Err(CliError::refused_in_its_own_words(
+                    ErrorCode::ResourceUnavailable,
+                    Shown::said("the host holds no such share, so nothing was revoked"),
+                ));
+            };
+            match &entry.grant.session_selector {
+                kr_protocol::grant::SessionSelector::These { session_ids } => {
+                    session_ids.iter().next().copied()
+                }
+                _ => None,
+            }
         }
-        _ => None,
+        Err(CliError::Refused(refusal))
+            if matches!(
+                refusal.code,
+                ErrorCode::ClockUntrusted | ErrorCode::StorageUnavailable
+            ) =>
+        {
+            report::say(&shown!(
+                "The host would not list its grants ({}), so grant {} is revoked by its \
+                 identifier alone.",
+                Shown::protocol(&refusal),
+                grant_id
+            ));
+            None
+        }
+        Err(error) => return Err(error),
     };
     let target = host.on_the_host();
     let watch = Watch {

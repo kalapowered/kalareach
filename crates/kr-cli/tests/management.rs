@@ -2263,3 +2263,85 @@ async fn the_receipt_a_daemon_keeps_for_its_own_action_is_read_by_its_identifier
     let nobody = host.refused(&["action", "read", NOBODY]);
     assert_ne!(nobody["code"], Value::Null, "{nobody}");
 }
+
+/// `kr share revoke` names a grant by its identifier and sends the revocation, whether or not the
+/// host will list its grants. A host that cannot decide where one grant that expires stands (its
+/// clock continuity is lost) refuses the whole list, and revoking takes authority away whatever the
+/// clock says: the command revokes the grant that never expires, leaves the other as it was, and
+/// the refused list names the grant the host cannot decide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_share_is_revoked_by_its_identifier_while_the_host_will_not_list_its_grants() {
+    use kr_controller::grants::GrantRecord;
+
+    let host = Host::start().await;
+    let device = DeviceId::new(Uuid::from_bytes([0xf1; 16]));
+    let ending = GrantId::new(Uuid::from_bytes([0x74; 16]));
+    let lasting = GrantId::new(Uuid::from_bytes([0x75; 16]));
+    let issue = |grant_id: GrantId, expiry: GrantExpiry| {
+        host.controller
+            .sharing()
+            .grants()
+            .issue(
+                &GrantRecord {
+                    grant: Grant {
+                        grant_id,
+                        parent_grant_id: Nullable::null(),
+                        issuer_device_id: device,
+                        recipient_device_id: device,
+                        authority_revision: host.controller.policy().authority_revision(),
+                        environment_selector: EnvironmentSelector::Any,
+                        session_selector: SessionSelector::Any,
+                        actions: [ActionRight::SessionView].into_iter().collect(),
+                        history: HistoryScope {
+                            lower_bound_ms: Nullable::null(),
+                            include_live_screen: false,
+                            named_questions: CanonicalSet::new(),
+                            named_approvals: CanonicalSet::new(),
+                        },
+                        expiry,
+                        organisation: Nullable::null(),
+                    },
+                    session_id: None,
+                    issued_at_ms: 1_000,
+                    activated_at_ms: Some(1_000),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("the grant is written");
+    };
+    issue(
+        ending,
+        GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(kr_ipc::now_ms().get() + 3_600_000),
+        },
+    );
+    issue(lasting, GrantExpiry::Never);
+    let (ending_text, lasting_text) = (ending.to_string(), lasting.to_string());
+    let revoked_at = |grant_id: GrantId| {
+        host.controller
+            .sharing()
+            .grants()
+            .record(grant_id)
+            .expect("the grant store reads")
+            .expect("the grant is held")
+            .revoked_at_ms
+    };
+
+    // The host cannot say where the grant that expires stands, so it will not list.
+    host.controller.utc_floor().lose_continuity();
+    let listed = host.refused(&["share", "list"]);
+    assert!(
+        text(&listed["message"]).contains(&ending_text),
+        "the refused list names the grant the host cannot decide: {listed}"
+    );
+
+    let revoked = host.kr_json(&["share", "revoke", &lasting_text]);
+    assert!(
+        revoked.to_string().contains(&lasting_text),
+        "the revocation names the grant: {revoked}"
+    );
+    assert!(revoked_at(lasting).is_some(), "the grant was revoked");
+    assert!(revoked_at(ending).is_none(), "the other grant was not");
+}
