@@ -682,7 +682,7 @@ impl Fixture {
             .clone()
     }
 
-    /// Waits until a reply of [`Reply::HalfThenHold`] has sent its half.
+    /// Waits until a reply of [`Reply::HalfThenHold`] or [`Reply::HalfThenRest`] has sent its half.
     async fn until_half_sent(&self) {
         tokio::time::timeout(PATIENCE, self.half_sent.notified())
             .await
@@ -3550,11 +3550,21 @@ async fn a_fetch_is_not_cancelled_after_a_change_to_authority_whose_fence_was_no
     // Let the held response finish: a fetch the refused request cancelled, before or after it was
     // refused, does not verify.
     rest.notify_one();
-    environment
-        .setup_until("the fetch verified", |shown| {
-            shown.download == DescriptionDownload::Verified
+    let ended = environment
+        .setup_until("the fetch ended", |shown| {
+            matches!(
+                shown.download,
+                DescriptionDownload::Verified
+                    | DescriptionDownload::Cancelled
+                    | DescriptionDownload::Failed
+            )
         })
         .await;
+    assert_eq!(
+        ended.download,
+        DescriptionDownload::Verified,
+        "the refused request left the fetch alone"
+    );
     assert!(environment.marker());
     assert_eq!(fixture.requests().len(), 1, "the file was fetched once");
     environment.stop().await;

@@ -591,6 +591,11 @@ async fn the_grant_list_says_a_voice_grant_ended_that_the_continuous_clock_ended
         "the list says what the continuous deadline says, and not what the wall clock alone would"
     );
     assert!(
+        controller.settled_utc_now() < now + 60_000,
+        "and the floor did not rise while the list read, so the list did not read UTC past the \
+         expiry"
+    );
+    assert!(
         authority
             .standing_voice_grant(device.device_id)
             .expect("the store answers")
@@ -611,8 +616,8 @@ async fn the_grant_list_says_a_voice_grant_ended_that_the_continuous_clock_ended
 
 /// KR-REQ-09.17, the part about a previously expired object never reviving: a grant whose end is
 /// on record is listed as ended while both of its clocks still hold, as the record is read before
-/// the clocks are everywhere else. The control: the same grant, before its end is written down, is
-/// listed as active.
+/// the clocks where a share is opened. The control: the same grant, before its end is written
+/// down, is listed as active.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_grant_list_says_a_grant_ended_whose_end_is_on_record_whatever_the_clocks_say() {
     use kr_protocol::sharing::GrantState;

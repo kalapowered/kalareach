@@ -3676,9 +3676,12 @@ mod tests {
             "the device's registration is withdrawn by the time the revocation is acknowledged"
         );
         release.send(()).expect("the repeat goes on");
-        let withheld = waiting
-            .await
-            .expect("the repeat finishes")
+        let refused = waiting.await.expect("the repeat finishes");
+        assert!(
+            refused.is_copied(),
+            "the repeat found the first submission's record and did not register again"
+        );
+        let withheld = refused
             .into_answer()
             .expect_err("a revoked device is not given the receipt");
         assert_eq!(withheld.code(), ErrorCode::PermissionDenied, "{withheld}");

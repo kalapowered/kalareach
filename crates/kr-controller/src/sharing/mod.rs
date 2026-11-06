@@ -639,17 +639,18 @@ impl SharingService {
     /// delegation authority reaches. Holding a right that a grant happens to contain is not
     /// authority over the grant, so it does not widen this list.
     ///
-    /// Whether a grant has run out is decided as every other reader of its time decides it: on
-    /// its anchor on the continuous clock and on its expiry in UTC under the host's floor, with the
-    /// end on record ([`GrantDirectory::lapsed`]). A list that read the wall clock alone could call
-    /// a grant active that the host has already found ended, and a grant that ended never revives.
+    /// Whether a grant has run out is decided on its anchor on the continuous clock and on its
+    /// expiry in UTC under the host's floor, with the end on record ([`GrantDirectory::lapsed`]).
+    /// A list that read the wall clock alone could call a grant active that the host has already
+    /// found ended, and a grant that ended never revives.
     ///
     /// # Errors
     ///
     /// Returns an error when the store cannot be read, `CLOCK_UNTRUSTED` when an expiring grant
-    /// with no end on record has no anchor in this boot and the clock cannot give it one, and a
-    /// `STORAGE_UNAVAILABLE` refusal while the clock floor a grant's expiry is decided on is owed
-    /// its record, and while an end found cannot be written down.
+    /// with no end on record has no anchor in this boot and the clock cannot give it one, or while
+    /// this boot's clock continuity is lost, and a `STORAGE_UNAVAILABLE` refusal while the clock
+    /// floor a grant's expiry is decided on is owed its record, and while an end found cannot be
+    /// written down.
     pub fn list_for_issuer(
         &self,
         issuer_device_id: DeviceId,
@@ -707,7 +708,7 @@ impl SharingService {
     /// Whether a grant that is not revoked has run out: its end is on record, or one of its two
     /// deadlines has passed. A grant that does not expire reads no clock, and a revoked one is
     /// revoked whatever its time says. An end on record is read first and stands whatever the
-    /// clocks say, as it does for every other reader: an object that ended never revives.
+    /// clocks say, as it does where a share is opened: an object that ended never revives.
     fn has_run_out(&self, record: &GrantRecord, now_ms: u64) -> Result<bool> {
         if record.revoked_at_ms.is_some() || record.grant.expiry == GrantExpiry::Never {
             return Ok(false);

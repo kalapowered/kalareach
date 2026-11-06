@@ -2048,10 +2048,17 @@ async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_a
     // A revocation of this host's authority, acknowledged while the lock is held, withdraws the
     // registration the late attempt was admitted under.
     let (waiting, release) = stopped_with_the_lock().await;
-    controller
+    let acknowledged = controller
         .revoke_authority()
         .await
         .expect("the revocation is acknowledged");
+    assert!(
+        acknowledged
+            .workers
+            .iter()
+            .all(|worker| worker.state != kr_protocol::action::BarrierState::Pending),
+        "no barrier is pending when the revocation is acknowledged"
+    );
     release.send(()).expect("the late attempt goes on");
     let refused = waiting.await.expect("the late attempt finishes");
     let withheld = refusal(&refused).unwrap_or_else(|| {
@@ -2060,6 +2067,11 @@ async fn a_fence_that_lands_while_a_late_attempt_holds_the_step_lock_stops_the_a
         )
     });
     assert_eq!(withheld.code, ErrorCode::PermissionDenied, "{withheld:?}");
+    assert_eq!(
+        withheld.message,
+        crate::authority::AdmissionLapse::Deregistered.to_string(),
+        "the refusal is the withdrawn registration's, and not a fence this host owes"
+    );
     assert!(
         !controller.a_machine_step_holds_the_step_lock(),
         "the refused attempt let the lock go"
