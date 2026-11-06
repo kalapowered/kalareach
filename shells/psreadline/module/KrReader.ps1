@@ -390,9 +390,11 @@ function Skip-KrReply {
 # at the later one, so an Escape the person pressed does not hide an answer behind it. Nothing is
 # waited for: only keys the terminal has delivered are read, and every other key, the Escape of a key
 # that is no answer included, is put into the editor's queue in the order it came in, behind the
-# module's own key. When the read fails part way, the keys it had finished with are put there; the
-# ones of the answer it was reading are lost. A key typed ahead is therefore met by the editor as it
-# would have been in the terminal.
+# module's own key. A run that turns out to be no answer gives its Escape and its introducer to the
+# editor and its other keys back to the reading, which starts again at the first of them: an Escape
+# among them may begin an answer of its own. When the read fails part way, every key it had taken is
+# put into the queue, in order, the ones of the answer it was reading included. A key typed ahead is
+# therefore met by the editor as it would have been in the terminal.
 function Clear-KrStaleReplies {
     if ($IsWindows -or -not $script:Kr.Registered -or $script:State.EditMode -cne 'Emacs') { return }
     $introducers = @(Get-KrOwnReplyIntroducers)
@@ -403,51 +405,69 @@ function Clear-KrStaleReplies {
         $convert = $script:Rl.Assembly.GetType('Microsoft.PowerShell.PSKeyInfo').GetMethod(
             'FromConsoleKeyInfo', [type[]]@([System.ConsoleKeyInfo]))
         if ($null -eq $convert) { return }
+        # The keys the editor is to have, in the order they came in.
         $kept = [System.Collections.Generic.List[object]]::new()
-        $attempt = [System.Collections.Generic.List[object]]::new()
-        $waiting = { [Console]::KeyAvailable }
-        $read = { $each = [Console]::ReadKey($true); $attempt.Add($each); $each }.GetNewClosure()
+        # Keys taken from the terminal or from `$ahead` that are neither the editor's nor dropped yet.
+        $undecided = [System.Collections.Generic.List[object]]::new()
+        # Keys taken and to be looked at again, the next first.
+        $ahead = [System.Collections.Generic.LinkedList[object]]::new()
+        $waiting = { $ahead.Count -gt 0 -or [Console]::KeyAvailable }.GetNewClosure()
+        $take = {
+            $each = if ($ahead.Count -gt 0) {
+                $first = $ahead.First.Value
+                $ahead.RemoveFirst()
+                $first
+            } else {
+                [Console]::ReadKey($true)
+            }
+            $undecided.Add($each)
+            $each
+        }.GetNewClosure()
         $dropped = 0
-        $held = $null
         try {
             for ($taken = 0; $taken -lt $script:ReplyKeysMax; $taken++) {
-                if ($null -ne $held) {
-                    $key = $held
-                    $held = $null
-                } elseif (& $waiting) {
-                    $key = [Console]::ReadKey($true)
-                } else {
-                    break
-                }
+                if (-not (& $waiting)) { break }
+                $key = & $take
                 if ([int]$key.KeyChar -ne 0x1B -or -not (& $waiting)) {
-                    $kept.Add($key)
+                    $kept.AddRange($undecided)
+                    $undecided.Clear()
                     continue
                 }
-                $next = [Console]::ReadKey($true)
+                $next = & $take
                 if ([int]$next.KeyChar -eq 0x1B) {
-                    $kept.Add($key)
-                    $held = $next
+                    # The first Escape is the person's, and an answer starts at the later one.
+                    $undecided.RemoveAt($undecided.Count - 1)
+                    $kept.AddRange($undecided)
+                    $undecided.Clear()
+                    $null = $ahead.AddFirst($next)
                     continue
                 }
                 if ($introducers -cnotcontains "$($next.KeyChar)") {
-                    $kept.Add($key)
-                    $kept.Add($next)
+                    $kept.AddRange($undecided)
+                    $undecided.Clear()
                     continue
                 }
-                $attempt.Clear()
-                $whole = Skip-KrReply ([char]$next.KeyChar) -Waiting $waiting -Read $read -Restore { param($Keys) }
+                $whole = Skip-KrReply ([char]$next.KeyChar) -Waiting $waiting -Read $take -Restore { param($Keys) }
                 if ($whole) {
                     $dropped++
                 } else {
                     # Not a whole answer: an Escape and a bracket that something else follows, or the
-                    # start of one that has not been delivered whole. Every key of it is the editor's.
-                    $kept.Add($key)
-                    $kept.Add($next)
-                    foreach ($each in $attempt) { $kept.Add($each) }
+                    # start of one that has not been delivered whole. The Escape and the introducer
+                    # are the editor's, and the keys the attempt read after them are looked at again
+                    # from the first: one of them may be the Escape of an answer.
+                    $kept.Add($undecided[0])
+                    $kept.Add($undecided[1])
+                    for ($index = $undecided.Count - 1; $index -ge 2; $index--) {
+                        $null = $ahead.AddFirst($undecided[$index])
+                    }
                 }
+                $undecided.Clear()
             }
         } finally {
-            if ($null -ne $held) { $kept.Add($held) }
+            # However the loop ends, no key taken is lost: the ones not decided on, then the ones to
+            # be looked at again, go behind the ones already kept.
+            $kept.AddRange($undecided)
+            foreach ($key in $ahead) { $kept.Add($key) }
             foreach ($key in $kept) {
                 try { $queue.Enqueue($convert.Invoke($null, @($key))) } catch {
                     Write-KrTrace "a key typed ahead was not given back to the editor: $($_.Exception.Message)"

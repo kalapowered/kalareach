@@ -1514,6 +1514,128 @@ pub fn keys_typed_ahead_of_a_read_reach_the_editor_whole_and_in_order_among_the_
     );
 }
 
+/// KR-REQ-08.48: the keys of an answer the module was reading when its read failed reach the
+/// editor, and the answer is still taken out.
+///
+/// Before the editor starts, the module reads the keys the terminal has delivered, and it takes an
+/// Escape and the introducer behind it before it reads the rest of the answer. A read that fails
+/// part way must not lose the keys it has already taken: they are the person's, as far as the
+/// module can tell. The case replaces the module's reader of the rest of an answer with one that
+/// fails on its first call and then does what it did, leaves the entry unanswered, and types a line
+/// with an answer in the middle of it. The first read fails, so the answer reaches the editor with
+/// its Escape and its bracket, and the module's chord for the bracket takes it out as the editor
+/// meets it; the line prints its word only if that happened and no key was lost. A module that
+/// loses the two keys leaves the rest of the answer in the line.
+///
+/// # Panics
+///
+/// Panics when the line does not print the word the keys spell.
+#[cfg(unix)]
+pub fn the_keys_of_an_answer_the_drain_was_reading_when_it_failed_reach_the_editor(
+    kind: ShellKind,
+) {
+    // Runs after the package's entry: the first call of the module's reader of an answer fails,
+    // the others are the module's own.
+    const FAILING_ONCE: &str = r#"& (Get-Module KalaReach.ShellBridge) {
+    $script:RealSkipReply = (Get-Command Skip-KrReply -CommandType Function).ScriptBlock
+    $script:SkipReplyFailures = 1
+    Set-Item function:script:Skip-KrReply -Value {
+        param([char]$Introducer, [scriptblock]$Waiting, [scriptblock]$Read, [scriptblock]$Restore)
+        if ($script:SkipReplyFailures -gt 0) {
+            $script:SkipReplyFailures--
+            throw 'the read of the answer failed'
+        }
+        & $script:RealSkipReply @PSBoundParameters
+    }
+}
+"#;
+    let package = Package::built(kind);
+    let mut session = Session::start_with_profile(
+        &package,
+        Profile {
+            after_entry: FAILING_ONCE,
+            ..Profile::ORDINARY
+        },
+    );
+    session.commands.hold_entries = true;
+    session.stepping = false;
+    session.first_prompt();
+    assert!(
+        session.wait_for_prompt(),
+        "the shell drew no prompt:\n{}",
+        session.terminal_output()
+    );
+    let typed = ["Write-Output ('kr-lost-' + 'a", "\x1b[?62;22c", "b')", "\r"].concat();
+    let start = session.written();
+    session.type_bytes(typed.as_bytes());
+    session.answer_held_entries();
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-lost-ab", deadline),
+        "the keys typed ahead of the read did not spell \"kr-lost-ab\":\n{}",
+        shown_since(&session, start)
+    );
+}
+
+/// KR-REQ-08.48: an answer behind one that was cut short is taken out before the editor starts.
+///
+/// The module reads the keys the terminal has delivered, and a run that turns out to be no answer
+/// gives its Escape and its bracket to the editor. The keys it read after them are looked at again
+/// from the first, because one of them may be the Escape of an answer of its own: a control
+/// sequence cut short by the Escape of the next one is the case. The case types a line in which a
+/// control sequence is cut short by an answer, and expects the module to say in its trace that it
+/// took one answer out of the input, and the line to print the word the other keys spell.
+///
+/// # Panics
+///
+/// Panics when the module does not take the second answer out or the line does not print its word.
+#[cfg(unix)]
+pub fn an_answer_behind_one_that_was_cut_short_is_taken_out_before_the_editor_starts(
+    kind: ShellKind,
+) {
+    let package = Package::built(kind);
+    let directory = tempfile::Builder::new()
+        .prefix("kr-cut-trace-")
+        .tempdir()
+        .expect("a directory for the module's trace");
+    let trace = directory.path().join("trace");
+    let mut session = Session::start_with(
+        &package,
+        &[("KR_SHELL_BRIDGE_TRACE".to_owned(), told(&trace))],
+    );
+    session.commands.hold_entries = true;
+    session.stepping = false;
+    session.first_prompt();
+    assert!(
+        session.wait_for_prompt(),
+        "the shell drew no prompt:\n{}",
+        session.terminal_output()
+    );
+    let typed = [
+        "Write-Output ('kr-cut-' + 'a",
+        "\x1b[?",
+        "\x1b[?62;22c",
+        "~b')",
+        "\r",
+    ]
+    .concat();
+    let start = session.written();
+    session.type_bytes(typed.as_bytes());
+    session.answer_held_entries();
+    let deadline = session.deadline_for(REPLY);
+    assert!(
+        session.wait_for_output_after_by(start, "kr-cut-ab", deadline),
+        "the keys typed ahead of the read did not spell \"kr-cut-ab\":\n{}",
+        shown_since(&session, start)
+    );
+    assert!(
+        the_trace(&trace).contains("1 host answers were in the terminal's input"),
+        "the module did not take the answer behind the one that was cut short out of the terminal's \
+         input:\n{}",
+        the_trace(&trace)
+    );
+}
+
 /// KR-REQ-08.48: a chord the person bound on an Escape runs when its keys were typed ahead of a read.
 ///
 /// The module takes an Escape and the key behind it for a host's answer only where the chord is its

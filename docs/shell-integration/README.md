@@ -1021,7 +1021,10 @@ method, and that is exactly what it cannot do:
   while that answer is owed. Then, before the editor starts, the module reads the keys the terminal
   has already delivered with the console's own read, drops each host answer in them as the chords
   drop one in the editor's keys (the next item), and puts every other key into the editor's queue,
-  in the order it came, behind its own key. Nothing is waited for there, and it takes what is in the
+  in the order it came, behind its own key. A run that proves to be no answer gives its Escape and
+  introducer to the editor, and the module looks again from the key after them, because an Escape
+  among them may start an answer of its own. If a read fails part way, the editor still gets every
+  key the module had taken. Nothing is waited for there, and it takes what is in the
   input when it reads: an answer that arrives later, or in two parts across the read, is not taken.
   A reply the writer had taken when the entry was applied is normally written by the time the
   worker's answer arrives, and is then in the input the module reads; one the writer has not yet

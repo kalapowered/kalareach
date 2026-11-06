@@ -199,6 +199,20 @@ fn a_hello_the_worker_refuses_is_reported_to_the_person() {
     shellpkg::a_hello_the_worker_refuses_is_reported_to_the_person();
 }
 
+/// KR-REQ-08.48: the keys of an answer the module was reading when its read failed reach the editor.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn the_keys_of_an_answer_the_drain_was_reading_when_it_failed_reach_the_editor() {
+    shellpkg::the_keys_of_an_answer_the_drain_was_reading_when_it_failed_reach_the_editor(PWSH);
+}
+
+/// KR-REQ-08.48: an answer behind one that was cut short is taken out before the editor starts.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn an_answer_behind_one_that_was_cut_short_is_taken_out_before_the_editor_starts() {
+    shellpkg::an_answer_behind_one_that_was_cut_short_is_taken_out_before_the_editor_starts(PWSH);
+}
+
 /// KR-REQ-07.37, KR-REQ-07.85
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
