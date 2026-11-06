@@ -783,6 +783,65 @@ async fn the_project_service_gives_a_refusal_another_copy_recorded_first_as_a_co
     world.serving.abort();
 }
 
+/// KR-REQ-09.09: a reused identifier found by a service's own lookup is this host's word about the
+/// identifier and names no result, so the door shows it as it is to a device that may not read the
+/// record the identifier was spent on, as it shows a create's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_identifier_is_shown_to_a_device_that_may_not_read_the_record() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let without_reading: Vec<ActionRight> = ActionRight::ALL
+        .iter()
+        .copied()
+        .filter(|right| *right != ActionRight::SessionView)
+        .collect();
+    let (connection, _) = paired_connection(controller, 84, &without_reading);
+    let mut mutation = mutation_of(
+        &world,
+        &connection,
+        Method::SessionRename,
+        92,
+        ParamsValue::empty(),
+    );
+    mutation.target = ActionTarget {
+        environment_id: world.environment_id,
+        session_id: Nullable::some(world.session_id),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let entry = connection
+        .admit(mutation.method.as_str(), mutation.method_version)
+        .expect("the method is in the registry");
+    let decided = connection
+        .ask_mutation(&mutation, entry)
+        .expect("the rename is decided for a device that holds every right but this one");
+    let validated = connection
+        .admitted_at()
+        .await
+        .expect("the registration stands");
+    let kept = ControlFrame::Response(Response {
+        request_id: mutation.request_id,
+        outcome: Outcome::Error(ProtocolError::new(
+            ErrorCode::IdConflict,
+            "the identifier was used with another request",
+        )),
+    });
+    let mut asked = None;
+    let answer = connection
+        .kept_answer(
+            kept.clone(),
+            Method::SessionRename,
+            &mutation,
+            validated,
+            &decided,
+            &mut asked,
+        )
+        .await;
+    assert_eq!(answer.ok(), Some(kept));
+    world.serving.abort();
+}
+
 /// KR-REQ-09.09: an answer kept from an earlier submission of an action, whoever found it, is a
 /// read of what that submission produced and is shown under the right to read that. A device that
 /// holds the right over the session its action names is given the answer; one that does not is
