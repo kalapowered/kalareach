@@ -8,9 +8,10 @@
 
 import { describe, expect, it } from 'vitest'
 
-import type { AttentionItem, AttentionReadResult } from '@kalareach/protocol'
+import type { AttentionItem, AttentionReadResult, Receipt } from '@kalareach/protocol'
 
 import { connectionLost, edit, startDraft, type Draft } from '../../src/model/drafts'
+import { ReceiptReads, supersessionFor } from '../../src/model/receipt-reads'
 import { queued, sent, unresolved, type Submission } from '../../src/model/receipts'
 import {
   count,
@@ -531,6 +532,41 @@ describe('recovery after suspension, termination and a network change (KR-ACC-01
     persist(store, { submissions: [submission] })
     const restored = restore(store)
     expect(restored.submissions[0]?.state).toBe('unknown')
+  })
+
+  it('puts a prompt kept from an earlier run below the action a refusal of this run names', () => {
+    // The earlier run's clock had stepped back, so its prompt carries a time ahead of this run's.
+    const OLDER = 'c2000000-0000-4000-8000-000000000001'
+    const NAMED = 'c2000000-0000-4000-8000-000000000002'
+    const sentTo = { applicationInstanceId: 'app-1', agentBindingRevision: '4' }
+    const unknown = (action: string, madeAtMs: number): Submission => ({
+      ...sent(queued(`local-${action}`, 'run it', madeAtMs), action),
+      state: 'unknown',
+      sentTo
+    })
+    const record = (action: string): Receipt => ({
+      action_id: action,
+      actor_id: 'owner:local',
+      error: null,
+      method: 'agent.prompt.submit',
+      method_version: 1,
+      payload_digest: '0'.repeat(64),
+      reason: null,
+      revision: '2',
+      state: 'unknown',
+      updated_at_ms: '100',
+      accepted_deadline_ms: null
+    })
+    const store = memoryStore()
+    persist(store, {
+      submissions: [unknown(OLDER, Date.now() + 3_600_000), unknown(NAMED, NOW)]
+    })
+    const kept = restore(store).submissions
+    const reads = new ReceiptReads()
+    reads.note(record(OLDER))
+    reads.note(record(NAMED))
+    reads.noteRefusal(`the uncertain outcome of this subject is action ${NAMED}, not ${OLDER}`)
+    expect(supersessionFor(kept, reads, sentTo)?.action_id).toBe(NAMED)
   })
 
   it('treats a suspension and a network change as a lost connection, not a restart', () => {

@@ -86,7 +86,14 @@ export function restore(store: DurableStore): DurableState {
       typeof each.state === 'string'
   )
   return {
-    submissions: submissions.map((submission) => ({ ...submission, state: 'unknown' as const }))
+    // A prompt kept from an earlier run was made before every refusal this run will keep, so it
+    // carries no time of its own: a stamp ahead of this clock, from a clock that had stepped back,
+    // would rank it above the action a refusal names.
+    submissions: submissions.map((submission) => ({
+      ...submission,
+      state: 'unknown' as const,
+      createdAtMs: 0
+    }))
   }
 }
 
