@@ -1520,6 +1520,10 @@ mod an_owner_establishes_the_clock;
 #[cfg(test)]
 mod the_clock_effect_at_its_commit;
 
+/// A request for the owner's confirmation of a change of exclusive management, asked again.
+#[cfg(test)]
+mod a_repeat_of_an_exclusive_management_request;
+
 /// A closure whose recording is dropped while it waits for the locks after the record.
 #[cfg(test)]
 mod a_closure_that_is_cancelled;

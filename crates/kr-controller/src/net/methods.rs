@@ -490,7 +490,9 @@ impl Controller {
                 // The grant is issued at the authority revision in force when it is written.
                 let revision = self.authority_revision().await?;
                 let confirmed = blocking(move || {
-                    pairing.confirm(&caller, &params, action, revision, &admission, &life)
+                    pairing.confirm(
+                        &caller, &params, action, revision, &admission, &life, &copied,
+                    )
                 })
                 .await?;
                 // A device that now manages this host is a key the feed may be told can remove it.
@@ -502,7 +504,10 @@ impl Controller {
             Method::PairCancel => {
                 let pairing = self.pairing_service()?;
                 let params: PairCancelParams = decode(&mutation.params)?;
-                blocking(move || pairing.cancel(&caller, &params, action, &admission, &life)).await
+                blocking(move || {
+                    pairing.cancel(&caller, &params, action, &admission, &life, &copied)
+                })
+                .await
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation the pairing service serves",
