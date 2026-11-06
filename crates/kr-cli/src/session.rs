@@ -5208,6 +5208,44 @@ mod tests {
         );
     }
 
+    /// A refused resize and a resize the terminal made as the owner are the terminal speaking: each
+    /// ends the rest a session that keeps refusing a size leaves, so the question the first owes and
+    /// the moves waiting behind the second go.
+    #[test]
+    fn a_resize_the_terminal_makes_or_has_refused_ends_the_rest() {
+        let resting = |after: fn(&mut WindowReports)| {
+            let mut window = parked_at_477();
+            window.pressed(1, 23, size(80, 24));
+            window.measured(size(100, 30));
+            send(&mut window, 2).expect("the size goes");
+            for id in 3..=6 {
+                window.answered(request(id - 1), Answer::NotSettled);
+                window.heard();
+                if id < 6 {
+                    send(&mut window, id).expect("and again with the session's next word");
+                }
+            }
+            window.heard();
+            assert_eq!(window.next(), None, "four tries in a row, and it rests");
+            after(&mut window);
+            window
+        };
+
+        let mut window = resting(|window| window.owe_question(size(100, 30)));
+        let question = send(&mut window, 7).expect("the question goes at once");
+        assert_eq!(
+            (question.dimensions, question.position),
+            (size(100, 30), row(477))
+        );
+
+        let mut window = resting(|window| window.took_size(size(100, 30)));
+        assert_eq!(
+            send(&mut window, 7).map(|sending| sending.position),
+            Some(row(454)),
+            "the owner's own resize ended the rest, and the move that waited goes"
+        );
+    }
+
     /// A return to the live screen is the person's own key, like a move: one the session did not
     /// take for now is settled as not taken, and no size is sent at the row the window was at,
     /// which would take the window back from where the key put it. The next key asks again.
