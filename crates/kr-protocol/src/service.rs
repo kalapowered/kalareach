@@ -86,6 +86,10 @@ pub const SERVICE_REQUEST_FRESHNESS_MS: u64 = 5 * 60 * 1000;
 /// The longest a gateway origin may be, in bytes.
 pub const MAX_GATEWAY_ORIGIN_LEN: usize = 128;
 
+/// The origin of the gateway KalaReach runs: where the official applications register, and the one
+/// gateway every host delivers through whatever its configuration document lists.
+pub const OFFICIAL_GATEWAY_ORIGIN: &str = "https://reach.kala.to";
+
 /// Which key signed a service request, and therefore which domain it is checked under.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,

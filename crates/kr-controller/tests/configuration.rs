@@ -3186,11 +3186,11 @@ fn record_unreachable_worker(
     reservation.session_id
 }
 
-/// A document of level 7: a setting this build knows, a ceiling, and two sections of a newer
+/// A document of level 8: a setting this build knows, a ceiling, and two sections of a newer
 /// release, one whose name looks like a credential.
 const AT_A_HIGHER_LEVEL: &[u8] = br#"{
   "version": 3,
-  "level": 7,
+  "level": 8,
   "revision": 5,
   "preferences": { "sleep_inhibition": "battery_too" },
   "ceilings": { "session_limit": 4 },
@@ -3261,7 +3261,7 @@ async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_
     assert_eq!(check.status, kr_protocol::hostinfo::DoctorStatus::Warning);
     let said = check.detail();
     assert!(
-        said.contains("level 7") && said.contains("reads level 6") && said.contains("2 members"),
+        said.contains("level 8") && said.contains("reads level 7") && said.contains("2 members"),
         "the levels and the count: {said}"
     );
     assert!(check.remedy().is_some(), "and what to do about it");
@@ -3298,7 +3298,7 @@ async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_
         .expect_err("an edit of a document above this build's level is refused");
     let said = format!("{refused}");
     assert!(
-        said.contains("level 7") && said.contains("nothing was written"),
+        said.contains("level 8") && said.contains("nothing was written"),
         "{said}"
     );
     assert_eq!(std::fs::read(&path).expect("the document"), before);

@@ -1428,7 +1428,8 @@ impl ComposedBundle {
 ///       "unit": { "command": "cargo test --workspace", "outputs": ["target"] }
 ///     }
 ///   },
-///   "relay": { "origin": "https://reach.example.com" }
+///   "relay": { "origin": "https://reach.example.com" },
+///   "push": { "gateways": ["https://push.builder.example"] }
 /// }
 /// ```
 ///
@@ -1438,6 +1439,10 @@ impl ComposedBundle {
 /// chosen, and the daemon reads them when it starts ([`NetworkSelection`],
 /// [`VoiceSelection`], [`StorageSelection`], [`AuthoritySelection`], [`MailboxSelection`],
 /// [`RelaySelection`]). No environment variable reaches any of them.
+///
+/// The `push` section lists the push gateways, besides the official one, that a paired device's
+/// credential may name ([`PushSelection`]). It is not read once at start: the host takes the list
+/// whenever the document is put into force, and a gateway taken out of it loses its credentials.
 ///
 /// Its numbers are ordinary JSON numbers rather than the decimal strings the wire types use. This
 /// is a file a person may open and edit, not a message a JavaScript consumer parses, and the
@@ -1490,6 +1495,7 @@ impl ComposedBundle {
 /// [`AuthoritySelection`]: configuration::AuthoritySelection
 /// [`MailboxSelection`]: configuration::MailboxSelection
 /// [`RelaySelection`]: configuration::RelaySelection
+/// [`PushSelection`]: configuration::PushSelection
 /// [`resolve`]: configuration::resolve
 /// [`ALLOWLIST`]: configuration::ALLOWLIST
 pub mod configuration {
@@ -2132,6 +2138,18 @@ pub mod configuration {
         /// carries one.
         #[serde(default, skip_serializing_if = "levels::is_unused")]
         pub shell: ShellSelection,
+        /// The push gateways, besides the official one, that a paired device's sender credential
+        /// may name.
+        ///
+        /// A section of level 7: written when its `gateways` member is not null, and ignored, with
+        /// a count, by a release that reads level 6. A release that does not know it registers a
+        /// credential from the official gateway only, so a device whose app uses another gateway
+        /// waits for the host to be brought forward; it keeps using a credential it already holds.
+        /// Read whenever the document is put into force, so a gateway taken out of the list loses
+        /// its credentials at once: they are no longer used or renewed, and the host asks the
+        /// gateway to revoke each. No profile, request or environment variable can set it.
+        #[serde(default, skip_serializing_if = "levels::is_unused")]
+        pub push: PushSelection,
         /// How this environment's control daemon is started when a command finds none running.
         ///
         /// Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
@@ -2190,6 +2208,7 @@ pub mod configuration {
                 relay: RelaySelection::default(),
                 automation: AutomationSelection::default(),
                 shell: ShellSelection::default(),
+                push: PushSelection::default(),
                 startup: StartupSelection::default(),
                 descriptions: DescriptionsSelection::default(),
                 agents: BTreeMap::new(),
@@ -2850,6 +2869,44 @@ pub mod configuration {
         }
     }
 
+    /// The most gateways one document may list.
+    pub const MAX_PUSH_GATEWAYS: usize = 16;
+
+    /// The push gateways a paired device's sender credential may name, besides the official one.
+    ///
+    /// An independently signed app registers with its own gateway, so the credential its
+    /// installation was issued names that gateway's origin, and the host sends every notification,
+    /// status question and renewal under it to that origin. The host therefore delivers through
+    /// the official gateway and through the origins listed here, and through no other: a device
+    /// cannot make the host post to an address of the device's choosing. The official gateway is
+    /// always allowed and is never listed.
+    ///
+    /// Taking a gateway out of the list retires the credentials the host holds for it. The host
+    /// stops using and renewing them at once, forgets them, and keeps a debt to ask the gateway to
+    /// revoke each authorisation, which it asks for again until the gateway has.
+    ///
+    /// The section arrived with level 7. A release that reads level 6 does not know it: it applies
+    /// the rest of the document, counts the section among the members it ignores, and does not
+    /// edit the document. Such a release registers a credential from the official gateway only,
+    /// so a host rolled back to one takes no new credential from a listed gateway until it is
+    /// brought forward again.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct PushSelection {
+        /// The origins, each an `https` origin or an `http` origin on a loopback address, spelled
+        /// as a gateway origin is, with no path and no trailing slash. An empty list names no
+        /// gateway besides the official one. Null or absent leaves the section unused.
+        pub gateways: Nullable<Vec<String>>,
+    }
+
+    impl PushSelection {
+        /// The listed origins: none when the member is null or absent.
+        #[must_use]
+        pub fn gateways(&self) -> &[String] {
+            self.gateways.as_ref().map_or(&[], Vec::as_slice)
+        }
+    }
+
     /// What this host's workflows run.
     ///
     /// A `run_tests` node names a suite and the immutable version it runs against, and never a
@@ -3260,12 +3317,17 @@ pub mod configuration {
         // states a lower level than the sections it holds need is refused, as the release that
         // reads those sections refuses it.
         let held = level_of(&document, release);
-        if newer.is_none() && declared_level < held {
+        if newer.is_none()
+            && declared_level < held
+            && let Some(section) = levels::highest_held(&document, release)
+        {
             return invalid(vec![
                 Sentence::new()
                     .stated("the document states level ")
                     .number(declared_level)
-                    .stated(" and holds a section of level ")
+                    .stated(" and holds the section ")
+                    .stated(section.member)
+                    .stated(", which needs level ")
                     .number(held),
             ]);
         }
@@ -3899,11 +3961,59 @@ pub mod configuration {
                     ),
             );
         }
+        problems.extend(push_gateway_problems(&document.push));
         if problems.is_empty() {
             Ok(())
         } else {
             Err(problems)
         }
+    }
+
+    /// Returns what is wrong with the list of push gateways, entry by entry.
+    ///
+    /// Each entry is an origin spelled as a gateway origin is, and the list names the official
+    /// gateway nowhere (it is always allowed, so listing it would only invite taking it out),
+    /// names no origin twice and holds at most [`MAX_PUSH_GATEWAYS`].
+    fn push_gateway_problems(push: &PushSelection) -> Vec<Sentence> {
+        let mut problems = Vec::new();
+        let gateways = push.gateways();
+        if gateways.len() > MAX_PUSH_GATEWAYS {
+            problems.push(
+                Sentence::new()
+                    .stated("push.gateways names ")
+                    .number(gateways.len() as u64)
+                    .stated(" origins, and a document lists at most ")
+                    .number(MAX_PUSH_GATEWAYS as u64),
+            );
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for origin in gateways {
+            if origin == crate::service::OFFICIAL_GATEWAY_ORIGIN {
+                problems.push(Sentence::new().stated(
+                    "push.gateways lists the official gateway, which is always allowed and is \
+                     not listed",
+                ));
+            } else if crate::service::GatewayOrigin::new(origin.as_str()).is_err() {
+                problems.push(
+                    Sentence::new()
+                        .stated("push.gateways (")
+                        .withheld(super::export::ContentClass::Location, origin)
+                        .stated(
+                            ") is not an https origin, or an http origin on a loopback address, \
+                             in the canonical spelling a gateway origin has, with no path and no \
+                             trailing slash",
+                        ),
+                );
+            } else if !seen.insert(origin.as_str()) {
+                problems.push(
+                    Sentence::new()
+                        .stated("push.gateways lists ")
+                        .withheld(super::export::ContentClass::Location, origin)
+                        .stated(" more than once"),
+                );
+            }
+        }
+        problems
     }
 
     /// What a relay or discovery URL is refused with.
@@ -4205,6 +4315,12 @@ pub mod configuration {
             /// Whether its integration is on.
             enabled: bool,
         },
+        /// Choose the push gateways besides the official one that a paired device's credential
+        /// may name, or clear the list.
+        ///
+        /// The whole list: what this names becomes what the document says. A gateway taken out of
+        /// it loses its credentials when the document is next put into force.
+        PushGateways(Option<Vec<String>>),
         /// Choose the shell mode a session is created in when its request names none, or clear
         /// the choice so the product default decides.
         ShellMode(Option<crate::session::ShellMode>),
@@ -4248,6 +4364,7 @@ pub mod configuration {
                 Self::Descriptions { .. } => "descriptions",
                 Self::DeviceConfiguration(_) => "device_configuration",
                 Self::ShellMode(_) => SHELL_MODE.key,
+                Self::PushGateways(_) => PUSH_GATEWAYS_KEY,
                 Self::Network(_) => "network",
             }
         }
@@ -4260,6 +4377,7 @@ pub mod configuration {
                 | Self::SessionLimit(_)
                 | Self::GrantRights(_)
                 | Self::Enrolment(_)
+                | Self::PushGateways(_)
                 | Self::Descriptions { .. } => ValueEffect::Immediately,
                 // Each part takes effect as it does alone: the descriptions at once, the profile and
                 // the integrations for the sessions created afterwards.
@@ -4642,6 +4760,9 @@ pub mod configuration {
             }
             Change::ShellMode(mode) => {
                 document.shell.mode = Nullable(*mode);
+            }
+            Change::PushGateways(gateways) => {
+                document.push.gateways = Nullable(gateways.clone());
             }
             Change::Network(selection) => {
                 let selected = selection.as_ref();
@@ -5845,6 +5966,46 @@ pub mod configuration {
     /// The key of the row of declared output paths [`automation_rows`] contributes.
     pub const AUTOMATION_TEST_OUTPUTS_KEY: &str = "automation.test_outputs";
 
+    /// The key of the row [`push_row`] contributes, and of the change that sets it.
+    pub const PUSH_GATEWAYS_KEY: &str = "push.gateways";
+
+    /// The row the `push` section contributes to the effective-value report: the gateways this
+    /// host delivers through besides the official one, as they are in force, or `none`.
+    ///
+    /// `in_force` is the list the host is acting on, which is the document's when it could use
+    /// one and the list before it when it could not: a document nobody can read retires nothing,
+    /// so the report does not say it did. The origins are locations the owner wrote down, so an
+    /// export carries their class and length. The host takes the list whenever the document is put
+    /// into force, so a change applies at once.
+    #[must_use]
+    pub fn push_row(
+        in_force: &[String],
+        document: Option<&ConfigurationDocument>,
+        origin: &str,
+    ) -> super::EffectiveValue {
+        use super::export::Declared;
+
+        let written = !in_force.is_empty()
+            || document.is_some_and(|document| document.push.gateways.is_present());
+        super::EffectiveValue::new(
+            PUSH_GATEWAYS_KEY,
+            "the push gateways besides the official one that a paired device's credential may name",
+            &if in_force.is_empty() {
+                Declared::term("none")
+            } else {
+                Declared::locations(in_force.iter().map(String::as_str))
+            },
+            if written {
+                ValueSource::HostConfiguration
+            } else {
+                ValueSource::Default
+            },
+            Nullable(written.then(|| origin.to_owned())),
+            Nullable::null(),
+            ValueEffect::Immediately,
+        )
+    }
+
     /// What the owner's two settings for session descriptions come to, and where each came from.
     ///
     /// Neither setting has a request, a profile or a variable rung: they are the owner's, written
@@ -6192,6 +6353,7 @@ pub mod configuration {
             || PREFERENCES.iter().any(|preference| preference.key == value)
             || SELECTIONS.iter().any(|selection| selection.key == value)
             || value == AGENTS_OWNERSHIP_KEY
+            || value == PUSH_GATEWAYS_KEY
             || value == IGNORED_MEMBERS_KEY
             || SELECTION_WORDS.contains(&value)
             || CEILINGS.contains(&value)

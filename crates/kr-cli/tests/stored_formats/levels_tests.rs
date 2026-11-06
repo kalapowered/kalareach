@@ -556,6 +556,7 @@ fn the_views_observe_builds_hold_the_names_the_reader_compares() {
             ("authority", Some(2)),
             ("automation", Some(5)),
             ("mailbox", Some(3)),
+            ("push", Some(7)),
             ("relay", Some(4)),
             ("shell", Some(6)),
         ],

@@ -25,7 +25,7 @@ use crate::hostinfo::export::{ContentClass, Sentence};
 pub const BASE_LEVEL: u64 = 1;
 
 /// The highest level this build reads.
-pub const LEVEL: u64 = 6;
+pub const LEVEL: u64 = 7;
 
 /// How many edits apart a member of a document above the reader's level may be from a name this
 /// build knows before it is taken for a misspelling of that name rather than a member of a newer
@@ -95,6 +95,10 @@ pub const LEVELLED: &[Levelled] = &[
         member: "shell",
         level: 6,
     },
+    Levelled {
+        member: "push",
+        level: 7,
+    },
 ];
 
 /// What a release reads and writes: its level and the sections that arrived with one.
@@ -145,12 +149,17 @@ pub fn is_unused<T: Serialize>(section: &T) -> bool {
 /// table that the document holds, and never below the base level.
 #[must_use]
 pub fn level_of(document: &ConfigurationDocument, release: &Release) -> u64 {
-    if release.levelled.is_empty() {
-        return BASE_LEVEL;
-    }
-    let Ok(json) = serde_json::to_value(document) else {
-        return BASE_LEVEL;
-    };
+    highest_held(document, release).map_or(BASE_LEVEL, |entry| entry.level)
+}
+
+/// The section of the release's table that the document holds at the highest level, if it holds
+/// any.
+#[must_use]
+pub fn highest_held<'a>(
+    document: &ConfigurationDocument,
+    release: &'a Release,
+) -> Option<&'a Levelled> {
+    let json = serde_json::to_value(document).ok()?;
     release
         .levelled
         .iter()
@@ -158,8 +167,7 @@ pub fn level_of(document: &ConfigurationDocument, release: &Release) -> u64 {
             json.get(entry.member)
                 .is_some_and(|section| !unused_value(section))
         })
-        .map(|entry| entry.level)
-        .fold(BASE_LEVEL, u64::max)
+        .max_by_key(|entry| entry.level)
 }
 
 // -------------------------------------------------------------------------------------------

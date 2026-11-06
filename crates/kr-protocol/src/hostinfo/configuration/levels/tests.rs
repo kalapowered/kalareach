@@ -136,6 +136,38 @@ const BEFORE_SHELL: Release = Release {
     ],
 };
 
+/// A release that reads level 6 and predates the push section: it takes the section for a member
+/// of a newer release.
+const BEFORE_PUSH: Release = Release {
+    level: 6,
+    levelled: &[
+        Levelled {
+            member: "authority",
+            level: 2,
+        },
+        Levelled {
+            member: "mailbox",
+            level: 3,
+        },
+        Levelled {
+            member: "relay",
+            level: 4,
+        },
+        Levelled {
+            member: "automation",
+            level: 5,
+        },
+        Levelled {
+            member: "shell",
+            level: 6,
+        },
+        Levelled {
+            member: "push",
+            level: 7,
+        },
+    ],
+};
+
 const BROKER: &str = "https://broker.example.com";
 
 const FEED: &str = "https://reach.example.com";
@@ -1217,4 +1249,346 @@ fn a_chosen_shell_mode_survives_the_file_and_the_registrys_copy() {
             "{stray}"
         );
     }
+}
+
+/// Two gateways besides the official one, one of them on a loopback address.
+const GATEWAYS: [&str; 2] = ["https://push.builder.example", "http://127.0.0.1:8788"];
+
+/// A document that lists gateways, as this build writes it.
+fn with_gateways() -> ConfigurationDocument {
+    let mut document = ConfigurationDocument::empty();
+    document.push.gateways =
+        Nullable::some(GATEWAYS.iter().map(|&origin| origin.to_owned()).collect());
+    document.ceilings.session_limit = Nullable::some(4);
+    document
+}
+
+/// KR-REQ-16.04: the push section is a section of level 7, and a writer stamps the highest level
+/// among the sections the document holds. A document that lists no gateway, or whose list is null,
+/// is written without the section and below level 7; an empty list is held, because it says that
+/// no gateway besides the official one is allowed.
+#[test]
+fn a_document_that_lists_no_gateway_is_stamped_below_the_sections_level() {
+    let mut shell_only = ConfigurationDocument::empty();
+    shell_only.shell.mode = Nullable::some(ShellMode::Managed);
+    let written = contents_in(&shell_only, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 6, "{written}");
+    assert!(json(&written).get("push").is_none(), "{written}");
+
+    let mut both = shell_only;
+    both.push.gateways = Nullable::some(vec![GATEWAYS[0].to_owned()]);
+    let written = contents_in(&both, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 7, "{written}");
+    assert_eq!(
+        json(&written)["push"]["gateways"][0],
+        GATEWAYS[0],
+        "{written}"
+    );
+    assert_eq!(json(&written)["shell"]["mode"], "managed", "{written}");
+
+    let mut empty_list = ConfigurationDocument::empty();
+    empty_list.push.gateways = Nullable::some(Vec::new());
+    let written = contents_in(&empty_list, &THIS_RELEASE);
+    assert_eq!(
+        json(&written)["level"],
+        7,
+        "an empty list is held: {written}"
+    );
+    assert_eq!(
+        json(&written)["push"]["gateways"],
+        serde_json::json!([]),
+        "{written}"
+    );
+}
+
+/// A release that reads level 6 takes the push section for a section of a newer release: it applies
+/// every member it knows, leaves the section out, counts and names it, does not fail closed, and
+/// does not edit the document.
+#[test]
+fn a_release_at_level_6_ignores_the_push_section_and_applies_the_rest() {
+    let mut document = with_gateways();
+    document.shell.mode = Nullable::some(ShellMode::NativeCompat);
+    let written = contents_in(&document, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 7, "{written}");
+
+    let loaded = load_in(Some(written.as_bytes()), &BEFORE_PUSH);
+    assert_eq!(
+        loaded.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        loaded.status
+    );
+    assert!(!loaded.fails_closed());
+    assert_eq!(
+        loaded.newer,
+        Some(Newer {
+            declared: 7,
+            count: 1,
+            names: vec!["push".to_owned()]
+        })
+    );
+    let used = loaded.document.as_ref().expect("the document is used");
+    assert_eq!(used.ceilings.session_limit.0, Some(4));
+    assert_eq!(
+        used.shell.mode(),
+        Some(ShellMode::NativeCompat),
+        "level 6 is still read"
+    );
+    assert!(used.push.gateways().is_empty(), "the section is left out");
+    assert!(matches!(
+        edit_in(&loaded, &Change::SessionLimit(Some(2)), &BEFORE_PUSH),
+        Err(EditRefused::NotOurs(_))
+    ));
+}
+
+/// The positive control of omission, and the round trip of an active value: a document that lists
+/// no gateway is read and edited by a release at level 6 as it was before the section existed; once
+/// gateways are listed the next write is at level 7 and keeps every other member, and the list
+/// survives the file, the typed document and the registry's copy.
+#[test]
+fn a_listed_gateway_survives_the_file_and_the_registrys_copy() {
+    let mut earlier = ConfigurationDocument::empty();
+    earlier.shell.mode = Nullable::some(ShellMode::Managed);
+    earlier.ceilings.session_limit = Nullable::some(4);
+    let before = contents_in(&earlier, &THIS_RELEASE);
+    let read = load_in(Some(before.as_bytes()), &BEFORE_PUSH);
+    assert_eq!(read.status.state, DocumentState::Loaded);
+    assert!(
+        read.newer.is_none(),
+        "a document at the level is read strictly"
+    );
+
+    let mut document = load_in(Some(before.as_bytes()), &THIS_RELEASE)
+        .document
+        .expect("used");
+    document.push = with_gateways().push;
+    let written = contents_in(&document, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 7, "{written}");
+    assert_eq!(json(&written)["ceilings"]["session_limit"], 4, "{written}");
+    assert_eq!(json(&written)["shell"]["mode"], "managed", "{written}");
+
+    let read = load_in(Some(written.as_bytes()), &THIS_RELEASE);
+    assert_eq!(
+        read.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        read.status
+    );
+    let typed = read.document.expect("used");
+    assert_eq!(typed.push.gateways(), GATEWAYS);
+    assert_eq!(typed.level, 7);
+    let copy = contents_in(&typed, &THIS_RELEASE);
+    assert_eq!(
+        load_in(Some(copy.as_bytes()), &THIS_RELEASE)
+            .document
+            .as_ref(),
+        Some(&typed)
+    );
+    assert_eq!(
+        copy, written,
+        "the copy is the file's reading written again"
+    );
+
+    // The section is as strict as any other.
+    for stray in [
+        r#"{"version": 3, "level": 7, "push": {"gateways": [], "fallback": true}}"#,
+        r#"{"version": 3, "level": 7, "push": {"gateways": "https://push.builder.example"}}"#,
+    ] {
+        assert_eq!(
+            load_in(Some(stray.as_bytes()), &THIS_RELEASE).status.state,
+            DocumentState::Invalid,
+            "{stray}"
+        );
+    }
+}
+
+/// KR-REQ-16.04: an origin in the list is what a gateway origin is everywhere else, the official
+/// gateway is never listed, no origin is listed twice and no more than sixteen are. Each refusal
+/// names `push.gateways`, and a document that holds the section but states a level below 7 is
+/// refused by name as well, so a hand-written document cannot slip a list past a release that
+/// would ignore it.
+#[test]
+fn the_list_of_gateways_is_refused_by_name_when_an_entry_is_not_an_allowed_origin() {
+    let long = format!("https://{}.example", "a".repeat(130));
+    let many: Vec<String> = (0..17)
+        .map(|n| format!("https://push{n}.example"))
+        .collect();
+    let refused: Vec<(&str, Vec<String>)> = vec![
+        ("no scheme", vec!["push.builder.example".to_owned()]),
+        (
+            "plain http off loopback",
+            vec!["http://push.builder.example".to_owned()],
+        ),
+        (
+            "a path",
+            vec!["https://push.builder.example/api".to_owned()],
+        ),
+        (
+            "a trailing slash",
+            vec!["https://push.builder.example/".to_owned()],
+        ),
+        (
+            "upper case",
+            vec!["https://PUSH.builder.example".to_owned()],
+        ),
+        (
+            "the default port spelled out",
+            vec!["https://push.builder.example:443".to_owned()],
+        ),
+        (
+            "user information",
+            vec!["https://user@push.builder.example".to_owned()],
+        ),
+        ("too long", vec![long]),
+        ("empty", vec![String::new()]),
+        (
+            "the official gateway",
+            vec![crate::service::OFFICIAL_GATEWAY_ORIGIN.to_owned()],
+        ),
+        (
+            "a duplicate",
+            vec![
+                GATEWAYS[0].to_owned(),
+                GATEWAYS[1].to_owned(),
+                GATEWAYS[0].to_owned(),
+            ],
+        ),
+        ("seventeen", many),
+    ];
+    for (why, list) in refused {
+        let mut document = ConfigurationDocument::empty();
+        document.push.gateways = Nullable::some(list.clone());
+        document.level = 7;
+        let text = serde_json::to_string(&document).expect("serialises");
+        let loaded = load_in(Some(text.as_bytes()), &THIS_RELEASE);
+        assert_eq!(
+            loaded.status.state,
+            DocumentState::Invalid,
+            "{why}: {list:?}"
+        );
+        let said = loaded.status.detail.to_string();
+        assert!(said.contains("push.gateways"), "{why}: {said}");
+        // The edit refuses the same list, by the same name, and writes nothing.
+        let refused = edit_in(
+            &load_in(None, &THIS_RELEASE),
+            &Change::PushGateways(Some(list.clone())),
+            &THIS_RELEASE,
+        );
+        match refused {
+            Err(EditRefused::Invalid(problems)) => assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.to_string().contains("push.gateways")),
+                "{why}: {problems:?}"
+            ),
+            other => panic!("{why}: the edit was not refused by name: {other:?}"),
+        }
+    }
+
+    // The control: the same document with allowed origins is read.
+    let accepted = r#"{"version": 3, "level": 7, "push": {"gateways": ["https://push.builder.example", "http://127.0.0.1:8788"]}}"#;
+    assert_eq!(
+        load_in(Some(accepted.as_bytes()), &THIS_RELEASE)
+            .status
+            .state,
+        DocumentState::Loaded
+    );
+    // A level below the section's is refused by name, an empty list included.
+    for low in [
+        r#"{"version": 3, "level": 6, "push": {"gateways": ["https://push.builder.example"]}}"#,
+        r#"{"version": 3, "push": {"gateways": []}}"#,
+    ] {
+        let loaded = load_in(Some(low.as_bytes()), &THIS_RELEASE);
+        assert_eq!(loaded.status.state, DocumentState::Invalid, "{low}");
+        assert!(
+            loaded.status.detail.to_string().contains("push"),
+            "{low}: {:?}",
+            loaded.status
+        );
+    }
+}
+
+/// KR-REQ-16.04: the edit sets the whole list, stamps level 7 itself, takes effect at once, changes
+/// no other member, and clearing it writes the document without the section at the level the rest
+/// of it needs.
+#[test]
+fn the_edit_sets_the_list_of_gateways_and_clearing_it_leaves_no_section_behind() {
+    let change = Change::PushGateways(Some(
+        GATEWAYS.iter().map(|&origin| origin.to_owned()).collect(),
+    ));
+    assert_eq!(change.key(), "push.gateways");
+    assert_eq!(
+        change.effect(),
+        crate::hostinfo::configuration::ValueEffect::Immediately
+    );
+
+    let power = Change::SessionLimit(Some(3));
+    let base = edit_in(&load_in(None, &THIS_RELEASE), &power, &THIS_RELEASE).expect("an edit");
+    let first = edit_in(
+        &load_in(Some(base.contents.as_bytes()), &THIS_RELEASE),
+        &change,
+        &THIS_RELEASE,
+    )
+    .expect("an edit");
+    assert_eq!(first.document.level, 7);
+    assert_eq!(first.document.push.gateways(), GATEWAYS);
+    assert_eq!(first.document.ceilings.session_limit.0, Some(3));
+    assert_eq!(first.revision, 2);
+
+    let cleared = edit_in(
+        &load_in(Some(first.contents.as_bytes()), &THIS_RELEASE),
+        &Change::PushGateways(None),
+        &THIS_RELEASE,
+    )
+    .expect("an edit");
+    assert!(cleared.document.push.gateways().is_empty());
+    assert_eq!(cleared.document.level, 1, "nothing of level 7 is held");
+    assert!(
+        json(&cleared.contents).get("push").is_none(),
+        "{}",
+        cleared.contents
+    );
+    assert_eq!(cleared.document.ceilings.session_limit.0, Some(3));
+}
+
+/// The report lists the gateways in force, by location, or `none`, and says the list applies at
+/// once. A document nobody can read decides nothing, so the report goes on saying what is in
+/// force and not what the absent document would have said.
+#[test]
+fn the_report_lists_the_gateways_in_force_and_says_they_apply_at_once() {
+    use crate::hostinfo::configuration::{PUSH_GATEWAYS_KEY, ValueEffect, ValueSource, push_row};
+
+    let none = push_row(&[], None, "/state/configuration.json");
+    assert_eq!(none.key, PUSH_GATEWAYS_KEY);
+    assert!(
+        crate::hostinfo::configuration::is_known_term(&none.key),
+        "the report prints the name of the row as it is, not as its class and length"
+    );
+    assert_eq!(none.source, ValueSource::Default);
+    assert_eq!(none.effect, ValueEffect::Immediately);
+    assert_eq!(none.value(), "none");
+
+    let document = with_gateways();
+    let in_force = document.push.gateways().to_vec();
+    let listed = push_row(&in_force, Some(&document), "/state/configuration.json");
+    assert_eq!(listed.source, ValueSource::HostConfiguration);
+    assert_eq!(listed.effect, ValueEffect::Immediately);
+    let shown = listed.value();
+    assert!(
+        shown.contains(GATEWAYS[0]) && shown.contains(GATEWAYS[1]),
+        "{shown}"
+    );
+
+    // The document is gone or unusable and the host still delivers through the list it had.
+    let carried = push_row(&in_force, None, "/state/configuration.json");
+    assert_eq!(carried.source, ValueSource::HostConfiguration);
+    assert_eq!(carried.value(), listed.value());
+
+    // The list is empty by the document's own word: held at level 7, and the row says it was
+    // written.
+    let mut cleared = ConfigurationDocument::empty();
+    cleared.push.gateways = Nullable::some(Vec::new());
+    let emptied = push_row(&[], Some(&cleared), "/state/configuration.json");
+    assert_eq!(emptied.source, ValueSource::HostConfiguration);
+    assert_eq!(emptied.value(), "none");
 }

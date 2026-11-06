@@ -12465,6 +12465,7 @@ export interface ConfigurationDocument {
   profiles?: {
     [k: string]: PreferenceSet1
   }
+  push?: PushSelection
   relay?: RelaySelection
   /**
    * The revision this host applied. It rises by one with every validated edit.
@@ -12820,6 +12821,26 @@ export interface PreferenceSet1 {
    * The execution context a session is created in when the request does not choose one.
    */
   worker_profile?: WorkerProfile | null
+}
+/**
+ * The push gateways, besides the official one, that a paired device's sender credential
+ * may name.
+ *
+ * A section of level 7: written when its `gateways` member is not null, and ignored, with
+ * a count, by a release that reads level 6. A release that does not know it registers a
+ * credential from the official gateway only, so a device whose app uses another gateway
+ * waits for the host to be brought forward; it keeps using a credential it already holds.
+ * Read whenever the document is put into force, so a gateway taken out of the list loses
+ * its credentials at once: they are no longer used or renewed, and the host asks the
+ * gateway to revoke each. No profile, request or environment variable can set it.
+ */
+export interface PushSelection {
+  /**
+   * The origins, each an `https` origin or an `http` origin on a loopback address, spelled
+   * as a gateway origin is, with no path and no trailing slash. An empty list names no
+   * gateway besides the official one. Null or absent leaves the section unused.
+   */
+  gateways?: string[] | null
 }
 /**
  * The relay lease service this host asks for a lease for each paired device, and the
