@@ -3542,7 +3542,9 @@ read. A repeated close is the one the daemon can still answer without its worker
 answers it for a device that may read the session's receipts, as it answers a close made after the
 closure. A request the daemon never routed is refused as any request is, and so is a reused
 identifier that carries another request, whether the daemon finds it at the route or in a service's
-record, and whether or not copies of that request wait behind it. That refusal is the daemon's word about the identifier and names no result, so a device that
+record, and whether or not copies of that request wait behind it. A close the daemon carried out with no
+route is the exception: a copy of it is told the outcome is unknown when another request has
+claimed the identifier since. That refusal is the daemon's word about the identifier and names no result, so a device that
 may not read the record is told it as it is; the change-set service's lookups of a capture, an
 apply, a revert and a materialisation are the exception, and tell such a device the outcome is
 unknown. A request whose route the daemon cannot read counts as a repeat. A repeat of a create
@@ -3570,9 +3572,9 @@ it has dispatched or committed the action. It tells `OUTCOME_UNKNOWN` instead: a
 not be held while the answer waited to be written; an answer, or a session's closure, that it could
 not record after the action was carried out; and an attempt under the action's identifier that is
 still running when a copy of it arrives. A project action that was refused, when the journal cannot
-keep the refusal, is told as the record another copy of the action left where it left one, and
-`OUTCOME_UNKNOWN` where there is none to read, because the refusal can be a word about what that
-copy did.
+keep the refusal, is told as the record of the action where there is one to read, `ID_CONFLICT`
+where the record is another request's, and `OUTCOME_UNKNOWN` where there is none, because the
+refusal can be a word about what another copy of the action did.
 
 A device that falls behind is told rather than waited for. What the daemon holds for one device is
 bounded in bytes, not in messages, at section 9's send queue per peer; a device that reaches that
