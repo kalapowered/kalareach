@@ -278,12 +278,18 @@ fn record_a_plain_program_and_a_nested_pseudo_console() {
     );
 }
 
-/// What `wsl.exe` printed for `arguments`, which it writes in UTF-16.
+/// What `wsl.exe` printed for `arguments`, which it writes in UTF-16. A call that does not succeed
+/// stops the case, so that no decision is made on the text of a failure.
 fn wsl_text(arguments: &[&str]) -> String {
     let output = Command::new(system32("wsl.exe"))
         .args(arguments)
         .output()
         .expect("wsl runs");
+    assert!(
+        output.status.success(),
+        "wsl.exe {arguments:?} did not succeed: {}",
+        output.status
+    );
     utf16_text(&output.stdout)
 }
 
@@ -307,14 +313,17 @@ fn listed_names(text: &str) -> Vec<&str> {
 
 /// Whether `distribution` is registered and not running, by the two lists `wsl.exe` prints. A name
 /// is matched whole and without regard to case, so that a distribution whose name holds another's
-/// (`Ubuntu-24.04` holds `Ubuntu`) is never taken for it.
+/// (`Ubuntu-24.04` holds `Ubuntu`) is never taken for it. Anything else on a line of the running
+/// list than the name of a registered distribution (a message in place of names) leaves it unknown,
+/// and an unknown state is not stopped: the distribution is left alone.
 fn is_stopped(distribution: &str, registered: &str, running: &str) -> bool {
-    let named = |text: &str| {
-        listed_names(text)
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(distribution))
-    };
-    named(registered) && !named(running)
+    let registered = listed_names(registered);
+    let running = listed_names(running);
+    let is =
+        |names: &[&str], wanted: &str| names.iter().any(|name| name.eq_ignore_ascii_case(wanted));
+    is(&registered, distribution)
+        && running.iter().all(|name| is(&registered, name))
+        && !is(&running, distribution)
 }
 
 /// Records `wsl.exe` running a command in the distribution, and leaves the distribution stopped if
@@ -587,5 +596,13 @@ fn a_distribution_is_stopped_by_its_complete_name_whatever_the_language() {
     assert!(
         !is_stopped("Debian", both, ""),
         "a distribution that is not registered is not one to end"
+    );
+    assert!(
+        !is_stopped(
+            "Ubuntu",
+            both,
+            "The Windows Subsystem for Linux has no running list\r\n"
+        ),
+        "a line that names no registered distribution leaves the state unknown, and unknown is not stopped"
     );
 }
