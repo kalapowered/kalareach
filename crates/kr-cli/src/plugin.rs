@@ -409,19 +409,28 @@ async fn still_listed(
     daemon: &mut Daemon,
     request: &kr_protocol::pairing::OwnerConfirmationRequest,
 ) -> bool {
-    listed_in(
-        ask_within(daemon.read::<_, OwnerConfirmationPendingResult>(
+    challenge_listed(
+        daemon.read::<_, OwnerConfirmationPendingResult>(
             Method::OwnerConfirmationPending,
             &OwnerConfirmationPendingParams {},
-        ))
-        .await,
+        ),
         request,
     )
+    .await
+}
+
+/// Whether the host answers `read`, within the time a request that changes nothing is given, with
+/// a list that holds the challenge `request`. A host that does not answer in time lists nothing.
+pub(crate) async fn challenge_listed(
+    read: impl std::future::Future<Output = Result<OwnerConfirmationPendingResult>>,
+    request: &kr_protocol::pairing::OwnerConfirmationRequest,
+) -> bool {
+    listed_in(ask_within(read).await, request)
 }
 
 /// Whether the host's answer to the list of pending challenges lists `request`. An answer the host
 /// did not give lists nothing.
-pub(crate) fn listed_in(
+fn listed_in(
     answer: Result<OwnerConfirmationPendingResult>,
     request: &kr_protocol::pairing::OwnerConfirmationRequest,
 ) -> bool {
@@ -1373,6 +1382,24 @@ mod tests {
             ))),
             &ours
         ));
+    }
+
+    /// KR-REQ-07.47: a read of the pending challenges that the host does not answer within the
+    /// time a request that changes nothing is given says the challenge is not listed, and is not
+    /// waited on beyond it.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_of_the_pending_challenges_the_host_does_not_answer_lists_nothing() {
+        // The read is given the time any request that changes nothing is given, and no more: a
+        // host that does not answer it has not said the challenge stands.
+        let answered = tokio::time::timeout(
+            ASK_WITHIN * 2,
+            challenge_listed(
+                std::future::pending::<Result<OwnerConfirmationPendingResult>>(),
+                &a_challenge(1),
+            ),
+        )
+        .await;
+        assert!(matches!(answered, Ok(false)), "{answered:?}");
     }
 
     /// KR-REQ-07.47: a host that is sent the request and does not answer it ends the wait at the
