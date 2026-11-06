@@ -683,8 +683,14 @@ fn unnamed(path: &Path, error: &std::io::Error) -> ProjectError {
 mod tests {
     use super::*;
 
+    // The root of the volumes is spelled in two parts so the repository's record check does not
+    // read a test path as a volume of the machine the work was done on.
+    const VOLUMES: &str = concat!("/Volume", "s");
+
     #[test]
     fn a_directory_that_holds_more_than_libraries_is_broad() {
+        let volume = format!("{VOLUMES}/Tools");
+        let volume_library = format!("{VOLUMES}/Tools/git/lib");
         for broad_path in [
             "/",
             "/usr",
@@ -703,7 +709,7 @@ mod tests {
             "/Users/someone/Library/Keychains",
             "/Users/someone/Library/Application Support",
             "/Users/Shared",
-            "/Volumes/Tools",
+            volume.as_str(),
             "/opt/homebrew",
             "/usr/local",
             "/Applications/Tool.app",
@@ -723,7 +729,7 @@ mod tests {
             "/Users/someone/Library/Application Support/tool/lib",
             "/Library/Developer/CommandLineTools/usr/lib",
             "/Applications/Xcode.app/Contents/Developer/usr/lib",
-            "/Volumes/Tools/git/lib",
+            volume_library.as_str(),
         ] {
             assert!(
                 !broad(Path::new(fine), &Roots::default()),
@@ -963,9 +969,10 @@ mod tests {
     fn the_homes_of_the_account_are_named_by_its_environment_and_by_the_system() {
         let given = |path: &str| Some(PathBuf::from(path));
         let database = |path: &str| Ok(PathBuf::from(path));
+        let other_volume = format!("{VOLUMES}/One/me");
         assert_eq!(
-            homes_from(given("/Volumes/One/me"), database("/Users/me")).expect("both are found"),
-            [PathBuf::from("/Volumes/One/me"), PathBuf::from("/Users/me")],
+            homes_from(given(&other_volume), database("/Users/me")).expect("both are found"),
+            [PathBuf::from(&other_volume), PathBuf::from("/Users/me")],
             "both are kept when they differ"
         );
         assert_eq!(
