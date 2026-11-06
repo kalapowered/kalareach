@@ -32,6 +32,7 @@ use kr_transport::clock::ContinuousInstant;
 
 pub use super::devices::CommitFn;
 pub use super::invitations::Admission;
+use super::invitations::noted_as_a_copy;
 use super::owner::Caller;
 use super::pairing::PairingHost;
 use super::rendezvous::Life;
@@ -335,8 +336,7 @@ impl Controller {
                         // its terminal, and that works off the network, as the clock's does.
                         owner.require_owner(&caller)?;
                         if let Some(requested) = owner.requested(&caller, action) {
-                            copied.store(true, Ordering::Release);
-                            return requested;
+                            return noted_as_a_copy(requested, &copied);
                         }
                         let resolved = controller.organisation_exclusive_resolved(exclusive)?;
                         owner.request(&caller, resolved, action, admission.as_ref(), &copied)
