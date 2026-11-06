@@ -1074,9 +1074,14 @@ impl Session {
             requested_ttl_ms: requested_ttl,
             params: params_record.clone(),
         };
+        // One lock from the look at what the host refused for now to the record of this send. An
+        // answer that marks the action refused for now in between would otherwise let a send
+        // that was composed anew, under the window the connection holds now, go out in place of
+        // the one the host refused, which is the send the host keyed the action by.
+        let mut outcomes = self.state.outcomes.lock().await;
         // The same send again, after the host refused it for now, goes out as it first did.
         if identity.is_continuation()
-            && let Some(sent) = self.state.outcomes.lock().await.sent_before(&mutation)
+            && let Some(sent) = outcomes.sent_before(&mutation)
         {
             mutation = sent;
         }
@@ -1103,24 +1108,22 @@ impl Session {
         //
         // A continuation is checked against the same book under the same lock, so nothing can
         // submit the action between the check and the record.
-        {
-            let mut outcomes = self.state.outcomes.lock().await;
-            if identity.is_continuation() {
-                outcomes.refuse_replacement(action_id)?;
-            }
-            outcomes.submit(
-                SubmittedAction {
-                    action_id,
-                    method,
-                    target: target_record,
-                    params: params_record,
-                    request_id,
-                    held: false,
-                    refused_for_now: false,
-                },
-                Some(sent),
-            )?;
+        if identity.is_continuation() {
+            outcomes.refuse_replacement(action_id)?;
         }
+        outcomes.submit(
+            SubmittedAction {
+                action_id,
+                method,
+                target: target_record,
+                params: params_record,
+                request_id,
+                held: false,
+                refused_for_now: false,
+            },
+            Some(sent),
+        )?;
+        drop(outcomes);
         if self.transport.send(&frame).await.is_err() {
             // The frame may or may not have reached the host, so the action stays on the pending
             // list and the caller is told the outcome is unknown.
