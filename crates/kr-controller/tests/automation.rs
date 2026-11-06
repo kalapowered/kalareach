@@ -1649,6 +1649,105 @@ async fn a_repeat_whose_record_in_the_journal_makes_no_sense_is_told_the_outcome
     host.clients.abort();
 }
 
+/// KR-REQ-19.04: a copy that meets, inside the journal's transaction, a record whose result is not
+/// JSON of the method's type is told that what became of the action is not known. The door found no
+/// record, so this is the service's own read of one another copy left meanwhile, and it is the same
+/// as the door's: the result cannot be read back, and the action was performed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_that_meets_a_result_it_cannot_read_where_the_action_is_performed_is_told_the_outcome_is_unknown()
+ {
+    let host = host().await;
+    let mut control = client(&host).await;
+
+    host.issue(grant_id(8), &COMMAND_RIGHTS);
+    let document = definition(
+        workflow_id(8),
+        grant_id(8),
+        "met when another copy left a result nobody can read",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    let params = WorkflowInstallParams {
+        workflow_id: document.workflow_id,
+        revision: document.revision,
+        definition: document.clone(),
+        grant_reference: document.grant_reference,
+    };
+    let first = control
+        .compose(
+            Method::WorkflowInstall,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the mutation is composed");
+    control
+        .repeat(&first)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the workflow is installed");
+    let second_action = ActionId::new(kr_ipc::new_uuid());
+    let second = control
+        .compose(
+            Method::WorkflowInstall,
+            second_action,
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the mutation is composed");
+
+    let journal = rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::store::WORKFLOW_DB_NAME),
+    )
+    .expect("opens the workflow journal beside the daemon's own handle");
+    journal
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .expect("a busy timeout");
+    let actor: String = journal
+        .query_row("SELECT actor_id FROM action_records", [], |row| row.get(0))
+        .expect("the installation's record");
+    let actor_id = kr_protocol::ids::ActorId::new(actor).expect("the actor the record names");
+    let digest = kr_protocol::digest::mutation_digest(&second, &actor_id).expect("digests it");
+
+    // The copy has looked for a record and found none; another copy then leaves one whose result is
+    // not JSON.
+    let (arrived, go) = host.controller.pause_retained_lookup();
+    let sending = tokio::spawn(async move { control.repeat(&second).await });
+    arrived.await.expect("the copy has looked for a record");
+    journal
+        .execute(
+            "INSERT INTO action_records (
+                actor_id, action_id, method, payload_digest, result_json, run_id, error_code,
+                error_detail, recorded_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, 'not json', NULL, NULL, NULL, 1)",
+            rusqlite::params![
+                actor_id.as_str(),
+                second_action.to_string(),
+                Method::WorkflowInstall.as_str(),
+                digest.as_bytes().to_vec(),
+            ],
+        )
+        .expect("the other copy's record is written");
+    let _ = go.send(());
+    let told = failure(
+        sending
+            .await
+            .expect("the copy ran")
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+    host.clients.abort();
+}
+
 /// KR-REQ-19.04: a caller that lost its reply and asks again over a new connection is answered
 /// from the record.
 ///
