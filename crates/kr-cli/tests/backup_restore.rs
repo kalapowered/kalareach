@@ -2106,11 +2106,15 @@ fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
             if path.is_dir() {
                 walk(root, &path, into);
             } else if let Ok(bytes) = std::fs::read(&path) {
+                // Named with `/` between its parts on every platform, so a case compares a name
+                // with the same text wherever it runs.
                 into.insert(
                     path.strip_prefix(root)
                         .expect("below the root")
-                        .display()
-                        .to_string(),
+                        .components()
+                        .map(|part| part.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/"),
                     bytes,
                 );
             }
