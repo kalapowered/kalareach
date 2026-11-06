@@ -213,11 +213,13 @@ impl RemoteConnection {
         received: kr_transport::listener::ReceivedFrame,
     ) -> Option<Answered> {
         let mut asked = None;
+        let mut received = received;
+        let hold = received.take_hold();
         let (frame, received_at) = received.into_parts();
         let frame = match frame {
             ControlFrame::Request(request) => self.read_decided(&request, &mut asked).await,
             ControlFrame::Mutation(mutation) => {
-                self.mutate_decided(&mutation, &mut asked, received_at)
+                self.mutate_decided(&mutation, &mut asked, received_at, hold)
                     .await
             }
             // A host does not call a client, and none of the daemon's own local frames belongs on
@@ -555,7 +557,8 @@ impl RemoteConnection {
     #[cfg(test)]
     pub(super) async fn mutate(&self, mutation: &MutationRequest) -> ControlFrame {
         let received_at = self.controller.clock.now();
-        self.mutate_decided(mutation, &mut None, received_at).await
+        self.mutate_decided(mutation, &mut None, received_at, None)
+            .await
     }
 
     /// Serves one mutation, and keeps the decision it was taken under in `asked`.
@@ -568,11 +571,13 @@ impl RemoteConnection {
         mutation: &MutationRequest,
         asked: &mut Option<Asked>,
         received_at: kr_transport::clock::ContinuousInstant,
+        hold: Option<kr_transport::listener::FrameHold>,
     ) -> ControlFrame {
-        // Entered among the calls that have not claimed the route of their action until it claims
-        // it or ends, so a refusal of a copy of it that arrives meanwhile is worded as a repeat's.
+        // Entered among the calls that have not claimed the route of their action from the moment
+        // the transport read it, until it claims it or ends, so a refusal of a copy of it that
+        // arrives meanwhile is worded as a repeat's.
         let own_claim = self
-            .arrival_of(mutation)
+            .arrival_of(mutation, hold)
             .map_or_else(OwnClaim::none, OwnClaim::arrived);
         match self
             .serve_mutation(mutation, asked, received_at, &own_claim)
@@ -891,7 +896,6 @@ impl RemoteConnection {
                 let standing = self.feed_standing(&decided.acting.grant);
                 let entered = own_claim.shared_with_the_work();
                 tokio::spawn(async move {
-                    let _entered = entered;
                     controller
                         .close_remote_session(
                             &mutation,
@@ -911,6 +915,11 @@ impl RemoteConnection {
                             receive,
                         )
                         .await;
+                    // The close has no route and its entry goes with this task. A copy that arrives
+                    // later finds the request kept as one carried out without a route.
+                    if let Some(entered) = entered {
+                        entered.settle_without_a_route();
+                    }
                 });
                 match self.controller.within_effect_wait(answered).await {
                     Ok(Ok(Ok(closed))) => {

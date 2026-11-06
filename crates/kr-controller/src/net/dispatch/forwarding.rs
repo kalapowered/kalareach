@@ -15,7 +15,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_transport::window::AcceptedDeadline;
 
-use super::super::arrivals::{Arrival, Arrivals, Carried};
+use super::super::arrivals::{Arrival, Arrivals, Carried, request_of};
 use super::super::proxy::{Vouched, WorkerProxy};
 use crate::error::{ControllerError, Result};
 use crate::grants::policy::HeldBound;
@@ -172,48 +172,21 @@ fn input_write_refusal(error: &CodecError) -> ProtocolError {
     }
 }
 
-/// The request `mutation` is, as the set of calls that have not yet claimed keeps it.
-pub(super) fn request_of(
-    actor_id: &kr_protocol::ids::ActorId,
-    mutation: &MutationRequest,
-) -> Option<Carried> {
-    kr_protocol::digest::mutation_digest(mutation, actor_id)
-        .ok()
-        .map(|digest| (actor_id.clone(), mutation.action_id, digest))
-}
-
 impl RemoteConnection {
-    /// Enters a mutation the connection has read ahead of the request it is answering, and holds
-    /// behind it, among the calls that have not claimed the route of their action: it is on this
-    /// host and will be carried out when its turn comes, although no door has served it yet.
-    pub(super) fn hold_ahead(&self, frame: &ControlFrame) {
-        let ControlFrame::Mutation(mutation) = frame else {
-            return;
-        };
-        if let Some(request) = request_of(&self.device.principal(), mutation) {
-            let arrival = self.controller.arrivals().arrive(request);
-            self.held_ahead
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(arrival);
-        }
-    }
-
-    /// The entry of `mutation` among the calls that have not claimed, when it was held ahead and
-    /// its turn has come, and otherwise a new one: the call is entered once, when it arrives.
-    pub(super) fn arrival_of(&self, mutation: &MutationRequest) -> Option<Arrival> {
+    /// The entry of `mutation` among the calls that have not claimed the route of their action: the
+    /// one the transport's reader made when it read the frame (`hold`), and otherwise a new one,
+    /// for a frame that did not come through the reader. The call is entered once, when it was read.
+    pub(super) fn arrival_of(
+        &self,
+        mutation: &MutationRequest,
+        hold: Option<kr_transport::listener::FrameHold>,
+    ) -> Option<Arrival> {
         let request = request_of(&self.device.principal(), mutation)?;
-        let held = {
-            let mut held_ahead = self
-                .held_ahead
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            held_ahead
-                .iter()
-                .position(|arrival| arrival.carries(&request))
-                .map(|at| held_ahead.remove(at))
-        };
-        Some(held.unwrap_or_else(|| self.controller.arrivals().arrive(request)))
+        let read = hold
+            .and_then(|hold| hold.downcast::<Arrival>().ok())
+            .map(|arrival| *arrival)
+            .filter(|arrival| arrival.carries(&request));
+        Some(read.unwrap_or_else(|| self.controller.arrivals().arrive(request)))
     }
 
     /// The standing work decided under `acting` takes with it: this connection's pairing grant,

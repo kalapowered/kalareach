@@ -71,7 +71,9 @@ use kr_protocol::pairing::NetworkConfig;
 use kr_protocol::scalars::EndpointKey;
 use kr_transport::clock::ContinuousInstant;
 use kr_transport::handshake::{HostEpochs, LocalIdentity, PairedDirectory};
-use kr_transport::listener::{AuthorisedSession, BoxFuture, HostHandler, ListenerConfig};
+use kr_transport::listener::{
+    AuthorisedSession, BoxFuture, FrameHold, HostHandler, ListenerConfig,
+};
 use kr_transport::preauth::PairingSurface;
 use kr_transport::window::AcceptedDeadline;
 
@@ -497,6 +499,26 @@ impl HostHandler for NetworkHost {
         Box::pin(async move {
             self.serve_connection(session).await;
         })
+    }
+
+    fn frame_read(
+        &self,
+        device_id: &DeviceId,
+        frame: &kr_protocol::envelope::ControlFrame,
+    ) -> Option<FrameHold> {
+        // A mutation is on this host from the moment its frame was read, although the connection's
+        // handler has not reached it: it is among the calls that have not claimed the route of
+        // their action ([`arrivals`]) while it waits in the connection's queue. The entry goes
+        // with the frame, and leaves when the call has claimed or the frame is dropped.
+        let kr_protocol::envelope::ControlFrame::Mutation(mutation) = frame else {
+            return None;
+        };
+        let controller = self.controller.upgrade()?;
+        let request = arrivals::request_of(
+            &kr_transport::listener::device_principal(device_id),
+            mutation,
+        )?;
+        Some(Box::new(controller.arrivals().arrive(request)))
     }
 
     fn control_stream_lost(&self, connection_id: ConnectionId) {
