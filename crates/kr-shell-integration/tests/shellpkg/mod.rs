@@ -1017,6 +1017,9 @@ enum HandshakeAnswer {
     Accept,
     /// A frame whose body is not a value of the contract at all, which the bridge cannot decode.
     NotDecodable,
+    /// The worker's own refusal of a shell whose start time it reads one unit away from the one
+    /// the shell named, followed at once by the end of the connection, as the worker ends it.
+    Refuse,
 }
 
 impl Session {
@@ -1131,6 +1134,28 @@ impl Session {
             Profile::ORDINARY,
             true,
             HandshakeAnswer::NotDecodable,
+        )
+    }
+
+    /// Starts the packaged shell and refuses its opening frame the way the worker refuses a shell
+    /// whose process it cannot match: with the refusal, and then the end of the connection.
+    ///
+    /// The shell is the person's own shell afterwards, with no worker behind it: what a case reads
+    /// from this session is what the bridge made of the refusal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shell does not connect, opens with anything but a hello, or the worker's
+    /// own decision does not refuse it.
+    #[must_use]
+    pub fn start_refused(package: &Package) -> Self {
+        Self::start_as(
+            package,
+            &[],
+            kr_shell_integration::contract::events::EofGesture::default(),
+            Profile::ORDINARY,
+            true,
+            HandshakeAnswer::Refuse,
         )
     }
 
@@ -1419,13 +1444,39 @@ impl Session {
             already_registered: false,
             gesture,
         };
+        let observed = if answer == HandshakeAnswer::Refuse {
+            // The kernel's start value is a unit away from the one the shell named: the least a
+            // start time can differ by, and the worker refuses the shell as another process.
+            let mut seen = hello.shell_process.clone();
+            seen.start_value = U64::new(seen.start_value.get() + 1);
+            seen
+        } else {
+            hello.shell_process.clone()
+        };
         let peer = ObservedPeer {
             uid: endpoint_owner(&endpoint_path),
-            process: Some(hello.shell_process.clone()),
+            process: Some(observed),
         };
         let outcome =
             handshake::admit_observed(&secret_key, &expectation, &endpoint, &peer, &hello)
                 .expect("the transcript encodes");
+        if answer == HandshakeAnswer::Refuse {
+            assert!(
+                matches!(
+                    &outcome,
+                    HandshakeOutcome::Refused(refused)
+                        if refused.reason
+                            == kr_shell_integration::contract::qualification::QualificationReason::ProcessMismatch
+                ),
+                "the worker's decision did not refuse the shell as another process: {outcome:?}"
+            );
+            // The refusal and the end of the connection go out together, as the worker's do: it
+            // writes the answer and drops the connection.
+            session.write_frame(&BridgeFrame::Handshake(outcome));
+            session.close_endpoint();
+            session.hello = hello;
+            return session;
+        }
         let accepted = match outcome {
             HandshakeOutcome::Accepted(accepted) => accepted,
             HandshakeOutcome::Refused(refused) => {

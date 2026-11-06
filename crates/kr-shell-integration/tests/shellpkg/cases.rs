@@ -5810,6 +5810,35 @@ pub fn an_error_in_the_powershell_handshake_leaves_the_bridge_unregistered() {
     );
 }
 
+/// KR-REQ-07.37: a hello the worker refuses is reported to the person, with the reason the worker
+/// gave, and the shell goes on without the integration.
+///
+/// A worker that refuses a shell's hello writes the refusal and ends the connection. A module that
+/// takes the end for the whole answer starts the person's shell with no integration and says
+/// nothing of why, which the person cannot tell from an installation that was never set up. The
+/// case answers the opening frame of a PowerShell with the worker's own refusal of a shell whose
+/// start time it reads a unit away from the one the shell named, which is a process mismatch, and
+/// ends the connection behind it as the worker does. The shell then runs a command of the person's,
+/// and the terminal has to show the reason by its name.
+///
+/// # Panics
+///
+/// Panics when the reason is not shown, or the shell does not answer.
+pub fn a_hello_the_worker_refuses_is_reported_to_the_person() {
+    let package = Package::built(ShellKind::PowerShell);
+    let mut session = Session::start_refused(&package);
+    assert!(
+        session.answered("kr-after-refusal"),
+        "the shell did not answer after the worker refused its hello:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        session.terminal_output().contains("process_mismatch"),
+        "the person was not told why the worker refused the shell's hello:\n{}",
+        session.terminal_output()
+    );
+}
+
 /// The libraries a native file asks the loader for, by the name or path the file records.
 ///
 /// On macOS they are the load commands that name a library the file needs, read with `otool -l`:

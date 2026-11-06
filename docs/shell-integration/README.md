@@ -417,7 +417,11 @@ that only goes forward, so setting the time of day neither shortens nor lengthen
 session whose environment names a whole number of milliseconds from 1 to 4294967295 in
 `KR_SHELL_BRIDGE_HANDSHAKE_WAIT_MS` gets that wait instead; any other value leaves five seconds.
 Like the bootstrap values, the variable leaves the exported environment once the handshake is
-accepted. The other packages wait two seconds and read no such variable.
+accepted. The other packages wait two seconds and read no such variable. The worker writes a
+refusal and closes the connection, and the module reads the refusal first: it takes the bytes the
+worker sent before it acts on the close. It then writes the refusal's reason and the worker's
+message to standard error, as it does for an editor it cannot qualify, and the shell goes on without
+the integration.
 
 ## The reader-thread rules
 

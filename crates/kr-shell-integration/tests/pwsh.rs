@@ -191,6 +191,14 @@ fn an_error_in_the_handshake_leaves_the_bridge_unregistered() {
     shellpkg::an_error_in_the_powershell_handshake_leaves_the_bridge_unregistered();
 }
 
+/// KR-REQ-07.37: a hello the worker refuses is reported to the person, with the reason the worker
+/// gave.
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_hello_the_worker_refuses_is_reported_to_the_person() {
+    shellpkg::a_hello_the_worker_refuses_is_reported_to_the_person();
+}
+
 /// KR-REQ-07.37, KR-REQ-07.85
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
@@ -793,6 +801,96 @@ try {
     Remove-Item -Recurse -Force $directory
 }
 "#;
+
+/// What the module makes of a refusal that is on the endpoint together with the end of the
+/// connection, as the worker leaves them: it writes the refusal and drops the connection. Both are
+/// there before the module first looks, so the probe does not depend on how the two arrive.
+const REFUSAL_PROBE: &str = r#"
+$ErrorActionPreference = 'Stop'
+Import-Module $env:KR_PROBE_MODULE
+$module = Get-Module KalaReach.ShellBridge
+
+$directory = Join-Path ([System.IO.Path]::GetTempPath()) ("kr-refused-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $directory | Out-Null
+$endpoint = [System.Net.Sockets.UnixDomainSocketEndPoint]::new((Join-Path $directory 's'))
+$listener = [System.Net.Sockets.Socket]::new('Unix', 'Stream', 'Unspecified')
+$listener.Bind($endpoint)
+$listener.Listen(1)
+$client = [System.Net.Sockets.Socket]::new('Unix', 'Stream', 'Unspecified')
+$client.Connect($endpoint)
+$peer = $listener.Accept()
+$client.Blocking = $false
+try {
+    $body = & $module {
+        ConvertTo-KrCbor @{
+            handshake = @{
+                refused = @{
+                    reason = 'process_mismatch'
+                    error  = @{ code = 'PERMISSION_DENIED'; message = 'the connecting process is not the root shell this session started' }
+                }
+            }
+        }
+    }
+    $framed = [byte[]]::new($body.Length + 4)
+    $framed[2] = [byte](($body.Length -shr 8) -band 0xFF)
+    $framed[3] = [byte]($body.Length -band 0xFF)
+    [Array]::Copy($body, 0, $framed, 4, $body.Length)
+    $null = $peer.Send($framed)
+    $peer.Shutdown([System.Net.Sockets.SocketShutdown]::Both)
+    $peer.Dispose()
+    $answer = & $module {
+        param($client)
+        $script:Kr.Socket = $client
+        $script:Kr.Incoming.Clear()
+        $verdict = @(Wait-KrHandshake)[-1]
+        "$verdict"
+    } $client
+    Write-Output "kr-refusal[verdict]=[$answer]"
+} finally {
+    $client.Dispose()
+    $listener.Dispose()
+    Remove-Item -Recurse -Force $directory
+}
+"#;
+
+/// A refusal the worker writes with the end of its connection is read before the end, and the
+/// person is told why the hello was refused.
+///
+/// The probe is [`REFUSAL_PROBE`]. A module that reads the end of the connection in the same look
+/// as the refusal discards the refusal with the connection, and the shell starts without its
+/// integration and without a word.
+#[test]
+#[ignore = "needs this tree's built shell packages; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_refusal_the_worker_writes_with_the_end_of_its_connection_is_read_before_the_end() {
+    let package = shellpkg::Package::built(PWSH);
+    let module = package
+        .directory()
+        .join("modules/KalaReach.ShellBridge/KalaReach.ShellBridge.psd1");
+    let scratch = tempfile::tempdir().expect("a directory on the internal disk");
+    let probe = scratch.path().join("refusal-probe.ps1");
+    std::fs::write(&probe, REFUSAL_PROBE).expect("the probe is written");
+    let asked = package
+        .command()
+        .args(["-NoProfile", "-NonInteractive", "-File"])
+        .arg(&probe)
+        .env("KR_PROBE_MODULE", &module)
+        .env_remove("KR_SHELL_BRIDGE")
+        .env_remove("KR_SHELL_BRIDGE_SECRET")
+        .env_remove("KR_SESSION")
+        .env_remove("KR_SHELL_BRIDGE_HANDSHAKE_WAIT_MS")
+        .output()
+        .expect("the package's host runs");
+    let said = String::from_utf8_lossy(&asked.stdout).into_owned();
+    let told = String::from_utf8_lossy(&asked.stderr).into_owned();
+    assert!(
+        said.contains("kr-refusal[verdict]=[False]"),
+        "the handshake wait did not end as refused:\n{said}\n{told}"
+    );
+    assert!(
+        told.contains("process_mismatch"),
+        "the person was not told why the hello was refused:\n{said}\n{told}"
+    );
+}
 
 /// The module measures its handshake wait and its send deadline on a clock that only goes forward,
 /// so setting the time of day neither shortens nor lengthens either.

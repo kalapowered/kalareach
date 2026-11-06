@@ -489,7 +489,14 @@ function Receive-KrPipeAvailable {
     while ($true) {
         $pending = $script:Kr.PipeRead
         if ($null -eq $pending) {
-            if (-not $Pipe.IsConnected) { Disconnect-KrEndpoint; return $false }
+            # The worker has closed its end. What it sent before that is read first: the
+            # disconnection discards the bytes not yet read, a refusal among them, and the next
+            # look finds the end alone and disconnects then.
+            if (-not $Pipe.IsConnected) {
+                if ($taken -gt 0) { return $true }
+                Disconnect-KrEndpoint
+                return $false
+            }
             if ($null -eq $script:Kr.PipeBuffer) { $script:Kr.PipeBuffer = [byte[]]::new(8192) }
             try {
                 $pending = $Pipe.ReadAsync(
@@ -506,9 +513,17 @@ function Receive-KrPipeAvailable {
         # Nothing has arrived. The read stays in flight and the reader goes back to its own work.
         if (-not $pending.IsCompleted) { return $true }
         $script:Kr.PipeRead = $null
-        if ($pending.IsFaulted -or $pending.IsCanceled) { Disconnect-KrEndpoint; return $false }
+        if ($pending.IsFaulted -or $pending.IsCanceled) {
+            if ($taken -gt 0) { return $true }
+            Disconnect-KrEndpoint
+            return $false
+        }
         $count = $pending.Result
-        if ($count -le 0) { Disconnect-KrEndpoint; return $false }
+        if ($count -le 0) {
+            if ($taken -gt 0) { return $true }
+            Disconnect-KrEndpoint
+            return $false
+        }
         $buffer = $script:Kr.PipeBuffer
         for ($i = 0; $i -lt $count; $i++) { $script:Kr.Incoming.Add($buffer[$i]) }
         $taken += $count
@@ -524,11 +539,20 @@ function Receive-KrAvailable {
         return (Receive-KrPipeAvailable $socket)
     }
     $buffer = [byte[]]::new(8192)
+    $collected = $false
     while ($true) {
         try {
             if (-not $socket.Poll(0, [System.Net.Sockets.SelectMode]::SelectRead)) { break }
             $count = $socket.Receive($buffer, 0, $buffer.Length, 'None')
-            if ($count -eq 0) { Disconnect-KrEndpoint; return $false }
+            if ($count -eq 0) {
+                # The worker has closed its end. What it sent before that is read first: the
+                # disconnection discards the bytes not yet read, a refusal among them, and the next
+                # look finds the end alone and disconnects then.
+                if ($collected) { break }
+                Disconnect-KrEndpoint
+                return $false
+            }
+            $collected = $true
             for ($i = 0; $i -lt $count; $i++) { $script:Kr.Incoming.Add($buffer[$i]) }
         } catch [System.Net.Sockets.SocketException] {
             if ($_.Exception.SocketErrorCode -eq [System.Net.Sockets.SocketError]::WouldBlock) { break }
@@ -687,6 +711,22 @@ function Get-KrHandshakeWaitMs {
     [uint64]$script:KR_HANDSHAKE_WAIT_MS
 }
 
+# What the worker said when it refused the hello: the reason and its message, or what stands in their
+# place when the refusal does not carry them.
+function Get-KrRefusalText {
+    param($Payload)
+    $reason = 'refused'
+    $detail = 'the worker refused the hello'
+    if ($Payload -is [System.Collections.IDictionary]) {
+        if ($Payload.Contains('reason') -and $Payload['reason'] -is [string]) { $reason = $Payload['reason'] }
+        if ($Payload.Contains('error') -and $Payload['error'] -is [System.Collections.IDictionary] -and
+            $Payload['error'].Contains('message') -and $Payload['error']['message'] -is [string]) {
+            $detail = $Payload['error']['message']
+        }
+    }
+    @{ Reason = $reason; Detail = $detail }
+}
+
 function Wait-KrHandshake {
     $deadline = (Get-KrTickMs) + (Get-KrHandshakeWaitMs)
     while ($true) {
@@ -702,6 +742,12 @@ function Wait-KrHandshake {
             $verdict = Get-KrVariant $outcome.Payload
             if ($null -eq $verdict -or $verdict.Name -ne 'accepted') {
                 Write-KrTrace "refused: $(if ($null -eq $verdict) { 'a verdict that is not a variant' } else { $verdict.Name })"
+                # The shell goes on as the person's own, and the person is told why it has no
+                # integration, in the worker's words.
+                if ($null -ne $verdict -and $verdict.Name -eq 'refused') {
+                    $why = Get-KrRefusalText $verdict.Payload
+                    Write-KrDiagnostic $why.Reason $why.Detail
+                }
                 return $false
             }
             Read-KrAccept $verdict.Payload
