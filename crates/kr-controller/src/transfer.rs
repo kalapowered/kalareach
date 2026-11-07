@@ -1130,15 +1130,11 @@ impl TransferModule {
             };
             match recorded {
                 None => outcome,
-                Some(RetainedOutcome::Ok(result)) => {
-                    kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-                        .map(ParamsValue::new)
-                        .map_err(|error| {
-                            ProtocolError::new(ErrorCode::OutcomeUnknown, error.to_string())
-                        })
-                }
-                Some(RetainedOutcome::Error { code, detail }) => {
-                    Err(ProtocolError::new(code, detail))
+                // Another copy recorded first. What it recorded goes back under the check any
+                // retained answer is owed, asked once the answer is in hand.
+                Some(retained) => {
+                    admission.check_retained()?;
+                    answer_of(retained)
                 }
             }
         })
