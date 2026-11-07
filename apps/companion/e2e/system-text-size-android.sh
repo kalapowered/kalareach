@@ -147,17 +147,60 @@ const check = (condition, message) => {
   if (!condition) failures += 1
 }
 
-/** What the tab bar must hold at a font scale: a gap clear of the screen's edges, a badge that holds its digits. */
+/** Whether two boxes share any area, to within half a pixel. */
+const overlap = (a, b) => a.left < b.right - 0.5 && b.left < a.right - 0.5 && a.top < b.bottom - 0.5 && b.top < a.bottom - 0.5
+
+/**
+ * What the tab bar must hold at a font scale. Every label keeps a gap from both edges of the screen
+ * and from the label beside it on its row. The badge holds its digits, and all four of its edges are
+ * inside the bar and the screen; where the bar has left its first form, it is clear of the glyph.
+ */
 function checkBar(scale, bar) {
-  const first = bar.words[0]
-  const last = bar.words[bar.words.length - 1]
+  const near = bar.gap - 0.5
+  const edges = bar.tabs.flatMap((tab) => [
+    { what: `${tab.name} from the left edge`, room: tab.word.left },
+    { what: `${tab.name} from the right edge`, room: bar.screen - tab.word.right }
+  ])
+  const short = edges.filter((edge) => edge.room < near)
   check(
-    first[0] >= bar.gap - 0.5 && bar.screen - last[1] >= bar.gap - 0.5,
-    `font scale ${scale}: the tab labels are a gap (${bar.gap}px) from the screen's edges (${first[0].toFixed(1)}px and ${(bar.screen - last[1]).toFixed(1)}px)`
+    short.length === 0,
+    `font scale ${scale}: every tab label is a gap (${bar.gap}px) from the screen's edges (${edges.map((edge) => `${edge.what} ${edge.room.toFixed(1)}px`).join(', ')})`
+  )
+  const beside = []
+  for (const [at, tab] of bar.tabs.entries()) {
+    for (const other of bar.tabs.slice(at + 1)) {
+      const sameRow = tab.word.top < other.word.bottom - 0.5 && other.word.top < tab.word.bottom - 0.5
+      if (!sameRow) continue
+      // Whichever starts first is the one on the left; two that start together are as close as can be.
+      const [left, right] = tab.word.left <= other.word.left ? [tab, other] : [other, tab]
+      beside.push({ what: `${left.name} and ${right.name}`, room: right.word.left - left.word.right })
+    }
+  }
+  check(
+    beside.every((pair) => pair.room >= near),
+    `font scale ${scale}: the tab labels on one row are a gap (${bar.gap}px) apart (${beside.length === 0 ? 'none share a row' : beside.map((pair) => `${pair.what} ${pair.room.toFixed(1)}px`).join(', ')})`
+  )
+  check(
+    bar.tabs.length === 4 && bar.badgeTab === 0,
+    `font scale ${scale}: the bar was read whole: ${bar.tabs.length} tab labels, and the badge on tab ${bar.badgeTab + 1} of them`
   )
   check(bar.holds, `font scale ${scale}: the badge holds its digits`)
-  check(bar.inside, `font scale ${scale}: the badge stays inside the bar`)
-  if (bar.form !== null) check(!bar.over, `font scale ${scale}: the badge is clear of the glyph in the ${bar.form} form`)
+  if (bar.badge !== null) {
+    const count = bar.badge
+    const sides = [
+      { side: 'top', room: count.top - bar.bar.top },
+      { side: 'bottom', room: bar.bar.bottom - count.bottom },
+      { side: 'left', room: count.left - Math.max(bar.bar.left, 0) },
+      { side: 'right', room: Math.min(bar.bar.right, bar.screen) - count.right }
+    ]
+    check(
+      sides.every((each) => each.room >= -0.5),
+      `font scale ${scale}: the badge's four edges are inside the bar (${sides.map((each) => `${each.side} ${each.room.toFixed(1)}px`).join(', ')})`
+    )
+    if (bar.form !== null && bar.glyph !== null) {
+      check(!overlap(count, bar.glyph), `font scale ${scale}: the badge is clear of the glyph in the ${bar.form} form`)
+    }
+  }
 }
 
 /** The page, over the web view's debugging socket. */
@@ -234,11 +277,10 @@ const READ = `(() => {
 })()`
 
 /**
- * The tab bar of the page as the application opens it, which has a count on its first tab: how far
- * each label's word is from the screen's edges, whether the badge holds its digits and stays inside
- * the bar, and, where the bar has left its first form, whether the badge is over the glyph. The web
- * view scales the text and leaves a length in em where it was, which a browser's text size does
- * not, so this is read on the device.
+ * The tab bar of the page as the application opens it, which has a count on its first tab: where each
+ * label's word is, where the bar is, and where the count and its glyph are. The web view scales the
+ * text and leaves a length in em where it was, which a browser's text size does not, so this is read
+ * on the device.
  */
 const BAR = `(() => {
   const bar = document.querySelector('.m-tabbar')
@@ -248,24 +290,24 @@ const BAR = `(() => {
   document.body.append(probe)
   const gap = parseFloat(getComputedStyle(probe).paddingLeft)
   probe.remove()
-  const words = [...bar.querySelectorAll('.m-tab-label')].map((label) => {
+  const edges = (box) => ({ left: box.left, right: box.right, top: box.top, bottom: box.bottom })
+  const tabs = [...bar.querySelectorAll('.m-tab-label')].map((label) => {
     const range = document.createRange()
     range.selectNodeContents(label)
-    const box = range.getBoundingClientRect()
-    return [box.left, box.right]
+    return { name: label.textContent, word: edges(range.getBoundingClientRect()) }
   })
   const badge = bar.querySelector('.m-tab-badge')
-  const glyph = badge?.closest('.m-tab-glyph')?.querySelector('svg')?.getBoundingClientRect()
-  const count = badge?.getBoundingClientRect()
+  const glyph = badge?.closest('.m-tab-glyph')?.querySelector('svg')
   return JSON.stringify({
     gap,
     form: bar.getAttribute('data-form'),
     screen: window.innerWidth,
-    words,
-    badge: Boolean(badge),
-    holds: !badge || (badge.scrollWidth <= badge.clientWidth + 0.5 && badge.scrollHeight <= badge.clientHeight + 0.5),
-    inside: !count || count.top >= bar.getBoundingClientRect().top - 0.5,
-    over: Boolean(count && glyph && count.left < glyph.right - 0.5 && glyph.left < count.right - 0.5 && count.top < glyph.bottom - 0.5 && glyph.top < count.bottom - 0.5)
+    bar: edges(bar.getBoundingClientRect()),
+    tabs,
+    badge: badge ? edges(badge.getBoundingClientRect()) : null,
+    badgeTab: badge ? [...bar.querySelectorAll('.m-tab')].findIndex((tab) => tab.contains(badge)) : -1,
+    glyph: glyph ? edges(glyph.getBoundingClientRect()) : null,
+    holds: !badge || (badge.scrollWidth <= badge.clientWidth + 0.5 && badge.scrollHeight <= badge.clientHeight + 0.5)
   })
 })()`
 
