@@ -369,6 +369,10 @@ pub struct DeliveryModule {
     /// debt and before it settles the debt. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_a_debt_is_settled: crate::attention::Pause,
+    /// Where this host's own tests stop the move of the gateway list once the journal's lock is
+    /// held and before the list moves. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    while_the_gateways_move: crate::attention::Pause,
 }
 
 /// What storing one destination's credential did.
@@ -423,6 +427,8 @@ impl DeliveryModule {
             key_write: Default::default(),
             #[cfg(feature = "testing")]
             before_a_debt_is_settled: Default::default(),
+            #[cfg(feature = "testing")]
+            while_the_gateways_move: Default::default(),
         })
     }
 
@@ -434,20 +440,34 @@ impl DeliveryModule {
         self.gateways.set(gateways).is_ok()
     }
 
-    /// Makes `listed` the gateways in force, in the journal's lock.
+    /// Makes `listed` the gateways in force in `gateways`, in the journal's lock. This is the one
+    /// way the set moves.
     ///
     /// The sweep of owed revocations decides in that lock whether a debt may be given up, and it
     /// never gives one up for a gateway that is not in force. The list moves under the same lock,
     /// so a change of the list is never between the sweep's reading of it and its settling of a
-    /// debt. Does nothing until the gateways are attached.
-    pub fn replace_gateways(&self, listed: &[String]) {
-        let Some(gateways) = self.gateways.get() else {
-            return;
-        };
+    /// debt.
+    ///
+    /// `gateways` is the set the caller reads, and it is the one attached here: a caller that
+    /// moved another would leave the sweep reading a list the host no longer holds. A build with
+    /// debug assertions refuses that.
+    pub fn replace_gateways(
+        &self,
+        gateways: &std::sync::Arc<gateways::AllowedGateways>,
+        listed: &[String],
+    ) {
+        debug_assert!(
+            self.gateways
+                .get()
+                .is_none_or(|attached| std::sync::Arc::ptr_eq(attached, gateways)),
+            "the gateways moved are not the ones attached to the delivery service"
+        );
         let _journal = self
             .producer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(feature = "testing")]
+        self.while_the_gateways_move.wait();
         gateways.replace(listed);
     }
 
@@ -493,6 +513,27 @@ impl DeliveryModule {
         std::sync::mpsc::SyncSender<()>,
     ) {
         self.before_a_debt_is_settled.arm()
+    }
+
+    /// Stops the next move of the gateway list once the journal's lock is held and before the list
+    /// moves. Returns the end that says it has arrived and the end that lets it go.
+    #[cfg(feature = "testing")]
+    pub fn pause_while_the_gateways_move(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.while_the_gateways_move.arm()
+    }
+
+    /// Whether another thread holds the journal's lock now.
+    #[cfg(feature = "testing")]
+    pub fn journal_is_held(&self) -> bool {
+        matches!(
+            self.producer.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
     }
 
     /// Stops the next destination write after everything it reads has been read and before its
