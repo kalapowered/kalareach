@@ -818,6 +818,13 @@ fn refused_saying(answer: &serde_json::Value, words: &str) {
 /// Section 12 executes these "in the selected host environment with scoped broker resources", and a
 /// path in a request is not a scoped resource. The one admission to answer is still taken for each
 /// request, so each is resolved by this host's own answer and by nothing else.
+///
+/// KR-REQ-10.50, the part about file bytes needing a file grant of their own, for an upstream
+/// agent's read of a file only: the file the read names is there, the upstream holds no granted
+/// directory, and the answer it is given is a refusal that carries none of the file's text. Not
+/// shown here: that the file grant is exercised independently of the screen and history grants,
+/// which the broker holds neither of, and the bytes a viewer is served, which this broker never
+/// serves.
 #[tokio::test]
 async fn kr_req_12_16_without_a_grant_a_reverse_request_is_refused_before_any_effect() {
     let broker = broker();
@@ -857,6 +864,10 @@ async fn kr_req_12_16_without_a_grant_a_reverse_request_is_refused_before_any_ef
             "the answer goes back on the identifier it came in with"
         );
         refused_saying(&answer, reason);
+        assert!(
+            !answer.to_string().contains("what the agent asked for"),
+            "the refusal carries none of the file's text: {answer}"
+        );
         resources.push(resource_id);
     }
     assert!(

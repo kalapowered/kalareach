@@ -3273,7 +3273,9 @@ descriptions* has the rule). `privacy.status` is answered by the daemon under `h
 
 Three reads are refused as `UNSUPPORTED_CAPABILITY`, with the read and the reason in the message:
 `upload.status`, `download.begin` and `download.chunk`, because a transfer's chunks travel on an
-attachment-chunk stream and this host opens none on a network connection.
+attachment-chunk stream and this host opens none on a network connection. A device that does not
+hold the right the read requires (`files.upload` for the first, `files.read` for the other two) is
+refused `PERMISSION_DENIED` first.
 
 What a device is told of a failure passes one rule, applied where this host's words leave it for a
 device: the write boundary of an authorised connection, the refusal of a connection that is not

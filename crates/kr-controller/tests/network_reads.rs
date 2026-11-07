@@ -308,3 +308,67 @@ async fn a_read_this_host_does_not_serve_a_device_is_refused_by_name() {
     elsewhere_session.close();
     host.stop().await;
 }
+
+/// KR-REQ-10.50, the part about file and attachment bytes needing a file grant of their own: a
+/// device that holds `session.view`, the live screen and a history that reaches every moment is
+/// refused the two methods that serve file bytes, and the one difference between it and a device
+/// that is not refused for its rights is `files.read`.
+///
+/// The first device is refused `PERMISSION_DENIED`, before the route. The second holds the right
+/// and is refused by name as every device is, since this host opens no chunk stream on a network
+/// connection, so no byte reaches either. That refusal is the control, and a host that serves a
+/// device a chunk stream turns it into a served read. Not shown here: a served byte, since none
+/// is, and the other rights of the transfer methods.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_50_a_device_that_holds_the_screen_and_history_but_not_files_read_is_refused_a_download()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let transfer_id = TransferId::new(kr_ipc::new_uuid());
+    let mut reached = Vec::new();
+    for rights in [
+        &[ActionRight::SessionView][..],
+        &[ActionRight::SessionView, ActionRight::FilesRead][..],
+    ] {
+        let device = Device::create().await;
+        let mut grant = proposal(rights);
+        grant.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
+        assert!(grant.history.include_live_screen, "the live screen is held");
+        let record = pair_with(&host, &device, &owner, grant).await;
+        let session = connect(&host, &device, &record).await;
+        let begin = refused::<_, DownloadBeginResult>(
+            &session,
+            Method::DownloadBegin,
+            &DownloadBeginParams {
+                environment_id: host.environment_id,
+                resume_transfer_id: Nullable::null(),
+                source: Nullable::some(DownloadSource::Attachment { transfer_id }),
+                device_id: Nullable::some(record.device_id),
+            },
+        )
+        .await;
+        let chunk = refused::<_, DownloadChunkResult>(
+            &session,
+            Method::DownloadChunk,
+            &DownloadChunkParams {
+                transfer_id,
+                index: U64::ZERO,
+            },
+        )
+        .await;
+        reached.push((begin.code, chunk.code));
+        session.close();
+    }
+    assert_eq!(
+        reached,
+        [
+            (ErrorCode::PermissionDenied, ErrorCode::PermissionDenied),
+            (
+                ErrorCode::UnsupportedCapability,
+                ErrorCode::UnsupportedCapability
+            ),
+        ],
+        "without files.read the read is refused for it; with it, by name"
+    );
+    host.stop().await;
+}
