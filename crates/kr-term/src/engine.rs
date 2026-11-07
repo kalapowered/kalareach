@@ -124,11 +124,12 @@ pub struct FeedOutcome {
     /// Where the attachment must move to projected mode, when something arrived that direct mode
     /// cannot carry.
     pub projection_required_at: Option<u64>,
-    /// The spans of control strings the profile consumes as an extension, which no attachment is
-    /// given: an inline file of the iTerm2 protocol, a sixel picture, a Kitty graphics command, a
-    /// string of a kind the profile names no class for, and a string discarded whole. A reader of
-    /// the retained stream has to be kept from them as well, since they are what a terminal takes
-    /// for a file or a picture.
+    /// The spans of control strings that no reader of the raw stream may be given as they were
+    /// written: those of the extension class (an inline file of the iTerm2 protocol, a sixel
+    /// picture, a Kitty graphics command, a string of a kind the profile names no class for, and a
+    /// string discarded whole), and any other string whose payload a terminal could frame
+    /// differently from this engine, since a raw 8-bit control inside it can end it and begin
+    /// another. Of these, the first are what a terminal takes for a file or a picture.
     pub withheld_strings: Vec<ByteSpan>,
     /// Side effects to route.
     pub side_effects: Vec<SideEffect>,
@@ -575,14 +576,14 @@ impl Engine {
             }
             let decision = self.policy.decide(event);
             let mut disposition = decision.disposition;
-            if event.class == SequenceClass::Extension
-                && matches!(
-                    event.kind,
-                    EventKind::Osc { .. }
-                        | EventKind::Dcs { .. }
-                        | EventKind::OtherString { .. }
-                        | EventKind::Discarded { .. }
-                )
+            if matches!(
+                event.kind,
+                EventKind::Osc { .. }
+                    | EventKind::Dcs { .. }
+                    | EventKind::OtherString { .. }
+                    | EventKind::Discarded { .. }
+            ) && (event.class == SequenceClass::Extension
+                || !event.kind.payload_is_direct_safe())
             {
                 push_span(&mut outcome.withheld_strings, event.span);
             }

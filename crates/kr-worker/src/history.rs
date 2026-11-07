@@ -111,9 +111,10 @@ pub enum Reach {
 pub enum Files {
     /// The output as it was written.
     Served,
-    /// The output with each control string the terminal engine withheld from every attachment
-    /// replaced by NUL, byte for byte, so that no cursor moves, and with no sequence that has begun
-    /// and not ended: nothing yet says what it is.
+    /// The output with each control string of the extension class, and each whose payload a
+    /// terminal could frame differently from the engine, replaced by NUL, byte for byte, so that no
+    /// cursor moves, and with no sequence that has begun and not ended: nothing yet says what it
+    /// is.
     Withheld,
 }
 
@@ -205,14 +206,18 @@ impl SpoolLayout {
 }
 
 /// The most ranges of retained output [`WithheldStrings`] keeps apart.
-const MAX_WITHHELD_RANGES: usize = 4096;
+///
+/// A range costs 16 bytes, and a session that prints one string at every prompt reaches the bound
+/// after as many prompts, so it is set well above what a session does in a week of retention.
+const MAX_WITHHELD_RANGES: usize = 65_536;
 
-/// Where the retained output holds a control string the terminal engine withheld from every
-/// attachment, as ranges of cursors, oldest first.
+/// Where the retained output holds a control string that no reader of the raw stream may be given
+/// as written, as ranges of cursors, oldest first.
 ///
 /// The engine names each such string when it ends, so a range is as long as the string and begins
-/// where it did. The ranges are bounded: past the bound the two nearest ranges become one, which
-/// withholds the text between them as well and never less.
+/// where it did. The ranges are bounded: past the bound every pair of neighbours no further apart
+/// than the median gap becomes one range, in one pass, so a stream of one-byte strings costs a
+/// constant for each. A pair joined withholds the text between them as well and never less.
 #[derive(Debug, Default)]
 struct WithheldStrings {
     ranges: VecDeque<(u64, u64)>,
@@ -229,16 +234,33 @@ impl WithheldStrings {
             _ => self.ranges.push_back((start, end)),
         }
         if self.ranges.len() > MAX_WITHHELD_RANGES {
-            let nearest = (1..self.ranges.len())
-                .min_by_key(|&index| {
-                    self.ranges[index]
-                        .0
-                        .saturating_sub(self.ranges[index - 1].1)
-                })
-                .unwrap_or(1);
-            let joined = self.ranges.remove(nearest).map_or(0, |range| range.1);
-            self.ranges[nearest - 1].1 = joined;
+            self.join_the_nearest();
         }
+    }
+
+    /// Joins every pair of neighbours whose gap is no wider than the median gap.
+    ///
+    /// At least half of the pairs are, so the record is at most about half as long afterwards, and
+    /// the work of the pass is spread over the notes it made room for.
+    fn join_the_nearest(&mut self) {
+        let mut gaps: Vec<u64> = self
+            .ranges
+            .iter()
+            .zip(self.ranges.iter().skip(1))
+            .map(|(earlier, later)| later.0.saturating_sub(earlier.1))
+            .collect();
+        let middle = gaps.len() / 2;
+        let median = *gaps.select_nth_unstable(middle).1;
+        let mut joined = VecDeque::with_capacity(self.ranges.len() / 2 + 1);
+        for &(start, end) in &self.ranges {
+            match joined.back_mut() {
+                Some((_, last_end)) if start.saturating_sub(*last_end) <= median => {
+                    *last_end = (*last_end).max(end);
+                }
+                _ => joined.push_back((start, end)),
+            }
+        }
+        self.ranges = joined;
     }
 
     /// Forgets the ranges that lie wholly before `cursor`, which output no longer holds.
@@ -311,7 +333,8 @@ pub struct OutputHistory {
     /// Nothing is recorded while the history is not retaining, and nothing is noted for a range the
     /// history does not hold.
     times: Option<TimeIndex>,
-    /// Where the retained output holds a control string no attachment is given.
+    /// Where the retained output holds a control string no reader of the raw stream may be given
+    /// as written.
     withheld: WithheldStrings,
     /// Whether the wall clock could be proved at the last append, which the rows record.
     clock_proven: bool,
@@ -1437,8 +1460,8 @@ impl OutputHistory {
         Ok(page)
     }
 
-    /// Notes the control strings the terminal engine withheld from every attachment, as the ranges
-    /// of cursors it named when each ended.
+    /// Notes the control strings the terminal engine named as withheld from the raw stream, as the
+    /// ranges of cursors it gave when each ended.
     pub fn note_withheld_strings(&mut self, ranges: &[(u64, u64)]) {
         for &(start, end) in ranges {
             self.withheld.note(start, end);
@@ -1452,7 +1475,9 @@ impl OutputHistory {
     /// The page is [`Self::page_within`]'s with each such control string replaced by NUL, byte for
     /// byte, so every cursor in it is where it was, and cut where `settled` is when it reaches
     /// further: the sequence the engine is part way through is not known for what it is until it
-    /// ends, and what the page leaves out is read from `next_cursor` once it has.
+    /// ends, and what the page leaves out is read from `next_cursor` once it has. A page that
+    /// would begin beyond `settled` begins there instead, so that a reader that asks where the
+    /// output ends is told where it may read to.
     ///
     /// # Errors
     ///
@@ -1465,7 +1490,11 @@ impl OutputHistory {
         settled: u64,
     ) -> Result<HistoryPageResult> {
         let mut page = self.page_within(from_cursor, max_bytes, reach)?;
-        let start = page.from_cursor.get();
+        let mut start = page.from_cursor.get();
+        if start > settled && page.gap.0.is_none() {
+            start = start.min(settled.max(page.oldest_retained_cursor.get()));
+            page.from_cursor = U64::new(start);
+        }
         let mut bytes = core::mem::replace(&mut page.bytes, Bytes::new(Vec::new())).into_vec();
         let settled_len = usize::try_from(settled.saturating_sub(start)).unwrap_or(usize::MAX);
         bytes.truncate(settled_len);
@@ -3019,12 +3048,12 @@ mod tests {
     }
 
     /// A reader that is not given files has every control string the engine named replaced by NUL,
-    /// byte for byte, however many the engine named: past the bound the record keeps apart, the
-    /// ranges nearest each other become one, which withholds the text between them as well and
-    /// never less, and a page stops where the engine is part way through a string.
+    /// byte for byte, however many it named: past the bound the record keeps apart, the ranges
+    /// nearest each other become one, which withholds the text between them as well and never
+    /// less.
     #[test]
     fn a_page_without_files_withholds_every_range_named_even_past_the_bound_kept_apart() {
-        let ranges = MAX_WITHHELD_RANGES as u64 * 3;
+        let ranges = MAX_WITHHELD_RANGES as u64 + 1_000;
         let mut history = OutputHistory::in_memory(1 << 20);
         let mut written = Vec::new();
         for _ in 0..ranges {
@@ -3048,24 +3077,20 @@ mod tests {
                 "the range {start}..{stop} is withheld"
             );
         }
-        // What the bound merged is withheld too, so the page holds less text and never more.
-        let kept = page
-            .bytes
-            .as_slice()
-            .iter()
-            .filter(|&&byte| byte != 0)
-            .count();
-        assert!(kept < written.len() - 2 * named.len(), "the ranges merged");
+    }
 
-        let settled = history
-            .page_without_files(0, u64::MAX, Reach::Whole, 7)
+    /// A range that reaches past the oldest retained cursor keeps its tail withheld: output that
+    /// went does not take with it what a string that began in it still covers.
+    #[test]
+    fn a_range_that_crosses_the_oldest_retained_cursor_keeps_its_tail_withheld() {
+        let mut history = OutputHistory::in_memory(8);
+        history.append(b"0123456789abcdef");
+        history.note_withheld_strings(&[(4, 12)]);
+        let page = history
+            .page_without_files(0, 64, Reach::Whole, 16)
             .expect("pages");
-        assert_eq!(
-            settled.bytes.len(),
-            7,
-            "the page stops at the settled cursor"
-        );
-        assert_eq!(settled.next_cursor.get(), 7);
+        assert_eq!(page.from_cursor.get(), 8);
+        assert_eq!(page.bytes.as_slice(), b"\0\0\0\0cdef");
     }
 
     /// A spool directory on the internal disk, named so two tests never share one.

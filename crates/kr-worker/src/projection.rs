@@ -131,8 +131,8 @@ pub struct Filtered {
     pub lost: bool,
     /// Side effects that had no attachment to go to and became host events.
     pub host_events: Vec<SideEffect>,
-    /// The spans of the raw stream, as cursors, that the engine consumed as control strings no
-    /// attachment is given: what a terminal takes for a file or a picture, among them.
+    /// The spans of the raw stream, as cursors, that are control strings no reader of the raw
+    /// stream may be given as written: what a terminal takes for a file or a picture, among them.
     pub withheld_strings: Vec<(u64, u64)>,
 }
 

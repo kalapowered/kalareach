@@ -840,45 +840,71 @@ async fn print(rig: &Rig, bytes: &[u8]) -> u64 {
     start
 }
 
-/// One word inside each payload `printed` writes.
-const PAYLOADS: [&str; 5] = [
+/// One word inside each payload `printed` writes that a device is not given.
+const PAYLOADS: [&str; 6] = [
     "INLINEFILEPAYLOAD",
     "SIXELPICTUREPAYLOAD",
     "KITTYPICTUREPAYLOAD",
     "ENVELOPEDFILEPAYLOAD",
     "LARGEFILEPAYLOAD",
+    "AFTERRAWC1PAYLOAD",
 ];
 
 /// What an application prints that a terminal takes for a file or a picture, with plain words
 /// between: an inline file of the iTerm2 protocol, a sixel picture, a Kitty graphics command, an
-/// inline file inside a tmux passthrough envelope, and an inline file longer than the engine holds
-/// of a control string.
+/// inline file inside a tmux passthrough envelope, an inline file longer than the engine holds of
+/// a control string, and a string of documented metadata whose payload holds a raw 8-bit string
+/// terminator and the start of an inline file, which a terminal that reads raw 8-bit controls
+/// takes for the end of the metadata and a file. The last is ordinary documented metadata, which
+/// is the control.
 ///
-/// The second is the same output with each of those sequences replaced, byte for byte, by NUL.
+/// The second is the same output with each sequence a device is not given replaced, byte for
+/// byte, by NUL.
 fn printed() -> (Vec<u8>, Vec<u8>) {
     let mut large = b"\x1b]1337;File=name=bGFyZ2U=;inline=1:".to_vec();
     large.extend(std::iter::repeat_n(b'Z', 70_000));
     large.extend_from_slice(PAYLOADS[4].as_bytes());
     large.push(0x07);
-    let sequences: [Vec<u8>; 5] = [
-        format!("\x1b]1337;File=name=bm90ZQ==;inline=1:{}\x07", PAYLOADS[0]).into_bytes(),
-        format!("\x1bP0;0;0q#0;2;0;0;0{}~~@@\x1b\\", PAYLOADS[1]).into_bytes(),
-        format!("\x1b_Gf=24,s=1,v=1,a=T;{}\x1b\\", PAYLOADS[2]).into_bytes(),
-        format!(
-            "\x1bPtmux;\x1b\x1b]1337;File=name=YQ==:{}\x1b\x1b\\\x1b\\",
-            PAYLOADS[3]
-        )
-        .into_bytes(),
-        large,
+    let mut raw_c1 = b"\x1b]1337;CurrentDir=/tmp\x9c\x9d1337;File=name=eA==:".to_vec();
+    raw_c1.extend_from_slice(PAYLOADS[5].as_bytes());
+    raw_c1.push(0x07);
+    let sequences: [(Vec<u8>, bool); 7] = [
+        (
+            format!("\x1b]1337;File=name=bm90ZQ==;inline=1:{}\x07", PAYLOADS[0]).into_bytes(),
+            true,
+        ),
+        (
+            format!("\x1bP0;0;0q#0;2;0;0;0{}~~@@\x1b\\", PAYLOADS[1]).into_bytes(),
+            true,
+        ),
+        (
+            format!("\x1b_Gf=24,s=1,v=1,a=T;{}\x1b\\", PAYLOADS[2]).into_bytes(),
+            true,
+        ),
+        (
+            format!(
+                "\x1bPtmux;\x1b\x1b]1337;File=name=YQ==:{}\x1b\x1b\\\x1b\\",
+                PAYLOADS[3]
+            )
+            .into_bytes(),
+            true,
+        ),
+        (large, true),
+        (raw_c1, true),
+        (b"\x1b]1337;CurrentDir=/tmp\x07".to_vec(), false),
     ];
     let mut written = Vec::new();
     let mut shown = Vec::new();
-    for (number, sequence) in sequences.into_iter().enumerate() {
+    for (number, (sequence, withheld)) in sequences.into_iter().enumerate() {
         let words = format!("words {number} ").into_bytes();
         written.extend_from_slice(&words);
         shown.extend_from_slice(&words);
         written.extend_from_slice(&sequence);
-        shown.extend(std::iter::repeat_n(0_u8, sequence.len()));
+        if withheld {
+            shown.extend(std::iter::repeat_n(0_u8, sequence.len()));
+        } else {
+            shown.extend_from_slice(&sequence);
+        }
     }
     written.extend_from_slice(b"last words");
     shown.extend_from_slice(b"last words");
@@ -948,6 +974,17 @@ async fn a_string_the_application_has_not_ended_is_paged_to_a_device_without_fil
         "the page stops where the string begins"
     );
     assert_eq!(page.next_cursor.get(), opens_at);
+    // A reader that asks where the output ends is told where it may read to, not where the
+    // string has got to.
+    let probe = device_page_of(&device, rig.session_id(), u64::MAX, WHOLE).await;
+    assert_eq!(
+        (
+            probe.from_cursor.get(),
+            probe.next_cursor.get(),
+            probe.bytes.len()
+        ),
+        (opens_at, opens_at, 0)
+    );
 
     rig.write(b"\x07 words after").await;
     let page = device_page_of(&device, rig.session_id(), opens_at, WHOLE).await;
