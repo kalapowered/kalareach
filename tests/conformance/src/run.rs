@@ -1233,6 +1233,13 @@ fn date_before(outputs: &[(String, PathBuf)], compiled: &[Compiled], began: Syst
             .filter(|unit| unit.package == *package)
             .collect();
         let unreadable = units.iter().any(|unit| unit.read.is_none());
+        // The directory that holds the build scripts' (`build`): under it, `companion-tauri-<hash>`
+        // holds the output directory `out`, and its name is in every path of a file written there.
+        let builds = directory
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(directory)
+            .to_path_buf();
         let mut pending = vec![directory.clone()];
         while let Some(directory) = pending.pop() {
             let Ok(entries) = std::fs::read_dir(&directory) else {
@@ -1257,10 +1264,20 @@ fn date_before(outputs: &[(String, PathBuf)], compiled: &[Compiled], began: Syst
                     continue;
                 }
                 let path = entry.path();
-                // The same bytes are named alike wherever a macro writes them (an icon, a page), so
-                // the name of the directory it lies in is part of what a dependency file must say.
-                let beside = directory.file_name().unwrap_or_default().to_string_lossy();
-                let tail = format!("{beside}/{name}");
+                // The same bytes are named alike wherever a macro writes them (an icon, a page),
+                // and every output directory is called `out`, so a dependency file must say the
+                // build directory's name and the path under it, whole, after a separator.
+                let tail = path.strip_prefix(&builds).map_or_else(
+                    |_| name.clone(),
+                    |under| {
+                        under
+                            .components()
+                            .map(|part| part.as_os_str().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    },
+                );
+                let tail = format!("/{tail}");
                 let readers: Vec<Unit> = units
                     .iter()
                     .filter(|unit| {
