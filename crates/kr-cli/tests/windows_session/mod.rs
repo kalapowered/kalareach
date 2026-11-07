@@ -31,8 +31,9 @@ pub fn build() -> BuildId {
 /// Why a session's root shell could not be read from its worker.
 #[derive(Debug)]
 pub enum RootProcessError {
-    /// The session has no published descriptor: the worker never published one, or the daemon has
-    /// withdrawn it.
+    /// The session has no published descriptor that reads and checks: the worker never published
+    /// one, or the daemon has withdrawn it (a file that is pending deletion or does not read is
+    /// not told from that).
     NoDescriptor,
     /// The connection to the worker could not be made, or ended before the worker had answered: a
     /// socket that failed or a peer that closed, at any step of the exchange. It is what a worker
@@ -788,10 +789,14 @@ impl Drop for WorkerHost {
 ///
 /// The tree's own removal ignores a refusal, so a tree whose removal is refused is left in the
 /// temporary folder with nothing said. This removes what is left, again, for as long as the
-/// refusal lasts (a worker that has ended may hold a file a moment longer), and fails the case when
-/// the folder is still there at the liveness deadline. A case that is failing is left as it is, and
-/// so is a tree that was kept on purpose because something it started could not be shown to have
-/// ended: that one is said by the tree, with a failure of its own.
+/// refusal lasts, and fails the case when the folder is still there at the liveness deadline.
+/// Something that is not the worker may hold a file after the daemon's lock is free: on the Windows
+/// test machine a host's drop takes about 33.5 s with this where a closure case itself takes 11 s,
+/// the same time after the daemon starts whatever the case did, which fits the daemon's challenge
+/// sweep (30 s) holding part of the daemon until its next tick; that is inferred from the times
+/// and the code, not measured. A case that is failing is left as it is, and so is a tree that was
+/// kept on purpose because something it started could not be shown to have ended: that one is said
+/// by the tree, with a failure of its own.
 struct TreeGone(PathBuf);
 
 impl Drop for TreeGone {
