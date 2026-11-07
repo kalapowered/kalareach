@@ -1048,11 +1048,12 @@ fn build_first(
 /// beside each other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Unit {
-    /// The package's library.
+    /// The package's library, in a form a program links as Rust.
     Library,
     /// The package's library built with its unit tests, which does not wait for the library.
     LibraryTests,
-    /// A program or a test program of the package, which links the library and so waits for it.
+    /// A program or a test program of the package, which links the library and so waits for it, or
+    /// a library that only another language links, which nothing waits for.
     Other,
 }
 
@@ -1085,9 +1086,11 @@ impl Compiled {
             return None;
         }
         let tests = message["profile"]["test"] == true;
+        // What a program can link as Rust, which Cargo makes it wait for. A `cdylib` or a
+        // `staticlib` is an output of its own, and nothing waits for it.
         let library = kinds
             .iter()
-            .any(|kind| matches!(*kind, "lib" | "rlib" | "dylib" | "cdylib" | "staticlib"));
+            .any(|kind| matches!(*kind, "lib" | "rlib" | "dylib" | "proc-macro"));
         let unit = match (library, tests) {
             (true, false) => Unit::Library,
             (true, true) => Unit::LibraryTests,
