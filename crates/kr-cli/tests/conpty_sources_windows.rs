@@ -335,24 +335,38 @@ fn is_stopped(distribution: &str, registered: &str, running: &str) -> bool {
 /// written to the error output when the drop runs it, without a panic that would end the process
 /// during an unwinding.
 struct Terminate {
-    program: PathBuf,
-    arguments: Vec<String>,
+    command: Box<dyn FnMut() -> Result<(), String>>,
     ran: bool,
+}
+
+/// Runs a program of the system directory and says why when it does not succeed.
+fn run_to_success(program: &Path, arguments: &[String]) -> Result<(), String> {
+    match Command::new(program).args(arguments).status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "{} {arguments:?} did not succeed: {status}",
+            program.display()
+        )),
+        Err(error) => Err(format!(
+            "{} {arguments:?} does not run: {error}",
+            program.display()
+        )),
+    }
 }
 
 impl Terminate {
     /// The command that ends `distribution`, which the case found registered and stopped.
     fn of(distribution: &str) -> Self {
-        Self::running(
-            system32("wsl.exe"),
-            vec!["--terminate".to_owned(), distribution.to_owned()],
-        )
+        let program = system32("wsl.exe");
+        let arguments = vec!["--terminate".to_owned(), distribution.to_owned()];
+        Self::running(move || run_to_success(&program, &arguments))
     }
 
-    fn running(program: PathBuf, arguments: Vec<String>) -> Self {
+    /// A guard over `command`, which a case that has to see what it did makes of an action on a
+    /// path it holds as data.
+    fn running(command: impl FnMut() -> Result<(), String> + 'static) -> Self {
         Self {
-            program,
-            arguments,
+            command: Box::new(command),
             ran: false,
         }
     }
@@ -362,19 +376,7 @@ impl Terminate {
         if std::mem::replace(&mut self.ran, true) {
             return Ok(());
         }
-        match Command::new(&self.program).args(&self.arguments).status() {
-            Ok(status) if status.success() => Ok(()),
-            Ok(status) => Err(format!(
-                "{} {:?} did not succeed: {status}",
-                self.program.display(),
-                self.arguments
-            )),
-            Err(error) => Err(format!(
-                "{} {:?} does not run: {error}",
-                self.program.display(),
-                self.arguments
-            )),
-        }
+        (self.command)()
     }
 }
 
@@ -662,23 +664,22 @@ fn a_parent_directory_that_is_there_already_is_refused_and_left_as_it_is() {
 
 /// A guard that ends a distribution runs its command when the case that holds it fails, runs it
 /// once, and the case fails when the command does not succeed. The command here is `cmd.exe`
-/// making a directory, which fails the second time, in place of `wsl.exe --terminate`, which this
-/// case must not run on a distribution it did not start.
+/// making a directory as data, in place of `wsl.exe --terminate`, which this case must not run on a
+/// distribution it did not start.
 #[test]
 fn a_distribution_the_case_started_is_ended_when_the_case_fails_after_that() {
-    let marker = std::env::temp_dir().join(unique("kr-terminate-test"));
-    let make = |marker: &Path| {
-        Terminate::running(
-            system32("cmd.exe"),
-            vec![
-                "/c".to_owned(),
-                "mkdir".to_owned(),
-                marker.display().to_string(),
-            ],
-        )
+    // The marker is in a folder whose name holds `&`, which `cmd.exe` would read as the end of a
+    // command: the stand-in makes it as data, without a shell.
+    let parent = std::env::temp_dir().join(unique("kr-a&b-terminate-test"));
+    std::fs::create_dir(&parent).expect("a folder that was not there");
+    let marker = parent.join("made");
+    let make = |marker: PathBuf| {
+        Terminate::running(move || {
+            std::fs::create_dir(&marker).map_err(|error| format!("{}: {error}", marker.display()))
+        })
     };
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _terminate = make(&marker);
+        let _terminate = make(marker.clone());
         panic!("a step after the distribution was started fails");
     }));
     let ran = marker.is_dir();
@@ -686,7 +687,7 @@ fn a_distribution_the_case_started_is_ended_when_the_case_fails_after_that() {
 
     // Asked for, it runs once, and the drop after that does not run it again: what the command
     // made is taken away before the drop, so a second run would make it again.
-    let mut asked = make(&marker);
+    let mut asked = make(marker.clone());
     let first = asked.end();
     let second = asked.end();
     let ran_once = marker.is_dir();
@@ -696,11 +697,15 @@ fn a_distribution_the_case_started_is_ended_when_the_case_fails_after_that() {
     let _ = std::fs::remove_dir(&marker);
 
     // A command that does not succeed is the case's failure.
-    let mut failing = Terminate::running(
-        system32("cmd.exe"),
-        vec!["/c".to_owned(), "exit".to_owned(), "3".to_owned()],
-    );
+    let mut failing = Terminate::running(|| {
+        run_to_success(
+            &system32("cmd.exe"),
+            &["/c".into(), "exit".into(), "3".into()],
+        )
+    });
     let refused = failing.end();
+    let stray = std::fs::read_dir(&parent).map(|entries| entries.count());
+    let parent_removed = std::fs::remove_dir(&parent);
 
     assert!(failed.is_err(), "the step failed");
     assert!(ran, "the guard ended the distribution when the case failed");
@@ -713,6 +718,12 @@ fn a_distribution_the_case_started_is_ended_when_the_case_fails_after_that() {
         refused.is_err_and(|why| why.contains("did not succeed")),
         "a command that does not succeed fails the case"
     );
+    assert_eq!(
+        stray.expect("the folder is read"),
+        0,
+        "nothing else was made in it"
+    );
+    parent_removed.expect("the folder holds nothing and is removed");
 }
 
 /// The distribution lists are read as the UTF-16 that `wsl.exe` writes even when the environment
