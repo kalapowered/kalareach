@@ -80,18 +80,22 @@ fn check(name: &'static str, ok: bool, detail: impl std::fmt::Display) -> Check 
 }
 
 /// Whether this launch was started to count or to clear the two keychain groups (`-KRDeviceProbe
-/// count` or `sweep`, the two modes the native launch runs before anything else).
+/// count` or `sweep`, the two modes the native launch runs before anything else; the first
+/// `-KRDeviceProbe` names the mode, as the native launch reads it).
 ///
-/// Such a launch opens nothing that writes to the secure store. The application makes its own keys
-/// at its first start, so a count taken after them is never empty, and a script that wants the
-/// groups as they were before the application ran could not tell the application's keys from what
-/// was there already.
+/// Such a launch opens nothing that reads or writes the secure store beyond its own count or
+/// sweep. The application makes its own keys at its first start and settles what an earlier run
+/// left, so a count taken after them is never empty, and a script that wants the groups as they
+/// were before the application ran could not tell the application's keys from what was there
+/// already.
 #[must_use]
 pub fn leaves_the_keychain_alone() -> bool {
-    let arguments: Vec<String> = std::env::args().collect();
+    let arguments: Vec<std::ffi::OsString> = std::env::args_os().collect();
     arguments
-        .windows(2)
-        .any(|pair| pair[0] == "-KRDeviceProbe" && matches!(pair[1].as_str(), "count" | "sweep"))
+        .iter()
+        .position(|argument| argument == "-KRDeviceProbe")
+        .and_then(|at| arguments.get(at + 1))
+        .is_some_and(|mode| mode == "count" || mode == "sweep")
 }
 
 /// Runs the checks a script asked for, if it asked: the request is read once and taken away.
