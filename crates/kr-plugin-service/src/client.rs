@@ -132,8 +132,8 @@ struct Churn {
     /// below what the host holds, so a count of nothing is the client's word that no registration
     /// of the identifier is live. A removal that a registration overlapped is not taken off it: the
     /// host answers a removal for the registration it was about, which can be one that was still
-    /// being made and was refused, and nothing in the answer says which. The count stays above what
-    /// the host holds then, which keeps the queue, until the client is dropped.
+    /// being made and was refused, and nothing in the answer says which. The count can stay above
+    /// what the host holds then, which keeps the queue, until the client is dropped.
     live: usize,
 }
 
@@ -314,8 +314,10 @@ impl Removing {
         let overlapped = self.registering_before || churn.started != self.started_before;
         if removed && !overlapped {
             // With no registration under way when the request began and none started since, the
-            // removal is about a registration the client read the answer to, which is one of those
-            // it counts.
+            // removal is about a registration the client read the answer to, which is one it
+            // counts, or about one that another removal has already taken off the count. Nothing
+            // is live at the host after either answer, so taking one more off cannot leave the
+            // count below what the host holds; it saturates at nothing.
             churn.live = churn.live.saturating_sub(1);
             self.sink.forget(self.binding_id);
         }

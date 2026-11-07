@@ -245,8 +245,8 @@ only word the client has that the registration it came from is gone. So the clie
 queue of the identifier when it reads the refusal, unless it counts a registration of the
 identifier as live or another registration of it is still waiting for its answer. It counts a
 registration as live from the host's answer that it was registered, and stops counting it at the
-answer to a removal that no registration overlapped. After a removal that one overlapped it counts
-more than the host holds, which keeps the queue.
+answer to a removal that no registration overlapped. After a removal that one overlapped it can
+count more than the host holds, which keeps the queue.
 
 A binding also holds a bounded number of unanswered calls. A caller whose deadline ran out has
 stopped waiting, but its request is still on the binding's thread until that thread reaches it, and
