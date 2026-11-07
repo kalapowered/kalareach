@@ -343,13 +343,15 @@ impl Controller {
         actor_id: &ActorId,
         mutation: &MutationRequest,
     ) -> Result<ParamsValue> {
-        // A record that cannot be read here says nothing of whether the earlier attempt carried the
-        // change out, so the repeat is told that what became of it is not known, and not a
-        // transient word, which says nothing took effect. The completion below only raises what the
-        // earlier attempt owed, which is safe to do again, and keeps the words of its own failures.
+        // A record that cannot be read here, or that is read and cannot be decoded, says nothing of
+        // whether the earlier attempt carried the change out, so the repeat is told that what became
+        // of it is not known, and not a transient word, which says nothing took effect, or a
+        // refusal of the argument. The request's own parameters cannot fail to decode: a claim
+        // exists for the same request. The completion below only raises what the earlier attempt
+        // owed, which is safe to do again, and keeps the words of its own failures.
         let left = self
             .what_an_unfinished_revocation_left(actor_id, mutation)
-            .map_err(|error| error.found_unreadable("authority changes"))?
+            .map_err(|_| ControllerError::record_unreadable("authority changes"))?
             .ok_or_else(unfinished_and_unknown)?;
         match left {
             OnRecord::Transferred {
@@ -2877,8 +2879,6 @@ pub(super) fn destination_identifier(
     })
 }
 
-/// The answer to an action whose attempt ended without recording what it did, when this host's
-/// records do not show what it did either.
 /// What an unfinished revocation's records show it did, once they show nothing left to do.
 enum OnRecord {
     /// A grant or a device revocation: the grants it withdrew, and the grant it named.
@@ -2893,6 +2893,8 @@ enum OnRecord {
     },
 }
 
+/// The answer to an action whose attempt ended without recording what it did, when this host's
+/// records do not show what it did either.
 fn unfinished_and_unknown() -> ControllerError {
     ControllerError::Uncertain {
         detail: "an earlier attempt at this action ended without recording what it did, and this \
