@@ -360,7 +360,7 @@ impl Controller {
             } => encode(
                 &self
                     .complete_transfer(
-                        replacement,
+                        *replacement,
                         withdrawn.into_iter().collect(),
                         self.publish_debts(&[]),
                     )
@@ -452,7 +452,7 @@ impl Controller {
                 return Ok(None);
             };
             return Ok(Some(OnRecord::Transferred {
-                replacement: written.grant,
+                replacement: Box::new(written.grant),
                 withdrawn,
             }));
         }
@@ -2888,7 +2888,7 @@ enum OnRecord {
     },
     /// A transfer: the grant it wrote and the grants it withdrew.
     Transferred {
-        replacement: kr_protocol::grant::Grant,
+        replacement: Box<kr_protocol::grant::Grant>,
         withdrawn: Vec<kr_protocol::ids::GrantId>,
     },
 }
