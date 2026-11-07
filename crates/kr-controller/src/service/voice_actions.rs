@@ -148,8 +148,9 @@ impl Controller {
     /// The facts the voice coordinator may read about one session.
     ///
     /// Read through this daemon's ordinary session read, so voice sees what any other reader sees
-    /// and nothing more. What this daemon does not hold — the worker's semantic history and its
-    /// pending decisions — is reported as unavailable rather than left out silently.
+    /// and nothing more. What the session's worker holds of its agents, the decisions waiting on a
+    /// person and the semantic messages, is read beside it ([`Self::voice_worker_half`]); a part
+    /// that cannot be read is reported as unavailable rather than left out silently.
     ///
     /// Every item carries the moment its content was produced, because that moment is what a
     /// grant's history lower bound is checked against. The shell a session runs and the directory
