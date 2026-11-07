@@ -41,11 +41,16 @@
 #                          the phone scans as it did the first; the host in use stays the first. The
 #                          second host's owner then bounds how long personal remote access stands
 #                          without its authority feed, with none reached, so the bound has lapsed as it
-#                          is chosen: the host answers the phone and refuses its inbox read, and the
-#                          inbox says that host refused to show it, in the host's words and not as lost
-#                          contact, beside what the host in use holds (KR-REQ-13.01). The host also
-#                          records what it answered another guest of its before the bound (the inbox,
-#                          empty) and after (refused)
+#                          is chosen: the inbox says that host refused to show it, in the host's words
+#                          and not as lost contact, beside what the host in use holds (KR-REQ-13.01).
+#                          The host keeps only a count of the phone's connections, no request of the
+#                          phone's, so which request it refused is not recorded: the phone's screen with
+#                          the host's words is the evidence of the refusal, and the application gives a
+#                          refusal of any request of its visit as the same row. A device under a lapsed
+#                          bound is still admitted and the host refuses its requests alike, so the run
+#                          also records, as a control, what the host answers another guest of its, paired
+#                          as the phone is: the inbox before the bound, empty, and after it who the host
+#                          is, the opening of the connection and the inbox read, each refused
 #
 # A simulator or an emulator only inside the Mac's device lease, and the builds inside a build slot:
 #
@@ -94,6 +99,10 @@ emulator_adb=""
 logs_searched=0
 log_problem=""
 logs_found=0
+# A line the run puts into the phone's log before the first invitation is scanned, and when the run
+# began: a search of the log must find the line, which shows the log reaches back to the first scans.
+run_marker="kr-pairing-run-$(uuidgen | tr 'A-F' 'a-f')"
+run_started="$(date +%s)"
 
 # What the iOS run makes or changes outside this script's own directories: a simulator of its own,
 # whose photo library takes the pictures, and two files of the build that are put back as they were.
@@ -244,9 +253,10 @@ host_file() { # <name>
 }
 
 # Searches one of the phone's logs for every form of an invitation's text and secret that the host
-# recorded: the log is read whole, and a match in it fails the run. A log that could not be read, or
-# that does not show the application at work, is a failed check and never an empty one: a reader
-# that fails prints nothing, and nothing holds no secret.
+# recorded: the log is read whole, and a match in it fails the run. A log that could not be read, that
+# does not show the application at work, or that does not hold the line the run put in it before the
+# first scan (so that it may begin after the first secrets were handled) is a failed check and never
+# an empty one: a reader that fails prints nothing, and nothing holds no secret.
 search_log() { # <extended pattern the application's own lines match> <command that prints the log...>
     local application="$1"
     shift
@@ -265,6 +275,10 @@ search_log() { # <extended pattern the application's own lines match> <command t
     fi
     if ! grep -q -E "$application" "$harness/log-searched.txt"; then
         log_problem="the log holds no line of the application, so it does not cover the run ($(wc -l <"$harness/log-searched.txt" | tr -d ' ') lines)"
+        return 0
+    fi
+    if ! grep -q -F "$run_marker" "$harness/log-searched.txt"; then
+        log_problem="the log does not hold the line the run put in it at its start, so it may begin after the first scans ($(wc -l <"$harness/log-searched.txt" | tr -d ' ') lines)"
         return 0
     fi
     local searched=0
@@ -350,10 +364,10 @@ judge() { # <driver output>
     fi
     result="$(host_file bound-result.txt)"
     case "$result" in
-        "before served items=0after refused PermissionDenied: "*"offline-validity policy has lapsed"*)
-            say "check=the second host served a guest's inbox, empty, and refused it once its owner bounded offline validity ok=1 detail=$result" ;;
+        "phone connections served at the choice: "[1-9]*"control before read: served items=0control after host.info: refused PermissionDenied: "*"offline-validity policy has lapsed"*"control after session.open: refused PermissionDenied: "*"offline-validity policy has lapsed"*"control after read: refused PermissionDenied: "*"offline-validity policy has lapsed"*)
+            say "check=the second host served the phone's connection, and once its owner bounded offline validity refused another guest's host identity, connection opening and inbox read alike ok=1 detail=$result" ;;
         *)
-            say "check=the second host served a guest's inbox, empty, and refused it once its owner bounded offline validity ok=0 detail=${result:-no record}"
+            say "check=the second host served the phone's connection, and once its owner bounded offline validity refused another guest's host identity, connection opening and inbox read alike ok=0 detail=${result:-no record}"
             bad=1 ;;
     esac
     result="$(host_file connections.txt)"
@@ -462,12 +476,13 @@ run_ios() {
 
     say "driving the application"
     local out="$artefacts/xcodebuild.log" status=0
-    TEST_RUNNER_KR_PAIRING_DIR="$harness" xcodebuild test-without-building -xctestrun "$plan" \
+    TEST_RUNNER_KR_PAIRING_DIR="$harness" TEST_RUNNER_KR_PAIRING_MARKER="$run_marker" xcodebuild test-without-building -xctestrun "$plan" \
         -destination "platform=iOS Simulator,id=$udid" -only-testing:KalaReachUITests/PairingTests \
         >"$out" 2>&1 || status=$?
     grep -E "Test Case .* (passed|failed)|error:|XCTAssert|PAIRING" "$out" | sed 's/^/    /' | tee -a "$log"
     xcrun simctl terminate "$udid" "$app_id" >/dev/null 2>&1
-    search_log 'KalaReach|to\.kala\.reach' xcrun simctl spawn "$udid" log show --last 40m --style compact
+    # From before the run began: its length and a margin of five minutes, never a fixed window.
+    search_log 'KalaReach|to\.kala\.reach' xcrun simctl spawn "$udid" log show --last "$((($(date +%s) - run_started) / 60 + 5))m" --style compact
     judge "$out" || status=2
     [ "$status" = 0 ] || return 2
 }
@@ -552,6 +567,7 @@ run_android() {
     # did not arrive at the host through that address (the host saw no connection at all), so that
     # service is reached on the emulator's own loopback interface, which `adb reverse` ties to the
     # host's listener.
+    "$adb" -s "$serial" shell log -p i -t KrPairingRun "$run_marker" || { say "the run's line could not be put in the phone's log"; return 2; }
     start_harness 10.0.2.2 127.0.0.1 || return 2
     local service_port
     service_port="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["service_port"])' "$harness/ready.json")"
