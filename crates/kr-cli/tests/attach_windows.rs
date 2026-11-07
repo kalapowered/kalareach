@@ -10,6 +10,7 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,6 +37,8 @@ fn command_shell() -> String {
 /// Everything a pseudo-console has shown so far, read on a thread of its own.
 struct ConsoleOutput {
     seen: Arc<Mutex<Vec<u8>>>,
+    /// Set by the thread once it has read the last of what the console will show.
+    complete: Arc<AtomicBool>,
 }
 
 impl ConsoleOutput {
@@ -51,6 +54,8 @@ impl ConsoleOutput {
     ) -> Self {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let collected = Arc::clone(&seen);
+        let complete = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&complete);
         let (running, started) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
             // Said before the first read, and `collect` does not return until it is heard.
@@ -83,11 +88,19 @@ impl ConsoleOutput {
                     answered += 1;
                 }
             }
+            // After the last byte was added to what is seen, so a reader that finds this set reads
+            // all of it.
+            finished.store(true, Ordering::SeqCst);
         });
         started
             .recv()
             .expect("the thread that reads the console started");
-        Self { seen }
+        Self { seen, complete }
+    }
+
+    /// Whether the console has shown everything it will: its thread has read to the end.
+    fn complete(&self) -> bool {
+        self.complete.load(Ordering::SeqCst)
     }
 
     fn text(&self) -> String {
@@ -467,21 +480,32 @@ impl Probe {
         keyboard.flush().expect("flushes the console input");
     }
 
-    /// Waits until the console shows `what`.
+    /// Waits until the console shows `what`. It fails when the console has shown all it will and
+    /// `what` is not in it, and when the liveness deadline passes.
+    ///
+    /// A probe that has ended can still have its last lines on their way to this side of the
+    /// console, and how long that takes is not this test's to know. So its end does not end the
+    /// wait: the console's thread having read to the end of the output does, and until it has, the
+    /// wait goes on to the deadline.
     fn waits_for(&mut self, what: &str) {
-        let mut ended = false;
-        while !self.output.text().contains(what) {
-            // A probe that has ended can still have its last lines on their way to this side of the
-            // console, so the output is read once more before the end counts against the wait.
+        loop {
+            // Read before the text is, so that a thread that was done has also added the last bytes.
+            let complete = self.output.complete();
+            if self.output.text().contains(what) {
+                return;
+            }
             assert!(
-                !ended,
-                "the probe ended before the console showed {what:?}: {:?}",
+                !complete,
+                "the console showed all it will and not {what:?}: {:?}",
                 self.output.text()
             );
-            ended = self.child.try_wait().expect("the probe's state").is_some();
             assert!(
                 self.started.elapsed() < LIVENESS_DEADLINE,
-                "waited for the console to show {what:?}: {:?}",
+                "waited for the console to show {what:?} while the probe {}: {:?}",
+                match self.child.try_wait().expect("the probe's state") {
+                    Some(status) => format!("had ended ({status})"),
+                    None => "was running".to_owned(),
+                },
                 self.output.text()
             );
             std::thread::sleep(Duration::from_millis(20));
