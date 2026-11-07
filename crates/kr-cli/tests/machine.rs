@@ -1353,8 +1353,10 @@ async fn a_step_that_could_not_be_written_is_taken_by_the_next_finish() {
 /// record shows nothing applied. `finish` stops with that action and the record B shows, leaves the
 /// step `sent` under the same action and exits with `OUTCOME_UNKNOWN`; a flag that names an action
 /// no step waits under sends nothing; and only `finish --after-unknown` with the action the person
-/// was shown sends the step again, as a new action that names the earlier one and the revision of
-/// the record shown. Once B can read its receipts, the step is taken, once.
+/// was shown sends the step again, as a new action. That request carries no supersession key, since
+/// the daemon that takes a machine step reads none and has no receipt to quote a revision of; what
+/// guards it is the step's own parameters, which approve it against the group and revision of the
+/// record B showed. Once B can read its receipts, the step is taken, once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_step_whose_outcome_the_environment_cannot_establish_is_sent_again_only_when_the_person_asks()
  {
@@ -1448,7 +1450,7 @@ async fn a_step_whose_outcome_the_environment_cannot_establish_is_sent_again_onl
     }
 
     // The person asks for it. The earlier result and the record are shown first, and the step is sent
-    // again as a new action that names the earlier action and the revision of the record shown.
+    // again as a new action.
     let output = run_kr(
         &pair.a.temp,
         Some(pair.bridges.path()),
@@ -1474,13 +1476,32 @@ async fn a_step_whose_outcome_the_environment_cannot_establish_is_sent_again_onl
         second, first,
         "a new action was made at the person's request: {asked}"
     );
-    let (quoted_action, quoted_revision) =
-        quote_in_the_plan(&pair.a.plan_file()).expect("the new request names an earlier action");
-    assert_eq!(quoted_action, uuid_bytes(&first), "the earlier action");
+    // The request the plan keeps is the one that was sent. It carries no supersession key, and the
+    // record it is guarded by is its own parameters': the group and revision B showed.
+    let sent = request_in_the_plan(&pair.a.plan_file(), 1).expect("the plan keeps the request");
+    for key in [
+        kr_protocol::action::SUPERSEDES_ACTION_KEY,
+        kr_protocol::action::SUPERSEDES_REVISION_KEY,
+    ] {
+        assert!(
+            sent.expected.get(key).is_none(),
+            "the request names no earlier action ({key}): {:?}",
+            sent.expected
+        );
+    }
     assert_eq!(
-        quoted_revision,
-        i128::from(shown.revision),
-        "and the revision of the record that was shown"
+        sent.approved_against,
+        Some((
+            kr_cbor::to_canonical_value(
+                &shown
+                    .machine_id
+                    .parse::<kr_protocol::ids::MachineId>()
+                    .expect("a group identifier")
+            )
+            .expect("encodes"),
+            i128::from(shown.revision)
+        )),
+        "the step is guarded by the record B showed"
     );
 
     renamed("authority_receipts_aside", "authority_receipts");
@@ -1490,41 +1511,41 @@ async fn a_step_whose_outcome_the_environment_cannot_establish_is_sent_again_onl
     assert_eq!(pair.b.group().machine_id, into);
 }
 
-/// The earlier action and the revision a request in the kept plan names: the pair in the preconditions
-/// of the step's request, wherever the plan keeps them.
-fn quote_in_the_plan(plan: &Path) -> Option<(Vec<u8>, i128)> {
+/// What a step's request holds in the kept plan: its own preconditions, and the group and revision
+/// of the record its parameters approve it against.
+struct KeptRequest {
+    expected: kr_cbor::CanonicalMap,
+    approved_against: Option<(kr_cbor::CanonicalValue, i128)>,
+}
+
+/// The request the kept plan holds for the forward step at `index`, which is exactly the request that
+/// was sent.
+fn request_in_the_plan(plan: &Path, index: usize) -> Option<KeptRequest> {
     use kr_cbor::CanonicalValue;
 
-    fn find(value: &CanonicalValue) -> Option<(Vec<u8>, i128)> {
+    fn map(value: &CanonicalValue) -> Option<&kr_cbor::CanonicalMap> {
         match value {
-            CanonicalValue::Map(map) => {
-                if let (
-                    Some(CanonicalValue::Bytes(action)),
-                    Some(CanonicalValue::Integer(revision)),
-                ) = (
-                    map.get("supersedes_action_id"),
-                    map.get("supersedes_revision"),
-                ) {
-                    return Some((action.clone(), revision.get()));
-                }
-                map.entries().iter().find_map(|(_, inner)| find(inner))
-            }
-            CanonicalValue::Array(items) => items.iter().find_map(find),
+            CanonicalValue::Map(map) => Some(map),
             _ => None,
         }
     }
 
     let kept = std::fs::read(plan).ok()?;
-    find(&kr_cbor::decode(&kept, &kr_cbor::Limits::DEFAULT).ok()?)
-}
-
-/// The bytes of an action identity, as the plan file keeps them.
-fn uuid_bytes(text: &str) -> Vec<u8> {
-    let digits: String = text.chars().filter(|each| *each != '-').collect();
-    (0..digits.len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(&digits[at..at + 2], 16).expect("hexadecimal"))
-        .collect()
+    let plan = kr_cbor::decode(&kept, &kr_cbor::Limits::DEFAULT).ok()?;
+    let CanonicalValue::Array(steps) = map(&plan)?.get("steps")? else {
+        return None;
+    };
+    let request = map(map(steps.get(index)?)?.get("mutation")?)?;
+    let approved = map(map(request.get("params")?)?.get("expected")?);
+    Some(KeptRequest {
+        expected: map(request.get("expected")?)?.clone(),
+        approved_against: approved.and_then(|approved| match approved.get("revision")? {
+            CanonicalValue::Integer(revision) => {
+                Some((approved.get("machine_id")?.clone(), revision.get()))
+            }
+            _ => None,
+        }),
+    })
 }
 
 /// KR-REQ-03.07: one command at a time works on the plan. While another holds it, `merge --from`,

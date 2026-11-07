@@ -1517,8 +1517,10 @@ pub struct MachineFinishArguments {
     /// Send a step again as a new action after an environment answered the action with an outcome
     /// it could not establish.
     ///
-    /// The new action names the earlier one and the revision of the environment's record that the
-    /// command shows. Without this, a step in that state is never sent again under a new action.
+    /// The command shows the earlier action and the environment's record on standard error and
+    /// sends the step as a new action, which the environment takes only while its record is still
+    /// the one the step was approved against. The new action names no earlier action. Without this,
+    /// a step in that state is never sent again under a new action.
     #[arg(long, value_name = "ACTION")]
     pub after_unknown: Option<String>,
 }

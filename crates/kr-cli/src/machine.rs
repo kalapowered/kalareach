@@ -60,9 +60,10 @@
 //!   running and of one that ended without recording what it did): `finish` stops with that action
 //!   and the record the environment shows, leaves the step sent, and composes no new action for it.
 //!   A new action is the person's later request, `finish --after-unknown <action>`, which shows the
-//!   same action and record first and then sends the step as a new action that names them. A
-//!   `finish` without the flag sends the same action again, which a first action that has finished
-//!   answers from its receipt.
+//!   same action and record first and then sends the step as a new action. That request names no
+//!   earlier action: the daemon reads no such name from a step, and the step's own record
+//!   precondition is what keeps the two actions from both applying. A `finish` without the flag
+//!   sends the same action again, which a first action that has finished answers from its receipt.
 //! - `undo` moves each environment the plan moved back into the group it left, by a step of its own
 //!   against the record the first one left, sent by the next `finish` or at once. A step that was
 //!   never sent is given up. One that may or may not have been taken has to be finished first,
@@ -106,7 +107,6 @@ use crate::error::{CliError, Result};
 use crate::output::{self, Document, Line};
 use crate::report::Completion;
 use crate::stdout_line;
-use kr_client::answers;
 
 /// The file the plan is kept in, in this user's own state directory.
 const PLAN_FILE: &str = "machine-merge-plan";
@@ -1002,8 +1002,8 @@ fn plan_shown(paths: &HostPaths, json: bool) -> Result<()> {
 /// `kr host machine finish`.
 ///
 /// `after` is the action the person names with `--after-unknown`: a step sent under it that an
-/// environment answers with an outcome it could not establish is sent again as a new action that
-/// names it. Without it such a step stops the command.
+/// environment answers with an outcome it could not establish is sent again as a new action, once
+/// the earlier result has been shown. Without it such a step stops the command.
 async fn finish(paths: &HostPaths, json: bool, after: Option<ActionId>) -> Result<Completion> {
     // The plan is read under the lock, never before it: another command may be taking it to its
     // results, or may have.
@@ -1368,8 +1368,9 @@ fn unknown_outcome(stopped: &[Stopped]) -> CliError {
     for each in stopped {
         said = shown!(
             "{} environment {} answered action {}, and its record shows group {} at revision {} \
-             (`kr host machine finish --after-unknown {}` sends the step as a new action that \
-             names that action and that revision);",
+             (`kr host machine finish --after-unknown {}` sends the step as a new action, which \
+             the environment takes only while its record is still that group at that \
+             revision);",
             said,
             each.environment_id,
             each.action_id,
@@ -1534,42 +1535,33 @@ async fn settle(
                     });
                     return Ok(());
                 }
-                // The person's later request. The quote names the environment's record revision,
-                // since a daemon's action has no receipt `action.read` could show; the daemon
-                // reads no supersession key from a step, so the quote is what this command
-                // records of what the person saw.
-                Some((
-                    answers::Quote {
-                        action_id: named,
-                        revision: record.revision.get(),
-                    },
-                    record.clone(),
-                ))
+                // The person's later request. The new action carries no supersession key: the
+                // daemon, which takes a machine step, reads none, and a daemon's action has no
+                // receipt for a key to quote the revision of. What guards the step is its own
+                // precondition, the record in its parameters, which is the record shown here.
+                Some((named, record.clone()))
             }
         };
         let action_id = ActionId::new(kr_ipc::new_uuid());
-        let Ok(mut mutation) = compose_step(reached, which, &step, action_id).await else {
+        let Ok(mutation) = compose_step(reached, which, &step, action_id).await else {
             return Ok(());
         };
-        if let Some((quote, record)) = flagged {
-            let Ok(expected) = answers::supersession(Some(quote)) else {
-                return Ok(());
-            };
-            mutation.expected = expected;
+        if let Some((earlier, record)) = flagged {
             // The earlier result and the record are shown before the new action goes, and the new
             // action goes only when the person could be shown them.
             if !crate::report::shown_before_going_on(&shown!(
                 "Environment {} answered action {} with an outcome it could not establish, and \
                  its record shows group {} at revision {}. The step is sent again as a new \
-                 action that names that action and that revision.",
+                 action, which the environment takes only while its record is still that group \
+                 at that revision.",
                 step.environment_id,
-                quote.action_id,
+                earlier,
                 record.machine_id.get(),
                 record.revision
             )) {
                 stopped.push(Stopped {
                     environment_id: step.environment_id,
-                    action_id: quote.action_id,
+                    action_id: earlier,
                     record,
                 });
                 return Ok(());
