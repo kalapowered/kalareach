@@ -3565,7 +3565,7 @@ a run the journal does not hold. Where the daemon cannot read such a record it c
 action from a repeat, and tells both the same. That holds as well in the attention, project,
 change-set and transfer stores where the door found no record and the store then fails to read it
 at the point the action is performed, and in the registry's receipts where an authority or voice
-change claims its action and the claim cannot be read. A transfer action repeated with no usable
+change claims its action and the claim cannot be read or its transaction cannot be begun. A transfer action repeated with no usable
 window is told the same when the daemon cannot read whether its claim is open. At the local door, a
 project action repeated with no usable window is told what its journal holds for the action:
 `OUTCOME_UNKNOWN` while its claim is open, because the attempt that wrote the claim may still be
@@ -3606,7 +3606,10 @@ that is still running when a copy of it arrives. A project action that was refus
 cannot keep the refusal, is told as the record of the action where there is one to read,
 `ID_CONFLICT` where the record is another request's, and `OUTCOME_UNKNOWN` where there is none,
 because the refusal can be a word about what another copy of the action did. A transfer action
-that was refused, when the store cannot keep the refusal, is told the same way. A copy of a project action
+that was refused, when the store cannot keep the refusal, is told the same way, unless a check of the
+request alone decided the refusal, such as a declared media type that is empty: every exact copy fails
+that check whatever another copy did, so it is told as itself. A record found in its place goes
+back only under the check any retained answer is owed. A copy of a project action
 whose first copy's claim is still open, refused by the admission the action is performed under, is
 told `OUTCOME_UNKNOWN` too, because the claim shows the action began; a first action holds no claim
 and is refused as the admission says.
