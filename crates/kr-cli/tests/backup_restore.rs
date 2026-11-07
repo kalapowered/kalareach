@@ -940,9 +940,8 @@ fn borrowed(members: &[(String, Vec<u8>)]) -> Vec<(&str, Vec<u8>)> {
 /// endpoint key, a control key, host authority, a revoked grant and a name no host archive carries,
 /// and the plan lists those five as not restored, with a reason each; none of their bytes is in
 /// the restored folder, and the host's own secrets, configuration and devices are as they were.
-/// Not shown here: that a backup is made without those keys, which the
-/// daemon's production case shows, or the kind the table gives each name, which the library's case
-/// shows.
+/// Not shown here: that a backup is made without those keys, which the daemon's production case
+/// shows, or the kind the table gives each name, which the library's case shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_of_its_own() {
     let world = World::new();
