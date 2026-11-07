@@ -217,18 +217,25 @@ class VoiceCall private constructor(
      */
     fun mediaCounters(): MediaCounters? {
         if (control.isStopped) return null
-        val open = synchronized(lock) { connection } ?: return null
         val latch = CountDownLatch(1)
         var counters: MediaCounters? = null
-        open.getStats { report ->
-            counters = MediaCounters.from(report.statsMap.values.map { it.type to it.members })
-                .let { read ->
-                    // The statistics of some devices carry no playout entry; the samples handed to the
-                    // speaker side are the same figure, counted here.
-                    val handed = speakerSamples.get()
-                    if (read.playedSamples == null && handed > 0) read.copy(playedSamples = handed) else read
+        // The request is submitted while the call cannot end under it, as every use of the
+        // connection is, and the lock is let go before the wait: the answer comes on a WebRTC thread.
+        try {
+            onOpenConnection { open ->
+                open.getStats { report ->
+                    counters = MediaCounters.from(report.statsMap.values.map { it.type to it.members })
+                        .let { read ->
+                            // The statistics of some devices carry no playout entry; the samples handed
+                            // to the speaker side are the same figure, counted here.
+                            val handed = speakerSamples.get()
+                            if (read.playedSamples == null && handed > 0) read.copy(playedSamples = handed) else read
+                        }
+                    latch.countDown()
                 }
-            latch.countDown()
+            }
+        } catch (ended: IllegalStateException) {
+            return null
         }
         return if (latch.await(1, TimeUnit.SECONDS)) counters else null
     }
