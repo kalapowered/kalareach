@@ -4169,8 +4169,9 @@ async fn a_collection_key_is_neither_backed_up_nor_restored() {
 /// KR-REQ-20.17, the settings part, the import only: an import refuses a member the archive calls
 /// a reusable endpoint (transport) private key, a control-signing (authorisation) private key or a
 /// revoked grant, with the table's reason and before it reads a byte of the member, and puts
-/// nothing back; the settings the archive does carry come back. The bytes offered under those
-/// names are the device's real seeds, kept in a secret store as the product keeps them. Not shown
+/// nothing back; the settings the archive does carry come back. Each name is offered twice: with
+/// the device's real seeds, kept in a secret store as the product keeps them, and with the real
+/// settings the archive carries, which an import that read the member would put back. Not shown
 /// here: that an export holds none of those keys, which holds because it reads one settings object
 /// from the sync store and no secret store, so no assertion here could fail for it; the other data
 /// paths of backup and recovery material; or a grant that has not been revoked.
@@ -4205,31 +4206,35 @@ async fn an_import_refuses_an_endpoint_key_a_control_key_and_a_revoked_grant() {
     let (filename, plaintext) = through_an_archive(&lost, &seed, &exported);
 
     // An archive that calls a member one of those keys, or a revoked grant, is refused with the
-    // table's reason before the member is read; nothing is put back.
+    // table's reason before the member is read, whether the member holds the key or the real
+    // settings: bytes that were read would put the settings back, and nothing is put back.
     let restored = Node::new(&world);
     let fresh = SyncStore::open(restored.root.path().join("sync")).expect("a sync store");
-    for (material, bytes) in [
+    for (material, key) in [
         (Material::EndpointPrivateKey, &endpoint),
         (Material::ControlSigningPrivateKey, &control),
         (Material::Grant { revoked: true }, &control),
     ] {
-        match import_settings(&fresh, material, bytes) {
-            Err(RecoveryError::Refused {
-                material: refused,
-                because,
-            }) => {
-                assert_eq!(refused, MaterialName(material));
-                assert!(!because.is_empty(), "the refusal says why");
+        for bytes in [key.as_slice(), plaintext.expose()] {
+            match import_settings(&fresh, material, bytes) {
+                Err(RecoveryError::Refused {
+                    material: refused,
+                    because,
+                }) => {
+                    assert_eq!(refused, MaterialName(material));
+                    assert!(!because.is_empty(), "the refusal says why");
+                }
+                other => panic!("{material:?} is refused, not {other:?}"),
             }
-            other => panic!("{material:?} is refused, not {other:?}"),
+            assert!(
+                fresh
+                    .object(object.object_id)
+                    .expect("a readable store")
+                    .is_none(),
+                "{material:?} put nothing back"
+            );
         }
     }
-    assert!(
-        fresh
-            .object(object.object_id)
-            .expect("a readable store")
-            .is_none()
-    );
     // The control for the refusals: the settings the archive does carry come back.
     import_settings(&fresh, material_named(&filename), plaintext.expose()).expect("the settings");
     assert!(
