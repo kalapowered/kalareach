@@ -199,25 +199,49 @@ pub fn push_gateways_acted_on(
         });
     }
     if let Some(problem) = effective.not_in_force.as_ref() {
-        let in_force = if reported.is_empty() {
-            Shown::said("the official gateway only")
-        } else {
-            shown!(
-                "the official gateway and {}",
-                Shown::joined(reported.iter().map(|origin| Shown::address(origin)), ", ")
-            )
-        };
         return Err(CliError::Unfinished {
             code: kr_protocol::error::ErrorCode::ResourceUnavailable,
             message: shown!(
-                "the push gateways in force are {}, and this host has not finished putting its \
-                 configuration into force: {}",
-                in_force,
+                "{}, and this host has not finished putting its configuration into force: {}",
+                gateways_in_force(&reported),
                 crate::shown::host_text(problem)
             ),
         });
     }
     Ok(reported)
+}
+
+/// The gateways in force, in the command's words: the official gateway, and the ones listed.
+fn gateways_in_force(listed: &[String]) -> Shown {
+    let which = if listed.is_empty() {
+        Shown::said("the official gateway only")
+    } else {
+        shown!(
+            "the official gateway and {}",
+            Shown::joined(listed.iter().map(|origin| Shown::address(origin)), ", ")
+        )
+    };
+    shown!("the push gateways in force are {}", which)
+}
+
+/// What the command says of the gateways it found in force.
+///
+/// A host whose routes are open delivers through them, and is said to. A host whose routes wait for
+/// a restart ([`routes_waiting_for_a_restart`]) sends nothing yet, whatever it has in force, so it
+/// is told which gateways are in force and nothing of delivery.
+#[must_use]
+pub fn gateways_said(listed: &[String], routes_wait_for_a_restart: bool) -> Shown {
+    if routes_wait_for_a_restart {
+        return gateways_in_force(listed);
+    }
+    if listed.is_empty() {
+        Shown::said("this host delivers notifications through the official gateway only")
+    } else {
+        shown!(
+            "this host delivers notifications through the official gateway and {}",
+            Shown::joined(listed.iter().map(|origin| Shown::address(origin)), ", ")
+        )
+    }
 }
 
 /// What to tell a person about the routes this host sends over, when they are not the ones its
@@ -514,6 +538,24 @@ mod tests {
             ))
             .is_none()
         );
+    }
+
+    /// KR-REQ-16.04: the line the command ends on says the host delivers through the gateways only
+    /// when its routes are open; a host whose routes wait for a restart is told which gateways are
+    /// in force, and nothing of delivery.
+    #[test]
+    fn a_host_whose_routes_wait_for_a_restart_is_not_said_to_deliver() {
+        const LISTED: &str = "https://push.builder.example";
+        for listed in [&[][..], &[LISTED.to_owned()][..]] {
+            let open = gateways_said(listed, false).to_string();
+            assert!(open.contains("delivers"), "{open}");
+            let waiting = gateways_said(listed, true).to_string();
+            assert!(
+                waiting.contains("in force") && !waiting.contains("deliver"),
+                "{waiting}"
+            );
+            assert_eq!(waiting.contains(LISTED), !listed.is_empty(), "{waiting}");
+        }
     }
 
     /// A refused edit says the configuration's own sentences, and a sentence that arrived from a

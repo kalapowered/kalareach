@@ -2350,7 +2350,10 @@ fn kr_host_push_gateways_with_nothing_to_change_fails_on_a_host_started_over_an_
 /// closed after the document is put right, because it reads its routes once, when it starts. The
 /// host reports the document as usable then, so `kr host push-gateways` shows its list and says on
 /// standard error that a restart is needed, naming the doctor check that says why; its answer on
-/// standard output is the one a host with open routes gives, and the exit is still success.
+/// standard output is the one a host with open routes gives, and the exit is still success. In
+/// text, the line it ends on names the gateways in force and does not say the host delivers through
+/// them. An edit that only says what a document left unsaid (`network.enabled` absent, then
+/// `false`) selects nothing new and gives no note on a host with open routes; a real change does.
 #[test]
 fn kr_host_push_gateways_says_a_restart_is_needed_on_a_host_started_over_a_document_put_right_since()
  {
@@ -2360,6 +2363,14 @@ fn kr_host_push_gateways_says_a_restart_is_needed_on_a_host_started_over_a_docum
         (
             output.status.success(),
             document(&output, "kr host push-gateways"),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let in_text = |host: &Standalone| {
+        let output = start(host.kr(&["host", "push-gateways"])).finish("kr host push-gateways");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
         )
     };
@@ -2380,6 +2391,37 @@ fn kr_host_push_gateways_says_a_restart_is_needed_on_a_host_started_over_a_docum
             .map(|members| members.keys().cloned().collect::<Vec<_>>())
     };
     let control_members = members(&shown);
+    let (ok, line, said) = in_text(&usable);
+    assert!(
+        ok && line.contains("delivers notifications through the official gateway only"),
+        "a host with open routes is said to deliver: {line}"
+    );
+    assert!(said.is_empty(), "{said}");
+
+    // The document now says what it left unsaid, and nothing else: the host is still off the
+    // network, so no route waits for a restart. A proxy is a real change.
+    kr_ipc::paths::write_owner_only_file(
+        &usable.document(),
+        br#"{"version": 1, "revision": 2, "startup": {"controller": "standalone"}, "network": {"enabled": false}}"#,
+    )
+    .expect("writes the configuration document");
+    let (ok, shown, said) = show(&usable);
+    assert!(ok, "{shown}: {said}");
+    assert!(
+        said.is_empty(),
+        "an edit that changes no selection needs no restart: {said}"
+    );
+    kr_ipc::paths::write_owner_only_file(
+        &usable.document(),
+        br#"{"version": 1, "revision": 3, "startup": {"controller": "standalone"}, "network": {"enabled": false, "proxy_url": "http://127.0.0.1:3128"}}"#,
+    )
+    .expect("writes the configuration document");
+    let (ok, shown, said) = show(&usable);
+    assert!(ok, "{shown}: {said}");
+    assert!(
+        said.contains("restart"),
+        "a proxy the host did not start with needs one: {said}"
+    );
 
     let host = Standalone::create();
     kr_ipc::paths::write_owner_only_file(&host.document(), br#"{"version": 99}"#)
@@ -2401,6 +2443,11 @@ fn kr_host_push_gateways_says_a_restart_is_needed_on_a_host_started_over_a_docum
     assert!(
         said.contains("restart") && said.contains("configuration-network"),
         "it says a restart is needed, and where the host says why: {said}"
+    );
+    let (ok, line, _) = in_text(&host);
+    assert!(
+        ok && line.contains("in force") && !line.contains("deliver"),
+        "the line it ends on does not say the host delivers: {line}"
     );
 }
 
