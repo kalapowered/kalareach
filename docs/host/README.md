@@ -8207,9 +8207,12 @@ carries the interval and the resources it was built from; the filter answers wit
 rebuild from when that interval crosses the viewer's scope, and with nothing when the whole of it
 does. Whether a viewer may read a particular *resource* is a separate question the caller answers:
 the filter decides when, and a file's or an attachment's own grant decides what. The bytes of a
-file or an attachment are checked against the right to read files, which the grant carries or
-does not, and not against the particular file: a caller that has to hold a file to one resource
-checks the resource itself before it asks.
+file are checked against the right to read files, which the grant carries or does not, and not
+against the particular file. The daemon makes that check before it routes the read, apart from the
+screen and history grants: `download.begin` and `download.chunk` require `files.read`, and a device
+without it is refused `PERMISSION_DENIED` before anything else is asked. A scope the worker builds
+from the history scope of a forwarded read states no rights, so it holds no file right
+(`reads_files`), which is what the retained-output page asks (see "Files and attachments").
 
 Two readers hold a bound as a number, and take it from the filter (`first_moment`): the attention
 inbox and the changed-since-last-visit view of a paired device. A grant with no history cursor

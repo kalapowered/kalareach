@@ -24,8 +24,10 @@
 //!   it reaches [`Surface::TerminalSnapshot`] for the screen that is showing. Inactive buffers,
 //!   scrollback and the backing transcript stay outside it until the content is actually displayed
 //!   or separately granted.
-//! * **Bytes need their own grant.** A viewer that may see an attachment *reference* still needs
-//!   `files.read` for the bytes, and the two are separate questions here.
+//! * **Bytes need their own grant.** The filter decides *when*, and the file right decides *what*:
+//!   whether a scope holds `files.read` is [`ViewerScope::reads_files`], which a reader of retained
+//!   output asks before it serves what a terminal takes for a file or a picture. A scope built
+//!   from the history scope of a forwarded read states no rights, and reads none.
 //!
 //! # The seam
 //!
@@ -64,7 +66,7 @@ pub enum Surface {
     SemanticSnapshot,
     /// A conversation loaded from a previous turn.
     LoadedConversation,
-    /// An attachment reference. The bytes behind it need their own file grant as well.
+    /// An attachment reference, which the history bound decides as it decides every surface.
     AttachmentReference,
     /// An export of session content.
     Export,
@@ -134,8 +136,6 @@ pub enum WithheldReason {
     OutsideTheVisibleScreen,
     /// It is a question or approval created before the bound that this grant does not name.
     NotNamedByTheGrant,
-    /// The bytes need their own file grant, which this grant does not carry.
-    NoFileGrant,
     /// It is derived from an interval that crosses this viewer's scope, and could not be
     /// recomputed inside it.
     SourceIntervalOutsideScope,
@@ -152,7 +152,6 @@ impl WithheldReason {
             Self::NoRetainedHistory => "no_retained_history",
             Self::OutsideTheVisibleScreen => "outside_the_visible_screen",
             Self::NotNamedByTheGrant => "not_named_by_the_grant",
-            Self::NoFileGrant => "no_file_grant",
             Self::SourceIntervalOutsideScope => "source_interval_outside_scope",
             Self::NoSessionView => "no_session_view",
         }
@@ -714,27 +713,6 @@ impl HistoryFilter {
         }
     }
 
-    /// Decides about one attachment's bytes.
-    ///
-    /// Two questions, both of which have to be answered: the reference is inside the history
-    /// scope, and the viewer holds `files.read` for the bytes behind it. Section 10 keeps them
-    /// apart, so a viewer that may see that an attachment exists does not thereby receive it.
-    ///
-    /// # Errors
-    ///
-    /// Returns the reason the bytes are outside this viewer's scope.
-    pub fn admit_attachment_bytes(
-        &self,
-        produced_at_ms: u64,
-    ) -> std::result::Result<(), WithheldReason> {
-        self.admit_at(Surface::AttachmentReference, produced_at_ms)?;
-        if self.scope.files_read {
-            Ok(())
-        } else {
-            Err(WithheldReason::NoFileGrant)
-        }
-    }
-
     /// How much of the screen a snapshot installation may carry for this viewer.
     ///
     /// Snapshot installation goes through the filtered projection, never the worker's unrestricted
@@ -960,29 +938,6 @@ mod tests {
                 "and one asked at the bound is inside it, in any state"
             );
         }
-    }
-
-    #[test]
-    fn attachment_bytes_need_their_own_file_grant() {
-        let viewer = HistoryFilter::new(ViewerScope::from_grant(&grant(
-            bounded(0, false),
-            &[ActionRight::SessionView],
-        )));
-        assert_eq!(
-            viewer.admit_at(Surface::AttachmentReference, 10),
-            Ok(()),
-            "the reference is inside the history scope"
-        );
-        assert_eq!(
-            viewer.admit_attachment_bytes(10),
-            Err(WithheldReason::NoFileGrant)
-        );
-
-        let reviewer = HistoryFilter::new(ViewerScope::from_grant(&grant(
-            bounded(0, false),
-            &[ActionRight::SessionView, ActionRight::FilesRead],
-        )));
-        assert_eq!(reviewer.admit_attachment_bytes(10), Ok(()));
     }
 
     #[test]

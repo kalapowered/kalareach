@@ -580,35 +580,6 @@ fn kr_req_10_50_a_previewed_screen_projection_carries_no_title_and_no_link_targe
 }
 
 #[test]
-fn attachment_bytes_need_their_own_file_grant() {
-    let viewer = HistoryFilter::new(ViewerScope::from_grant(&grant(
-        scope(Some(CUTOFF_MS), true, &[], &[]),
-        &[ActionRight::SessionView],
-    )));
-    // The reference is inside the history scope, so the viewer may see that an attachment exists.
-    assert_eq!(
-        viewer.admit_at(Surface::AttachmentReference, 20_000),
-        Ok(())
-    );
-    // The bytes are a separate question, and the answer is no.
-    assert_eq!(
-        viewer.admit_attachment_bytes(20_000),
-        Err(WithheldReason::NoFileGrant)
-    );
-
-    let reviewer = HistoryFilter::new(ViewerScope::from_grant(&grant(
-        scope(Some(CUTOFF_MS), true, &[], &[]),
-        &[ActionRight::SessionView, ActionRight::FilesRead],
-    )));
-    assert_eq!(reviewer.admit_attachment_bytes(20_000), Ok(()));
-    // And the file grant does not reach back past the history bound either: both hold at once.
-    assert_eq!(
-        reviewer.admit_attachment_bytes(1_000),
-        Err(WithheldReason::BeforeHistoryBound)
-    );
-}
-
-#[test]
 fn voice_context_intersects_the_requesting_device_scope() {
     let device = HistoryFilter::new(ViewerScope::from_grant(&grant(
         scope(Some(CUTOFF_MS), false, &[], &[]),
@@ -847,9 +818,9 @@ fn a_scope_from_a_history_reads_no_file_bytes_and_sees_the_session_only_when_tol
         told.admit_at(Surface::SemanticSnapshot, CUTOFF_MS - 1),
         Err(WithheldReason::BeforeHistoryBound)
     );
-    assert_eq!(
-        told.admit_attachment_bytes(CUTOFF_MS),
-        Err(WithheldReason::NoFileGrant)
+    assert!(
+        !told.scope().reads_files(),
+        "a scope from a forwarded read states no file right"
     );
     let untold = HistoryFilter::new(ViewerScope::from_history(&history, false));
     assert_eq!(
