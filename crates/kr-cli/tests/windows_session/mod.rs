@@ -741,11 +741,14 @@ impl Created {
 impl Drop for WorkerHost {
     /// Ends the daemon before the tree goes.
     ///
-    /// The daemon holds `singleton.lock` for as long as any part of it lives, and that is an open
+    /// The daemon holds `singleton.lock` until the daemon value itself is gone, and that is an open
     /// file that shares nothing: the removal of the folder it is in is refused for as long as it is
     /// held, and the tree would stay in the temporary folder for good. So the tasks that serve are
     /// cancelled, the host lets go of the daemon, and the tree is let go of once the lock can be
-    /// taken, which is when the last part of the daemon has let go of it.
+    /// taken. A task that still holds a part of the daemon can outlive that, which `TreeGone` looks
+    /// at after the tree has gone. The wait needs another thread of the runtime to cancel the
+    /// aborted tasks, so a case that holds a host runs on the multi-thread runtime, and the wait
+    /// ends at the liveness deadline at the latest.
     fn drop(&mut self) {
         for task in &self.serving {
             task.abort();

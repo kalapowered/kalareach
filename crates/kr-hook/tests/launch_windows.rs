@@ -386,8 +386,9 @@ impl Shell {
     /// none comes.
     ///
     /// The report is read as bytes: the batch file writes it in the console's code page, which is
-    /// not UTF-8, so a directory with an accented letter in its name makes a line that is not valid
-    /// text. Such a byte reads back as the replacement character.
+    /// not UTF-8 on most machines (437 on the Windows test machine), so a directory with an accented
+    /// letter in its name makes a line that is not valid text there. Such a byte reads back as the
+    /// replacement character.
     fn report_from(&self, name: &str, launcher: &mut Child) -> BTreeMap<String, String> {
         let path = self.reports.join(name);
         let started = Instant::now();
@@ -1428,8 +1429,9 @@ fn kr_req_12_16_a_launch_is_granted_the_directory_the_program_inherits_and_it_is
 }
 
 /// The report of a program run in a directory with an accented letter in its name is read. The
-/// batch file writes the directory in the console's code page, which is not UTF-8, and a report with
-/// a byte that is not valid text is a report all the same.
+/// batch file writes the directory in the console's code page, which is not UTF-8 on most machines
+/// (437 on the Windows test machine, where this case can fail against a read as text), and a report
+/// with a byte that is not valid text is a report all the same.
 #[test]
 fn the_report_of_a_program_run_in_a_directory_with_an_accented_name_is_read() {
     let shell = Shell::new();

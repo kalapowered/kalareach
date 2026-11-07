@@ -291,8 +291,10 @@ async fn a_desktop_bound_session_is_made_and_the_account_signed_out() {
     // failing, and the case that follows, which needs a record, is not run on processes this case
     // ended itself. The entry the host registered is the one exception: the host is forgotten with
     // its hold on the entry, so this guard holds it. The case that follows deletes it, and when
-    // the sign-out does not come this case fails and the guard deletes it, since nothing else
-    // would.
+    // the logoff itself fails this case fails and the guard deletes it, since nothing else would.
+    // A logoff that is accepted and does not end the session leaves this case waiting below, with
+    // the guard held: the run that signed the account in finds the session still there and removes
+    // the entry with the rest.
     let _task = RegisteredTask::new(definition.name.clone());
     std::mem::forget(host);
     eprintln!("signing out login session {login}");

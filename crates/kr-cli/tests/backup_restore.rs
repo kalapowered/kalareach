@@ -388,11 +388,13 @@ struct Rig {
 impl Drop for Rig {
     /// Ends the daemon before the tree goes.
     ///
-    /// The daemon holds `singleton.lock` for as long as any part of it lives, and on Windows that is
-    /// an open file that shares nothing, which the removal of the folder it is in is refused for:
+    /// The daemon holds `singleton.lock` until the daemon value itself is gone, and on Windows that
+    /// is an open file that shares nothing, which the removal of the folder it is in is refused for:
     /// the tree would stay in the temporary folder for good. So the tasks that serve are cancelled,
-    /// the rig lets go of the daemon, and the tree is removed once the lock can be taken, which is
-    /// when the last part of the daemon has let go of it. The fields go after this, the tree first.
+    /// the rig lets go of the daemon, and the tree is removed once the lock can be taken. The wait
+    /// needs another thread of the runtime to cancel the aborted tasks, so a case that holds a rig
+    /// runs on the multi-thread runtime, and it ends at the liveness deadline at the latest. The
+    /// fields go after this, the tree first.
     fn drop(&mut self) {
         for task in &self.serving {
             task.abort();
@@ -965,10 +967,10 @@ fn borrowed(members: &[(String, Vec<u8>)]) -> Vec<(&str, Vec<u8>)> {
 /* Cases                                                                       */
 /* -------------------------------------------------------------------------- */
 
-/// A rig removes the whole tree it made when it goes, the daemon's lock file in it, however long
-/// the daemon was up and on whichever platform. Windows refuses the removal of a folder below a file
-/// the daemon still holds open, and the folder's remains would stay in the temporary folder for
-/// good.
+/// A rig removes the whole tree it made when it goes, the daemon's lock file in it. Windows refuses
+/// the removal of a folder below a file the daemon still holds open, and the folder's remains would
+/// stay in the temporary folder for good; on Unix a lock file is no obstacle, so this case cannot
+/// fail there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rig_leaves_no_part_of_its_tree_behind() {
     let rig = Rig::start(SignIn::Nobody).await;
