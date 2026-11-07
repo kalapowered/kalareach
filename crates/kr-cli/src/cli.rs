@@ -1476,8 +1476,11 @@ pub enum MachineCommand {
     Plan,
     /// Send each step of the plan that has no result, and say what each came to. A step never
     /// sent is sent under its own action, and one already sent is sent again as it was composed. An
-    /// environment that cannot be reached, or cannot yet say what it did, stays pending.
-    Finish,
+    /// environment that cannot be reached, or cannot yet say what it did, stays pending. A step an
+    /// environment answers with an outcome it could not establish stops the command with that
+    /// step's action and the record the environment shows; nothing new is sent for it unless
+    /// `--after-unknown` names the action.
+    Finish(MachineFinishArguments),
     /// Move each environment the plan moved back into the group it left, one step at a time. A
     /// step never sent is given up, and one that may have been taken has to be finished first.
     Undo,
@@ -1506,6 +1509,18 @@ pub struct MachineMergeArguments {
     /// each of them has to report, by identifier.
     #[arg(long)]
     pub from: Option<String>,
+}
+
+/// `kr host machine finish`.
+#[derive(Args)]
+pub struct MachineFinishArguments {
+    /// Send a step again as a new action after an environment answered the action with an outcome
+    /// it could not establish.
+    ///
+    /// The new action names the earlier one and the revision of the environment's record that the
+    /// command shows. Without this, a step in that state is never sent again under a new action.
+    #[arg(long, value_name = "ACTION")]
+    pub after_unknown: Option<String>,
 }
 
 /// `kr host machine split`.

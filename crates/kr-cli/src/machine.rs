@@ -30,13 +30,17 @@
 //!   environment decides against the request itself: that is final, whatever the environment reports
 //!   or can read, and the step is refused with it. At the record the step was approved against
 //!   nothing was applied. A step sent again is then composed again under a new action identity,
-//!   against the same record (an environment tells a repeat that meets a first action still running
-//!   the word it tells one whose first attempt ended without recording what it did, so the two are
-//!   not told apart, and at most one action of a step applies), except that a refusal with
+//!   against the same record (at most one action of a step applies), except that a refusal with
 //!   `RESOURCE_UNAVAILABLE`, which says the environment dispatched nothing, leaves the step sent
-//!   for the next `finish` to send the same action again. A step composed now is refused for what
-//!   the environment refused it for, unless the environment could not write, answer or finish it,
-//!   or refused it for now with another transient code, which stay sent.
+//!   for the next `finish` to send the same action again, and that an answer of `OUTCOME_UNKNOWN`,
+//!   which an environment tells a repeat that meets a first action still running and one whose
+//!   first attempt ended without recording what it did alike, stops the command with that action
+//!   and the record the environment shows, and sends nothing new unless the person's later `finish
+//!   --after-unknown <action>` names it (the next `finish` sends the same action again, which a
+//!   first action that has finished answers from its receipt). A step composed now is refused for
+//!   what the environment refused it for, unless the environment could not write, answer or finish
+//!   it, or refused it for now with another transient code, which stay sent; its `OUTCOME_UNKNOWN`
+//!   stops the command in the same way.
 //!   One step on, the plan takes the record as showing the step was taken once the environment has
 //!   confirmed that the record survives a crash, which it does before it claims any step, so a step
 //!   it refuses with `DRAFT_CONFLICT` after it claimed it, for the record it now holds, is taken,
@@ -98,6 +102,7 @@ use crate::error::{CliError, Result};
 use crate::output::{self, Document, Line};
 use crate::report::Completion;
 use crate::stdout_line;
+use kr_client::answers;
 
 /// The file the plan is kept in, in this user's own state directory.
 const PLAN_FILE: &str = "machine-merge-plan";
@@ -136,7 +141,7 @@ pub async fn run(paths: &HostPaths, arguments: MachineArguments, json: bool) -> 
     } = arguments;
     if matches!(
         command,
-        Some(MachineCommand::Plan | MachineCommand::Finish | MachineCommand::Undo)
+        Some(MachineCommand::Plan | MachineCommand::Finish(_) | MachineCommand::Undo)
     ) && !environment.is_empty()
     {
         return Err(CliError::Usage(Shown::said(
@@ -156,7 +161,14 @@ pub async fn run(paths: &HostPaths, arguments: MachineArguments, json: bool) -> 
             split(paths, &environment, &arguments, json).await
         }
         Some(MachineCommand::Plan) => plan_shown(paths, json).map(|()| Completion::Done),
-        Some(MachineCommand::Finish) => finish(paths, json).await,
+        Some(MachineCommand::Finish(arguments)) => {
+            let after = arguments
+                .after_unknown
+                .as_deref()
+                .map(|text| identifier::<ActionId>(text, "an action"))
+                .transpose()?;
+            finish(paths, json, after).await
+        }
         Some(MachineCommand::Undo) => undo(paths, json).await,
     }
 }
@@ -959,7 +971,7 @@ async fn plan_made(
     // Written before anything is sent, and never replaced by another: a second plan would be a
     // second set of steps for the same environments.
     create(paths, &plan)?;
-    take_steps(paths, plan, json).await
+    take_steps(paths, plan, json, None).await
 }
 
 /// `kr host machine plan`.
@@ -984,14 +996,31 @@ fn plan_shown(paths: &HostPaths, json: bool) -> Result<()> {
 }
 
 /// `kr host machine finish`.
-async fn finish(paths: &HostPaths, json: bool) -> Result<Completion> {
+///
+/// `after` is the action the person names with `--after-unknown`: a step sent under it that an
+/// environment answers with an outcome it could not establish is sent again as a new action that
+/// names it. Without it such a step stops the command.
+async fn finish(paths: &HostPaths, json: bool, after: Option<ActionId>) -> Result<Completion> {
     // The plan is read under the lock, never before it: another command may be taking it to its
     // results, or may have.
     let _lock = lock_plan(paths)?;
     let Some(plan) = load(paths)? else {
         return Err(CliError::Usage(Shown::said("no merge plan is kept")));
     };
-    take_steps(paths, plan, json).await
+    if let Some(named) = after
+        && !plan
+            .steps
+            .iter()
+            .chain(plan.undo.iter())
+            .any(|step| step.action_id == named && matches!(step.state, StepState::Sent))
+    {
+        return Err(CliError::Usage(shown!(
+            "no step of the plan was sent under action {} and is waiting for an answer: \
+             `kr host machine plan` names each step's action",
+            named
+        )));
+    }
+    take_steps(paths, plan, json, after).await
 }
 
 /// `kr host machine undo`.
@@ -1024,24 +1053,30 @@ async fn undo(paths: &HostPaths, json: bool) -> Result<Completion> {
     // lacks a step.
     plan.with_the_missing_undo();
     save(paths, &plan)?;
-    take_steps(paths, plan, json).await
+    take_steps(paths, plan, json, None).await
 }
 
 /// Takes each step of the plan that has no result, in order, keeping the plan as each answer
 /// arrives, and removes the plan once nothing is owed.
-async fn take_steps(paths: &HostPaths, mut plan: Plan, json: bool) -> Result<Completion> {
+async fn take_steps(
+    paths: &HostPaths,
+    mut plan: Plan,
+    json: bool,
+    after: Option<ActionId>,
+) -> Result<Completion> {
+    let mut stopped = Vec::new();
     for index in 0..plan.steps.len() {
-        advance(paths, &mut plan, Which::Forward, index).await?;
+        advance(paths, &mut plan, Which::Forward, index, after, &mut stopped).await?;
     }
     for index in 0..plan.undo.len() {
-        advance(paths, &mut plan, Which::Undo, index).await?;
+        advance(paths, &mut plan, Which::Undo, index, after, &mut stopped).await?;
     }
     let removal = if plan.complete() {
         finished(paths)
     } else {
         Ok(())
     };
-    let (kept, failure) = conclusion(&plan, removal);
+    let (kept, failure) = conclusion(&plan, removal, &stopped);
     report_plan(&plan, kept, failure.as_ref(), json);
     Ok(failure.map_or(Completion::Done, Completion::Reported))
 }
@@ -1051,7 +1086,7 @@ async fn take_steps(paths: &HostPaths, mut plan: Plan, json: bool) -> Result<Com
 ///
 /// A plan whose file could not be removed is still kept, and that failure is the one reported: it
 /// is in the same report as the plan, not a second one after it.
-fn conclusion(plan: &Plan, removal: Result<()>) -> (bool, Option<CliError>) {
+fn conclusion(plan: &Plan, removal: Result<()>, stopped: &[Stopped]) -> (bool, Option<CliError>) {
     let kept = !plan.complete() || removal.is_err();
     let pending = plan
         .steps
@@ -1066,6 +1101,8 @@ fn conclusion(plan: &Plan, removal: Result<()>) -> (bool, Option<CliError>) {
     });
     let failure = if let Err(error) = removal {
         Some(error)
+    } else if !stopped.is_empty() {
+        Some(unknown_outcome(stopped))
     } else if pending {
         Some(CliError::Unfinished {
             code: ErrorCode::EnvironmentUnavailable,
@@ -1128,7 +1165,14 @@ fn step_mut(plan: &mut Plan, which: Which, index: usize) -> &mut PlannedStep {
 }
 
 /// Takes one step to its result, or leaves it pending where its environment cannot be reached.
-async fn advance(paths: &HostPaths, plan: &mut Plan, which: Which, index: usize) -> Result<()> {
+async fn advance(
+    paths: &HostPaths,
+    plan: &mut Plan,
+    which: Which,
+    index: usize,
+    after: Option<ActionId>,
+    stopped: &mut Vec<Stopped>,
+) -> Result<()> {
     let (environment_id, reach, state) = {
         let step = step_mut(plan, which, index);
         (step.environment_id, step.reach.clone(), step.state.clone())
@@ -1139,7 +1183,7 @@ async fn advance(paths: &HostPaths, plan: &mut Plan, which: Which, index: usize)
     let Ok(mut reached) = reach_environment(paths, environment_id, &reach).await else {
         return Ok(());
     };
-    let outcome = attempt(paths, plan, which, index, &mut reached).await;
+    let outcome = attempt(paths, plan, which, index, &mut reached, (after, stopped)).await;
     reached.close().await;
     outcome
 }
@@ -1198,6 +1242,7 @@ async fn attempt(
     which: Which,
     index: usize,
     reached: &mut Reached,
+    later: (Option<ActionId>, &mut Vec<Stopped>),
 ) -> Result<()> {
     let stored = step_mut(plan, which, index).mutation.clone();
     // A step no environment was sent is composed here, under its own identity, on this connection:
@@ -1235,7 +1280,7 @@ async fn attempt(
     match answered {
         Ok(value) => taken(paths, plan, which, index, &value),
         // No receipt answered it. What the environment reports says what it came to.
-        Err(error) => settle(paths, plan, which, index, reached, error, sent).await,
+        Err(error) => settle(paths, plan, which, index, reached, error, sent, later).await,
     }
 }
 
@@ -1293,6 +1338,46 @@ enum Verdict {
     /// is composed again under a new action, against the same record, and what the environment
     /// answers that is read once more.
     AskAgain,
+    /// The environment answered that it cannot say what became of the action, and its record shows
+    /// nothing applied. The command stops with the action and the record, and the step stays sent:
+    /// a new action is composed only when the person asks for one that names this action.
+    Unknown,
+}
+
+/// A step an environment answered with an outcome it could not establish, and the record it showed.
+struct Stopped {
+    environment_id: EnvironmentId,
+    /// The action the step was sent under, which the environment could not say the outcome of.
+    action_id: ActionId,
+    /// The group the environment's record showed then.
+    record: MachineGroup,
+}
+
+/// What `finish` ends as when environments answered steps with outcomes they could not establish:
+/// each action and the record its environment shows, and how a later request is made. Nothing new
+/// was sent for any of them.
+fn unknown_outcome(stopped: &[Stopped]) -> CliError {
+    let mut said = Shown::said(
+        "an environment answered a step with an outcome it could not establish, so the step stays \
+         sent and nothing new is sent for it:",
+    );
+    for each in stopped {
+        said = shown!(
+            "{} environment {} answered action {}, and its record shows group {} at revision {} \
+             (`kr host machine finish --after-unknown {}` sends the step as a new action that \
+             names that action and that revision);",
+            said,
+            each.environment_id,
+            each.action_id,
+            each.record.machine_id.get(),
+            each.record.revision,
+            each.action_id
+        );
+    }
+    CliError::Unfinished {
+        code: ErrorCode::OutcomeUnknown,
+        message: said,
+    }
 }
 
 /// Decides what a step an environment refused, or could not answer, has come to, from what the
@@ -1328,14 +1413,20 @@ fn judge(
     if group.machine_id == step.expected.machine_id && group.revision == step.expected.revision {
         // Nothing was applied.
         return match (fresh, code) {
+            // The environment could not establish what became of the action, which it says alike of
+            // a first action still running and of one that ended without recording what it did.
+            // Nothing is applied that the record shows, and the record's precondition would let a
+            // new action apply at most once, but a new action is an explicit later request of the
+            // person's, made after the result was shown, and never this command's own choice. The
+            // action stays sent: asked again, a first action that has finished answers from its
+            // receipt.
+            (_, ErrorCode::OutcomeUnknown) => Verdict::Unknown,
             // The environment refused the repeat before it dispatched anything, which is what a
             // transient word says: the same action is asked again by the next `finish`.
             (false, ErrorCode::ResourceUnavailable) => Verdict::Pending,
             // A mutation sent again was refused for its window, or an action the environment kept
-            // a refusal for, or one it cannot finish, or one whose first attempt is still running:
-            // the environment tells that last as it tells an attempt that ended without recording
-            // what it did (`OUTCOME_UNKNOWN`), and the two are not told apart. It is composed again
-            // under a new action against the same record, so at most one of its actions applies.
+            // a refusal for, or one it cannot finish: it is composed again under a new action
+            // against the same record, so at most one of its actions applies.
             (false, _) => Verdict::AskAgain,
             // A step composed here and refused as the owner's authority is not the owner's.
             (true, ErrorCode::PermissionDenied) => {
@@ -1347,7 +1438,6 @@ fn judge(
                 true,
                 ErrorCode::ResourceUnavailable
                 | ErrorCode::StorageUnavailable
-                | ErrorCode::OutcomeUnknown
                 | ErrorCode::DraftConflict,
             ) => Verdict::Pending,
             // Any other transient refusal is the environment saying it cannot take the step now,
@@ -1385,6 +1475,7 @@ fn judge(
 /// Reads an environment that refused a step, or could not answer it, and decides what the step came
 /// to. A step composed again is taken once, and what the environment answers it is read the same
 /// way.
+#[allow(clippy::too_many_arguments)]
 async fn settle(
     paths: &HostPaths,
     plan: &mut Plan,
@@ -1393,6 +1484,7 @@ async fn settle(
     reached: &mut Reached,
     mut error: ProtocolError,
     mut sent: Sent,
+    (after, stopped): (Option<ActionId>, &mut Vec<Stopped>),
 ) -> Result<()> {
     loop {
         // A refusal the environment decides against the request, such as a join into the group it
@@ -1411,7 +1503,7 @@ async fn settle(
             return Ok(());
         };
         let step = step_mut(plan, which, index).clone();
-        match judge(&step, info.machine.as_ref(), error.code, sent) {
+        let quote = match judge(&step, info.machine.as_ref(), error.code, sent) {
             Verdict::Done(group) => {
                 return conclude(paths, plan, which, index, StepState::Done(group));
             }
@@ -1419,28 +1511,56 @@ async fn settle(
                 return conclude(paths, plan, which, index, StepState::Refused(code, why));
             }
             Verdict::Pending => return Ok(()),
-            Verdict::AskAgain => {
-                let action_id = ActionId::new(kr_ipc::new_uuid());
-                let Ok(mutation) = compose_step(reached, which, &step, action_id).await else {
+            // The environment's own definite word on the action: a new one is composed, which asks
+            // against the same record.
+            Verdict::AskAgain => None,
+            // An outcome the environment could not establish is shown to the person with the
+            // record it holds, and a new action follows only when the person asks for one that
+            // names this action.
+            Verdict::Unknown => {
+                let named = step.action_id;
+                let Some(record) = info.machine.as_ref() else {
                     return Ok(());
                 };
-                {
-                    let step = step_mut(plan, which, index);
-                    step.action_id = action_id;
-                    step.mutation = Some(mutation.clone());
-                    step.state = StepState::Sent;
+                if after != Some(named) {
+                    stopped.push(Stopped {
+                        environment_id: step.environment_id,
+                        action_id: named,
+                        record: record.clone(),
+                    });
+                    return Ok(());
                 }
-                save(paths, plan)?;
-                match reached.send(&mutation).await {
-                    Ok(Ok(value)) => return taken(paths, plan, which, index, &value),
-                    Ok(Err(refused)) => {
-                        error = refused;
-                        sent = Sent::Anew;
-                    }
-                    // Sent, and not known: it stays sent.
-                    Err(_) => return Ok(()),
-                }
+                Some(answers::Quote {
+                    action_id: named,
+                    revision: record.revision.get(),
+                })
             }
+        };
+        let action_id = ActionId::new(kr_ipc::new_uuid());
+        let Ok(mut mutation) = compose_step(reached, which, &step, action_id).await else {
+            return Ok(());
+        };
+        if let Some(quote) = quote {
+            let Ok(expected) = answers::supersession(Some(quote)) else {
+                return Ok(());
+            };
+            mutation.expected = expected;
+        }
+        {
+            let step = step_mut(plan, which, index);
+            step.action_id = action_id;
+            step.mutation = Some(mutation.clone());
+            step.state = StepState::Sent;
+        }
+        save(paths, plan)?;
+        match reached.send(&mutation).await {
+            Ok(Ok(value)) => return taken(paths, plan, which, index, &value),
+            Ok(Err(refused)) => {
+                error = refused;
+                sent = Sent::Anew;
+            }
+            // Sent, and not known: it stays sent.
+            Err(_) => return Ok(()),
         }
     }
 }
@@ -1830,10 +1950,11 @@ mod tests {
 
     /// KR-REQ-03.07: at the record the step was approved against, nothing was applied. A mutation
     /// sent again that is refused is composed again under a new action, against the same record,
-    /// also when its first action is still running, which the environment tells as it tells an
-    /// attempt that ended without recording what it did; one composed on the connection that sent
-    /// it, as a first action or a new one, is not given up for an answer that says it may yet be
-    /// taken, and a refusal of the owner's authority is final.
+    /// except when the environment cannot say what became of its action, which it says alike of a
+    /// first action still running and of one that ended without recording what it did: that stops
+    /// the command, for the person to ask for a new action; one composed on the connection that
+    /// sent it, as a first action or a new one, is not given up for an answer that says it may yet
+    /// be taken, and a refusal of the owner's authority is final.
     #[test]
     fn at_the_precondition_a_step_is_asked_again_once_and_never_while_it_may_still_be_taken() {
         let step = step();
@@ -1852,10 +1973,10 @@ mod tests {
         }
         assert_eq!(
             judge(&step, Some(&at), ErrorCode::OutcomeUnknown, Sent::Again),
-            Verdict::AskAgain,
+            Verdict::Unknown,
             "a first action still running is told as an unknown outcome, as one that ended \
-             without recording what it did is, and the step is composed again against the same \
-             record"
+             without recording what it did is, so the command stops and the step is composed \
+             again only when the person asks for it"
         );
         assert_eq!(
             judge(
@@ -1874,7 +1995,6 @@ mod tests {
             for code in [
                 ErrorCode::ResourceUnavailable,
                 ErrorCode::StorageUnavailable,
-                ErrorCode::OutcomeUnknown,
                 ErrorCode::DraftConflict,
                 ErrorCode::EditorBusy,
                 ErrorCode::RateLimited,
@@ -1899,6 +2019,69 @@ mod tests {
         }
     }
 
+    /// KR-REQ-23.24, the client's half: an environment's answer that it cannot say what became of a
+    /// step's action is an uncertain outcome, so the step is never composed again under a new action
+    /// by this command, whichever attempt it answers: it stops with the action, and a new action is
+    /// the person's later request (`finish --after-unknown`). Every other refusal at the same
+    /// record is still the environment's definite word on the action.
+    #[test]
+    fn a_step_answered_with_an_unknown_outcome_is_stopped_and_not_asked_again_by_itself() {
+        let step = step();
+        let at = at_the_precondition();
+        for sent in [Sent::First, Sent::Again, Sent::Anew] {
+            assert_eq!(
+                judge(&step, Some(&at), ErrorCode::OutcomeUnknown, sent),
+                Verdict::Unknown,
+                "{sent:?}"
+            );
+        }
+        assert_eq!(
+            judge(&step, Some(&at), ErrorCode::StorageUnavailable, Sent::Again),
+            Verdict::AskAgain,
+            "a refusal the environment kept for the action is its definite word"
+        );
+        // With the record showing the step taken, or unreadable, no new action is ever composed
+        // for an unknown outcome, so there is no replacement to put behind the person's request.
+        assert_eq!(
+            judge(
+                &step,
+                Some(&one_step_on()),
+                ErrorCode::OutcomeUnknown,
+                Sent::Again
+            ),
+            Verdict::Pending
+        );
+        assert_eq!(
+            judge(&step, None, ErrorCode::OutcomeUnknown, Sent::Again),
+            Verdict::Pending
+        );
+    }
+
+    /// What the command says when it stops names each action, the record its environment shows and
+    /// the command that makes the later request, and is an unknown outcome and not a pending step.
+    #[test]
+    fn the_stop_names_the_action_the_record_and_the_later_request() {
+        let step = step();
+        let stopped = Stopped {
+            environment_id: step.environment_id,
+            action_id: step.action_id,
+            record: at_the_precondition(),
+        };
+        let error = unknown_outcome(&[stopped]);
+        assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
+        assert_eq!(error.exit_code(), 1);
+        let said = error.to_string();
+        assert!(said.contains(&step.action_id.to_string()), "{said}");
+        assert!(
+            said.contains(&format!("--after-unknown {}", step.action_id)),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!("revision {}", at_the_precondition().revision)),
+            "{said}"
+        );
+    }
+
     /// KR-REQ-03.07: a plan whose file could not be removed is still kept, and the failure is the
     /// one reported with it; a complete plan that was removed is not kept; a plan with a step still
     /// to be answered is kept and says so.
@@ -1914,7 +2097,7 @@ mod tests {
             undo: Vec::new(),
             undoing: false,
         };
-        let (kept, failure) = conclusion(&plan, Ok(()));
+        let (kept, failure) = conclusion(&plan, Ok(()), &[]);
         assert!(
             !kept && failure.is_none(),
             "a complete plan that was removed"
@@ -1925,6 +2108,7 @@ mod tests {
             Err(CliError::Other(Shown::said(
                 "the plan could not be removed",
             ))),
+            &[],
         );
         assert!(kept, "the file is still there");
         assert!(
@@ -1933,7 +2117,7 @@ mod tests {
         );
 
         plan.steps[0].state = StepState::Sent;
-        let (kept, failure) = conclusion(&plan, Ok(()));
+        let (kept, failure) = conclusion(&plan, Ok(()), &[]);
         assert!(kept);
         assert!(matches!(
             failure,
