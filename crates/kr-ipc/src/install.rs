@@ -3369,6 +3369,27 @@ mod tests {
         ));
     }
 
+    /// Whether the file system the store is on exchanges two names, as the switch asks it to.
+    ///
+    /// The probe makes two links in the directory beside the store's root, which is on the same file
+    /// system and is removed with the rest of the fixture, and asks for the same exchange.
+    #[cfg(target_os = "macos")]
+    fn names_can_be_exchanged_where(store_root: &Path) -> bool {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        use rustix::io::Errno;
+
+        let beside = store_root.parent().expect("the store is in a directory");
+        let first = beside.join("exchange-probe-first");
+        let second = beside.join("exchange-probe-second");
+        std::os::unix::fs::symlink("first", &first).expect("a link");
+        std::os::unix::fs::symlink("second", &second).expect("a link");
+        match renameat_with(CWD, &first, CWD, &second, RenameFlags::EXCHANGE) {
+            Ok(()) => true,
+            Err(Errno::NOTSUP) => false,
+            Err(error) => panic!("asking the file system to exchange two names failed: {error}"),
+        }
+    }
+
     /// The switch replaces `current` in one rename, and names only releases of the store.
     #[test]
     fn the_switch_renames_one_link_over_current() {
@@ -3424,19 +3445,26 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with('.'))
             .collect();
         // Only an exchange leaves the link it swapped out, which on macOS is every switch over a
-        // `current` that exists, in a temporary directory whose file system can exchange names (the
-        // internal disk's is), and the next switch takes it away. The refused switch took none.
+        // `current` that exists, and the next switch takes it away. The refused switch took none.
+        // A temporary directory on a file system that cannot exchange names gets the rename and
+        // leaves none, so the file system is asked first.
+        #[cfg(target_os = "macos")]
+        let exchanges = names_can_be_exchanged_where(test.store.root());
+        #[cfg(not(target_os = "macos"))]
+        let exchanges = false;
         assert_eq!(
             leftovers.len(),
-            usize::from(cfg!(target_os = "macos")),
+            usize::from(exchanges),
             "no temporary link is left behind but the one an exchange swapped out: {leftovers:?}"
         );
         #[cfg(target_os = "macos")]
-        assert_eq!(
-            std::fs::read_link(leftovers[0].path()).expect("a link"),
-            Path::new("versions").join(one.as_str()),
-            "the exchange left the link `current` was"
-        );
+        if exchanges {
+            assert_eq!(
+                std::fs::read_link(leftovers[0].path()).expect("a link"),
+                Path::new("versions").join(one.as_str()),
+                "the exchange left the link `current` was"
+            );
+        }
     }
 
     /// A link that a crash left beside `current` names no release `current` could take, and the next
