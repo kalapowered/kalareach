@@ -984,6 +984,13 @@ fn plan_names_what_it_does_not_restore(plan: &Value, held: &[(String, Vec<u8>)])
         .iter()
         .find(|refused| refused["object"] == object_of("other/unknown.bin").as_str())
         .unwrap_or_else(|| panic!("the unknown name is shown as not restored: {plan}"));
+    assert_eq!(
+        unknown["because"],
+        kr_client::recovery::MemberRefusal::UnknownKind
+            .said()
+            .to_string(),
+        "a name no host archive carries is refused as an unknown name, not for a kind's reason"
+    );
     assert!(
         table_reasons
             .iter()
