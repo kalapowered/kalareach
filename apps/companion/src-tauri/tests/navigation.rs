@@ -116,7 +116,9 @@ mod macos {
         });
         let workers = Arc::new(Mutex::new(Some((first, second))));
         // A test context: the library already embeds the application's Info.plist, and a second
-        // copy is a duplicate symbol.
+        // copy is a duplicate symbol. Its icons are the application's, the macOS one included: the
+        // context writes a file for each, and the files are then the ones the library's context
+        // wrote before this program was built.
         let paths = workers
             .lock()
             .expect("the workers")
