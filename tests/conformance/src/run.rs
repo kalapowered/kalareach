@@ -1319,11 +1319,12 @@ fn run_logged(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
+    use std::time::{Duration, SystemTime};
 
     use super::{
-        Binary, ERROR_BYTES, LISTING_BEGIN, LISTING_END, Unit, dependency_file, ends_of,
-        ends_of_root_resolved, file_name, is_count, is_named_by_digest, libtest,
-        may_have_overlapped, read_listing, reconcile, unrecorded,
+        Binary, Compiled, ERROR_BYTES, LISTING_BEGIN, LISTING_END, Unit, date_before,
+        dependency_file, ends_of, ends_of_root_resolved, file_name, is_count, is_named_by_digest,
+        libtest, may_have_overlapped, read_listing, reconcile, unrecorded,
     };
     use crate::workspace::{TargetId, TargetKind};
 
@@ -1754,6 +1755,88 @@ mod tests {
         // Two compiles of the library itself are two variants of it, as `panic = "abort"` makes
         // beside the library the tests link, and nothing makes one wait for the other.
         assert!(may_have_overlapped(&[Unit::Library, Unit::Library]));
+    }
+
+    #[test]
+    fn a_file_is_told_from_one_of_the_same_name_in_another_directory() {
+        // The same bytes are named alike wherever a macro writes them, and the library's compile
+        // reading one of the files says nothing of the other.
+        let directory = tempfile::tempdir().expect("a directory");
+        let digest = "5d4140c1a3b2c9d6e7f80a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5";
+        let began = SystemTime::now() - Duration::from_secs(10);
+        for beside in ["a", "b"] {
+            std::fs::create_dir(directory.path().join(beside)).expect("a directory");
+            std::fs::write(directory.path().join(beside).join(digest), "x").expect("a file");
+        }
+        let reads = |beside: &str| {
+            Some(format!(
+                "target: {}\n",
+                directory.path().join(beside).join(digest).display()
+            ))
+        };
+        let compiled = |unit, beside| Compiled {
+            package: "p".to_owned(),
+            unit,
+            read: reads(beside),
+        };
+        let dating = date_before(
+            &[("p".to_owned(), directory.path().to_path_buf())],
+            &[
+                compiled(Unit::Library, "a"),
+                compiled(Unit::Other, "b"),
+                compiled(Unit::Other, "b"),
+            ],
+            began,
+        );
+        // The library alone read `a`, and two programs that it did not wait for read `b`.
+        assert_eq!(dating.dated, 1, "{dating:?}");
+        assert_eq!(dating.left.len(), 1, "{dating:?}");
+        assert!(dating.left[0].contains("b"), "{dating:?}");
+    }
+
+    #[test]
+    fn a_cause_cargo_gives_over_several_lines_is_kept_whole() {
+        // A line break in the runner's path makes Cargo's message run over two lines, and the
+        // cause under it has a block of its own.
+        let text = "     Running unittests src/lib.rs (target/debug/deps/a-0123)\n\
+                    error: test failed, to rerun pass `-p a --lib`\n\
+                    \nCaused by:\n  could not execute process `/x/line\n  break/lister list-one a-0123 --list` (never executed)\n\
+                    \nCaused by:\n  No such file or directory (os error 2)\n\
+                    note: test exited abnormally; to see the full output pass --no-capture to the harness.\n\
+                    \x20  Doc-tests a\n";
+        let ends = ends_of(text, Path::new("/nowhere"));
+        for word in [
+            "break/lister",
+            "(never executed)",
+            "No such file or directory",
+        ] {
+            assert!(ends.contains(word), "{word}: {ends}");
+        }
+        assert!(!ends.contains("Doc-tests"), "{ends}");
+    }
+
+    #[test]
+    fn a_library_that_is_only_dynamic_or_static_is_none_a_program_waits_for() {
+        // Cargo makes a program wait for the library of its package when the library can be linked
+        // into it as Rust (`lib`, `rlib`, `dylib` or `proc-macro`); a `cdylib` or a `staticlib` is
+        // an output of its own, and nothing waits for it.
+        let unit = |kinds: &[&str]| {
+            let message = serde_json::json!({
+                "target": { "kind": kinds, "name": "app" },
+                "profile": { "test": false },
+                "filenames": ["/nowhere/target/debug/libapp.a"],
+            });
+            Compiled::from_artifact("p", &message, SystemTime::now())
+                .expect("a unit")
+                .unit
+        };
+        assert_eq!(unit(&["lib", "cdylib", "staticlib"]), Unit::Library);
+        assert_eq!(unit(&["rlib"]), Unit::Library);
+        assert_eq!(unit(&["dylib"]), Unit::Library);
+        assert_eq!(unit(&["proc-macro"]), Unit::Library);
+        assert_eq!(unit(&["cdylib"]), Unit::Other);
+        assert_eq!(unit(&["staticlib"]), Unit::Other);
+        assert_eq!(unit(&["cdylib", "staticlib"]), Unit::Other);
     }
 
     #[test]
