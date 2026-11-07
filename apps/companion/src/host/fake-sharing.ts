@@ -146,7 +146,10 @@ export interface FakeSharing {
    * closes as not done, and one it wrote closes as happened, without its result.
    */
   passTheBound(): void
-  /** The next revocation's barrier has a worker that has not fenced it, until told otherwise. */
+  /**
+   * The next revocation's barrier has a worker that has not fenced it, beside one that has, until
+   * told otherwise.
+   */
   holdBarrier(held: boolean): void
   /**
    * The host's answer to the next hand-over that is sent is held until the test lets it go: the
@@ -1055,10 +1058,23 @@ export class ScriptedSharing implements FakeSharing {
                 rejected_actions_total: '0',
                 session_id: sessionOf(summary),
                 state: 'pending'
+              },
+              // The host lists the workers that have not confirmed first, then the ones that have.
+              {
+                acknowledged_revision: '6',
+                detail: '',
+                names_pending: '0',
+                omitted_actions: '0',
+                possibly_executed: [],
+                possibly_executed_total: '0',
+                rejected_actions: [],
+                rejected_actions_total: '0',
+                session_id: idOf('5d5d5d5d', 1),
+                state: 'acknowledged'
               }
             ]
           : [],
-        workers_total: pending ? '1' : '0'
+        workers_total: pending ? '2' : '0'
       }
     }
   }

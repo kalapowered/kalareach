@@ -17,14 +17,16 @@ import type { SharingDesk, Waiting } from './sharing-desk'
 export type Say = (text: string, tone?: 'success' | 'danger' | 'pending') => void
 
 /**
- * The session workers a revocation still waits for. The host names the workers that have not
- * confirmed before any that has, and says how many there were in all, so when it cut its list the
- * names are a floor.
+ * The session workers a revocation still waits for, and those that have confirmed it. The host
+ * names the workers that have not confirmed before any that has, and says how many there were in
+ * all, so when it cut its list the names of those waiting are a floor and those that confirmed are
+ * only the ones it listed.
  */
 export function waitingOn(result: RevocationResult): Waiting {
   const { workers, workers_total: total } = result.barrier
   return {
     sessions: workers.filter((worker) => worker.state === 'pending').map((worker) => worker.session_id),
+    confirmed: workers.filter((worker) => worker.state !== 'pending').map((worker) => worker.session_id),
     cut: Number(total) > workers.length
   }
 }

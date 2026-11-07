@@ -346,8 +346,9 @@ describe('who has access', () => {
 describe('a revocation some session worker has not confirmed', () => {
   // KR-REQ-18.14: the words do not call it done. The toast says that the revocation is recorded and
   // not done, and how many session workers have not confirmed it. The line says the same, states
-  // the authority revision and names each session whose worker has not confirmed it; once a check
-  // finds none left, the line says the access was revoked.
+  // the authority revision and names each session the host listed: the one whose worker has not
+  // confirmed it and the one whose worker has; once a check finds none left, the line says the
+  // access was revoked.
   it('is said to be recorded and not done, with each session that has not confirmed it', async () => {
     const { controls, person } = await openSharing()
     await person.click(screen.getByRole('radio', { name: PHONE }))
@@ -371,6 +372,7 @@ describe('a revocation some session worker has not confirmed', () => {
     expect(line.textContent).toMatch(/not done/)
     expect(line.textContent).toMatch(/authority revision 6/)
     expect(line.textContent).toMatch(/1 session worker has not confirmed yet \(session 8a7b6c50\)/)
+    expect(line.textContent).toMatch(/Confirmed: session 5d5d5d5d/)
     const toast = screen.getByText(/is recorded, and not done: 1 session worker has not confirmed yet/)
     expect(toast.textContent).not.toMatch(/^Revoked/)
 
@@ -379,6 +381,37 @@ describe('a revocation some session worker has not confirmed', () => {
       expect(screen.getByTestId('recently-revoked').textContent).toMatch(/^Revoked /)
     })
     expect(screen.getByTestId('recently-revoked').textContent).not.toMatch(/not done|session 8a7b6c50/)
+  })
+
+  // KR-REQ-18.14, a withdrawn invitation: withdrawing an invitation nobody has accepted is a
+  // revocation too, and a worker that has not confirmed it keeps it from being called done. The
+  // toast says the withdrawal is recorded and not done; the line states the authority revision and
+  // the sessions, and a check that finds none left ends it.
+  it('says a withdrawn invitation is recorded and not done, with the revision and each session', async () => {
+    const { controls, person } = await openSharing()
+    await person.click(screen.getByRole('radio', { name: PHONE }))
+    await person.click(screen.getByTestId('invite'))
+    const row = await waitFor(() => {
+      const found = screen.getByTestId('access').querySelector('[data-state="pending"]')
+      expect(found).not.toBeNull()
+      return found as HTMLElement
+    })
+
+    controls.sharing.holdBarrier(true)
+    await person.click(within(row).getByTestId('withdraw'))
+    const line = await screen.findByTestId('recently-revoked')
+    expect(line.textContent).not.toMatch(/^Revoked/)
+    expect(line.textContent).toMatch(/not done/)
+    expect(line.textContent).toMatch(/authority revision 6/)
+    expect(line.textContent).toMatch(/1 session worker has not confirmed yet \(session 8a7b6c50\)/)
+    expect(line.textContent).toMatch(/Confirmed: session 5d5d5d5d/)
+    expect(screen.getByText(/The withdrawal of the invitation to .* is recorded, and not done: 1 session worker has not confirmed yet/)).toBeInTheDocument()
+
+    await person.click(within(line).getByTestId('check-again'))
+    await waitFor(() => {
+      expect(screen.getByTestId('recently-revoked').textContent).toMatch(/^Revoked /)
+    })
+    expect(screen.getByTestId('recently-revoked').textContent).toMatch(/authority revision 6/)
   })
 })
 
@@ -772,6 +805,27 @@ describe('a revocation whose answer was lost', () => {
     expect(line.textContent).toMatch(/1 session worker has not confirmed yet/)
     expect(within(line).getByTestId('check-again')).toBeInTheDocument()
   })
+
+  // KR-REQ-18.14, a recovered revocation: when the host's answer was lost and what it shows is read
+  // instead, the revision and the workers are not known, so the attempt says the host has recorded
+  // the revocation and that the workers are not known, and does not say it is done.
+  it('is not called done when it is recovered without the host’s answer, and says the workers are not known', async () => {
+    const { controls, person } = await withActiveShare()
+    controls.sharing.holdBarrier(true)
+    controls.sharing.loseNextAnswer()
+    await person.click(screen.getByTestId('revoke'))
+    await screen.findByTestId('attempt')
+    controls.sharing.passTheBound()
+    await reread()
+    const row = await waitFor(() => {
+      const found = screen.getByTestId('attempt')
+      expect(found).toHaveAttribute('data-outcome', 'happened')
+      return found
+    })
+    expect(row.textContent).not.toMatch(/\bdone\b/)
+    expect(row.textContent).toMatch(/recorded/)
+    expect(row.textContent).toMatch(/whether each session worker has stopped acting under it is not known/i)
+  })
 })
 
 describe('what an invitation is agreed to', () => {
@@ -895,6 +949,10 @@ describe('what the page keeps of a result after the screen that sent it has gone
     })
     const line = await screen.findByTestId('recently-revoked')
     expect(line.textContent).toMatch(/1 session worker has not confirmed yet/)
+    // KR-REQ-18.14, a hand-over: the line for the giving device's revocation states the authority
+    // revision the host issued and the sessions, as the line for any revocation does.
+    expect(line.textContent).toMatch(/authority revision 6/)
+    expect(line.textContent).toMatch(/Confirmed: session 5d5d5d5d/)
     await person.click(within(line).getByTestId('check-again'))
     await waitFor(() => {
       expect(screen.getByTestId('recently-revoked').textContent).not.toMatch(/not confirmed yet/)
@@ -960,6 +1018,10 @@ describe('what the page keeps of a result after the screen that sent it has gone
     await reread()
     const line = await screen.findByTestId('recently-revoked')
     expect(line.textContent).toMatch(/1 session worker has not confirmed yet/)
+    // KR-REQ-18.14, a recovered hand-over: the hand-over is told, and the giving device's access is
+    // not told as done while a worker has not confirmed that it was lost.
+    const told = screen.getByText(/1 session worker has not confirmed that .* lost access yet/)
+    expect(told.textContent).not.toMatch(/: done\./)
     await person.click(within(line).getByTestId('check-again'))
     await waitFor(() => {
       expect(screen.getByTestId('recently-revoked').textContent).not.toMatch(/not confirmed yet/)

@@ -383,7 +383,7 @@ function SharingTab({
       }
     } else if (attempt.kind === 'transfer') {
       const done = value as GrantTransferResult
-      const words = `${nameWords(attempt.label)}: done.`
+      const words = `${nameWords(attempt.label)}: handed over.`
       if (attempt.revoked_grant_id === null) say(words)
       else {
         handedOver(desk, say, done, attempt.revoked_grant_id, 'the device that gave control up', words, clock.now())
@@ -746,7 +746,7 @@ function SharingTab({
           >
             <span>
               {line.waiting.length > 0
-                ? `The revocation for ${nameWords(line.name)} is recorded at ${momentWords(line.atMs, now)} (authority revision ${line.revision}), and not done: ${workersHave(line.waiting.length, line.cut)} not confirmed yet (${line.waiting.map(sessionIdWords).join(', ')}).`
+                ? `The revocation for ${nameWords(line.name)} is recorded at ${momentWords(line.atMs, now)} (authority revision ${line.revision}), and not done: ${workersHave(line.waiting.length, line.cut)} not confirmed yet (${line.waiting.map(sessionIdWords).join(', ')}).${line.confirmed.length > 0 ? ` ${line.cut ? 'Confirmed among those the host listed' : 'Confirmed'}: ${line.confirmed.map(sessionIdWords).join(', ')}.` : ''}`
                 : `Revoked ${nameWords(line.name)} at ${momentWords(line.atMs, now)} (authority revision ${line.revision}).`}
             </span>{' '}
             {line.waiting.length > 0 ? (
