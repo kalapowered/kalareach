@@ -27,15 +27,25 @@ use kr_client::services::account::{
     BACKUP_WRITE_SCOPE, Client, IssuedGrant, RECOVERY_BACKUP_SCOPES, REQUESTED_SCOPES,
     RefreshToken, SignedInAccount,
 };
+use kr_client::services::backup::ManagedBackupManifestService;
+use kr_client::services::storage::ArchiveAnswer;
 use kr_client::services::{
-    HttpDeadlines, HttpService, ManagedSyncService, NullService, ServiceFuture, ServiceSigner,
-    managed_response_limits,
+    BackupManifestService as _, HttpDeadlines, HttpService, ManagedSyncService, NullService,
+    ServiceFuture, ServiceHttp, ServiceSigner, managed_response_limits,
+};
+use kr_crypto::backup::{
+    ArchivePlan, ArchiveRecipients, CollectionKind, ObjectSource, StagedObject, seal_archive,
+    stage_object,
 };
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
 use kr_crypto::sign::{SigningTranscript, sign};
 use kr_crypto::store::{MemoryStore, load_recovery_seed, store_recovery_seed};
-use kr_protocol::archive::{RecoveryBundle, RecoveryContext, RecoveryKit};
+use kr_protocol::archive::{
+    BACKUP_PUBLICATION_DOMAIN, BACKUP_WRITER_DOMAIN, BackupGenerationPublication,
+    BackupGenerationPublicationPayload, BackupWriterRecord, BackupWriterRecordPayload,
+    RecoveryBundle, RecoveryContext, RecoveryKit, TrustedWriter,
+};
 use kr_protocol::backup_read::BackupSignIn;
 use kr_protocol::backup_setup::{
     BackupEnableParams, BackupEnableResult, BackupHostKeys, BackupSetupState, BackupStatusResult,
@@ -44,7 +54,7 @@ use kr_protocol::backup_setup::{
 use kr_protocol::error::ErrorCode;
 use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
-use kr_service_stand_in::{Moment, RESTORE_TOKEN, Served, TOKEN, serve};
+use kr_service_stand_in::{ACCOUNT, Moment, RESTORE_TOKEN, Served, TOKEN, serve};
 use serde_json::{Value, json};
 use tauri::Manager as _;
 use tauri::test::{INVOKE_KEY, MockRuntime, mock_builder, mock_context, noop_assets};
@@ -200,6 +210,24 @@ async fn read_with_only_the_kit(served: &Served, kit: &RecoveryKit) -> RecoveryB
 /* This computer, and the application started on it                            */
 /* -------------------------------------------------------------------------- */
 
+/// The page's `recovery_cover_host` with a host double in place of the host on this computer. The
+/// command the application registers reads its host from the application's connection to the host on
+/// this computer, which this suite has none of, and returns what `Recovery::cover_host` answers
+/// unchanged; this one does the same over the host the suite manages, so that the answer goes the
+/// way the page's is sent and not into the case's hands.
+#[tauri::command]
+async fn cover_the_host_double(
+    state: tauri::State<'_, AppState>,
+    account: tauri::State<'_, AccountSlot>,
+    host: tauri::State<'_, Arc<Host>>,
+    replace: bool,
+) -> companion_tauri::Result<HostCoverView> {
+    state
+        .recovery()?
+        .cover_host(account.get().await?, &**host, replace)
+        .await
+}
+
 /// What survives the application being closed: the service, the data directory and the secure
 /// store, which holds the device's keys and, once recovery is on, the recovery seed.
 struct Computer {
@@ -253,6 +281,7 @@ impl Computer {
                 companion_tauri::commands::recovery_archives,
                 companion_tauri::commands::recovery_export_offline,
                 companion_tauri::commands::recovery_cover_host,
+                cover_the_host_double,
             ])
             .build(mock_context(noop_assets()))
             .expect("an application on the mock runtime");
@@ -330,6 +359,11 @@ impl Page {
                 .any(|(name, _)| *name == command),
             "{command} is a command the application registers"
         );
+        self.invoke(command, body)
+    }
+
+    /// As [`Self::call`], for a command this suite registers itself.
+    fn invoke(&self, command: &str, body: Value) -> Result<Value, Value> {
         let answered = tokio::task::block_in_place(|| {
             tauri::test::get_ipc_response(
                 &self.window,
@@ -361,6 +395,14 @@ impl Page {
                 Err(refusal)
             }
         }
+    }
+
+    /// The page's `recovery_cover_host`, over `host` in place of the host on this computer: the
+    /// answer reaches the page as the invoke path sends it, and is among what the page was told.
+    fn cover_host(&self, host: &Arc<Host>, replace: bool) -> Result<Value, Value> {
+        // Managed once for the page's host; a second host is a second page.
+        self.app.manage(Arc::clone(host));
+        self.invoke("cover_the_host_double", json!({ "replace": replace }))
     }
 
     /// What recovery shows now.
@@ -429,6 +471,10 @@ type WayLeft = (&'static str, Box<dyn Fn(&Host)>, LeftView);
 struct Host {
     status: Mutex<BackupStatusResult>,
     keys: BackupHostKeys,
+    /// The private halves of those keys, which a case that has the host publish an archive seals
+    /// and signs with.
+    writer: AuthorisationKeyPair,
+    producer: StoredEnvelopeKeyPair,
     /// What the host answers to the setup, or nothing when the answer is lost.
     answer: Mutex<Option<BackupEnableResult>>,
     /// How the call fails instead of being answered, when it does.
@@ -471,6 +517,8 @@ impl Host {
                 last_attempt: kr_protocol::scalars::Nullable::null(),
             }),
             keys,
+            writer,
+            producer,
             answer: Mutex::new(None),
             failure: Mutex::new(None),
             enabled: Mutex::new(Vec::new()),
@@ -1632,29 +1680,177 @@ fn x25519_secret_of(seed: &[u8]) -> Vec<u8> {
     sha2::Sha512::digest(seed)[..32].to_vec()
 }
 
+/// A generation of an archive as the host's producer makes one, put at the service: sealed for the
+/// recovery recipient `seed` derives and signed by the host's writer, which this computer's own key
+/// enrols; its objects stored under the account; the publication sent by the writer.
+struct PublishedGeneration {
+    publication: BackupGenerationPublication,
+    manifest_object: kr_protocol::ids::BackupObjectId,
+    objects: Vec<kr_protocol::ids::BackupObjectId>,
+}
+
+async fn publish_generation(
+    computer: &Computer,
+    seed: &RecoverySeed,
+    host: &Host,
+    archive: kr_protocol::ids::ArchiveId,
+    members: &[(&str, Vec<u8>)],
+) -> PublishedGeneration {
+    use kr_protocol::ids::{BackupGeneration, BackupObjectId, BackupWriterRevision, DeviceId};
+    use kr_protocol::scalars::Uuid;
+
+    let http: Arc<dyn ServiceHttp> = Arc::new(
+        HttpService::with(
+            computer.origin(),
+            HttpDeadlines::default(),
+            managed_response_limits(),
+        )
+        .expect("a transport"),
+    );
+    let manifest_as = |key: AuthorisationKeyPair| {
+        ManagedBackupManifestService::new(
+            computer.origin(),
+            Arc::clone(&http),
+            Arc::new(Installation(key)),
+        )
+        .presenting(Arc::new(Bearer(TOKEN)))
+    };
+
+    // This computer's key enrols the host's writer, which the bundle already names.
+    let owner = computer.identity().keys.authorisation.clone();
+    let payload = BackupWriterRecordPayload {
+        archive_id: archive,
+        writer: TrustedWriter {
+            writer_key_id: host.writer.key_id(),
+            signing_key: *host.writer.public(),
+            enrolled_at_ms: TimestampMs::new(1_000),
+        },
+        writer_revision: BackupWriterRevision::new(1),
+        owner_key_id: owner.key_id(),
+        enrolled_at_ms: TimestampMs::new(1_000),
+    };
+    let signature = sign(
+        &owner,
+        &SigningTranscript::from_canonical_bytes(
+            BACKUP_WRITER_DOMAIN,
+            payload.signing_input().expect("an enrolment input"),
+        )
+        .expect("a transcript"),
+    )
+    .expect("a signature");
+    manifest_as(owner)
+        .enrol(&BackupWriterRecord { payload, signature })
+        .await
+        .expect("the service enrols the writer");
+
+    // The generation, sealed for the recovery recipient.
+    let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
+    assert!(recipients.add_recovery(&seed.recipient().expect("a recipient")));
+    let staged: Vec<_> = members
+        .iter()
+        .enumerate()
+        .map(|(at, (name, plaintext))| {
+            stage_object(
+                &ObjectSource {
+                    object_id: BackupObjectId::new(Uuid::from_bytes(
+                        [0x20 + u8::try_from(at).expect("few members"); 16],
+                    )),
+                    filename: name,
+                    plaintext,
+                },
+                recipients.rotation(),
+            )
+            .expect("a staged object")
+        })
+        .collect();
+    let manifest_object = BackupObjectId::new(Uuid::from_bytes([0xf0; 16]));
+    let sealed = seal_archive(
+        &host.writer,
+        &host.producer,
+        &recipients,
+        &ArchivePlan {
+            archive_id: archive,
+            backup_generation: BackupGeneration::new(1),
+            owner_device_id: DeviceId::new(Uuid::from_bytes([0x33; 16])),
+            manifest_object_id: manifest_object,
+            created_at_ms: TimestampMs::new(1_700_000_000_000),
+        },
+        &staged,
+    )
+    .expect("a sealed archive");
+    let web = computer.served.web();
+    for object in &staged {
+        web.put_object(
+            &archive.to_string(),
+            &object.object_id().to_string(),
+            ACCOUNT,
+            object.bytes().to_vec(),
+        );
+    }
+    web.put_object(
+        &archive.to_string(),
+        &manifest_object.to_string(),
+        ACCOUNT,
+        sealed.encrypted_manifest.clone(),
+    );
+
+    // The writer publishes it.
+    let payload = BackupGenerationPublicationPayload {
+        descriptor: sealed.descriptor.clone(),
+        writer_key_id: host.writer.key_id(),
+        published_at_ms: TimestampMs::new(5_000),
+    };
+    let signature = sign(
+        &host.writer,
+        &SigningTranscript::from_canonical_bytes(
+            BACKUP_PUBLICATION_DOMAIN,
+            payload.signing_input().expect("a publication input"),
+        )
+        .expect("a transcript"),
+    )
+    .expect("a signature");
+    let publication = BackupGenerationPublication { payload, signature };
+    let answer = manifest_as(host.writer.clone())
+        .publish(&publication)
+        .await
+        .expect("the service answers the publication");
+    assert!(
+        matches!(answer, ArchiveAnswer::Done(_)),
+        "the service stored the publication"
+    );
+    PublishedGeneration {
+        publication,
+        manifest_object,
+        objects: staged.iter().map(StagedObject::object_id).collect(),
+    }
+}
+
 /// KR-REQ-20.17, what this case reads of the companion's outputs and no more: the kit file saved as
 /// text; the QR code file and the text a scanner reads from it; the offline export file of the
-/// bundle alone (`archive: null`), as bytes; the setup a host double is sent when the computer
-/// covers it, as the JSON of its parameters; the bundle as the service holds it, opened with the kit
-/// alone once the host is covered (so it names the host's public keys); and the answers to the
-/// commands the page was called with in this case. None of them holds a private key this computer
-/// keeps in the secure store beside the recovery seed: the reusable endpoint (transport) key, the
-/// control-signing (authorisation) key, and the stored envelope and notification preview keys with
-/// the private keys made from their seeds. Each key is looked for as bytes, in hexadecimal of either
-/// case, in either base64 alphabet wherever it lies in a longer value, and as a list of numbers. The
-/// controls that can fail are the scan finding a seed in each of those forms, the kit's seed line in
-/// what the QR code scans back to, the kit's fingerprint in the setup and the host's writer key in
-/// the bundle; the control on the kit file cuts its line from the file itself, so it shows only that
-/// the scan runs over the file's text. Not shown here: the sealed bundle inside the export file and
-/// the one inside the setup, which are scanned as ciphertext only (the case does not open them or
-/// compare them with the service's copy, as `the_bundle_exports_alone_as_a_private_file_of_ciphertext`
-/// compares the export's); the export of an archive, which this case does not make (it exports
-/// `archive: null`; the library's export case reads the file for an archive); the answer of
-/// `cover_host`, which is called directly and so is not among the page's answers; that the derived
-/// private keys are the keys of the pairs (the host's case in the controller's suite checks the
-/// derivation against the public key); a key in a binary list of integers, split, reversed or
+/// bundle alone (`archive: null`) and the one of an archive the host made and published, as bytes;
+/// the setup a host double is sent when the computer covers it, as the JSON of its parameters; the
+/// sealed bundle in the setup and the one in the bundle export, each opened with the kit alone (and
+/// each equal, byte for byte, to the bundle the service holds); the bundle as the service holds
+/// it, opened with the kit alone once the host is covered (so it names the host's public keys); the
+/// view of the host's cover that the page is sent; and the answers to the commands the page was
+/// called with in this case. None of them holds a private key this computer keeps in the secure
+/// store beside the recovery seed: the reusable endpoint (transport) key, the control-signing
+/// (authorisation) key, and the stored envelope and notification preview keys with the private keys
+/// made from their seeds, which are checked against the public keys of the pairs. Each key is
+/// looked for as bytes, in hexadecimal of either case, in either base64 alphabet wherever it lies in
+/// a longer value, and as a list of numbers. The archive export is made over a generation sealed
+/// for the recovery recipient with production primitives and put at the service; the file is
+/// decoded and equal, object by object, to what the service holds, so it adds no byte of its own.
+/// The controls are the scan finding a seed in each of those forms, the seed printed from the
+/// secure store's own copy in the kit file and in what the QR code scans back to, the kit's
+/// fingerprint in the setup, the host's writer key in the opened bundle, the writer's key
+/// identifier and a member's ciphertext in the archive export, and the cover view's fields in what
+/// the page was told. Not shown here: what an archive the host really makes carries (the daemon's
+/// production case reads the host's, and the members here are the case's own); the host's private
+/// keys, which this computer never holds; a key in a binary list of integers, split, reversed or
 /// otherwise transformed; `kr backup setup`'s outputs; or the other data paths of backup and
-/// recovery material.
+/// recovery material. The view is sent through a command this suite registers over the host double
+/// and not through `recovery_cover_host`, which needs a connection to a host this suite has none of.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_computer_keeps() {
     use kr_crypto::store::{SecretName, SecretStore as _};
@@ -1665,13 +1861,22 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
     page.call("recovery_turn_on", json!({})).expect("on");
     let out = tempfile::tempdir().expect("a directory");
 
-    // The private keys this computer keeps, read from the store the recovery seed is in.
+    // The private keys this computer keeps, read from the store the recovery seed is in. The
+    // private keys of the two X25519 pairs are made from their seeds by a hash, so each is checked
+    // against the public key its pair has.
+    let identity = computer.identity();
     let mut kept = Vec::new();
-    for purpose in [
-        KeyPurpose::Transport,
-        KeyPurpose::Authorisation,
-        KeyPurpose::StoredEnvelope,
-        KeyPurpose::NotificationPreview,
+    for (purpose, public) in [
+        (KeyPurpose::Transport, None),
+        (KeyPurpose::Authorisation, None),
+        (
+            KeyPurpose::StoredEnvelope,
+            Some(*identity.keys.stored_envelope.public().as_bytes()),
+        ),
+        (
+            KeyPurpose::NotificationPreview,
+            Some(*identity.keys.notification_preview.public().as_bytes()),
+        ),
     ] {
         let name = SecretName::device_key(companion_tauri::device::identity::SCOPE, purpose)
             .expect("a name");
@@ -1681,26 +1886,30 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
             .expect("the store reads")
             .unwrap_or_else(|| panic!("this computer kept a {purpose:?} key"));
         kept.push((format!("{purpose:?} seed"), seed.expose().to_vec()));
-        if matches!(
-            purpose,
-            KeyPurpose::StoredEnvelope | KeyPurpose::NotificationPreview
-        ) {
-            kept.push((
-                format!("{purpose:?} private key (derived)"),
-                x25519_secret_of(seed.expose()),
-            ));
+        if let Some(public) = public {
+            let secret = x25519_secret_of(seed.expose());
+            let derived = aws_lc_rs::agreement::PrivateKey::from_private_key(
+                &aws_lc_rs::agreement::X25519,
+                &secret,
+            )
+            .expect("an X25519 private key")
+            .compute_public_key()
+            .expect("its public key");
+            assert_eq!(
+                derived.as_ref(),
+                public.as_slice(),
+                "the {purpose:?} private key is the first half of its seed's hash"
+            );
+            kept.push((format!("{purpose:?} private key (derived)"), secret));
         }
     }
     assert_eq!(kept.len(), 6, "four seeds and two keys made from them");
     for (name, key) in &kept {
         assert!(key.len() >= 32, "the {name} is a key, not a stub");
     }
-    assert!(
-        load_recovery_seed(&*computer.secrets, SEED_SCOPE)
-            .expect("the store reads")
-            .is_some(),
-        "the recovery seed is in the same store"
-    );
+    let stored_seed = load_recovery_seed(&*computer.secrets, SEED_SCOPE)
+        .expect("the store reads")
+        .expect("the recovery seed is in the same store");
 
     // What the computer writes or shows: the kit, the QR code (read as a scanner reads it), the
     // export of the bundle, the bundle opened with the kit alone, and what the page was told.
@@ -1708,16 +1917,20 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
     let kit_file = std::fs::read(&kit_path).expect("the kit file");
 
     // The host on this computer is covered, which sends it the setup and names its writer and
-    // producer in the bundle: the outputs below are read after that.
-    let host = Host::new(&computer, computer.served.origin());
+    // producer in the bundle: the outputs below are read after that. The view of the cover reaches
+    // the page as any answer does.
+    let host = Arc::new(Host::new(&computer, computer.served.origin()));
     host.sets_up();
-    page.recovery
-        .cover_host(&page.account, &host, false)
-        .await
-        .expect("the host is covered");
+    let view = page.cover_host(&host, false).expect("the host is covered");
+    assert_eq!(view["state"], "covered");
     let sent = host.setups_sent();
     assert_eq!(sent.len(), 1, "the host was sent one setup");
-    let setup = serde_json::to_vec(&sent[0].0).expect("the setup encodes");
+    let (setup_params, held_exactly) = &sent[0];
+    assert!(
+        *held_exactly,
+        "the service held exactly the bundle the host was sent when the host was asked"
+    );
+    let setup = serde_json::to_vec(setup_params).expect("the setup encodes");
 
     let qr = out.path().join("kit.svg");
     page.dialog_returns(&qr);
@@ -1738,15 +1951,124 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
     let export_file = std::fs::read(&export).expect("the export file");
     let bundle = serde_json::to_vec(&read_with_only_the_kit(&computer.served, &kit).await)
         .expect("the bundle encodes");
+
+    // The sealed bundle in the setup and the one in the export are the bundle the service holds,
+    // and each opens with the kit alone.
+    let held_bundle = computer
+        .served
+        .web()
+        .bundle(&kit.bundle_locator)
+        .expect("the service holds the bundle");
+    let bundle_export =
+        kr_client::recovery::OfflineExport::from_canonical_slice(&export_file).expect("an export");
+    assert_eq!(
+        bundle_export.encrypted_bundle.as_slice(),
+        held_bundle.as_slice(),
+        "the export's bundle is the one the service holds"
+    );
+    assert_eq!(
+        setup_params.sealed_bundle.as_slice(),
+        held_bundle.as_slice(),
+        "the setup's bundle is the one the service holds"
+    );
+    let seed = RecoverySeed::from_kit(&kit).expect("the kit's seed");
+    let bundle_key = seed
+        .bundle_key_for(&kit.context(&kit.service_origins[0]).expect("a context"))
+        .expect("the bundle's key");
+    let opened_with_the_kit = |sealed: &[u8]| -> Vec<u8> {
+        serde_json::to_vec(
+            &kr_crypto::archive::decrypt_recovery_bundle(&bundle_key, sealed)
+                .expect("the kit opens the sealed bundle"),
+        )
+        .expect("the bundle encodes")
+    };
+    let setup_bundle = opened_with_the_kit(setup_params.sealed_bundle.as_slice());
+    let export_bundle = opened_with_the_kit(bundle_export.encrypted_bundle.as_slice());
+
+    // An archive the host made and published, listed by the page and exported by it.
+    let archive = setup_params.archive_id;
+    let published = publish_generation(
+        &computer,
+        &seed,
+        &host,
+        archive,
+        &[
+            ("host/configuration.json", b"{\"revision\":1}".to_vec()),
+            ("sessions/a.json", b"{\"output\":\"a line\"}".to_vec()),
+        ],
+    )
+    .await;
+    let listed = page
+        .call("recovery_archives", json!({}))
+        .expect("the archives");
+    assert_eq!(listed[0]["archive_id"], archive.to_string());
+    assert_eq!(listed[0]["generation"], 1, "the page lists the generation");
+    let archive_path = out.path().join("archive.krexport");
+    page.dialog_returns(&archive_path);
+    let saved = page
+        .call(
+            "recovery_export_offline",
+            json!({ "path": archive_path.to_string_lossy(), "archive": archive.to_string() }),
+        )
+        .expect("the archive is exported");
+    assert_eq!(saved["archive_id"], archive.to_string());
+    assert_eq!(saved["generation"], 1);
+    let archive_file = std::fs::read(&archive_path).expect("the archive export file");
+    assert_eq!(saved["bytes"], archive_file.len());
+    let exported =
+        kr_client::recovery::OfflineExport::from_canonical_slice(&archive_file).expect("an export");
+    assert_eq!(
+        exported.encrypted_bundle.as_slice(),
+        held_bundle.as_slice(),
+        "the archive export's bundle is the one the service holds"
+    );
+    let carried = exported.archive.0.as_ref().expect("an archive");
+    assert_eq!(carried.archive_id, archive);
+    assert_eq!(
+        carried.publication, published.publication,
+        "the publication the service holds"
+    );
+    let service_object = |object: kr_protocol::ids::BackupObjectId| {
+        computer
+            .served
+            .web()
+            .stored(&archive.to_string(), &object.to_string())
+            .expect("the service holds the object")
+    };
+    assert_eq!(
+        carried.encrypted_manifest.as_slice(),
+        service_object(published.manifest_object).as_slice(),
+        "the manifest object is the one the service holds"
+    );
+    let exported_objects: Vec<_> = carried
+        .objects
+        .iter()
+        .map(|object| object.object_id)
+        .collect();
+    assert_eq!(
+        exported_objects, published.objects,
+        "every member object the generation has, once each and in order"
+    );
+    for object in &carried.objects {
+        assert_eq!(
+            object.bytes.as_slice(),
+            service_object(object.object_id).as_slice(),
+            "a member object is the one the service holds"
+        );
+    }
+
     let told = page.told().into_bytes();
     let outputs = [
         ("the kit file", kit_file.clone()),
         ("the QR code file", qr_file),
         ("the QR code's text", scanned_text.clone().into_bytes()),
-        ("the offline export", export_file),
+        ("the offline export of the bundle", export_file),
+        ("the offline export of an archive", archive_file.clone()),
         ("the setup the host was sent", setup.clone()),
+        ("the setup's sealed bundle, opened", setup_bundle),
+        ("the export's sealed bundle, opened", export_bundle),
         ("the bundle opened with the kit", bundle.clone()),
-        ("what the page was told", told),
+        ("what the page was told", told.clone()),
     ];
 
     // The controls: the scan finds a key in each form it looks for, wherever the key lies in a
@@ -1791,16 +2113,21 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
         carried_in(&list, probe).as_deref(),
         Some("as a list of numbers")
     );
-    let kit_text = String::from_utf8(kit_file).expect("the kit is text");
-    let seed_line = kit_text
+    // The seed's printed form is made from the secure store's own copy of the seed, not cut from
+    // the file the scan reads, so a file that left the seed out, or wrote another, fails here.
+    let printed = kr_client::recovery::render_kit(
+        &stored_seed.to_kit(kit.service_origins.clone(), kit.bundle_locator.clone()),
+    )
+    .expect("the kit's text")
+    .to_string();
+    let seed_line = printed
         .lines()
         .find_map(|line| line.strip_prefix("seed: "))
         .expect("a seed line");
-    // The line is cut from the kit file itself, so this shows only that the scan runs over the
-    // file's text; the code's control below takes the same line from another output.
+    let kit_text = String::from_utf8(kit_file).expect("the kit is text");
     assert!(
         carried_in(kit_text.as_bytes(), seed_line.as_bytes()).is_some(),
-        "the scan does not read the kit file"
+        "the scan does not find the seed in the kit file"
     );
     assert!(
         carried_in(scanned_text.as_bytes(), seed_line.as_bytes()).is_some(),
@@ -1813,6 +2140,21 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
     assert!(
         carried_in(&bundle, host.keys.writer_public_key.as_bytes()).is_some(),
         "the scan does not read the host's keys in the bundle"
+    );
+    assert!(
+        carried_in(&archive_file, host.keys.writer_key_id.as_bytes()).is_some(),
+        "the scan does not read the publication in the archive export"
+    );
+    let member_ciphertext = service_object(published.objects[0]);
+    assert!(
+        archive_file
+            .windows(member_ciphertext.len())
+            .any(|window| window == member_ciphertext.as_slice()),
+        "the scan does not read the member objects in the archive export"
+    );
+    assert!(
+        carried_in(&told, sent[0].0.kit_fingerprint.as_bytes()).is_some(),
+        "the scan does not read the view of the cover"
     );
 
     for (output, bytes) in &outputs {
