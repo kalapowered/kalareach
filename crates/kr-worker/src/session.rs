@@ -5092,13 +5092,30 @@ impl Session {
     /// shell has gone.
     ///
     /// A start that fails after the launch has no closure to do it, because nothing reads or writes
-    /// the terminal. The shell is forced to stop and waited for, so that it has ended when this
-    /// returns. A session that launched no shell has nothing to end.
+    /// the terminal. The shell is forced to stop and, when it was signalled, waited for, so that it
+    /// has ended when this returns. A shell the kernel will not describe is not signalled and is
+    /// not waited for. A session that launched no shell has nothing to end.
     pub fn end_launched_shell(&mut self) {
-        let _ = self.force_close();
+        if self.force_close().is_err() {
+            return;
+        }
         if let Some(shell) = self.shell.as_mut() {
             let _ = shell.wait();
         }
+    }
+
+    /// Whether the root shell has ended, which is true of a session that launched none.
+    ///
+    /// The shell's exit is kept as the closure will read it, so asking does not take it from the
+    /// record.
+    pub fn root_has_ended(&mut self) -> bool {
+        let exit = match self.shell.as_mut().map(RootShell::try_wait) {
+            None => return true,
+            Some(Ok(Some(exit))) => exit,
+            Some(_) => return false,
+        };
+        self.root_exit.get_or_insert(exit);
+        true
     }
 
     /// Writes the final record and moves the session to `closed`.
