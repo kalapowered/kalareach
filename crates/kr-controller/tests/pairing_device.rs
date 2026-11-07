@@ -12,7 +12,8 @@
 //! The script and this suite talk through files in `KR_HARNESS_DIR`, on the internal disk (a file
 //! holds an invitation's secret, so it is written for its owner alone). The suite works through the
 //! phases the script asks for, each started by a `go-<phase>` file, in any order and any number of
-//! times, and ends when `finish` appears. Every phase says when it is done with `done-<phase>`.
+//! times, and ends when `finish` appears, which also ends a phase's wait for the phone or the
+//! script. Every phase says when it is done with `done-<phase>`.
 //!
 //! | Phase | The script's file | The suite writes |
 //! | --- | --- | --- |
@@ -27,7 +28,7 @@
 //! | `sent` | `go-sent`, then `go-counted` | `sent-first.txt` once the agent in the session was sent the draft the phone wrote (`DRAFT`); `sent-result.txt`, how many times it was, once the script has seen the phone itself say the send is applied and asks for the count |
 //! | `handover` | `go-handover` | a session shared with a second device is to be handed to a third: `handover-asked.txt` once the host asks, `handover-result.txt` with the record of the phone's answer and who holds the session after the transfer |
 //! | `second` | `go-second`, then `second-approve` | the second host, a daemon of its own that the phone reaches at its own address, issues a guest invitation: `second-environment.txt`, its environment; `second.png`, the invitation's QR; `second-value.txt`, the value that host shows once a candidate redeemed; `second-paired.txt` once approved |
-//! | `bound` | `go-bound` | once the second host is serving a connection of the phone, its owner bounds how long personal remote access stands without its authority feed, which no feed has been reached for, so the bound has lapsed as it is chosen: `bound-result.txt` holds what that host answers the inbox read of another guest of its before and after, the refusal's words included |
+//! | `bound` | `go-bound` | once the second host is serving a connection of the phone, its owner bounds how long personal remote access stands without its authority feed, which no feed has been reached for, so the bound has lapsed as it is chosen: `bound-result.txt` holds how many connections of the phone the host was serving at the choice (all the host keeps of the phone), and, as a control beside the phone's own screen, what that host answers another guest of its, paired as the phone is: the inbox read before the choice (served, empty), and after it what it answers the host's identity, the opening of the connection and the inbox read, in the order a phone's connection makes them (each is refused alike, with the lapsed words) |
 //!
 //! `KR_HARNESS_PEER` is the name the phone reaches this machine by: `127.0.0.1` for a simulator,
 //! which shares the machine's network, and `10.0.2.2` for an emulator. `KR_HARNESS_SERVICE_PEER` is
@@ -52,6 +53,7 @@ use kr_ipc::client::LocalClient;
 use kr_pairing::grants::{DEFAULT_GUEST_PAIRING_MS, guest_grant, personal_owner_grant};
 use kr_protocol::attention::{AttentionReadParams, AttentionReadResult, AttentionSource};
 use kr_protocol::confirmation::{ConfirmationSubject, TransferControlSubject};
+use kr_protocol::hostinfo::HostInfoResult;
 use kr_protocol::ids::{
     ActionId, ConfirmationId, DeviceId, EnvironmentId, InvitationId, SessionId,
 };
@@ -65,6 +67,7 @@ use kr_protocol::pairing::{
     group_verification_value,
 };
 use kr_protocol::scalars::{DurationMs, Nullable, SecretBytes32, U64};
+use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
 use kr_protocol::sharing::{
     GrantTransferParams, GrantTransferResult, OfflineValidityPolicy, SessionRole,
 };
@@ -263,6 +266,18 @@ const SECOND: Answers = Answers {
     paired: "second-paired.txt",
 };
 
+/// What a read is answered with: that it is served, or the code and the words the host refuses it
+/// with.
+fn served_or_refused<T>(read: Result<T, kr_client::ClientError>) -> String {
+    match read {
+        Ok(_) => "served".to_owned(),
+        Err(kr_client::ClientError::Host(refusal)) => {
+            format!("refused {:?}: {}", refusal.code, refusal.message)
+        }
+        Err(other) => format!("failed {other}"),
+    }
+}
+
 /// What `session` is answered when it reads the inbox: how many items it is served, or the code and
 /// the words the host refuses it with.
 async fn inbox_answer(session: &kr_client::session::Session) -> String {
@@ -279,11 +294,25 @@ async fn inbox_answer(session: &kr_client::session::Session) -> String {
         .await;
     match read {
         Ok(page) => format!("served items={}", page.items.len()),
-        Err(kr_client::ClientError::Host(refusal)) => {
-            format!("refused {:?}: {}", refusal.code, refusal.message)
-        }
-        Err(other) => format!("failed {other}"),
+        refused => served_or_refused(refused),
     }
+}
+
+/// What `session` is answered by the two reads a phone makes of a host first, as the application's
+/// connection makes them: who the host is, and the opening of the connection for the host.
+async fn opening_answers(session: &kr_client::session::Session) -> (String, String) {
+    let info: Result<HostInfoResult, kr_client::ClientError> =
+        session.read(Method::HostInfo, &()).await;
+    let opened: Result<SessionOpenResult, kr_client::ClientError> = session
+        .read(
+            Method::SessionOpen,
+            &SessionOpenParams {
+                session_id: Nullable::null(),
+                grant_id: Nullable::null(),
+            },
+        )
+        .await;
+    (served_or_refused(info), served_or_refused(opened))
 }
 
 /// The daemon a phone is paired with and the owner the run bootstraps it with, and a second daemon.
@@ -324,6 +353,14 @@ impl Run {
         write_private(&self.directory.join(file), text.as_bytes());
     }
 
+    /// Whether a wait that began so as to end by `end` goes on. A wait for what the phone or the
+    /// script does stops at its limit and when the script has said the run is finished, so that a
+    /// failed run ends this suite at once, with its daemons stopped and their trees removed, and not
+    /// when the limit passes.
+    fn waiting(&self, end: Instant) -> bool {
+        Instant::now() < end && !self.directory.join("finish").exists()
+    }
+
     /// Issues a direct invitation for a personal owner, which the owner confirms here.
     async fn invite(&self, client: &mut LocalClient) -> PairInviteResult {
         let signer = Signer::OwnerDevice(&self.owner);
@@ -338,14 +375,15 @@ impl Run {
         .expect("a direct invitation")
     }
 
-    /// Waits for the candidate of `invitation` to bind and says its value.
+    /// Waits for the candidate of `invitation` to bind and says its value, or says nothing once the
+    /// wait's limit has passed or the script has said the run is finished.
     async fn candidate_value(
         &self,
         client: &mut LocalClient,
         invitation: InvitationId,
     ) -> Option<String> {
         let end = Instant::now() + STEP;
-        while Instant::now() < end {
+        while self.waiting(end) {
             let status = calls::owner_status(client, invitation)
                 .await
                 .expect("the invitation's status");
@@ -357,10 +395,11 @@ impl Run {
         None
     }
 
-    /// Waits for the host to hold an answer to `confirmation`, and says its record.
+    /// Waits for the host to hold an answer to `confirmation`, and says its record, or says nothing
+    /// once the wait's limit has passed or the script has said the run is finished.
     async fn answered(&self, confirmation: ConfirmationId) -> Option<String> {
         let end = Instant::now() + STEP;
-        while Instant::now() < end {
+        while self.waiting(end) {
             if let Some(record) = self
                 .host()
                 .await
@@ -524,10 +563,19 @@ impl Run {
     /// The owner of the second host chooses a bounded offline validity for personal remote access,
     /// with no synchronisation of its authority feed to measure from, so the bound has lapsed as it is
     /// chosen and no clock is waited on. From then on the host refuses every read of a device that
-    /// reaches it, the phone's inbox read among them. The choice is made once the host is serving a
-    /// connection of the phone, which the phone's visit of its inbox keeps (that the phone's read was
-    /// answered is not shown here). Another guest of that host, paired here, is read before and after,
-    /// so that the run records what the host itself answered, served and then refused.
+    /// reaches it, the phone's inbox read among them.
+    ///
+    /// The choice is made once the host is serving a connection of the phone: its visit of the inbox
+    /// opened one, which may not have read yet. That count is all the host keeps of the phone: it
+    /// records no request of a device, so this suite cannot say which request of the phone's the host
+    /// refused, or whether any was served first. What shows the refusal is the phone's own screen,
+    /// which the drivers read for the host's lapsed words. A device under a lapsed bound is still
+    /// admitted, and the host refuses its requests alike, who the host is and the opening of the
+    /// connection (the first two a connection of the application makes) as much as the inbox read;
+    /// and the application gives a refusal of any request of its visit as the same row, with the
+    /// host's words. So a control stands beside the screen: another guest of this host, paired as the
+    /// phone is with the same grant, is read before the choice (its inbox is served, empty) and after
+    /// it, and the host's answer to each of those three requests is recorded.
     async fn bound(&self) {
         let second = &self.second_host;
         let host = &second.host;
@@ -538,12 +586,14 @@ impl Run {
                 .expect("the second host approved the phone"),
         );
         let end = Instant::now() + STEP;
-        while host.connections_of(&phone) == 0 {
+        let mut serving = host.connections_of(&phone);
+        while serving == 0 {
             assert!(
-                Instant::now() < end,
-                "the second host never served a connection of the phone"
+                self.waiting(end),
+                "the second host served no connection of the phone before the wait ended or the run finished"
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
+            serving = host.connections_of(&phone);
         }
         let guest = Device::create().await;
         let proposal = guest_grant(
@@ -565,11 +615,14 @@ impl Run {
             })
             .expect("the owner's choice is recorded");
         let refused = connect(host, &guest, &record).await;
+        let (info, opened) = opening_answers(&refused).await;
         let after = inbox_answer(&refused).await;
         refused.close();
         self.say(
             "bound-result.txt",
-            &format!("before {before}\nafter {after}\n"),
+            &format!(
+                "phone connections served at the choice: {serving}\ncontrol before read: {before}\ncontrol after host.info: {info}\ncontrol after session.open: {opened}\ncontrol after read: {after}\n"
+            ),
         );
     }
 
@@ -603,7 +656,7 @@ impl Run {
         );
         let end = Instant::now() + STEP;
         let mut last = usize::MAX;
-        while Instant::now() < end && !self.directory.join("code-done").exists() {
+        while self.waiting(end) && !self.directory.join("code-done").exists() {
             let now = connections.load(Ordering::SeqCst);
             if now != last {
                 last = now;
@@ -835,7 +888,7 @@ impl Run {
     /// the host came back.
     async fn sent(&self) {
         let end = Instant::now() + STEP;
-        while Instant::now() < end {
+        while self.waiting(end) {
             if self.upstream.prompts().iter().any(|prompt| prompt == DRAFT) {
                 self.say("sent-first.txt", "sent\n");
                 // The phone says the send is applied when the host has answered it, and sends
@@ -844,7 +897,7 @@ impl Run {
                 let counted = self.directory.join("go-counted");
                 while !counted.exists() {
                     assert!(
-                        Instant::now() < end,
+                        self.waiting(end),
                         "the script never asked how many times the draft was sent"
                     );
                     tokio::time::sleep(Duration::from_millis(250)).await;
