@@ -235,6 +235,20 @@ impl Performing {
     }
 }
 
+impl Spending {
+    /// Whether another arrival holds this identifier for the same mutation at this moment.
+    ///
+    /// An arrival takes the identifier before it is admitted and holds it until its effect has
+    /// ended, so one that holds it may be about to write the claim of its action, or may be carrying
+    /// the action out. A copy that finds no claim while another holds the identifier cannot say that
+    /// nothing was done. It must ask before it reads the claim: one that asks after can find the
+    /// other arrival gone, with its claim written and settled in between.
+    pub(super) fn is_shared(&self) -> bool {
+        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        held.get(&self.key).is_some_and(|(_, count)| *count > 1)
+    }
+}
+
 impl Drop for Spending {
     fn drop(&mut self) {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);

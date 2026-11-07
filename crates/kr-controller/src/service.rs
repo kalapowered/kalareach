@@ -599,6 +599,12 @@ pub struct Controller {
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_retained_lookup: ReadPause,
+    /// Where this host's own tests stop a first admission at the local door that holds its action
+    /// identifier, once its effect is spawned and before the service that performs it is asked, so
+    /// that a copy of the request can arrive on another connection before the action has written
+    /// its claim. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_a_door_effect: ReadPause,
     /// Where this host's own tests stop a paired device's mutation once its worker has answered,
     /// before the answer is checked against the device's authority, so that the authority can
     /// change in between. Compiled away in every shipped build.

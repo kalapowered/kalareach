@@ -19,6 +19,7 @@ use kr_transport::window::MAX_WINDOW_VALIDITY;
 use crate::error::{ControllerError, Result};
 
 use super::authority_changes::declaration_answer;
+use super::identifiers::Spending;
 use super::{Controller, error_reply, net, respond};
 
 /// How often the daemon replaces a live connection's action window.
@@ -299,6 +300,20 @@ impl Controller {
         tokio::sync::oneshot::Sender<()>,
     ) {
         self.after_the_retained_lookup.arm()
+    }
+
+    /// Arms the pause the next first admission at this door stops at once its effect is spawned,
+    /// before the service that performs it is asked and so before its action has written a claim.
+    /// Returns the end that says the effect has arrived, and the end that lets it go. The pause
+    /// fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_a_door_effect(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.before_a_door_effect.arm()
     }
 
     /// Arms the pause the next mutation of a paired device stops at once its worker has answered,
@@ -987,11 +1002,15 @@ impl Controller {
             Err(ControllerError::WindowExpired { .. }) if forwarded_to_worker(method) => None,
             // The same holds for an exact repeat of a transfer action that claimed an effect and
             // was interrupted before it settled. The repeat is the original request, window
-            // included, and on a replacement connection that window is not one this connection
-            // issued. The service finishes what the claim began and begins nothing.
+            // included, and on a connection that did not issue that window, or on one where it has
+            // expired, it admits nothing. The service finishes what the claim began and begins
+            // nothing.
             Err(error @ ControllerError::WindowExpired { .. })
                 if crate::transfer::TransferModule::serves(method) =>
             {
+                // Asked before the claim is, so that a first attempt that writes its claim and ends
+                // between the two is read as its claim and not missed as an absent one.
+                let another_holds = spending.as_ref().is_some_and(Spending::is_shared);
                 match self.transfer.settles(actor_id, &mutation, method).await {
                     crate::transfer::Settling::Open => None,
                     // The claim was settled between the lookup above and this one, by another copy
@@ -1007,6 +1026,16 @@ impl Controller {
                         }
                         return DoorReply::Answered(answer);
                     }
+                    // No claim, and no other arrival holds the action: a first admission, which
+                    // has no window. If another does, the first attempt has not reached its claim
+                    // and goes on to carry the action out.
+                    crate::transfer::Settling::No if another_holds => {
+                        return self.the_attempt_that_holds_the_action(
+                            &mutation,
+                            connection_id,
+                            admitted,
+                        );
+                    }
                     crate::transfer::Settling::No => {
                         return DoorReply::Refused(ControlFrame::Response(Response {
                             request_id: mutation.request_id,
@@ -1018,17 +1047,30 @@ impl Controller {
             // And for an exact repeat of a project action whose claim is open: its first attempt
             // may still be carrying the action out, and a refusal about a window says nothing was
             // done. The repeat is told what the service holds for its action, which for an open
-            // claim is that the outcome is not known yet. An action with no claim is a first
-            // admission, and is refused for its window; so is a copy that arrives before the
-            // first attempt has written its claim, as it always was.
+            // claim is that what became of the action is not known. An action with no claim is a
+            // first admission, and is refused for its window, unless another arrival holds the
+            // action: a copy that arrives before the first attempt has written its claim is told
+            // that the attempt has not finished.
             Err(error @ ControllerError::WindowExpired { .. })
                 if crate::project::ProjectModule::serves(method) =>
             {
-                let Some(held) = self.project.held_answer(actor_id, &mutation, method).await else {
-                    return DoorReply::Refused(ControlFrame::Response(Response {
-                        request_id: mutation.request_id,
-                        outcome: Outcome::Error(error.to_protocol_error()),
-                    }));
+                // Asked before the claim is, as for a transfer action above.
+                let another_holds = spending.as_ref().is_some_and(Spending::is_shared);
+                let held = match self.project.held_answer(actor_id, &mutation, method).await {
+                    Some(held) => held,
+                    None if another_holds => {
+                        return self.the_attempt_that_holds_the_action(
+                            &mutation,
+                            connection_id,
+                            admitted,
+                        );
+                    }
+                    None => {
+                        return DoorReply::Refused(ControlFrame::Response(Response {
+                            request_id: mutation.request_id,
+                            outcome: Outcome::Error(error.to_protocol_error()),
+                        }));
+                    }
                 };
                 if let Err(error) = self.check_retained_answer(connection_id, admitted) {
                     return DoorReply::Refused(error_reply(
@@ -1051,6 +1093,8 @@ impl Controller {
         let actor_id = actor_id.clone();
         let effect = tokio::spawn(async move {
             let _spending = spending;
+            #[cfg(feature = "testing")]
+            controller.before_a_door_effect.wait().await;
             controller
                 .write_method(
                     &actor_id,
@@ -1070,6 +1114,29 @@ impl Controller {
                 "the daemon could not report what happened to this action",
             )
         }))
+    }
+
+    /// The answer to a copy of an action that no claim answers while another arrival holds the
+    /// action: its first attempt has not written the claim and goes on to carry the action out,
+    /// so it may have been done by the time the copy asks again. It passes the check any
+    /// retained answer is owed, as the answers about a claim do.
+    fn the_attempt_that_holds_the_action(
+        &self,
+        mutation: &MutationRequest,
+        connection_id: ConnectionId,
+        admitted: Option<AuthorityRevision>,
+    ) -> DoorReply {
+        if let Err(error) = self.check_retained_answer(connection_id, admitted) {
+            return DoorReply::Refused(error_reply(
+                mutation.request_id,
+                error.code(),
+                error.to_string(),
+            ));
+        }
+        DoorReply::Answered(respond(
+            mutation.request_id,
+            Err(ControllerError::attempt_still_running()),
+        ))
     }
 
     /// Returns the answer a retained installation action is owed.

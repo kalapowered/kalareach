@@ -460,9 +460,10 @@ impl ProjectModule {
     /// to refuse it: that refusal is definite, and a client takes it for the host's word that
     /// nothing was done. The repeat is told that what became of the action is not known yet, and
     /// asks again under the same identifier. A claim the first attempt settled since the lookup is
-    /// answered with its record. `None` is an action this service holds no claim for, which is a
-    /// first admission and has no window to be admitted under, or a copy that arrived before the
-    /// first attempt wrote its claim: that copy is refused for its window, as it always was.
+    /// answered with its record. `None` is an action this service holds no claim for: a first
+    /// admission, which has no window to be admitted under, or a copy that arrived before the first
+    /// attempt wrote its claim. The door tells the two apart by whether another arrival holds the
+    /// action, which the service cannot see.
     pub async fn held_answer(
         &self,
         actor_id: &ActorId,

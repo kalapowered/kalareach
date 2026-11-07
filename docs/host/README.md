@@ -3567,11 +3567,14 @@ change-set and transfer stores where the door found no record and the store then
 at the point the action is performed, and in the registry's receipts where an authority or voice
 change claims its action and the claim cannot be read or its transaction cannot be begun. A transfer action repeated with no usable
 window is told the same when the daemon cannot read whether its claim is open. At the local door, a
-project action repeated with no usable window is told what its journal holds for the action:
+project action repeated with no usable window, because the window is one this connection never
+issued or one that has expired on it, is told what its journal holds for the action:
 `OUTCOME_UNKNOWN` while its claim is open, because the attempt that wrote the claim may still be
-carrying the action out, as a long `project.clone` does; the recorded answer once that attempt has
-settled the claim; and the refusal of the window only when the journal holds no claim for it, which
-is a first action, or a copy that arrived before the first attempt wrote its claim. At the network
+carrying the action out, as a long `project.clone` does; and the recorded answer once that attempt
+has settled the claim. Where the journal holds no claim, the door refuses the window only if no other
+arrival holds the action. A copy that arrives while the first attempt has been admitted and has not
+yet written its claim is told `OUTCOME_UNKNOWN`, because that attempt goes on to carry the action
+out; a transfer action repeated with no usable window is told the same in that case. At the network
 door, the route that every project action claims before it is carried out gives a repeat the
 unknown outcome. A create asked again is told
 `OUTCOME_UNKNOWN` when its worker is known and the daemon cannot ask it about the session: the

@@ -4234,3 +4234,98 @@ async fn a_repeat_with_no_usable_window_whose_claim_cannot_be_read_is_told_the_o
     );
     let _ = host.stop().await;
 }
+
+/// KR-REQ-09.09: a copy of a project action that arrives on another connection before the first
+/// attempt has written its claim is told that the attempt has not finished, and not refused for a
+/// window that connection never issued. The first attempt goes on to carry the action out, so a
+/// definite refusal would be taken for the host's word that nothing was done. A first action under
+/// the same window, which no attempt holds, is refused as ever, and once the first attempt has
+/// ended the copy is given what it recorded.
+///
+/// The first attempt is stopped after the daemon has admitted it and before the project service is
+/// asked, which is before any claim is written, and the case lets it go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_copy_that_arrives_before_the_first_attempt_has_claimed_is_told_the_outcome_is_unknown() {
+    let host = host().await;
+    let mut first = client(&host).await;
+    let original = composed(
+        &mut first,
+        host.environment_id,
+        Method::ProjectInit,
+        ActionId::new(kr_ipc::new_uuid()),
+        &ProjectInitParams {
+            destination: host.destination("made"),
+            label: "made".to_owned(),
+            initial_branch: Nullable::null(),
+        },
+    )
+    .await;
+    let (arrived, go) = host.controller.pause_before_a_door_effect();
+    let running = {
+        let original = original.clone();
+        tokio::spawn(async move { first.repeat(&original).await })
+    };
+    arrived
+        .await
+        .expect("the first attempt has been admitted and has not claimed");
+
+    let mut second = client(&host).await;
+    let told = failure(
+        second
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    // A first action under a window this connection never issued, which no attempt holds, is
+    // refused for its window as it always was, and makes nothing.
+    let mut third = client(&host).await;
+    let fresh = composed(
+        &mut third,
+        host.environment_id,
+        Method::ProjectInit,
+        ActionId::new(kr_ipc::new_uuid()),
+        &ProjectInitParams {
+            destination: host.destination("fresh"),
+            label: "fresh".to_owned(),
+            initial_branch: Nullable::null(),
+        },
+    )
+    .await;
+    let refused = failure(
+        second
+            .repeat(&fresh)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        !host.work().join("fresh").exists(),
+        "the refused first action made nothing"
+    );
+
+    // The first attempt goes on and makes the project once; the copy, asked again, is given the
+    // record the attempt left.
+    go.send(()).expect("the first attempt is waiting");
+    let made: ProjectInitResult = typed(
+        &running
+            .await
+            .expect("the first attempt ran")
+            .expect("the call reaches the daemon")
+            .expect("project.init succeeds"),
+    );
+    let given: ProjectInitResult = typed(
+        &second
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the copy is given the record"),
+    );
+    assert_eq!(given, made, "the action was carried out once");
+    let _ = host.stop().await;
+}
