@@ -2503,9 +2503,12 @@ test.describe("the phone's tab bar", () => {
   // holds its digits and, where the glyph has a place of its own, sits clear of it.
   test('keeps every label and the badge clear at each width and at the largest text, on android', async ({ page }) => {
     const failures: string[] = []
+    const forms = new Set<string | null>()
     for (let width = 320; width <= 480; width += 10) {
       await onPhone(page, 'android', { width, height: 844, scale: '200%' })
       await expect(page.getByRole('navigation', { name: 'Sections' })).toBeVisible()
+      // The first tab has a count to show, which is what the badge's checks are about.
+      await expect(page.locator('.m-tab-badge')).toBeVisible()
       const seen = await page.evaluate(() => {
         const probe = document.createElement('div')
         probe.style.paddingLeft = 'var(--gap-2)'
@@ -2533,6 +2536,7 @@ test.describe("the phone's tab bar", () => {
               : count.left < glyph.right - 0.5 && glyph.left < count.right - 0.5 && count.top < glyph.bottom - 0.5 && glyph.top < count.bottom - 0.5
         }
       })
+      forms.add(seen.form)
       const at = `${width} px wide (${seen.form ?? 'row'})`
       for (const word of seen.words) {
         if (word.left < seen.gap - 0.5) failures.push(`${at}: ${word.name} is ${word.left.toFixed(1)} px from the left edge`)
@@ -2548,6 +2552,9 @@ test.describe("the phone's tab bar", () => {
       if (seen.form !== null && seen.overGlyph) failures.push(`${at}: the badge is over the glyph in the ${seen.form} form`)
     }
     expect(failures, 'where a label or the badge is too close').toEqual([])
+    // The widths cover the first form and a stacked one, so each of the checks above was made in both.
+    expect(forms.has(null), 'a width at which the bar is one row').toBe(true)
+    expect([...forms].some((form) => form !== null), 'a width at which the bar is stacked').toBe(true)
   })
 })
 
