@@ -1164,6 +1164,11 @@ impl PairedLinks {
 
     /// Lets an ambient link go, if it is still the one held for `session_id`: a call that failed
     /// on an old link does not take a new one away.
+    ///
+    /// Whether it is held is read from the entry's mirror, which no call holds across an open, and
+    /// not from the slot, which a call opening a link does: a slot that cannot be read is no
+    /// answer that the link is not held. A call that holds the slot reads the link in it as ended
+    /// once it is closed, and opens another.
     pub(crate) fn forget_ambient(&self, session_id: SessionId, link: &Arc<Link>) {
         let entry = {
             let inner = self.lock();
@@ -1173,14 +1178,28 @@ impl PairedLinks {
                 .find(|entry| entry.session_id == session_id)
                 .map(|entry| (Arc::clone(&entry.slot), Arc::clone(&entry.held)))
         };
-        if let Some((slot, mirror)) = entry
-            && let Ok(mut held) = slot.try_lock()
+        let Some((slot, mirror)) = entry else {
+            return;
+        };
+        let was_held = {
+            let mut held = mirror.lock().unwrap_or_else(PoisonError::into_inner);
+            let is_held = held
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, link));
+            if is_held {
+                *held = None;
+            }
+            is_held
+        };
+        if !was_held {
+            return;
+        }
+        if let Ok(mut held) = slot.try_lock()
             && held.as_ref().is_some_and(|held| Arc::ptr_eq(held, link))
         {
             *held = None;
-            mirror.lock().unwrap_or_else(PoisonError::into_inner).take();
-            link.session.close();
         }
+        link.session.close();
     }
 
     /// Keeps an opening: waits for its link's connection to end, and reaches the host again as the
@@ -1680,5 +1699,42 @@ pub(crate) mod tests {
                 "the book no longer holds the earlier sends"
             );
         }
+    }
+
+    /// A call that is opening a link holds the ambient slot, and an ambient link a failed call lets
+    /// go of is no longer held while it does: it is not found for the session, whether or not the
+    /// slot can be read. The control is a link that is not the one held, which stays.
+    #[tokio::test]
+    async fn an_ambient_link_let_go_of_while_a_call_holds_its_slot_is_no_longer_held() {
+        let environment_id = EnvironmentId::new(Uuid::from_bytes([1; 16]));
+        let session_id = SessionId::new(Uuid::from_bytes([2; 16]));
+        let (shared, _) = link_holding_a_send(
+            environment_id,
+            session_id,
+            Some(GrantId::new(Uuid::from_bytes([4; 16]))),
+            5,
+        )
+        .await;
+        let (ambient, _) = link_holding_a_send(environment_id, session_id, None, 6).await;
+        let (older, _) = link_holding_a_send(environment_id, session_id, None, 7).await;
+
+        let links = paired_links_holding(session_id, &shared, &ambient);
+        let slot = Arc::clone(&links.lock().ambient[0].slot);
+        let _opening = slot.lock().await;
+        links.forget_ambient(session_id, &older);
+        assert!(
+            links
+                .held_for(session_id)
+                .iter()
+                .any(|link| Arc::ptr_eq(link, &ambient)),
+            "a link that is not the one held is not let go of"
+        );
+        links.forget_ambient(session_id, &ambient);
+        let held = links.held_for(session_id);
+        assert!(
+            held.iter().all(|link| !Arc::ptr_eq(link, &ambient)),
+            "the link was let go of while a call held the slot"
+        );
+        assert!(held.iter().any(|link| Arc::ptr_eq(link, &shared)));
     }
 }
