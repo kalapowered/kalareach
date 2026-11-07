@@ -1,12 +1,14 @@
 //
 //  What the lock screen and the other remote controls can do to a call.
 //
-//  The system's two centres are replaced by a surface the test drives the way the system does: a
-//  command reaches its handler only while it is offered. Everything else is the product's: a real
-//  `VoiceCallControl`, and a platform that makes the three calls `VoiceCall`'s own platform makes
-//  (begin when permitted, follow each publication, end with the call). A call cannot be permitted
-//  in a test host, because opening its audio session needs the microphone, so the simulator run of
-//  the device harness reads the real centres of a permitted call.
+//  Most cases replace the system's two centres with a surface the test drives the way the system
+//  does: a command reaches its handler only while it is offered. Everything else is the product's:
+//  a real `VoiceCallControl`, and a platform that makes the three calls `VoiceCall`'s own platform
+//  makes (begin when permitted, follow each publication, end with the call). The cases on
+//  `SystemRemoteControls` use the real centres, which a test host can reach, and read them back. A
+//  call cannot be permitted in a test host, because opening its audio session needs the
+//  microphone, so the simulator run of the device harness reads the real centres of a permitted
+//  call.
 //
 
 import Foundation
@@ -35,7 +37,12 @@ private final class ScriptedSurface: RemoteControlSurface {
         }
     }
 
-    func offerPause(_ offered: Bool) { locked { self.offered = offered } }
+    func present(pauseOffered: Bool, info: NowPlaying?) {
+        locked {
+            offered = pauseOffered
+            showing = info
+        }
+    }
 
     func remove() {
         locked {
@@ -44,8 +51,6 @@ private final class ScriptedSurface: RemoteControlSurface {
             removed += 1
         }
     }
-
-    func show(_ info: NowPlaying?) { locked { showing = info } }
 
     /// What the system does with a command: it reaches the handler only while it is offered. Pause
     /// is offered when the surface was told so; stop while a handler is held; play and toggle never.
@@ -255,26 +260,109 @@ final class LockScreenControlsTests: XCTestCase {
         let earlier = SystemRemoteControls()
         let later = SystemRemoteControls()
         earlier.install { _ in }
-        earlier.offerPause(true)
-        earlier.show(NowPlaying(title: LockScreenControls.title, playbackRate: 1))
+        earlier.present(pauseOffered: true, info: NowPlaying(title: LockScreenControls.title, playbackRate: 1))
         later.install { _ in }
-        later.offerPause(true)
-        later.show(NowPlaying(title: LockScreenControls.title, playbackRate: 1))
+        later.present(pauseOffered: true, info: NowPlaying(title: LockScreenControls.title, playbackRate: 1))
 
         // The earlier call's end arrives late.
-        earlier.show(nil)
+        earlier.present(pauseOffered: false, info: nil)
         earlier.remove()
         let kept = SystemRemoteControls.reading()
         XCTAssertTrue(kept.pauseOffered, "the later call's pause stays")
         XCTAssertTrue(kept.stopOffered, "the later call's stop stays")
         XCTAssertEqual(kept.title, LockScreenControls.title, "the later call's information stays")
 
-        later.show(nil)
+        later.present(pauseOffered: false, info: nil)
         later.remove()
         let gone = SystemRemoteControls.reading()
         XCTAssertFalse(gone.pauseOffered)
         XCTAssertFalse(gone.stopOffered)
         XCTAssertNil(gone.title)
+    }
+
+    /// KR-ACC-014: an earlier call whose registration comes late, after a later call registered,
+    /// takes nothing from it: the later call's commands and information stay, whatever the earlier
+    /// call then shows or removes.
+    func testAnEarlierCallsLateInstallTakesNothingFromTheLaterCall() {
+        let earlier = SystemRemoteControls()
+        let later = SystemRemoteControls()
+        later.install { _ in }
+        later.present(pauseOffered: true, info: NowPlaying(title: LockScreenControls.title, playbackRate: 1))
+
+        // The earlier call's registration, and then its end, arrive late.
+        earlier.install { _ in }
+        earlier.present(pauseOffered: false, info: nil)
+        earlier.remove()
+        let kept = SystemRemoteControls.reading()
+        XCTAssertTrue(kept.pauseOffered, "the later call's pause stays")
+        XCTAssertTrue(kept.stopOffered, "the later call's stop stays")
+        XCTAssertEqual(kept.title, LockScreenControls.title, "the later call's information stays")
+
+        later.present(pauseOffered: false, info: nil)
+        later.remove()
+        let gone = SystemRemoteControls.reading()
+        XCTAssertFalse(gone.pauseOffered)
+        XCTAssertFalse(gone.stopOffered)
+        XCTAssertNil(gone.title)
+    }
+
+    /// KR-ACC-014: a reading of the system's centres, taken while the microphone is muted and
+    /// unmuted again and again, never finds pause offered with the muted rate, or withheld with the
+    /// rate of an open microphone: the two change as one.
+    func testAReadingNeverCatchesPauseAndTheInformationApart() {
+        let controls = SystemRemoteControls()
+        controls.install { _ in }
+        defer {
+            controls.present(pauseOffered: false, info: nil)
+            controls.remove()
+        }
+        let writing = DispatchGroup()
+        writing.enter()
+        DispatchQueue.global().async {
+            for turn in 0..<20_000 {
+                let muted = turn % 2 == 1
+                controls.present(
+                    pauseOffered: !muted,
+                    info: NowPlaying(title: LockScreenControls.title, playbackRate: muted ? 0 : 1)
+                )
+            }
+            writing.leave()
+        }
+        var readings = 0
+        var apart: LockScreenReading?
+        while writing.wait(timeout: .now()) == .timedOut {
+            let reading = SystemRemoteControls.reading()
+            guard reading.title != nil else { continue }
+            readings += 1
+            if reading.pauseOffered != (reading.rate == 1), apart == nil { apart = reading }
+        }
+        XCTAssertGreaterThan(readings, 0, "the reader read while the writer wrote")
+        XCTAssertNil(apart, "pause and the rate were read apart")
+    }
+
+    /// KR-ACC-014: the end of a call that holds the real centres leaves nothing on them: no title
+    /// and no command, in whatever order the surface takes its own parts away.
+    func testTheEndOfACallOnTheRealCentresLeavesNothing() {
+        let queue = DispatchQueue(label: "to.kala.reach.test-lock-screen-system")
+        let controls = LockScreenControls(surface: SystemRemoteControls(), queue: queue, mute: {}, stop: {})
+
+        controls.begin(mutedByPerson: false) { true }
+        queue.sync {}
+        let held = SystemRemoteControls.reading()
+        XCTAssertTrue(held.pauseOffered)
+        XCTAssertTrue(held.stopOffered)
+        XCTAssertEqual(held.title, LockScreenControls.title)
+        XCTAssertEqual(held.rate, 1)
+
+        controls.end()
+        queue.sync {}
+        let gone = SystemRemoteControls.reading()
+        XCTAssertFalse(gone.pauseOffered)
+        XCTAssertFalse(gone.stopOffered)
+        XCTAssertFalse(gone.playOffered)
+        XCTAssertFalse(gone.toggleOffered)
+        XCTAssertNil(gone.title)
+        XCTAssertNil(gone.rate)
     }
 
     /// KR-ACC-014: a registration that was queued when the call ended registers nothing. The queue

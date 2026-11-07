@@ -43,35 +43,46 @@ public struct NowPlaying: Equatable, Sendable {
 /// The system's remote controls and its now playing information, as the call uses them.
 public protocol RemoteControlSurface: AnyObject {
     /// Makes the pause and stop commands live and sends each command the system delivers to
-    /// `handler`, which may be called on any thread. Pause is offered only once `offerPause(true)`
-    /// says so. Nothing else is offered.
+    /// `handler`, which may be called on any thread. Pause is offered only once `present` says so.
+    /// Nothing else is offered.
     func install(_ handler: @escaping (RemoteCommand) -> Void)
-    /// Whether the pause command is offered.
-    func offerPause(_ offered: Bool)
+    /// Sets whether the pause command is offered and what is playing (`info`, or nothing) as one
+    /// change: no reading of the surface finds one of them changed and the other not.
+    func present(pauseOffered: Bool, info: NowPlaying?)
     /// Takes every handler away and offers no command.
     func remove()
-    /// Shows `info` as what is playing, or nothing.
-    func show(_ info: NowPlaying?)
 }
 
 /// The system's own centres.
 public final class SystemRemoteControls: RemoteControlSurface {
-    /// The centres are one thing for the whole process. The surface that registered last holds
-    /// them, and an older one that comes to take its call away late turns off and clears nothing of
-    /// the newer one's. Held across each change, so that none is made on a surface that has just
-    /// lost them.
+    /// The centres are one thing for the whole process. Each surface takes a serial when it is made,
+    /// in the order the calls are made, and the newest surface that has registered holds them. A
+    /// registration by an older surface than that is late and is refused, and an older one that
+    /// comes to take its call away late turns off and clears nothing of the newer one's. Held
+    /// across each change and each reading, so that none is made on a surface that has just lost
+    /// the centres and none is read half made.
     private static let centres = NSLock()
-    private static var holder: ObjectIdentifier?
+    private static var issued: UInt64 = 0
+    private static var newest: UInt64 = 0
+    private static var holder: UInt64?
 
+    private let serial: UInt64
     private let lock = NSLock()
     private var tokens: [(command: MPRemoteCommand, token: Any)] = []
 
-    public init() {}
+    public init() {
+        Self.centres.lock()
+        defer { Self.centres.unlock() }
+        Self.issued &+= 1
+        serial = Self.issued
+    }
 
     public func install(_ handler: @escaping (RemoteCommand) -> Void) {
         Self.centres.lock()
         defer { Self.centres.unlock() }
-        Self.holder = ObjectIdentifier(self)
+        guard serial >= Self.newest else { return }
+        Self.newest = serial
+        Self.holder = serial
         let center = MPRemoteCommandCenter.shared()
         // Offered by none of them, whatever else the application or the system does with them.
         center.playCommand.isEnabled = false
@@ -91,34 +102,11 @@ public final class SystemRemoteControls: RemoteControlSurface {
         lock.unlock()
     }
 
-    public func offerPause(_ offered: Bool) {
+    public func present(pauseOffered: Bool, info: NowPlaying?) {
         Self.centres.lock()
         defer { Self.centres.unlock() }
-        guard Self.holder == ObjectIdentifier(self) else { return }
-        MPRemoteCommandCenter.shared().pauseCommand.isEnabled = offered
-    }
-
-    public func remove() {
-        Self.centres.lock()
-        defer { Self.centres.unlock() }
-        lock.lock()
-        let held = tokens
-        tokens = []
-        lock.unlock()
-        for (command, token) in held { command.removeTarget(token) }
-        guard Self.holder == ObjectIdentifier(self) else { return }
-        Self.holder = nil
-        let center = MPRemoteCommandCenter.shared()
-        center.pauseCommand.isEnabled = false
-        center.stopCommand.isEnabled = false
-        center.playCommand.isEnabled = false
-        center.togglePlayPauseCommand.isEnabled = false
-    }
-
-    public func show(_ info: NowPlaying?) {
-        Self.centres.lock()
-        defer { Self.centres.unlock() }
-        guard Self.holder == ObjectIdentifier(self) else { return }
+        guard Self.holder == serial else { return }
+        MPRemoteCommandCenter.shared().pauseCommand.isEnabled = pauseOffered
         let center = MPNowPlayingInfoCenter.default()
         guard let info else {
             center.nowPlayingInfo = nil
@@ -133,8 +121,27 @@ public final class SystemRemoteControls: RemoteControlSurface {
         center.playbackState = info.playbackRate == 0 ? .paused : .playing
     }
 
+    public func remove() {
+        Self.centres.lock()
+        defer { Self.centres.unlock() }
+        lock.lock()
+        let held = tokens
+        tokens = []
+        lock.unlock()
+        for (command, token) in held { command.removeTarget(token) }
+        guard Self.holder == serial else { return }
+        Self.holder = nil
+        let center = MPRemoteCommandCenter.shared()
+        center.pauseCommand.isEnabled = false
+        center.stopCommand.isEnabled = false
+        center.playCommand.isEnabled = false
+        center.togglePlayPauseCommand.isEnabled = false
+    }
+
     /// What the system's centres hold now, for a run on a simulator that reads them.
     public static func reading() -> LockScreenReading {
+        centres.lock()
+        defer { centres.unlock() }
         let remote = MPRemoteCommandCenter.shared()
         let playing = MPNowPlayingInfoCenter.default().nowPlayingInfo
         return LockScreenReading(
@@ -224,14 +231,16 @@ public final class LockScreenControls: @unchecked Sendable {
             generation &+= 1
             // What is shown goes first: taking the commands away ends this surface's hold of the
             // system's centres, after which it may change nothing there.
-            surface.show(nil)
+            surface.present(pauseOffered: false, info: nil)
             surface.remove()
         }
     }
 
     private func present() {
-        surface.offerPause(!mutedByPerson)
-        surface.show(NowPlaying(title: Self.title, playbackRate: mutedByPerson ? 0 : 1))
+        surface.present(
+            pauseOffered: !mutedByPerson,
+            info: NowPlaying(title: Self.title, playbackRate: mutedByPerson ? 0 : 1)
+        )
     }
 
     private func received(_ command: RemoteCommand, generation sent: UInt64) {
