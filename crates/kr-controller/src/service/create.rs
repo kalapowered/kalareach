@@ -1294,6 +1294,29 @@ impl Controller {
         self: &Arc<Self>,
         reservation: &crate::registry::Reservation,
     ) -> Result<ParamsValue> {
+        // What the caller read may be older than this repeat: a reservation that was `reserved` or
+        // `spawned` then may have been settled since by the attempt that made it, and the answer is
+        // owed for what the registry shows now. A row that cannot be read leaves the one in hand.
+        let current;
+        let reservation = if matches!(
+            reservation.phase,
+            LaunchPhase::Reserved | LaunchPhase::Spawned
+        ) {
+            match self
+                .registry
+                .lock()
+                .await
+                .reservation(reservation.reservation_id)
+            {
+                Ok(Some(row)) => {
+                    current = row;
+                    &current
+                }
+                _ => reservation,
+            }
+        } else {
+            reservation
+        };
         let failed;
         let reservation = match self.the_launch_that_failed_unwritten(reservation).await {
             Some(unwritten) => {
