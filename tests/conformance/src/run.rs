@@ -1099,14 +1099,16 @@ fn dependency_file(name: &str, outputs: &[PathBuf], began: SystemTime) -> Option
 /// Whether the compiles in `readers` could have run beside each other.
 ///
 /// Cargo compiles a unit as soon as the ones it needs are done. A program and a test program of a
-/// package link its library, so they wait for it; the library's unit tests, and each of two
-/// programs or test programs, do not wait for the library or for each other.
+/// package link its library, so they wait for it; the library's unit tests, each of two programs or
+/// test programs, and each of two variants of the library (a profile with `panic = "abort"` builds
+/// one beside the one the tests link), do not wait for the library or for each other.
 fn may_have_overlapped(readers: &[Unit]) -> bool {
-    let others = readers
+    let libraries = readers
         .iter()
-        .filter(|unit| **unit != Unit::Library)
+        .filter(|unit| **unit == Unit::Library)
         .count();
-    others > 1 || (readers.contains(&Unit::LibraryTests) && readers.contains(&Unit::Library))
+    let others = readers.len() - libraries;
+    libraries > 1 || others > 1 || (libraries == 1 && readers.contains(&Unit::LibraryTests))
 }
 
 /// What [`date_before`] did.
