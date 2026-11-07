@@ -469,7 +469,7 @@ pub struct Started {
 
 impl PartialEq for Started {
     fn eq(&self, other: &Self) -> bool {
-        self.network == other.network
+        network_selects_alike(&self.network, &other.network)
             && self.voice == other.voice
             && self.storage == other.storage
             && self.authority == other.authority
@@ -480,6 +480,44 @@ impl PartialEq for Started {
 }
 
 impl Eq for Started {}
+
+/// Whether two readings of the network section select the same thing.
+///
+/// An option the document leaves out and the default the section gives it are one selection: a
+/// document that did not name `enabled` and one that says `false` both keep the host off the
+/// network, and relaunching the daemon over the second changes nothing. So the readings are
+/// compared by what they select, through the section's own accessors, and not by how they spell it.
+/// The destructuring names every field, so a field added to the section is a compile error here
+/// until it is compared.
+fn network_selects_alike(
+    one: &configuration::NetworkSelection,
+    other: &configuration::NetworkSelection,
+) -> bool {
+    let configuration::NetworkSelection {
+        enabled: _,
+        bind_address: _,
+        relay_urls: _,
+        pkarr_publisher_url: _,
+        pkarr_resolver_url: _,
+        dns_origin: _,
+        relay_trust_anchors: _,
+        relay_only: _,
+        local_discovery: _,
+        mainline_dht: _,
+        proxy_url: _,
+    } = one;
+    one.joins() == other.joins()
+        && one.bind_address() == other.bind_address()
+        && one.relay_urls() == other.relay_urls()
+        && one.pkarr_publisher_url() == other.pkarr_publisher_url()
+        && one.pkarr_resolver_url() == other.pkarr_resolver_url()
+        && one.dns_origin() == other.dns_origin()
+        && one.relay_trust_anchors() == other.relay_trust_anchors()
+        && one.relay_only() == other.relay_only()
+        && one.local_discovery() == other.local_discovery()
+        && one.mainline_dht() == other.mainline_dht()
+        && one.proxy_url() == other.proxy_url()
+}
 
 impl Started {
     /// Reads the selections from one reading of the document: its own when it is usable, and the
@@ -1146,8 +1184,9 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         },
         if effective.not_in_force.is_present() {
             Some(
-                "The values below are what this host is enforcing, not what the document asks \
-                 for. Fix what the line above names and run this again.",
+                "The values below are what this host is acting on, which can be less than the \
+                 document asks for: the line above says what it asked for and did not get. Fix \
+                 what the line above names and run this again.",
             )
         } else if effective.fence_outstanding.is_present() {
             Some(
