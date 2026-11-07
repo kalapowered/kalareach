@@ -165,3 +165,66 @@ async fn a_repeat_of_a_voice_change_whose_record_cannot_be_read_is_told_the_outc
         "{unknown_code}"
     );
 }
+
+/// KR-REQ-09.09: a voice change that found no record of its action at the early look, and then meets
+/// a claim that cannot be read where it claims the action, is told the outcome is unknown. A copy
+/// of the change may have claimed in between and carried it out; the claim's own transaction cannot
+/// tell a first change from a repeat, and a transient word would say that nothing took effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_change_whose_claim_cannot_be_read_where_it_is_made_is_told_the_outcome_is_unknown()
+{
+    let (temp, controller) = daemon().await;
+    let actor_id = ActorId::new("local:test").expect("a principal");
+    let mutation = voice_stop_request(&temp);
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("the registry opens beside the daemon's own handle");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    let accepted = kr_transport::window::AcceptedDeadline {
+        deadline: controller
+            .clock
+            .now()
+            .checked_add(std::time::Duration::from_secs(30))
+            .expect("a deadline half a minute out"),
+        bound: kr_transport::window::DeadlineBound::RequestedTtl,
+    };
+    let carried = super::a_close_a_worker_never_answers::admission(&controller, accepted).await;
+    let revision = controller.policy().authority_revision();
+
+    // The change has looked for a record and found none; the claims then cannot be read where it
+    // claims the action.
+    let (arrived, go) = controller.before_a_voice_change_claims.arm();
+    let making = tokio::spawn({
+        let controller = std::sync::Arc::clone(&controller);
+        let mutation = mutation.clone();
+        async move {
+            controller
+                .voice_mutation(
+                    super::voice_actions::VoiceIngress {
+                        actor_id,
+                        actor: crate::voice::VoiceActor::Owner,
+                        route: None,
+                    },
+                    &mutation,
+                    Method::VoiceStop,
+                    revision,
+                    carried,
+                )
+                .await
+        }
+    });
+    arrived.await.expect("the change has looked for a record");
+    registry
+        .execute_batch("ALTER TABLE authority_receipts RENAME TO authority_receipts_aside;")
+        .expect("the claims cannot be read");
+    let _ = go.send(());
+    let given = making.await.expect("the change ran");
+    registry
+        .execute_batch("ALTER TABLE authority_receipts_aside RENAME TO authority_receipts;")
+        .expect("the claims can be read again");
+    let unread = given
+        .into_answer()
+        .expect_err("a claim that cannot be read is not one this change may be made under");
+    assert_eq!(unread.code(), ErrorCode::OutcomeUnknown, "{unread}");
+}

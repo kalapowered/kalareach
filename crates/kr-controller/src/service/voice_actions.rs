@@ -531,7 +531,9 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::IdConflict`] when the identifier was used with another payload.
+    /// Returns [`ControllerError::IdConflict`] when the identifier was used with another payload,
+    /// and [`ControllerError::Uncertain`] when the claim cannot be read: a copy of this change may
+    /// have claimed the action since the early look found no record of it.
     fn claim_voice_action(
         &self,
         actor_id: &ActorId,

@@ -2131,7 +2131,8 @@ impl GrantDirectory {
     /// # Errors
     ///
     /// Returns [`ControllerError::IdConflict`] when the identifier was reused with a different
-    /// payload, and a storage error when the row cannot be read or written.
+    /// payload, [`ControllerError::Uncertain`] when the claim cannot be read, and a storage error
+    /// when the row cannot be written.
     pub fn claim_action(
         &self,
         actor_id: &ActorId,
@@ -2141,7 +2142,14 @@ impl GrantDirectory {
     ) -> Result<ActionClaim> {
         let key = claim_key(actor_id, action_id);
         self.in_transaction(|connection| {
-            if let Some(record) = read_claim(connection, &key, payload_digest, &self.live)? {
+            // A claim that cannot be read is not one that is absent, and this read cannot tell a
+            // first attempt from a repeat that arrived after the caller's own look found nothing:
+            // another copy may have claimed since, and carried the action out. So the caller is
+            // not told a transient word, which says nothing took effect. The write below is
+            // another matter: a claim that cannot be written has performed nothing.
+            if let Some(record) = read_claim(connection, &key, payload_digest, &self.live)
+                .map_err(|error| error.found_unreadable("action claims"))?
+            {
                 return Ok(ActionClaim::Recorded(record));
             }
             connection
