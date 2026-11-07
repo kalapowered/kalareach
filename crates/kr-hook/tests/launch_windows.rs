@@ -384,18 +384,22 @@ impl Shell {
 
     /// Waits for the report a launched program writes, and says what became of the launcher when
     /// none comes.
+    ///
+    /// The report is read as bytes: the batch file writes it in the console's code page, which is
+    /// not UTF-8, so a directory with an accented letter in its name makes a line that is not valid
+    /// text. Such a byte reads back as the replacement character.
     fn report_from(&self, name: &str, launcher: &mut Child) -> BTreeMap<String, String> {
         let path = self.reports.join(name);
         let started = Instant::now();
         loop {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                return parsed(&text);
+            if let Ok(bytes) = std::fs::read(&path) {
+                return parsed(&String::from_utf8_lossy(&bytes));
             }
             if let Ok(Some(status)) = launcher.try_wait() {
                 // A program that has written its report and gone is read once more.
                 std::thread::sleep(Duration::from_millis(200));
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    return parsed(&text);
+                if let Ok(bytes) = std::fs::read(&path) {
+                    return parsed(&String::from_utf8_lossy(&bytes));
                 }
                 panic!("the launcher ended with {status} and the program reported nothing");
             }
@@ -1420,6 +1424,30 @@ fn kr_req_12_16_a_launch_is_granted_the_directory_the_program_inherits_and_it_is
     assert!(
         moved.is_ok(),
         "the directory is let go of once the program has ended: {moved:?}"
+    );
+}
+
+/// The report of a program run in a directory with an accented letter in its name is read. The
+/// batch file writes the directory in the console's code page, which is not UTF-8, and a report with
+/// a byte that is not valid text is a report all the same.
+#[test]
+fn the_report_of_a_program_run_in_a_directory_with_an_accented_name_is_read() {
+    let shell = Shell::new();
+    let work = nested(&shell, "caf\u{e9}");
+    let answer = shell.establish_in(&work);
+    let mut launcher = shell.launcher(
+        &shell.executable.clone(),
+        &shell.typed(),
+        &answer,
+        "accented",
+        &[],
+        &work,
+    );
+    let report = shell.report_from("accented", &mut launcher);
+    assert_eq!(report["relaunch"], "true", "the launch itself goes through");
+    assert!(
+        report["cwd"].ends_with("\\b\\work"),
+        "the program worked in the directory: {report:?}"
     );
 }
 
