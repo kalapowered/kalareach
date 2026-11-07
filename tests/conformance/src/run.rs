@@ -708,13 +708,13 @@ fn without_the_verbatim_prefix(path: &str) -> Option<String> {
 /// Cargo's first line about it, "error: test failed, to rerun pass ..." (or "error: doctest failed
 /// ..."), and the causes Cargo gives after that line. Cargo lets a program write to its standard
 /// error as it runs, so what the program said stands before the line. What Cargo says of the
-/// program after it ("Caused by:" and a cause on the next line, which is all the cause there is when
-/// the runner could not start or was killed) is kept, but not a plain exit status, which says
-/// nothing the runner's own words do not. The note that follows, the status lines of every program
+/// program after it (its "Caused by:" blocks, which are all the cause there is when the runner could
+/// not start or was killed) is kept, but not a plain exit status, which says nothing the runner's
+/// own words do not. The note that follows, the status lines of every program
 /// Cargo goes on to when it was told to, and its header "error: N targets failed:" with the
 /// indented, backquoted command lines that follow, are left out. A similar line anywhere else is
 /// kept.
-fn what_the_program_said(text: &str) -> Vec<&str> {
+fn what_the_program_said(text: &str) -> Vec<String> {
     let mut said = Vec::new();
     let mut in_the_account = false;
     let mut lines = text.lines();
@@ -742,20 +742,31 @@ fn what_the_program_said(text: &str) -> Vec<&str> {
             }
             in_the_account = false;
         }
-        said.push(trimmed);
+        said.push(trimmed.to_owned());
     }
     said
 }
 
 /// The causes in the "Caused by:" blocks that follow a line about a failed program, in `after`, the
-/// lines after it, each block being a cause on one line. A plain exit status of the runner (a
-/// number, and not a signal or a Windows status in hexadecimal) is none of them.
-fn causes_cargo_gives<'a>(after: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+/// lines after it. Cargo indents a cause by two spaces, each of its lines when it runs over
+/// several, and its own status lines by more; a cause is the lines of its block, joined. A plain
+/// exit status of the runner (a number, and not a signal or a Windows status in hexadecimal) is none
+/// of them.
+fn causes_cargo_gives<'a>(after: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut causes = Vec::new();
-    let mut after = after.map(str::trim).filter(|line| !line.is_empty());
-    while after.next() == Some("Caused by:") {
-        let Some(cause) = after.next() else { break };
-        if !is_a_plain_exit_status(cause) {
+    let mut after = after.filter(|line| !line.trim().is_empty()).peekable();
+    while after.next().is_some_and(|line| line.trim() == "Caused by:") {
+        let mut cause = Vec::new();
+        while let Some(line) =
+            after.next_if(|line| line.starts_with("  ") && !line.starts_with("   "))
+        {
+            cause.push(line.trim());
+        }
+        if cause.is_empty() {
+            break;
+        }
+        let cause = cause.join(" ");
+        if !is_a_plain_exit_status(&cause) {
             causes.push(cause);
         }
     }
