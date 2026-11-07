@@ -2971,3 +2971,66 @@ async fn a_transfer_action_whose_record_cannot_be_read_by_the_service_is_told_th
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
     host.stop().await;
 }
+
+/// KR-REQ-09.09, KR-REQ-14.12: an exact repeat of an unfinished finish that arrives on a new
+/// connection, with no usable window, and whose claim cannot be read when the host asks whether it
+/// is open, is told that what became of the action is not known. Its claim is open, so the
+/// publication may have run or may yet be finished; the window refusal is the host's word that
+/// nothing was done, and a later read that finds the record readable again does not make it true.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_whose_open_claim_cannot_be_read_is_told_the_outcome_is_unknown() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let mut chunks = channel(&host).await;
+    let bytes = pattern(4096);
+    let (transfer_id, finish) =
+        upload_ready_to_finish(&host, &mut control, &mut chunks, &bytes, "unread.bin").await;
+    leave_a_publication_unrecorded(&host, transfer_id, &bytes, "unread.bin", &finish);
+    let store = beside_the_store(&host);
+
+    drop(control);
+    let mut resumed = client(&host).await;
+    let (looked, go) = host.controller.pause_retained_lookup();
+    let (asked, read_again) = host
+        .controller
+        .transfer()
+        .pause_after_the_claim_is_asked_about();
+    let repeated = finish.clone();
+    let repeating = tokio::spawn(async move { resumed.repeat(&repeated).await });
+
+    // The door finds the claim open. The record cannot be read when the repeat then asks whether
+    // the claim is open, and can be read again when it looks for the record a second time.
+    looked.await.expect("the repeat has looked for an answer");
+    store
+        .execute_batch("ALTER TABLE actions RENAME TO actions_aside;")
+        .expect("the claim cannot be read");
+    let _ = go.send(());
+    tokio::task::spawn_blocking(move || asked.recv_timeout(std::time::Duration::from_secs(30)))
+        .await
+        .expect("the waiting thread finishes")
+        .expect("the repeat has asked whether its claim is open");
+    store
+        .execute_batch("ALTER TABLE actions_aside RENAME TO actions;")
+        .expect("the claim can be read again");
+    read_again.send(()).expect("the repeat goes on");
+    let told = failure(
+        repeating
+            .await
+            .expect("the repeat ran")
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    // The claim is still open: once it can be read, the same repeat settles the publication.
+    let mut again = client(&host).await;
+    let settled: UploadFinishResult = typed(
+        &again
+            .repeat(&finish)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the repeat settles the publication"),
+    );
+    assert_eq!(settled.handle.transfer_id, transfer_id);
+    host.stop().await;
+}
