@@ -1019,7 +1019,8 @@ impl Controller {
             // may still be carrying the action out, and a refusal about a window says nothing was
             // done. The repeat is told what the service holds for its action, which for an open
             // claim is that the outcome is not known yet. An action with no claim is a first
-            // admission, and is refused for its window.
+            // admission, and is refused for its window; so is a copy that arrives before the
+            // first attempt has written its claim, as it always was.
             Err(error @ ControllerError::WindowExpired { .. })
                 if crate::project::ProjectModule::serves(method) =>
             {

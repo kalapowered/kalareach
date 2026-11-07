@@ -4152,11 +4152,28 @@ async fn a_repeat_of_a_clone_still_running_is_told_the_outcome_is_unknown_on_a_n
         "the refused first action made nothing"
     );
 
-    // The remote lets go. The clone ends, its connection is told what came of it, and the repeat
-    // is then given the record the first attempt left.
+    // A repeat that has looked for a record and found the claim open, and whose claim the first
+    // attempt settles before the door asks after it again, is given the record and not the refusal
+    // of its window. The remote lets go while that repeat waits, and the clone ends.
+    let (arrived, go) = host.controller.pause_retained_lookup();
+    let waiting = {
+        let original = original.clone();
+        tokio::spawn(async move {
+            let told = second.repeat(&original).await;
+            (second, told)
+        })
+    };
+    arrived.await.expect("the repeat has looked for a record");
     release.send(()).expect("the remote is waiting");
     let (_first, ended) = running.await.expect("the clone ran");
     let ended = failure(ended.expect("the call reaches the daemon"));
+    let _ = go.send(());
+    let (mut second, caught) = waiting.await.expect("the repeat ran");
+    let caught = failure(caught.expect("the call reaches the daemon"));
+    assert_eq!(caught.code, ended.code, "{caught:?} against {ended:?}");
+    assert_eq!(caught.message, ended.message);
+
+    // And a repeat asked once the clone has ended is given the same record by the door's lookup.
     let settled = failure(
         second
             .repeat(&original)
