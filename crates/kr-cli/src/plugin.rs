@@ -549,7 +549,8 @@ pub(crate) async fn ask_within<T>(
 /// the host was asked, the host did not answer in time, or the connection failed before it did,
 /// whether it ended or sent what could not be read. The request is not made at all once the
 /// challenge has ended. The inner result is the host's own answer or refusal, which the caller
-/// reads for itself; an answer that cannot be read is one of those, since the connection stands.
+/// reads for itself; an answer that cannot be read is one of those, since the connection stands,
+/// and so is a request the host's release cannot read, which was not written and says so.
 pub(crate) async fn ask_before<T>(
     deadline: tokio::time::Instant,
     request: impl std::future::Future<Output = Result<T>>,
@@ -560,6 +561,9 @@ pub(crate) async fn ask_before<T>(
     }
     match tokio::time::timeout_at(deadline.min(now + ASK_WITHIN), request).await {
         Err(_) => Err(host_did_not_answer()),
+        Ok(Err(CliError::Ipc(failure @ kr_ipc::IpcError::NotInLevel(_)))) => {
+            Ok(Err(request_not_written(&failure)))
+        }
         Ok(Err(CliError::Ipc(failure))) => Err(connection_failed_before_it_answered(&failure)),
         Ok(answered) => Ok(answered),
     }
@@ -594,6 +598,18 @@ fn challenge_ran_out() -> CliError {
         ErrorCode::OwnerConfirmationRequired,
         Shown::said("the challenge ran out before it could be confirmed. Nothing was changed"),
     ))
+}
+
+/// What the command says when the host's release cannot read the request for an owner device's
+/// confirmation: it was not written, and the connection stands.
+fn request_not_written(failure: &kr_ipc::IpcError) -> CliError {
+    CliError::refused_in_its_own_words(
+        failure.code(),
+        Shown::said(
+            "the host's release cannot read the request for an owner device's confirmation, so it \
+             was not sent. Nothing was changed",
+        ),
+    )
 }
 
 /// What the command says when the connection fails before the host answers a request that changes
@@ -1671,6 +1687,26 @@ mod tests {
             assert!(nothing_changed(&lost));
             assert!(lost.to_string().contains(cause), "{lost}");
         }
+
+        // A request the host's release cannot read is not written, and the connection stands: it
+        // is the host's answer for the caller to read, in its own words, and no lost connection.
+        let unread = display_listed(
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(60),
+            async {
+                Err(CliError::Ipc(kr_ipc::IpcError::NotInLevel(
+                    "a request the level cannot read".to_owned(),
+                )))
+            },
+            &request,
+        )
+        .await;
+        let Err(unread) = unread else {
+            panic!("the request was not written");
+        };
+        assert_eq!(unread.code(), ErrorCode::UnsupportedCapability);
+        assert_ne!(unread.exit_code(), 3, "the connection is whole");
+        assert!(nothing_changed(&unread));
+        assert!(!unread.to_string().contains("connection"), "{unread}");
 
         // The controls: what the host lists is read, and what it refuses and what cannot be read
         // are its answer.

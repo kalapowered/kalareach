@@ -1819,6 +1819,25 @@ mod tests {
         .await
         .expect("an answer that cannot be read does not end the command");
         assert!(matches!(unreadable.display, Err(CliError::Other(_))));
+
+        // A request the host's release cannot read is not written, and the connection stands: the
+        // read of what is shown is not made, and the command goes on without it.
+        let unread = issued(
+            &mut (),
+            true,
+            async |_| Ok(challenge.clone()),
+            async |_| {
+                Err(CliError::Ipc(kr_ipc::IpcError::NotInLevel(
+                    "a request the level cannot read".to_owned(),
+                )))
+            },
+        )
+        .await
+        .expect("a request that was not written does not end the command");
+        let Err(unread) = unread.display else {
+            panic!("the read of what is shown was not made");
+        };
+        assert_eq!(unread.code(), ErrorCode::UnsupportedCapability);
     }
 
     /// KR-REQ-07.47: a host that holds the connection open and does not answer the terminal's
