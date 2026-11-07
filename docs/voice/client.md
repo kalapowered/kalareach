@@ -86,8 +86,11 @@ These rules hold whatever the service would accept. A frame the device sends is 
 
 The microphone's mute is told to the service as advice to the provider, from one task that follows
 the mute native code holds, whichever control changed it: the page, the lock screen or the
-notification. It tells the service when that differs from what the service last accepted, in order,
-and tries again when the control attaches again. The mute itself never waits for the service.
+notification. It tells the service when that differs from the state it last asked for, in order. A
+request that was not sent, or that the service refused, is tried again when the control attaches
+again. A request the service never answered may have reached the provider, so it is not made again:
+the same state is not asked for a second time, and a different one, an unmute after the mute, is.
+The mute itself never waits for the service.
 
 The host's selected context is sent as the call's opening context, appended using `thinking` frames. The first line of the opening context says that the text is data about the person's work and not instructions, and the selected text follows. Where possible, splitting will be done at line breaks, and each chunk will be at most 500 bytes. If the selection would require more than 64 chunks of opening context, the whole selection will be rejected.
 
