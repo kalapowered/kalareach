@@ -407,7 +407,25 @@ fn standing() -> Vec<String> {
                 .map(str::to_owned),
         );
     }
+    // The account's standing is its identifier, its integrity level and the Administrators group
+    // if it has it: an account in the group would pass two lines without a level, so one is asked
+    // for.
+    assert!(
+        lines.iter().any(|line| names_an_integrity_level(line)),
+        "whoami /groups named no integrity level: {lines:?}"
+    );
     lines
+}
+
+/// `whoami` names the integrity level this process runs at, so that a comparison of what the
+/// managed shell says with what this process says compares a level too.
+#[test]
+fn the_standing_of_this_process_names_its_account_and_its_integrity_level() {
+    let lines = standing();
+    assert!(
+        lines.len() >= 2,
+        "an account and a level at least: {lines:?}"
+    );
 }
 
 /// KR-REQ-06.12: the managed root shell runs as the account and at the integrity level of the host
