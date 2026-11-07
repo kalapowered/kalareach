@@ -935,11 +935,27 @@ fn borrowed(members: &[(String, Vec<u8>)]) -> Vec<(&str, Vec<u8>)> {
 /// KR-REQ-24.16, 20.16, 20.19, KR-ACC-033: a fresh host with only the kit previews, then confirms
 /// the digest it saw, and the folder holds exactly the plaintexts; the host's stored keys,
 /// configuration and devices are as they were.
+///
+/// KR-REQ-20.17, the restore through the shipped command only: the archive here also carries an
+/// endpoint key, a control key, host authority, a revoked grant and a name no host archive carries,
+/// and the plan lists those five as not restored, with a reason each; none of their bytes is in
+/// the restored folder, and the host's own secrets, configuration and devices are as they were.
+/// Not shown here: that a backup is made without those keys, which the
+/// daemon's production case shows, or the kind the table gives each name, which the library's case
+/// shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_of_its_own() {
     let world = World::new();
     let rig = Rig::start(SignIn::Usable).await;
-    let held = members();
+    let mut held = members();
+    held.push((
+        "keys/endpoint/device".to_owned(),
+        b"ENDPOINT-KEY-BYTES-A-RESTORE-MUST-NOT-WRITE".to_vec(),
+    ));
+    held.push((
+        "grants/revoked/grant-2".to_owned(),
+        b"REVOKED-GRANT-A-RESTORE-MUST-NOT-WRITE".to_vec(),
+    ));
     let sealed = seal(&world, 1, &borrowed(&held));
     rig.put(&world, &sealed, None).await;
     let kit = rig.work.join("kit.txt");
@@ -989,17 +1005,21 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
             .is_some_and(|standing| standing.contains("generation 1")),
         "{plan}"
     );
+    let not_restored = plan["not_restored"].as_array().expect("refused");
     assert_eq!(
-        plan["not_restored"].as_array().expect("refused").len(),
-        3,
-        "a control key, host authority and an unknown name are shown as not restored"
+        not_restored.len(),
+        5,
+        "an endpoint key, a control key, host authority, a revoked grant and an unknown name are \
+         shown as not restored"
     );
-    assert!(
-        plan["not_restored"][0]["because"]
-            .as_str()
-            .is_some_and(|because| !because.is_empty()),
-        "{plan}"
-    );
+    for refused in not_restored {
+        assert!(
+            refused["because"]
+                .as_str()
+                .is_some_and(|because| !because.is_empty()),
+            "{plan}"
+        );
+    }
 
     let restored = rig
         .run(
@@ -1082,7 +1102,13 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
             );
         }
     }
-    for refused in ["CONTROL-KEY-BYTES", "AUTHORITY", "UNKNOWN"] {
+    for refused in [
+        "ENDPOINT-KEY-BYTES",
+        "CONTROL-KEY-BYTES",
+        "AUTHORITY",
+        "REVOKED-GRANT",
+        "UNKNOWN",
+    ] {
         assert!(
             tree(&into)
                 .values()
