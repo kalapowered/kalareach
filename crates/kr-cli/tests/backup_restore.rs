@@ -388,7 +388,7 @@ struct Rig {
 impl Drop for Rig {
     /// Ends the daemon before the tree goes.
     ///
-    /// The daemon holds `singleton.lock` until the daemon value itself is gone, and on Windows that
+    /// The daemon holds `controller.lock` until the daemon value itself is gone, and on Windows that
     /// is an open file that shares nothing, which the removal of the folder it is in is refused for:
     /// the tree would stay in the temporary folder for good. So the tasks that serve are cancelled,
     /// the rig lets go of the daemon, and the tree is removed once the lock can be taken. The wait
@@ -420,10 +420,48 @@ impl Drop for Rig {
         if let Some(error) = problem {
             assert!(
                 std::thread::panicking(),
-                "the daemon still held {} {:?} after the rig let go of it: {error}",
+                "the lock {} was not free {:?} after the rig let go of the daemon: {error}",
                 lock.display(),
                 begun.elapsed()
             );
+        }
+        // The lock being free shows the daemon value is gone, not that every task that holds a part
+        // of it has ended: the backup carrier's task is aborted when the daemon goes and cannot be
+        // joined from here, and it may hold the backup store's files a moment longer. So the tree
+        // is removed here, again for as long as the removal is refused, and a tree that is left is
+        // said (and fails the case, unless it is failing already).
+        let root = self.temp.root().to_path_buf();
+        if let Err(error) = remove_tree(&root, |_| {}) {
+            let said = format!(
+                "{} is left in the temporary folder, and its removal is refused: {error}",
+                root.display()
+            );
+            if std::thread::panicking() {
+                let _ = writeln!(std::io::stderr(), "{said}");
+            } else {
+                panic!("{said}");
+            }
+        }
+    }
+}
+
+/// Removes the tree at `root`, again for as long as the removal is refused and for no longer than
+/// the liveness deadline, and returns the refusal that was still there at the end. `refused` is
+/// called after each refusal, with it.
+fn remove_tree(
+    root: &Path,
+    mut refused: impl FnMut(&std::io::Error),
+) -> Result<(), std::io::Error> {
+    let begun = Instant::now();
+    loop {
+        match std::fs::remove_dir_all(root) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if begun.elapsed() < LIVENESS_DEADLINE => {
+                refused(&error);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -3766,4 +3804,37 @@ async fn a_held_folder_dropped_before_the_record_is_published_is_emptied_of_what
         "the file was removed with the handle"
     );
     assert!(fixture.into.is_dir(), "the folder is never removed");
+}
+
+/// A rig's tree is removed again for as long as the removal is refused, and the removal that was
+/// refused is said: a file held open without sharing, as the backup carrier's task holds the
+/// backup store's, is let go of after the first refusal, and the tree then goes.
+#[cfg(windows)]
+#[test]
+fn a_tree_whose_removal_is_refused_is_removed_when_the_file_is_let_go_of() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    let place = kr_ipc::testing::PrivateTempDir::create();
+    let root = place.path().join("tree");
+    std::fs::create_dir(&root).expect("a tree");
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .share_mode(0)
+        .open(root.join("store.db"))
+        .expect("a file held open without sharing");
+    let mut held = Some(held);
+    let mut refusals = 0_u32;
+
+    let outcome = remove_tree(&root, |_| {
+        refusals += 1;
+        drop(held.take());
+    });
+
+    assert!(outcome.is_ok(), "the tree is removed: {outcome:?}");
+    assert!(
+        refusals >= 1,
+        "the first removal was refused, which is what the case is about"
+    );
+    assert!(!root.exists(), "{} is left", root.display());
 }
