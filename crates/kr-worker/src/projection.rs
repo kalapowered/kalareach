@@ -131,6 +131,9 @@ pub struct Filtered {
     pub lost: bool,
     /// Side effects that had no attachment to go to and became host events.
     pub host_events: Vec<SideEffect>,
+    /// The spans of the raw stream, as cursors, that the engine consumed as control strings no
+    /// attachment is given: what a terminal takes for a file or a picture, among them.
+    pub withheld_strings: Vec<(u64, u64)>,
 }
 
 impl Filtered {
@@ -155,6 +158,7 @@ impl Filtered {
         self.effects.extend(other.effects);
         self.replies.extend(other.replies);
         self.host_events.extend(other.host_events);
+        self.withheld_strings.extend(other.withheld_strings);
         self.projection_required_at = self.projection_required_at.or(other.projection_required_at);
         self.projection_reset |= other.projection_reset;
         self.lost |= other.lost;
@@ -468,6 +472,13 @@ impl TerminalEngine {
         let outcome = self.engine.feed(bytes, now_ms);
         self.tail.extend_from_slice(bytes);
         self.collect(&outcome, gate, now_ms)
+    }
+
+    /// The cursor before which every byte of the raw stream belongs to a finished event, which is
+    /// where a reader that may not be given a sequence still in flight has to stop.
+    #[must_use]
+    pub const fn settled_cursor(&self) -> u64 {
+        self.engine.settled_cursor()
     }
 
     /// Returns the encoding an input path must produce to control this application.
@@ -987,6 +998,11 @@ impl TerminalEngine {
         let mut filtered = Filtered {
             projection_required_at: outcome.projection_required_at,
             projection_reset: outcome.projection_reset,
+            withheld_strings: outcome
+                .withheld_strings
+                .iter()
+                .map(|span| (span.start(), span.end()))
+                .collect(),
             ..Filtered::default()
         };
         if outcome.projection_required_at.is_some() {

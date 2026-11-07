@@ -8228,9 +8228,28 @@ and an export are not served to one.
 A live-only invitation reaches the currently visible screen and nothing else. Snapshot installation
 goes through the filtered projection rather than the worker's unrestricted state, so the buffer that
 is not showing is neither drawn nor described: not its rows, not its saved cursor, not its keyboard
-negotiation. Attachment bytes are a second question from the attachment reference, and need their
-own `files.read`. An invitation may name current questions or approval requests explicitly, which
+negotiation. An invitation may name current questions or approval requests explicitly, which
 permits those exact decisions and not the conversation they came from.
+
+### Files and attachments
+
+File and attachment bytes need their own `files.read`, a second question from the screen and the
+history bound. No byte of a file or an attachment reaches a paired device or the holder of a share:
+the download methods are refused to a device by name (*Pairing and the host's owner*),
+and an attachment's thumbnail is returned only to the actor that owns the upload. An agent reads an
+attachment only through the read grant over its one file, and a file only beneath a directory that
+its connector's `filesystem.read` was granted.
+
+What a terminal takes for a file or a picture is not served either. An application can print an
+iTerm2 inline file, a sixel picture or a Kitty graphics command. The terminal engine consumes each
+of them and gives no attachment their bytes, as it does any control string the profile names no
+class for and any it discards whole. A page of retained output served to a caller that holds no
+file right, which is every caller under a grant, has each such string replaced by NUL, byte for
+byte, so no cursor moves and the words around it stay where they were. A page that begins or ends
+inside one withholds that part of it, and a string that has begun and not ended is left out of the
+page until it ends, because nothing yet says what it is. The local owner is paged the output as it
+was written. The worker cannot tell a device that holds `files.read` from one that does not, since
+the scope a forwarded read carries states no rights, so no device is paged one.
 
 ## The broker
 

@@ -3382,6 +3382,10 @@ impl Session {
             // there, so a keystroke that opens a paste while this batch is parsed cannot find
             // an answer already written into the middle of it.
             let filtered = self.engine.feed(cursor, bytes, InputDomain::shut_gate());
+            // Noted with the batch, under the lock the retained output is read under, so a reader
+            // of a page that reaches these bytes finds them named.
+            self.history
+                .note_withheld_strings(&filtered.withheld_strings);
             span.held();
             filtered
         };
@@ -4148,7 +4152,8 @@ impl Session {
         self.history.page(from_cursor, max_bytes)
     }
 
-    /// Reads one page of retained output for a reader that reaches `reach` of it.
+    /// Reads one page of retained output for a reader that reaches `reach` of it, and is given
+    /// what a terminal takes for a file or a picture only when `files` says so.
     ///
     /// # Errors
     ///
@@ -4158,8 +4163,19 @@ impl Session {
         from_cursor: u64,
         max_bytes: u64,
         reach: crate::history::Reach,
+        files: crate::history::Files,
     ) -> Result<HistoryPageResult> {
-        self.history.page_within(from_cursor, max_bytes, reach)
+        match files {
+            crate::history::Files::Served => {
+                self.history.page_within(from_cursor, max_bytes, reach)
+            }
+            crate::history::Files::Withheld => self.history.page_without_files(
+                from_cursor,
+                max_bytes,
+                reach,
+                self.engine.settled_cursor(),
+            ),
+        }
     }
 
     /// Returns why a cursor is no longer retained, when this host recorded a reason.

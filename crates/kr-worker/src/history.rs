@@ -106,6 +106,17 @@ pub enum Reach {
     },
 }
 
+/// Whether a reader of retained output is given what a terminal takes for a file or a picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Files {
+    /// The output as it was written.
+    Served,
+    /// The output with each control string the terminal engine withheld from every attachment
+    /// replaced by NUL, byte for byte, so that no cursor moves, and with no sequence that has begun
+    /// and not ended: nothing yet says what it is.
+    Withheld,
+}
+
 /// What discarding a session's retained output took, and what it could not.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Discarded {
@@ -193,6 +204,67 @@ impl SpoolLayout {
     }
 }
 
+/// The most ranges of retained output [`WithheldStrings`] keeps apart.
+const MAX_WITHHELD_RANGES: usize = 4096;
+
+/// Where the retained output holds a control string the terminal engine withheld from every
+/// attachment, as ranges of cursors, oldest first.
+///
+/// The engine names each such string when it ends, so a range is as long as the string and begins
+/// where it did. The ranges are bounded: past the bound the two nearest ranges become one, which
+/// withholds the text between them as well and never less.
+#[derive(Debug, Default)]
+struct WithheldStrings {
+    ranges: VecDeque<(u64, u64)>,
+}
+
+impl WithheldStrings {
+    /// Notes one range, which begins no earlier than the one noted before it.
+    fn note(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        match self.ranges.back_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => self.ranges.push_back((start, end)),
+        }
+        if self.ranges.len() > MAX_WITHHELD_RANGES {
+            let nearest = (1..self.ranges.len())
+                .min_by_key(|&index| {
+                    self.ranges[index]
+                        .0
+                        .saturating_sub(self.ranges[index - 1].1)
+                })
+                .unwrap_or(1);
+            let joined = self.ranges.remove(nearest).map_or(0, |range| range.1);
+            self.ranges[nearest - 1].1 = joined;
+        }
+    }
+
+    /// Forgets the ranges that lie wholly before `cursor`, which output no longer holds.
+    fn forget_before(&mut self, cursor: u64) {
+        while self.ranges.front().is_some_and(|range| range.1 <= cursor) {
+            self.ranges.pop_front();
+        }
+    }
+
+    /// Replaces with NUL what `bytes`, which begins at `from`, holds of a range.
+    fn replace_in(&self, from: u64, bytes: &mut [u8]) {
+        let end = from.saturating_add(bytes.len() as u64);
+        let first = self.ranges.partition_point(|range| range.1 <= from);
+        for &(start, stop) in self.ranges.iter().skip(first) {
+            if start >= end {
+                break;
+            }
+            let low = usize::try_from(start.max(from) - from).unwrap_or(usize::MAX);
+            let high = usize::try_from(stop.min(end) - from).unwrap_or(usize::MAX);
+            if let Some(held) = bytes.get_mut(low..high) {
+                held.fill(0);
+            }
+        }
+    }
+}
+
 /// Retained output for one session.
 #[derive(Debug)]
 pub struct OutputHistory {
@@ -239,6 +311,8 @@ pub struct OutputHistory {
     /// Nothing is recorded while the history is not retaining, and nothing is noted for a range the
     /// history does not hold.
     times: Option<TimeIndex>,
+    /// Where the retained output holds a control string no attachment is given.
+    withheld: WithheldStrings,
     /// Whether the wall clock could be proved at the last append, which the rows record.
     clock_proven: bool,
     /// What the environment's spools held when they were last measured for the host-wide cap.
@@ -334,6 +408,7 @@ impl OutputHistory {
             resident_marks: VecDeque::new(),
             evictions: VecDeque::new(),
             times: None,
+            withheld: WithheldStrings::default(),
             clock_proven: false,
             host_reading: None,
             awaits_the_host_cap_lock: false,
@@ -1359,6 +1434,44 @@ impl OutputHistory {
                 cause,
             }));
         }
+        Ok(page)
+    }
+
+    /// Notes the control strings the terminal engine withheld from every attachment, as the ranges
+    /// of cursors it named when each ended.
+    pub fn note_withheld_strings(&mut self, ranges: &[(u64, u64)]) {
+        for &(start, end) in ranges {
+            self.withheld.note(start, end);
+        }
+        self.withheld.forget_before(self.oldest_retained_cursor());
+    }
+
+    /// Reads one page of retained output for a reader that reaches `reach` of it and is not given
+    /// what a terminal takes for a file or a picture ([`Files::Withheld`]).
+    ///
+    /// The page is [`Self::page_within`]'s with each such control string replaced by NUL, byte for
+    /// byte, so every cursor in it is where it was, and cut where `settled` is when it reaches
+    /// further: the sequence the engine is part way through is not known for what it is until it
+    /// ends, and what the page leaves out is read from `next_cursor` once it has.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a spool segment cannot be read.
+    pub fn page_without_files(
+        &self,
+        from_cursor: u64,
+        max_bytes: u64,
+        reach: Reach,
+        settled: u64,
+    ) -> Result<HistoryPageResult> {
+        let mut page = self.page_within(from_cursor, max_bytes, reach)?;
+        let start = page.from_cursor.get();
+        let mut bytes = core::mem::replace(&mut page.bytes, Bytes::new(Vec::new())).into_vec();
+        let settled_len = usize::try_from(settled.saturating_sub(start)).unwrap_or(usize::MAX);
+        bytes.truncate(settled_len);
+        self.withheld.replace_in(start, &mut bytes);
+        page.next_cursor = U64::new(start + bytes.len() as u64);
+        page.bytes = Bytes::new(bytes);
         Ok(page)
     }
 
@@ -2903,6 +3016,56 @@ mod tests {
         assert_eq!(page.from_cursor.get(), 6);
         assert_eq!(page.next_cursor.get(), 11);
         assert!(!page.gap.is_present());
+    }
+
+    /// A reader that is not given files has every control string the engine named replaced by NUL,
+    /// byte for byte, however many the engine named: past the bound the record keeps apart, the
+    /// ranges nearest each other become one, which withholds the text between them as well and
+    /// never less, and a page stops where the engine is part way through a string.
+    #[test]
+    fn a_page_without_files_withholds_every_range_named_even_past_the_bound_kept_apart() {
+        let ranges = MAX_WITHHELD_RANGES as u64 * 3;
+        let mut history = OutputHistory::in_memory(1 << 20);
+        let mut written = Vec::new();
+        for _ in 0..ranges {
+            written.extend_from_slice(b"ab;;cd");
+        }
+        history.append(&written);
+        let named: Vec<(u64, u64)> = (0..ranges).map(|n| (n * 6 + 2, n * 6 + 4)).collect();
+        history.note_withheld_strings(&named);
+
+        let end = written.len() as u64;
+        let page = history
+            .page_without_files(0, u64::MAX, Reach::Whole, end)
+            .expect("pages");
+        assert_eq!(page.bytes.len(), written.len(), "no byte moves");
+        assert_eq!(page.next_cursor.get(), end);
+        for &(start, stop) in &named {
+            assert!(
+                page.bytes.as_slice()[start as usize..stop as usize]
+                    .iter()
+                    .all(|&byte| byte == 0),
+                "the range {start}..{stop} is withheld"
+            );
+        }
+        // What the bound merged is withheld too, so the page holds less text and never more.
+        let kept = page
+            .bytes
+            .as_slice()
+            .iter()
+            .filter(|&&byte| byte != 0)
+            .count();
+        assert!(kept < written.len() - 2 * named.len(), "the ranges merged");
+
+        let settled = history
+            .page_without_files(0, u64::MAX, Reach::Whole, 7)
+            .expect("pages");
+        assert_eq!(
+            settled.bytes.len(),
+            7,
+            "the page stops at the settled cursor"
+        );
+        assert_eq!(settled.next_cursor.get(), 7);
     }
 
     /// A spool directory on the internal disk, named so two tests never share one.

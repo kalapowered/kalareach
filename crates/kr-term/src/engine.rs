@@ -124,6 +124,12 @@ pub struct FeedOutcome {
     /// Where the attachment must move to projected mode, when something arrived that direct mode
     /// cannot carry.
     pub projection_required_at: Option<u64>,
+    /// The spans of control strings the profile consumes as an extension, which no attachment is
+    /// given: an inline file of the iTerm2 protocol, a sixel picture, a Kitty graphics command, a
+    /// string of a kind the profile names no class for, and a string discarded whole. A reader of
+    /// the retained stream has to be kept from them as well, since they are what a terminal takes
+    /// for a file or a picture.
+    pub withheld_strings: Vec<ByteSpan>,
     /// Side effects to route.
     pub side_effects: Vec<SideEffect>,
     /// Side effects policy refused.
@@ -431,6 +437,17 @@ impl Engine {
         self.lexer.offset()
     }
 
+    /// The cursor before which every byte belongs to a finished event: the start of the sequence
+    /// the parser is part way through, or the read offset when it is part way through none.
+    ///
+    /// Unlike [`Engine::output_cursor`] it does not stop short of the last text cluster, which is
+    /// text whatever follows it. What it holds back is a sequence that has begun and not ended,
+    /// whose kind is not known until it does.
+    #[must_use]
+    pub const fn settled_cursor(&self) -> u64 {
+        self.lexer.offset().saturating_sub(self.lexer.pending_len())
+    }
+
     /// The current projection generation.
     #[must_use]
     pub const fn projection_generation(&self) -> u64 {
@@ -558,6 +575,17 @@ impl Engine {
             }
             let decision = self.policy.decide(event);
             let mut disposition = decision.disposition;
+            if event.class == SequenceClass::Extension
+                && matches!(
+                    event.kind,
+                    EventKind::Osc { .. }
+                        | EventKind::Dcs { .. }
+                        | EventKind::OtherString { .. }
+                        | EventKind::Discarded { .. }
+                )
+            {
+                push_span(&mut outcome.withheld_strings, event.span);
+            }
             // A cursor restore clears state in the reducer that a terminal would have kept, and the
             // shift a cursor was saved with is one the reducer does not keep at all. So what was in
             // force before is noted here, and put right once the sequence has been applied.

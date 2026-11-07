@@ -8668,9 +8668,17 @@ impl WorkerService {
                 None => crate::history::Reach::Nothing { end },
             }
         };
+        // What a terminal takes for a file or a picture is a file's bytes, and needs a file grant
+        // of its own that the scope a read carries never states, so only a reader that holds one
+        // by being the local owner is given it: no attachment is, of the live stream.
+        let files = if filter.scope().reads_files() {
+            crate::history::Files::Served
+        } else {
+            crate::history::Files::Withheld
+        };
         let session = self.runtime.session();
         Self::check_page_session(&session, params.session_id, caller)?;
-        let page = session.history_page_within(params.from_cursor.get(), limit, reach)?;
+        let page = session.history_page_within(params.from_cursor.get(), limit, reach, files)?;
         encode(&page)
     }
 
