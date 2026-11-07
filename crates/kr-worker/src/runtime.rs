@@ -2153,6 +2153,10 @@ pub struct LaunchFailure {
     pub error: WorkerError,
     /// The closure record, when the session got far enough to leave one.
     pub closure: Option<ClosureRecord>,
+    /// Whether the root shell may still be running: the session launched one, its start then
+    /// failed, and the shell is not seen to have ended. A failure that leaves it is not reported as
+    /// a launch that failed.
+    pub shell_may_run: bool,
 }
 
 /// Starts a session and reports a launch failure with its closure record.
@@ -2193,6 +2197,7 @@ pub fn start_or_record(
             return Err(Box::new(LaunchFailure {
                 error,
                 closure: None,
+                shell_may_run: false,
             }));
         }
     };
@@ -2204,6 +2209,7 @@ pub fn start_or_record(
         return Err(Box::new(LaunchFailure {
             error,
             closure: session.closure().cloned(),
+            shell_may_run: false,
         }));
     }
     // The privacy state the specification carries, before the shell can print its first byte.
@@ -2211,18 +2217,33 @@ pub fn start_or_record(
         return Err(Box::new(LaunchFailure {
             error,
             closure: session.closure().cloned(),
+            shell_may_run: false,
         }));
     }
     if let Err(error) = session.launch() {
         let closure = session.closure().cloned();
-        return Err(Box::new(LaunchFailure { error, closure }));
+        return Err(Box::new(LaunchFailure {
+            error,
+            closure,
+            shell_may_run: false,
+        }));
     }
+    let shell = session.root_identity();
     SessionRuntime::start(session, shared_clock)
         .map(Arc::new)
         .map_err(|error| {
+            // A start that fails after the launch ends the shell, and a shell the kernel does not
+            // show to have ended is one the failure is not reported over.
+            let shell_may_run = shell.is_some_and(|shell| {
+                !matches!(
+                    kr_ipc::identity::process_state(&shell),
+                    kr_ipc::identity::ProcessState::Ended
+                )
+            });
             Box::new(LaunchFailure {
                 error,
                 closure: None,
+                shell_may_run,
             })
         })
 }
