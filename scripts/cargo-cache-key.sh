@@ -8,8 +8,12 @@
 #
 # settings   The toolchain, the build settings of `.cargo/config.toml`, the `[profile]` tables of the
 #            workspace's `Cargo.toml`, the `CARGO_PROFILE_*` and `RUSTFLAGS` variables of the
-#            environment, comments left out, and the runner image: a crate built with other
-#            settings is not the crate a cache holds, and an edit to a comment changes none. The
+#            environment, the variables the native compilers read (the deployment target and the
+#            SDK, the compilers, their flags and wrappers), comments left out, and the runner
+#            image: a crate built with other settings is not the crate a cache holds, and an edit
+#            to a comment changes none. Cargo does not see a change to a variable that only a
+#            compiler reads: a build script that compiles C runs again only for the variables it
+#            names, and what it built before stays in the cache. The
 #            image is `ImageOS` and `ImageVersion`, which a hosted runner sets. A native build
 #            leaves its configured tree in the cache (a CMake tree holds the paths of the tools
 #            and libraries it found), and on another image those paths are gone or other, so a
@@ -44,8 +48,13 @@ fi
 # Each part is assigned to a variable first, so that a file that cannot be read stops the script.
 toolchain="$(grep -h -v -E '^[[:space:]]*(#|$)' rust-toolchain.toml .cargo/config.toml)"
 profiles="$(awk '/^\[profile/ { keep = 1 } /^\[/ && !/^\[profile/ { keep = 0 } keep && !/^[[:space:]]*(#|$)/' Cargo.toml)"
-# The settings the workflow gives every build by environment variable.
-environment="$(env | grep -E '^(CARGO_PROFILE_|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)' | LC_ALL=C sort || true)"
+# The settings the workflow gives every build by environment variable: Rust's, and what the native
+# compilers read, which the `cc` crate and the C builds of the third-party crates take from the
+# environment, also for one target (`CC_x86_64_apple_darwin`) or for the host (`HOST_CC`).
+rust_variables='CARGO_PROFILE_|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS='
+native_variables='MACOSX_DEPLOYMENT_TARGET=|SDKROOT=|DEVELOPER_DIR=|CRATE_CC_|CXXSTDLIB='
+native_variables+='|((HOST|TARGET)_)?(CC|CXX|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|AR|ARFLAGS|RANLIB)(_[^=]*)?='
+environment="$(env | grep -E "^($rust_variables|$native_variables)" | LC_ALL=C sort || true)"
 image="ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset}"
 settings="$(printf '%s\n%s\n%s\n%s\n' "$toolchain" "$profiles" "$environment" "$image" | digest)"
 week="$(date -u +%G-W%V)"
