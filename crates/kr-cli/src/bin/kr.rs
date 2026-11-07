@@ -1092,9 +1092,11 @@ async fn run(cli: Cli) -> Result<Completion> {
                     host_read(&mut client, &environment.paths, Method::HostDoctor, &()).await?;
                 // A host whose routes were read at its start, and differ from its document now,
                 // sends over the routes it started with, whatever else this command finds. Said
-                // on standard error and after the answer, so the answer stays what it was; and
-                // said when the command fails, because a failure about the list says nothing of
-                // the routes.
+                // on standard error, and after the answer when there is one, so the answer stays
+                // what it was; and said before a failure of a list check, because that failure
+                // says nothing of the routes. A failure to take the lock, to write the document
+                // or to read the host again says nothing of them either, and an unusable
+                // document gets none.
                 let mut restart =
                     kr_cli::doctor::configuration::routes_waiting_for_a_restart(&answer);
                 // The list the host reports is shown only when the host acts on its document, as a

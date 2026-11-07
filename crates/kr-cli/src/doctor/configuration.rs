@@ -409,8 +409,8 @@ mod tests {
     }
 
     /// KR-REQ-16.04: a host that has not finished putting its document into force fails the
-    /// command with one answer: the exit says it is unfinished, and the message says what the host
-    /// delivers through and what it has not finished. A host that applied the document and could
+    /// command with one answer: the exit says it is unfinished, and the message says which
+    /// gateways are in force and what the host has not finished. A host that applied the document and could
     /// not record that it had is not said to have failed to put it into force.
     #[test]
     fn a_host_that_has_not_finished_putting_its_document_into_force_is_said_to_have_not_finished() {
@@ -460,11 +460,13 @@ mod tests {
     fn a_restart_is_said_to_be_needed_only_when_the_hosts_routes_differ_from_a_usable_document() {
         use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus, HostDoctorResult};
 
-        let answer = |status: Option<DoctorStatus>, state: configuration::DocumentState| {
+        let answer = |id: &'static str,
+                      status: Option<DoctorStatus>,
+                      state: configuration::DocumentState| {
             let checks = status
                 .map(|status| {
                     DoctorCheck::new(
-                        NETWORK_CHECK,
+                        id,
                         "This host started with the network its configuration selects",
                         status,
                         Sentence::new().stated("a check"),
@@ -479,17 +481,34 @@ mod tests {
         };
         let usable = configuration::DocumentState::Loaded;
 
-        let note = routes_waiting_for_a_restart(&answer(Some(DoctorStatus::Warning), usable))
-            .expect("the routes differ from the document")
-            .to_string();
+        let note = routes_waiting_for_a_restart(&answer(
+            NETWORK_CHECK,
+            Some(DoctorStatus::Warning),
+            usable,
+        ))
+        .expect("the routes differ from the document")
+        .to_string();
         assert!(
             note.contains("restart") && note.contains("configuration-network"),
             "{note}"
         );
-        assert!(routes_waiting_for_a_restart(&answer(Some(DoctorStatus::Ok), usable)).is_none());
-        assert!(routes_waiting_for_a_restart(&answer(None, usable)).is_none());
+        assert!(
+            routes_waiting_for_a_restart(&answer(NETWORK_CHECK, Some(DoctorStatus::Ok), usable))
+                .is_none()
+        );
+        assert!(routes_waiting_for_a_restart(&answer(NETWORK_CHECK, None, usable)).is_none());
+        // Another check that warns is not about the routes.
         assert!(
             routes_waiting_for_a_restart(&answer(
+                "configuration-ceilings",
+                Some(DoctorStatus::Warning),
+                usable
+            ))
+            .is_none()
+        );
+        assert!(
+            routes_waiting_for_a_restart(&answer(
+                NETWORK_CHECK,
                 Some(DoctorStatus::Warning),
                 configuration::DocumentState::Invalid
             ))
