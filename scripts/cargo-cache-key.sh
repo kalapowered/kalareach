@@ -9,7 +9,8 @@
 # settings   The toolchain, the build settings of `.cargo/config.toml`, the `[profile]` tables of the
 #            workspace's `Cargo.toml`, the `CARGO_PROFILE_*` and `RUSTFLAGS` variables of the
 #            environment, the variables the native compilers read (the deployment targets and the
-#            SDK, the compilers, their flags and wrappers), comments left out, and the runner
+#            SDK, the compilers, their flags, wrappers and search paths) and the C builds of the
+#            locked crates (libsodium's, SQLite's, `pkg-config`'s), comments left out, and the runner
 #            image: a crate built with other settings is not the crate a cache holds, and an edit
 #            to a comment changes none. Cargo does not see a change to a variable that only a
 #            compiler reads: it does not for a Rust crate (rustc records none of them), and a
@@ -54,6 +55,11 @@ profiles="$(awk '/^\[profile/ { keep = 1 } /^\[/ && !/^\[profile/ { keep = 0 } k
 # environment, also for one target (`CC_x86_64_apple_darwin`) or for the host (`HOST_CC`).
 rust_variables='CARGO_PROFILE_|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS='
 native_variables='[A-Z]*OSX?_DEPLOYMENT_TARGET=|SDKROOT=|DEVELOPER_DIR=|CROSS_COMPILE=|CRATE_CC_'
+# What the compilers search for headers and libraries, and what the C builds of the locked crates
+# read without telling Cargo (no `rerun-if-env-changed`): libsodium's `SODIUM_*`, SQLite's
+# `LIBSQLITE3_*` and `SQLITE_MAX_*`, and `pkg-config`'s.
+native_variables+='|CPATH=|C_INCLUDE_PATH=|CPLUS_INCLUDE_PATH=|OBJC_INCLUDE_PATH=|LIBRARY_PATH=|COMPILER_PATH='
+native_variables+='|SODIUM_|LIBSQLITE3_|SQLITE_MAX_|PKG_CONFIG[A-Z_]*='
 native_variables+='|((HOST|TARGET)_)?(CC|CXX|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|AR|ARFLAGS|RANLIB|RANLIBFLAGS|CXXSTDLIB)(_[^=]*)?='
 environment="$(env | grep -E "^($rust_variables|$native_variables)" | LC_ALL=C sort || true)"
 image="ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset}"
