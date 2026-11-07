@@ -3101,3 +3101,66 @@ async fn a_transfer_action_carried_out_whose_record_cannot_be_written_is_told_th
     );
     host.stop().await;
 }
+
+/// KR-REQ-09.09: a transfer action the service refused, whose refusal cannot be recorded, is not
+/// told as the store's transient word. The refusal may be a word about what another copy of the
+/// action did, and nothing can vouch for it when no record can be read, so the caller is told that
+/// what became of the action is not known. The refusal was not kept, so the same action asked
+/// again once the store can be written is decided again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_refusal_that_cannot_be_recorded_is_told_the_outcome_is_unknown() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let params = begin_params(&host, &pattern(64), "big.bin");
+    host.controller
+        .transfer()
+        .service()
+        .set_limits(kr_transfer::Limits {
+            max_file_len: 8,
+            ..kr_transfer::Limits::default()
+        })
+        .expect("writes the limits");
+    // The service refuses the file for its size before it writes anything, and the record of that
+    // refusal is the first write of the action.
+    let store = beside_the_store(&host);
+    store
+        .execute_batch(
+            "CREATE TRIGGER no_record_can_be_written BEFORE INSERT ON actions
+             BEGIN SELECT RAISE(ABORT, 'the record cannot be written'); END;",
+        )
+        .expect("no record of an action can be written");
+    let told = failure(
+        control
+            .mutate(
+                Method::UploadBegin,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    store
+        .execute_batch("DROP TRIGGER no_record_can_be_written;")
+        .expect("records can be written again");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    let again = failure(
+        control
+            .mutate(
+                Method::UploadBegin,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(
+        again.code,
+        ErrorCode::QuotaExceeded,
+        "the refusal was not kept, so it is decided again: {again:?}"
+    );
+    host.stop().await;
+}

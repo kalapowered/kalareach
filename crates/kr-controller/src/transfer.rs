@@ -1098,19 +1098,32 @@ impl TransferModule {
             // Recorded before it is returned, so the reply and the record cannot disagree about
             // what happened. When another copy of this action recorded first, that record is the
             // answer both callers get: one action, one receipt.
-            let recorded = service
-                .record_action(&actor, action_id, name, digest, &record)
-                .map_err(|error| {
-                    let error = ProtocolError::from(error);
-                    // An action that was carried out is not one that was not: a record that cannot
-                    // be written or read back now is told as a record that cannot be read, and a
-                    // transient word would have it sent again as though nothing had been done.
-                    if outcome.is_ok() {
-                        ControllerError::found_unreadable_on_the_wire(error, RECORDS)
-                    } else {
-                        error
-                    }
-                })?;
+            let recorded = match service.record_action(&actor, action_id, name, digest, &record) {
+                Ok(recorded) => recorded,
+                // An action that was carried out is not one that was not: a record that cannot be
+                // written or read back now is told as a record that cannot be read, and a
+                // transient word would have it sent again as though nothing had been done.
+                Err(error) if outcome.is_ok() => {
+                    return Err(ControllerError::found_unreadable_on_the_wire(
+                        error.into(),
+                        RECORDS,
+                    ));
+                }
+                // A refusal that cannot be written down is not told as a definite one, nor as the
+                // store's transient word: it can be a word about what another copy of the action
+                // did. The record is read instead. It is the answer where the action has one, and
+                // where there is none to be read the outcome is not known.
+                Err(_) => {
+                    return match service.retained_action(&actor, action_id, name, digest) {
+                        Ok(Some(retained)) => answer_of(retained),
+                        Ok(None) => Err(ControllerError::refusal_not_recorded()),
+                        Err(error @ kr_transfer::TransferError::IdConflict { .. }) => {
+                            Err(error.into())
+                        }
+                        Err(_) => Err(ControllerError::refusal_not_recorded()),
+                    };
+                }
+            };
             match recorded {
                 None => outcome,
                 Some(RetainedOutcome::Ok(result)) => {

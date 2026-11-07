@@ -727,11 +727,11 @@ impl ProjectModule {
                             }
                             recorded(retained)
                         }
-                        Ok(None) => Err(refusal_not_recorded()),
+                        Ok(None) => Err(ControllerError::refusal_not_recorded()),
                         Err(error @ kr_project::ProjectError::IdConflict { .. }) => {
                             Err(error.into())
                         }
-                        Err(_) => Err(refusal_not_recorded()),
+                        Err(_) => Err(ControllerError::refusal_not_recorded()),
                     };
                 }
             };
@@ -817,16 +817,6 @@ fn recorded(retained: RetainedOutcome) -> Answer<ParamsValue> {
             .map_err(|_| ControllerError::record_unreadable(RECORDS).to_protocol_error()),
         RetainedOutcome::Error { code, detail } => Err(ProtocolError::new(code, detail)),
     }
-}
-
-/// What a refusal is told as when this host could not record it, no record of the action can be
-/// read, and another copy of the action may have been performed.
-fn refusal_not_recorded() -> ProtocolError {
-    ProtocolError::new(
-        ErrorCode::OutcomeUnknown,
-        "this request was refused and this host could not record the refusal; whether another \
-         attempt at this action was carried out is not known",
-    )
 }
 
 /// Performs one of the owner's two confirmed location decisions.

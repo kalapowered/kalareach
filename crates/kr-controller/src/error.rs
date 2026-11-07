@@ -239,6 +239,21 @@ impl ControllerError {
         }
     }
 
+    /// What an action is told when the service refused it, this host could not record the refusal,
+    /// no record of the action can be read, and another copy of the action may have been performed.
+    ///
+    /// A refusal that cannot be written down is not told as a definite one: it can be a word about
+    /// what another copy of the action did, and a client takes a definite refusal for the host's
+    /// word that nothing was done. A transient word would say the same.
+    #[must_use]
+    pub fn refusal_not_recorded() -> ProtocolError {
+        ProtocolError::new(
+            ErrorCode::OutcomeUnknown,
+            "this request was refused and this host could not record the refusal; whether another \
+             attempt at this action was carried out is not known",
+        )
+    }
+
     /// What a repeat is told of the failure of the read of its first attempt's record, on a path
     /// that answers in wire errors.
     ///
