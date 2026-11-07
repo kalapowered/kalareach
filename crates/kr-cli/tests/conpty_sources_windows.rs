@@ -611,10 +611,17 @@ fn an_integrity_level_is_named_by_its_sid_whatever_the_language() {
     );
 }
 
-#[test]
-fn a_directory_made_for_a_case_that_then_fails_is_removed_with_what_is_in_it() {
-    let parent = std::env::temp_dir().join(format!("kr-made-directory-{}", std::process::id()));
-    std::fs::create_dir_all(&parent).expect("a parent directory");
+/// A name that no other run has: the process's number and a random part.
+fn unique(prefix: &str) -> String {
+    let random = kr_ipc::new_uuid().to_string().replace('-', "");
+    format!("{prefix}-{}-{}", std::process::id(), &random[..12])
+}
+
+/// The self-test of `Made`, over a parent directory it makes itself: the parent is made with
+/// `create_dir`, which fails when something is there already, so what is in it and removed with it
+/// is the test's own and a directory that is not is refused and left as it is.
+fn check_a_made_directory_is_removed_with_what_is_in_it(parent: &Path) {
+    std::fs::create_dir(parent).expect("a parent directory that was not there");
     let directory = parent.join(".ssh");
     let failed = std::panic::catch_unwind(|| {
         let _made = Made::directory(directory.clone());
@@ -623,9 +630,34 @@ fn a_directory_made_for_a_case_that_then_fails_is_removed_with_what_is_in_it() {
         panic!("a step after the directory was made fails");
     });
     let left = directory.exists();
-    std::fs::remove_dir_all(&parent).expect("the parent directory is removed");
+    if left {
+        // A run that is red removes what it made.
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+    std::fs::remove_dir(parent).expect("the parent directory, which holds nothing now, is removed");
     assert!(failed.is_err(), "the step failed");
     assert!(!left, "the directory and the key in it are left behind");
+}
+
+#[test]
+fn a_directory_made_for_a_case_that_then_fails_is_removed_with_what_is_in_it() {
+    check_a_made_directory_is_removed_with_what_is_in_it(
+        &std::env::temp_dir().join(unique("kr-made-directory")),
+    );
+}
+
+#[test]
+fn a_parent_directory_that_is_there_already_is_refused_and_left_as_it_is() {
+    let there = Made::directory(std::env::temp_dir().join(unique("kr-made-there")));
+    std::fs::write(there.0.join("kept"), b"not the test's to remove").expect("a file in it");
+    let refused = std::panic::catch_unwind(|| {
+        check_a_made_directory_is_removed_with_what_is_in_it(&there.0);
+    });
+    assert!(refused.is_err(), "a parent that is there is refused");
+    assert_eq!(
+        std::fs::read(there.0.join("kept")).expect("the file is still there"),
+        b"not the test's to remove"
+    );
 }
 
 /// A guard that ends a distribution runs its command when the case that holds it fails, runs it
