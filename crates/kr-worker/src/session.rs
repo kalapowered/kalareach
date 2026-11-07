@@ -5088,6 +5088,19 @@ impl Session {
         shell.map(|()| remaining)
     }
 
+    /// Ends the root shell this session launched, and what the session owns, and waits until the
+    /// shell has gone.
+    ///
+    /// A start that fails after the launch has no closure to do it, because nothing reads or writes
+    /// the terminal. The shell is forced to stop and waited for, so that it has ended when this
+    /// returns. A session that launched no shell has nothing to end.
+    pub fn end_launched_shell(&mut self) {
+        let _ = self.force_close();
+        if let Some(shell) = self.shell.as_mut() {
+            let _ = shell.wait();
+        }
+    }
+
     /// Writes the final record and moves the session to `closed`.
     ///
     /// Which processes were forced is recorded where force was applied, not here: by the time this

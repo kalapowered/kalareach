@@ -484,8 +484,17 @@ impl Host {
 
     /// Installs a qualified Zsh package whose shell starts and stays, and never says a word to the
     /// worker: a session that cannot qualify, as one whose profile never opens the bridge is.
+    ///
+    /// The shell writes its process identifier to [`Self::silent_shell_pid_file`] and ignores the
+    /// signals that ask a process to stop, so that it goes only when the worker forces it, and a
+    /// case can tell whether it has gone. It ends of its own accord after two minutes.
     fn with_a_silent_shell_package(self) -> Self {
         self.shell_package(true)
+    }
+
+    /// Where the silent shell writes its process identifier.
+    fn silent_shell_pid_file(&self) -> PathBuf {
+        self.temp.root().join("silent-shell.pid")
     }
 
     fn shell_package(mut self, silent: bool) -> Self {
@@ -501,7 +510,15 @@ impl Host {
         let executable = directory.join("bin").join("zsh");
         if silent {
             let script = directory.join("bin").join("silent.sh");
-            std::fs::write(&script, "#!/bin/sh\nexec sleep 600\n").expect("writes the shell");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\necho $$ > '{}'\ntrap '' HUP INT TERM QUIT\ni=0\n\
+                     while [ $i -lt 120 ]; do sleep 1; i=$((i+1)); done\n",
+                    self.silent_shell_pid_file().display()
+                ),
+            )
+            .expect("writes the shell");
             kr_ipc::testing::place_program(&script, &executable);
         } else {
             kr_ipc::testing::place_program(std::path::Path::new("/bin/cat"), &executable);
@@ -2040,6 +2057,28 @@ async fn a_managed_create_whose_shell_never_qualifies_is_answered_with_the_worke
     assert!(
         refused.message.contains("did not qualify"),
         "the worker's own words do not reach the caller: {refused}"
+    );
+
+    // The worker reports that its launch failed only once the shell it started has ended: the
+    // daemon records a launch the worker reported as failed, and a repeat of the create is told the
+    // launch failed, which would be false of a shell still running. The shell here ignores the
+    // signals that ask a process to stop, so it is gone only if the worker forced it before it
+    // reported.
+    let pid: u32 = std::fs::read_to_string(host.silent_shell_pid_file())
+        .expect("the shell named itself when it started")
+        .trim()
+        .parse()
+        .expect("a process identifier");
+    let still_there = kr_ipc::identity::process_start_identity(pid).is_ok_and(|identity| {
+        !matches!(
+            kr_ipc::identity::process_state(&identity),
+            kr_ipc::identity::ProcessState::Ended
+        )
+    });
+    assert!(
+        !still_there,
+        "the worker reported its launch failed while the shell it started (process {pid}) was \
+         still running"
     );
 }
 

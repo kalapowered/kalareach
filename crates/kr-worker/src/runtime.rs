@@ -748,8 +748,19 @@ impl SessionRuntime {
         mut session: Session,
         shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
     ) -> Result<Self> {
-        let reader = session.output_reader()?;
-        let writer = session.input_writer()?;
+        // The shell is already launched, and a session that cannot take its terminal has nothing
+        // that will close it: it is ended here, so the failure this returns is never reported while
+        // the shell it started is still running.
+        let (reader, writer) = match session
+            .output_reader()
+            .and_then(|reader| session.input_writer().map(|writer| (reader, writer)))
+        {
+            Ok(taken) => taken,
+            Err(error) => {
+                session.end_launched_shell();
+                return Err(error);
+            }
+        };
         // The session's time contract, which the writer reads UTC through when a batch carries a
         // UTC end.
         let writer_time = Arc::clone(session.time());

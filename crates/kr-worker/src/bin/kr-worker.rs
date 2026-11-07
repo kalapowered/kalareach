@@ -464,14 +464,16 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             .await_qualification(kr_worker::runtime::QUALIFICATION_DEADLINE)
             .await
     {
-        // The failure is reported if it can be, and the session is closed either way: a create that
-        // could not deliver the managed contract leaves a closure record rather than a shell nobody
-        // is going to use.
+        // The session is closed first, and the failure is reported if it can be once the shell has
+        // ended: the daemon records a launch its worker reports as failed, and tells a repeat of the
+        // create that the launch failed, which a shell still running would make false. A create
+        // that could not deliver the managed contract leaves a closure record rather than a shell
+        // nobody is going to use.
+        runtime.close(ClosureReason::RootLaunchFailed).1.release();
+        let _ = runtime.wait_closed().await;
         let _ = writer
             .write_message(&ControlFrame::WorkerFailed(error.clone()))
             .await;
-        runtime.close(ClosureReason::RootLaunchFailed).1.release();
-        let _ = runtime.wait_closed().await;
         finish(&runtime, serving, bridge_server).await;
         return Err(error.message.into());
     }
