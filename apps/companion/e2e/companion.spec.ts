@@ -2200,6 +2200,168 @@ test.describe("the phone's tab bar", () => {
   /** A form the bar is laid out in: four tabs side by side, two rows of two, or a tab to a row. */
   type Form = 'row' | 'pairs' | 'column'
 
+  /** A box in the page, as the four lines that bound it. */
+  interface Rect {
+    readonly left: number
+    readonly right: number
+    readonly top: number
+    readonly bottom: number
+  }
+
+  /** What the bar holds and where, as it is laid out at the size the page is at now. */
+  interface BarLayout {
+    /** The gap a word keeps from the screen's edges and from the word beside it. */
+    readonly gap: number
+    readonly form: string | null
+    readonly bar: Rect
+    /** Each tab's word, as typeset, and its glyph. */
+    readonly tabs: readonly { readonly name: string; readonly word: Rect; readonly glyph: Rect | null }[]
+    /** The count, which sits on the first tab, when there is one. */
+    readonly badge:
+      | (Rect & { readonly holdsDigits: boolean; readonly position: string; readonly tab: number })
+      | null
+  }
+
+  /** Reads where the bar's words, glyphs and count are. */
+  const readBar = (page: Page): Promise<BarLayout> =>
+    page.evaluate(() => {
+      const probe = document.createElement('div')
+      probe.style.paddingLeft = 'var(--gap-2)'
+      document.body.append(probe)
+      const gap = parseFloat(getComputedStyle(probe).paddingLeft)
+      probe.remove()
+      const bar = document.querySelector('.m-tabbar') as HTMLElement
+      const edges = (box: DOMRect): Rect => ({ left: box.left, right: box.right, top: box.top, bottom: box.bottom })
+      const tabs = Array.from(bar.querySelectorAll<HTMLElement>('.m-tab'))
+      const badge = bar.querySelector<HTMLElement>('.m-tab-badge')
+      return {
+        gap,
+        form: bar.getAttribute('data-form'),
+        bar: edges(bar.getBoundingClientRect()),
+        tabs: tabs.map((tab) => {
+          const label = tab.querySelector('.m-tab-label') as HTMLElement
+          const range = document.createRange()
+          range.selectNodeContents(label)
+          const glyph = tab.querySelector('.m-tab-glyph svg')
+          return {
+            name: label.textContent ?? '',
+            word: edges(range.getBoundingClientRect()),
+            glyph: glyph === null ? null : edges(glyph.getBoundingClientRect())
+          }
+        }),
+        badge:
+          badge === null
+            ? null
+            : {
+                ...edges(badge.getBoundingClientRect()),
+                holdsDigits: badge.scrollWidth <= badge.clientWidth + 0.5 && badge.scrollHeight <= badge.clientHeight + 0.5,
+                position: getComputedStyle(badge).position,
+                tab: tabs.findIndex((tab) => tab.contains(badge))
+              }
+      }
+    })
+
+  /** Whether two boxes share any area, to within half a pixel. */
+  const overlap = (a: Rect, b: Rect): boolean =>
+    a.left < b.right - 0.5 && b.left < a.right - 0.5 && a.top < b.bottom - 0.5 && b.top < a.bottom - 0.5
+
+  /**
+   * What is too close at `width`, in words. A word keeps a gap from the screen's edges and from the
+   * word beside it, and a glyph keeps clear of its own word. The count holds its digits, stays inside
+   * the bar and the screen, and keeps clear of its own word; where `beside` says it has a place of
+   * its own beside the glyph, it is also clear of the glyph and starts where the glyph ends.
+   */
+  const crowding = (seen: BarLayout, width: number, at: string, beside: boolean): string[] => {
+    const problems: string[] = []
+    // A bar read as empty, or with the count on another tab, would pass every check below.
+    if (seen.tabs.length !== 4) problems.push(`${at}: the bar was read with ${seen.tabs.length} tabs`)
+    if (seen.badge?.tab !== 0) problems.push(`${at}: the count is on tab ${(seen.badge?.tab ?? -1) + 1}, not the first`)
+    for (const [index, tab] of seen.tabs.entries()) {
+      const { word, name, glyph } = tab
+      if (word.left < seen.gap - 0.5) problems.push(`${at}: ${name} is ${word.left.toFixed(1)} px from the left edge`)
+      if (width - word.right < seen.gap - 0.5) problems.push(`${at}: ${name} is ${(width - word.right).toFixed(1)} px from the right edge`)
+      for (const other of seen.tabs.slice(index + 1)) {
+        const sameRow = word.top < other.word.bottom - 0.5 && other.word.top < word.bottom - 0.5
+        if (!sameRow) continue
+        // Whichever starts first is the one on the left; two that start together are as close as can be.
+        const [left, right] = word.left <= other.word.left ? [tab, other] : [other, tab]
+        if (right.word.left - left.word.right < seen.gap - 0.5) {
+          problems.push(`${at}: ${left.name} and ${right.name} are ${(right.word.left - left.word.right).toFixed(1)} px apart`)
+        }
+      }
+      if (glyph !== null && overlap(glyph, word)) problems.push(`${at}: the glyph of ${name} runs into its word`)
+      if (seen.badge !== null && seen.badge.tab === index) {
+        const count = seen.badge
+        if (overlap(count, word)) problems.push(`${at}: the badge runs into the word ${name}`)
+        if (beside && glyph !== null) {
+          if (overlap(count, glyph)) problems.push(`${at}: the badge is over the glyph`)
+          if (count.left < glyph.right - 0.5) problems.push(`${at}: the badge starts ${(glyph.right - count.left).toFixed(1)} px before the glyph ends`)
+          if (count.position !== 'static') problems.push(`${at}: the badge is ${count.position}, not in the row beside the glyph`)
+        }
+      }
+    }
+    if (seen.badge !== null) {
+      const count = seen.badge
+      if (!count.holdsDigits) problems.push(`${at}: the badge does not hold its digits`)
+      if (count.top < seen.bar.top - 0.5 || count.bottom > seen.bar.bottom + 0.5) problems.push(`${at}: the badge is outside the bar`)
+      if (count.left < -0.5 || count.right > width + 0.5) problems.push(`${at}: the badge is outside the screen`)
+    }
+    return problems
+  }
+
+  /**
+   * The form the bar's rule gives for the labels as they are typeset: the first of row, pairs and column
+   * in which every label shows its whole word and keeps a gap (`--gap-2`) from the screen's edges, each
+   * label in the bold weight of the current tab's, the widest it is set in. Read by laying the bar out
+   * in each form in turn, so it follows the fonts of the machine the case runs on, and left as it was.
+   */
+  const formTheRuleGives = (page: Page): Promise<Form> =>
+    page.evaluate(() => {
+      const bar = document.querySelector('.m-tabbar') as HTMLElement
+      const found = bar.getAttribute('data-form')
+      const probe = document.createElement('div')
+      probe.style.paddingLeft = 'var(--gap-2)'
+      document.body.append(probe)
+      const gap = parseFloat(getComputedStyle(probe).paddingLeft)
+      probe.remove()
+      let answer: 'row' | 'pairs' | 'column' = 'column'
+      bar.setAttribute('data-measuring', '')
+      try {
+        for (const form of ['row', 'pairs', 'column'] as const) {
+          if (form === 'row') bar.removeAttribute('data-form')
+          else bar.setAttribute('data-form', form)
+          const whole =
+            bar.scrollWidth <= bar.clientWidth &&
+            Array.from(bar.querySelectorAll<HTMLElement>('.m-tab-label')).every((label) => {
+              const range = document.createRange()
+              range.selectNodeContents(label)
+              const word = range.getBoundingClientRect()
+              return (
+                label.scrollWidth <= label.clientWidth &&
+                word.width <= label.getBoundingClientRect().width + 0.02 &&
+                word.left >= gap - 0.5 &&
+                window.innerWidth - word.right >= gap - 0.5
+              )
+            })
+          if (whole) {
+            answer = form
+            break
+          }
+        }
+      } finally {
+        bar.removeAttribute('data-measuring')
+        if (found === null) bar.removeAttribute('data-form')
+        else bar.setAttribute('data-form', found)
+      }
+      return answer
+    })
+
+  /** The root's text is the scale's size, 16 px at 100%: a sweep at some other size would prove nothing. */
+  const expectRootSize = async (page: Page, scale: string): Promise<void> => {
+    const root = await page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).fontSize))
+    expect(root, `the root's text at ${scale}`).toBeCloseTo((16 * parseFloat(scale)) / 100, 1)
+  }
+
   /** One case: a platform's bar at a screen, a text size and a face, and what it shows that no other case does. */
   interface TabBarCase {
     readonly seen: Seen
@@ -2240,9 +2402,8 @@ test.describe("the phone's tab bar", () => {
       {
         seen: { width: 320, height: 720, scale: '200%' },
         face: WIDE_BOLD,
-        form: 'pairs',
         covers:
-          'two rows of two on the narrow screen at the largest text, with a bold much wider than the regular that each label keeps the room of, tabs as tall as the iOS target'
+          'the narrow screen at the largest text, with a bold much wider than the regular that each label keeps the room of, tabs as tall as the iOS target: two rows of two where the labels keep their gap from the screen in them, which the Mac\'s font does and DejaVu Sans does not, and a tab to a row where they do not'
       },
       {
         seen: { width: 320, height: 720, scale: '200%' },
@@ -2317,6 +2478,10 @@ test.describe("the phone's tab bar", () => {
           })
         )
         expect(placed.map((each) => each.name)).toEqual(['Attention', 'Sessions', 'Hosts', 'Account'])
+        // The bar is in the form its rule gives for the labels as this machine's fonts typeset them, with
+        // the gap kept from the screen's edges, whichever form that is.
+        const chosen = (await page.locator('.m-tabbar').getAttribute('data-form')) ?? 'row'
+        expect(chosen, 'the form the bar chose is the one its rule gives for these labels').toBe(await formTheRuleGives(page))
         // The case is laid out in the form it says it is, as the rows its tabs are on show, so it cannot
         // go on passing after it has stopped covering that form.
         if (form !== undefined) {
@@ -2444,6 +2609,10 @@ test.describe("the phone's tab bar", () => {
           await expect(tabs.nth(at)).toHaveAttribute('aria-current', 'page')
           await settle()
           await holds(`on ${name} after the press`)
+          // The word of the tab just chosen is the boldest, and every word still keeps its gap from the
+          // screen's edges and from the word beside it, with the count clear of its glyph and its word.
+          const now = await readBar(page)
+          expect.soft(crowding(now, seen.width, `${name} chosen, in the ${now.form ?? 'row'} form`, now.form !== null), 'where a label or the count is too close').toEqual([])
           // A person at the end of a list stays there while the bar measures again. The bar is made
           // to measure by a pixel's change of its own width, which leaves the page above it alone.
           const end = await list.evaluate((element) => {
@@ -2496,115 +2665,6 @@ test.describe("the phone's tab bar", () => {
     }
   }
 
-  /** A box in the page, as the four lines that bound it. */
-  interface Rect {
-    readonly left: number
-    readonly right: number
-    readonly top: number
-    readonly bottom: number
-  }
-
-  /** What the bar holds and where, as it is laid out at the size the page is at now. */
-  interface BarLayout {
-    /** The gap a word keeps from the screen's edges and from the word beside it. */
-    readonly gap: number
-    readonly form: string | null
-    readonly bar: Rect
-    /** Each tab's word, as typeset, and its glyph. */
-    readonly tabs: readonly { readonly name: string; readonly word: Rect; readonly glyph: Rect | null }[]
-    /** The count, which sits on the first tab, when there is one. */
-    readonly badge:
-      | (Rect & { readonly holdsDigits: boolean; readonly position: string; readonly tab: number })
-      | null
-  }
-
-  /** Reads where the bar's words, glyphs and count are. */
-  const readBar = (page: Page): Promise<BarLayout> =>
-    page.evaluate(() => {
-      const probe = document.createElement('div')
-      probe.style.paddingLeft = 'var(--gap-2)'
-      document.body.append(probe)
-      const gap = parseFloat(getComputedStyle(probe).paddingLeft)
-      probe.remove()
-      const bar = document.querySelector('.m-tabbar') as HTMLElement
-      const edges = (box: DOMRect): Rect => ({ left: box.left, right: box.right, top: box.top, bottom: box.bottom })
-      const tabs = Array.from(bar.querySelectorAll<HTMLElement>('.m-tab'))
-      const badge = bar.querySelector<HTMLElement>('.m-tab-badge')
-      return {
-        gap,
-        form: bar.getAttribute('data-form'),
-        bar: edges(bar.getBoundingClientRect()),
-        tabs: tabs.map((tab) => {
-          const label = tab.querySelector('.m-tab-label') as HTMLElement
-          const range = document.createRange()
-          range.selectNodeContents(label)
-          const glyph = tab.querySelector('.m-tab-glyph svg')
-          return {
-            name: label.textContent ?? '',
-            word: edges(range.getBoundingClientRect()),
-            glyph: glyph === null ? null : edges(glyph.getBoundingClientRect())
-          }
-        }),
-        badge:
-          badge === null
-            ? null
-            : {
-                ...edges(badge.getBoundingClientRect()),
-                holdsDigits: badge.scrollWidth <= badge.clientWidth + 0.5 && badge.scrollHeight <= badge.clientHeight + 0.5,
-                position: getComputedStyle(badge).position,
-                tab: tabs.findIndex((tab) => tab.contains(badge))
-              }
-      }
-    })
-
-  /** Whether two boxes share any area, to within half a pixel. */
-  const overlap = (a: Rect, b: Rect): boolean =>
-    a.left < b.right - 0.5 && b.left < a.right - 0.5 && a.top < b.bottom - 0.5 && b.top < a.bottom - 0.5
-
-  /**
-   * What is too close at `width`, in words. A word keeps a gap from the screen's edges and from the
-   * word beside it, and a glyph keeps clear of its own word. The count holds its digits, stays inside
-   * the bar and the screen, and keeps clear of its own word; where `beside` says it has a place of
-   * its own beside the glyph, it is also clear of the glyph and starts where the glyph ends.
-   */
-  const crowding = (seen: BarLayout, width: number, at: string, beside: boolean): string[] => {
-    const problems: string[] = []
-    // A bar read as empty, or with the count on another tab, would pass every check below.
-    if (seen.tabs.length !== 4) problems.push(`${at}: the bar was read with ${seen.tabs.length} tabs`)
-    if (seen.badge?.tab !== 0) problems.push(`${at}: the count is on tab ${(seen.badge?.tab ?? -1) + 1}, not the first`)
-    for (const [index, tab] of seen.tabs.entries()) {
-      const { word, name, glyph } = tab
-      if (word.left < seen.gap - 0.5) problems.push(`${at}: ${name} is ${word.left.toFixed(1)} px from the left edge`)
-      if (width - word.right < seen.gap - 0.5) problems.push(`${at}: ${name} is ${(width - word.right).toFixed(1)} px from the right edge`)
-      for (const other of seen.tabs.slice(index + 1)) {
-        const sameRow = word.top < other.word.bottom - 0.5 && other.word.top < word.bottom - 0.5
-        if (!sameRow) continue
-        // Whichever starts first is the one on the left; two that start together are as close as can be.
-        const [left, right] = word.left <= other.word.left ? [tab, other] : [other, tab]
-        if (right.word.left - left.word.right < seen.gap - 0.5) {
-          problems.push(`${at}: ${left.name} and ${right.name} are ${(right.word.left - left.word.right).toFixed(1)} px apart`)
-        }
-      }
-      if (glyph !== null && overlap(glyph, word)) problems.push(`${at}: the glyph of ${name} runs into its word`)
-      if (seen.badge !== null && seen.badge.tab === index) {
-        const count = seen.badge
-        if (overlap(count, word)) problems.push(`${at}: the badge runs into the word ${name}`)
-        if (beside && glyph !== null) {
-          if (overlap(count, glyph)) problems.push(`${at}: the badge is over the glyph`)
-          if (count.left < glyph.right - 0.5) problems.push(`${at}: the badge starts ${(glyph.right - count.left).toFixed(1)} px before the glyph ends`)
-          if (count.position !== 'static') problems.push(`${at}: the badge is ${count.position}, not in the row beside the glyph`)
-        }
-      }
-    }
-    if (seen.badge !== null) {
-      const count = seen.badge
-      if (!count.holdsDigits) problems.push(`${at}: the badge does not hold its digits`)
-      if (count.top < seen.bar.top - 0.5 || count.bottom > seen.bar.bottom + 0.5) problems.push(`${at}: the badge is outside the bar`)
-      if (count.left < -0.5 || count.right > width + 0.5) problems.push(`${at}: the badge is outside the screen`)
-    }
-    return problems
-  }
-
   // A label that fills its tab touches the edge of the screen or the word beside it, and a count that
   // is larger than its circle runs over the glyph: neither shows at one width in the cases above, since
   // each is a width at which the bar's last form fits, so every width from a narrow phone to a wide one
@@ -2615,6 +2675,7 @@ test.describe("the phone's tab bar", () => {
     const forms = new Set<string | null>()
     for (let width = 320; width <= 480; width += 10) {
       await onPhone(page, 'android', { width, height: 844, scale: '200%' })
+      await expectRootSize(page, '200%')
       await expect(page.getByRole('navigation', { name: 'Sections' })).toBeVisible()
       // The first tab has a count to show, which is what the badge's checks are about.
       await expect(page.locator('.m-tab-badge')).toBeVisible()
@@ -2630,10 +2691,11 @@ test.describe("the phone's tab bar", () => {
   })
 
   // A short landscape screen has no room for a label under every tab, so each glyph sits beside its
-  // label, and its count beside the glyph, in every form of the bar. The screens are the short ones
-  // a phone turns to (the narrowest and the widest, and a step of 26 px between), at the text sizes a
-  // person sets: the count is beside its glyph and clear of its word, and no word touches the edge of
-  // the screen or the word beside it.
+  // label, and its count beside the glyph, in the forms the bar takes there: one row, and two rows of
+  // two. A tab to a row is the portrait bar's last form, and the cases with the widest face reach it.
+  // The screens are the short ones a phone turns to (the narrowest and the widest, and a step of 26 px
+  // between), at the text sizes a person sets: the count is beside its glyph and clear of its word, and
+  // no word touches the edge of the screen or the word beside it.
   for (const surface of ['ios', 'android'] as const) {
     test(`keeps every label, glyph and the badge clear at each width of a short landscape screen, on ${surface}`, async ({ page }) => {
       const failures: string[] = []
@@ -2643,6 +2705,7 @@ test.describe("the phone's tab bar", () => {
         for (const height of [320, 412]) {
           for (let width = 568; width <= 932; width += 26) {
             await onPhone(page, surface, { width, height, scale })
+            await expectRootSize(page, scale)
             await expect(page.getByRole('navigation', { name: 'Sections' })).toBeVisible()
             await expect(page.locator('.m-tab-badge')).toBeVisible()
             const seen = await readBar(page)
@@ -2655,6 +2718,7 @@ test.describe("the phone's tab bar", () => {
       expect(failures, 'where a label, a glyph or the badge is too close').toEqual([])
       expect(sizes, 'the sizes looked at').toBeGreaterThan(50)
       expect(forms.has('row'), 'a size at which the bar is one row').toBe(true)
+      expect(forms.has('pairs'), 'a size at which the bar is two rows of two').toBe(true)
     })
   }
 })

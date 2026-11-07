@@ -251,6 +251,11 @@
  * screen: a label sits one gap from its glyph, the smaller of the two, and the glyph has no margin
  * of its own. A bold wide enough to cut a label in two columns on the narrowest phone, at the largest
  * text, is what takes a tab to a row of its own, and not the room a count and a gap would have taken.
+ *
+ * A word keeps a gap (`--gap-2`) from the edge of the screen in every form: the tabs of the row are
+ * padded by it, the tabs of the column by more, and the bar of the pairs by it, since the columns
+ * share the room that is left and each tab's words are centred in its own. The bar is measured with
+ * that padding, so the pairs are the form only where the labels still show whole inside it.
  */
 .m-tabbar[data-form] {
   grid-auto-flow: row;
@@ -258,6 +263,7 @@
 
 .m-tabbar[data-form='pairs'] {
   grid-template-columns: repeat(2, minmax(0, auto));
+  padding-inline: calc(var(--safe-left) + var(--gap-2)) calc(var(--safe-right) + var(--gap-2));
 }
 
 .m-tabbar[data-form='column'] {
