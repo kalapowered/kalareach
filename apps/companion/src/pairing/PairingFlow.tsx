@@ -23,7 +23,7 @@ import {
   type RefObject
 } from 'react'
 
-import { ServiceAddress, spokenAddress } from '../components/ServiceAddress'
+import { sayingAddresses, ServiceAddress, spokenAddress } from '../components/ServiceAddress'
 import { Button, Card, Switch } from '../components/ui'
 import { useApp } from '../app/state'
 import {
@@ -446,7 +446,7 @@ export function PairingFlow({
             </div>
             {pasteFailure !== null ? (
               <p className="small danger-text" role="alert" data-testid="paste-failure">
-                {failureWords(pasteFailure, service, 'code', failedFrom).sentence}
+                {sayingAddresses(failureWords(pasteFailure, service, 'code', failedFrom).sentence, [service])}
               </p>
             ) : null}
             {pasteFailure === 'camera_denied' ? (
@@ -688,7 +688,7 @@ function Ended({
         Pairing did not finish
       </h1>
       <p role="alert" data-testid="failure-sentence">
-        {failureSentence(failure, service, mode, reading)}
+        {sayingAddresses(failureSentence(failure, service, mode, reading), [service])}
       </p>
       <div className="row">
         <Button data-wraps

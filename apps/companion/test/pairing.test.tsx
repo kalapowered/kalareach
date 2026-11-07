@@ -14,7 +14,7 @@ import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
 import type { AttemptState, FailureKind, ConfirmationRequest } from '../src/host/port'
 import { failureWords } from '../src/pairing/words'
-import { heardIn, readAloud, regionsOf } from './live-regions'
+import { heardIn, readAloud, regionsOf, shown } from './live-regions'
 
 function start(initialPlace: Place = { view: 'pairing' }): { controls: FakeHostControls } {
   const { port, controls } = fakeHost()
@@ -168,8 +168,12 @@ describe('pairing with a host', () => {
     for (const kind of kinds) {
       attempt(controls, ended(kind, 3))
       const sentence = await screen.findByTestId('failure-sentence')
-      expect(sentence.textContent).toBe(
+      expect(shown(sentence)).toBe(
         `${failureWords(kind, 'reach.kala.to').sentence} 3 tries left on this device.`
+      )
+      // The alert says the service as words, wherever its sentence names it.
+      expect(readAloud(sentence)).toBe(
+        `${failureWords(kind, 'reach dot kala dot to').sentence} 3 tries left on this device.`
       )
     }
     attempt(controls, ended('declined', null))
@@ -187,8 +191,12 @@ describe('pairing with a host', () => {
       mode: 'code',
       service: 'pair.example.org'
     })
-    expect((await screen.findByTestId('failure-sentence')).textContent).toBe(
+    const sentence = await screen.findByTestId('failure-sentence')
+    expect(shown(sentence)).toBe(
       "pair.example.org could not be reached. Check this device's connection and try again. 4 tries left on this device."
+    )
+    expect(readAloud(sentence)).toBe(
+      "pair dot example dot org could not be reached. Check this device's connection and try again. 4 tries left on this device."
     )
   })
 

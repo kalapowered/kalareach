@@ -7,7 +7,7 @@
  * it as words in its place: "reach dot kala dot to".
  */
 
-import type { ReactNode } from 'react'
+import { Fragment, type ReactNode } from 'react'
 
 /**
  * An address as a person says it aloud: each dot is the word "dot", each colon of an IPv6 literal
@@ -32,6 +32,36 @@ function sayColons(groups: string): string {
 
 function withPort(words: string, port: string | undefined): string {
   return port === undefined ? words : `${words} port ${port}`
+}
+
+/**
+ * A sentence of words that names addresses, for a live region: each of `hosts` in `text` is drawn as
+ * written and hidden from a screen reader, which is told the address as words in its place. A sentence
+ * that names none is the text itself.
+ */
+export function sayingAddresses(
+  text: string,
+  hosts: readonly (string | null | undefined)[]
+): ReactNode {
+  const named = [...new Set(hosts.filter((host): host is string => host !== null && host !== undefined && host !== ''))]
+  if (named.length === 0) return text
+  // The longest first, so that an address that begins another is not cut short.
+  const pattern = new RegExp(
+    `(${named
+      .sort((a, b) => b.length - a.length)
+      .map((host) => host.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('|')})`
+  )
+  return text.split(pattern).map((part, at) =>
+    at % 2 === 0 ? (
+      part
+    ) : (
+      <Fragment key={at}>
+        <span className="visually-hidden spoken-form">{spokenAddress(part)}</span>
+        <span aria-hidden="true">{part}</span>
+      </Fragment>
+    )
+  )
 }
 
 /** The address, written for the eye and spoken for a screen reader. `testId` marks the written form. */

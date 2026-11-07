@@ -19,6 +19,7 @@ import { ThemeChooser } from '../src/components/ui'
 import { fakeHost } from '../src/host/fake'
 import type { SettingsView } from '../src/host/port'
 import { applyMode } from '../src/theme-init'
+import { readAloud } from './live-regions'
 
 describe('the colour mode', () => {
   // The document is the page's one place for the mode, and a case leaves it as it chose.
@@ -290,6 +291,11 @@ describe('settings sync in the account sheet', () => {
     })
     expect(controls.settings.syncTurnedOn).toBe(1)
     expect(within(card).getByTestId('settings-sync-status')).toHaveTextContent('reach.kala.to')
+    // The live region says where the settings are kept as words, and a screen reader reads no dotted form.
+    expect(readAloud(within(card).getByTestId('settings-sync-status'))).toContain(
+      'Your settings are kept in step through reach dot kala dot to.'
+    )
+    expect(readAloud(within(card).getByTestId('settings-sync-status'))).not.toContain('reach.kala.to')
     expect(within(card).queryByTestId('settings-sync-turn-on')).toBeNull()
     expect(within(card).getByTestId('settings-sync-status')).toHaveFocus()
 
