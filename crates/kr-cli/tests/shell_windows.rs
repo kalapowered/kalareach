@@ -245,8 +245,18 @@ impl Profiles {
     }
 }
 
+/// Writes a line to the log of the run for a person to read. A failed write does not panic, which
+/// `eprintln!` does: a panic in a drop while another is unwinding ends the process, and the profiles
+/// a drop is putting back stay as the case left them.
+fn note(line: &str) {
+    use std::io::Write as _;
+
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
 impl Drop for Profiles {
     fn drop(&mut self) {
+        // Each profile that is not as it was, and why.
         let mut unrestored = Vec::new();
         for (path, before) in &self.files {
             let restored = match before {
@@ -256,19 +266,23 @@ impl Drop for Profiles {
                     other => other,
                 },
             };
-            if let Err(error) = &restored {
-                eprintln!("PROFILE NOT RESTORED: {}: {error}", path.display());
-            }
             // What is there now, read back, is what decides whether the profile came back.
             let now = std::fs::read(path).ok();
-            if restored.is_err() || now != *before {
-                unrestored.push(path.display().to_string());
+            match &restored {
+                Err(error) => unrestored.push(format!("{}: {error}", path.display())),
+                Ok(()) if now != *before => {
+                    unrestored.push(format!(
+                        "{}: it reads back as something else",
+                        path.display()
+                    ));
+                }
+                Ok(()) => {}
             }
-            eprintln!(
+            note(&format!(
                 "profile after: {} sha256={}",
                 path.display(),
                 fingerprint(path)
-            );
+            ));
         }
         // The directories this case made, innermost first, and only while they are empty.
         for directory in &self.made {
@@ -277,20 +291,24 @@ impl Drop for Profiles {
         if unrestored.is_empty() {
             return;
         }
-        // The copies are the only place the original bytes are, so they stay.
+        // The copies are the only place the original bytes are, so they stay, with a record of what
+        // was not put back.
         let kept = self.copies.take().map(tempfile::TempDir::keep);
-        eprintln!(
+        let report = format!(
             "PROFILES NOT RESTORED: {}; the copies of what they held are in {kept:?}",
-            unrestored.join(", ")
+            unrestored.join("; ")
         );
+        if let Some(kept) = &kept {
+            let _ = std::fs::write(kept.join(NOT_RESTORED), &report);
+        }
+        note(&report);
         // A case that is already failing is not made to panic twice.
-        assert!(
-            std::thread::panicking(),
-            "the profiles {} are not as they were; the copies are in {kept:?}",
-            unrestored.join(", ")
-        );
+        assert!(std::thread::panicking(), "{report}");
     }
 }
+
+/// The file in the kept copies that says which profiles were not put back.
+const NOT_RESTORED: &str = "NOT-RESTORED.txt";
 
 /// A host whose PowerShell package is published and whose daemon reads it, and the account's
 /// profiles as they were.
@@ -2390,4 +2408,92 @@ fn an_integrity_level_is_named_by_its_sid_whatever_the_language() {
         ),
         "the words do not make a level"
     );
+}
+
+/// Two files for `Profiles` to put back, one it cannot (a folder stands where the file was) and one
+/// it can, with the copies it keeps and the folder they are in.
+fn profiles_one_of_which_cannot_be_put_back()
+-> (Profiles, PathBuf, PathBuf, PathBuf, tempfile::TempDir) {
+    let place = tempfile::tempdir().expect("a folder for the files");
+    let blocked = place.path().join("blocked.ps1");
+    std::fs::create_dir(&blocked).expect("a folder where the profile was");
+    let changed = place.path().join("changed.ps1");
+    std::fs::write(&changed, b"what the case wrote").expect("a profile the case changed");
+    let copies = tempfile::Builder::new()
+        .prefix("kr-profile-copies-")
+        .tempdir()
+        .expect("a folder for the copies");
+    let kept = copies.path().to_path_buf();
+    std::fs::write(kept.join("profile-0"), b"the saved bytes").expect("a copy");
+    let profiles = Profiles {
+        files: vec![
+            (blocked.clone(), Some(b"the saved bytes".to_vec())),
+            (changed.clone(), Some(b"what it was".to_vec())),
+        ],
+        made: Vec::new(),
+        copies: Some(copies),
+    };
+    (profiles, blocked, changed, kept, place)
+}
+
+#[test]
+fn profiles_that_cannot_be_put_back_fail_the_case_with_the_reason_and_keep_the_copies() {
+    let (profiles, blocked, changed, kept, _place) = profiles_one_of_which_cannot_be_put_back();
+    let reason = std::fs::write(&blocked, b"x")
+        .expect_err("a folder cannot be written as a file")
+        .to_string();
+
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(profiles)))
+        .expect_err("a profile that is not put back fails the case");
+
+    let message = failure
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        message.contains(&blocked.display().to_string()) && message.contains(&reason),
+        "the failure names the profile and why it was not put back: {message}"
+    );
+    assert!(
+        !message.contains(&changed.display().to_string()),
+        "and not a profile that was put back: {message}"
+    );
+    assert_eq!(
+        std::fs::read(&changed).expect("the profile"),
+        b"what it was",
+        "the profile that could be put back is, whatever happened to the other"
+    );
+    assert_eq!(
+        std::fs::read(kept.join("profile-0")).expect("the copy is kept"),
+        b"the saved bytes"
+    );
+    let record = std::fs::read_to_string(kept.join(NOT_RESTORED)).expect("the record is kept");
+    assert!(
+        record.contains(&blocked.display().to_string()) && record.contains(&reason),
+        "the kept copies say what was not put back and why: {record}"
+    );
+    std::fs::remove_dir_all(&kept).expect("the kept copies are removed");
+}
+
+#[test]
+fn profiles_that_cannot_be_put_back_do_not_make_a_failing_case_panic_twice() {
+    let (profiles, _blocked, _changed, kept, _place) = profiles_one_of_which_cannot_be_put_back();
+
+    // A second panic in a drop while the first unwinds ends this process, so a case that gets to
+    // the end of this assertion shows there was none.
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = profiles;
+        panic!("the case failed on its own");
+    }))
+    .expect_err("the case fails");
+
+    assert_eq!(
+        failure.downcast_ref::<&str>().copied(),
+        Some("the case failed on its own")
+    );
+    assert!(
+        kept.join(NOT_RESTORED).exists(),
+        "and the record of what was not put back is kept all the same"
+    );
+    std::fs::remove_dir_all(&kept).expect("the kept copies are removed");
 }
