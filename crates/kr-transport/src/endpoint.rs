@@ -734,7 +734,7 @@ fn fallback_nameservers() -> Vec<iroh::dns::NameserverConfig> {
     servers
 }
 
-/// Returns the transport configuration every KalaReach connection uses.
+/// Returns the transport configuration every KalaReach peer connection uses.
 ///
 /// The keepalive and the idle timeout are the section 23 values. Setting them here rather than per
 /// connection means a connection cannot be opened without them.
@@ -749,14 +749,19 @@ fn transport_config() -> QuicTransportConfig {
         // than only by the application's own accounting: past this, a write waits instead of
         // handing more bytes to a queue nothing can drain.
         .send_window(MAX_SEND_QUEUE_BYTES as u64)
-        // One datagram per send. Some kernels (Linux before 6.11) refuse a segmented send on a
-        // device without transmit checksum offload: the Android emulator's Wi-Fi, some phones'
-        // cellular and Wi-Fi drivers, some Linux NICs. The socket layer then stops batching, but
-        // iroh 1.4.1 reads its limit once, when a connection is created, so a connection already
-        // open keeps asking for batches that are all refused: whenever it has more than one
-        // datagram to send at a time its stream data can stall for tens of seconds, or for good,
-        // while single datagrams still pass. Remove this, the transport guide's "Datagrams" bullet
-        // and `tests/segmentation.rs` once iroh reads the limit at every send (iroh issue 4555).
+        // One datagram per send. Some kernels refuse a segmented send on some devices and routes,
+        // for example Linux before 6.11 on a device without transmit checksum offload (the Android
+        // emulator's Wi-Fi, some phones' cellular and Wi-Fi drivers, some Linux NICs), Linux on an
+        // IPsec policy route, and Windows, which has its own refusal. The socket layer then stops
+        // batching, but iroh 1.4.1 reads its limit once, when a connection is created, so a
+        // connection already open keeps asking for batches that are all refused: whenever it has
+        // more than one datagram to send at a time its stream data can stall for tens of seconds,
+        // or for good, while single datagrams still pass (iroh issues 4555 and 4647).
+        //
+        // Removal condition: when an iroh release this project takes reads the segmentation limit
+        // after a refused send, turn offload back on, keep `tests/segmentation.rs` with its product
+        // assertion changed to expect the batches its control connection shows, and update the
+        // transport guide's "Datagrams" bullet.
         .enable_segmentation_offload(false)
         .build()
 }

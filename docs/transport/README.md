@@ -538,12 +538,20 @@ through.
   the same frames over a local socket.
 * Inactivity: 30 seconds without traffic declares the transport unavailable. A mobile suspension
   that trips it is a normal disconnect.
-* Datagrams: every connection sends one UDP datagram per send and never a segmented batch (UDP
-  segmentation offload is off). Some kernels refuse a segmented send, for example Linux before
-  6.11 on a device without transmit checksum offload. A connection that was open when that first
-  happened would go on sending batches, and whenever it had more than one datagram to send at a
-  time its stream data could then stall for tens of seconds or for good, while single datagrams
-  could still keep it inside the inactivity threshold.
+* Datagrams: every KalaReach peer connection sends one UDP datagram per send and never a segmented
+  batch (UDP segmentation offload is off). The one exception is iroh's own address-discovery
+  probes to each relay, which use iroh's default configuration with offload on and which this crate
+  cannot reach. They are short, and a stall in one could affect only address discovery. Some
+  kernels refuse a segmented send on some devices and routes, for example Linux before 6.11 on a
+  device without transmit checksum offload, Linux on an IPsec policy route, and Windows, which has
+  its own refusal. A connection that was open when that first happened would go on sending
+  batches, and whenever it had more than one datagram to send at a time its stream data could then
+  stall for tens of seconds or for good, while single datagrams could still keep it inside the
+  inactivity threshold. The setting has two costs. On Linux, Android and Windows a bulk transfer
+  makes up to ten times as many send calls, because a batch held up to ten datagrams. On a relayed
+  path each datagram travels as its own relay frame, so the relay's 256-item send queue holds 256
+  datagrams where batches let it hold up to 2,560. On macOS and iOS this build already sent one
+  datagram per send, so nothing changes there.
 * Reconnect: jittered exponential backoff from 250 ms to 30 seconds, drawn with full jitter so a
   fleet that lost the same relay does not return in step. The ladder resets after a connection that
   lasted at least the inactivity threshold; a connection that died immediately does not reset it.
