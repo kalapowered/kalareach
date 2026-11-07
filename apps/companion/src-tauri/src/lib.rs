@@ -335,6 +335,11 @@ fn build_account(
     use kr_client::services::{HttpDeadlines, HttpService, ServiceHttp, managed_response_limits};
     use tauri::Emitter as _;
 
+    // A launch that counts or clears the keychain's groups settles nothing the account left there.
+    #[cfg(all(debug_assertions, target_os = "ios"))]
+    if device_probe::leaves_the_keychain_alone() {
+        return Err("this launch only looks at the keychain".to_owned());
+    }
     let client = if cfg!(mobile) {
         Client::Mobile
     } else {
@@ -488,7 +493,7 @@ fn watch_drops(app: &tauri::AppHandle) {
 fn open_pairing(app: &tauri::AppHandle) {
     // A launch that counts or clears the keychain's groups finds them as they were, so it makes
     // none of the keys the records hold.
-    #[cfg(all(debug_assertions, mobile))]
+    #[cfg(all(debug_assertions, target_os = "ios"))]
     if device_probe::leaves_the_keychain_alone() {
         return;
     }
