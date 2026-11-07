@@ -127,10 +127,13 @@ struct Churn {
     /// How many removals of it wait for their answers now.
     removing: usize,
     /// How many registrations of it the host has answered as registered, less the removals it has
-    /// answered as having removed one. It is the client's account, from the answers it has read, of
-    /// the registrations the host stands behind: answers that arrive out of their order leave it
-    /// above what the host holds, and never below, so a count of nothing is the client's word that
-    /// no registration of the identifier is live.
+    /// answered as having removed one that no registration overlapped. It is the client's account,
+    /// from the answers it has read, of the registrations the host stands behind, and it is never
+    /// below what the host holds, so a count of nothing is the client's word that no registration
+    /// of the identifier is live. A removal that a registration overlapped is not taken off it: the
+    /// host answers a removal for the registration it was about, which can be one that was still
+    /// being made and was refused, and nothing in the answer says which. The count stays above what
+    /// the host holds then, which keeps the queue, until the client is dropped.
     live: usize,
 }
 
@@ -308,12 +311,13 @@ impl Removing {
             Some(ResponseBody::Refused { .. }) => true,
             _ => false,
         };
-        if removed {
+        let overlapped = self.registering_before || churn.started != self.started_before;
+        if removed && !overlapped {
+            // With no registration under way when the request began and none started since, the
+            // removal is about a registration the client read the answer to, which is one of those
+            // it counts.
             churn.live = churn.live.saturating_sub(1);
-            let overlapped = self.registering_before || churn.started != self.started_before;
-            if !overlapped {
-                self.sink.forget(self.binding_id);
-            }
+            self.sink.forget(self.binding_id);
         }
         churn.removing = churn.removing.saturating_sub(1);
         if churn.idle() {
