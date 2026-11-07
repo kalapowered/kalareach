@@ -278,11 +278,14 @@ fn record_a_plain_program_and_a_nested_pseudo_console() {
     );
 }
 
-/// What `wsl.exe` printed for `arguments`, which it writes in UTF-16. A call that does not succeed
-/// stops the case, so that no decision is made on the text of a failure.
+/// What `wsl.exe` printed for `arguments`, which it writes in UTF-16 unless its environment asks
+/// for UTF-8 with `WSL_UTF8=1`: the variable is taken out of the call's environment, so that the
+/// text is always the encoding it is read in. A call that does not succeed stops the case, so that
+/// no decision is made on the text of a failure.
 fn wsl_text(arguments: &[&str]) -> String {
     let output = Command::new(system32("wsl.exe"))
         .args(arguments)
+        .env_remove("WSL_UTF8")
         .output()
         .expect("wsl runs");
     assert!(
@@ -566,6 +569,30 @@ fn a_directory_made_for_a_case_that_then_fails_is_removed_with_what_is_in_it() {
     std::fs::remove_dir_all(&parent).expect("the parent directory is removed");
     assert!(failed.is_err(), "the step failed");
     assert!(!left, "the directory and the key in it are left behind");
+}
+
+/// The distribution lists are read as the UTF-16 that `wsl.exe` writes even when the environment
+/// asks it for UTF-8. It reads the lists and starts nothing; run it with `WSL_UTF8=1` set, which is
+/// what it is about.
+#[test]
+#[ignore = "reads the Windows Subsystem for Linux's lists with WSL_UTF8=1 set, on a machine that has a distribution; it runs with --ignored by hand"]
+fn the_distribution_lists_are_read_when_the_environment_asks_wsl_for_utf8() {
+    assert!(
+        std::env::var("WSL_UTF8").is_ok_and(|value| value == "1"),
+        "this case is about an environment that asks wsl.exe for UTF-8; set WSL_UTF8=1"
+    );
+    let registered = wsl_text(&["--list", "--quiet"]);
+    let names = listed_names(&registered);
+    assert!(
+        !names.is_empty(),
+        "wsl.exe lists a distribution: {registered:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .all(|name| name.chars().all(|letter| letter.is_ascii_graphic())),
+        "every name reads as the plain text it is: {names:?}"
+    );
 }
 
 /// UTF-16 text, little-endian, as `wsl.exe` writes it.
