@@ -343,3 +343,63 @@ async fn a_voice_change_whose_claim_cannot_be_begun_is_told_the_outcome_is_unkno
         .expect_err("a claim that cannot be begun is not one this change may be made under");
     assert_eq!(unbegun.code(), ErrorCode::OutcomeUnknown, "{unbegun}");
 }
+
+/// A `grant.create` under a fresh action. The repeat of an unfinished one reads what the first
+/// attempt wrote and never looks at the request's parameters, so they are left empty.
+fn grant_create_request(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
+    MutationRequest {
+        method: Method::GrantCreate.into(),
+        params: ParamsValue::empty(),
+        ..revoke_request(temp)
+    }
+}
+
+/// KR-REQ-09.09: a repeat of a `grant.create` whose claim is unfinished, asked of a registry that
+/// cannot read what the first attempt wrote, is told the outcome is unknown, by both lookups. The
+/// claim shows the first attempt began, and a transient word would say that nothing took effect and
+/// have the share sent again as though nothing had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_of_an_unfinished_share_whose_grants_cannot_be_read_is_told_the_outcome_is_unknown()
+ {
+    let (temp, controller) = daemon().await;
+    let actor_id = ActorId::new("local:test").expect("a principal");
+    let mutation = grant_create_request(&temp);
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("the registry opens beside the daemon's own handle");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    let digest = kr_protocol::digest::mutation_digest(&mutation, &actor_id).expect("digests it");
+    registry
+        .execute(
+            "INSERT INTO authority_receipts
+                 (actor_id, action_id, payload_digest, claimed_at_ms, result, recorded_at_ms,
+                  refusal_code, refusal_detail)
+             VALUES (?1, ?2, ?3, 1, NULL, NULL, NULL, NULL)",
+            rusqlite::params![
+                actor_id.as_str(),
+                mutation.action_id.get().as_bytes().to_vec(),
+                digest.as_bytes().to_vec(),
+            ],
+        )
+        .expect("the claim is written with nothing recorded under it");
+
+    registry
+        .execute_batch("ALTER TABLE grants RENAME TO grants_aside;")
+        .expect("the grants cannot be read");
+    let waiting = told(
+        controller
+            .retained_authority_answer(&actor_id, &mutation)
+            .await,
+    );
+    let not_waiting = told(controller.retained_authority_change(&actor_id, &mutation));
+    registry
+        .execute_batch("ALTER TABLE grants_aside RENAME TO grants;")
+        .expect("the grants can be read again");
+    assert_eq!(waiting.code, ErrorCode::OutcomeUnknown, "{waiting:?}");
+    assert_eq!(
+        not_waiting.code,
+        ErrorCode::OutcomeUnknown,
+        "{not_waiting:?}"
+    );
+}

@@ -3568,7 +3568,9 @@ a run the journal does not hold. Where the daemon cannot read such a record it c
 action from a repeat, and tells both the same. That holds as well in the attention, project,
 change-set and transfer stores where the door found no record and the store then fails to read it
 at the point the action is performed, and in the registry's receipts where an authority or voice
-change claims its action and the claim cannot be read or its transaction cannot be begun. A transfer action repeated with no usable
+change claims its action and the claim cannot be read or its transaction cannot be begun. A
+`grant.create` repeated while its claim is unfinished is told the same when the registry cannot be
+read where the host looks for the grant and invitation the first attempt wrote. A transfer action repeated with no usable
 window is told the same when the daemon cannot read whether its claim is open. At the local door, a
 project action repeated with no usable window, because the window is one this connection never
 issued or one that has expired on it, is told what its journal holds for the action:
