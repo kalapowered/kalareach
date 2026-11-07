@@ -7,9 +7,10 @@
 //! both have a test target called `fixtures`, and only the executable tells them apart. The calls
 //! after the build, the listing and the run, have nothing to build unless a macro wrote a file while
 //! a crate compiled: Cargo takes that file for newer than the compile and builds the crate again in
-//! the listing. The build dates such a file before it began when `date_before` can tell that no two
-//! compiles of the crate read it at once. When it cannot, it leaves the file to Cargo, which builds
-//! the crate again, and the log says why. A listing that builds anyway says so in the log.
+//! the listing. The build dates such a file before it began when `date_before` can tell that no
+//! compile of the crate can have read it while another wrote it. When it cannot, it leaves the file
+//! to Cargo, which builds the crate again, and the log says why. A listing that builds anyway says
+//! so in the log.
 //!
 //! What the build names is what the run is held to. Every test binary it built is listed, by the
 //! step's own command with this program as Cargo's runner, and has to be run and read; a listing
@@ -1165,17 +1166,18 @@ fn dependency_file(name: &str, outputs: &[PathBuf], began: SystemTime) -> Option
     (written.len() == 1).then(|| written[0].clone())
 }
 
-/// Whether the compiles in `readers` could have run beside each other.
+/// Whether one of the compiles in `readers`, which all read one file, could have read it while
+/// another wrote it. Tauri's macro writes a file directly and only if it is not there, so a compile
+/// that finds it there while another is writing it can read part of it.
 ///
 /// Cargo compiles a unit as soon as the ones it needs are done, and a program or a test program
 /// needs the whole of its package's library, so it starts after the library's compile has ended.
-/// When the library is one of the readers it is the compile that wrote the file (Tauri's macro
-/// writes a file only if it is not there), and the programs find it whole and only read it, however
-/// many there are. The library's unit tests do not wait for the library, nor do two variants of the
-/// library (a profile with `panic = "abort"` builds one beside the one the tests link), nor, when
-/// the library does not read the file, two programs or test programs: any of them may write the file
-/// while another reads it.
-fn may_have_overlapped(readers: &[Unit]) -> bool {
+/// When the library is one of the readers it is the compile that wrote the file, and the programs
+/// find it whole and only read it, however many there are. The library's unit tests do not wait for
+/// the library, nor do two variants of the library (a profile with `panic = "abort"` builds one
+/// beside the one the tests link), nor, when the library does not read the file, two programs or test
+/// programs: any of them may write the file while another reads it.
+fn may_have_been_read_while_written(readers: &[Unit]) -> bool {
     let count = |wanted: Unit| readers.iter().filter(|unit| **unit == wanted).count();
     let (libraries, with_tests, others) = (
         count(Unit::Library),
@@ -1198,8 +1200,8 @@ struct Dating {
 }
 
 /// Gives each content-addressed file in `outputs`, the output directories of the build scripts of
-/// this tree's packages, that the build wrote and that no two compiles can have read at once, a
-/// time a second before `began`.
+/// this tree's packages, that the build wrote and that no compile can have read while another wrote
+/// it, a time a second before `began`.
 ///
 /// Cargo takes a crate for out of date when a file the compile read is newer than the start of that
 /// compile. The macros of some crates write a file into the build script's output directory while
@@ -1214,9 +1216,10 @@ struct Dating {
 /// present can read part of it. So a file is dated only when it is named by a digest of 64
 /// hexadecimal digits, with an extension or none ([`is_named_by_digest`]: Tauri names what its
 /// macros write so, and a complete file holds the bytes its name stands for), and only when the
-/// compiles that read it (rustc's dependency files say which) cannot have run beside each other
-/// ([`may_have_overlapped`]): then the compile that wrote it is the one that read it, or the one
-/// that read it started after the writer was done. Any other file keeps its time, and Cargo
+/// compiles that read it (rustc's dependency files say which, by the directory's name and the
+/// file's) cannot have read it while another wrote it ([`may_have_been_read_while_written`]): then
+/// the compile that wrote it is the one that read it, or the ones that read it started after the
+/// writer was done. Any other file keeps its time, and Cargo
 /// compiles the crate again in the next call, as it did before. A time only goes back, to before
 /// the build, and only for a file the build wrote. The compile that wrote the file is told by
 /// nothing but the dependency files, so a package with a compile whose dependency file cannot be
@@ -1278,8 +1281,10 @@ fn date_before(outputs: &[(String, PathBuf)], compiled: &[Compiled], began: Syst
                     ))
                 } else if readers.is_empty() {
                     Some("no compile's dependency file names it".to_owned())
-                } else if may_have_overlapped(&readers) {
-                    Some(format!("{readers:?} read it and could have overlapped"))
+                } else if may_have_been_read_while_written(&readers) {
+                    Some(format!(
+                        "{readers:?} read it, and one could have read it while another wrote it"
+                    ))
                 } else {
                     None
                 };
@@ -1346,7 +1351,7 @@ mod tests {
     use super::{
         Binary, Compiled, ERROR_BYTES, LISTING_BEGIN, LISTING_END, Unit, date_before,
         dependency_file, ends_of, ends_of_root_resolved, file_name, is_count, is_named_by_digest,
-        libtest, may_have_overlapped, read_listing, reconcile, unrecorded,
+        libtest, may_have_been_read_while_written, read_listing, reconcile, unrecorded,
     };
     use crate::workspace::{TargetId, TargetKind};
 
@@ -1760,23 +1765,38 @@ mod tests {
     fn compiles_of_a_package_that_could_have_run_beside_each_other_are_told() {
         // Programs and test programs link the library, so they start after it has ended: a file
         // that the library read is whole when they read it, however many of them there are.
-        assert!(!may_have_overlapped(&[Unit::Library]));
-        assert!(!may_have_overlapped(&[Unit::Library, Unit::Other]));
-        assert!(!may_have_overlapped(&[
+        assert!(!may_have_been_read_while_written(&[Unit::Library]));
+        assert!(!may_have_been_read_while_written(&[
+            Unit::Library,
+            Unit::Other
+        ]));
+        assert!(!may_have_been_read_while_written(&[
             Unit::Library,
             Unit::Other,
             Unit::Other
         ]));
-        assert!(!may_have_overlapped(&[Unit::Other]));
-        assert!(!may_have_overlapped(&[Unit::LibraryTests]));
+        assert!(!may_have_been_read_while_written(&[Unit::Other]));
+        assert!(!may_have_been_read_while_written(&[Unit::LibraryTests]));
         // The library's unit tests do not wait for it, nor do two programs that it did not read
         // the file for wait for each other.
-        assert!(may_have_overlapped(&[Unit::Library, Unit::LibraryTests]));
-        assert!(may_have_overlapped(&[Unit::Other, Unit::Other]));
-        assert!(may_have_overlapped(&[Unit::LibraryTests, Unit::Other]));
+        assert!(may_have_been_read_while_written(&[
+            Unit::Library,
+            Unit::LibraryTests
+        ]));
+        assert!(may_have_been_read_while_written(&[
+            Unit::Other,
+            Unit::Other
+        ]));
+        assert!(may_have_been_read_while_written(&[
+            Unit::LibraryTests,
+            Unit::Other
+        ]));
         // Two compiles of the library itself are two variants of it, as `panic = "abort"` makes
         // beside the library the tests link, and nothing makes one wait for the other.
-        assert!(may_have_overlapped(&[Unit::Library, Unit::Library]));
+        assert!(may_have_been_read_while_written(&[
+            Unit::Library,
+            Unit::Library
+        ]));
     }
 
     #[test]
