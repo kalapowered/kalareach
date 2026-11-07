@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -757,7 +758,7 @@ impl Created {
 impl Drop for WorkerHost {
     /// Ends the daemon before the tree goes.
     ///
-    /// The daemon holds `singleton.lock` until the daemon value itself is gone, and that is an open
+    /// The daemon holds `controller.lock` until the daemon value itself is gone, and that is an open
     /// file that shares nothing: the removal of the folder it is in is refused for as long as it is
     /// held, and the tree would stay in the temporary folder for good. So the tasks that serve are
     /// cancelled, the host lets go of the daemon, and the tree is let go of once the lock can be
@@ -817,6 +818,16 @@ struct TreeGone(PathBuf);
 impl Drop for TreeGone {
     fn drop(&mut self) {
         if std::thread::panicking() {
+            // The case's own failure is the one that is reported, and a tree the teardown kept on
+            // purpose is not removed from under what it started. What is left is said all the same,
+            // without a second panic.
+            if self.0.exists() {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{} is left in the temporary folder, and the case is failing",
+                    self.0.display()
+                );
+            }
             return;
         }
         let begun = std::time::Instant::now();
