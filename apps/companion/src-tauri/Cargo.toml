@@ -14,7 +14,10 @@ name = "companion_tauri"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 # `main` calls the library and nothing else, so the program has no tests of its own: a unit-test
-# build of it would compile the same source a second time.
+# build of it would compile the same source a second time. The conformance runner depends on this:
+# it finds the program's dependency file by its name, and with a unit-test build there are two files
+# of that name, so it cannot tell which is the program's, leaves every file the library's macro
+# wrote to Cargo, and the listing builds this crate again.
 [[bin]]
 name = "kalareach-companion"
 path = "src/main.rs"
