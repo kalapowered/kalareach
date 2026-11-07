@@ -10511,7 +10511,9 @@ fn an_exchange_under_a_bearer_never_leaves_for_a_gateway_taken_out_of_the_list_b
     assert_eq!(recorder.asked().len(), 2);
 
     let directory = tempfile::tempdir().expect("a directory");
-    a_module_in(directory.path()).replace_gateways(&gateways, &[]);
+    let module = a_module_in(directory.path());
+    assert!(module.attach_gateways(Arc::clone(&gateways)));
+    module.replace_gateways(&[]);
     let before = recorder.asked().len();
     assert!(matches!(
         senders.begin_renewal(&origin, id),
@@ -10658,7 +10660,7 @@ fn a_gateway_taken_out_of_the_list_as_the_sweep_settles_its_debt_keeps_the_debt(
                 .recv()
                 .expect("the sweep reached the pause before it ended");
             if remove {
-                module.replace_gateways(&gateways, &[]);
+                module.replace_gateways(&[]);
             }
             release.send(()).expect("the sweep goes on");
             sweeping.join().expect("the sweep ends");
@@ -10707,7 +10709,7 @@ fn the_gateway_list_moves_while_the_journal_is_held() {
             // when the move ends, and when it panics, so a move that does not reach the pause
             // fails the case and does not hang it.
             let _closes_the_arrival = OnDrop(|| drop(module.pause_while_the_gateways_move()));
-            module.replace_gateways(&gateways, &[]);
+            module.replace_gateways(&[]);
         });
         arrived
             .recv()
@@ -10724,41 +10726,30 @@ fn the_gateway_list_moves_while_the_journal_is_held() {
     assert!(!module.journal_is_held(), "and the journal is free again");
 }
 
-/// KR-REQ-16.04: the list moves in the set the caller names, whether or not any is attached to the
-/// delivery service yet, and a set that is not the attached one is refused where assertions are
-/// on: the sweep would read a list the host no longer holds.
+/// KR-REQ-16.04: the list moves in the set attached to the delivery service, which is the one the
+/// sweep of owed revocations reads, and a move before any set is attached is refused: it would
+/// otherwise do nothing and leave the sweep reading a list nobody moved.
 #[test]
-fn a_move_of_the_gateway_list_moves_the_set_it_names() {
+fn a_move_of_the_gateway_list_moves_the_attached_set_and_is_refused_with_none() {
     use kr_controller::push::gateways::AllowedGateways;
 
     const LISTED: &str = "https://push.listed.invalid";
     let directory = tempfile::tempdir().expect("a directory");
     let module = a_module_in(directory.path());
-    let set = || {
-        Arc::new(AllowedGateways::new(
-            "https://reach.invalid",
-            &[LISTED.to_owned()],
-        ))
-    };
 
-    // Nothing attached yet: the set named is the one that moves.
-    let unattached = set();
-    module.replace_gateways(&unattached, &[]);
-    assert!(!unattached.allows(LISTED));
+    // Nothing attached yet: the move is refused, and not taken for done.
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        module.replace_gateways(&[]);
+    }));
+    assert!(refused.is_err(), "a move with no set attached did nothing");
 
-    // Attached: the same set moves.
-    let attached = set();
+    // Attached: that set moves.
+    let attached = Arc::new(AllowedGateways::new(
+        "https://reach.invalid",
+        &[LISTED.to_owned()],
+    ));
     assert!(module.attach_gateways(Arc::clone(&attached)));
-    module.replace_gateways(&attached, &[]);
-    assert!(!attached.allows(LISTED));
-
-    // Another set than the attached one is refused in a build with debug assertions.
-    if cfg!(debug_assertions) {
-        let other = set();
-        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            module.replace_gateways(&other, &[]);
-        }));
-        assert!(refused.is_err(), "a set that is not the attached one moved");
-        assert!(other.allows(LISTED), "and it was left as it was");
-    }
+    assert!(attached.allows(LISTED), "the control: it is listed");
+    module.replace_gateways(&[]);
+    assert!(!attached.allows(LISTED), "the attached set moved");
 }

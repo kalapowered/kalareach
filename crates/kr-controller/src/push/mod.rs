@@ -440,28 +440,24 @@ impl DeliveryModule {
         self.gateways.set(gateways).is_ok()
     }
 
-    /// Makes `listed` the gateways in force in `gateways`, in the journal's lock. This is the one
-    /// way the set moves.
+    /// Makes `listed` the gateways in force, in the journal's lock. This is the one way the set
+    /// moves.
     ///
     /// The sweep of owed revocations decides in that lock whether a debt may be given up, and it
     /// never gives one up for a gateway that is not in force. The list moves under the same lock,
     /// so a change of the list is never between the sweep's reading of it and its settling of a
-    /// debt.
+    /// debt. It moves the set attached here, which is the one the sweep reads, so a set the sweep
+    /// does not read cannot be moved by mistake.
     ///
-    /// `gateways` is the set the caller reads, and it is the one attached here: a caller that
-    /// moved another would leave the sweep reading a list the host no longer holds. A build with
-    /// debug assertions refuses that.
-    pub fn replace_gateways(
-        &self,
-        gateways: &std::sync::Arc<gateways::AllowedGateways>,
-        listed: &[String],
-    ) {
-        debug_assert!(
-            self.gateways
-                .get()
-                .is_none_or(|attached| std::sync::Arc::ptr_eq(attached, gateways)),
-            "the gateways moved are not the ones attached to the delivery service"
-        );
+    /// # Panics
+    ///
+    /// Panics when no gateways are attached: the composition root attaches them when it builds the
+    /// service, and a move before that would leave the sweep reading a list nobody moved.
+    pub fn replace_gateways(&self, listed: &[String]) {
+        let gateways = self
+            .gateways
+            .get()
+            .expect("the gateways are attached when the delivery service is built");
         let _journal = self
             .producer
             .lock()
