@@ -3780,8 +3780,9 @@ fn opened_members_as(
 struct OpenedGeneration {
     /// The descriptor, as the host recorded it when it sealed the generation: it is not encrypted.
     descriptor: Vec<u8>,
-    /// The manifest, decrypted and verified, as canonical bytes.
-    manifest: Vec<u8>,
+    /// The whole manifest object, decrypted and verified: the signed manifest and every member key
+    /// wrap, which `open_archive` keeps to itself.
+    payload: kr_protocol::archive::ManifestPayload,
     /// Every member in the order the manifest names them, with its plaintext. Two members may share
     /// a name here: nothing is collected by name.
     members: Vec<(String, Vec<u8>)>,
@@ -3828,6 +3829,12 @@ fn opened_generation_as(
         &manifest,
     )
     .expect("the recovery recipient opens the generation");
+    let payload = manifest_payload_as(reader, sender.public(), &descriptor, &manifest);
+    assert_eq!(
+        &payload.manifest,
+        opened.manifest(),
+        "the payload read here is the manifest the archive opened"
+    );
     let members = opened
         .objects()
         .iter()
@@ -3844,10 +3851,56 @@ fn opened_generation_as(
         })
         .collect();
     OpenedGeneration {
-        manifest: kr_cbor::to_canonical_vec(opened.manifest()).expect("a manifest encodes"),
+        payload,
         descriptor: descriptor_bytes,
         members,
     }
+}
+
+/// The manifest object of a generation as `reader` decrypts it, whole: `open_archive` hands out the
+/// signed manifest and keeps the member key wraps, so a scan of everything the object holds opens
+/// it here, under the context `open_archive` checks the manifest key's wrap against.
+fn manifest_payload_as(
+    reader: &kr_crypto::backup::ArchiveReader<'_>,
+    sender: &kr_protocol::scalars::StoredEnvelopeKey,
+    descriptor: &kr_protocol::archive::ArchiveDescriptor,
+    encrypted_manifest: &[u8],
+) -> kr_protocol::archive::ManifestPayload {
+    use kr_crypto::backup::ArchiveReader;
+    use kr_protocol::archive::{
+        KeyWrapContext, KeyWrapFormat, KeyWrapPurpose, MANIFEST_PAYLOAD_LIMITS,
+    };
+
+    let reader_key_id = reader.key_id();
+    let wrap = kr_crypto::archive::manifest_wrap_for(descriptor, &reader_key_id)
+        .expect("a manifest key wrap addressed to the reader");
+    let expected = KeyWrapContext {
+        format: KeyWrapFormat::V1,
+        purpose: KeyWrapPurpose::ManifestKey,
+        archive_id: descriptor.archive_id,
+        backup_generation: descriptor.backup_generation,
+        object_id: descriptor.encrypted_manifest.object_id,
+        encrypted_object_hash: descriptor.encrypted_manifest.encrypted_object_hash,
+        sender_key_id: kr_crypto::backup::recipient_key_id(sender),
+        recipient_key_id: reader_key_id,
+    };
+    let key = match reader {
+        ArchiveReader::Device(keys) => {
+            kr_crypto::archive::unwrap_object_key(keys, sender, wrap, &expected)
+        }
+        ArchiveReader::Recovery(recovery) => {
+            kr_crypto::archive::unwrap_object_key_with_recovery(recovery, sender, wrap, &expected)
+        }
+    }
+    .expect("the manifest key opens");
+    let plaintext = kr_crypto::archive::decrypt_object(
+        &key,
+        &descriptor.encrypted_manifest,
+        encrypted_manifest,
+    )
+    .expect("the manifest object decrypts");
+    kr_cbor::from_canonical_slice(plaintext.expose(), &MANIFEST_PAYLOAD_LIMITS)
+        .expect("a manifest payload")
 }
 
 /// A generation is made of a closed session and the configuration document, uploaded, published,
@@ -4031,30 +4084,33 @@ fn x25519_secret_of(seed: &[u8]) -> Vec<u8> {
 
 /// KR-REQ-20.17, the host's own backup production only, and only what this case reads: a generation
 /// the daemon makes holds the members the convention names, each of a kind the material table lets
-/// a backup carry, and the objects the case opens hold no private key this host keeps. The host
-/// keeps two sets of four keys (transport, which is the reusable endpoint key; authorisation, which
-/// is the control-signing key; stored envelope; and notification preview): the controller identity
-/// that signs its workers' tokens, and the device keys it pairs with. It also keeps a backup
-/// writer's key. The case reads all nine seeds from the secret store the daemon wrote them to, and
-/// for the four X25519 keys (whose private key is made from the seed by a hash, so that the seed is
-/// not the key) the private key too, checked against the public key the pair has. It reads, each on
-/// its own, the descriptor as the host recorded it when it sealed the generation (it is not
-/// encrypted), the signed manifest decrypted and verified, and each member's plaintext, so a member
-/// that shares a name with another is read as well; and it asserts the service holds no object
-/// beyond the manifest and the members. Each key is looked for as bytes, in hexadecimal of either
-/// case, in either base64 alphabet wherever it lies in a longer value, and as a list of numbers.
-/// The controls are the scan finding each form of a seed where one is put, in a member of the same
-/// name as another, and the session's own output in the session's member, so the scan reads what
-/// the members hold. Not shown here: the member key wraps in the decrypted manifest object, which
-/// the reader does not hand out, so an unused wrap (its sealed keys and its clear context fields)
-/// could hold a key and pass; the publication the service holds, whose fields beyond the
-/// descriptor (the writer's key identifier, the time and the signature) are not read, and the
-/// descriptor as the service holds it, which is not read apart from the host's record; the stored
-/// bytes of the objects and the requests the daemon sent the service, which are ciphertext and are
-/// not read (the plaintexts are read through the opened archive); a key in a binary list of
-/// integers, split, reversed or otherwise transformed; that a restore refuses a member under a
-/// reserved name or a revoked grant, which the restore cases show; or the other data paths of backup
-/// and recovery material.
+/// a backup carry, and nothing the daemon makes or sends for it holds a private key this host keeps.
+/// The host keeps two sets of four keys (transport, which is the reusable endpoint key;
+/// authorisation, which is the control-signing key; stored envelope; and notification preview): the
+/// controller identity that signs its workers' tokens, and the device keys it pairs with. It also
+/// keeps a backup writer's key. The case reads all nine seeds from the secret store the daemon wrote
+/// them to, and for the four X25519 keys (whose private key is made from the seed by a hash, so
+/// that the seed is not the key) the private key too, checked against the public key the pair has.
+/// It reads, each on its own: the descriptor as the host recorded it when it sealed the generation
+/// (it is not encrypted); the manifest object decrypted whole, as a `ManifestPayload`, with the
+/// signed manifest and every member key wrap (the sealed keys and the clear context fields of the
+/// wraps among them, so an unused wrap is read too), once as the bytes of its canonical encoding and
+/// once as the JSON a client would see; each member's plaintext, so a member that shares a name
+/// with another is read as well; the publication as the service holds it, with its descriptor, its
+/// writer's key identifier, its time and its signature; and every request the daemon sent the
+/// service, each body, the content beside it and the account token. It asserts the service holds no
+/// object beyond the manifest and the members, and that the descriptor in the publication is the
+/// one the host recorded. Each key is looked for as bytes, in hexadecimal of either case, in either
+/// base64 alphabet wherever it lies in a longer value, and as a list of numbers. The controls are
+/// the scan finding each form of a seed where one is put, in a member of the same name as another,
+/// in the sealed key of an unused wrap and in a clear context field of one, in both encodings of
+/// the payload; the session's own output in the session's member; the writer's key identifier in the
+/// publication; and the manifest object's ciphertext in the contents the daemon sent, so the scan
+/// reads what was sent. Not shown here: the stored bytes of the objects, which are read only as
+/// the ciphertext the daemon sent (a key sealed inside them is read through the opened archive); a
+/// key in a binary list of integers, split, reversed or otherwise transformed; that a restore
+/// refuses a member under a reserved name or a revoked grant, which the restore cases show; or the
+/// other data paths of backup and recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_keeps() {
     use kr_crypto::backup::{Material, may_back_up, member_material};
@@ -4254,23 +4310,129 @@ async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_kee
         "the scan does not read the session's member"
     );
 
-    // Every object of the generation, each read on its own.
+    // The manifest object whole: an unused wrap that holds a key, in its sealed key or in a clear
+    // context field, is found in both encodings of the payload.
+    let wraps = &generation.payload.member_key_wraps;
+    assert!(
+        wraps.len() >= generation.members.len(),
+        "the manifest object holds a wrap for each member"
+    );
+    let probe_hash: [u8; 32] = probe.as_slice().try_into().expect("a 32-byte seed");
+    for (where_, in_the_sealed_key) in [
+        ("the sealed key of an unused wrap", true),
+        ("a clear context field of an unused wrap", false),
+    ] {
+        let mut planted = generation.payload.clone();
+        let mut unused = wraps[0].clone();
+        if in_the_sealed_key {
+            unused.ciphertext = kr_protocol::scalars::Bytes::new(probe.clone());
+        } else {
+            unused.context.encrypted_object_hash =
+                kr_protocol::scalars::Digest256::from_bytes(probe_hash);
+        }
+        planted.member_key_wraps.push(unused);
+        let encodings = payload_encodings(&planted);
+        assert_eq!(encodings.len(), 2);
+        assert_eq!(
+            carried_keys(&encodings, &kept[..1]).len(),
+            2,
+            "the scan of the manifest object misses a key in {where_}"
+        );
+    }
+    assert_eq!(
+        carried_keys(&payload_encodings(&generation.payload), &kept[..1]).len(),
+        0,
+        "the unplanted payload carries the key the controls plant"
+    );
+
+    // The publication as the service holds it, and the descriptor in it.
+    let publication = web
+        .publication(&archive_id().to_string(), 1)
+        .expect("the service holds the publication");
+    let held_publication: kr_protocol::archive::BackupGenerationPublication =
+        serde_json::from_value(publication.clone()).expect("a publication");
+    assert_eq!(
+        kr_cbor::to_canonical_vec(&held_publication.payload.descriptor)
+            .expect("a descriptor encodes"),
+        generation.descriptor,
+        "the service holds the descriptor the host recorded"
+    );
+    let publication = serde_json::to_vec(&publication).expect("a publication encodes");
+    assert!(
+        carried_in(&publication, rig.writer.key_id().as_bytes()).is_some(),
+        "the scan does not read the publication's writer"
+    );
+
+    // Every request the daemon sent the service: the document, the content beside it, the token.
+    let mut sent = Vec::new();
+    for (at, arrived) in web.arrived().iter().enumerate() {
+        let to = format!("request {at} to {}", arrived.path);
+        sent.push((
+            format!("the body of {to}"),
+            serde_json::to_vec(&arrived.body).expect("a body encodes"),
+        ));
+        if let Some(content) = &arrived.content {
+            sent.push((format!("the content of {to}"), content.clone()));
+        }
+        if let Some(token) = &arrived.token {
+            sent.push((format!("the token of {to}"), token.clone().into_bytes()));
+        }
+    }
+    let manifest_object = web
+        .stored(
+            &archive_id().to_string(),
+            &held_publication
+                .payload
+                .descriptor
+                .encrypted_manifest
+                .object_id
+                .to_string(),
+        )
+        .expect("the service holds the manifest object");
+    assert!(
+        sent.iter().any(|(_, bytes)| bytes
+            .windows(manifest_object.len())
+            .any(|window| window == manifest_object.as_slice())),
+        "the scan does not read the contents the daemon sent"
+    );
+
+    // Everything the generation is, each read on its own.
     let mut clear = vec![
-        ("the descriptor".to_owned(), generation.descriptor.clone()),
-        ("the manifest".to_owned(), generation.manifest.clone()),
+        (
+            "the descriptor the host recorded".to_owned(),
+            generation.descriptor.clone(),
+        ),
+        ("the publication the service holds".to_owned(), publication),
     ];
     assert!(!clear[0].1.is_empty() && !clear[1].1.is_empty());
+    clear.extend(payload_encodings(&generation.payload));
     clear.extend(
         generation
             .members
             .iter()
             .map(|(name, bytes)| (format!("the member {name}"), bytes.clone())),
     );
+    clear.extend(sent);
     assert_eq!(
         carried_keys(&clear, &kept),
         Vec::<String>::new(),
-        "an object of the generation holds a private key the host keeps"
+        "something the host made or sent for the generation holds a private key the host keeps"
     );
+}
+
+/// The manifest object's payload in the two encodings a scan reads it in: the canonical bytes it was
+/// sealed as, and the JSON a client sees.
+fn payload_encodings(payload: &kr_protocol::archive::ManifestPayload) -> Vec<(String, Vec<u8>)> {
+    vec![
+        (
+            "the manifest object as canonical bytes".to_owned(),
+            kr_cbor::to_canonical_vec(payload).expect("a payload encodes"),
+        ),
+        (
+            "the manifest object as JSON".to_owned(),
+            serde_json::to_vec(payload).expect("a payload encodes"),
+        ),
+    ]
 }
 
 /// A journal of an earlier build for a closed session, at the schema that build wrote: with the

@@ -994,6 +994,18 @@ impl ServiceWeb {
             .count()
     }
 
+    /// The publication one collection holds for `generation`, as the service stores it.
+    #[must_use]
+    pub fn publication(&self, archive: &str, generation: u64) -> Option<serde_json::Value> {
+        self.state
+            .lock()
+            .expect("the state")
+            .collections
+            .get(archive)
+            .and_then(|collection| collection.generations.get(&generation))
+            .map(|(_, publication)| publication.clone())
+    }
+
     /// The generations one collection holds.
     #[must_use]
     pub fn generations(&self, archive: &str) -> Vec<u64> {
