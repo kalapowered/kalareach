@@ -39,7 +39,8 @@ use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_controller::testing::HeldTimer;
 use kr_crypto::backup::{
-    ArchivePlan, ArchiveRecipients, CollectionKind, ObjectSource, seal_archive, stage_object,
+    ArchivePlan, ArchiveRecipients, CollectionKind, Material, ObjectSource, seal_archive,
+    stage_object,
 };
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
@@ -1004,6 +1005,9 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
             .is_some_and(|standing| standing.contains("generation 1")),
         "{plan}"
     );
+    // The five members that are not restored, each by the object the plan names it by, with the
+    // table's reason for its kind; the unknown name has a reason of its own, and none of the three
+    // members that are restored is among them.
     let not_restored = plan["not_restored"].as_array().expect("refused");
     assert_eq!(
         not_restored.len(),
@@ -1011,12 +1015,53 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
         "an endpoint key, a control key, host authority, a revoked grant and an unknown name are \
          shown as not restored"
     );
-    for refused in not_restored {
+    let object_of = |name: &str| {
+        let at = held
+            .iter()
+            .position(|(member, _)| member == name)
+            .expect("a member of the archive");
+        object(0x20 + u8::try_from(at).expect("few members"))
+            .get()
+            .to_string()
+    };
+    let reason_of = |material| {
+        kr_crypto::backup::may_restore(material)
+            .because()
+            .expect("the table refuses it")
+    };
+    let table_reasons = [
+        ("keys/endpoint/device", Material::EndpointPrivateKey),
+        ("keys/control/main", Material::ControlSigningPrivateKey),
+        ("authority/grant-1", Material::HostGrantAuthority),
+        ("grants/revoked/grant-2", Material::Grant { revoked: true }),
+    ];
+    for (name, material) in table_reasons {
+        let entry = not_restored
+            .iter()
+            .find(|refused| refused["object"] == object_of(name).as_str())
+            .unwrap_or_else(|| panic!("{name} is shown as not restored: {plan}"));
+        assert_eq!(
+            entry["because"],
+            reason_of(material),
+            "{name} is refused for its kind's reason"
+        );
+    }
+    let unknown = not_restored
+        .iter()
+        .find(|refused| refused["object"] == object_of("other/unknown.bin").as_str())
+        .unwrap_or_else(|| panic!("the unknown name is shown as not restored: {plan}"));
+    assert!(
+        table_reasons
+            .iter()
+            .all(|(_, material)| unknown["because"] != reason_of(*material)),
+        "a name no host archive carries is not given a kind's reason: {plan}"
+    );
+    for name in [held[0].0.as_str(), held[1].0.as_str(), held[2].0.as_str()] {
         assert!(
-            refused["because"]
-                .as_str()
-                .is_some_and(|because| !because.is_empty()),
-            "{plan}"
+            not_restored
+                .iter()
+                .all(|refused| refused["object"] != object_of(name).as_str()),
+            "{name} is restored, not refused: {plan}"
         );
     }
 
