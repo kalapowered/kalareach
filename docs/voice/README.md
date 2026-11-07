@@ -82,7 +82,8 @@ a reader can tell which is which without knowing where the value came from.
 The coordinator returns the selection and its results **to the paired client**. The client is what
 sends them to the managed service, as bounded context requests. The host does not reach the managed
 service with content at all; the only calls it makes are reading the terms the service publishes,
-creating a call and ending one.
+creating a call and ending one. When a call's control first attaches, the phone reads the
+selection for the call's first session and sends exactly that as the call's opening context.
 
 ## What the managed operator can see
 
@@ -223,23 +224,45 @@ the host has seen one, and once the command has ended, no active application is 
 selection carries the reason for withholding it instead. If a model has written any text about the
 session this is also read; this text is marked as written by a local model which may be incorrect,
 and as written at the start of the session, so a grant whose history begins after the start of the
-session is not shown it. The model's text will not be read if a name is pinned. Summaries of pending
-decisions, and messages, are not read as the daemon does not store semantic history for workers; the
-selection carries that reason as withheld. Content of either class selected by the person
-(environment variables, scrollback contents) will not be provided: the companion selects neither,
-and this daemon has no place to read them from, so a request that selects one gets nothing for it
-and no withheld entry. File contents and attachment bytes are no class at all, so no request can
-select them.
+session is not shown it. The model's text will not be read if a name is pinned.
 
-What a model wrote and what the description host saw leave the daemon only while the privacy mode is
-in the same state as it was when they were read. Privacy mode removes both when it is turned on, and
-the daemon reads neither while it is on. If the privacy mode is turned on whilst the context is
-being read the context will be read again, and the answer carries neither. The context will be read
+The session's worker holds the other half, and the daemon reads it from the worker with the reads
+the worker already serves, over the daemon's own link and within the one time a read of a session
+is given. The semantic messages are the entries of the session's agents, each as its kind and its
+text at the moment it was observed; the last twenty across the agents, oldest first, are the ones
+carried. The decisions waiting on a person are the questions a verified source asked and the
+approvals a decoder gave meaning to, each as its wording or its upstream method and whether it was
+verified. The request behind an approval is not read: it can hold anything the agent was asked to
+do. Nothing else of the worker is read, so its output, its screen, its files, its environment and
+its attachments never come into the context. A part the worker cannot give is reported as withheld,
+with its reason, and the rest is still served.
+
+Both halves go into one selection. The shared history filter is applied to every item, then one
+cap, one set of secret patterns and one set of counts cover everything the selection carries. A
+decision that was created before the grant's history bound stays withheld, though the specification
+would admit a current decision that the grant names. That is the narrower reading, and a voice
+grant names none.
+
+Of the four things the default leaves out (file contents, environment variables, raw terminal
+scrollback and attachment bytes), a person may select two: environment variables and terminal
+scrollback. The companion selects neither, and this daemon has no place to read either from, so a
+request that selects one gets nothing for it and no withheld entry. File contents and attachment
+bytes are no class at all, so no request can select them. The patterns that strip secrets are the
+product's own and are not configurable at this level.
+
+What a model wrote, what the description host saw and what the worker holds leave the daemon only
+while the privacy mode is in the same state as it was when they were read. Privacy mode removes the
+first two when it is turned on, and a worker removes its semantic history and records none while it
+is on. The daemon reads none of them while it is on. After privacy mode is turned off the daemon
+carries only what was produced after the moment it last changed, because a worker of an earlier
+release keeps its history through the change; what that keeps out is counted. If the privacy mode
+is turned on whilst the context is being read the context will be read again, and the answer
+carries none of it. The context will be read
 at most three times; if the privacy mode keeps changing the request will be refused as transient and
 the device will request it again. The answer is checked once, when the read ends, so the privacy
 mode may still be turned on between that check and the write to the device. The receipt for a voice
 read of a session carries the pinned name and the facts the daemon holds itself, but no model text
-or description host information.
+or description host information, and it passes the same secret patterns as a selection does.
 
 ## A voice session is not a terminal session
 

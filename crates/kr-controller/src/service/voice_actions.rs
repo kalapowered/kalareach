@@ -168,6 +168,8 @@ impl Controller {
         self: &Arc<Self>,
         session_id: SessionId,
     ) -> Result<crate::voice::SessionSnapshot> {
+        // One time for the session read and for what the worker holds beside it.
+        let deadline = tokio::time::Instant::now() + self.voice_budgets().read;
         let params = ParamsValue::from_typed(&SessionReadParams { session_id })
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let read: SessionReadResult = parse(
@@ -176,11 +178,218 @@ impl Controller {
                 .await?,
         )?;
         let described = self.voice_description_of(&read.session).await?;
-        Ok(crate::voice::snapshot_with(
-            &read.session,
-            session_id,
-            &described,
-        ))
+        let half = self.voice_worker_half(session_id, deadline).await;
+        Ok(
+            crate::voice::snapshot_with(&read.session, session_id, &described)
+                .with_worker_half(half),
+        )
+    }
+
+    /// What the session's worker holds that the default context carries: the decisions waiting on
+    /// a person and the semantic messages of its agents.
+    ///
+    /// Read over this daemon's own link to the worker, with the three reads the worker already
+    /// serves (`agent.instances`, `question.read` and `agent.snapshot`) and nothing else. It is
+    /// read wide and filtered once, in [`crate::voice::filtered`], under the requesting device's
+    /// grant, as the session and its description are. A part that cannot be read is one withheld
+    /// run with its reason, and the rest is still served.
+    ///
+    /// While privacy mode is on nothing is read. After it was on, only what was produced after it
+    /// last changed is carried, so that a worker that kept its history through the change cannot
+    /// give it up to a call.
+    async fn voice_worker_half(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        deadline: tokio::time::Instant,
+    ) -> crate::voice::WorkerHalf {
+        use crate::voice::{PRIVACY_ON, WorkerHalf};
+
+        // Without waiting: a change being made is a state that has moved, and nothing is read.
+        let published = self
+            .privacy
+            .state()
+            .try_reading()
+            .map(|reading| reading.published());
+        let Some(published) = published.filter(|published| !published.private) else {
+            return WorkerHalf::not_read(PRIVACY_ON);
+        };
+        let boundary = (published.generation.get() > 0).then(|| self.privacy.changed_at_ms().get());
+        let Some(worker) = self.directory.lock().await.get(session_id).cloned() else {
+            return WorkerHalf::not_read("this session has no worker to read");
+        };
+
+        let mut half = WorkerHalf::default();
+        let mut decisions = Vec::new();
+        let instances = self
+            .voice_agent_instances(&worker, session_id, deadline)
+            .await;
+        match &instances {
+            Ok((_, resources)) => {
+                decisions.extend(resources.iter().filter_map(crate::voice::approval));
+            }
+            Err(()) => half.could_not_read("the session's pending approvals"),
+        }
+        match self
+            .ask_worker::<_, kr_protocol::question::QuestionReadResult>(
+                &worker,
+                deadline,
+                Method::QuestionRead,
+                &kr_protocol::question::QuestionReadParams {
+                    session_id,
+                    question_id: kr_protocol::scalars::Nullable::null(),
+                    include_resolved: false,
+                },
+            )
+            .await
+        {
+            Some(read) => {
+                decisions.extend(read.questions.iter().filter_map(crate::voice::question))
+            }
+            None => half.could_not_read("the session's pending questions"),
+        }
+        half.decisions = crate::voice::decisions(decisions);
+
+        if let Ok((agents, _)) = &instances {
+            let mut histories = Vec::new();
+            for agent in agents {
+                match self
+                    .voice_agent_history(&worker, session_id, *agent, deadline)
+                    .await
+                {
+                    Some(entries) => histories.push(entries),
+                    None => half.could_not_read("an agent's recent messages"),
+                }
+            }
+            half.messages = crate::voice::messages(histories);
+        } else {
+            half.could_not_read("the session's agents");
+        }
+        half.after(boundary)
+    }
+
+    /// The live agent instances of a session and the approvals waiting on a person, paged to the
+    /// end. Errs, with nothing said of why, when the worker cannot give them.
+    async fn voice_agent_instances(
+        &self,
+        worker: &crate::directory::KnownWorker,
+        session_id: SessionId,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<
+        (
+            Vec<kr_protocol::ids::ApplicationInstanceId>,
+            Vec<kr_protocol::gateway::PendingResource>,
+        ),
+        (),
+    > {
+        use kr_protocol::recovery::{AgentInstancesParams, AgentInstancesResult};
+
+        let mut agents = Vec::new();
+        let mut resources = Vec::new();
+        let mut from = kr_protocol::scalars::Nullable::null();
+        for part in 0..crate::voice::MAX_HISTORY_PARTS {
+            let page: AgentInstancesResult = self
+                .ask_worker(
+                    worker,
+                    deadline,
+                    Method::AgentInstances,
+                    &AgentInstancesParams {
+                        session_id,
+                        agent_resources_from: from,
+                    },
+                )
+                .await
+                .ok_or(())?;
+            if part == 0 {
+                agents = page
+                    .agent_instances
+                    .instances
+                    .iter()
+                    .filter(|instance| instance.ended_at.as_ref().is_none())
+                    .map(|instance| instance.application_instance_id)
+                    .collect();
+            }
+            resources.extend(page.agent_resources.resources);
+            match page.agent_resources.continue_after.0 {
+                Some(after_resource_id) => {
+                    from = kr_protocol::scalars::Nullable::some(
+                        kr_protocol::projection::AgentResourceSnapshotContinuation {
+                            snapshot_id: page.agent_resources.snapshot_id,
+                            after_resource_id,
+                        },
+                    );
+                }
+                None => return Ok((agents, resources)),
+            }
+        }
+        Err(())
+    }
+
+    /// One agent's retained semantic history, paged to the end: a history has no tail read, and
+    /// the last twenty entries are the end of it. `None` when the worker cannot give it, or gives
+    /// more parts than a history can have.
+    async fn voice_agent_history(
+        &self,
+        worker: &crate::directory::KnownWorker,
+        session_id: SessionId,
+        application_instance_id: kr_protocol::ids::ApplicationInstanceId,
+        deadline: tokio::time::Instant,
+    ) -> Option<Vec<kr_protocol::agent::AgentSnapshotEntry>> {
+        use kr_protocol::agent::{AgentSnapshotParams, AgentSnapshotResult, AgentSubject};
+
+        let mut entries = Vec::new();
+        let mut from_node = kr_protocol::scalars::Nullable::null();
+        for _ in 0..crate::voice::MAX_HISTORY_PARTS {
+            let part: AgentSnapshotResult = self
+                .ask_worker(
+                    worker,
+                    deadline,
+                    Method::AgentSnapshot,
+                    &AgentSnapshotParams {
+                        subject: AgentSubject {
+                            session_id,
+                            application_instance_id,
+                        },
+                        from_node,
+                    },
+                )
+                .await?;
+            entries.extend(part.entries);
+            match part.continuation.0 {
+                Some(continuation) => {
+                    from_node = kr_protocol::scalars::Nullable::some(continuation.from_node);
+                }
+                None => return Some(entries),
+            }
+        }
+        None
+    }
+
+    /// Asks a session's worker one read over this daemon's own link, and gives the link back once
+    /// the answer, a refusal included, is read to its end. `None` when the link cannot be had or
+    /// the worker does not answer by `deadline` or refuses: a link that did not finish an exchange
+    /// is closed, not given back.
+    async fn ask_worker<P, R>(
+        &self,
+        worker: &crate::directory::KnownWorker,
+        deadline: tokio::time::Instant,
+        method: Method,
+        params: &P,
+    ) -> Option<R>
+    where
+        P: serde::Serialize + ?Sized,
+        R: kr_protocol::wire::WireMessage,
+    {
+        let mut link = tokio::time::timeout_at(deadline, self.worker_client(worker))
+            .await
+            .ok()?
+            .ok()?;
+        let level = link.client().level();
+        let answered = tokio::time::timeout_at(deadline, link.client().request(method, params))
+            .await
+            .ok()?
+            .ok()?;
+        link.give_back();
+        level.decode_value::<R>(&answered.ok()?).ok()
     }
 
     /// The display number of one session as a person says it, or nothing when this daemon holds

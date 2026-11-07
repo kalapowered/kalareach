@@ -46,6 +46,19 @@ pub struct SessionSnapshot {
     pub unavailable: Vec<WithheldRun>,
 }
 
+impl SessionSnapshot {
+    /// Adds what the session's worker holds: its decisions and its semantic messages, and what of
+    /// them could not be read. They are placed in the snapshot beside the daemon's own half, so
+    /// that one filter and one selection act on both.
+    #[must_use]
+    pub fn with_worker_half(mut self, half: super::WorkerHalf) -> Self {
+        self.pending_decisions = half.decisions;
+        self.recent_messages = half.messages;
+        self.unavailable.extend(half.unavailable);
+        self
+    }
+}
+
 /// What this host can say about one session, with the moment each fact was produced.
 ///
 /// The moment is the whole point. A grant's history lower bound is checked against the time
@@ -67,20 +80,16 @@ pub fn snapshot_of(summary: &SessionSummary, session_id: SessionId) -> SessionSn
         description: description_text(summary, None, false).map(at_creation),
         working_directory: (!summary.cwd.is_empty()).then(|| at_creation(summary.cwd.clone())),
         active_application: None,
+        // The worker's half is the worker's to give: a caller that has read it adds it with
+        // [`SessionSnapshot::with_worker_half`].
         pending_decisions: Vec::new(),
         recent_messages: Vec::new(),
         selected: Vec::new(),
         resources: vec![format!("session:{session_id}")],
-        unavailable: vec![
-            WithheldRun {
-                reason: "this host does not hold the worker's semantic history".to_owned(),
-                count: 0,
-            },
-            WithheldRun {
-                reason: "this host cannot say when the foreground last changed".to_owned(),
-                count: 1,
-            },
-        ],
+        unavailable: vec![WithheldRun {
+            reason: "this host cannot say when the foreground last changed".to_owned(),
+            count: 1,
+        }],
     }
 }
 
@@ -187,10 +196,11 @@ pub trait SessionFacts: Send + Sync + std::fmt::Debug {
     /// The state of privacy mode as it stands now, which a reading is noted under before it is
     /// made.
     ///
-    /// A snapshot carries a model's text and what the description host observed, and privacy mode
-    /// removes both when it is enabled. A source that cannot read the state without waiting, or at
-    /// all, answers a state that no change of privacy mode publishes, so that [`Self::unmoved`] of
-    /// it is false once the state can be read.
+    /// A snapshot carries a model's text, what the description host observed and what the
+    /// session's worker holds of its agents, and privacy mode removes all three when it is
+    /// enabled. A source that cannot read the state without waiting, or at all, answers a state
+    /// that no change of privacy mode publishes, so that [`Self::unmoved`] of it is false once the
+    /// state can be read.
     fn privacy(&self) -> Published;
 
     /// Whether privacy mode is still in the state `decided` and no change of it is being made.
