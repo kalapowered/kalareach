@@ -543,7 +543,8 @@ pub(crate) async fn ask_within<T>(
 }
 
 /// Asks for what the host lists, within the time [`ask_within`] gives and never past `deadline`: a
-/// challenge that ends sooner than the host is given to answer ends the wait for it.
+/// challenge that ends sooner than the host is given to answer ends the wait for it. `reading` says
+/// what the list is read for, which the words for a request the host's release cannot read follow.
 ///
 /// The error is the command's end, and the request changed nothing: the challenge had ended before
 /// the host was asked, the host did not answer in time, or the connection failed before it did,
@@ -553,6 +554,7 @@ pub(crate) async fn ask_within<T>(
 /// and so is a request the host's release cannot read, which was not written and says so.
 pub(crate) async fn ask_before<T>(
     deadline: tokio::time::Instant,
+    reading: ListRead,
     request: impl std::future::Future<Output = Result<T>>,
 ) -> Result<Result<T>> {
     let now = tokio::time::Instant::now();
@@ -562,7 +564,7 @@ pub(crate) async fn ask_before<T>(
     match tokio::time::timeout_at(deadline.min(now + ASK_WITHIN), request).await {
         Err(_) => Err(host_did_not_answer()),
         Ok(Err(CliError::Ipc(failure @ kr_ipc::IpcError::NotInLevel(_)))) => {
-            Ok(Err(request_not_written(&failure)))
+            Ok(Err(request_not_written(&failure, reading)))
         }
         Ok(Err(CliError::Ipc(failure))) => Err(connection_failed_before_it_answered(&failure)),
         Ok(answered) => Ok(answered),
@@ -576,7 +578,10 @@ pub(crate) async fn display_listed(
     read: impl std::future::Future<Output = Result<OwnerConfirmationPendingResult>>,
     request: &kr_protocol::pairing::OwnerConfirmationRequest,
 ) -> Result<Option<ConfirmationDisplay>> {
-    Ok(display_in(ask_before(deadline, read).await??, request))
+    Ok(display_in(
+        ask_before(deadline, ListRead::WhatIsShown, read).await??,
+        request,
+    ))
 }
 
 /// What the host's list of pending challenges shows for `request`, when it lists it.
@@ -600,17 +605,30 @@ fn challenge_ran_out() -> CliError {
     ))
 }
 
-/// What the command says when the host's release cannot read the request for what an owner device
-/// is shown: it was not written, and the connection stands. The confirmation itself was asked for
-/// and stands.
-fn request_not_written(failure: &kr_ipc::IpcError) -> CliError {
-    CliError::refused_in_its_own_words(
-        failure.code(),
-        Shown::said(
+/// What a command reads the host's list of pending challenges for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ListRead {
+    /// To say what an owner device is shown for the challenge.
+    WhatIsShown,
+    /// To wait until an owner device has answered the challenge.
+    TheAnswer,
+}
+
+/// What the command says when the host's release cannot read the request for the list, which
+/// `reading` says what it is for: it was not written, and the connection stands. The confirmation
+/// itself was asked for and stands.
+fn request_not_written(failure: &kr_ipc::IpcError, reading: ListRead) -> CliError {
+    let said = match reading {
+        ListRead::WhatIsShown => Shown::said(
             "the host's release cannot read the request for what an owner device is shown, so it \
              was not sent. Nothing was changed",
         ),
-    )
+        ListRead::TheAnswer => Shown::said(
+            "the host's release cannot read the request for the list, so it was not sent. Nothing \
+             was changed",
+        ),
+    };
+    CliError::refused_in_its_own_words(failure.code(), said)
 }
 
 /// What the command says when the connection fails before the host answers a request that changes
