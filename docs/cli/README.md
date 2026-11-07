@@ -2429,9 +2429,10 @@ earlier release does not, is refused with nothing written, because it would igno
 the daemon again after it writes, and says the list is in force only when the daemon reports it so.
 A gateway taken out of the list is then retired: the host stops using and renewing the credentials it
 holds for that gateway, forgets them, and asks the gateway to revoke each authorisation, again until
-it has (`docs/delivery/README.md`). A request that was already waiting for its connection to that
-gateway when the list changed can still leave the host for up to about ten seconds, which can be
-after the command has returned; no request that starts later does. When the daemon cannot put the
+it has or the gateway says it holds no such authorisation (`docs/delivery/README.md`). A request that
+was already waiting for its connection to that gateway when the list changed can still leave the
+host for up to about ten seconds, which can be after the command has returned; no request that
+starts later does. When the daemon cannot put the
 change into force, because it cannot write down the revocation it owes, for one, the command fails
 and says why, and the daemon's own report (`kr doctor`) says which gateways are in force. With
 neither `--set` nor `--clear` the command shows the gateways the daemon reports in force. It fails

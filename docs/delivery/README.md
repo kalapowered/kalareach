@@ -372,9 +372,12 @@ The host checks the set in three places.
   status question, a request to forget and a renewal for such a credential do not start, and a
   notification settles as revoked, as it does for a destination with no credential.
 - Every exchange under a bearer (a post, a status question, a request to forget, a renewal, and the
-  confirmation of a registration) is made through the same set when it starts. One that begins after
-  a gateway was taken out never leaves the host. One that began before it is carried out. A request
-  still waiting for its connection when the gateway is taken out can leave the host up to about ten
+  confirmation of a registration) is made through the same set when it starts. A request that
+  starts after a gateway was taken out never leaves the host. A request that started before it is
+  carried out. An exchange of two requests, a renewal (a nonce, then the renewal) or the
+  confirmation of a registration (a status question, then a nonce), is checked at each request: the
+  gate refuses the second one after a removal, so such an exchange ends there. A request still
+  waiting for its connection when the gateway is taken out can leave the host up to about ten
   seconds later, which can be after `kr host push-gateways` has said the list is in force: the
   transport waits five seconds for a connection and tries once more. One already written ends
   within twenty seconds, the longest the transport gives one exchange.
