@@ -195,6 +195,10 @@ pub struct PluginHost {
     /// connection has read an unbind and its task has not yet run.
     #[cfg(feature = "testing")]
     unbinding_hold: Arc<kr_plugin_service::hold::Hold>,
+    /// The pause the task of a call into a binding takes when it starts, which a test holds to
+    /// stand where the connection has read the call and its task has not yet run.
+    #[cfg(feature = "testing")]
+    calling_hold: Arc<kr_plugin_service::hold::Hold>,
 }
 
 impl core::fmt::Debug for PluginHost {
@@ -294,6 +298,8 @@ impl PluginHost {
             reserving_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
             #[cfg(feature = "testing")]
             unbinding_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
+            #[cfg(feature = "testing")]
+            calling_hold: Arc::new(kr_plugin_service::hold::Hold::default()),
         })
     }
 
@@ -360,6 +366,15 @@ impl PluginHost {
     #[must_use]
     pub fn hold_unbinds_before_they_run(&self) -> kr_plugin_service::hold::HoldHandle {
         self.unbinding_hold.set()
+    }
+
+    /// Holds the next call into a binding at the start of its task, for the tests of what a call
+    /// is about when its task runs after other requests were read: until the returned hold is
+    /// released the task stops there, with the connection long past reading the request.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_calls_before_they_run(&self) -> kr_plugin_service::hold::HoldHandle {
+        self.calling_hold.set()
     }
 
     /// Returns the host's own identity.
@@ -563,6 +578,10 @@ impl PluginHost {
             let served = Arc::clone(served);
             tokio::spawn(async move {
                 let _permit = permit;
+                #[cfg(feature = "testing")]
+                if called_binding(&request.body).is_some() {
+                    host.calling_hold.pause().await;
+                }
                 let body = host.answer(request.body, settled, &served).await;
                 // An answer that could not be delivered ends the connection. Leaving the reader
                 // waiting for the next request on a connection whose last answer never arrived
@@ -713,7 +732,7 @@ impl PluginHost {
                 binding_id,
                 deadline_ms,
             } => {
-                let binding = self.binding(served.owner, binding_id)?;
+                let binding = settled.binding_of(binding_id)?;
                 let result = binding
                     .snapshot(core::time::Duration::from_millis(deadline_ms))
                     .await;
@@ -730,7 +749,7 @@ impl PluginHost {
                     arguments,
                     deadline_ms,
                 } = *call;
-                let binding = self.binding(served.owner, binding_id)?;
+                let binding = settled.binding_of(binding_id)?;
                 let result = binding
                     .prepare_action(
                         wire::token_of(token),
@@ -751,7 +770,7 @@ impl PluginHost {
                 binding_id,
                 deadline_ms,
             } => {
-                let binding = self.binding(served.owner, binding_id)?;
+                let binding = settled.binding_of(binding_id)?;
                 let result = binding
                     .checkpoint(core::time::Duration::from_millis(deadline_ms))
                     .await;
@@ -764,7 +783,7 @@ impl PluginHost {
                 state,
                 deadline_ms,
             } => {
-                let binding = self.binding(served.owner, binding_id)?;
+                let binding = settled.binding_of(binding_id)?;
                 let result = binding
                     .restore(state, core::time::Duration::from_millis(deadline_ms))
                     .await;
@@ -785,7 +804,7 @@ impl PluginHost {
                 // that what a scrape looks like never reaches a component that was asked to
                 // interpret a request.
                 let scoped = native_request_of(&event)?;
-                let binding = self.binding(served.owner, binding_id)?;
+                let binding = settled.binding_of(binding_id)?;
                 let result = binding.decode_request(scoped, deadline).await;
                 called_of(result.map(|result| {
                     (
@@ -830,7 +849,7 @@ impl PluginHost {
                         Some(scoped)
                     }
                 };
-                let binding = self.binding(served.owner, binding_id)?;
+                let binding = settled.binding_of(binding_id)?;
                 let asked = request.request_id.clone();
                 let result = binding
                     .encode_response(
@@ -1308,15 +1327,7 @@ impl PluginHost {
     ) -> Result<Arc<crate::runtime::binding::BindingHandle>, (String, bool)> {
         self.runtime
             .binding(owner, BindingId::new(binding_id))
-            .ok_or_else(|| {
-                (
-                    RuntimeError::NoSuchBinding {
-                        binding: binding_id.to_string(),
-                    }
-                    .to_string(),
-                    false,
-                )
-            })
+            .ok_or_else(|| no_such_binding(binding_id))
     }
 }
 
@@ -1537,6 +1548,15 @@ impl Held {
     /// Returns when the registration's forwarder has ended, while this connection records it.
     fn ended_of(&self, incarnation: Incarnation) -> Option<Ended> {
         self.ends.get(&incarnation).cloned()
+    }
+
+    /// Returns the live binding this connection stands behind under an identifier now: the one a
+    /// call read now is about. A registration the connection stopped standing behind, because an
+    /// unbind has been read, is not one a worker can still ask anything of.
+    fn standing_binding(&self, binding_id: Uuid) -> Option<Arc<BindingHandle>> {
+        let handle = self.live.get(&binding_id)?;
+        self.stands(handle.incarnation())
+            .then(|| Arc::clone(handle))
     }
 
     /// Returns the registration this connection holds under an identifier now: the binding that is
@@ -1912,6 +1932,17 @@ fn refused(detail: String) -> (String, bool) {
     (detail, false)
 }
 
+/// The refusal for a call into a binding that the connection holds none of.
+fn no_such_binding(binding_id: Uuid) -> (String, bool) {
+    (
+        RuntimeError::NoSuchBinding {
+            binding: binding_id.to_string(),
+        }
+        .to_string(),
+        false,
+    )
+}
+
 /// What the connection settled about a request when it read it, before the request's task ran.
 #[derive(Default)]
 struct Settled {
@@ -1920,21 +1951,57 @@ struct Settled {
     registering: Option<Incarnation>,
     /// For an unbind, the registration it is about; none when the connection held none.
     leaving: Option<Leaving>,
+    /// For a call into a binding, the binding it is about; none when the connection stood behind
+    /// none under the identifier.
+    binding: Option<Arc<BindingHandle>>,
 }
 
-/// Settles what one request is about: the registration a request to register records, and the one
-/// a request to unbind is about.
+impl Settled {
+    /// Returns the binding a call into a component is about: the one the connection stood behind
+    /// under the identifier when it read the request, and not whichever it holds when the
+    /// request's task gets to run, which may be the registration of an identifier that was removed
+    /// and registered again in between.
+    fn binding_of(self, binding_id: Uuid) -> Result<Arc<BindingHandle>, (String, bool)> {
+        self.binding.ok_or_else(|| no_such_binding(binding_id))
+    }
+}
+
+/// Settles what one request is about: the registration a request to register records, the one a
+/// request to unbind is about, and the binding a call into a component is about.
 fn settle(body: &RequestBody, served: &Served) -> Settled {
     match body {
         RequestBody::RegisterBinding(registration) => Settled {
             registering: begin(served, registration.binding_id),
-            leaving: None,
+            ..Settled::default()
         },
         RequestBody::Unbind { binding_id } => Settled {
-            registering: None,
             leaving: leave(served, *binding_id),
+            ..Settled::default()
         },
-        _ => Settled::default(),
+        _ => Settled {
+            binding: called_binding(body).and_then(|binding_id| {
+                served
+                    .registered
+                    .lock()
+                    .ok()
+                    .and_then(|held| held.standing_binding(binding_id))
+            }),
+            ..Settled::default()
+        },
+    }
+}
+
+/// Returns the identifier of the binding a request calls into, for the requests that run in a
+/// binding's component and are about a binding that is already registered.
+fn called_binding(body: &RequestBody) -> Option<Uuid> {
+    match body {
+        RequestBody::Snapshot { binding_id, .. }
+        | RequestBody::Checkpoint { binding_id, .. }
+        | RequestBody::Restore { binding_id, .. } => Some(*binding_id),
+        RequestBody::PrepareAction(call) => Some(call.binding_id),
+        RequestBody::Decode(call) => Some(call.binding_id),
+        RequestBody::Encode(call) => Some(call.binding_id),
+        _ => None,
     }
 }
 

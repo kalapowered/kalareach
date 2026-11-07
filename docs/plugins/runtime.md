@@ -477,14 +477,18 @@ finds no binding, which is the same answer it would get for one nobody ever regi
 connection that ends takes its own bindings and nobody else's, once whatever it had running has
 finished.
 
-The host settles what a registration or an unbind is about when it reads the request, and not when
-the request's task runs. A registration is the connection's from that moment, so an unbind that
-arrives before the host has read or compiled the component is about it: the host answers that a
-binding existed, and refuses the registration when it gets further. An unbind removes the
-registration the connection held under the identifier when the request was read, so a second unbind
-of an identifier that was registered again in the meantime finds nothing and leaves the new
-registration alone. The answer says that a binding existed to the request that ended the
-registration, and to no other request about it.
+The host settles what a registration, an unbind or a call into a binding is about when it reads the
+request, and not when the request's task runs. A registration is the connection's from that moment,
+so an unbind that arrives before the host has read or compiled the component is about it: the host
+answers that a binding existed, and refuses the registration when it gets further. An unbind
+removes the registration the connection held under the identifier when the request was read, so a
+second unbind of an identifier that was registered again in the meantime finds nothing and leaves
+the new registration alone. The answer says that a binding existed to the request that ended the
+registration, and to no other request about it. A call (`snapshot`, `prepare_action`, `checkpoint`,
+`restore`, `decode`, `encode`) is about the live binding the connection stood behind under the
+identifier when the request was read. One read after an unbind of that binding is refused as a call
+on a binding the connection does not hold, and one read before it is never carried out in a
+registration made after it.
 
 A document travels as its own frames, chunked so each fits one, and every piece names the document it
 belongs to; only the last is marked as the last. That is how a reader knows which notices go together
