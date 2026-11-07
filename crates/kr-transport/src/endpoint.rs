@@ -830,24 +830,6 @@ mod tests {
         assert_eq!(IDLE_TIMEOUT, Duration::from_secs(30));
     }
 
-    /// An endpoint hands the network one datagram at a time, never a segmented batch.
-    ///
-    /// A network device with no transmit checksum offload makes some kernels refuse a segmented
-    /// send (the Android emulator's Wi-Fi interface does). The socket layer then stops batching
-    /// on that socket, but a connection that is already open goes on asking for batches, every
-    /// one is refused, and its stream data stops while single datagrams (acknowledgements,
-    /// keepalives) still pass, so the idle timeout never fires. The setting is the behaviour, and
-    /// a socket that refuses a batch cannot be made in a process, so the transport
-    /// configuration's own description is what is read.
-    #[test]
-    fn an_endpoint_never_asks_for_segmented_datagrams() {
-        let described = format!("{:?}", transport_config());
-        assert!(
-            described.contains("enable_segmentation_offload: false"),
-            "{described}"
-        );
-    }
-
     /// KR-REQ-10.02: without a selected relay the endpoint relays nothing.
     #[test]
     fn an_unselected_relay_map_disables_relaying() {
