@@ -3559,16 +3559,21 @@ registry's receipts of authority changes and voice changes, its record of device
 or its record of pairing actions, or of a rearm whose chain or grant it cannot read, is told
 `OUTCOME_UNKNOWN` and nothing is performed: a record that cannot be read is not one that is absent.
 A result that is read and cannot be decoded is told the same in the project, change-set, transfer,
-workflow and voice records, and so is a workflow record that makes no sense: a row that says two
-things about how the action ended, a refusal under a code this build does not know, a run record
-under a method that starts no run, or the record of a run the journal does not hold. Where the
-daemon cannot read such a record it cannot tell a first action from a repeat, and tells both the
-same. That holds as well in the attention, project, change-set and transfer stores where the door
-found no record and the store then fails to read it at the point the action is performed. A create
-asked again is told `OUTCOME_UNKNOWN` when its worker is known and cannot be reached, when its
-closure cannot be read, and when its worker has gone with no closure recorded and its reservation
-shows that a worker was asked for or may still be asked for. A reservation that shows the launch
-produced no worker is refused as ever, unless the closure cannot be read.
+workflow and voice records. So is a record that makes no sense: a refusal that the workflow journal
+or the registry's receipts keep under a code this build does not know, a workflow row that says two
+things about how the action ended, a run record under a method that starts no run, or the record of
+a run the journal does not hold. Where the daemon cannot read such a record it cannot tell a first
+action from a repeat, and tells both the same. That holds as well in the attention, project,
+change-set and transfer stores where the door found no record and the store then fails to read it
+at the point the action is performed. A transfer action repeated with no usable window is told the
+same when the daemon cannot read whether its claim is open. A create asked again is told
+`OUTCOME_UNKNOWN` when its worker is known and the daemon cannot ask it about the session: the
+worker cannot be reached, refuses the read, or gives an answer the daemon cannot decode. It is told
+the same when the daemon fails to recover a claimed worker it has not yet adopted, when its closure
+cannot be read, and when its worker has gone with no closure recorded and its reservation shows that
+a worker was asked for or may still be asked for. A reservation recorded as failed that no worker
+claimed shows that the launch produced no worker, and the create is refused as ever whatever else
+the daemon cannot read.
 The services behind the door check the registration again where they write, and a copy of an
 action that meets a fence owed there is refused in their words. A service that answers a copy of an
 action from its own record while it carries the action out, because the first copy finished
@@ -3587,11 +3592,12 @@ refuses before it reserves holds no reservation, and its repeat is decided again
 A transient failure says nothing took effect, so the daemon does not give one for these answers once
 it has dispatched or committed the action. It tells `OUTCOME_UNKNOWN` instead: a decision that could
 not be held while the answer waited to be written; an answer, or a session's closure, that it could
-not record after the action was carried out; and an attempt under the action's identifier that is
-still running when a copy of it arrives. A project action that was refused, when the journal cannot
-keep the refusal, is told as the record of the action where there is one to read, `ID_CONFLICT`
-where the record is another request's, and `OUTCOME_UNKNOWN` where there is none, because the
-refusal can be a word about what another copy of the action did. A copy of a project action
+not record after the action was carried out; the receipt of a transfer action that it could not
+write or read back after the action was carried out; and an attempt under the action's identifier
+that is still running when a copy of it arrives. A project action that was refused, when the journal
+cannot keep the refusal, is told as the record of the action where there is one to read,
+`ID_CONFLICT` where the record is another request's, and `OUTCOME_UNKNOWN` where there is none,
+because the refusal can be a word about what another copy of the action did. A copy of a project action
 whose first copy's claim is still open, refused by the admission the action is performed under, is
 told `OUTCOME_UNKNOWN` too, because the claim shows the action began; a first action holds no claim
 and is refused as the admission says.
