@@ -686,8 +686,9 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{}-{}", std::process::id(), &random[..12])
 }
 
-/// Registers a task that would run once, tomorrow or later today, and no task of that name is
-/// replaced: without `/F`, `schtasks` refuses a name that is taken.
+/// Registers a task that would run once, at 23:59 of the day it is made (one made later never
+/// runs), and no task of that name is replaced: without `/F`, `schtasks` refuses a name that is
+/// taken.
 fn register(name: &str) -> std::process::Output {
     Command::new(system32("schtasks.exe"))
         .args([

@@ -187,6 +187,8 @@ async fn nothing_started_the_closed_session_again(
     drop(terminal);
     ended(&root, "the root shell").await;
     ended(&worker, "the worker").await;
+    // Said, so that a run's output shows which way the read went: an answer, or none.
+    eprintln!("the second read of the root shell, judged after the worker ended: {reported:?}");
     match reported {
         Ok(now) => assert!(
             now.as_ref().is_none_or(|reported| *reported == root),
