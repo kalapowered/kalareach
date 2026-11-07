@@ -9,8 +9,9 @@
 //! calls cases through macros and attributes the report cannot see into, and `conventions`, read
 //! and never built as well, steps outside the conventions a helper key relies on, and `late`, whose
 //! macro writes a file while its library compiles (its package `racy` has two test programs that
-//! do). The runs build into a target directory of their own under the platform's temporary
-//! directory.
+//! do, its package `shared` a library and two test programs that do), and `several`, three
+//! libraries whose first test program fails to be listed. The runs build into a target directory
+//! of their own under the platform's temporary directory.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1531,6 +1532,50 @@ fn a_file_two_test_programs_may_write_and_read_at_once_keeps_its_time() {
         log.lines().any(|line| line.contains("is left to Cargo")),
         "the build dated a file that two compiles read:\n{log}"
     );
+}
+
+/// A library that expands the macro, and two test programs that do it after the library (a test
+/// program waits for the library it links), find the file the library wrote, whole, and only read
+/// it. Nothing is written beside a read, so the build dates the file, and the next call of Cargo
+/// has nothing to build.
+#[test]
+fn a_file_a_library_wrote_and_two_test_programs_read_leaves_the_listing_nothing_to_build() {
+    let evidence = tempfile::tempdir().expect("an evidence directory");
+    let target = tempfile::tempdir().expect("a target directory");
+    let options = Options {
+        root: tree("late"),
+        evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
+        selection: Some(vec![Group::Rust]),
+        all_terminals: false,
+        platform: Platform::current(),
+        case_tables: &[],
+        lanes: &[],
+        ignored_runs: None,
+        applications: None,
+        steps: Some(vec![Step::cargo(
+            Group::Rust,
+            "the package's tests",
+            &["test", "--locked", "-p", "shared", "--no-fail-fast"],
+        )]),
+        lister: lister(),
+        environment: vec![(
+            "CARGO_TARGET_DIR".to_owned(),
+            target.path().to_string_lossy().into_owned(),
+        )],
+    };
+    let document = report::run(&options, &mut |_| {}).expect("runs");
+    let step = &document.steps[0];
+    assert!(step.error.is_none(), "{step:?}");
+    let log = std::fs::read_to_string(evidence.path().join(&step.log)).expect("the step's log");
+    assert!(
+        log.lines().any(|line| line.contains("Compiling shared ")),
+        "the build did not compile the package, so the macro did not run in it:\n{log}"
+    );
+    assert!(
+        !log.contains("is left to Cargo") && !log.contains("the listing compiled again"),
+        "the listing built what the build before it had built:\n{log}"
+    );
+    assert!(document.passed());
 }
 
 #[test]
