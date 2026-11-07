@@ -216,6 +216,11 @@ jobs:
           # host has none, which would let a runner without them pass the checks without running
           # them. Here a missing tmux or tic fails them.
           KR_REQUIRE_MULTIPLEXERS: "1"
+          # The transport's segmentation check compares its connection with a control connection
+          # that keeps segmentation offload on, and says on a host that cannot show a segmented
+          # batch that it passed without proving anything. Here a runner that cannot show one fails
+          # it.
+          KR_REQUIRE_SEGMENTATION: "1"
         run: cargo test --locked --workspace
 
       # Documentation is built with warnings refused, so a link that resolves to nothing, or to an
