@@ -3314,3 +3314,83 @@ async fn a_refusal_the_request_alone_decided_is_told_as_itself_though_it_cannot_
     assert_eq!(again.code, ErrorCode::InvalidArgument, "{again:?}");
     host.stop().await;
 }
+
+/// KR-REQ-09.09: a copy of a transfer action that arrives on another connection before the first
+/// attempt has reached the transfer service is told that the attempt has not finished, and not
+/// refused for a window that connection never issued. The first attempt goes on to carry the action
+/// out, so a definite refusal would be taken for the host's word that nothing was done. A first
+/// action under the same window, which no attempt holds, is refused as ever, and once the first
+/// attempt has ended the copy is given what it recorded.
+///
+/// The first attempt is stopped after the daemon has admitted it and before the transfer service is
+/// asked, and the case lets it go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_copy_that_arrives_before_the_first_attempt_has_reached_the_service_is_told_the_outcome_is_unknown()
+ {
+    let host = host().await;
+    let mut first = client(&host).await;
+    let bytes = pattern(64);
+    let params = begin_params(&host, &bytes, "held.bin");
+    let original = first
+        .compose(
+            Method::UploadBegin,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the mutation is composed");
+    let (arrived, go) = host.controller.pause_before_a_door_effect();
+    let running = {
+        let original = original.clone();
+        tokio::spawn(async move { first.repeat(&original).await })
+    };
+    arrived
+        .await
+        .expect("the first attempt has been admitted and has not reached the service");
+
+    let mut second = client(&host).await;
+    let told = failure(
+        second
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    // A first action under a window this connection never issued, which no attempt holds, is
+    // refused for its window as it always was.
+    let mut third = client(&host).await;
+    let fresh = third
+        .compose(
+            Method::UploadBegin,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &begin_params(&host, &bytes, "fresh.bin"),
+        )
+        .await
+        .expect("the mutation is composed");
+    let refused = failure(
+        second
+            .repeat(&fresh)
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+
+    // The first attempt goes on and begins the upload once; the copy, asked again, is given the
+    // record the attempt left.
+    go.send(()).expect("the first attempt is waiting");
+    let begun = running
+        .await
+        .expect("the first attempt ran")
+        .expect("the call reaches the daemon")
+        .expect("upload.begin succeeds");
+    let given = second
+        .repeat(&original)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the copy is given the record");
+    assert_eq!(given, begun, "the action was carried out once");
+    host.stop().await;
+}

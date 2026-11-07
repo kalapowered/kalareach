@@ -87,7 +87,9 @@ pub enum Settling {
     Open,
     /// Its action's claim was settled, and this is the answer it was settled with.
     Answered(ControlFrame),
-    /// Its action claimed nothing here, so the repeat is a first admission and has no window.
+    /// Its action claimed nothing here, so the repeat is a first admission and has no window,
+    /// unless another arrival holds the action and has not reached its claim, which the door
+    /// knows and this service does not.
     No,
 }
 
