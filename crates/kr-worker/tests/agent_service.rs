@@ -4576,12 +4576,19 @@ async fn an_answer_is_not_inserted_into_the_thread_the_agent_selected_after_aski
         "the person's prompt is the one request the new thread was sent"
     );
 
-    // The fixture's shell sleeps for half a minute, and nothing else ends it: the session is
-    // closed, and the case returns once the session has finished closing.
+    // The fixture's shell sleeps for half a minute, and nothing else ends it before then: the
+    // session is closed, and the case returns once the session has finished closing. The record
+    // says the case closed it, and that the shell did not run out its own time.
     let runtime = host.service.runtime();
     runtime.close(ClosureReason::CloseRequested).1.release();
-    let closed = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed()).await;
-    assert!(closed.is_ok(), "the session closed and its shell ended");
+    let closed = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed())
+        .await
+        .expect("the session finished closing");
+    assert_eq!(
+        closed.reason,
+        ClosureReason::CloseRequested,
+        "the session closed because the case closed it"
+    );
 }
 
 /// KR-REQ-10.51: an answering `plugin.action.invoke` is held to the caller's history as an
