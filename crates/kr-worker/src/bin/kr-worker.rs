@@ -115,6 +115,14 @@ struct Arguments {
 /// the process for this long and no longer.
 const DIAGNOSTICS_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a worker whose launch failed gives its root shell to be seen to end before it stops
+/// waiting for it.
+///
+/// The session's closure asks the shell to stop and forces it after five seconds, so a shell that
+/// can be ended is gone well inside this. One that is not seen to end is not reported on, because
+/// the failure is reported only of a shell that has ended.
+const SHELL_END_BOUND: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn main() -> ExitCode {
     let ended = serve();
     kr_worker::diagnostics::drain(DIAGNOSTICS_DRAIN);
@@ -464,16 +472,29 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             .await_qualification(kr_worker::runtime::QUALIFICATION_DEADLINE)
             .await
     {
-        // The session is closed first, and the failure is reported if it can be once the shell has
-        // ended: the daemon records a launch its worker reports as failed, and tells a repeat of the
-        // create that the launch failed, which a shell still running would make false. A create
-        // that could not deliver the managed contract leaves a closure record rather than a shell
-        // nobody is going to use.
+        // The session is closed first, and the failure is reported, if it can be, once the shell
+        // has ended: the daemon records a launch its worker reports as failed, and tells a repeat
+        // of the create that the launch failed, which a shell still running would make false. A
+        // shell that is not seen to end within the bound is not reported on: the daemon then finds
+        // the worker's connection gone, and tells the create that what became of it is not known.
+        // A create that could not deliver the managed contract leaves a closure record rather than
+        // a shell nobody is going to use.
         runtime.close(ClosureReason::RootLaunchFailed).1.release();
+        if tokio::time::timeout(SHELL_END_BOUND, runtime.wait_root_ended())
+            .await
+            .is_ok()
+        {
+            let _ = writer
+                .write_message(&ControlFrame::WorkerFailed(error.clone()))
+                .await;
+        } else {
+            tell(format_args!(
+                "the root shell did not end within {} seconds of the session being closed, so \
+                 the launch failure is not reported",
+                SHELL_END_BOUND.as_secs()
+            ));
+        }
         let _ = runtime.wait_closed().await;
-        let _ = writer
-            .write_message(&ControlFrame::WorkerFailed(error.clone()))
-            .await;
         finish(&runtime, serving, bridge_server).await;
         return Err(error.message.into());
     }

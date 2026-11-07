@@ -1602,6 +1602,19 @@ impl SessionRuntime {
         self.sink.activity.supervision_is_looking()
     }
 
+    /// Waits until the root shell has ended, and returns at once for a session that has none.
+    ///
+    /// It gives up by itself never: a caller that cannot wait for ever bounds it. It does not wait
+    /// for the rest of the closure, which drains the terminal and ends the session's servers.
+    pub async fn wait_root_ended(&self) {
+        loop {
+            if self.session().root_has_ended() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     /// Waits until the session has finished closing and returns its record.
     pub async fn wait_closed(&self) -> ClosureRecord {
         loop {

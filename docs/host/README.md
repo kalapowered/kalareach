@@ -1698,8 +1698,10 @@ the same way. Step 6 changes for a managed session: the worker binds the root-ed
 *before* the shell starts, because the address and a one-time secret travel to it in its own
 environment, and it reports itself ready only after the integration has qualified, which is after the
 user's startup files have run. An integration that fails before that closes the session that was
-being created and records why, and the worker reports the failure only after the shell has ended; an
-explicit compatibility retry is a new create request.
+being created and records why, and the worker reports the failure only after it has seen the shell end. A
+shell it does not see end within fifteen seconds is not reported on: the daemon finds the worker's
+connection gone, and the create is told that what became of it is not known. An explicit
+compatibility retry is a new create request.
 
 **`native_compat`** launches the selected stock shell. It keeps create, attach, detach, close,
 transfer and terminal presentation, and it claims none of the managed editor: Ctrl-D follows that

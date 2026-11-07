@@ -2043,14 +2043,31 @@ async fn a_managed_create_whose_shell_never_qualifies_is_answered_with_the_worke
     params.shell_mode = ShellMode::Managed;
     params.shell = Nullable::some("zsh".to_owned());
 
-    let refused = client
-        .mutate(
-            Method::SessionCreate,
-            ActionId::new(kr_ipc::new_uuid()),
-            ActionTarget::environment(host.environment_id),
-            &params,
-        )
+    let environment_id = host.environment_id;
+    let creating = tokio::spawn(async move {
+        client
+            .mutate(
+                Method::SessionCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &params,
+            )
+            .await
+    });
+    // The shell names itself when it starts, and its identity is taken then, while it runs: a
+    // process identifier that is reused after it has gone is not mistaken for it.
+    let pid_file = host.silent_shell_pid_file();
+    let shell = until("the silent shell to name itself", || {
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .and_then(|pid| kr_ipc::identity::process_start_identity(pid).ok())
+    })
+    .await;
+
+    let refused = creating
         .await
+        .expect("the create ran")
         .expect("the call reaches the daemon")
         .expect_err("a shell that never qualifies cannot be managed");
     assert_eq!(refused.code, ErrorCode::ShellIntegrationUnsupported);
@@ -2064,21 +2081,14 @@ async fn a_managed_create_whose_shell_never_qualifies_is_answered_with_the_worke
     // launch failed, which would be false of a shell still running. The shell here ignores the
     // signals that ask a process to stop, so it is gone only if the worker forced it before it
     // reported.
-    let pid: u32 = std::fs::read_to_string(host.silent_shell_pid_file())
-        .expect("the shell named itself when it started")
-        .trim()
-        .parse()
-        .expect("a process identifier");
-    let still_there = kr_ipc::identity::process_start_identity(pid).is_ok_and(|identity| {
-        !matches!(
-            kr_ipc::identity::process_state(&identity),
-            kr_ipc::identity::ProcessState::Ended
-        )
-    });
     assert!(
-        !still_there,
-        "the worker reported its launch failed while the shell it started (process {pid}) was \
-         still running"
+        matches!(
+            kr_ipc::identity::process_state(&shell),
+            kr_ipc::identity::ProcessState::Ended
+        ),
+        "the worker reported its launch failed while the shell it started (process {}) was still \
+         running",
+        shell.pid.get()
     );
 }
 
