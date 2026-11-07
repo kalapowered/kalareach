@@ -156,6 +156,13 @@ fn usage(error: &clap::Error, json: bool) -> ExitCode {
     ExitCode::from(failure.exit_code())
 }
 
+/// Writes on standard error that the host's routes wait for a restart, when they do.
+fn say_restart(restart: Option<&Shown>) {
+    if let Some(restart) = restart {
+        report::say(restart);
+    }
+}
+
 async fn run(cli: Cli) -> Result<Completion> {
     // A kr a package manager put on the search path runs as the store's own copy of its release,
     // admitted there by its first command. Installing it by hand is a command of its own. The
@@ -1081,17 +1088,31 @@ async fn run(cli: Cli) -> Result<Completion> {
                     None
                 };
                 let mut client = open_controller(&environment.paths, build_id()).await?;
-                let before: HostDoctorResult =
+                let mut answer: HostDoctorResult =
                     host_read(&mut client, &environment.paths, Method::HostDoctor, &()).await?;
+                // A host whose routes were read at its start, and differ from its document now,
+                // sends over the routes it started with, whatever else this command finds. Said
+                // on standard error and after the answer, so the answer stays what it was; and
+                // said when the command fails, because a failure about the list says nothing of
+                // the routes.
+                let mut restart =
+                    kr_cli::doctor::configuration::routes_waiting_for_a_restart(&answer);
                 // The list the host reports is shown only when the host acts on its document, as a
                 // change says it was made only when the host reports it in force.
-                let mut listed = match change {
-                    Some(_) => kr_cli::doctor::configuration::push_gateways_reported(
-                        &before.configuration,
-                    )?,
-                    None => kr_cli::doctor::configuration::push_gateways_acted_on(
-                        &before.configuration,
-                    )?,
+                let first = match change {
+                    Some(_) => {
+                        kr_cli::doctor::configuration::push_gateways_reported(&answer.configuration)
+                    }
+                    None => {
+                        kr_cli::doctor::configuration::push_gateways_acted_on(&answer.configuration)
+                    }
+                };
+                let mut listed = match first {
+                    Ok(listed) => listed,
+                    Err(failure) => {
+                        say_restart(restart.as_ref());
+                        return Err(failure);
+                    }
                 };
                 if let Some(chosen) = change {
                     let written = chosen.clone().unwrap_or_default();
@@ -1104,12 +1125,19 @@ async fn run(cli: Cli) -> Result<Completion> {
                         &permit,
                     )?;
                     drop(writers);
-                    let after: HostDoctorResult =
+                    answer =
                         host_read(&mut client, &environment.paths, Method::HostDoctor, &()).await?;
-                    listed = kr_cli::doctor::configuration::push_gateways_in_force(
-                        &after.configuration,
+                    restart = kr_cli::doctor::configuration::routes_waiting_for_a_restart(&answer);
+                    listed = match kr_cli::doctor::configuration::push_gateways_in_force(
+                        &answer.configuration,
                         &written,
-                    )?;
+                    ) {
+                        Ok(listed) => listed,
+                        Err(failure) => {
+                            say_restart(restart.as_ref());
+                            return Err(failure);
+                        }
+                    };
                 }
                 if cli.json {
                     output::document(
@@ -1134,6 +1162,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                         Shown::joined(listed.iter().map(|origin| Shown::address(origin)), ", ")
                     ));
                 }
+                say_restart(restart.as_ref());
                 Ok(Completion::Done)
             }
             HostCommand::Terminal(terminal) => {
