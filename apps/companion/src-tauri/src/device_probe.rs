@@ -78,6 +78,21 @@ fn check(name: &'static str, ok: bool, detail: impl std::fmt::Display) -> Check 
     }
 }
 
+/// Whether this launch was started to count or to clear the two keychain groups (`-KRDeviceProbe
+/// count` or `sweep`, the two modes the native launch runs before anything else).
+///
+/// Such a launch opens nothing that writes to the secure store. The application makes its own keys
+/// at its first start, so a count taken after them is never empty, and a script that wants the
+/// groups as they were before the application ran could not tell the application's keys from what
+/// was there already.
+#[must_use]
+pub fn leaves_the_keychain_alone() -> bool {
+    let arguments: Vec<String> = std::env::args().collect();
+    arguments
+        .windows(2)
+        .any(|pair| pair[0] == "-KRDeviceProbe" && matches!(pair[1].as_str(), "count" | "sweep"))
+}
+
 /// Runs the checks a script asked for, if it asked: the request is read once and taken away.
 pub fn start<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let Ok(data) = app.path().app_data_dir() else {
