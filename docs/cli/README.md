@@ -2450,10 +2450,11 @@ use sends nothing to any gateway until it starts again, though it reports the do
 once it is put right, and a network selection edited after the start likewise applies at the next
 start. When the `configuration-network` check in the daemon's doctor answer (`kr doctor --json`)
 warns that the routes differ from the document, the command writes a line on standard error, with
-or without `--json`, saying that a restart is needed and naming that check. It writes the line
-after its answer, and also when it fails because the document is not all in force; it writes none
-for a document the daemon cannot use, which the command says on its own. The answer on standard
-output and the exit status are the same as for a host with open routes.
+or without `--json`, saying that a restart is needed and naming that check. When the command
+succeeds it writes the line after its answer. When it fails because the document is not all in
+force it writes the line before the error; it writes none for a document the daemon cannot use,
+which the command says on its own. The answer on standard output and the exit status are the same
+as for a host with open routes.
 
 Devices paired through a gateway taken out stay paired and are not sent notifications until their
 app registers with a gateway the host allows. With `--json` the answer is

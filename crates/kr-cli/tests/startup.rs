@@ -2214,8 +2214,8 @@ fn a_gateway_that_is_unavailable() -> String {
 }
 
 /// KR-REQ-16.04: `kr host push-gateways` with nothing to change fails, as a change does, when the
-/// host says it has not finished putting its configuration document into force, and says both what
-/// the host delivers through and what it has not finished. Here the host could not write down the
+/// host says it has not finished putting its configuration document into force, and says both the
+/// gateways in force and what the host has not finished. Here the host could not write down the
 /// revocation it owes a gateway the document no longer lists. It moves the list before it retires
 /// the gateway's credential, so the list it reports is the one it delivers through, and what is
 /// unfinished is the retirement; a list shown on its own would suggest that the host has acted on
@@ -2285,8 +2285,8 @@ fn kr_host_push_gateways_with_nothing_to_change_fails_when_the_host_did_not_put_
     assert!(
         shown["message"]
             .as_str()
-            .is_some_and(|message| message.contains("could not be written down")),
-        "it gives the host's reason: {shown}"
+            .is_some_and(|message| message.contains("were not let go of")),
+        "it gives the retirement as the reason: {shown}"
     );
     assert!(
         shown["message"]
@@ -2419,15 +2419,17 @@ fn kr_host_push_gateways_says_a_restart_is_needed_when_the_document_put_right_is
         .expect("writes a configuration document this build cannot use");
     host.hold_a_credential_issued_by(&gateway);
     host.start_a_daemon_by_hand();
-    let show = || {
-        let output =
-            start(host.kr(&["--json", "host", "push-gateways"])).finish("kr host push-gateways");
+    let push_gateways = |arguments: &[&str]| {
+        let mut command = vec!["--json", "host", "push-gateways"];
+        command.extend_from_slice(arguments);
+        let output = start(host.kr(&command)).finish("kr host push-gateways");
         (
             output.status.success(),
             document(&output, "kr host push-gateways"),
             String::from_utf8_lossy(&output.stderr).into_owned(),
         )
     };
+    let show = || push_gateways(&[]);
     let (ok, shown, said) = show();
     assert!(!ok, "the host cannot use its document: {shown}");
     assert!(
@@ -2451,8 +2453,8 @@ fn kr_host_push_gateways_says_a_restart_is_needed_when_the_document_put_right_is
     assert_eq!(shown["code"], "RESOURCE_UNAVAILABLE", "{shown}");
     let message = shown["message"].as_str().expect("a message");
     assert!(
-        message.contains("could not be written down"),
-        "it gives the host's reason: {shown}"
+        message.contains("were not let go of"),
+        "it gives the retirement as the reason: {shown}"
     );
     assert!(
         message.contains("the official gateway only") && !message.contains("delivers"),
@@ -2461,6 +2463,22 @@ fn kr_host_push_gateways_says_a_restart_is_needed_when_the_document_put_right_is
     assert!(
         said.contains("restart") && said.contains("configuration-network"),
         "it still says a restart is needed, and where the host says why: {said}"
+    );
+
+    // A change fails the same way: the document is written, the acceptance does not finish, and the
+    // note is written beside the failure. The credential is outside the new list too.
+    let (ok, shown, said) = push_gateways(&["--set", "https://push.other.example"]);
+    assert!(!ok, "the change is not all in force: {shown}");
+    assert_eq!(shown["code"], "RESOURCE_UNAVAILABLE", "{shown}");
+    assert!(
+        shown["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("were not let go of")),
+        "it gives the host's reason: {shown}"
+    );
+    assert!(
+        said.contains("restart") && said.contains("configuration-network"),
+        "a failed change says a restart is needed too: {said}"
     );
 }
 
