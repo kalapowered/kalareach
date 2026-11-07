@@ -329,9 +329,66 @@ fn is_stopped(distribution: &str, registered: &str, running: &str) -> bool {
         && !is(&running, distribution)
 }
 
+/// A command that ends a distribution the case started, run once when it is asked for or, if it
+/// has not been asked for, when this is dropped, so that a case that fails after it started the
+/// distribution still ends it. A failure of the command is the caller's when it asks, and is
+/// written to the error output when the drop runs it, without a panic that would end the process
+/// during an unwinding.
+struct Terminate {
+    program: PathBuf,
+    arguments: Vec<String>,
+    ran: bool,
+}
+
+impl Terminate {
+    /// The command that ends `distribution`, which the case found registered and stopped.
+    fn of(distribution: &str) -> Self {
+        Self::running(
+            system32("wsl.exe"),
+            vec!["--terminate".to_owned(), distribution.to_owned()],
+        )
+    }
+
+    fn running(program: PathBuf, arguments: Vec<String>) -> Self {
+        Self {
+            program,
+            arguments,
+            ran: false,
+        }
+    }
+
+    /// Runs the command, when it has not run, and says why when it does not succeed.
+    fn end(&mut self) -> Result<(), String> {
+        if std::mem::replace(&mut self.ran, true) {
+            return Ok(());
+        }
+        match Command::new(&self.program).args(&self.arguments).status() {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(format!(
+                "{} {:?} did not succeed: {status}",
+                self.program.display(),
+                self.arguments
+            )),
+            Err(error) => Err(format!(
+                "{} {:?} does not run: {error}",
+                self.program.display(),
+                self.arguments
+            )),
+        }
+    }
+}
+
+impl Drop for Terminate {
+    fn drop(&mut self) {
+        if let Err(why) = self.end() {
+            let _ = writeln!(std::io::stderr(), "{why}");
+        }
+    }
+}
+
 /// Records `wsl.exe` running a command in the distribution, and ends the distribution again when
-/// both lists showed it registered and stopped. A distribution whose state the lists leave unknown
-/// is left as it is.
+/// both lists showed it registered and stopped, whichever way the case ends, and fails the case when
+/// ending it does not succeed. A distribution whose state the lists leave unknown is left as it is.
 #[test]
 #[ignore = records!()]
 fn record_wsl_exe() {
@@ -363,13 +420,13 @@ fn record_wsl_exe() {
         "-c",
         "echo kr-capture-wsl",
     ]);
+    // The guard is made before the distribution is started, and only for one the lists showed
+    // stopped.
+    let mut terminate = was_stopped.then(|| Terminate::of(&distribution));
     let recorded = record_in_a_pseudo_console(command, 24, 100);
-    if was_stopped {
-        let ended = Command::new(system32("wsl.exe"))
-            .args(["--terminate", &distribution])
-            .status()
-            .expect("wsl runs");
-        println!("wsl --terminate {distribution}: {ended}");
+    if let Some(terminate) = terminate.as_mut() {
+        terminate.end().unwrap_or_else(|why| panic!("{why}"));
+        println!("wsl --terminate {distribution}: ended");
     }
     println!(
         "wsl after: {}",
@@ -569,6 +626,56 @@ fn a_directory_made_for_a_case_that_then_fails_is_removed_with_what_is_in_it() {
     std::fs::remove_dir_all(&parent).expect("the parent directory is removed");
     assert!(failed.is_err(), "the step failed");
     assert!(!left, "the directory and the key in it are left behind");
+}
+
+/// A guard that ends a distribution runs its command when the case that holds it fails, runs it
+/// once, and the case fails when the command does not succeed. The command here is `cmd.exe`
+/// making a directory, which fails the second time, in place of `wsl.exe --terminate`, which this
+/// case must not run on a distribution it did not start.
+#[test]
+fn a_distribution_the_case_started_is_ended_when_the_case_fails_after_that() {
+    let marker = std::env::temp_dir().join(unique("kr-terminate-test"));
+    let make = |marker: &Path| {
+        Terminate::running(
+            system32("cmd.exe"),
+            vec![
+                "/c".to_owned(),
+                "mkdir".to_owned(),
+                marker.display().to_string(),
+            ],
+        )
+    };
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _terminate = make(&marker);
+        panic!("a step after the distribution was started fails");
+    }));
+    let ran = marker.is_dir();
+    let removed = std::fs::remove_dir(&marker);
+
+    // Asked for, it runs once, and the drop after that does not run it again.
+    let mut asked = make(&marker);
+    let first = asked.end();
+    let second = asked.end();
+    drop(asked);
+    let ran_once = marker.is_dir();
+    let _ = std::fs::remove_dir(&marker);
+
+    // A command that does not succeed is the case's failure.
+    let mut failing = Terminate::running(
+        system32("cmd.exe"),
+        vec!["/c".to_owned(), "exit".to_owned(), "3".to_owned()],
+    );
+    let refused = failing.end();
+
+    assert!(failed.is_err(), "the step failed");
+    assert!(ran, "the guard ended the distribution when the case failed");
+    removed.expect("the directory the command made is removed");
+    assert!(first.is_ok() && second.is_ok(), "{first:?} {second:?}");
+    assert!(ran_once, "and a command that was asked for ran");
+    assert!(
+        refused.is_err_and(|why| why.contains("did not succeed")),
+        "a command that does not succeed fails the case"
+    );
 }
 
 /// The distribution lists are read as the UTF-16 that `wsl.exe` writes even when the environment
