@@ -486,6 +486,12 @@ fn watch_drops(app: &tauri::AppHandle) {
 /// works as it did. A phone that was started before its first unlock cannot open them yet, and
 /// opens them in place when the device may have been unlocked ([`open_after_unlock`]).
 fn open_pairing(app: &tauri::AppHandle) {
+    // A launch that counts or clears the keychain's groups finds them as they were, so it makes
+    // none of the keys the records hold.
+    #[cfg(all(debug_assertions, mobile))]
+    if device_probe::leaves_the_keychain_alone() {
+        return;
+    }
     // The system is listened to before the first try, so an unlock that falls between the try and
     // the wait is heard.
     #[cfg(target_os = "ios")]
