@@ -37,6 +37,9 @@ final class PairingTests: DeviceTestCase {
         super.setUp()
         XCTAssertFalse(directory.isEmpty, "KR_PAIRING_DIR names no directory")
         try? FileManager.default.createDirectory(atPath: shots, withIntermediateDirectories: true)
+        // The script's line in the simulator's log, put there before the first case's first scan, so
+        // that the script can show its search of that log reaches back to the start of the run.
+        if let marker = ProcessInfo.processInfo.environment["KR_PAIRING_MARKER"], !marker.isEmpty { NSLog("%@", marker) }
     }
 
     // MARK: The host's files
@@ -311,13 +314,41 @@ final class PairingTests: DeviceTestCase {
         eventually("the \(name) view to be chosen") { app.buttons.matching(NSPredicate(format: "label == %@", name)).firstMatch.isSelected }
     }
 
-    /// Whether the inbox's refusal says, in its title, that the host named by `prefix` refused. The tree
-    /// gives the host's name and the rest of the title as texts of their own, one after the other.
-    private func refusalTitleNames(_ prefix: String) -> Bool {
-        let texts = app.staticTexts.allElementsBoundByIndex.map { $0.label }
-        guard let at = texts.firstIndex(where: { $0.hasSuffix("refused to show its inbox") }), at > 0 else { return false }
-        return texts[at - 1].hasPrefix(prefix)
+    /// The page's static texts in the tree's order, each with the place in the tree of the element that
+    /// holds it, all read from one snapshot of the tree: one round trip to the application, and every
+    /// text from the same tree.
+    private func pageTexts() -> [(label: String, parent: [Int])] {
+        guard let root = try? app.snapshot() else { return [] }
+        var found: [(label: String, parent: [Int])] = []
+        func walk(_ element: XCUIElementSnapshot, _ place: [Int]) {
+            for (index, child) in element.children.enumerated() {
+                if child.elementType == .staticText { found.append((child.label, place)) }
+                walk(child, place + [index])
+            }
+        }
+        walk(root, [])
+        return found
     }
+
+    /// Whether `texts` hold a refusal whose own title says that the host named by `prefix` refused. The
+    /// tree gives a row's texts one after another under one element: its kind, the host its head
+    /// names, then the title, as one text or as the host's name and the rest of it ("refused to show
+    /// its inbox"). So the title's own name is the text before the rest, the head's the one before
+    /// that, and a title that names no host leaves the kind where its name should be.
+    static func titleNames(_ prefix: String, in texts: [(label: String, parent: [Int])]) -> Bool {
+        let rest = "refused to show its inbox"
+        for (at, text) in texts.enumerated() where text.label.hasSuffix(rest) {
+            if text.label.trimmingCharacters(in: .whitespaces) == rest {
+                if at > 1, texts[at - 1].parent == text.parent, texts[at - 2].parent == text.parent,
+                   texts[at - 1].label.hasPrefix(prefix), texts[at - 2].label.hasPrefix(prefix) { return true }
+            } else if text.label.hasPrefix(prefix) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func refusalTitleNames(_ prefix: String) -> Bool { Self.titleNames(prefix, in: pageTexts()) }
 
     // MARK: The cases
 
@@ -621,10 +652,17 @@ final class PairingTests: DeviceTestCase {
     }
 
     /// A second host, paired by the same scan as a guest, which then refuses the phone its inbox
-    /// (13.01). The host in use stays the first. Nothing before the refusal says it happened: the
-    /// guest is served an empty inbox, and the host chooses to refuse after. Then the inbox says
-    /// that host refused to show it, in the host's own words and not as lost contact, beside what
-    /// the host in use holds.
+    /// (13.01). The host in use stays the first. Nothing before the refusal says it happened, and
+    /// the host chooses to refuse after. Then the inbox says that host refused to show it, in the
+    /// host's own words and not as lost contact, beside what the host in use holds. The host keeps
+    /// only a count of the phone's connections, no request of the phone's, so which request of the
+    /// phone's it refused is not recorded: the picture of the host's lapsed words on the phone's
+    /// screen is the evidence of the refusal. A device under a lapsed bound is still admitted, and the
+    /// host refuses its requests alike: who the host is and the opening of the connection (the first
+    /// two a connection of the application makes) as much as the inbox read. The application gives a
+    /// refusal of any request of its visit as the same row, with the host's words. So a control stands
+    /// beside the screen: another guest of that host, paired as the phone is, is served before the
+    /// choice, and the host's answer to each of those three requests after it is recorded.
     func testBASecondHostThatRefusesTheInboxIsToldApartFromOneOutOfContact() {
         openHosts()
         begin("second", picture: "second")
@@ -649,7 +687,8 @@ final class PairingTests: DeviceTestCase {
         say("PAIRING the second host is paired by the same scan and listed beside the first, which stays in use")
 
         // Nothing of the second host is refused yet. The host chooses to refuse once it is serving a
-        // connection of the phone, which the phone's visit of its inbox keeps: it waits for that itself.
+        // connection of the phone, which the phone's visit of the second host's inbox opened and which
+        // may not have read yet: it waits for that itself.
         let environment = String(read("second-environment.txt").prefix(8))
         XCTAssertNotNil(environment.range(of: "^[0-9a-f]{8}$", options: .regularExpression), "the second host named no environment: \(environment)")
         openAttention()
@@ -667,6 +706,11 @@ final class PairingTests: DeviceTestCase {
         screenshot("inbox-host-refused")
         say("PAIRING the inbox shows a host that refused it, in the host's words, above what the host in use holds")
         let result = read("bound-result.txt")
-        XCTAssertTrue(result.hasPrefix("before served items=0\nafter refused PermissionDenied: ") && result.contains("offline-validity policy has lapsed"), "the second host did not answer as expected: \(result)")
+        // The host's count of the phone's connections when it chose, and the control's answers: its inbox
+        // served before, then each of the three requests refused alike after the choice, with the lapsed
+        // words.
+        let refused = "refused PermissionDenied: [^\\n]*offline-validity policy has lapsed[^\\n]*"
+        let wanted = "^phone connections served at the choice: [1-9][0-9]*\\ncontrol before read: served items=0\\ncontrol after host\\.info: \(refused)\\ncontrol after session\\.open: \(refused)\\ncontrol after read: \(refused)$"
+        XCTAssertNotNil(result.range(of: wanted, options: .regularExpression), "the second host did not answer as expected: \(result)")
     }
 }
