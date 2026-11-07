@@ -1219,10 +1219,14 @@ impl Controller {
         self: &Arc<Self>,
         reservation: &crate::registry::Reservation,
     ) -> Result<ParamsValue> {
-        // A launch recorded as failed that no worker ever claimed made no session, and the
-        // reservation the caller read says so. It is decided before the records that may fail to
-        // be read, a closure or a second read of the reservation: none of them can say otherwise.
-        if reservation.phase == LaunchPhase::Failed && reservation.claimed_key.is_none() {
+        // A launch recorded as failed, or fenced, that no worker ever claimed made no session, and
+        // the reservation the caller read says so: a worker is given its launch specification only
+        // by claiming, and a claim is admitted only against a reservation still waiting for it. It
+        // is decided before the records that may fail to be read, a closure or a second read of the
+        // reservation: none of them can say otherwise.
+        if matches!(reservation.phase, LaunchPhase::Failed | LaunchPhase::Fenced)
+            && reservation.claimed_key.is_none()
+        {
             return Err(launch_failed(reservation));
         }
         // A retry can arrive before this daemon has adopted the worker its first attempt started,
