@@ -685,6 +685,7 @@ fn ends_of_root_resolved(standard_error: &str, root: &Path, resolved: Option<&Pa
             ends = ends.replace(&spelling, "<root>");
         }
     }
+    let mut ends = without_machine_paths(&ends);
     if ends.len() > ERROR_BYTES {
         // Three bytes of the limit are the dots.
         let mut from = ends.len() - (ERROR_BYTES - 3);
@@ -694,6 +695,41 @@ fn ends_of_root_resolved(standard_error: &str, root: &Path, resolved: Option<&Pa
         ends = format!("...{}", &ends[from..]);
     }
     format!("its standard error ends: {ends}")
+}
+
+/// `text` with each absolute path in it cut to its last component. A result names no path of this
+/// machine (the checkout's is `<root>`), and what a test binary, a target directory outside the
+/// checkout or the runner is called by is one; the step's log holds every path whole.
+fn without_machine_paths(text: &str) -> String {
+    let is_mark = |c: char| {
+        matches!(
+            c,
+            '`' | '\'' | '"' | '(' | ')' | '[' | ']' | ',' | ';' | ':'
+        )
+    };
+    text.split(' ')
+        .map(|word| {
+            let start = word.find(|c| !is_mark(c)).unwrap_or(word.len());
+            let end = word.rfind(|c| !is_mark(c)).map_or(start, |last| {
+                last + word[last..].chars().next().map_or(0, char::len_utf8)
+            });
+            let path = &word[start..end];
+            let bytes = path.as_bytes();
+            let absolute = path.starts_with('/')
+                || path.starts_with("\\\\")
+                || (bytes.len() > 2
+                    && bytes[0].is_ascii_alphabetic()
+                    && bytes[1] == b':'
+                    && matches!(bytes[2], b'\\' | b'/'));
+            match path.rsplit(['/', '\\']).next() {
+                Some(last) if absolute && !last.is_empty() => {
+                    format!("{}{last}{}", &word[..start], &word[end..])
+                }
+                _ => word.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `path` without the prefix that Windows gives a physical path: `\\?\C:\a` is `C:\a`, and
@@ -721,7 +757,7 @@ fn what_the_program_said(text: &str) -> Vec<String> {
     let mut lines = text.lines();
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || is_a_cargo_status_line(line) {
             continue;
         }
         if trimmed.starts_with("error: test failed, to rerun pass")
@@ -746,6 +782,36 @@ fn what_the_program_said(text: &str) -> Vec<String> {
         said.push(trimmed.to_owned());
     }
     said
+}
+
+/// Whether `line` is one of Cargo's status lines: a verb, right-aligned in twelve columns, then a
+/// space ("    Finished `test` profile ...", "     Running unittests ...", "   Doc-tests a").
+/// They say where Cargo was and name the programs it ran, and not why one failed.
+fn is_a_cargo_status_line(line: &str) -> bool {
+    const VERBS: [&str; 14] = [
+        "Compiling",
+        "Finished",
+        "Running",
+        "Doc-tests",
+        "Fresh",
+        "Checking",
+        "Documenting",
+        "Blocking",
+        "Locking",
+        "Updating",
+        "Adding",
+        "Removing",
+        "Downloading",
+        "Downloaded",
+    ];
+    let said = line.trim_start();
+    let indent = line.len() - said.len();
+    VERBS.iter().any(|verb| {
+        indent + verb.len() == 12
+            && said
+                .strip_prefix(verb)
+                .is_some_and(|rest| rest.starts_with(' '))
+    })
 }
 
 /// The causes in the "Caused by:" blocks that follow a line about a failed program, in `after`, the
