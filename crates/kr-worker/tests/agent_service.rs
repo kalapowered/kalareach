@@ -29,7 +29,7 @@ use kr_protocol::ids::{
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::receipt::ReceiptState;
 use kr_protocol::scalars::{Digest256, DurationMs, Nullable, TimestampMs, Uuid};
-use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
+use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, ShellMode};
 use kr_worker::broker::{
     BrokerError, BrokerTransport, Credential, ManagedProcess, PendingTransmission, TransportHandle,
     UpstreamDispatch, UpstreamOutcome, UpstreamRequest, subject,
@@ -4575,6 +4575,13 @@ async fn an_answer_is_not_inserted_into_the_thread_the_agent_selected_after_aski
         )],
         "the person's prompt is the one request the new thread was sent"
     );
+
+    // The fixture's shell sleeps for half a minute, and nothing else ends it: the session is
+    // closed, and the case returns once the session has finished closing.
+    let runtime = host.service.runtime();
+    runtime.close(ClosureReason::CloseRequested).1.release();
+    let closed = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed()).await;
+    assert!(closed.is_ok(), "the session closed and its shell ended");
 }
 
 /// KR-REQ-10.51: an answering `plugin.action.invoke` is held to the caller's history as an
