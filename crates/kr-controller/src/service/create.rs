@@ -663,7 +663,7 @@ impl Controller {
             let (desktop, _) = self.desktop().await;
             if !desktop.is_desktop() || !desktop.graphic_access {
                 let mut registry = self.registry.lock().await;
-                registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                self.record_failed(&mut registry, reservation.reservation_id);
                 drop(registry);
                 return Err(ControllerError::NotConfigured(
                     NO_DESKTOP_TO_BIND.to_owned(),
@@ -683,6 +683,18 @@ impl Controller {
         let mut hold =
             CreateHold::open(self, reservation.reservation_id, environment, sender).await;
 
+        // The address the worker meets this daemon at. It comes from this environment's paths
+        // alone, so it is known before anything is spent on the launch, and a host whose runtime
+        // directory cannot hold one fails here with nothing started.
+        let rendezvous = match self.paths.rendezvous_endpoint() {
+            Ok(endpoint) => endpoint.as_path().to_path_buf(),
+            Err(error) => {
+                hold.end_wait().await;
+                self.resolve_failed(&reservation).await;
+                return Err(error.into());
+            }
+        };
+
         // Everything the launch needs is prepared before the checks that admit it, so nothing
         // between the last check and the launch can wait: a directory tree is several filesystem
         // operations, and a slow disk would otherwise spend the rest of an accepted deadline here.
@@ -695,7 +707,7 @@ impl Controller {
             // Nothing was started, so the reservation is resolved as a confirmed failure and stops
             // occupying the environment.
             hold.end_wait().await;
-            self.resolve_failed(reservation.reservation_id).await?;
+            self.resolve_failed(&reservation).await;
             return Err(ControllerError::SessionDirectory(error));
         }
 
@@ -719,7 +731,7 @@ impl Controller {
             .and_then(|noted| noted)
         {
             hold.end_wait().await;
-            self.resolve_failed(reservation.reservation_id).await?;
+            self.resolve_failed(&reservation).await;
             return Err(error);
         }
 
@@ -748,7 +760,7 @@ impl Controller {
                     // other attempt holds it: a repeat would otherwise be told, until the next
                     // start, that this one is still under way.
                     hold.end_wait().await;
-                    self.resolve_failed(reservation.reservation_id).await?;
+                    self.resolve_failed(&reservation).await;
                     return Err(ControllerError::supervision(error.to_string()));
                 }
             }
@@ -770,7 +782,16 @@ impl Controller {
         let mut registration;
         {
             let mut registry = self.registry.lock().await;
-            registry.set_phase(reservation.reservation_id, LaunchPhase::Spawned)?;
+            if let Err(error) = registry.set_phase(reservation.reservation_id, LaunchPhase::Spawned)
+            {
+                // Nothing was started, so the reservation is resolved as a confirmed failure and
+                // stops occupying the environment, whatever the registry refused.
+                self.record_failed(&mut registry, reservation.reservation_id);
+                drop(registry);
+                hold.end_wait().await;
+                self.discard_worker_dir(reservation.session_id);
+                return Err(error);
+            }
             // The session is a writer where it starts from here to its end, and a capture that is
             // holding the repository it starts in still refuses it now, before the admission, so
             // the clock is still read last. The registration ends with this scope unless a
@@ -783,7 +804,7 @@ impl Controller {
             {
                 Ok(registration) => Some(registration),
                 Err(held) => {
-                    registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                    self.record_failed(&mut registry, reservation.reservation_id);
                     drop(registry);
                     hold.end_wait().await;
                     self.discard_worker_dir(reservation.session_id);
@@ -810,7 +831,7 @@ impl Controller {
             if let Err(refusal) = unusable.map_or(Ok(()), Err).and_then(|()| admit(&registry)) {
                 // Nothing was started, so the reservation is resolved as a confirmed failure and
                 // stops occupying the environment. The caller is told which of the two it was.
-                registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                self.record_failed(&mut registry, reservation.reservation_id);
                 drop(registry);
                 hold.end_wait().await;
                 self.discard_worker_dir(reservation.session_id);
@@ -823,7 +844,7 @@ impl Controller {
             environment_id: self.paths.environment_id(),
             display_number: reservation.display_number,
             program: self.worker_program.clone(),
-            rendezvous: self.paths.rendezvous_endpoint()?.as_path().to_path_buf(),
+            rendezvous,
             // The roots, not this environment's directories: the worker derives its own paths
             // from the environment identity, and giving it the derived directory would make it
             // apply the prefix twice.
@@ -857,7 +878,7 @@ impl Controller {
             LaunchOutcome::NotStarted { detail } => {
                 hold.end_wait().await;
                 let mut registry = self.registry.lock().await;
-                registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                self.record_failed(&mut registry, reservation.reservation_id);
                 drop(registry);
                 self.discard_worker_dir(reservation.session_id);
                 // A definition may have been written, and even loaded, before the platform
@@ -1177,18 +1198,72 @@ impl Controller {
     ///
     /// The phase is the durable half: a reservation recorded as failed stops occupying the
     /// environment and is never resumed. The directory prepared for the worker goes with it,
-    /// because nothing is going to use it.
-    async fn resolve_failed(&self, reservation_id: ReservationId) -> Result<()> {
+    /// because nothing is going to use it. What the registry refuses to write is held by
+    /// [`Self::record_failed`], and the create goes on to tell why its launch failed.
+    async fn resolve_failed(&self, reservation: &crate::registry::Reservation) {
         let mut registry = self.registry.lock().await;
-        let session_id = registry
-            .reservation(reservation_id)?
-            .map(|reservation| reservation.session_id);
-        registry.set_phase(reservation_id, LaunchPhase::Failed)?;
+        self.record_failed(&mut registry, reservation.reservation_id);
         drop(registry);
-        if let Some(session_id) = session_id {
-            self.discard_worker_dir(session_id);
+        self.discard_worker_dir(reservation.session_id);
+    }
+
+    /// Records that nothing was launched for a reservation and that its launch has failed.
+    ///
+    /// A registry that refuses the write leaves the row as it was, `reserved` or `spawned`, which a
+    /// repeat would read as an attempt still under way, or one that may have started a worker, until
+    /// the next start settles the row. The host knows better: this attempt has ended and started
+    /// nothing. So the failure is held in memory until the row can be written, and a repeat of the
+    /// create is told it ([`Self::the_launch_that_failed_unwritten`]).
+    fn record_failed(
+        &self,
+        registry: &mut crate::registry::Registry,
+        reservation_id: ReservationId,
+    ) {
+        if registry
+            .set_phase(reservation_id, LaunchPhase::Failed)
+            .is_err()
+        {
+            self.unwritten_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(reservation_id);
         }
-        Ok(())
+    }
+
+    /// The reservation as it stands once a failure this daemon could not write has been, if it holds
+    /// one for it.
+    ///
+    /// The write is tried again here, so the row says `failed` as soon as the registry takes it. The
+    /// repeat is told the failure whether or not it does: nothing was launched, and a worker's claim
+    /// is admitted only against a reservation that is `spawned` with a launcher recorded.
+    async fn the_launch_that_failed_unwritten(
+        &self,
+        reservation: &crate::registry::Reservation,
+    ) -> Option<crate::registry::Reservation> {
+        let held = self
+            .unwritten_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&reservation.reservation_id);
+        if !held {
+            return None;
+        }
+        let written = self
+            .registry
+            .lock()
+            .await
+            .set_phase(reservation.reservation_id, LaunchPhase::Failed)
+            .is_ok();
+        if written {
+            self.unwritten_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&reservation.reservation_id);
+        }
+        Some(crate::registry::Reservation {
+            phase: LaunchPhase::Failed,
+            ..reservation.clone()
+        })
     }
 
     /// Gives back the directory a worker was to run in.
@@ -1219,6 +1294,14 @@ impl Controller {
         self: &Arc<Self>,
         reservation: &crate::registry::Reservation,
     ) -> Result<ParamsValue> {
+        let failed;
+        let reservation = match self.the_launch_that_failed_unwritten(reservation).await {
+            Some(unwritten) => {
+                failed = unwritten;
+                &failed
+            }
+            None => reservation,
+        };
         // A launch recorded as failed, or fenced, that no worker ever claimed made no session, and
         // the reservation the caller read says so: a worker is given its launch specification only
         // by claiming, and a claim is admitted only against a reservation still waiting for it. It
@@ -1282,8 +1365,10 @@ impl Controller {
                 // is recorded for it: the host says what the reservation shows.
                 LaunchPhase::Failed => launch_failed(reservation),
                 // The first attempt has reserved the session and not yet asked for a worker: it may
-                // still make the session. A row its attempt left behind when a write failed reads the
-                // same until the next start moves it to failed, and nothing ran for it.
+                // still make the session. A row its attempt left behind when it panicked between
+                // the reservation and its first write reads the same until the next start moves it
+                // to failed, and nothing ran for it. A create that ended and could not write its
+                // failure is answered above, from what the daemon holds.
                 LaunchPhase::Reserved => ControllerError::attempt_still_running(),
                 // A worker was asked for, or ran: with it gone and no closure recorded, whether the
                 // session was made and what it came to is not known.

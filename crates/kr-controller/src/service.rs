@@ -6,7 +6,7 @@
 //! dies at any point in that sequence finds a record that tells it what happened, which is what
 //! makes a lost reply something to resolve rather than a reason to start a second shell.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -342,6 +342,13 @@ pub struct Controller {
     /// closure or refused for the session having closed ([`Controller::hold_proxy`]).
     proxies: std::sync::Mutex<BTreeMap<SessionId, Vec<std::sync::Weak<net::proxy::WorkerProxy>>>>,
     pending: Mutex<BTreeMap<ReservationId, PendingCreate>>,
+    /// The reservations whose create ended before it asked for a worker, and whose move to `failed`
+    /// the registry refused to take.
+    ///
+    /// Nothing was launched for any of them, so a repeat of the create is told that the launch
+    /// failed, and not that the first attempt is still under way, until the row can be written. It is
+    /// written again at the next repeat, and a daemon that starts again settles every such row.
+    unwritten_failures: std::sync::Mutex<BTreeSet<ReservationId>>,
     /// The reservations a look or a publication currently holds.
     ///
     /// A challenge presents a generation token, and one presented while that worker's own report is
