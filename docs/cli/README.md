@@ -349,7 +349,8 @@ success the terminal cannot read, may have been dispatched, and an unknown outco
 no answer sends that resize again, and nothing is asked in its place, because a size report changes
 the window the session keeps for the terminal and is not a read. The session stays at the size it
 has until the terminal is resized again. If the unknown resize was taken, that next resize is
-refused for the size owner's epoch, and the question follows that refusal as above.
+refused for the size owner's epoch, unless a later answer has updated the epoch, and the question
+follows that refusal as above.
 
 A read is one of those keys or it is the session's, whole and unchanged. That is the rule rather
 than a reader that looks inside a batch, because looking inside is how a command starts altering
@@ -2139,10 +2140,12 @@ session and the giving device's grant is revoked.
 
 While it waits for the owner device, the command reads the host's list of pending confirmations
 once a second. Each read is given thirty seconds, and never past the end of the challenge, which is
-measured once, when the challenge arrives. A host that does not answer a read, or a connection that
-fails, ends the command with nothing changed and exit status 3, and the command says which. A
-challenge that the host stops listing, or lists unanswered until it ends, is said to have run out:
-exit status 8 with `OWNER_CONFIRMATION_REQUIRED`, and nothing was handed over.
+measured once, when the challenge arrives. A host that does not answer a read within thirty
+seconds, or a connection that fails, ends the command with nothing changed and exit status 3, and
+the command says which. A challenge that the host stops listing, that it lists unanswered until it
+ends, or whose end cuts a read short, is said to have run out: exit status 8 with
+`OWNER_CONFIRMATION_REQUIRED`, and nothing was handed over. A host whose release cannot read the
+request for the list ends the command with exit status 8 and `UNSUPPORTED_CAPABILITY`.
 
 ## `kr plugin`
 
