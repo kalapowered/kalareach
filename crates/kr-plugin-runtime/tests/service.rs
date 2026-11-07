@@ -2723,6 +2723,89 @@ async fn an_unbind_is_about_the_registration_the_connection_held_when_the_reques
     );
 }
 
+/// Reads `call`, a call into the binding `request` registers, while the call's task is held; removes
+/// the registration and registers the identifier again; and lets the task run. The call is about
+/// the registration it was read under: its component is gone, so the call is refused, and the
+/// component of the registration made after it has finished no call it was not asked for.
+async fn a_call_read_before_the_registration_was_removed(
+    name: &str,
+    call: impl FnOnce(kr_protocol::scalars::Uuid) -> RequestBody,
+) {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let served = Served::start_unbinding_within(HANG_GUARD).await;
+    let (path, digest, bytes) = served.install("well-behaved", &wasm);
+    let component = ComponentSource {
+        path,
+        digest,
+        bytes,
+    };
+    let mut raw = Raw::connect(&served).await;
+    let request = components::request("well-behaved", 1);
+    let registered = raw.register(&request, &component).await;
+    assert!(
+        matches!(registered, ResponseBody::Registered { .. }),
+        "the binding was answered with {registered:?}"
+    );
+
+    let hold = served.host.hold_calls_before_they_run();
+    let asked = raw.send(call(request.binding_id.get())).await;
+    reached(&hold, "the call's task never started").await;
+    let removed = raw.unbind(&request).await;
+    assert!(
+        matches!(removed, ResponseBody::Unbound { existed: true }),
+        "the unbind before the {name} ran was answered with {removed:?}"
+    );
+    let registered = raw.register(&request, &component).await;
+    assert!(
+        matches!(registered, ResponseBody::Registered { .. }),
+        "the binding was answered with {registered:?}"
+    );
+    let before = raw.health().await.component_calls;
+    hold.release();
+
+    let answered = raw.collect(&[asked]).await.pop().expect("one answer");
+    assert!(
+        matches!(answered, ResponseBody::Refused { .. }),
+        "a {name} read before the registration was removed was answered with {answered:?}"
+    );
+    let after = raw.health().await.component_calls;
+    assert_eq!(
+        before, after,
+        "a {name} read before the registration was removed was carried out in the registration \
+         made after it"
+    );
+}
+
+// A snapshot is about the registration the connection held under the identifier when the request
+// was read, and not about whichever it holds when the request's task gets to run. The task is held
+// where it starts, so that the registration can be removed and the identifier registered again
+// before it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_is_about_the_registration_the_connection_held_when_the_request_was_read() {
+    a_call_read_before_the_registration_was_removed("snapshot", |binding_id| {
+        RequestBody::Snapshot {
+            binding_id,
+            deadline_ms: 20_000,
+        }
+    })
+    .await;
+}
+
+// A restore is about the registration the connection held under the identifier when the request was
+// read, as a snapshot is: a checkpoint of the registration that was removed is not applied to the
+// one made after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_is_about_the_registration_the_connection_held_when_the_request_was_read() {
+    a_call_read_before_the_registration_was_removed("restore", |binding_id| RequestBody::Restore {
+        binding_id,
+        state: Vec::new(),
+        deadline_ms: 20_000,
+    })
+    .await;
+}
+
 // A registration is the connection's from the moment the request is read, and not from the moment
 // its component has been read and compiled. An unbind that comes in between is about it: it is
 // answered as an unbind of a binding that exists, and the registration is refused when it gets
