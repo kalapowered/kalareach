@@ -1736,5 +1736,6 @@ pub(crate) mod tests {
             "the link was let go of while a call held the slot"
         );
         assert!(held.iter().any(|link| Arc::ptr_eq(link, &shared)));
+        assert!(!live(&ambient).await, "and it was closed");
     }
 }
