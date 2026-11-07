@@ -359,6 +359,12 @@ async fn answering(terminal: &mut WorkerTerminal) {
         .await;
 }
 
+/// Whether a line of `whoami /groups /fo csv /nh` is an integrity level, which it is by the level's
+/// SID, a field that begins `S-1-16-`, and not by the group's name, which the system translates.
+fn names_an_integrity_level(line: &str) -> bool {
+    line.contains(",\"S-1-16-")
+}
+
 /// The lines of `whoami`'s own account and group reports that tell one principal from another: the
 /// account's identifier, the integrity level, and the Administrators group with the state it is in.
 fn standing() -> Vec<String> {
@@ -377,7 +383,7 @@ fn standing() -> Vec<String> {
                 .lines()
                 .filter(|line| {
                     switch == "/user"
-                        || line.contains("Mandatory Label")
+                        || names_an_integrity_level(line)
                         || line.contains("S-1-5-32-544")
                 })
                 .map(str::to_owned),
@@ -2362,4 +2368,26 @@ fn after_a_sign_out_nothing_the_session_started_is_left_and_the_startup_entry_st
         let _ = std::fs::remove_dir_all(directory.as_str().expect("a directory"));
     }
     std::fs::remove_file(&path).expect("the record is removed");
+}
+
+#[test]
+fn an_integrity_level_is_named_by_its_sid_whatever_the_language() {
+    // The words of the first field are translated and the SID is not. The first line has the shape
+    // `whoami` prints in English; the second is an example of a translation, not a recording.
+    let english = "\"Mandatory Label\\Medium Mandatory Level\",\"Label\",\"S-1-16-8192\",\"\"";
+    let translated = "\"Etiquette obligatoire\\Niveau moyen\",\"Etiquette\",\"S-1-16-8192\",\"\"";
+    assert!(names_an_integrity_level(english));
+    assert!(names_an_integrity_level(translated));
+    assert!(
+        !names_an_integrity_level(
+            "\"Everyone\",\"Well-known group\",\"S-1-1-0\",\"Mandatory group\""
+        ),
+        "a group that is not a level is not one"
+    );
+    assert!(
+        !names_an_integrity_level(
+            "\"Mandatory Label\\Not A Level\",\"Label\",\"S-1-5-32-544\",\"\""
+        ),
+        "the words do not make a level"
+    );
 }
