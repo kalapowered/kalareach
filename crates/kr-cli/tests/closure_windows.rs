@@ -22,7 +22,7 @@ mod teardown;
 mod windows_session;
 
 use windows_session::{
-    LIVENESS_DEADLINE, RootProcessError, WorkerHost, WorkerTerminal, root_process_of,
+    LIVENESS_DEADLINE, RootProcessError, WorkerHost, WorkerTerminal, at_step, root_process_of,
 };
 
 /// A program of the system directory.
@@ -246,6 +246,61 @@ async fn nothing_started_the_closed_session_again(
         closed["display_number"], second["display_number"],
         "a display number is never used twice: {sessions:?}"
     );
+}
+
+/// An error of the exchange with a worker is no answer only when the connection itself failed: a pipe
+/// that is not there or is broken, a peer that closed. A worker that refuses the connection (access
+/// denied), a pipe that stays busy, and a worker that answers wrongly are failures.
+#[test]
+fn only_a_connection_that_failed_is_no_answer_from_a_worker() {
+    use kr_ipc::IpcError;
+    use std::io::{Error, ErrorKind};
+    let socket = |source: Error| IpcError::Socket {
+        operation: "connect",
+        source,
+    };
+    let gone = |error: IpcError| matches!(at_step("a step", &error), RootProcessError::Gone(_));
+    for (what, error) in [
+        (
+            "a pipe that is not there",
+            socket(Error::from(ErrorKind::NotFound)),
+        ),
+        ("a broken pipe", socket(Error::from(ErrorKind::BrokenPipe))),
+        (
+            "a reset pipe",
+            socket(Error::from(ErrorKind::ConnectionReset)),
+        ),
+        (
+            "a pipe whose far end has gone",
+            socket(Error::from_raw_os_error(233)),
+        ),
+        ("a peer that closed", IpcError::PeerClosed),
+        (
+            "a frame cut short",
+            IpcError::TruncatedFrame {
+                received: 1,
+                expected: 8,
+            },
+        ),
+    ] {
+        assert!(gone(error), "{what} is no answer");
+    }
+    for (what, error) in [
+        (
+            "a pipe that refuses the connection",
+            socket(Error::from_raw_os_error(5)),
+        ),
+        (
+            "a pipe that stays busy",
+            socket(Error::from(ErrorKind::TimedOut)),
+        ),
+        (
+            "an unexpected message",
+            IpcError::UnexpectedMessage("a variant"),
+        ),
+    ] {
+        assert!(!gone(error), "{what} is a failure");
+    }
 }
 
 /// A host that ran a session to its closure takes its whole tree away when it goes, the daemon's

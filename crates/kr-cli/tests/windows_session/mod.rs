@@ -47,19 +47,34 @@ pub enum RootProcessError {
 }
 
 /// Whether an error of a connection is the connection failing, as opposed to the peer answering
-/// wrongly: a socket that failed, a peer that closed, a frame the stream ended in the middle of.
+/// wrongly or this side being refused: a pipe that is not there, a pipe that is broken or reset, a
+/// peer that closed, a frame the stream ended in the middle of. A pipe that refuses the connection
+/// (access denied, which a live worker's pipe can answer) or stays busy past the deadline is not
+/// this: the Windows connect gives a socket error for every failure to open a pipe, and only the
+/// kind of the underlying error tells these apart.
 fn the_connection_failed(error: &kr_ipc::IpcError) -> bool {
-    matches!(
-        error,
-        kr_ipc::IpcError::Socket { .. }
-            | kr_ipc::IpcError::PeerClosed
-            | kr_ipc::IpcError::TruncatedFrame { .. }
-    )
+    use std::io::ErrorKind::{
+        BrokenPipe, ConnectionAborted, ConnectionReset, NotFound, UnexpectedEof,
+    };
+    /// ERROR_NO_DATA and ERROR_PIPE_NOT_CONNECTED, which a pipe whose far end has gone gives.
+    const PIPE_ENDED: [i32; 2] = [232, 233];
+    match error {
+        kr_ipc::IpcError::Socket { source, .. } => {
+            matches!(
+                source.kind(),
+                NotFound | BrokenPipe | ConnectionReset | ConnectionAborted | UnexpectedEof
+            ) || source
+                .raw_os_error()
+                .is_some_and(|code| PIPE_ENDED.contains(&code))
+        }
+        kr_ipc::IpcError::PeerClosed | kr_ipc::IpcError::TruncatedFrame { .. } => true,
+        _ => false,
+    }
 }
 
 /// What an error of `step` of the exchange with a worker says: the connection ending, or the worker
 /// answering wrongly.
-fn at_step(step: &str, error: &kr_ipc::IpcError) -> RootProcessError {
+pub fn at_step(step: &str, error: &kr_ipc::IpcError) -> RootProcessError {
     let said = format!("{step}: {error:?}");
     if the_connection_failed(error) {
         RootProcessError::Gone(said)
