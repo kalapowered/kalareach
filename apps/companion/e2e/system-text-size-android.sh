@@ -147,6 +147,19 @@ const check = (condition, message) => {
   if (!condition) failures += 1
 }
 
+/** What the tab bar must hold at a font scale: a gap clear of the screen's edges, a badge that holds its digits. */
+function checkBar(scale, bar) {
+  const first = bar.words[0]
+  const last = bar.words[bar.words.length - 1]
+  check(
+    first[0] >= bar.gap - 0.5 && bar.screen - last[1] >= bar.gap - 0.5,
+    `font scale ${scale}: the tab labels are a gap (${bar.gap}px) from the screen's edges (${first[0].toFixed(1)}px and ${(bar.screen - last[1]).toFixed(1)}px)`
+  )
+  check(bar.holds, `font scale ${scale}: the badge holds its digits`)
+  check(bar.inside, `font scale ${scale}: the badge stays inside the bar`)
+  if (bar.form !== null) check(!bar.over, `font scale ${scale}: the badge is clear of the glyph in the ${bar.form} form`)
+}
+
 /** The page, over the web view's debugging socket. */
 async function connect() {
   const pid = (await waitFor('the application to start', async () => run('shell', 'pidof', 'to.kala.reach').trim() || null)).split(/\s+/)[0]
@@ -220,6 +233,42 @@ const READ = `(() => {
   })
 })()`
 
+/**
+ * The tab bar of the page as the application opens it, which has a count on its first tab: how far
+ * each label's word is from the screen's edges, whether the badge holds its digits and stays inside
+ * the bar, and, where the bar has left its first form, whether the badge is over the glyph. The web
+ * view scales the text and leaves a length in em where it was, which a browser's text size does
+ * not, so this is read on the device.
+ */
+const BAR = `(() => {
+  const bar = document.querySelector('.m-tabbar')
+  if (!bar) return null
+  const probe = document.createElement('div')
+  probe.style.paddingLeft = 'var(--gap-2)'
+  document.body.append(probe)
+  const gap = parseFloat(getComputedStyle(probe).paddingLeft)
+  probe.remove()
+  const words = [...bar.querySelectorAll('.m-tab-label')].map((label) => {
+    const range = document.createRange()
+    range.selectNodeContents(label)
+    const box = range.getBoundingClientRect()
+    return [box.left, box.right]
+  })
+  const badge = bar.querySelector('.m-tab-badge')
+  const glyph = badge?.closest('.m-tab-glyph')?.querySelector('svg')?.getBoundingClientRect()
+  const count = badge?.getBoundingClientRect()
+  return JSON.stringify({
+    gap,
+    form: bar.getAttribute('data-form'),
+    screen: window.innerWidth,
+    words,
+    badge: Boolean(badge),
+    holds: !badge || (badge.scrollWidth <= badge.clientWidth + 0.5 && badge.scrollHeight <= badge.clientHeight + 0.5),
+    inside: !count || count.top >= bar.getBoundingClientRect().top - 0.5,
+    over: Boolean(count && glyph && count.left < glyph.right - 0.5 && glyph.left < count.right - 0.5 && count.top < glyph.bottom - 0.5 && glyph.top < count.bottom - 0.5)
+  })
+})()`
+
 const CONVERSATION = `http://tauri.localhost/harness.html?session=${SESSION}`
 
 /**
@@ -235,12 +284,16 @@ async function measure(scale) {
       try {
         const root = Number(await page.evaluate('parseFloat(getComputedStyle(document.documentElement).fontSize)'))
         if (!(Math.abs(root - expected) < 0.05)) throw new Error(`the root text is ${root}px`)
+        const bar = await waitFor('the first tab to show its count', async () => {
+          const found = JSON.parse((await page.evaluate(BAR)) ?? 'null')
+          return found?.badge ? found : null
+        }, 20_000)
         await page.send('Page.navigate', { url: CONVERSATION })
         return await waitFor('the conversation to show', async () => {
           const said = await page.evaluate(READ)
           const value = JSON.parse(said ?? 'null')
           if (!(value && Math.abs(value.root - expected) < 0.05 && value.line > 0)) throw new Error(`the page said ${said}`)
-          return JSON.stringify(value)
+          return JSON.stringify({ ...value, bar })
         }, 20_000)
       } finally {
         page.close()
@@ -252,6 +305,7 @@ async function measure(scale) {
 try {
   const atDefault = await measure('1.0')
   check(true, `font scale 1.0: the root text is ${atDefault.root}px, and a line of the conversation is ${atDefault.line.toFixed(1)}px tall`)
+  checkBar('1.0', atDefault.bar)
   for (const scale of ['1.5', '2.0', '1.0']) {
     run('shell', 'settings', 'put', 'system', 'font_scale', scale)
     const seen = await measure(scale).catch((failure) => {
@@ -262,6 +316,7 @@ try {
     if (seen === null) continue
     check(true, `font scale ${scale}: the root text is ${seen.root}px, ${scale} times the base size`)
     check(seen.wide <= seen.screen, `font scale ${scale}: the page is no wider than the screen (${seen.wide} of ${seen.screen})`)
+    checkBar(scale, seen.bar)
     if (Number(scale) > 1) {
       check(
         seen.line > atDefault.line * 1.3,
