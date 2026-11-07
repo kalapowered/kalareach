@@ -1685,36 +1685,17 @@ async fn transfer(
         "Waiting for an owner device to confirm this plan. It expires {}.",
         crate::shown::utc_moment(expires_at_ms)
     ));
-    loop {
-        let pending: OwnerConfirmationPendingResult = tokio::time::timeout(
-            READ_WITHIN,
-            host.read(
-                Method::OwnerConfirmationPending,
-                &OwnerConfirmationPendingParams {},
-            ),
+    // The wait ends at the host's own expiry, measured once on this process's monotonic clock.
+    let deadline = tokio::time::Instant::now()
+        + crate::plugin::time_left(expires_at_ms, kr_ipc::now_ms().get());
+    answered_by_an_owner_device(deadline, POLL_EVERY, &challenge.request, async || {
+        host.read(
+            Method::OwnerConfirmationPending,
+            &OwnerConfirmationPendingParams {},
         )
         .await
-        .map_err(|_| CliError::Other(Shown::said("the host did not answer in time")))??;
-        match pending
-            .pending
-            .iter()
-            .find(|waiting| waiting.request == challenge.request)
-        {
-            Some(waiting) if waiting.answered => break,
-            Some(_) if kr_ipc::now_ms().get() < expires_at_ms => {
-                tokio::time::sleep(POLL_EVERY).await;
-            }
-            _ => {
-                return Err(CliError::refused_in_its_own_words(
-                    ErrorCode::OwnerConfirmationRequired,
-                    Shown::said(
-                        "the confirmation ran out or was taken before an owner device answered \
-                         it, so nothing was handed over; ask again",
-                    ),
-                ));
-            }
-        }
-    }
+    })
+    .await?;
 
     let uid = host.client.acknowledgement().peer.uid.get();
     let new_grant_id = transfer_identity(&local_actor(uid), transfer_action);
@@ -1755,6 +1736,53 @@ async fn transfer(
             )
         }
         other => Err(unfinished(other, "the transfer", &watch.list_command)),
+    }
+}
+
+/// Reads the host's list of pending challenges every `every` until an owner device has answered
+/// `request`, and ends the command when the challenge has run out or been taken, when `deadline`
+/// passes, or when the list cannot be read: each read is given the time any request that changes
+/// nothing is given and never past `deadline`, as the other owner-device commands give it, and
+/// each ends the command with nothing changed and the reason it ended. A read that `deadline` cut
+/// short is the challenge running out.
+///
+/// `deadline` is a point on this process's own monotonic clock, fixed when the challenge arrived,
+/// so nothing that happens to the wall clock afterwards moves it.
+async fn answered_by_an_owner_device(
+    deadline: tokio::time::Instant,
+    every: Duration,
+    request: &kr_protocol::pairing::OwnerConfirmationRequest,
+    mut pending: impl AsyncFnMut() -> Result<OwnerConfirmationPendingResult>,
+) -> Result<()> {
+    let ran_out = || {
+        CliError::refused_in_its_own_words(
+            ErrorCode::OwnerConfirmationRequired,
+            Shown::said(
+                "the confirmation ran out or was taken before an owner device answered it, so \
+                 nothing was handed over; ask again",
+            ),
+        )
+    };
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ran_out());
+        }
+        // A read the challenge's end cut short is the challenge running out, not a host that did
+        // not answer: the host is asked about it every poll until then.
+        let listed = match crate::plugin::ask_before(deadline, pending()).await {
+            Ok(listed) => listed?,
+            Err(_) if tokio::time::Instant::now() >= deadline => return Err(ran_out()),
+            Err(ended) => return Err(ended),
+        };
+        match listed
+            .pending
+            .iter()
+            .find(|waiting| waiting.request == *request)
+        {
+            Some(waiting) if waiting.answered => return Ok(()),
+            Some(_) => tokio::time::sleep(every).await,
+            None => return Err(ran_out()),
+        }
     }
 }
 
@@ -2247,5 +2275,159 @@ mod tests {
             shown.iter().all(|path| path.ends_with("recipient_name")),
             "{shown:?}"
         );
+    }
+
+    fn a_challenge() -> kr_protocol::pairing::OwnerConfirmationRequest {
+        use kr_protocol::ids::{ConfirmationId, DeviceId};
+        use kr_protocol::pairing::SensitiveAction;
+        use kr_protocol::scalars::{Digest256, EndpointKey, Nonce256};
+        kr_protocol::pairing::OwnerConfirmationRequest {
+            confirmation_id: ConfirmationId::new(Uuid::from_bytes([1; 16])),
+            action: SensitiveAction::TrustRepositoryRoot,
+            action_digest: Digest256::from_bytes([1; 32]),
+            destination_keys: Nullable::null(),
+            destination_rights: CanonicalSet::new(),
+            host_device_id: DeviceId::new(Uuid::from_bytes([3; 16])),
+            host_endpoint_id: EndpointKey::from_bytes([5; 32]),
+            nonce: Nonce256::from_bytes([4; 32]),
+            expires_at_ms: TimestampMs::new(1),
+        }
+    }
+
+    /// KR-REQ-07.47: the wait for an owner device to answer a transfer's confirmation reads the
+    /// host's list as the other owner-device commands do. It ends with the challenge, on this
+    /// process's own clock, and not after the time any read is given: a host that does not answer,
+    /// or a connection that fails, ends the command with nothing changed and the reason, with the
+    /// status of a host that is not there; a challenge the host stops listing, or lists to its
+    /// end unanswered, is one that ran out, and so is a read the challenge's end cuts short. The
+    /// controls are a challenge an owner device has answered and a refusal of the host's, which is
+    /// its own.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_for_an_owner_device_to_confirm_a_transfer_ends_with_the_challenge_and_says_why()
+     {
+        use kr_protocol::confirmation::{ConfirmationDisplay, PendingConfirmation};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // The outer bound is the test's own: a wait that is never given up never ends.
+        let outer = Duration::from_secs(3600);
+        let request = a_challenge();
+        let listing = |answered: bool| OwnerConfirmationPendingResult {
+            pending: vec![PendingConfirmation {
+                request: request.clone(),
+                display: ConfirmationDisplay::EstablishClock,
+                answered,
+            }],
+        };
+        let nothing_changed = |error: &CliError| error.to_string().contains("Nothing was changed");
+
+        // A host that does not answer the read is given the time any request is given, and not
+        // the ten seconds a read of the list was once given: on the paused clock, thirty.
+        let started = tokio::time::Instant::now();
+        let silent = tokio::time::timeout(
+            outer,
+            answered_by_an_owner_device(
+                started + Duration::from_secs(600),
+                POLL_EVERY,
+                &request,
+                async || std::future::pending::<Result<OwnerConfirmationPendingResult>>().await,
+            ),
+        )
+        .await
+        .expect("the wait was given up when the host did not answer");
+        let Err(unanswered @ CliError::HostUnavailable(_)) = silent else {
+            panic!("the host did not answer");
+        };
+        assert_eq!(unanswered.exit_code(), 3);
+        assert!(nothing_changed(&unanswered), "{unanswered}");
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+
+        // A read the challenge's end cuts short, five seconds on, is the challenge running out, and
+        // is given up there.
+        let started = tokio::time::Instant::now();
+        let cut = tokio::time::timeout(
+            outer,
+            answered_by_an_owner_device(
+                started + Duration::from_secs(5),
+                POLL_EVERY,
+                &request,
+                async || std::future::pending::<Result<OwnerConfirmationPendingResult>>().await,
+            ),
+        )
+        .await
+        .expect("the wait was given up at the challenge's end");
+        let Err(cut @ CliError::ServiceRefused { .. }) = cut else {
+            panic!("the challenge ran out");
+        };
+        assert_eq!(cut.code(), ErrorCode::OwnerConfirmationRequired);
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+
+        // A connection that fails before the host answers.
+        let lost = answered_by_an_owner_device(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            POLL_EVERY,
+            &request,
+            async || Err(CliError::Ipc(kr_ipc::IpcError::PeerClosed)),
+        )
+        .await;
+        let Err(lost @ CliError::HostUnavailable(_)) = lost else {
+            panic!("the connection failed");
+        };
+        assert!(nothing_changed(&lost), "{lost}");
+
+        // A challenge listed to its end, unanswered, is asked about every poll until then and ends
+        // the wait there; one the host stops listing ends it at once.
+        let reads = AtomicUsize::new(0);
+        let ran_out = tokio::time::timeout(
+            outer,
+            answered_by_an_owner_device(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                POLL_EVERY,
+                &request,
+                async || {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    Ok(listing(false))
+                },
+            ),
+        )
+        .await
+        .expect("the wait ended with the challenge");
+        let Err(ran_out @ CliError::ServiceRefused { .. }) = ran_out else {
+            panic!("the challenge ran out");
+        };
+        assert_eq!(ran_out.code(), ErrorCode::OwnerConfirmationRequired);
+        assert!(
+            reads.load(Ordering::SeqCst) > 1,
+            "the host's list is read again until the challenge ends"
+        );
+        let reads = AtomicUsize::new(0);
+        let unlisted = answered_by_an_owner_device(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            POLL_EVERY,
+            &request,
+            async || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok(OwnerConfirmationPendingResult { pending: vec![] })
+            },
+        )
+        .await;
+        let Err(unlisted @ CliError::ServiceRefused { .. }) = unlisted else {
+            panic!("the challenge is not listed");
+        };
+        assert_eq!(unlisted.code(), ErrorCode::OwnerConfirmationRequired);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        // The controls.
+        let live = tokio::time::Instant::now() + Duration::from_secs(60);
+        answered_by_an_owner_device(live, POLL_EVERY, &request, async || Ok(listing(true)))
+            .await
+            .expect("an owner device has answered");
+        let refused = answered_by_an_owner_device(live, POLL_EVERY, &request, async || {
+            Err(CliError::Refused(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "no",
+            )))
+        })
+        .await;
+        assert!(matches!(refused, Err(CliError::Refused(_))));
     }
 }
