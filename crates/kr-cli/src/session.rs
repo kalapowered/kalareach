@@ -981,9 +981,10 @@ struct WindowReports {
     /// How many resizes this terminal made as the owner, one after another, the session did not
     /// take for now. They end when a resize is taken, or when the person resizes the terminal.
     owner_not_taken: u8,
-    /// The size of the newest resize this terminal asked for as the owner, the person's or one an
-    /// answer showed it owed.
-    owner_asked: Option<Dimensions>,
+    /// The request of the newest resize this terminal asked for as the owner, the person's or one
+    /// an answer showed it owed. It ends when the person resizes the terminal while it does not
+    /// own the size, since that resize is newer than any the owner asked for.
+    owner_request: Option<kr_protocol::ids::RequestId>,
     /// The size of the newest resize this terminal asked for as the owner that the session could
     /// not say what became of. It is not made again by itself, whatever size the session is found
     /// at: nothing is asked in its place, and the next resize the person makes is. It ends when
@@ -1040,7 +1041,7 @@ impl WindowReports {
             size_sent: size,
             size_owed: None,
             carried_at: None,
-            owner_asked: None,
+            owner_request: None,
             resize_unknown: None,
             resting: false,
             not_taken_in_a_row: 0,
@@ -1075,6 +1076,7 @@ impl WindowReports {
     /// by the person, which ends what was left of that one.
     fn measured(&mut self, size: Dimensions) {
         self.size = size;
+        self.owner_request = None;
         if self.resize_unknown != Some(size) {
             self.resize_unknown = None;
         }
@@ -1105,7 +1107,6 @@ impl WindowReports {
         self.size = size;
         self.size_sent = size;
         self.size_owed = None;
-        self.owner_asked = Some(size);
         self.resize_unknown = None;
         self.spoke();
     }
@@ -1115,13 +1116,20 @@ impl WindowReports {
     /// Says whether the resize is to be made. A signal for the size a resize ended unknown for is
     /// no new resize, since an answer may have read the new size before the signal was read: it
     /// is not made again.
+    #[must_use]
     fn resized_as_owner(&mut self, size: Dimensions) -> bool {
         if self.resize_unknown == Some(size) {
+            self.size = size;
             return false;
         }
         self.owner_not_taken = 0;
         self.took_size(size);
         true
+    }
+
+    /// The resize this terminal asked for as the owner went under `request`.
+    const fn resize_sent(&mut self, request: kr_protocol::ids::RequestId) {
+        self.owner_request = Some(request);
     }
 
     /// A resize this terminal made as the owner was taken.
@@ -1145,14 +1153,14 @@ impl WindowReports {
         self.resting = true;
     }
 
-    /// The session could not say what became of the resize to `asked`, which this terminal made as
-    /// the owner. It may have been dispatched, and an unknown outcome is not retried, so it is not
-    /// made again, and nothing is asked in its place: no answer owes it. It is no resize taken, and
-    /// no resize refused for now, so the count of those stands. A resize this terminal asked for
-    /// since, to another size, is the one that counts, and an answer to an older one that comes
-    /// late leaves no mark.
-    fn resize_ended_unknown(&mut self, asked: Dimensions) {
-        if self.owner_asked == Some(asked) {
+    /// The session could not say what became of the resize to `asked`, which went under `request`.
+    /// It may have been dispatched, and an unknown outcome is not retried, so it is not made again,
+    /// and nothing is asked in its place: no answer owes it. It is no resize taken, and no resize
+    /// refused for now, so the count of those stands. Only the newest resize this terminal asked
+    /// for counts: an older one answered late, after a newer resize or after the person resized
+    /// the terminal, leaves no mark, since the size has moved on from it.
+    fn resize_ended_unknown(&mut self, request: kr_protocol::ids::RequestId, asked: Dimensions) {
+        if self.owner_request == Some(request) {
             self.resize_unknown = Some(asked);
         }
     }
@@ -2586,7 +2594,9 @@ async fn drive(
                                 // report changes the window the session keeps for this terminal, so
                                 // it is no read. If the resize was taken, the next resize is
                                 // refused for its epoch and the question follows that definite word.
-                                Err(ResizeRefusal::Unknown) => window.resize_ended_unknown(asked),
+                                Err(ResizeRefusal::Unknown) => {
+                                    window.resize_ended_unknown(answered, asked);
+                                }
                                 // The session's definite word: the resize did not happen and will
                                 // not, and asking again changes nothing.
                                 Err(ResizeRefusal::Refused) => {}
@@ -2649,6 +2659,7 @@ async fn drive(
                                         return AttachOutcome::Disconnected;
                                     }
                                     outstanding.insert(request_id, Outstanding::Resize(dimensions));
+                                    window.resize_sent(request_id);
                                 }
                             }
                             (
@@ -2804,6 +2815,7 @@ async fn drive(
                     return AttachOutcome::Disconnected;
                 }
                 outstanding.insert(request_id, Outstanding::Resize(dimensions));
+                window.resize_sent(request_id);
             }
             read = input.recv() => {
                 let Some(read) = read else {
@@ -6603,7 +6615,7 @@ mod tests {
     fn an_owners_resize_the_session_did_not_take_for_now_is_asked_about_with_its_next_word() {
         let mut window = WindowReports::new(size(80, 24));
         window.installed(0, None);
-        window.resized_as_owner(size(100, 30));
+        assert!(window.resized_as_owner(size(100, 30)));
         assert_eq!(window.next(), None, "the resize is not a viewport report");
         window.resize_not_taken(size(100, 30));
         assert_eq!(
@@ -6640,7 +6652,7 @@ mod tests {
         );
 
         // The person resizing the terminal starts the count again, and so does a resize taken.
-        window.resized_as_owner(size(90, 20));
+        assert!(window.resized_as_owner(size(90, 20)));
         window.resize_not_taken(size(90, 20));
         window.heard();
         assert!(
@@ -6722,63 +6734,86 @@ mod tests {
     /// A resize this terminal made as the owner that the session could not say what became of is
     /// not made again, and nothing is owed in its place. A signal for the size it was made for is
     /// no new resize, and a resize to another size is: from the person, whether the terminal owns
-    /// the size or not. An answer to an older resize that comes after a newer one was asked leaves
-    /// no mark. It is no resize taken and none refused for now: the count of those, which ends a
-    /// session that keeps refusing after three, stands as it was.
+    /// the size or not. Only the newest resize this terminal asked for leaves a mark: an older one
+    /// answered late, whether a newer resize went to another size, back to the same size or the
+    /// person resized the terminal while it did not own the size, leaves none. It is no resize
+    /// taken and none refused for now: the count of those, which ends a session that keeps
+    /// refusing after three, stands as it was.
     #[test]
     fn an_owners_resize_of_unknown_outcome_is_not_made_again_and_owes_nothing() {
+        let (a, b) = (size(100, 30), size(90, 20));
         let mut window = WindowReports::new(size(80, 24));
         window.installed(0, None);
-        assert!(
-            window.resized_as_owner(size(100, 30)),
-            "the person's resize"
-        );
-        window.resize_ended_unknown(size(100, 30));
+        assert!(window.resized_as_owner(a), "the person's resize");
+        window.resize_sent(request(101));
+        window.resize_ended_unknown(request(101), a);
         assert_eq!(
             window.resize_unknown(),
-            Some(size(100, 30)),
+            Some(a),
             "no answer owes this resize"
         );
         window.heard();
         assert_eq!(window.next(), None, "and nothing is asked in its place");
+        window.pressed(0, 1, b);
         assert!(
-            !window.resized_as_owner(size(100, 30)),
+            !window.resized_as_owner(a),
             "a signal for the size the resize was made for is no new resize"
         );
-        assert_eq!(window.resize_unknown(), Some(size(100, 30)));
-        assert!(
-            window.resized_as_owner(size(90, 20)),
-            "another size is a new resize"
+        assert_eq!(window.resize_unknown(), Some(a));
+        assert_eq!(
+            window.next(),
+            None,
+            "and the size the terminal has is the one the resize was made for"
         );
+        assert!(window.resized_as_owner(b), "another size is a new resize");
+        window.resize_sent(request(102));
         assert_eq!(window.resize_unknown(), None);
 
-        // Answers out of order: the older resize's comes after a newer one was asked.
-        assert!(window.resized_as_owner(size(100, 30)));
-        assert!(window.resized_as_owner(size(80, 24)));
-        window.resize_ended_unknown(size(100, 30));
+        // The person drags through a size, away and back: the answer to the first resize comes
+        // after the third was asked, though all three are for sizes the terminal went through.
+        assert!(window.resized_as_owner(a));
+        window.resize_sent(request(103));
+        assert!(window.resized_as_owner(b));
+        window.resize_sent(request(104));
+        assert!(window.resized_as_owner(a));
+        window.resize_sent(request(105));
+        window.resize_ended_unknown(request(103), a);
         assert_eq!(
             window.resize_unknown(),
             None,
             "the older one leaves no mark"
         );
-        assert!(
-            window.resized_as_owner(size(100, 30)),
-            "so the person's resize back to it is made"
-        );
+        window.resize_ended_unknown(request(105), a);
+        assert_eq!(window.resize_unknown(), Some(a), "the newest does");
 
-        // A terminal that does not own the size: the same size keeps the mark, another ends it.
-        window.resize_ended_unknown(size(100, 30));
-        window.measured(size(100, 30));
-        assert_eq!(window.resize_unknown(), Some(size(100, 30)));
-        window.measured(size(90, 20));
+        // The terminal lost the size and the person resized it: an answer to the resize it made
+        // as the owner leaves no mark, and a measured size other than the marked one ends one.
+        assert!(window.resized_as_owner(b));
+        window.resize_sent(request(106));
+        window.measured(a);
+        window.resize_ended_unknown(request(106), b);
         assert_eq!(window.resize_unknown(), None);
+        assert!(
+            window.resized_as_owner(b),
+            "so the resize back to it is made"
+        );
+        window.resize_sent(request(107));
+        window.resize_ended_unknown(request(107), b);
+        window.measured(b);
+        assert_eq!(
+            window.resize_unknown(),
+            Some(b),
+            "the same size keeps the mark"
+        );
+        window.measured(a);
+        assert_eq!(window.resize_unknown(), None, "another size ends it");
 
         // Resizes refused for now go three times in a row at most, and one of unknown outcome
         // between them neither ends the count nor adds to it.
         let mut id = 1;
         let mut refused_for_now = |window: &mut WindowReports| {
-            window.took_size(size(100, 30));
-            window.resize_not_taken(size(100, 30));
+            window.took_size(a);
+            window.resize_not_taken(a);
             window.heard();
             let asked = send(window, id).is_some();
             if asked {
@@ -6789,8 +6824,10 @@ mod tests {
         };
         assert!(refused_for_now(&mut window), "the first");
         assert!(refused_for_now(&mut window), "the second");
-        window.took_size(size(100, 30));
-        window.resize_ended_unknown(size(100, 30));
+        window.took_size(a);
+        window.resize_sent(request(108));
+        window.resize_ended_unknown(request(108), a);
+        assert_eq!(window.resize_unknown(), Some(a));
         window.heard();
         assert_eq!(window.next(), None);
         assert!(refused_for_now(&mut window), "the third");
