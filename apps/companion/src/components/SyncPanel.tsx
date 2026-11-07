@@ -70,6 +70,7 @@ import {
   describeSettingsSync,
   describeWaiting
 } from '../model/settings'
+import { ServiceAddress } from './ServiceAddress'
 import { SettingsChoiceForm } from './SettingsChoice'
 import { SettingsDevices } from './SettingsDevices'
 import { Button, Card, Switch } from './ui'
@@ -323,7 +324,7 @@ export function SyncPanel({
           >
             {service !== null ? (
               <p className="account-lead">
-                This device uses <strong data-testid="sync-service">{service.host}</strong> as its
+                This device uses <ServiceAddress host={service.host} testId="sync-service" /> as its
                 sync service.
               </p>
             ) : null}

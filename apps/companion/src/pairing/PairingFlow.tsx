@@ -23,6 +23,7 @@ import {
   type RefObject
 } from 'react'
 
+import { ServiceAddress } from '../components/ServiceAddress'
 import { Button, Card, Switch } from '../components/ui'
 import { useApp } from '../app/state'
 import {
@@ -459,7 +460,7 @@ export function PairingFlow({
           <div className="pairing-settings">
             <div className="divided-row">
               <p className="small">
-                Codes go through <strong data-testid="pairing-service">{view.origin.host}</strong>
+                Codes go through <ServiceAddress host={view.origin.host} testId="pairing-service" />
               </p>
               <Button data-wraps
                 tone="quiet"
