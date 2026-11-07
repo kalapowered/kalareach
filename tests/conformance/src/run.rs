@@ -1107,17 +1107,25 @@ fn dependency_file(name: &str, outputs: &[PathBuf], began: SystemTime) -> Option
 
 /// Whether the compiles in `readers` could have run beside each other.
 ///
-/// Cargo compiles a unit as soon as the ones it needs are done. A program and a test program of a
-/// package link its library, so they wait for it; the library's unit tests, each of two programs or
-/// test programs, and each of two variants of the library (a profile with `panic = "abort"` builds
-/// one beside the one the tests link), do not wait for the library or for each other.
+/// Cargo compiles a unit as soon as the ones it needs are done, and a program or a test program
+/// needs the whole of its package's library, so it starts after the library's compile has ended.
+/// When the library is one of the readers it is the compile that wrote the file (Tauri's macro
+/// writes a file only if it is not there), and the programs find it whole and only read it, however
+/// many there are. The library's unit tests do not wait for the library, nor do two variants of the
+/// library (a profile with `panic = "abort"` builds one beside the one the tests link), nor, when
+/// the library does not read the file, two programs or test programs: any of them may write the file
+/// while another reads it.
 fn may_have_overlapped(readers: &[Unit]) -> bool {
-    let libraries = readers
-        .iter()
-        .filter(|unit| **unit == Unit::Library)
-        .count();
-    let others = readers.len() - libraries;
-    libraries > 1 || others > 1 || (libraries == 1 && readers.contains(&Unit::LibraryTests))
+    let count = |wanted: Unit| readers.iter().filter(|unit| **unit == wanted).count();
+    let (libraries, with_tests, others) = (
+        count(Unit::Library),
+        count(Unit::LibraryTests),
+        count(Unit::Other),
+    );
+    libraries > 1
+        || with_tests > 1
+        || (with_tests == 1 && libraries + others > 0)
+        || (libraries == 0 && others > 1)
 }
 
 /// What [`date_before`] did.
@@ -1681,18 +1689,20 @@ mod tests {
 
     #[test]
     fn compiles_of_a_package_that_could_have_run_beside_each_other_are_told() {
-        // Programs and test programs link the library, so they wait for it.
+        // Programs and test programs link the library, so they start after it has ended: a file
+        // that the library read is whole when they read it, however many of them there are.
         assert!(!may_have_overlapped(&[Unit::Library]));
         assert!(!may_have_overlapped(&[Unit::Library, Unit::Other]));
-        assert!(!may_have_overlapped(&[Unit::Other]));
-        assert!(!may_have_overlapped(&[Unit::LibraryTests]));
-        // The library's unit tests do not wait for it, nor do two programs wait for each other.
-        assert!(may_have_overlapped(&[Unit::Library, Unit::LibraryTests]));
-        assert!(may_have_overlapped(&[
+        assert!(!may_have_overlapped(&[
             Unit::Library,
             Unit::Other,
             Unit::Other
         ]));
+        assert!(!may_have_overlapped(&[Unit::Other]));
+        assert!(!may_have_overlapped(&[Unit::LibraryTests]));
+        // The library's unit tests do not wait for it, nor do two programs that it did not read
+        // the file for wait for each other.
+        assert!(may_have_overlapped(&[Unit::Library, Unit::LibraryTests]));
         assert!(may_have_overlapped(&[Unit::Other, Unit::Other]));
         assert!(may_have_overlapped(&[Unit::LibraryTests, Unit::Other]));
         // Two compiles of the library itself are two variants of it, as `panic = "abort"` makes
