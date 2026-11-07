@@ -3908,8 +3908,9 @@ async fn the_host_makes_a_backup_of_a_closed_session_and_its_configuration_once_
     );
 }
 
-/// Whether `needle` is in `haystack` as it is, in lower-case hexadecimal or in base64url, which
-/// are the ways a document of the host's could carry a key.
+/// Whether `needle` is in `haystack` as it is, in lower-case hexadecimal, or as base64url on its
+/// own: the ways a document of the host's could carry a key. A key encoded inside a longer base64
+/// field, at an offset that is not a multiple of three bytes, is not found.
 fn is_carried_in(haystack: &[u8], needle: &[u8]) -> bool {
     let hex: String = needle.iter().map(|byte| format!("{byte:02x}")).collect();
     [
@@ -3923,13 +3924,16 @@ fn is_carried_in(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// KR-REQ-20.17, the host's own backup production only: a generation the daemon makes holds the
 /// members the convention names, each of a kind the material table lets a backup carry, and none
-/// holds a private key this host keeps: not its transport (endpoint) key, its authorisation
-/// (control-signing) key, its stored-envelope key, its notification-preview key or its backup
-/// writer's key, whether as the bytes, in hexadecimal or in base64url. The control is the session's
-/// own output, which the same scan finds in the session's member in the one encoding that member
-/// uses, so the scan reads what the members hold. Not shown here: that a restore refuses a member
-/// under a reserved name or a revoked grant, which the restore cases show, or the other data
-/// paths of backup and recovery material.
+/// holds a private key this host keeps. The host keeps two sets of four keys (transport, which is
+/// the reusable endpoint key; authorisation, which is the control-signing key; stored envelope; and
+/// notification preview): the controller identity that signs its workers' tokens, and the device
+/// keys it pairs with. It also keeps a backup writer's key. The case reads all nine seeds from the
+/// secret store the daemon wrote them to and scans every member for each as the bytes, in
+/// hexadecimal or as base64url. The controls are the scan finding each of those forms of a seed
+/// where one is put, and the session's own output in the session's member, so the scan reads what
+/// the members hold. Not shown here: a key inside a longer base64 field at an offset that is not a
+/// multiple of three bytes, that a restore refuses a member under a reserved name or a revoked
+/// grant, which the restore cases show, or the other data paths of backup and recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_keeps() {
     use kr_crypto::backup::{Material, may_back_up, member_material};
@@ -3965,26 +3969,34 @@ async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_kee
         );
     }
 
-    // The private keys the host keeps, read from the secret store the daemon wrote them to.
+    // The private keys the host keeps, read from the secret store the daemon wrote them to: the
+    // controller identity under the environment's own scope, and the device keys and the backup
+    // writer's key under the scope the daemon pairs with.
     let store =
         open_store_in(&rig.host.environment().secrets_dir()).expect("the daemon's secret store");
-    let scope = kr_controller::service::net::device_key_scope(rig.host.environment_id());
+    let identity_scope = rig.host.environment_id().to_string();
+    let device_scope = kr_controller::service::net::device_key_scope(rig.host.environment_id());
     let mut kept = Vec::new();
-    for purpose in [
-        KeyPurpose::Transport,
-        KeyPurpose::Authorisation,
-        KeyPurpose::StoredEnvelope,
-        KeyPurpose::NotificationPreview,
+    for (whose, scope) in [
+        ("controller identity", &identity_scope),
+        ("device", &device_scope),
     ] {
-        let name = kr_crypto::store::SecretName::device_key(&scope, purpose).expect("a name");
-        let seed = store
-            .store
-            .get(&name)
-            .expect("the store reads")
-            .unwrap_or_else(|| panic!("the daemon kept a {purpose:?} key"));
-        kept.push((format!("{purpose:?}"), seed.expose().to_vec()));
+        for purpose in [
+            KeyPurpose::Transport,
+            KeyPurpose::Authorisation,
+            KeyPurpose::StoredEnvelope,
+            KeyPurpose::NotificationPreview,
+        ] {
+            let name = kr_crypto::store::SecretName::device_key(scope, purpose).expect("a name");
+            let seed = store
+                .store
+                .get(&name)
+                .expect("the store reads")
+                .unwrap_or_else(|| panic!("the daemon kept a {whose} {purpose:?} key"));
+            kept.push((format!("{whose} {purpose:?}"), seed.expose().to_vec()));
+        }
     }
-    let writer = kr_crypto::store::SecretName::backup_writer(&scope).expect("a name");
+    let writer = kr_crypto::store::SecretName::backup_writer(&device_scope).expect("a name");
     kept.push((
         "backup writer".to_owned(),
         store
@@ -3995,11 +4007,25 @@ async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_kee
             .expose()
             .to_vec(),
     ));
+    assert_eq!(kept.len(), 9, "two sets of four keys and the writer's");
     for (name, seed) in &kept {
         assert!(seed.len() >= 32, "the {name} key is a seed, not a stub");
     }
 
-    // The control: the scan finds what a member does hold, in the encoding the member uses.
+    // The controls: the scan finds a seed in each form it looks for, and finds what a member does
+    // hold, in the encoding the member uses.
+    let (_, probe) = &kept[0];
+    let hex: String = probe.iter().map(|byte| format!("{byte:02x}")).collect();
+    for form in [
+        probe.clone(),
+        hex.into_bytes(),
+        kr_protocol::scalars::to_base64url(probe).into_bytes(),
+    ] {
+        let mut around = b"{\"a\":\"".to_vec();
+        around.extend_from_slice(&form);
+        around.extend_from_slice(b"\"}");
+        assert!(is_carried_in(&around, probe), "the scan misses a form");
+    }
     let output = b"first line\r\nsecond line\r\n";
     assert!(
         is_carried_in(&members[&format!("sessions/{session}.json")], output),
