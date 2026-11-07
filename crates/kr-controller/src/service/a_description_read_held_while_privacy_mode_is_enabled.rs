@@ -77,6 +77,7 @@ async fn an_answer_held_while_privacy_mode_is_enabled_carries_no_description() {
     controller.privacy.state().set(Published {
         generation: PrivacyGeneration::new(1),
         private: true,
+        ..Published::default()
     });
     controller
         .attention()

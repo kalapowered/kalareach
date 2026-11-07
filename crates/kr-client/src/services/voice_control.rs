@@ -668,7 +668,8 @@ impl VoiceControl {
     /// use without speaking it, under a first line that says it is data and not instructions, and
     /// is cut at line breaks where it can be into appends of at most [`VOICE_CONTEXT_BYTES`]
     /// bytes. The control paces them. Returns how many were accepted; the first request that is
-    /// not accepted stops it. The owner calls this once the call's first media frames are counted.
+    /// not accepted stops it, so a call can be given a part of its context. The owner calls this
+    /// when the control first attaches.
     ///
     /// # Errors
     ///

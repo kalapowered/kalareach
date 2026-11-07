@@ -1832,6 +1832,7 @@ pub(crate) mod tests {
         Published {
             generation: PrivacyGeneration::new(generation),
             private,
+            ..Published::default()
         }
     }
 

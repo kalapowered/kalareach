@@ -459,16 +459,34 @@ impl Worker {
 
     /// As [`Self::ask`], for a question that comes with `context` to decide it by.
     pub fn ask_with_context(&self, request: &str, context: &str) -> Question {
-        self.ask_from(request, context, "/bin/agent", "an agent")
+        self.ask_from(request, context, "/bin/agent", "an agent", None)
     }
 
     /// As [`Self::ask`], for a question asked by the program at `executable`, which gives itself
     /// the name `label`: the worker verifies the program, and nothing verifies the name.
     pub fn ask_as(&self, request: &str, executable: &str, label: &str) -> Question {
-        self.ask_from(request, "the release is tagged", executable, label)
+        self.ask_from(request, "the release is tagged", executable, label, None)
     }
 
-    fn ask_from(&self, request: &str, context: &str, executable: &str, label: &str) -> Question {
+    /// As [`Self::ask`], for a question the ledger records as created at `utc_ms`.
+    pub fn ask_at(&self, request: &str, utc_ms: u64) -> Question {
+        self.ask_from(
+            request,
+            "the release is tagged",
+            "/bin/agent",
+            "an agent",
+            Some(utc_ms),
+        )
+    }
+
+    fn ask_from(
+        &self,
+        request: &str,
+        context: &str,
+        executable: &str,
+        label: &str,
+        utc_ms: Option<u64>,
+    ) -> Question {
         self.service
             .questions()
             .create(
@@ -493,7 +511,7 @@ impl Worker {
                     wait_ms: Nullable::null(),
                 },
                 kr_worker::questions::Now {
-                    utc_ms: kr_ipc::now_ms(),
+                    utc_ms: utc_ms.map_or_else(kr_ipc::now_ms, TimestampMs::new),
                     boot_ms: kr_ipc::clock::boot_elapsed_ms(),
                 },
             )

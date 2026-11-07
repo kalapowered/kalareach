@@ -6282,6 +6282,7 @@ pub(crate) mod tests {
         world.privacy.set(crate::privacy::Published {
             generation: kr_worker::privacy::PrivacyGeneration::new(1),
             private: true,
+            ..crate::privacy::Published::default()
         });
         world
             .module
@@ -8487,6 +8488,7 @@ pub(crate) mod tests {
             crate::privacy::Published {
                 generation: kr_worker::privacy::PrivacyGeneration::new(3),
                 private: true,
+                ..crate::privacy::Published::default()
             },
         ));
         module
@@ -8749,6 +8751,7 @@ pub(crate) mod tests {
             crate::privacy::PrivacyState::at(crate::privacy::Published {
                 generation: kr_worker::privacy::PrivacyGeneration::new(3),
                 private: true,
+                ..crate::privacy::Published::default()
             }),
             kr_attention::PrivacyStamp {
                 generation: 3,

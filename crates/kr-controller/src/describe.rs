@@ -1449,6 +1449,7 @@ pub(crate) mod tests {
         PrivacyState::at(Published {
             generation: PrivacyGeneration::new(generation),
             private: true,
+            ..Published::default()
         })
     }
 
@@ -1780,6 +1781,7 @@ pub(crate) mod tests {
             PrivacyState::at(Published {
                 generation: PrivacyGeneration::new(generation),
                 private: false,
+                ..Published::default()
             })
         };
         let partial = module

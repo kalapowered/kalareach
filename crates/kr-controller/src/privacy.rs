@@ -167,6 +167,12 @@ pub struct Published {
     pub generation: PrivacyGeneration,
     /// Whether privacy mode is on.
     pub private: bool,
+    /// The moment, on this host's wall clock, this state was published: when privacy mode was
+    /// turned on, or when it was turned off and the daemon began to serve what is produced after
+    /// it. It is read with the state and in the same step, so a reader that needs to tell what
+    /// was produced after privacy mode ended needs no second look at the record. Nought for a
+    /// host that has never changed it.
+    pub since_ms: u64,
 }
 
 impl Published {
@@ -689,6 +695,7 @@ impl EnvironmentPrivacy {
         state.publish(Published {
             generation: stored.generation,
             private: stored.enabled,
+            since_ms: stored.changed_at_ms.get(),
         });
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -839,6 +846,7 @@ impl EnvironmentPrivacy {
         change.publish(Published {
             generation,
             private: true,
+            since_ms: now_ms.get(),
         });
         // Raised as soon as the state says so, before the steps that follow: a tick that waits on
         // the record then runs its pass behind this hold on the record, whether or not the steps
@@ -899,9 +907,13 @@ impl EnvironmentPrivacy {
         inner.record.disable(resumed.generation, now_ms, admitted)?;
         inner.mode = mode;
         inner.changed_at_ms = now_ms;
+        // Read as the state is published, not when the change was asked for: the request can have
+        // waited for the store, and what is produced while privacy mode still stands is not what
+        // follows it.
         self.state.publish(Published {
             generation: resumed.generation,
             private: false,
+            since_ms: kr_ipc::now_ms().get(),
         });
         for progress in inner.sessions.values_mut() {
             progress.notices = Backoff::default();
@@ -988,13 +1000,6 @@ impl EnvironmentPrivacy {
     #[must_use]
     pub fn status(&self, now_ms: TimestampMs) -> PrivacyReport {
         self.report_now(now_ms).to_wire()
-    }
-
-    /// When privacy mode last changed, on this host's wall clock: nought for a host that has never
-    /// changed it.
-    #[must_use]
-    pub fn changed_at_ms(&self) -> TimestampMs {
-        self.inner().changed_at_ms
     }
 
     /// Says where privacy mode stands, without retrying anything.
@@ -3337,6 +3342,37 @@ mod tests {
         );
     }
 
+    /// KR-REQ-15.20 and KR-REQ-24.27: the state a disabling publishes carries the moment it took
+    /// effect and not the moment the change was asked for. A request can wait for the store, and
+    /// what is produced while privacy mode still stands is not what follows it, so a reader that
+    /// carries only what came after the change draws its line at the state it read.
+    #[test]
+    fn a_disabling_publishes_the_moment_it_took_effect_and_not_the_moment_it_was_asked_for() {
+        let host = Host::open();
+        host.privacy
+            .enable(&[], at(0), &standing)
+            .expect("privacy mode is enabled");
+        let enabled = host.privacy.state().reading().published();
+        assert!(enabled.private);
+        assert_eq!(
+            enabled.since_ms,
+            at(0).get(),
+            "an enabling is published at its own moment"
+        );
+
+        let before = kr_ipc::now_ms().get();
+        host.privacy
+            .disable(at(10), &standing)
+            .expect("privacy mode is disabled");
+        let disabled = host.privacy.state().reading().published();
+        assert!(!disabled.private);
+        assert!(
+            disabled.since_ms >= before,
+            "published at {} and not at the moment 10 it was asked for; the call began at {before}",
+            disabled.since_ms
+        );
+    }
+
     /// Disabling is refused while the backup service still owes cleanup, a target it could not
     /// remove is retried on its schedule, and once nothing is owed every fence is released.
     #[cfg(unix)]
@@ -3659,6 +3695,7 @@ mod tests {
                 state.publish(Published {
                     generation: PrivacyGeneration::new(1),
                     private: true,
+                    ..Published::default()
                 });
                 done_tx.send(()).expect("the turn says so");
             });
@@ -4082,10 +4119,12 @@ mod tests {
         state.publish(Published {
             generation: PrivacyGeneration::new(1),
             private: true,
+            ..Published::default()
         });
         state.publish(Published {
             generation: PrivacyGeneration::new(2),
             private: false,
+            ..Published::default()
         });
         assert!(
             state.admit_send(admitted_under).is_none(),
@@ -4318,6 +4357,7 @@ mod tests {
         state.set(Published {
             generation: PrivacyGeneration::new(7),
             private: true,
+            ..Published::default()
         });
         let after = state.observed();
         assert!(

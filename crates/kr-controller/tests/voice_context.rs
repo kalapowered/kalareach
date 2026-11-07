@@ -315,14 +315,6 @@ impl World {
         report.changed_at_ms.get()
     }
 
-    /// Waits until the host's clock reads a later millisecond than `moment`, so that what is
-    /// produced next is produced after it.
-    async fn until_after(&self, moment: u64) {
-        while kr_ipc::now_ms().get() <= moment {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-    }
-
     async fn stop(self) {
         self.adopted.stop().await;
     }
@@ -537,8 +529,8 @@ async fn a_secret_in_either_half_is_replaced_and_counted() {
     world.stop().await;
 }
 
-/// KR-REQ-15.20: the receipt of a voice read of a session is stated through the same selection:
-/// a secret in the name a person pinned is replaced there too.
+/// KR-REQ-15.20: the receipt of a voice read of a session is stripped with the same patterns a
+/// selection is: a secret in the name a person pinned is replaced there too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_receipt_of_a_voice_read_passes_the_same_stripping() {
     let world = World::start().await;
@@ -557,6 +549,7 @@ fn planted_in(directory: &std::path::Path) -> String {
     format!(
         "export KR_VOICE_ENV_MARKER=env-marker-5c1e; \
          cd '{}' && printf 'file-marker-9d2a\\n' > notes.txt; \
+         printf '%s\\n' \"$KR_VOICE_ENV_MARKER\" > environment.txt; \
          printf 'scrollback-marker-3b7f\\n'; \
          exec cat",
         directory.display()
@@ -564,12 +557,16 @@ fn planted_in(directory: &std::path::Path) -> String {
 }
 
 /// KR-REQ-15.20: what the default leaves out (file contents, environment variables, raw terminal
-/// scrollback and attachment bytes) never reaches the context, whether nothing is selected or
-/// every class a person may select is. The control is a marker in what an agent said, which does.
+/// scrollback) never reaches the context, whether nothing is selected or both classes a person may
+/// select are. The control is a marker in what an agent said, which does.
 ///
-/// The environment and attachment legs show that no path leads in: this daemon has no read of a
-/// session's environment or of its attachments for a call, and the two classes a person may
-/// select (environment variables and terminal scrollback) have no collection behind them.
+/// What this shows, and what it does not. Each marker is first shown at its source: the file in
+/// the session's directory, the environment variable's value (the shell writes it to a file), and
+/// the terminal's retained output. The daemon has no read of any of them for a call, so these legs
+/// guard against a route being added; only the scrollback leg is proved by a mutation that adds
+/// one. The loop that selects both classes records that no collector stands behind a class a
+/// person may select: it is not a test of a rule. Attachment bytes are not planted: this host
+/// holds no store of them for a call, and the class cannot be selected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_the_default_leaves_out_never_reaches_the_context_selected_or_not() {
     let directory = tempfile::tempdir().expect("a directory");
@@ -577,6 +574,7 @@ async fn what_the_default_leaves_out_never_reaches_the_context_selected_or_not()
         World::start_over(Adopted::start_running(&planted_in(directory.path())).await).await;
     // The markers are where they were planted: in the file and in the terminal's retained output.
     until_the_file_holds(&directory.path().join("notes.txt"), "file-marker-9d2a").await;
+    until_the_file_holds(&directory.path().join("environment.txt"), "env-marker-5c1e").await;
     world.until_the_output_holds("scrollback-marker-3b7f").await;
 
     let agent = world.agent();
@@ -683,13 +681,13 @@ async fn nothing_produced_before_privacy_mode_last_changed_is_carried_after_it()
     world.adopted.set_privacy(true).await;
     world.adopted.set_privacy(false).await;
     let changed = world.privacy_changed_at().await;
-    world.until_after(changed).await;
 
     // What a worker that kept its history through the change would still hold: an entry stamped
     // before it.
     world.said(agent, "kept from before the change", changed - 1);
-    world.said(agent, "after the change", changed + 1);
-    world.worker().ask("after");
+    let after = kr_ipc::now_ms().get() + 5;
+    world.said(agent, "after the change", after);
+    world.worker().ask_at("after", after);
 
     let result = world.context().await;
     assert_eq!(

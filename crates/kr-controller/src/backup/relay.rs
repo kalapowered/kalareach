@@ -675,6 +675,7 @@ mod tests {
         Published {
             generation: kr_worker::privacy::PrivacyGeneration::new(generation),
             private,
+            ..Published::default()
         }
     }
 
