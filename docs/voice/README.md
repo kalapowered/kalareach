@@ -66,8 +66,9 @@ and supplies says:
   half. The host cannot run the provider's encoder, so what it counts is a bound no byte-level
   tokenizer can exceed (the selection's own byte count), and a selection is therefore often
   smaller than the cap rather than larger;
-- file contents, environment variables, raw terminal scrollback and attachment bytes are **excluded
-  until the person selects them**, and the four are a closed list rather than a rule to remember.
+- environment variables and raw terminal scrollback are **excluded until the person selects them**,
+  and the two are a closed list rather than a rule to remember. File contents and attachment bytes
+  are excluded from every call and cannot be selected: nothing on a host reads them for one.
 
 Configured secret patterns are replaced on the way out. That is a **secondary** measure. Every
 selection carries the sentence that says so, and the count of what was replaced: filtering does not
@@ -224,10 +225,11 @@ session this is also read; this text is marked as written by a local model which
 and as written at the start of the session, so a grant whose history begins after the start of the
 session is not shown it. The model's text will not be read if a name is pinned. Summaries of pending
 decisions, and messages, are not read as the daemon does not store semantic history for workers; the
-selection carries that reason as withheld. Content of any of the four classes selected by the person
-(file contents, environment variables, scrollback contents, and attachment bytes) will not be
-provided: the companion selects none of these classes, and this daemon has no place to read them
-from, so a request that selects one gets nothing for it and no withheld entry.
+selection carries that reason as withheld. Content of either class selected by the person
+(environment variables, scrollback contents) will not be provided: the companion selects neither,
+and this daemon has no place to read them from, so a request that selects one gets nothing for it
+and no withheld entry. File contents and attachment bytes are no class at all, so no request can
+select them.
 
 What a model wrote and what the description host saw leave the daemon only while the privacy mode is
 in the same state as it was when they were read. Privacy mode removes both when it is turned on, and
