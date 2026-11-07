@@ -2310,8 +2310,7 @@ fn kr_host_push_gateways_with_nothing_to_change_fails_when_the_host_did_not_put_
 /// KR-REQ-16.04: `kr host push-gateways` with nothing to change fails, and says why, on a host
 /// that started over a configuration document it cannot use and still reads one it cannot use.
 /// That host closes its routes, so it does not deliver through the official gateway or any other,
-/// whatever list it reports. Once the document is put right the host reports it as usable, and
-/// its routes stay closed until it starts again; the command cannot tell that from the report.
+/// whatever list it reports.
 #[test]
 fn kr_host_push_gateways_with_nothing_to_change_fails_on_a_host_started_over_an_unusable_document()
 {
@@ -2344,6 +2343,124 @@ fn kr_host_push_gateways_with_nothing_to_change_fails_on_a_host_started_over_an_
             .as_str()
             .is_some_and(|message| message.contains("unknown_version")),
         "it says what the document turned out to be: {shown}"
+    );
+}
+
+/// KR-REQ-16.04: a host started over a configuration document it could not use keeps its routes
+/// closed after the document is put right, because it reads its routes once, when it starts. The
+/// host reports the document as usable then, so `kr host push-gateways` shows its list and says on
+/// standard error that a restart is needed, naming the doctor check that says why; its answer on
+/// standard output is the one a host with open routes gives, and the exit is still success.
+#[test]
+fn kr_host_push_gateways_says_a_restart_is_needed_on_a_host_started_over_a_document_put_right_since()
+ {
+    let show = |host: &Standalone| {
+        let output =
+            start(host.kr(&["--json", "host", "push-gateways"])).finish("kr host push-gateways");
+        (
+            output.status.success(),
+            document(&output, "kr host push-gateways"),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+
+    // The control: a daemon started by hand over a document the host can use needs no restart.
+    let usable = Standalone::create();
+    usable.select_standalone();
+    usable.start_a_daemon_by_hand();
+    let (ok, shown, said) = show(&usable);
+    assert!(ok, "{shown}");
+    assert!(
+        said.is_empty(),
+        "a host with open routes says nothing: {said}"
+    );
+    let members = |answer: &Value| {
+        answer
+            .as_object()
+            .map(|members| members.keys().cloned().collect::<Vec<_>>())
+    };
+    let control_members = members(&shown);
+
+    let host = Standalone::create();
+    kr_ipc::paths::write_owner_only_file(&host.document(), br#"{"version": 99}"#)
+        .expect("writes a configuration document this build cannot use");
+    host.start_a_daemon_by_hand();
+    let (ok, shown, _) = show(&host);
+    assert!(!ok, "the host cannot use its document: {shown}");
+
+    // The owner puts the document right. The host reads it as usable, and its routes stay closed.
+    host.select_standalone();
+    let (ok, shown, said) = show(&host);
+    assert!(ok, "the document is usable now: {shown}: {said}");
+    assert_eq!(
+        members(&shown),
+        control_members,
+        "the answer on standard output is the one a host with open routes gives: {shown}"
+    );
+    assert_eq!(shown["push_gateways"], serde_json::json!([]), "{shown}");
+    assert!(
+        said.contains("restart") && said.contains("configuration-network"),
+        "it says a restart is needed, and where the host says why: {said}"
+    );
+}
+
+/// KR-REQ-16.04: a host started over a document it could not use, and then given one it can use
+/// whose acceptance does not finish, fails the command with the host's reason, says the gateways in
+/// force without saying that the host delivers through them, and still says that a restart is
+/// needed: its routes are closed whatever it has accepted since. Here the document is put right and
+/// no longer lists a gateway the host holds a credential for, and the journal will not take the
+/// debt the retirement writes down.
+#[test]
+fn kr_host_push_gateways_says_a_restart_is_needed_when_the_document_put_right_is_not_all_in_force()
+{
+    let gateway = a_gateway_that_is_unavailable();
+    let host = Standalone::create();
+    kr_ipc::paths::write_owner_only_file(&host.document(), br#"{"version": 99}"#)
+        .expect("writes a configuration document this build cannot use");
+    host.hold_a_credential_issued_by(&gateway);
+    host.start_a_daemon_by_hand();
+    let show = || {
+        let output =
+            start(host.kr(&["--json", "host", "push-gateways"])).finish("kr host push-gateways");
+        (
+            output.status.success(),
+            document(&output, "kr host push-gateways"),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let (ok, shown, said) = show();
+    assert!(!ok, "the host cannot use its document: {shown}");
+    assert!(
+        !said.contains("restart"),
+        "a document the host cannot use gets no note about the routes: {said}"
+    );
+
+    // The journal will not take a debt, and the document is put right without the gateway.
+    host.delivery_journal()
+        .execute_batch(
+            "CREATE TRIGGER refuse_a_debt BEFORE INSERT ON delivery_revocations
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .expect("the trigger");
+    host.select_standalone();
+    let (ok, shown, said) = show();
+    assert!(
+        !ok,
+        "the host did not finish putting the document into force: {shown}"
+    );
+    assert_eq!(shown["code"], "RESOURCE_UNAVAILABLE", "{shown}");
+    let message = shown["message"].as_str().expect("a message");
+    assert!(
+        message.contains("could not be written down"),
+        "it gives the host's reason: {shown}"
+    );
+    assert!(
+        message.contains("the official gateway only") && !message.contains("delivers"),
+        "it says the list in force and does not say the host delivers through it: {shown}"
+    );
+    assert!(
+        said.contains("restart") && said.contains("configuration-network"),
+        "it still says a restart is needed, and where the host says why: {said}"
     );
 }
 

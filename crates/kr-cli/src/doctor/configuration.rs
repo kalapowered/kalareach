@@ -220,6 +220,49 @@ pub fn push_gateways_acted_on(
     Ok(reported)
 }
 
+/// What to tell a person about the routes this host sends over, when they are not the ones its
+/// configuration document now selects.
+///
+/// A host reads the document's network, proxy and service selections once, when it starts, and
+/// sends over what it read until it starts again: a document edited since, or put right after the
+/// host started over one it could not use, applies at the next start. A host that started over a
+/// document it could not use sends nothing to any gateway until then, though it reports the
+/// document as usable once it is put right, so a list of gateways shown on its own would suggest
+/// that notifications are delivered. The host says that its routes differ in the
+/// `configuration-network` check of its doctor answer, a warning that also covers a selection
+/// edited since the start; this says a restart is needed, and where the host says why.
+///
+/// A document the host cannot use now gets no note: the command says that, and a restart would
+/// close the routes, not open them.
+#[must_use]
+pub fn routes_waiting_for_a_restart(
+    result: &kr_protocol::hostinfo::HostDoctorResult,
+) -> Option<Shown> {
+    if result.configuration.status.state.is_a_problem() {
+        return None;
+    }
+    result
+        .checks
+        .iter()
+        .any(|check| {
+            check.id() == NETWORK_CHECK
+                && check.status == kr_protocol::hostinfo::DoctorStatus::Warning
+        })
+        .then(|| {
+            Shown::said(
+                "a restart is needed to put the routes this host's configuration document \
+                 selects in force: the host sends over the routes it read when it started, and a \
+                 host that started over a document it could not use sends nothing to any gateway \
+                 until it restarts; the configuration-network check in kr doctor --json says \
+                 which applies",
+            )
+        })
+}
+
+/// The identifier of the doctor check that compares the routes the host started with and the ones
+/// its configuration document selects now.
+const NETWORK_CHECK: &str = "configuration-network";
+
 /// The push gateways the host delivers through after a change, when it put the change into force.
 ///
 /// The host answers a question about its configuration only after it has put the document into
@@ -407,6 +450,51 @@ mod tests {
                  claim delivery, which a closed route would make untrue: {said}"
             );
         }
+    }
+
+    /// KR-REQ-16.04: the note that a restart is needed is given when the host's doctor answer
+    /// warns that its routes differ from its document, and not otherwise: not when the check
+    /// passes, not when the answer has no such check, and not for a document the host cannot use,
+    /// which the command says on its own and for which a restart closes the routes.
+    #[test]
+    fn a_restart_is_said_to_be_needed_only_when_the_hosts_routes_differ_from_a_usable_document() {
+        use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus, HostDoctorResult};
+
+        let answer = |status: Option<DoctorStatus>, state: configuration::DocumentState| {
+            let checks = status
+                .map(|status| {
+                    DoctorCheck::new(
+                        NETWORK_CHECK,
+                        "This host started with the network its configuration selects",
+                        status,
+                        Sentence::new().stated("a check"),
+                        None,
+                    )
+                })
+                .into_iter()
+                .collect();
+            let mut effective = reporting(Some(&[]), None);
+            effective.status.state = state;
+            HostDoctorResult::new(checks, effective)
+        };
+        let usable = configuration::DocumentState::Loaded;
+
+        let note = routes_waiting_for_a_restart(&answer(Some(DoctorStatus::Warning), usable))
+            .expect("the routes differ from the document")
+            .to_string();
+        assert!(
+            note.contains("restart") && note.contains("configuration-network"),
+            "{note}"
+        );
+        assert!(routes_waiting_for_a_restart(&answer(Some(DoctorStatus::Ok), usable)).is_none());
+        assert!(routes_waiting_for_a_restart(&answer(None, usable)).is_none());
+        assert!(
+            routes_waiting_for_a_restart(&answer(
+                Some(DoctorStatus::Warning),
+                configuration::DocumentState::Invalid
+            ))
+            .is_none()
+        );
     }
 
     /// A refused edit says the configuration's own sentences, and a sentence that arrived from a
