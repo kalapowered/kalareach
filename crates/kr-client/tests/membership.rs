@@ -4166,6 +4166,97 @@ async fn a_collection_key_is_neither_backed_up_nor_restored() {
     }
 }
 
+/// KR-REQ-20.17, the settings part: a device's reusable endpoint (transport) and control-signing
+/// (authorisation) private keys are in neither the settings it exports nor the archive that carries
+/// them, whether as the bytes, in hexadecimal or in base64url, and an import refuses a member that
+/// the archive calls one of those keys, or a revoked grant, with the table's reason and before it
+/// reads a byte of it. The device is one that holds all four of its keys and its collection's.
+/// The control is the exported settings themselves, which the same scan finds. Not shown here: the
+/// other data paths of backup and recovery material, or a grant that has not been revoked.
+#[tokio::test]
+async fn a_devices_endpoint_and_control_keys_are_not_exported_and_an_import_refuses_them() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut lost = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut lost]).await;
+    assert!(!keys_held(&lost, &collection, epoch_of(&world.newest(&collection))).is_empty());
+
+    // The private keys of the device, as the product keeps them in a secret store.
+    let kept = kr_crypto::store::MemoryStore::new();
+    kr_crypto::store::store_device_keys(&kept, SCOPE, &lost.keys).expect("the keys are kept");
+    let seed_of = |purpose| {
+        kr_crypto::store::SecretStore::get(
+            &kept,
+            &kr_crypto::store::SecretName::device_key(SCOPE, purpose).expect("a name"),
+        )
+        .expect("the store reads")
+        .expect("the key is kept")
+        .expose()
+        .to_vec()
+    };
+    let endpoint = seed_of(KeyPurpose::Transport);
+    let control = seed_of(KeyPurpose::Authorisation);
+    assert!(endpoint.len() >= 32 && control.len() >= 32);
+    let carried_in = |haystack: &[u8], needle: &[u8]| {
+        let hex: String = needle.iter().map(|byte| format!("{byte:02x}")).collect();
+        [
+            needle.to_vec(),
+            hex.into_bytes(),
+            kr_protocol::scalars::to_base64url(needle).into_bytes(),
+        ]
+        .iter()
+        .any(|form| contains(haystack, form))
+    };
+
+    let (store, object) = settings_on(&lost);
+    let exported = export_settings(&store, object.object_id).expect("the settings export");
+    let seed = RecoverySeed::generate().expect("a seed");
+    let (filename, plaintext) = through_an_archive(&lost, &seed, &exported);
+    assert!(
+        carried_in(exported.plaintext(), &exported.plaintext()[..16]),
+        "the scan reads the exported settings"
+    );
+    for (what, key) in [("endpoint", &endpoint), ("control-signing", &control)] {
+        assert!(
+            !carried_in(exported.plaintext(), key),
+            "the {what} private key is in the export"
+        );
+        assert!(
+            !carried_in(plaintext.expose(), key),
+            "the {what} private key is in the archive"
+        );
+    }
+
+    // An archive that calls a member one of those keys, or a revoked grant, is refused with the
+    // table's reason before the member is read; nothing is put back.
+    let restored = Node::new(&world);
+    let fresh = SyncStore::open(restored.root.path().join("sync")).expect("a sync store");
+    for (material, bytes) in [
+        (Material::EndpointPrivateKey, &endpoint),
+        (Material::ControlSigningPrivateKey, &control),
+        (Material::Grant { revoked: true }, &control),
+    ] {
+        match import_settings(&fresh, material, bytes) {
+            Err(RecoveryError::Refused {
+                material: refused,
+                because,
+            }) => {
+                assert_eq!(refused, MaterialName(material));
+                assert!(!because.is_empty(), "the refusal says why");
+            }
+            other => panic!("{material:?} is refused, not {other:?}"),
+        }
+    }
+    assert!(
+        fresh
+            .object(object.object_id)
+            .expect("a readable store")
+            .is_none()
+    );
+    // The control for the refusals: the settings the archive does carry come back.
+    import_settings(&fresh, material_named(&filename), plaintext.expose()).expect("the settings");
+}
+
 /// KR-REQ-20.17, the settings part (the library's half; the device's archive producer carries it
 /// the rest of the way): a fresh restore returns the settings object as the restored device's own,
 /// with no collection key, no membership and no note of where the object stood on the service.
