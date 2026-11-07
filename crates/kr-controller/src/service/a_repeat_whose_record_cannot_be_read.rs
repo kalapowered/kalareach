@@ -101,8 +101,8 @@ fn voice_stop_request(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
 }
 
 /// KR-REQ-09.09: a repeat of a voice change asked of a store that cannot read the claim, or that
-/// holds a result it cannot read back, is told the outcome is unknown. The change may have been
-/// made, and a transient word, or a refusal of the argument, would say it was not.
+/// holds a result or a refusal it cannot read back, is told the outcome is unknown. The change may
+/// have been made, and a transient word, or a refusal of the argument, would say it was not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repeat_of_a_voice_change_whose_record_cannot_be_read_is_told_the_outcome_is_unknown() {
     let (temp, controller) = daemon().await;
@@ -146,4 +146,22 @@ async fn a_repeat_of_a_voice_change_whose_record_cannot_be_read_is_told_the_outc
         .await
         .expect_err("a result that cannot be read back does not answer the repeat");
     assert_eq!(undecoded.code(), ErrorCode::OutcomeUnknown, "{undecoded}");
+
+    // The claim holds a refusal under a code this build does not know.
+    registry
+        .execute(
+            "UPDATE authority_receipts
+                SET result = NULL, refusal_code = 'A_CODE_THIS_BUILD_LACKS', refusal_detail = 'no'",
+            [],
+        )
+        .expect("the claim holds a refusal");
+    let unknown_code = controller
+        .voice_answered(&actor_id, &mutation)
+        .await
+        .expect_err("a refusal that cannot be read back does not answer the repeat");
+    assert_eq!(
+        unknown_code.code(),
+        ErrorCode::OutcomeUnknown,
+        "{unknown_code}"
+    );
 }

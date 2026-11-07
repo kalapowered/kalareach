@@ -3309,8 +3309,14 @@ fn read_claim(
         return Ok(Some(ActionRecord::Answered { result }));
     }
     if let Some(code) = refusal_code {
-        let code = ErrorCode::from_wire(&code).ok_or_else(|| {
-            ControllerError::InvalidArgument("a stored refusal's code is malformed".to_owned())
+        // A refusal kept under a code this build cannot read is the record of an action that was
+        // claimed, so what it did is not known. It is not a refusal of the request now asked, which
+        // a caller takes for the host's word that nothing was done.
+        let code = ErrorCode::from_wire(&code).ok_or_else(|| ControllerError::Uncertain {
+            detail: "this host's record of what this action did is a refusal under a code this \
+                     build cannot read, so what the action did is not known; asking again under \
+                     the same action meets the same record"
+                .to_owned(),
         })?;
         return Ok(Some(ActionRecord::Refused {
             code,
@@ -4875,6 +4881,49 @@ mod tests {
             ActionClaim::Claimed { hold } => hold,
             ActionClaim::Recorded(_) => panic!("a first claim on an action is this attempt's"),
         }
+    }
+
+    /// KR-REQ-09.09: a receipt kept under a refusal code this build does not know is a record that
+    /// cannot be read, for the lookup and for the claim: what the action did is not known, and the
+    /// caller is not given a refusal of its argument.
+    #[test]
+    fn a_receipt_kept_under_a_refusal_code_this_build_lacks_is_a_record_that_cannot_be_read() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        let store = GrantDirectory::open(&path).expect("the store opens");
+        let actor = ActorId::new("local:1").expect("an actor");
+        let action = ActionId::new(Uuid::from_bytes([9; 16]));
+        let digest = Digest256::from_bytes([3; 32]);
+        Connection::open(&path)
+            .expect("the store opens beside the directory's own handle")
+            .execute(
+                "INSERT INTO authority_receipts
+                     (actor_id, action_id, payload_digest, claimed_at_ms, result, recorded_at_ms,
+                      refusal_code, refusal_detail)
+                 VALUES (?1, ?2, ?3, 1, NULL, 1, 'A_CODE_THIS_BUILD_LACKS', 'no')",
+                params![
+                    actor.as_str(),
+                    [9u8; 16].as_slice(),
+                    digest.as_bytes().as_slice()
+                ],
+            )
+            .expect("the receipt is written");
+
+        let looked_up = store
+            .recorded_action(&actor, action, &digest)
+            .expect_err("a refusal that cannot be read is not given back");
+        assert!(
+            matches!(looked_up, ControllerError::Uncertain { .. }),
+            "{looked_up:?}"
+        );
+        let claimed = store
+            .claim_action(&actor, action, &digest, 2)
+            .err()
+            .expect("a refusal that cannot be read is not claimed over");
+        assert!(
+            matches!(claimed, ControllerError::Uncertain { .. }),
+            "{claimed:?}"
+        );
     }
 
     /// A policy and the answer to the action that changed it are written together or not at all:

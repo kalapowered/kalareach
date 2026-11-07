@@ -982,10 +982,9 @@ fn recorded_answer(record: crate::grants::ActionRecord) -> Result<ParamsValue> {
     }
 }
 
-/// The answer to a receipt that is kept and cannot be read back, whether its result does not decode
-/// or its refusal's code does not parse: the action was claimed, so what it did is not known.
-/// Asking again under the same action would meet the same row, so the caller is told to read the
-/// record before asking under a new action.
+/// The answer to a receipt that is kept and whose result cannot be read back: the action was
+/// claimed, so what it did is not known. Asking again under the same action would meet the same
+/// row, so the caller is told to read the record before asking under a new action.
 fn receipt_cannot_be_read(why: &dyn std::fmt::Display) -> ControllerError {
     eprintln!("kr-controller: a machine group step's receipt cannot be read: {why}");
     ControllerError::Uncertain {
@@ -1002,11 +1001,11 @@ fn receipt_cannot_be_read(why: &dyn std::fmt::Display) -> ControllerError {
 ///
 /// A lookup that fails says nothing about the action. The step is neither refused, which a caller
 /// would take for a step that changed nothing, nor performed again: asking again under the same
-/// action is answered once the receipts can be read. A row that was found and cannot be parsed is
-/// [`receipt_cannot_be_read`]'s. A reused identifier is still `ID_CONFLICT`.
+/// action is answered once the receipts can be read. A row that was found and whose result cannot be
+/// decoded is [`receipt_cannot_be_read`]'s, and the store tells a refusal kept under a code this
+/// build cannot read as an outcome it does not know. A reused identifier is still `ID_CONFLICT`.
 fn receipts_unreadable(error: ControllerError) -> ControllerError {
     match error {
-        ControllerError::InvalidArgument(_) => receipt_cannot_be_read(&error),
         ControllerError::Storage { .. } | ControllerError::RegistryUnavailable { .. } => {
             eprintln!("kr-controller: a machine group step's receipt cannot be looked up: {error}");
             ControllerError::Uncertain {
@@ -1053,15 +1052,7 @@ mod tests {
         );
         assert_eq!(damaged.code(), ErrorCode::OutcomeUnknown);
 
-        // A kept refusal whose code does not parse is no more readable, and no more a refusal of
-        // the caller's request; a reused identifier is still the caller's.
-        let malformed = receipts_unreadable(ControllerError::InvalidArgument(
-            "a stored refusal's code is malformed".to_owned(),
-        ));
-        assert!(
-            matches!(malformed, ControllerError::Uncertain { .. }),
-            "{malformed:?}"
-        );
+        // A reused identifier is still the caller's.
         let reused = receipts_unreadable(ControllerError::IdConflict {
             token: "an action".to_owned(),
         });
