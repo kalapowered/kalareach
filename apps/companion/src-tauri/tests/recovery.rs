@@ -1558,6 +1558,241 @@ async fn the_bundle_exports_alone_as_a_private_file_of_ciphertext() {
     assert_eq!(malformed["code"], "INVALID_ARGUMENT");
 }
 
+/// The forms in which a document could carry `key`, as the bytes to look for in it: the bytes
+/// themselves and their hexadecimal in either case; and base64 in either alphabet, which puts three
+/// bytes in four characters, so that the characters standing for the key's whole groups of three are
+/// the same wherever the key lies in a longer value. Which groups those are depends on where the key
+/// starts, so each of the three ways it can start is looked for.
+fn forms_of(key: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let hex = |upper: bool| -> Vec<u8> {
+        key.iter()
+            .map(|byte| {
+                if upper {
+                    format!("{byte:02X}")
+                } else {
+                    format!("{byte:02x}")
+                }
+            })
+            .collect::<String>()
+            .into_bytes()
+    };
+    let mut forms = vec![
+        ("as bytes".to_owned(), key.to_vec()),
+        ("in lower-case hexadecimal".to_owned(), hex(false)),
+        ("in upper-case hexadecimal".to_owned(), hex(true)),
+    ];
+    for start in 0..3 {
+        let whole = &key[start..start + (key.len() - start) / 3 * 3];
+        let url = kr_protocol::scalars::to_base64url(whole);
+        forms.push((
+            format!("in base64url from its byte {start}"),
+            url.clone().into_bytes(),
+        ));
+        forms.push((
+            format!("in base64 from its byte {start}"),
+            url.replace('-', "+").replace('_', "/").into_bytes(),
+        ));
+    }
+    forms
+}
+
+/// How `key` is carried in `haystack`, in a form [`forms_of`] names or as serde writes a list of
+/// bytes, a list of numbers, with any space between its items; nothing when it is not.
+fn carried_in(haystack: &[u8], key: &[u8]) -> Option<String> {
+    let found = |needle: &[u8], haystack: &[u8]| {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    };
+    if let Some((form, _)) = forms_of(key)
+        .into_iter()
+        .find(|(_, needle)| found(needle, haystack))
+    {
+        return Some(form);
+    }
+    let compact: Vec<u8> = haystack
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let numbers = key
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+        .into_bytes();
+    found(&numbers, &compact).then(|| "as a list of numbers".to_owned())
+}
+
+/// The X25519 private key of a stored-envelope or notification-preview pair, made from its seed as
+/// libsodium's `crypto_box_seed_keypair` makes it: the first half of the seed's SHA-512.
+fn x25519_secret_of(seed: &[u8]) -> Vec<u8> {
+    use sha2::Digest as _;
+    sha2::Sha512::digest(seed)[..32].to_vec()
+}
+
+/// KR-REQ-20.17, the companion's own outputs only: the kit saved as text, the kit saved as a QR
+/// code, the offline export of the bundle and the bundle itself, opened with the kit alone, hold none
+/// of the private keys this computer keeps in the secure store beside the recovery seed: the
+/// reusable endpoint (transport) key, the control-signing (authorisation) key, and the stored
+/// envelope and notification preview keys with the private keys made from their seeds. Every text the
+/// page was sent is read as well. Each key is looked for as bytes, in hexadecimal of either case, in
+/// either base64 alphabet wherever it lies in a longer value, and as a list of numbers. The controls
+/// are the scan finding a seed in each of those forms, and the kit's own seed in the kit file and in
+/// what the QR code scans back to, so that the scan reads what the outputs hold. Not shown here: an
+/// export of an archive, which adds no byte to the ciphertext the service holds (the library's
+/// export cases); a key in a binary list of integers, split, reversed or otherwise transformed; or
+/// the other data paths of backup and recovery material.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_computer_keeps() {
+    use kr_crypto::store::{SecretName, SecretStore as _};
+    use kr_protocol::pairing::KeyPurpose;
+
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let out = tempfile::tempdir().expect("a directory");
+
+    // The private keys this computer keeps, read from the store the recovery seed is in.
+    let mut kept = Vec::new();
+    for purpose in [
+        KeyPurpose::Transport,
+        KeyPurpose::Authorisation,
+        KeyPurpose::StoredEnvelope,
+        KeyPurpose::NotificationPreview,
+    ] {
+        let name = SecretName::device_key(companion_tauri::device::identity::SCOPE, purpose)
+            .expect("a name");
+        let seed = computer
+            .secrets
+            .get(&name)
+            .expect("the store reads")
+            .unwrap_or_else(|| panic!("this computer kept a {purpose:?} key"));
+        kept.push((format!("{purpose:?} seed"), seed.expose().to_vec()));
+        if matches!(
+            purpose,
+            KeyPurpose::StoredEnvelope | KeyPurpose::NotificationPreview
+        ) {
+            kept.push((
+                format!("{purpose:?} private key (derived)"),
+                x25519_secret_of(seed.expose()),
+            ));
+        }
+    }
+    assert_eq!(kept.len(), 6, "four seeds and two keys made from them");
+    for (name, key) in &kept {
+        assert!(key.len() >= 32, "the {name} is a key, not a stub");
+    }
+    assert!(
+        load_recovery_seed(&*computer.secrets, SEED_SCOPE)
+            .expect("the store reads")
+            .is_some(),
+        "the recovery seed is in the same store"
+    );
+
+    // What the computer writes or shows: the kit, the QR code (read as a scanner reads it), the
+    // export of the bundle, the bundle opened with the kit alone, and what the page was told.
+    let (kit_path, kit) = page.kit(out.path());
+    let kit_file = std::fs::read(&kit_path).expect("the kit file");
+    let qr = out.path().join("kit.svg");
+    page.dialog_returns(&qr);
+    page.call(
+        "recovery_save_kit_qr",
+        json!({ "path": qr.to_string_lossy() }),
+    )
+    .expect("the QR code is saved");
+    let (_, scanned_text, _) = scanned(&std::fs::read_to_string(&qr).expect("the file"));
+    let export = out.path().join("bundle.krexport");
+    page.dialog_returns(&export);
+    page.call(
+        "recovery_export_offline",
+        json!({ "path": export.to_string_lossy(), "archive": null }),
+    )
+    .expect("the bundle is exported");
+    let export_file = std::fs::read(&export).expect("the export file");
+    let bundle = serde_json::to_vec(&read_with_only_the_kit(&computer.served, &kit).await)
+        .expect("the bundle encodes");
+    let told = page.told().into_bytes();
+    let outputs = [
+        ("the kit file", kit_file.clone()),
+        ("the QR code's text", scanned_text.clone().into_bytes()),
+        ("the offline export", export_file),
+        ("the bundle opened with the kit", bundle.clone()),
+        ("what the page was told", told),
+    ];
+
+    // The controls: the scan finds a key in each form it looks for, wherever the key lies in a
+    // longer value, and reads what the kit file and the code hold.
+    let (_, probe) = &kept[0];
+    for (form, needle) in forms_of(probe) {
+        let document = [b"{\"a\":\"".as_slice(), &needle, b"\"}"].concat();
+        assert!(
+            carried_in(&document, probe).is_some(),
+            "the scan misses a key {form}"
+        );
+    }
+    for alphabet in ["base64url", "base64"] {
+        for before in 0..3 {
+            let mut longer = vec![0x5a_u8; before];
+            longer.extend_from_slice(probe);
+            longer.extend_from_slice(b"tail");
+            let encoded = kr_protocol::scalars::to_base64url(&longer);
+            let encoded = if alphabet == "base64" {
+                encoded.replace('-', "+").replace('_', "/")
+            } else {
+                encoded
+            };
+            let value = format!("{{\"k\":\"{encoded}\"}}").into_bytes();
+            assert!(
+                carried_in(&value, probe).is_some(),
+                "the scan misses a key inside a longer {alphabet} value that starts {before} \
+                 bytes before it"
+            );
+        }
+    }
+    let list = format!(
+        "{{\"k\":[\n  {}\n]}}",
+        probe
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",\n  ")
+    )
+    .into_bytes();
+    assert_eq!(
+        carried_in(&list, probe).as_deref(),
+        Some("as a list of numbers")
+    );
+    let kit_text = String::from_utf8(kit_file).expect("the kit is text");
+    let seed_line = kit_text
+        .lines()
+        .find_map(|line| line.strip_prefix("seed: "))
+        .expect("a seed line");
+    assert!(
+        carried_in(kit_text.as_bytes(), seed_line.as_bytes()).is_some(),
+        "the scan does not read the kit file"
+    );
+    assert!(
+        carried_in(scanned_text.as_bytes(), seed_line.as_bytes()).is_some(),
+        "the scan does not read what the QR code holds"
+    );
+    assert!(
+        String::from_utf8_lossy(&bundle).contains("trusted_writers"),
+        "the scan does not read the bundle"
+    );
+
+    for (output, bytes) in &outputs {
+        for (name, key) in &kept {
+            assert_eq!(
+                carried_in(bytes, key),
+                None,
+                "{output} holds the {name} this computer keeps"
+            );
+        }
+    }
+}
+
 /// The first write of all can be lost too. Whether it landed or not, settling it leaves recovery
 /// either on or ready to be turned on again, and the locator the kit names does not change.
 ///
