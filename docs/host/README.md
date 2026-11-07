@@ -1684,7 +1684,7 @@ session. A lost reply never causes a second launch.
 
 A reservation records the create request without the environment variables its creator sent. The list in a recorded request is always empty and says nothing about what the creator sent. The environment is kept in memory in the daemon in the entry corresponding to a create request waiting for a worker to claim it. When a worker claims the create request, the environment is "moved" (once) from the waiting create request to the specification of what needs to be launched by the worker. A create that stops waiting takes back whatever the claim has not taken, whether its launch could not start or the time it waits for its worker ran out (30 seconds, and 30 more for a managed create, whose worker reports itself once its shell has qualified), so a claim that arrives afterwards finds none.
 
-When a worker claims a create request, if there is no more environment, the claim is refused. A reservation that is still `spawned` becomes `failed` without any key, and nothing is launched with an environment its creator did not send. Another case where this can happen is when the daemon is restarted in between a reservation and the claim of a worker created by the previous daemon. A second claim on a reservation that was already claimed still fences it. A repeat under the same token is answered from the record: with the session once it exists, or with an error that names the reservation's phase. A `claimed` reservation can still become a session. A `spawned` one can only while its create is waiting or a claim has already taken the variables; otherwise it becomes `failed` when its worker's claim is refused or, once its worker has ended, at a later start. A `failed` one cannot. Note that if a worker claimed the create request in time but is not answering anymore, the answer to the create request will be `OUTCOME_UNKNOWN`. In that case, the create request can be sent again under the same token, but a new session should only be created if the answer is `failed`.
+When a worker claims a create request, if there is no more environment, the claim is refused. A reservation that is still `spawned` becomes `failed` without any key, and nothing is launched with an environment its creator did not send. Another case where this can happen is when the daemon is restarted in between a reservation and the claim of a worker created by the previous daemon. A second claim on a reservation that was already claimed still fences it. A repeat under the same token is answered from the record: with the session once it exists, or with an error that names the reservation's phase. A `claimed` reservation can still become a session. A `spawned` one can only while its create is waiting or a claim has already taken the variables; otherwise it becomes `failed` when its worker's claim is refused or, once its worker has ended, at a later start. A `failed` one cannot. A create that ends before it has asked for a worker moves its own reservation to `failed`, so a repeat of it is told that the launch failed and not that the first attempt is still under way. A reservation that stays `reserved` is one whose own write the registry refused: the repeat is told the first attempt may still make the session, and the next start moves the row to `failed`. Note that if a worker claimed the create request in time but is not answering anymore, the answer to the create request will be `OUTCOME_UNKNOWN`. In that case, the create request can be sent again under the same token, but a new session should only be created if the answer is `failed`.
 
 ### Which shell, and what the session claims
 
@@ -3559,21 +3559,27 @@ registry's receipts of authority changes and voice changes, its record of device
 or its record of pairing actions, or of a rearm whose chain or grant it cannot read, is told
 `OUTCOME_UNKNOWN` and nothing is performed: a record that cannot be read is not one that is absent.
 A result that is read and cannot be decoded is told the same in the project, change-set, transfer,
-workflow and voice records. So is a record that makes no sense: a refusal that the workflow journal
+workflow, voice and authority-change records. So is a record that makes no sense: a refusal that the workflow journal
 or the registry's receipts keep under a code this build does not know, a workflow row that says two
 things about how the action ended, a run record under a method that starts no run, or the record of
 a run the journal does not hold. Where the daemon cannot read such a record it cannot tell a first
 action from a repeat, and tells both the same. That holds as well in the attention, project,
 change-set and transfer stores where the door found no record and the store then fails to read it
-at the point the action is performed. A transfer action repeated with no usable window is told the
-same when the daemon cannot read whether its claim is open. A create asked again is told
+at the point the action is performed, and in the registry's receipts where an authority or voice
+change claims its action and the claim cannot be read. A transfer action repeated with no usable
+window is told the same when the daemon cannot read whether its claim is open. A project action
+repeated with no usable window is told what its journal holds for the action: `OUTCOME_UNKNOWN`
+while its claim is open, because the attempt that wrote the claim may still be carrying the action
+out, as a long `project.clone` does; the recorded answer once that attempt has settled the claim;
+and the refusal of the window only when the journal holds no claim for it, which is a first action. A create asked again is told
 `OUTCOME_UNKNOWN` when its worker is known and the daemon cannot ask it about the session: the
 worker cannot be reached, refuses the read, or gives an answer the daemon cannot decode. It is told
 the same when the daemon fails to recover a claimed worker it has not yet adopted, when its closure
 cannot be read, and when its worker has gone with no closure recorded and its reservation shows that
-a worker was asked for or may still be asked for. A reservation recorded as failed that no worker
-claimed shows that the launch produced no worker, and the create is refused as ever whatever else
-the daemon cannot read.
+a worker was asked for or may still be asked for. A reservation recorded as failed, or
+fenced, that no worker claimed shows that the launch produced no worker, because a worker is given
+its launch specification only by claiming, and the create is refused as ever whatever else the
+daemon cannot read.
 The services behind the door check the registration again where they write, and a copy of an
 action that meets a fence owed there is refused in their words. A service that answers a copy of an
 action from its own record while it carries the action out, because the first copy finished
@@ -3597,7 +3603,8 @@ write or read back after the action was carried out; and an attempt under the ac
 that is still running when a copy of it arrives. A project action that was refused, when the journal
 cannot keep the refusal, is told as the record of the action where there is one to read,
 `ID_CONFLICT` where the record is another request's, and `OUTCOME_UNKNOWN` where there is none,
-because the refusal can be a word about what another copy of the action did. A copy of a project action
+because the refusal can be a word about what another copy of the action did. A transfer action
+that was refused, when the store cannot keep the refusal, is told the same way. A copy of a project action
 whose first copy's claim is still open, refused by the admission the action is performed under, is
 told `OUTCOME_UNKNOWN` too, because the claim shows the action began; a first action holds no claim
 and is refused as the admission says.
