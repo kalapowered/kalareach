@@ -1246,9 +1246,10 @@ impl World {
     }
 
     /// What a look says of how current its reports are. Where the controller could not count a
-    /// current report from every worker, it also says which workers still have a round out (one
-    /// that has not answered) and what the catalogue noted, which separates a worker that did not
-    /// answer from a view of the reports that the controller did not refresh.
+    /// current report from every worker, it also says how many of the workers that gave the
+    /// reports have a round that has not ended and what the catalogue noted: further evidence for
+    /// telling a worker that did not answer from a view the controller did not refresh, not a
+    /// proof of either, since a round that timed out is no longer out.
     async fn counting_in_words(&self, look: &Look) -> String {
         if look.counted {
             return "the controller counted a current report from every worker".to_owned();
@@ -1262,8 +1263,8 @@ impl World {
         let notes = controller.catalogue_warnings().await;
         format!(
             "the controller could not count a current report from every worker, so these may be \
-             the reports last accepted; {out} of {} workers have a round still out; the \
-             catalogue's notes: {}",
+             the reports last accepted; {out} of {} workers have a round that has not ended; \
+             the catalogue's notes: {}",
             look.workers.len(),
             if notes.is_empty() {
                 "none".to_owned()
