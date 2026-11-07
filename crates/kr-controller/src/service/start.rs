@@ -1136,6 +1136,7 @@ impl Controller {
             connections: Mutex::new(BTreeMap::new()),
             proxies: std::sync::Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
+            unwritten_failures: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             reservations: Arc::default(),
             admitted: std::sync::RwLock::new(BTreeMap::new()),
             commit_hold: std::sync::RwLock::new(()),

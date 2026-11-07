@@ -2036,6 +2036,205 @@ async fn a_create_that_ends_before_it_asks_for_a_worker_settles_its_reservation(
     assert_eq!(told.code(), ErrorCode::ResourceUnavailable, "{told}");
 }
 
+/// Makes the registry refuse the write that moves a reservation to `failed`, which is how a create
+/// that started nothing settles the reservation it made.
+fn refuse_the_move_to_failed(temp: &kr_ipc::testing::TempHost) {
+    rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("opens the registry")
+        .execute_batch(
+            "CREATE TRIGGER refuse_failed BEFORE UPDATE OF phase ON reservations
+                 WHEN NEW.phase = 'failed'
+                 BEGIN SELECT RAISE(ABORT, 'refused by this test'); END;",
+        )
+        .expect("installs the refusal");
+}
+
+/// Lets the registry write the move to `failed` again.
+fn allow_the_move_to_failed(temp: &kr_ipc::testing::TempHost) {
+    rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("opens the registry")
+        .execute_batch("DROP TRIGGER refuse_failed;")
+        .expect("removes the refusal");
+}
+
+/// KR-REQ-09.09: a create that started nothing and cannot write that its launch failed still tells
+/// a repeat of it that the launch failed. Nothing was launched, so the repeat is not told that the
+/// first attempt is still under way, or that what became of the session is not known, until the
+/// next start moves the row. The repeat tries the write again, and the row says `failed` once the
+/// registry takes it.
+///
+/// The two ways a create ends before it asks for a worker, each with the write refused: the look at
+/// where the session starts is lost, and the reservation cannot move to `spawned`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_that_started_nothing_and_cannot_write_that_it_failed_still_tells_a_repeat_so() {
+    for lost_look in [true, false] {
+        let (temp, controller, asked) = daemon().await;
+        let environment_id = temp.environment_id();
+        let (connection_id, actor_id) = admitted(&controller).await;
+        let request = create_request(environment_id);
+        let carried = carried(&controller, connection_id, half_a_minute(&controller));
+        refuse_the_move_to_failed(&temp);
+        if lost_look {
+            controller
+                .place_lookup_panics
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            refuse_the_move_to_spawned(&temp);
+        }
+
+        let first = controller
+            .session_create(&actor_id, &request, carried)
+            .await
+            .into_answer()
+            .expect_err("a create that cannot go on starts nothing");
+        assert!(
+            asked.lock().expect("the record is not poisoned").is_empty(),
+            "no worker was asked for (lost look {lost_look}): {first}"
+        );
+
+        let told = controller
+            .session_create(&actor_id, &request, carried)
+            .await
+            .into_answer()
+            .expect_err("a create that started nothing leaves no session to answer with");
+        assert_eq!(
+            told.code(),
+            ErrorCode::ResourceUnavailable,
+            "lost look {lost_look}: {told}"
+        );
+
+        allow_the_move_to_failed(&temp);
+        let told = controller
+            .session_create(&actor_id, &request, carried)
+            .await
+            .into_answer()
+            .expect_err("a create that started nothing leaves no session to answer with");
+        assert_eq!(
+            told.code(),
+            ErrorCode::ResourceUnavailable,
+            "lost look {lost_look}: {told}"
+        );
+        let reservation = controller
+            .registry
+            .lock()
+            .await
+            .reservation_for_token(&actor_id, request.action_id.get())
+            .expect("reads the token")
+            .expect("the first attempt reserved the token");
+        assert_eq!(
+            reservation.phase,
+            LaunchPhase::Failed,
+            "the repeat wrote what the first attempt could not (lost look {lost_look})"
+        );
+        assert!(reservation.claimed_key.is_none(), "no worker claimed it");
+    }
+}
+
+/// KR-REQ-09.09: a create whose reservation cannot move to `spawned` has asked for no worker, and
+/// settles the reservation as failed, so that it stops occupying the environment and a repeat is
+/// told that the launch failed and not that the first attempt is still under way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_reservation_cannot_move_to_spawned_settles_it_as_failed() {
+    let (temp, controller, asked) = daemon().await;
+    let environment_id = temp.environment_id();
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let request = create_request(environment_id);
+    let carried = carried(&controller, connection_id, half_a_minute(&controller));
+    refuse_the_move_to_spawned(&temp);
+
+    let first = controller
+        .session_create(&actor_id, &request, carried)
+        .await
+        .into_answer()
+        .expect_err("a create whose reservation cannot move to spawned starts nothing");
+    assert!(
+        asked.lock().expect("the record is not poisoned").is_empty(),
+        "nothing was launched: {first}"
+    );
+    let registry = controller.registry.lock().await;
+    let reservation = registry
+        .reservation_for_token(&actor_id, request.action_id.get())
+        .expect("reads the token")
+        .expect("the first attempt reserved the token");
+    assert_eq!(reservation.phase, LaunchPhase::Failed);
+    assert_eq!(
+        registry.occupancy().expect("counts"),
+        0,
+        "the reservation stops occupying the environment"
+    );
+    drop(registry);
+
+    let told = controller
+        .session_create(&actor_id, &request, carried)
+        .await
+        .into_answer()
+        .expect_err("a create that started nothing leaves no session to answer with");
+    assert_eq!(told.code(), ErrorCode::ResourceUnavailable, "{told}");
+}
+
+/// Removes the directory a host that is too deep for a socket address was made under.
+#[cfg(unix)]
+struct DeepParent(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for DeepParent {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+/// KR-REQ-09.09: a create that cannot give its worker an address to meet its daemon at has asked for
+/// no worker, and settles the reservation as failed, so that it stops occupying the environment and
+/// a repeat is told that the launch failed and not that what became of the session is not known.
+/// A daemon that is listening has an address of the same length, so this is a host whose runtime
+/// directory is deeper than a socket address allows and which has not bound one.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_worker_has_no_address_to_meet_its_daemon_at_settles_its_reservation() {
+    let suffix = kr_ipc::new_uuid().to_string();
+    let parent = DeepParent(std::env::temp_dir().join(format!(
+        "{}{}",
+        "d".repeat(kr_ipc::paths::MAX_SOCKET_PATH_LEN + 8),
+        &suffix[..8]
+    )));
+    std::fs::create_dir_all(&parent.0).expect("makes the directory the host goes under");
+    let temp = kr_ipc::testing::TempHost::create_in(&parent.0);
+    let (controller, asked) = daemon_running(&temp, temp.root().join("kr-worker"), None).await;
+    let environment_id = temp.environment_id();
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let request = create_request(environment_id);
+    let carried = carried(&controller, connection_id, half_a_minute(&controller));
+
+    let first = controller
+        .session_create(&actor_id, &request, carried)
+        .await
+        .into_answer()
+        .expect_err("a worker with no address to meet its daemon at is not started");
+    assert!(
+        asked.lock().expect("the record is not poisoned").is_empty(),
+        "no worker was asked for: {first}"
+    );
+    let registry = controller.registry.lock().await;
+    let reservation = registry
+        .reservation_for_token(&actor_id, request.action_id.get())
+        .expect("reads the token")
+        .expect("the first attempt reserved the token");
+    assert_eq!(reservation.phase, LaunchPhase::Failed);
+    assert_eq!(
+        registry.occupancy().expect("counts"),
+        0,
+        "the reservation stops occupying the environment"
+    );
+    drop(registry);
+
+    let told = controller
+        .session_create(&actor_id, &request, carried)
+        .await
+        .into_answer()
+        .expect_err("a create that started nothing leaves no session to answer with");
+    assert_eq!(told.code(), ErrorCode::ResourceUnavailable, "{told}");
+}
+
 /// Makes the registry refuse the write that moves a reservation to `spawned`, which a create
 /// makes after it has registered the wait for its worker.
 fn refuse_the_move_to_spawned(temp: &kr_ipc::testing::TempHost) {
