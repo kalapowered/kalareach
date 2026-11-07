@@ -17,6 +17,7 @@ import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
 import { MobileApp } from '../src/mobile/MobileApp'
 import { PURCHASE_WORDS } from '../src/model/account'
+import { readAloud } from './live-regions'
 
 const SIGNED_IN = {
   state: 'signed_in',
@@ -73,6 +74,11 @@ describe('the sync service setting', () => {
     await waitFor(() => {
       expect(within(sheet).getByTestId('sync-service')).toHaveTextContent('sync.example')
     })
+    // The status line, a live region, says the choice with the address as words, and a screen
+    // reader reads no dotted form in it.
+    expect(readAloud(within(sheet).getByTestId('sync-status'))).toBe(
+      'This device uses sync dot example as its sync service. This device now uses sync dot example as its sync service.'
+    )
     expect(within(sheet).queryByLabelText('Sync service')).toBeNull()
     expect(within(sheet).getByTestId('sync-status')).toHaveFocus()
   })

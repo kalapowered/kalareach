@@ -365,6 +365,11 @@ export interface ToastAction {
 export interface ToastMessage {
   readonly id: number
   readonly text: string
+  /**
+   * What a screen reader is told in place of `text`, for a message whose written words hold what
+   * is better said another way, such as an address said as words.
+   */
+  readonly spoken?: string
   readonly tone: 'success' | 'danger' | 'pending'
   readonly action?: ToastAction
   /**
@@ -459,7 +464,7 @@ function HeldToast({
   const page = useAnnouncer()
   useAnnouncedIn(
     useCallback(() => currentToastDock()?.announcer ?? page, [page]),
-    message.text,
+    message.spoken ?? message.text,
     message.said ?? 0
   )
   const held = holds.pointer || holds.focused
@@ -593,7 +598,15 @@ function ToastCard({
           role={overflowing ? 'region' : undefined}
           aria-label={overflowing ? 'Message' : undefined}
         >
-          {message.text}
+          {message.spoken === undefined ? (
+            message.text
+          ) : (
+            <>
+              {/* The words said in place of the written ones, as the spoken form of an address is. */}
+              <span className="visually-hidden spoken-form">{message.spoken}</span>
+              <span aria-hidden="true">{message.text}</span>
+            </>
+          )}
         </span>
       </div>
       <div className="toast-controls">

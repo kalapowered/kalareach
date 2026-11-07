@@ -81,11 +81,15 @@ interface AppValue {
   readonly place: Place
   readonly go: (place: Place) => void
   readonly toast: ToastMessage | null
-  /** Shows a passing message, with the one thing it offers to do, if any. */
+  /**
+   * Shows a passing message, with the one thing it offers to do, if any, and the words a screen
+   * reader is told in place of the written ones, if they are better said another way.
+   */
   readonly say: (
     text: string,
     tone?: 'success' | 'danger' | 'pending',
-    action?: ToastAction
+    action?: ToastAction,
+    spoken?: string
   ) => void
   readonly dismissToast: () => void
   /** The open session tabs, in the order the person opened them. */
@@ -143,8 +147,13 @@ export function AppProvider({
   }, [])
 
   const say = useCallback(
-    (text: string, tone: 'success' | 'danger' | 'pending' = 'success', action?: ToastAction) => {
-      setToast({ id: Date.now() + Math.random(), text, tone, action })
+    (
+      text: string,
+      tone: 'success' | 'danger' | 'pending' = 'success',
+      action?: ToastAction,
+      spoken?: string
+    ) => {
+      setToast({ id: Date.now() + Math.random(), text, spoken, tone, action })
     },
     []
   )

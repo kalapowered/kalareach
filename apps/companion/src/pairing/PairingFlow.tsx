@@ -23,7 +23,7 @@ import {
   type RefObject
 } from 'react'
 
-import { ServiceAddress } from '../components/ServiceAddress'
+import { ServiceAddress, spokenAddress } from '../components/ServiceAddress'
 import { Button, Card, Switch } from '../components/ui'
 import { useApp } from '../app/state'
 import {
@@ -483,7 +483,12 @@ export function PairingFlow({
                     .pairingSetOrigin(draftOrigin)
                     .then((origin) => {
                       setChanging(false)
-                      say(`Codes now go through ${origin.host}.`)
+                      say(
+                        `Codes now go through ${origin.host}.`,
+                        'success',
+                        undefined,
+                        `Codes now go through ${spokenAddress(origin.host)}.`
+                      )
                     })
                     .catch((error: unknown) => {
                       say(failureMessage(error), 'danger')
