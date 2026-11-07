@@ -665,6 +665,11 @@ pub struct Controller {
     /// record the action in between. Compiled away in every shipped build.
     #[cfg(test)]
     before_a_voice_change_claims: ReadPause,
+    /// Set by this host's own tests to make the next look at where a session starts end as a task
+    /// that panicked does, which the create waiting for it meets as a failure to join. The flag is
+    /// taken by the first look. Compiled away in every shipped build.
+    #[cfg(test)]
+    place_lookup_panics: std::sync::atomic::AtomicBool,
     /// Where this host's own tests stop a close asked for by voice once it is held against its
     /// grant and before the revision and the authority are read, so that a withdrawal of the grant
     /// can land in between. Compiled away in every shipped build.
