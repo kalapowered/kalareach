@@ -3034,3 +3034,65 @@ async fn a_repeat_whose_open_claim_cannot_be_read_is_told_the_outcome_is_unknown
     assert_eq!(settled.handle.transfer_id, transfer_id);
     host.stop().await;
 }
+
+/// KR-REQ-09.09: a transfer action that was carried out, and whose record cannot be written or read
+/// back after it, is told that what became of it is not known. An upload that is begun has reserved
+/// its bytes and kept its receipt in one commit; a transient word would say nothing took effect.
+/// The action is performed once: asked again, it is answered with the record it kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_action_carried_out_whose_record_cannot_be_written_is_told_the_outcome_is_unknown()
+ {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let params = begin_params(&host, &pattern(64), "kept.bin");
+    let store = beside_the_store(&host);
+    // The commit that begins the upload keeps its receipt. The write after it, which covers the
+    // actions that keep none of their own, meets that receipt and cannot be written.
+    store
+        .execute_batch(
+            "CREATE TRIGGER the_record_cannot_be_written_twice BEFORE INSERT ON actions
+             WHEN EXISTS (SELECT 1 FROM actions
+                           WHERE actor_id = NEW.actor_id AND action_id = NEW.action_id)
+             BEGIN SELECT RAISE(ABORT, 'the record cannot be written'); END;",
+        )
+        .expect("the second write of a record fails");
+    let told = failure(
+        control
+            .mutate(
+                Method::UploadBegin,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    store
+        .execute_batch("DROP TRIGGER the_record_cannot_be_written_twice;")
+        .expect("the record can be written again");
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    let begun: UploadBeginResult = typed(
+        &control
+            .mutate(
+                Method::UploadBegin,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the repeat is answered with the record the action kept"),
+    );
+    assert_eq!(
+        host.controller
+            .transfer()
+            .service()
+            .staged_byte_len()
+            .expect("reads the staged total"),
+        begun.staged_byte_len.get(),
+        "the upload was begun once"
+    );
+    host.stop().await;
+}

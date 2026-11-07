@@ -1098,7 +1098,20 @@ impl TransferModule {
             // Recorded before it is returned, so the reply and the record cannot disagree about
             // what happened. When another copy of this action recorded first, that record is the
             // answer both callers get: one action, one receipt.
-            match service.record_action(&actor, action_id, name, digest, &record)? {
+            let recorded = service
+                .record_action(&actor, action_id, name, digest, &record)
+                .map_err(|error| {
+                    let error = ProtocolError::from(error);
+                    // An action that was carried out is not one that was not: a record that cannot
+                    // be written or read back now is told as a record that cannot be read, and a
+                    // transient word would have it sent again as though nothing had been done.
+                    if outcome.is_ok() {
+                        ControllerError::found_unreadable_on_the_wire(error, RECORDS)
+                    } else {
+                        error
+                    }
+                })?;
+            match recorded {
                 None => outcome,
                 Some(RetainedOutcome::Ok(result)) => {
                     kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
