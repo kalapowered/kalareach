@@ -1240,9 +1240,17 @@ fn date_before(outputs: &[(String, PathBuf)], compiled: &[Compiled], began: Syst
                     continue;
                 }
                 let path = entry.path();
+                // The same bytes are named alike wherever a macro writes them (an icon, a page), so
+                // the name of the directory it lies in is part of what a dependency file must say.
+                let beside = directory.file_name().unwrap_or_default().to_string_lossy();
+                let tail = format!("{beside}/{name}");
                 let readers: Vec<Unit> = units
                     .iter()
-                    .filter(|unit| unit.read.as_ref().is_some_and(|read| read.contains(&name)))
+                    .filter(|unit| {
+                        unit.read
+                            .as_ref()
+                            .is_some_and(|read| read.replace('\\', "/").contains(&tail))
+                    })
                     .map(|unit| unit.unit)
                     .collect();
                 let why = if unreadable {
