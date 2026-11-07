@@ -359,6 +359,11 @@ impl Shown {
             IpcError::IdentityUnavailable { what, .. } => {
                 crate::shown!("{} is not available", *what)
             }
+            // The connection stands: the request is in a form the peer's release cannot read, and
+            // it was not written.
+            IpcError::NotInLevel(_) => {
+                Self::said("the peer's release cannot read the request, so it was not sent")
+            }
             _ => Self::said("the local connection failed"),
         }
     }
@@ -1951,6 +1956,19 @@ mod tests {
         assert!(
             said.as_str()
                 .contains("is not known to keep other accounts out"),
+            "{said}"
+        );
+    }
+
+    /// A request the peer's release cannot read is not written, and the connection stands: it is
+    /// said as that, in fixed words, and not as a connection that failed.
+    #[test]
+    fn a_request_the_peers_release_cannot_read_is_not_said_to_be_a_failed_connection() {
+        let said = Shown::ipc(&IpcError::NotInLevel("a method the level lacks".to_owned()));
+        assert!(said.as_str().contains("was not sent"), "{said}");
+        assert!(!said.as_str().contains("failed"), "{said}");
+        assert!(
+            !said.as_str().contains("a method the level lacks"),
             "{said}"
         );
     }
