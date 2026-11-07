@@ -11,10 +11,12 @@ fn repository() -> PathBuf {
 /// The variables the native compilers read when a build script compiles C or C++: the deployment
 /// target and the SDK, the compilers, their flags and wrappers, each also in the forms the `cc`
 /// crate reads for one target or for the host.
-const NATIVE: [&str; 15] = [
+const NATIVE: &[&str] = &[
     "MACOSX_DEPLOYMENT_TARGET",
+    "IPHONEOS_DEPLOYMENT_TARGET",
     "SDKROOT",
     "DEVELOPER_DIR",
+    "CROSS_COMPILE",
     "CC",
     "CXX",
     "CFLAGS",
@@ -22,9 +24,13 @@ const NATIVE: [&str; 15] = [
     "CPPFLAGS",
     "LDFLAGS",
     "AR",
+    "RANLIBFLAGS",
+    "CXXSTDLIB",
     "CC_x86_64_apple_darwin",
     "CXXFLAGS_x86_64-apple-darwin",
+    "CXXSTDLIB_x86_64_apple_darwin",
     "HOST_CC",
+    "HOST_CXXSTDLIB",
     "TARGET_CFLAGS",
     "CRATE_CC_NO_DEFAULTS",
 ];
@@ -47,7 +53,7 @@ fn key_with(
         .current_dir(repository())
         .env_remove("ImageOS")
         .env_remove("ImageVersion");
-    for name in NATIVE {
+    for &name in NATIVE {
         command.env_remove(name);
     }
     for (name, value) in extra {
@@ -122,7 +128,7 @@ fn a_machine_that_is_not_a_hosted_runner_has_a_key_of_its_own() {
 fn a_cache_built_with_other_native_compiler_inputs_is_never_restored() {
     let image = (Some("macos15"), Some("20260907.0337.1"));
     let base = key_with(image.0, image.1, &[]);
-    for name in NATIVE {
+    for &name in NATIVE {
         let one = key_with(image.0, image.1, &[(name, "a value")]);
         let other = key_with(image.0, image.1, &[(name, "another value")]);
         assert_ne!(base[0], one[0], "{name} is not in the key");
