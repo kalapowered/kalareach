@@ -151,6 +151,19 @@ final class AccessibilityTests: HarnessTestCase {
         }
     }
 
+    // MARK: What the audit cannot see
+
+    /// The service's address is drawn as written and said as words. The audit passes as well when a
+    /// page says neither, so the words are looked for on the two screens that show the address.
+    func testTheServiceAddressIsSaidAsWords() {
+        start(size: nil, colour: "light")
+        for screen in [Screen.hosts, .account] {
+            go(to: screen)
+            let spoken = app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS 'reach dot kala dot to'")).firstMatch
+            XCTAssertTrue(spoken.waitForExistence(timeout: 10), "\(screen.rawValue) does not say the service's address as words")
+        }
+    }
+
     // MARK: Growth
 
     /// A line of text is taller at the largest size than at the default one: the page follows the

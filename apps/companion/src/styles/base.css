@@ -156,6 +156,12 @@ main:focus {
   border: 0;
 }
 
+/* A text said aloud in place of one that is written: a copy of the written one does not carry it. */
+.visually-hidden.spoken-form {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
 /* The link is for a keyboard: out of sight until it has focus, at every text size. It is parked by its
    own height, above the window, and not by a distance: a link that grows with the text outgrows a
    fixed one and shows over the page. With focus it comes to rest inside the window, and it wraps
