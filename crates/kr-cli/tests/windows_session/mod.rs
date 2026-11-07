@@ -334,6 +334,8 @@ impl WorkerTerminal {
 /// worker is a process of its own outside this test's job.
 pub struct WorkerHost {
     pub tree: teardown::Tree,
+    /// Straight after the tree, so that it looks once the tree has been removed.
+    _gone: TreeGone,
     _task: kr_controller::supervision::windows::testing::TestTask,
     controller: Option<std::sync::Arc<kr_controller::service::Controller>>,
     serving: Vec<tokio::task::JoinHandle<kr_controller::Result<()>>>,
@@ -498,6 +500,7 @@ impl Prepared {
         let environment = tree.environment();
         let environment_id = environment.environment_id();
         let secrets = environment.secrets_dir();
+        let gone = TreeGone(tree.root().to_path_buf());
         let controller = Controller::start(ControllerSetup {
             paths: environment.clone(),
             environment_id,
@@ -535,6 +538,7 @@ impl Prepared {
         ];
         WorkerHost {
             tree,
+            _gone: gone,
             _task: task,
             controller: Some(controller),
             serving,
@@ -711,10 +715,78 @@ impl Created {
 }
 
 impl Drop for WorkerHost {
+    /// Ends the daemon before the tree goes.
+    ///
+    /// The daemon holds `singleton.lock` for as long as any part of it lives, and that is an open
+    /// file that shares nothing: the removal of the folder it is in is refused for as long as it is
+    /// held, and the tree would stay in the temporary folder for good. So the tasks that serve are
+    /// cancelled, the host lets go of the daemon, and the tree is let go of once the lock can be
+    /// taken, which is when the last part of the daemon has let go of it.
     fn drop(&mut self) {
         for task in &self.serving {
             task.abort();
         }
         drop(self.controller.take());
+        let lock = self.tree.environment().singleton_lock();
+        let environment_id = self.tree.environment_id();
+        let begun = std::time::Instant::now();
+        let problem = loop {
+            match kr_controller::singleton::SingletonLock::hold(&lock, environment_id) {
+                Ok(held) => {
+                    drop(held);
+                    break None;
+                }
+                Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
+                    if begun.elapsed() < LIVENESS_DEADLINE =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => break Some(error),
+            }
+        };
+        // A case that is already failing is not made to panic twice, and the tree is still let go
+        // of below: the fields go after this.
+        if let Some(error) = problem {
+            assert!(
+                std::thread::panicking(),
+                "the daemon still held {} {:?} after the host let go of it: {error}",
+                lock.display(),
+                begun.elapsed()
+            );
+        }
+    }
+}
+
+/// What the tree's removal left, looked at once the tree has been dropped.
+///
+/// The tree's own removal ignores a refusal, so a tree whose removal is refused is left in the
+/// temporary folder with nothing said. This removes what is left, again, for as long as the
+/// refusal lasts (a worker that has ended may hold a file a moment longer), and fails the case when
+/// the folder is still there at the liveness deadline. A case that is failing is left as it is, and
+/// so is a tree that was kept on purpose because something it started could not be shown to have
+/// ended: that one is said by the tree, with a failure of its own.
+struct TreeGone(PathBuf);
+
+impl Drop for TreeGone {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let begun = std::time::Instant::now();
+        loop {
+            match std::fs::remove_dir_all(&self.0) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) if begun.elapsed() < LIVENESS_DEADLINE => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    panic!(
+                        "{} is left in the temporary folder, and its removal is refused: {error}",
+                        self.0.display()
+                    );
+                }
+            }
+        }
     }
 }
