@@ -21,7 +21,9 @@ mod support;
 mod teardown;
 mod windows_session;
 
-use windows_session::{LIVENESS_DEADLINE, WorkerHost, WorkerTerminal, root_process_of};
+use windows_session::{
+    LIVENESS_DEADLINE, RootProcessError, WorkerHost, WorkerTerminal, root_process_of,
+};
 
 /// A program of the system directory.
 fn system32(program: &str) -> String {
@@ -134,18 +136,22 @@ async fn opened(
     let typist = WorkerTerminal::attach(&environment, session, dimensions).await;
     let root = root_process_of(&environment, session)
         .await
-        .unwrap_or_else(|why| panic!("the worker is asked for its root shell: {why}"))
+        .unwrap_or_else(|why| panic!("the worker is asked for its root shell: {why:?}"))
         .expect("the worker reports the session's root shell");
     (session, typist, worker, root)
 }
 
 /// What a closed session leaves to show that nothing started its shell again.
 ///
-/// The root shell the closure names is the one the worker reported before the closure, and the
-/// worker, asked again, names no other. Then the terminal is let go, and the root shell and the
-/// worker are each gone. A second session is opened and closed, and the daemon lists exactly the
-/// two sessions, both closed, the first with the display number it had and the second with a
-/// number of its own.
+/// The root shell the closure names is the one the worker reported before the closure. The worker
+/// is asked again, with the terminal still attached; then the terminal is let go, and the root
+/// shell and the worker are each gone. A worker that answered names no other root shell than the
+/// first. One that could not be reached (the daemon withdraws a closed session's descriptor at the
+/// end of its closure, and the worker ends once the terminal is let go) says nothing, and is
+/// accepted as unreachable only once the kernel has shown it ended; a worker that is reached and
+/// then fails or answers wrongly fails the case. A second session is opened and closed, and the
+/// daemon lists exactly the two sessions, both closed, the first with the display number it had and
+/// the second with a number of its own.
 async fn nothing_started_the_closed_session_again(
     host: &WorkerHost,
     (session, terminal, worker, root): (
@@ -172,18 +178,26 @@ async fn nothing_started_the_closed_session_again(
         named, root,
         "the shell the closure names is the one the session started with: {closed}"
     );
-    // A worker that is still there names no other shell as the root. One that has already ended
-    // has withdrawn its descriptor and can name none, and what is left of it is checked below.
-    if let Ok(now) = root_process_of(&host.tree.environment(), session).await {
-        assert!(
-            now.as_ref().is_none_or(|reported| *reported == root),
-            "no other shell took the root's place: the worker reports {now:?}, the session started with {root:?}"
-        );
-    }
+    // The worker is asked while the terminal is attached, and the answer is judged once the kernel
+    // has shown the root shell and the worker ended.
+    let reported = root_process_of(&host.tree.environment(), session).await;
     // The terminal is let go, so the worker has nobody left to send the closure to.
     drop(terminal);
     ended(&root, "the root shell").await;
     ended(&worker, "the worker").await;
+    match reported {
+        Ok(now) => assert!(
+            now.as_ref().is_none_or(|reported| *reported == root),
+            "no other shell took the root's place: the worker reports {now:?}, the session started with {root:?}"
+        ),
+        // The daemon had withdrawn the descriptor, or the endpoint took no connection, and the
+        // kernel has now shown the worker ended. The read said nothing then, and the kernel's word
+        // above is all this case holds of the root shell.
+        Err(RootProcessError::NoDescriptor | RootProcessError::NotReached(_)) => {}
+        Err(RootProcessError::Failed(why)) => {
+            panic!("the worker was asked for its root shell again and the exchange failed: {why}")
+        }
+    }
 
     let (next, mut next_terminal, next_worker, _) = opened(host, &system32("cmd.exe")).await;
     next_terminal.type_line("exit 0").await;

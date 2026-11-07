@@ -28,27 +28,46 @@ pub fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
 
+/// Why a session's root shell could not be read from its worker.
+#[derive(Debug)]
+pub enum RootProcessError {
+    /// The session has no published descriptor: the worker never published one, or the daemon has
+    /// withdrawn it.
+    NoDescriptor,
+    /// The descriptor's endpoint did not take the connection.
+    NotReached(String),
+    /// The worker was reached, or the descriptor could not be used, and a step after that failed:
+    /// the runtime directory is not read, the worker does not answer the descriptor's challenge,
+    /// refuses the snapshot, or the answer does not decode.
+    Failed(String),
+}
+
 /// The session's root shell as its worker reports it now, by the identity it was started under, or
 /// nothing when the worker reports none. The worker is reached on a connection of its own, through
-/// its descriptor, as a command would. It is an error, with the step that failed, when the worker
-/// cannot be reached: a worker that has ended has withdrawn its descriptor.
+/// its descriptor, as a command would. The error says which step failed: a session with no
+/// published descriptor and an endpoint that does not take the connection are the two ways a
+/// worker that has ended shows, and every other step failing is the worker or the answer being
+/// wrong.
 pub async fn root_process_of(
     environment: &kr_ipc::paths::EnvironmentPaths,
     session_id: kr_protocol::ids::SessionId,
-) -> Result<Option<kr_protocol::identity::ProcessStartIdentity>, String> {
+) -> Result<Option<kr_protocol::identity::ProcessStartIdentity>, RootProcessError> {
+    use RootProcessError::{Failed, NoDescriptor, NotReached};
     let descriptor = kr_ipc::descriptor::read_all(environment)
-        .map_err(|error| format!("the runtime directory is not read: {error:?}"))?
+        .map_err(|error| Failed(format!("the runtime directory is not read: {error:?}")))?
         .into_iter()
         .filter_map(|entry| entry.descriptor.ok())
         .find(|descriptor| descriptor.session_id == session_id)
-        .ok_or_else(|| "the session has no published descriptor".to_owned())?;
+        .ok_or(NoDescriptor)?;
     let endpoint = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint)
-        .map_err(|error| format!("the descriptor's endpoint: {error:?}"))?;
+        .map_err(|error| Failed(format!("the descriptor's endpoint: {error:?}")))?;
     let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
         .await
-        .map_err(|error| format!("the worker is not reached: {error:?}"))?;
+        .map_err(|error| NotReached(format!("{error:?}")))?;
     client.verify_worker(&descriptor).await.map_err(|error| {
-        format!("the worker does not answer the descriptor's challenge: {error:?}")
+        Failed(format!(
+            "the worker does not answer the descriptor's challenge: {error:?}"
+        ))
     })?;
     let snapshot: kr_protocol::recovery::EventsSnapshotResult = client
         .request(
@@ -59,10 +78,10 @@ pub async fn root_process_of(
             },
         )
         .await
-        .map_err(|error| format!("the snapshot call is not answered: {error:?}"))?
-        .map_err(|error| format!("the worker refuses the snapshot: {error:?}"))?
+        .map_err(|error| Failed(format!("the snapshot call is not answered: {error:?}")))?
+        .map_err(|error| Failed(format!("the worker refuses the snapshot: {error:?}")))?
         .to_typed()
-        .map_err(|error| format!("the snapshot is not decoded: {error:?}"))?;
+        .map_err(|error| Failed(format!("the snapshot is not decoded: {error:?}")))?;
     Ok(snapshot.session.root_process.as_ref().cloned())
 }
 
