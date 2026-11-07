@@ -600,13 +600,14 @@ fn challenge_ran_out() -> CliError {
     ))
 }
 
-/// What the command says when the host's release cannot read the request for an owner device's
-/// confirmation: it was not written, and the connection stands.
+/// What the command says when the host's release cannot read the request for what an owner device
+/// is shown: it was not written, and the connection stands. The confirmation itself was asked for
+/// and stands.
 fn request_not_written(failure: &kr_ipc::IpcError) -> CliError {
     CliError::refused_in_its_own_words(
         failure.code(),
         Shown::said(
-            "the host's release cannot read the request for an owner device's confirmation, so it \
+            "the host's release cannot read the request for what an owner device is shown, so it \
              was not sent. Nothing was changed",
         ),
     )

@@ -1764,9 +1764,6 @@ async fn answered_by_an_owner_device(
         )
     };
     loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(ran_out());
-        }
         // A read the challenge's end cut short is the challenge running out, not a host that did
         // not answer: the host is asked about it every poll until then.
         let listed = match crate::plugin::ask_before(deadline, pending()).await {
