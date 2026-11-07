@@ -20,9 +20,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
-#[cfg(unix)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kr_client::recovery::fresh_locator;
 use kr_client::services::account::{
@@ -34,8 +32,10 @@ use kr_client::services::{
     ServiceHttp, ServiceSigner, managed_response_limits,
 };
 use kr_controller::account::{HostAccount, Service};
+use kr_controller::error::ControllerError;
 use kr_controller::quiet::Timer;
 use kr_controller::service::{Controller, ControllerSetup};
+use kr_controller::singleton::SingletonLock;
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_controller::testing::HeldTimer;
 use kr_crypto::backup::{
@@ -380,16 +380,49 @@ struct Rig {
     temp: kr_ipc::testing::TempHost,
     served: Served,
     timer: Arc<HeldTimer>,
-    _controller: Arc<Controller>,
+    controller: Option<Arc<Controller>>,
     serving: Vec<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
     work: PathBuf,
     home: PathBuf,
 }
 
 impl Drop for Rig {
+    /// Ends the daemon before the tree goes.
+    ///
+    /// The daemon holds `singleton.lock` for as long as any part of it lives, and on Windows that is
+    /// an open file that shares nothing, which the removal of the folder it is in is refused for:
+    /// the tree would stay in the temporary folder for good. So the tasks that serve are cancelled,
+    /// the rig lets go of the daemon, and the tree is removed once the lock can be taken, which is
+    /// when the last part of the daemon has let go of it. The fields go after this, the tree first.
     fn drop(&mut self) {
         for task in &self.serving {
             task.abort();
+        }
+        drop(self.controller.take());
+        let lock = self.temp.environment().singleton_lock();
+        let begun = Instant::now();
+        let problem = loop {
+            match SingletonLock::hold(&lock, self.temp.environment_id()) {
+                Ok(held) => {
+                    drop(held);
+                    break None;
+                }
+                Err(ControllerError::AlreadyRunning { .. })
+                    if begun.elapsed() < LIVENESS_DEADLINE =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => break Some(error),
+            }
+        };
+        // A case that is already failing is not made to panic twice.
+        if let Some(error) = problem {
+            assert!(
+                std::thread::panicking(),
+                "the daemon still held {} {:?} after the rig let go of it: {error}",
+                lock.display(),
+                begun.elapsed()
+            );
         }
     }
 }
@@ -463,7 +496,7 @@ impl Rig {
             temp,
             served,
             timer,
-            _controller: controller,
+            controller: Some(controller),
             serving,
             work,
             home,
@@ -1035,6 +1068,26 @@ fn borrowed(members: &[(String, Vec<u8>)]) -> Vec<(&str, Vec<u8>)> {
 /* -------------------------------------------------------------------------- */
 /* Cases                                                                       */
 /* -------------------------------------------------------------------------- */
+
+/// A rig removes the whole tree it made when it goes, the daemon's lock file in it, however long
+/// the daemon was up and on whichever platform. Windows refuses the removal of a folder below a file
+/// the daemon still holds open, and the folder's remains would stay in the temporary folder for
+/// good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rig_leaves_no_part_of_its_tree_behind() {
+    let rig = Rig::start(SignIn::Nobody).await;
+    let root = rig.temp.root().to_path_buf();
+    assert!(
+        rig.temp.environment().singleton_lock().exists(),
+        "the daemon holds its lock file in the tree"
+    );
+    drop(rig);
+    assert!(
+        !root.exists(),
+        "{} is left in the temporary folder",
+        root.display()
+    );
+}
 
 /// KR-REQ-24.16, 20.16, 20.19, KR-ACC-033: a fresh host with only the kit previews, then confirms
 /// the digest it saw, and the folder holds exactly the plaintexts; the host's stored keys,
