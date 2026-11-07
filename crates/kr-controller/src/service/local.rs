@@ -19,7 +19,7 @@ use kr_transport::window::MAX_WINDOW_VALIDITY;
 use crate::error::{ControllerError, Result};
 
 use super::authority_changes::declaration_answer;
-use super::identifiers::Spending;
+use super::identifiers::Arrival;
 use super::{Controller, error_reply, net, respond};
 
 /// How often the daemon replaces a live connection's action window.
@@ -314,6 +314,14 @@ impl Controller {
         tokio::sync::oneshot::Sender<()>,
     ) {
         self.before_a_door_effect.arm()
+    }
+
+    /// Arms the signal that the next copy of an action to wait, because its window is refused and
+    /// an arrival under the same identifier has not decided what it is doing, gives. Returns the end
+    /// that says the copy is waiting. It fires once.
+    #[cfg(feature = "testing")]
+    pub fn notify_when_a_copy_waits(&self) -> tokio::sync::oneshot::Receiver<()> {
+        self.identifiers_performing.notify_when_a_copy_waits()
     }
 
     /// Arms the pause the next mutation of a paired device stops at once its worker has answered,
@@ -913,6 +921,11 @@ impl Controller {
                 error.to_string(),
             ));
         }
+        // The arrival is recorded as soon as the door has the mutation, so that a copy that arrives
+        // on another connection while this arrival looks for a retained answer, or reads the other
+        // stores, knows that this one is there: it may be the first attempt, and about to write the
+        // claim of its action. It is held until this arrival has ended, whatever it comes to.
+        let mut arrival = self.arrive(actor_id, &mutation, method);
         // A retained action is answered before anything about a first admission is considered.
         // Section 9 makes the freshness window the thing that admits a *new* action; applying it to
         // a retry would refuse a caller its own completed result because its window has since been
@@ -1010,7 +1023,7 @@ impl Controller {
             {
                 // Asked before the claim is, so that a first attempt that writes its claim and ends
                 // between the two is read as its claim and not missed as an absent one.
-                let another_holds = spending.as_ref().is_some_and(Spending::is_shared);
+                let another_holds = another_may_carry_it_out(&mut arrival).await;
                 match self.transfer.settles(actor_id, &mutation, method).await {
                     crate::transfer::Settling::Open => None,
                     // The claim was settled between the lookup above and this one, by another copy
@@ -1026,8 +1039,8 @@ impl Controller {
                         }
                         return DoorReply::Answered(answer);
                     }
-                    // No claim, and no other arrival holds the action: a first admission, which
-                    // has no window. If another does, the first attempt has not reached its claim
+                    // No claim, and no other arrival may carry the action out: a first admission,
+                    // which has no window. If one may, the first attempt has not reached its claim
                     // and goes on to carry the action out.
                     crate::transfer::Settling::No if another_holds => {
                         return self.the_attempt_that_holds_the_action(
@@ -1048,14 +1061,14 @@ impl Controller {
             // may still be carrying the action out, and a refusal about a window says nothing was
             // done. The repeat is told what the service holds for its action, which for an open
             // claim is that what became of the action is not known. An action with no claim is a
-            // first admission, and is refused for its window, unless another arrival holds the
-            // action: a copy that arrives before the first attempt has written its claim is told
-            // that the attempt has not finished.
+            // first admission, and is refused for its window, unless another arrival may carry
+            // the action out: a copy that arrives before the first attempt has written its claim
+            // is told that the attempt has not finished.
             Err(error @ ControllerError::WindowExpired { .. })
                 if crate::project::ProjectModule::serves(method) =>
             {
                 // Asked before the claim is, as for a transfer action above.
-                let another_holds = spending.as_ref().is_some_and(Spending::is_shared);
+                let another_holds = another_may_carry_it_out(&mut arrival).await;
                 let held = match self.project.held_answer(actor_id, &mutation, method).await {
                     Some(held) => held,
                     None if another_holds => {
@@ -1088,10 +1101,16 @@ impl Controller {
                 }));
             }
         };
+        // From here this arrival carries the action out, and a copy that finds no claim yet asks
+        // whether it may.
+        if let Some(arrival) = arrival.as_mut() {
+            arrival.runs();
+        }
         let request_id = mutation.request_id;
         let controller = Arc::clone(self);
         let actor_id = actor_id.clone();
         let effect = tokio::spawn(async move {
+            let _arrival = arrival;
             let _spending = spending;
             #[cfg(feature = "testing")]
             controller.before_a_door_effect.wait().await;
@@ -1116,8 +1135,8 @@ impl Controller {
         }))
     }
 
-    /// The answer to a copy of an action that no claim answers while another arrival holds the
-    /// action: its first attempt has not written the claim and goes on to carry the action out,
+    /// The answer to a copy of an action that no claim answers while another arrival may carry the
+    /// action out: its first attempt has not written the claim and goes on to carry the action out,
     /// so it may have been done by the time the copy asks again. It passes the check any
     /// retained answer is owed, as the answers about a claim do.
     fn the_attempt_that_holds_the_action(
@@ -1168,6 +1187,16 @@ impl Controller {
             Ok(None) => None,
             Err(error) => Some(respond(mutation.request_id, Err(error))),
         }
+    }
+}
+
+/// Whether another arrival under the identifier may carry the action out, asked by a copy that is
+/// refused for its window ([`Arrival::another_may_carry_it_out`]). A method that records no arrival
+/// has no other.
+async fn another_may_carry_it_out(arrival: &mut Option<Arrival>) -> bool {
+    match arrival.as_mut() {
+        Some(arrival) => arrival.another_may_carry_it_out().await,
+        None => false,
     }
 }
 

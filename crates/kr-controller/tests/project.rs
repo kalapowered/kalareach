@@ -4329,3 +4329,130 @@ async fn a_copy_that_arrives_before_the_first_attempt_has_claimed_is_told_the_ou
     assert_eq!(given, made, "the action was carried out once");
     let _ = host.stop().await;
 }
+
+/// KR-REQ-09.09: a copy that arrives while the first attempt is still looking for a record of its
+/// action, which is before the attempt has decided to carry the action out, is told that the attempt
+/// has not finished once it has. The copy waits for the attempt to decide: refused for its window at
+/// once, it would have a refusal for an action the first attempt goes on to carry out.
+///
+/// The first attempt is stopped at the end of its look for a record, and then again after the daemon
+/// has admitted it and before the project service is asked, and the case lets it go at each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn a_copy_that_arrives_while_the_first_attempt_is_still_looking_for_a_record_is_told_the_outcome_is_unknown()
+ {
+    let host = host().await;
+    let mut first = client(&host).await;
+    let original = composed(
+        &mut first,
+        host.environment_id,
+        Method::ProjectInit,
+        ActionId::new(kr_ipc::new_uuid()),
+        &ProjectInitParams {
+            destination: host.destination("made"),
+            label: "made".to_owned(),
+            initial_branch: Nullable::null(),
+        },
+    )
+    .await;
+    let (looked, let_it_look_on) = host.controller.pause_retained_lookup();
+    let (reached, let_it_go_on) = host.controller.pause_before_a_door_effect();
+    let waits = host.controller.notify_when_a_copy_waits();
+    let running = {
+        let original = original.clone();
+        tokio::spawn(async move { first.repeat(&original).await })
+    };
+    looked
+        .await
+        .expect("the first attempt has looked for a record and has not been admitted");
+
+    let mut second = client(&host).await;
+    let mut copy = {
+        let original = original.clone();
+        tokio::spawn(async move { second.repeat(&original).await })
+    };
+    // While the first attempt has not decided, the copy can only wait for it: an answer now would
+    // be a refusal for an action the first attempt goes on to carry out.
+    tokio::select! {
+        waiting = waits => waiting.expect("the copy is waiting for the first attempt"),
+        answered = &mut copy => panic!("the copy was answered before the first attempt decided: {answered:?}"),
+    }
+    let_it_look_on
+        .send(())
+        .expect("the first attempt is waiting");
+    reached
+        .await
+        .expect("the first attempt has been admitted and has not claimed");
+    let told = failure(
+        copy.await
+            .expect("the copy ran")
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+
+    let_it_go_on.send(()).expect("the first attempt is waiting");
+    running
+        .await
+        .expect("the first attempt ran")
+        .expect("the call reaches the daemon")
+        .expect("project.init succeeds");
+    assert!(
+        host.work().join("made").exists(),
+        "the first attempt made the project"
+    );
+    let _ = host.stop().await;
+}
+
+/// KR-REQ-09.09: two copies of an action that no attempt is carrying out, both refused for a window
+/// their connections never issued, are both refused for it. Neither is told that the outcome is not
+/// known because of the other: the other carries nothing out either, and the action was never done.
+///
+/// The first copy is stopped at the end of its look for a record, so that the second reaches its
+/// refusal while the first has not decided, and the case lets it go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "this platform runs no Git, so the daemon refuses every repository operation this case needs"
+)]
+async fn two_copies_refused_for_their_window_at_once_are_not_told_the_outcome_is_unknown() {
+    let host = host().await;
+    let mut issuing = client(&host).await;
+    let original = composed(
+        &mut issuing,
+        host.environment_id,
+        Method::ProjectInit,
+        ActionId::new(kr_ipc::new_uuid()),
+        &ProjectInitParams {
+            destination: host.destination("made"),
+            label: "made".to_owned(),
+            initial_branch: Nullable::null(),
+        },
+    )
+    .await;
+    let (looked, let_it_look_on) = host.controller.pause_retained_lookup();
+    let mut second = client(&host).await;
+    let mut third = client(&host).await;
+    let one = {
+        let original = original.clone();
+        tokio::spawn(async move { second.repeat(&original).await })
+    };
+    looked
+        .await
+        .expect("the first copy has looked for a record");
+    let two = tokio::spawn(async move { third.repeat(&original).await });
+    let_it_look_on.send(()).expect("the first copy is waiting");
+
+    for answer in [one.await, two.await] {
+        let refused = failure(
+            answer
+                .expect("the copy ran")
+                .expect("the call reaches the daemon"),
+        );
+        assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    }
+    assert!(!host.work().join("made").exists(), "no copy made anything");
+    let _ = host.stop().await;
+}

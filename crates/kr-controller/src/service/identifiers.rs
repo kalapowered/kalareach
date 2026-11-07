@@ -22,6 +22,14 @@
 //! retry does. One daemon runs per environment, so memory is enough for the arrivals that are
 //! simultaneous, and the reads cover the ones that follow, a restart among them.
 //!
+//! The door also keeps what every arrival under one identifier is doing from the moment it has the
+//! mutation: it has not decided yet, it is carrying the action out, or it has been refused. A copy
+//! that is refused for its window, and finds no claim for its action, asks the others which of them
+//! may still carry the action out. That is a question of the arrivals that are running and of those
+//! that have not decided, and the copy waits for the latter to decide, so it is neither refused
+//! while a first attempt is about to claim, nor told that the outcome is not known because of
+//! another copy that is refused as well.
+//!
 //! What this does not cover: a mutation forwarded to a worker (a close, a prompt) is kept in that
 //! worker's journal, which the daemon does not read here; and four methods keep no record of their
 //! action and so spend no identifier (`organisation.policy.apply`, `membership.present`,
@@ -197,6 +205,49 @@ fn storage(error: impl std::fmt::Display) -> ControllerError {
     }
 }
 
+/// What the arrivals under one identifier, for one mutation, are doing.
+#[derive(Debug, Default)]
+struct Arrivals {
+    /// How many arrivals hold the identifier for the mutation.
+    arrivals: usize,
+    /// How many of them have neither started their effect nor been refused.
+    undecided: usize,
+    /// How many of them are carrying the action out.
+    running: usize,
+}
+
+/// The arrivals at the door, and what changes in them.
+#[derive(Debug, Default)]
+struct Door {
+    arrivals: Mutex<HashMap<(ActorId, ActionId, Digest256), Arrivals>>,
+    /// Woken when an arrival decides, or ends.
+    changed: tokio::sync::Notify,
+    /// Where this host's own tests are told that a copy is waiting for an arrival to decide. Armed
+    /// once, it fires once. Compiled only with the `testing` feature.
+    #[cfg(feature = "testing")]
+    a_copy_waits: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+/// Where an arrival stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    /// It has not started its effect and has not been refused.
+    Undecided,
+    /// It is carrying the action out.
+    Running,
+    /// It has been refused and carries nothing out.
+    Refused,
+}
+
+/// An arrival at the door, from the moment the door has its mutation until the arrival has ended,
+/// whatever it comes to.
+#[must_use = "the arrival is forgotten when this is dropped"]
+pub(super) struct Arrival {
+    door: Arc<Door>,
+    key: (ActorId, ActionId, Digest256),
+    stage: Stage,
+}
+
 /// The identifiers being performed: each with the digest of the mutation it is performed for and
 /// how many arrivals are performing it.
 type Held = HashMap<(ActorId, ActionId), (Digest256, usize)>;
@@ -206,6 +257,7 @@ type Held = HashMap<(ActorId, ActionId), (Digest256, usize)>;
 #[derive(Debug, Default)]
 pub(super) struct Performing {
     held: Arc<Mutex<Held>>,
+    door: Arc<Door>,
 }
 
 /// An identifier being performed, until the effect it was taken for has ended.
@@ -216,6 +268,39 @@ pub(super) struct Spending {
 }
 
 impl Performing {
+    /// Arms the signal that the next copy to wait for an arrival to decide gives. Returns the end
+    /// that says it is waiting.
+    #[cfg(feature = "testing")]
+    pub(super) fn notify_when_a_copy_waits(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (waiting, told) = tokio::sync::oneshot::channel();
+        *self
+            .door
+            .a_copy_waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(waiting);
+        told
+    }
+
+    /// Records an arrival under the identifier for the mutation whose digest this is.
+    fn arrive(&self, actor_id: &ActorId, action_id: ActionId, digest: Digest256) -> Arrival {
+        let key = (actor_id.clone(), action_id, digest);
+        {
+            let mut arrivals = self
+                .door
+                .arrivals
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let entry = arrivals.entry(key.clone()).or_default();
+            entry.arrivals += 1;
+            entry.undecided += 1;
+        }
+        Arrival {
+            door: Arc::clone(&self.door),
+            key,
+            stage: Stage::Undecided,
+        }
+    }
+
     /// Takes the identifier for the mutation whose digest this is, or says it is being performed
     /// for another.
     fn take(&self, actor_id: &ActorId, action_id: ActionId, digest: Digest256) -> Option<Spending> {
@@ -235,17 +320,108 @@ impl Performing {
     }
 }
 
-impl Spending {
-    /// Whether another arrival holds this identifier for the same mutation at this moment.
+impl Arrival {
+    /// Says that this arrival is going on to carry its action out.
+    pub(super) fn runs(&mut self) {
+        if self.stage != Stage::Undecided {
+            return;
+        }
+        {
+            let mut arrivals = self
+                .door
+                .arrivals
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = arrivals.get_mut(&self.key) {
+                entry.undecided -= 1;
+                entry.running += 1;
+            }
+        }
+        self.stage = Stage::Running;
+        self.door.changed.notify_waiters();
+    }
+
+    /// Says that this arrival is refused, waits until every other arrival under the identifier for
+    /// the same mutation has decided, and whether one of them is carrying the action out.
     ///
-    /// An arrival takes the identifier before it is admitted and holds it until its effect has
-    /// ended, so one that holds it may be about to write the claim of its action, or may be carrying
-    /// the action out. A copy that finds no claim while another holds the identifier cannot say that
-    /// nothing was done. It must ask before it reads the claim: one that asks after can find the
-    /// other arrival gone, with its claim written and settled in between.
-    pub(super) fn is_shared(&self) -> bool {
-        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        held.get(&self.key).is_some_and(|(_, count)| *count > 1)
+    /// It is asked by a copy that its window refuses and that finds no claim for its action. An
+    /// arrival that has not decided may be a first attempt about to write its claim, so the copy
+    /// waits for it: refused while the first attempt goes on to run, it would have a refusal the
+    /// host cannot stand behind, and told that the outcome is not known because of an arrival that
+    /// is refused as well, it would be told what is not so. An arrival decides without waiting for
+    /// anything this one holds, so the wait ends. It must be asked before the claim is read: asked
+    /// after, it can find the arrival that ran gone, its claim written and settled in between.
+    pub(super) async fn another_may_carry_it_out(&mut self) -> bool {
+        if self.stage == Stage::Undecided {
+            {
+                let mut arrivals = self
+                    .door
+                    .arrivals
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if let Some(entry) = arrivals.get_mut(&self.key) {
+                    entry.undecided -= 1;
+                }
+            }
+            self.stage = Stage::Refused;
+            self.door.changed.notify_waiters();
+        }
+        loop {
+            let changed = self.door.changed.notified();
+            tokio::pin!(changed);
+            // Registered before the arrivals are looked at, so a decision made between the look and
+            // the wait is not missed.
+            changed.as_mut().enable();
+            {
+                let arrivals = self
+                    .door
+                    .arrivals
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let Some(entry) = arrivals.get(&self.key) else {
+                    return false;
+                };
+                if entry.undecided == 0 {
+                    let own = usize::from(self.stage == Stage::Running);
+                    return entry.running > own;
+                }
+            }
+            #[cfg(feature = "testing")]
+            if let Some(waiting) = self
+                .door
+                .a_copy_waits
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                let _ = waiting.send(());
+            }
+            changed.await;
+        }
+    }
+}
+
+impl Drop for Arrival {
+    fn drop(&mut self) {
+        {
+            let mut arrivals = self
+                .door
+                .arrivals
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = arrivals.get_mut(&self.key) {
+                entry.arrivals -= 1;
+                match self.stage {
+                    Stage::Undecided => entry.undecided -= 1,
+                    Stage::Running => entry.running -= 1,
+                    Stage::Refused => {}
+                }
+                if entry.arrivals == 0 {
+                    arrivals.remove(&self.key);
+                }
+            }
+        }
+        self.door.changed.notify_waiters();
     }
 }
 
@@ -262,6 +438,26 @@ impl Drop for Spending {
 }
 
 impl Controller {
+    /// Records the arrival of a mutation at the local door, so that a copy that arrives on another
+    /// connection while this one looks for a retained answer or reads the other stores knows that
+    /// it is there: it may be the first attempt, about to write the claim of its action.
+    ///
+    /// Nothing is recorded for a method that keeps no record of its action here, or for a mutation
+    /// whose digest cannot be made, which the first admission refuses.
+    pub(super) fn arrive(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Option<Arrival> {
+        Domain::of(method)?;
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        Some(
+            self.identifiers_performing
+                .arrive(actor_id, mutation.action_id, digest),
+        )
+    }
+
     /// Checks that a first admission at the local door spends an identifier no other method of the
     /// same actor has spent, and takes the identifier for the effect.
     ///
