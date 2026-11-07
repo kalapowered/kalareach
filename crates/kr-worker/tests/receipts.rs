@@ -6102,7 +6102,8 @@ async fn a_reconnect_discards_unsent_keystrokes_rather_than_replaying_them() {
 /// lease with another identity, a later epoch and a sequence that starts again at zero. It takes
 /// the lease while the first connection still holds it, as a host that has not yet counted the
 /// first connection gone sees it, and the record is read in the answer to the acquisition and from
-/// the worker's own lease. When the first connection then goes, the lease still names the second.
+/// the worker's own lease. When the first connection then goes, and the worker has taken its
+/// attachment away, the lease still names the second and the second's first input is accepted.
 /// Not shown here: that the old stream's unsent keystrokes are discarded, which the case above
 /// shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6162,16 +6163,34 @@ async fn the_lease_names_the_connection_that_holds_it_and_a_reconnect_is_another
     );
     assert_eq!(lease_connection(&host), Some(second_connection));
 
-    // The first connection goes, and the lease it no longer holds still names the second.
+    // The first connection goes. The worker takes its attachment away when it handles the end of
+    // the connection, so the case waits until that attachment has left the table and only then
+    // reads the lease: a read taken before the worker has handled the end would show the second
+    // connection's lease whatever the end did to it.
     drop(first);
-    write_input(&mut second, &host, reattached, next.epoch, 0, b"b")
-        .await
-        .expect("the new stream's first position is accepted");
+    let gone = within(std::time::Duration::from_secs(120), || {
+        let session = host.service.runtime().session();
+        let attachments = session.attachments();
+        attachments
+            .iter()
+            .all(|summary| summary.attachment_id != attachment)
+            && attachments
+                .iter()
+                .any(|summary| summary.attachment_id == reattached)
+    })
+    .await;
+    assert!(
+        gone,
+        "the worker took the first connection's attachment away and kept the second's"
+    );
     assert_eq!(
         lease_connection(&host),
         Some(second_connection),
         "the first connection going leaves the lease with the second"
     );
+    write_input(&mut second, &host, reattached, next.epoch, 0, b"b")
+        .await
+        .expect("the new stream's first position is accepted once the first connection is gone");
 }
 
 async fn attach(client: &mut Client<impl Codec>, host: &Host) -> kr_protocol::ids::AttachmentId {
