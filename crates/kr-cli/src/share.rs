@@ -1767,7 +1767,13 @@ async fn answered_by_an_owner_device(
     loop {
         // A read the challenge's end cut short is the challenge running out, not a host that did
         // not answer: the host is asked about it every poll until then.
-        let listed = match crate::plugin::ask_before(deadline, pending()).await {
+        let listed = match crate::plugin::ask_before(
+            deadline,
+            crate::plugin::ListRead::TheAnswer,
+            pending(),
+        )
+        .await
+        {
             Ok(listed) => listed?,
             Err(_) if tokio::time::Instant::now() >= deadline => return Err(ran_out()),
             Err(ended) => return Err(ended),
@@ -2301,8 +2307,10 @@ mod tests {
     /// or a connection that fails, ends the command with nothing changed and the reason, with the
     /// status of a host that is not there; a challenge the host stops listing, or lists to its
     /// end unanswered, is one that ran out, and so is a read the challenge's end cuts short; the
-    /// wait ends at the challenge's end and not a pause later. The controls are a challenge an
-    /// owner device has answered and a refusal of the host's, which is its own.
+    /// wait ends at the challenge's end and not a pause later. A request the host's release cannot
+    /// read was not sent, and the wait ends with the host's own code and says which request it
+    /// was. The controls are a challenge an owner device has answered and a refusal of the host's,
+    /// which is its own.
     #[tokio::test(start_paused = true)]
     async fn the_wait_for_an_owner_device_to_confirm_a_transfer_ends_with_the_challenge_and_says_why()
      {
@@ -2435,6 +2443,29 @@ mod tests {
         };
         assert_eq!(unlisted.code(), ErrorCode::OwnerConfirmationRequired);
         assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        // A request the host's release cannot read is not written, and the connection stands: the
+        // wait ends with the host's own code, and says which request it was.
+        let unread = answered_by_an_owner_device(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            POLL_EVERY,
+            &request,
+            async || {
+                Err(CliError::Ipc(kr_ipc::IpcError::NotInLevel(
+                    "a request the level cannot read".to_owned(),
+                )))
+            },
+        )
+        .await;
+        let Err(unread) = unread else {
+            panic!("the request was not written");
+        };
+        assert_eq!(unread.code(), ErrorCode::UnsupportedCapability);
+        assert!(nothing_changed(&unread), "{unread}");
+        assert!(
+            unread.to_string().contains("the request for the list"),
+            "{unread}"
+        );
 
         // The controls.
         let live = tokio::time::Instant::now() + Duration::from_secs(60);

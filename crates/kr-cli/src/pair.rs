@@ -674,9 +674,13 @@ async fn issued<C>(
             kr_ipc::now_ms().get(),
         );
     let display = if wants_display {
-        crate::plugin::ask_before(deadline, pending(client))
-            .await?
-            .map(|listed| crate::plugin::display_in(listed, &challenge.request))
+        crate::plugin::ask_before(
+            deadline,
+            crate::plugin::ListRead::WhatIsShown,
+            pending(client),
+        )
+        .await?
+        .map(|listed| crate::plugin::display_in(listed, &challenge.request))
     } else {
         Ok(None)
     };
