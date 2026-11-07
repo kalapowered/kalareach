@@ -4,6 +4,8 @@
  * is heard look at the changes.
  */
 
+import { isInaccessible } from '@testing-library/react'
+
 /** The page's own mutations, kept from the moment `holder` is watched. */
 export function watched(holder: HTMLElement): { records: () => MutationRecord[]; stop: () => void } {
   const kept: MutationRecord[] = []
@@ -38,4 +40,15 @@ export function addedTo(region: HTMLElement, records: readonly MutationRecord[])
     .filter((record) => record.target === region)
     .flatMap((record) => Array.from(record.addedNodes))
     .map((node) => node.textContent ?? '')
+}
+
+/** The words a screen reader reads in `element`: its text, leaving out what is hidden from it. */
+export function readAloud(element: Element): string {
+  const read = (node: Node): string => {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? ''
+    if (!(node instanceof Element) || isInaccessible(node)) return ''
+    const inside = Array.from(node.childNodes).map(read).join('')
+    return node.tagName === 'P' ? `${inside} ` : inside
+  }
+  return read(element).replace(/\s+/g, ' ').trim()
 }

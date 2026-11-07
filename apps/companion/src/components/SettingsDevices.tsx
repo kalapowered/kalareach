@@ -17,7 +17,7 @@
  */
 
 import { useEffect, useRef, useState } from 'react'
-import type { ReactNode, RefObject } from 'react'
+import type { ReactElement, ReactNode, RefObject } from 'react'
 
 import type { DeviceMember, DevicesView } from '../host/port'
 import {
@@ -53,7 +53,7 @@ export function SettingsDevices({
   readonly busy: boolean
   readonly target: number
   /** What the last step of this card said, when it said anything. */
-  readonly said: string | null
+  readonly said: string | ReactElement | null
   /** The status line a finished step moves focus to. */
   readonly statusRef: RefObject<HTMLDivElement | null>
   readonly onLook: () => void

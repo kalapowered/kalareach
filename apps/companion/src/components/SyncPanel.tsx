@@ -29,7 +29,7 @@
  * the account panel's frame.
  */
 
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useRef, useState, type ReactElement, type ReactNode } from 'react'
 
 import {
   failureCode,
@@ -81,7 +81,8 @@ type Place = 'service' | 'settings' | 'devices' | 'recovery'
 /** What the last step said. */
 interface Said {
   readonly place: Place
-  readonly text: string
+  /** Words, or a sentence with an address in it, which a screen reader is told as words. */
+  readonly text: string | ReactElement
   /** Whether the backend refused what the person typed as unusable, so that the field is the one thing to mend. */
   readonly invalid: boolean
 }
@@ -280,7 +281,7 @@ export function SyncPanel({
    * sign-in, which the account card follows from the browser back to its own status line) moves
    * none.
    */
-  const step = (place: Place, work: () => Promise<string | null>, moveFocus = true) => {
+  const step = (place: Place, work: () => Promise<string | ReactElement | null>, moveFocus = true) => {
     setBusy(true)
     setSaid(null)
     let invalid = false
@@ -370,7 +371,13 @@ export function SyncPanel({
                 step('service', () =>
                   port.syncServiceSet(draft).then((next) => {
                     setChanging(false)
-                    return `This device now uses ${next.host} as its sync service.`
+                    return (
+                      <>
+                        This device now uses{' '}
+                        <ServiceAddress host={next.host} testId="sync-service-changed" /> as its sync
+                        service.
+                      </>
+                    )
                   })
                 )
               }}

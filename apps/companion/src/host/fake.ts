@@ -2440,10 +2440,15 @@ export function fakeHost(
     },
     pairingSetOrigin: (origin) => {
       const trimmed = origin.trim().replace(/\/$/, '')
-      if (!/^https:\/\/[a-z0-9.-]+(:[0-9]+)?$/.test(trimmed)) {
+      if (!/^https:\/\/([a-z0-9.-]+|\[[0-9a-f:]+\])(:[0-9]+)?$/.test(trimmed)) {
         refuse('INVALID_ARGUMENT', 'That is not a service this device can use.')
       }
-      const host = trimmed.slice('https://'.length).split(':')[0] ?? trimmed
+      // The host as the backend names it to a person: no scheme, no port, and no brackets round an
+      // IPv6 literal.
+      const authority = trimmed.slice('https://'.length)
+      const host = authority.startsWith('[')
+        ? authority.slice(1, authority.indexOf(']'))
+        : (authority.split(':')[0] ?? authority)
       publishPairing({
         origin: { origin: trimmed, host, is_default: trimmed === 'https://reach.kala.to' }
       })

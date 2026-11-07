@@ -14,6 +14,7 @@ import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
 import type { AttemptState, FailureKind, ConfirmationRequest } from '../src/host/port'
 import { failureWords } from '../src/pairing/words'
+import { heardIn, readAloud, regionsOf } from './live-regions'
 
 function start(initialPlace: Place = { view: 'pairing' }): { controls: FakeHostControls } {
   const { port, controls } = fakeHost()
@@ -634,6 +635,35 @@ describe('pairing with a host', () => {
     // A screen reader says the address as words, and does not read the written form.
     expect(isInaccessible(screen.getByText('pair dot example dot org'))).toBe(false)
     expect(isInaccessible(screen.getByTestId('pairing-service'))).toBe(true)
+    // So does the announcement that the service changed, and it is made once, without the dots.
+    const heard = regionsOf(document.body).flatMap(heardIn)
+    expect(heard).toEqual(['Codes now go through pair dot example dot org.'])
+    // The card on the screen shows the written address, and a screen reader moving to it reads the words.
+    const written = screen.getByText('Codes now go through pair.example.org.')
+    expect(isInaccessible(written)).toBe(true)
+    const card = written.closest<HTMLElement>('.toast')
+    expect(card).not.toBeNull()
+    if (card === null) return
+    expect(isInaccessible(within(card).getByText('Codes now go through pair dot example dot org.'))).toBe(false)
+  })
+
+  // The pairing service names its host to the page without brackets and without a port, so an IPv6
+  // service comes as bare groups of letters and colons.
+  it('says an IPv6 service as words, in the sentence and in the announcement', async () => {
+    start()
+    await userEvent.click(await screen.findByTestId('change-service'))
+    const input = await screen.findByTestId('service-input')
+    await userEvent.clear(input)
+    await userEvent.paste('https://[2001:db8::1]:8443')
+    await userEvent.click(screen.getByTestId('save-service'))
+    await waitFor(() => {
+      expect(screen.getByTestId('pairing-service').textContent).toBe('2001:db8::1')
+    })
+    const sentence = screen.getByTestId('pairing-service').closest('p')
+    expect(sentence).not.toBeNull()
+    if (sentence === null) return
+    expect(readAloud(sentence)).toBe('Codes go through 2001 colon db8 colon colon 1')
+    expect(regionsOf(document.body).flatMap(heardIn)).toEqual(['Codes now go through 2001 colon db8 colon colon 1.'])
   })
 })
 
