@@ -34,25 +34,50 @@ pub enum RootProcessError {
     /// The session has no published descriptor: the worker never published one, or the daemon has
     /// withdrawn it.
     NoDescriptor,
-    /// The descriptor's endpoint did not take the connection.
-    NotReached(String),
-    /// The worker was reached, or the descriptor could not be used, and a step after that failed:
-    /// the runtime directory is not read, the worker does not answer the descriptor's challenge,
-    /// refuses the snapshot, or the answer does not decode.
+    /// The connection to the worker could not be made, or ended before the worker had answered: a
+    /// socket that failed or a peer that closed, at any step of the exchange. It is what a worker
+    /// that ends while it is read looks like from here, and it says nothing of what the worker
+    /// would have answered.
+    Gone(String),
+    /// Anything else: the runtime directory is not read, or the worker, reached, refuses a step,
+    /// answers one in a shape that is not the protocol's, names another identity than its
+    /// descriptor's, or gives an answer that does not decode.
     Failed(String),
+}
+
+/// Whether an error of a connection is the connection failing, as opposed to the peer answering
+/// wrongly: a socket that failed, a peer that closed, a frame the stream ended in the middle of.
+fn the_connection_failed(error: &kr_ipc::IpcError) -> bool {
+    matches!(
+        error,
+        kr_ipc::IpcError::Socket { .. }
+            | kr_ipc::IpcError::PeerClosed
+            | kr_ipc::IpcError::TruncatedFrame { .. }
+    )
+}
+
+/// What an error of `step` of the exchange with a worker says: the connection ending, or the worker
+/// answering wrongly.
+fn at_step(step: &str, error: &kr_ipc::IpcError) -> RootProcessError {
+    let said = format!("{step}: {error:?}");
+    if the_connection_failed(error) {
+        RootProcessError::Gone(said)
+    } else {
+        RootProcessError::Failed(said)
+    }
 }
 
 /// The session's root shell as its worker reports it now, by the identity it was started under, or
 /// nothing when the worker reports none. The worker is reached on a connection of its own, through
-/// its descriptor, as a command would. The error says which step failed: a session with no
-/// published descriptor and an endpoint that does not take the connection are the two ways a
-/// worker that has ended shows, and every other step failing is the worker or the answer being
-/// wrong.
+/// its descriptor, as a command would. The error says what the read met: a session with no
+/// published descriptor, and a connection that could not be made or ended before it was answered
+/// (whichever step it ended at), are what a worker that has ended shows; everything else is the
+/// worker or its answer being wrong.
 pub async fn root_process_of(
     environment: &kr_ipc::paths::EnvironmentPaths,
     session_id: kr_protocol::ids::SessionId,
 ) -> Result<Option<kr_protocol::identity::ProcessStartIdentity>, RootProcessError> {
-    use RootProcessError::{Failed, NoDescriptor, NotReached};
+    use RootProcessError::{Failed, NoDescriptor};
     let descriptor = kr_ipc::descriptor::read_all(environment)
         .map_err(|error| Failed(format!("the runtime directory is not read: {error:?}")))?
         .into_iter()
@@ -63,12 +88,11 @@ pub async fn root_process_of(
         .map_err(|error| Failed(format!("the descriptor's endpoint: {error:?}")))?;
     let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
         .await
-        .map_err(|error| NotReached(format!("{error:?}")))?;
-    client.verify_worker(&descriptor).await.map_err(|error| {
-        Failed(format!(
-            "the worker does not answer the descriptor's challenge: {error:?}"
-        ))
-    })?;
+        .map_err(|error| at_step("the connection and its hello", &error))?;
+    client
+        .verify_worker(&descriptor)
+        .await
+        .map_err(|error| at_step("the descriptor's challenge", &error))?;
     let snapshot: kr_protocol::recovery::EventsSnapshotResult = client
         .request(
             kr_protocol::method::Method::EventsSnapshot,
@@ -78,7 +102,7 @@ pub async fn root_process_of(
             },
         )
         .await
-        .map_err(|error| Failed(format!("the snapshot call is not answered: {error:?}")))?
+        .map_err(|error| at_step("the snapshot call", &error))?
         .map_err(|error| Failed(format!("the worker refuses the snapshot: {error:?}")))?
         .to_typed()
         .map_err(|error| Failed(format!("the snapshot is not decoded: {error:?}")))?;

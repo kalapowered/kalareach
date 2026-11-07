@@ -146,12 +146,14 @@ async fn opened(
 /// The root shell the closure names is the one the worker reported before the closure. The worker
 /// is asked again, with the terminal still attached; then the terminal is let go, and the root
 /// shell and the worker are each gone. A worker that answered names no other root shell than the
-/// first. One that could not be reached (the daemon withdraws a closed session's descriptor at the
-/// end of its closure, and the worker ends once the terminal is let go) says nothing, and is
-/// accepted as unreachable only once the kernel has shown it ended; a worker that is reached and
-/// then fails or answers wrongly fails the case. A second session is opened and closed, and the
-/// daemon lists exactly the two sessions, both closed, the first with the display number it had and
-/// the second with a number of its own.
+/// first. One that could not be read (the daemon withdraws a closed session's descriptor at the end
+/// of its closure, and the worker ends by itself once the closure has been delivered or after its
+/// notice timeout, so the read can meet it at any point of its ending) says nothing, and is
+/// accepted as unread only once the kernel has shown it ended: that is no descriptor, or a
+/// connection that could not be made or ended before it was answered. A worker that is reached and
+/// then refuses, names another identity or answers wrongly fails the case. A second session is
+/// opened and closed, and the daemon lists exactly the two sessions, both closed, the first with
+/// the display number it had and the second with a number of its own.
 async fn nothing_started_the_closed_session_again(
     host: &WorkerHost,
     (session, terminal, worker, root): (
@@ -190,10 +192,10 @@ async fn nothing_started_the_closed_session_again(
             now.as_ref().is_none_or(|reported| *reported == root),
             "no other shell took the root's place: the worker reports {now:?}, the session started with {root:?}"
         ),
-        // The daemon had withdrawn the descriptor, or the endpoint took no connection, and the
-        // kernel has now shown the worker ended. The read said nothing then, and the kernel's word
-        // above is all this case holds of the root shell.
-        Err(RootProcessError::NoDescriptor | RootProcessError::NotReached(_)) => {}
+        // The daemon had withdrawn the descriptor, or the connection could not be made or ended
+        // before it was answered, and the kernel has now shown the worker ended. The read said
+        // nothing then, and the kernel's word above is all this case holds of the root shell.
+        Err(RootProcessError::NoDescriptor | RootProcessError::Gone(_)) => {}
         Err(RootProcessError::Failed(why)) => {
             panic!("the worker was asked for its root shell again and the exchange failed: {why}")
         }
