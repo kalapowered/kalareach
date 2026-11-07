@@ -1336,6 +1336,114 @@ async fn a_step_that_could_not_be_written_is_taken_by_the_next_finish() {
     assert_eq!(pair.b.group().machine_id, into);
 }
 
+/// KR-REQ-23.24, the client's half: an action whose outcome the environment cannot establish is not
+/// sent again under a new action by `finish` itself. B's step was not written, and B then cannot
+/// look up its receipts, so its answer to the step's action is an outcome nobody knows while its
+/// record shows nothing applied. `finish` stops with that action and the record B shows, leaves the
+/// step `sent` under the same action and exits with `OUTCOME_UNKNOWN`; a flag that names an action
+/// no step waits under sends nothing; and only `finish --after-unknown` with the action the person
+/// was shown sends the step again, as a new action that names the earlier one and the revision of
+/// the record shown. Once B can read its receipts, the step is taken, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_step_whose_outcome_the_environment_cannot_establish_is_sent_again_only_when_the_person_asks()
+ {
+    let pair = Pair::start().await;
+    let (shared, into, started) = merge_with_b_answer_lost(&pair, |b| {
+        b.controller.fail_the_next_machine_write();
+    });
+    assert_eq!(started["steps"][1]["state"], "sent", "{started}");
+    let first = text(&started["steps"][1]["action_id"]);
+    assert_eq!(
+        pair.b.group().machine_id,
+        shared.machine_id,
+        "nothing was written"
+    );
+    let shown = pair.b.group();
+
+    let database = pair.b.temp.environment().registry_database();
+    let renamed = |from: &str, to: &str| {
+        let connection = rusqlite::Connection::open(&database).expect("opens B's registry");
+        connection
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .expect("waits");
+        connection
+            .execute_batch(&format!("ALTER TABLE {from} RENAME TO {to};"))
+            .expect("renames the table");
+    };
+    renamed("authority_receipts", "authority_receipts_aside");
+
+    // The step is asked about again and the environment cannot say: nothing new is sent.
+    let (status, stopped) = pair
+        .a
+        .kr_json(Some(pair.bridges.path()), &["host", "machine", "finish"]);
+    assert_eq!(status, Some(1), "{stopped}");
+    assert_eq!(stopped["code"], "OUTCOME_UNKNOWN", "{stopped}");
+    assert_eq!(stopped["steps"][1]["state"], "sent", "{stopped}");
+    assert_eq!(
+        text(&stopped["steps"][1]["action_id"]),
+        first,
+        "no new action was made for the step: {stopped}"
+    );
+    let said = text(&stopped["message"]);
+    assert!(said.contains(&first), "the stop names the action: {said}");
+    assert!(
+        said.contains(&format!("--after-unknown {first}")),
+        "and the command that sends the step again: {said}"
+    );
+    assert!(
+        said.contains(&format!("revision {}", shown.revision)),
+        "and the record B shows: {said}"
+    );
+    assert_eq!(stopped["kept"], Value::Bool(true), "{stopped}");
+
+    // An action no step waits under is not one the person was shown.
+    let elsewhere = pair.at_a_failing(&[
+        "host",
+        "machine",
+        "finish",
+        "--after-unknown",
+        &kr_ipc::new_uuid().to_string(),
+    ]);
+    assert_eq!(elsewhere["code"], "INVALID_ARGUMENT", "{elsewhere}");
+
+    // The person asks for it: the step is sent again as a new action that names the earlier one.
+    let (status, asked) = pair.a.kr_json(
+        Some(pair.bridges.path()),
+        &["host", "machine", "finish", "--after-unknown", &first],
+    );
+    assert_eq!(status, Some(1), "{asked}");
+    let second = text(&asked["steps"][1]["action_id"]);
+    assert_ne!(
+        second, first,
+        "a new action was made at the person's request: {asked}"
+    );
+    let kept = std::fs::read(pair.a.plan_file()).expect("the plan");
+    let holds = |needle: &[u8]| kept.windows(needle.len()).any(|window| window == needle);
+    assert!(
+        holds(b"supersedes_action_id") && holds(&uuid_bytes(&first)),
+        "the new request names the earlier action"
+    );
+    assert!(
+        holds(b"supersedes_revision"),
+        "and the revision of the record shown"
+    );
+
+    renamed("authority_receipts_aside", "authority_receipts");
+    let finished = pair.at_a(&["host", "machine", "finish"]);
+    assert_eq!(finished["steps"][1]["state"], "done", "{finished}");
+    assert_eq!(finished["kept"], Value::Bool(false), "{finished}");
+    assert_eq!(pair.b.group().machine_id, into);
+}
+
+/// The bytes of an action identity, as the plan file keeps them.
+fn uuid_bytes(text: &str) -> Vec<u8> {
+    let digits: String = text.chars().filter(|each| *each != '-').collect();
+    (0..digits.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&digits[at..at + 2], 16).expect("hexadecimal"))
+        .collect()
+}
+
 /// KR-REQ-03.07: one command at a time works on the plan. While another holds it, `merge --from`,
 /// `finish` and `undo` each refuse and send nothing, and `plan`, which reads a file that is always
 /// whole, is answered; once it is let go the same command goes through.
