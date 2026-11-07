@@ -4433,6 +4433,7 @@ async fn two_copies_refused_for_their_window_at_once_are_not_told_the_outcome_is
     )
     .await;
     let (looked, let_it_look_on) = host.controller.pause_retained_lookup();
+    let waits = host.controller.notify_when_a_copy_waits();
     let mut second = client(&host).await;
     let mut third = client(&host).await;
     let one = {
@@ -4442,7 +4443,13 @@ async fn two_copies_refused_for_their_window_at_once_are_not_told_the_outcome_is
     looked
         .await
         .expect("the first copy has looked for a record");
-    let two = tokio::spawn(async move { third.repeat(&original).await });
+    let mut two = tokio::spawn(async move { third.repeat(&original).await });
+    // The second copy is refused for its window and waits for the first to decide: it is either
+    // waiting or answered, and an answer now would be one given while the first had not decided.
+    tokio::select! {
+        waiting = waits => waiting.expect("the second copy is waiting for the first"),
+        answered = &mut two => panic!("the second copy was answered before the first decided: {answered:?}"),
+    }
     let_it_look_on.send(()).expect("the first copy is waiting");
 
     for answer in [one.await, two.await] {
