@@ -317,6 +317,10 @@ final class LockScreenControlsTests: XCTestCase {
             controls.remove()
         }
         let writing = DispatchGroup()
+        // The writer does not go on past its first change until the reader has read it, so it cannot
+        // finish before the reader has made one reading of a call that shows something. The wait's
+        // limit only keeps a reader that never reads from holding the suite.
+        let firstReading = DispatchSemaphore(value: 0)
         writing.enter()
         DispatchQueue.global().async {
             for turn in 0..<20_000 {
@@ -325,6 +329,7 @@ final class LockScreenControlsTests: XCTestCase {
                     pauseOffered: !muted,
                     info: NowPlaying(title: LockScreenControls.title, playbackRate: muted ? 0 : 1)
                 )
+                if turn == 0 { _ = firstReading.wait(timeout: .now() + 60) }
             }
             writing.leave()
         }
@@ -334,6 +339,7 @@ final class LockScreenControlsTests: XCTestCase {
             let reading = SystemRemoteControls.reading()
             guard reading.title != nil else { continue }
             readings += 1
+            if readings == 1 { firstReading.signal() }
             if reading.pauseOffered != (reading.rate == 1), apart == nil { apart = reading }
         }
         XCTAssertGreaterThan(readings, 0, "the reader read while the writer wrote")
