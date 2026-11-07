@@ -101,9 +101,11 @@ mod window {
         let mut worker = Some(worker);
         // A test context: on macOS the library already embeds the application's Info.plist, and a
         // second copy is a duplicate symbol. With no capability of its own, the context takes the
-        // application's, so the page is allowed what the interface is and nothing more. Its icons
-        // are the application's too, the macOS one included: the context writes a file for each,
-        // and the files are then the ones the library's context wrote before this program was built.
+        // application's, so the page is allowed what the interface is and nothing more. On macOS
+        // its icons are the application's too, the icns included: the context writes a file for
+        // each, and the files are then the ones the library's context wrote before this program was
+        // built. On Windows the configuration lists no icon of the `.ico` kind that the library's
+        // window icon is, so the window icon is the png, a file only this program reads.
         let app = tauri::Builder::default()
             // The application's own state, as the publisher finds it when its connection ends.
             .manage(companion_tauri::AppState::new())
