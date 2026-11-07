@@ -34,7 +34,7 @@ use kr_crypto::backup::{
     read_descriptor,
 };
 use kr_crypto::kdf::RecoverySeed;
-use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
+use kr_crypto::keys::{AuthorisationKeyPair, DeviceKeys, StoredEnvelopeKeyPair};
 use kr_protocol::archive::RecoveryContext;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
@@ -281,6 +281,12 @@ struct Owner {
 impl Owner {
     /// A device holding its settings object, on an account whose backup storage is on.
     fn new() -> Self {
+        Self::holding(DeviceKeys::generate().expect("a device's keys"))
+    }
+
+    /// As [`Self::new`], for the device whose keys are `keys`: its authorisation key is the owner's
+    /// and the writer's, and its stored-envelope key is the producer's.
+    fn holding(keys: DeviceKeys) -> Self {
         let web = Arc::new(ServiceWeb::new());
         web.set_backup(true);
         let sync_disk = tempfile::tempdir().expect("a directory on the internal disk");
@@ -303,9 +309,9 @@ impl Owner {
         Self {
             bundles: Bundles::beside(&web),
             web,
-            device: Device::generate(),
+            device: Arc::new(Device(keys.authorisation)),
             seed: RecoverySeed::generate().expect("a seed"),
-            producer: StoredEnvelopeKeyPair::generate().expect("a producer key"),
+            producer: keys.stored_envelope,
             store,
             settings,
             bundle_disk: tempfile::tempdir().expect("a directory on the internal disk"),
@@ -539,6 +545,423 @@ async fn the_settings_go_out_as_an_archive_and_come_back_with_only_the_kit() {
     assert_eq!(
         fresh.object(owner.settings.object_id).expect("readable"),
         Some(owner.settings.clone())
+    );
+}
+
+/// The forms in which a document could carry `key`, as the bytes to look for in it: the bytes
+/// themselves and their hexadecimal in either case; and base64 in either alphabet, which puts three
+/// bytes in four characters, so that the characters standing for the key's whole groups of three are
+/// the same wherever the key lies in a longer value. Which groups those are depends on where the key
+/// starts, so each of the three ways it can start is looked for.
+fn forms_of(key: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let hex = |upper: bool| -> Vec<u8> {
+        key.iter()
+            .map(|byte| {
+                if upper {
+                    format!("{byte:02X}")
+                } else {
+                    format!("{byte:02x}")
+                }
+            })
+            .collect::<String>()
+            .into_bytes()
+    };
+    let mut forms = vec![
+        ("as bytes".to_owned(), key.to_vec()),
+        ("in lower-case hexadecimal".to_owned(), hex(false)),
+        ("in upper-case hexadecimal".to_owned(), hex(true)),
+    ];
+    for start in 0..3 {
+        let whole = &key[start..start + (key.len() - start) / 3 * 3];
+        let url = kr_protocol::scalars::to_base64url(whole);
+        forms.push((
+            format!("in base64url from its byte {start}"),
+            url.clone().into_bytes(),
+        ));
+        forms.push((
+            format!("in base64 from its byte {start}"),
+            url.replace('-', "+").replace('_', "/").into_bytes(),
+        ));
+    }
+    forms
+}
+
+/// How `key` is carried in `haystack`, in a form [`forms_of`] names or as serde writes a list of
+/// bytes, a list of numbers, with any space between its items; nothing when it is not.
+fn carried_in(haystack: &[u8], key: &[u8]) -> Option<String> {
+    let found = |needle: &[u8], haystack: &[u8]| {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    };
+    if let Some((form, _)) = forms_of(key)
+        .into_iter()
+        .find(|(_, needle)| found(needle, haystack))
+    {
+        return Some(form);
+    }
+    let compact: Vec<u8> = haystack
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let numbers = key
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+        .into_bytes();
+    found(&numbers, &compact).then(|| "as a list of numbers".to_owned())
+}
+
+/// Every key of `kept` that is carried in an object of `clear`, as the object's label and the key's
+/// name with the form. Each object is read on its own.
+fn carried_keys(clear: &[(String, Vec<u8>)], kept: &[(String, Vec<u8>)]) -> Vec<String> {
+    let mut found = Vec::new();
+    for (label, bytes) in clear {
+        for (name, key) in kept {
+            if let Some(form) = carried_in(bytes, key) {
+                found.push(format!("{label} holds the {name} {form}"));
+            }
+        }
+    }
+    found
+}
+
+/// The private keys a device keeps, as their bytes with a name: the four seeds, and the private
+/// keys of the two X25519 pairs, which are made from their seeds by a hash (the first half of the
+/// seed's SHA-512, which is what libsodium's `crypto_box_seed_keypair` makes of it) and are checked
+/// here against the public key the pair has.
+fn private_keys_of(keys: &DeviceKeys) -> Vec<(String, Vec<u8>)> {
+    use kr_crypto::store::{MemoryStore, SecretName, SecretStore as _, store_device_keys};
+    use kr_protocol::pairing::KeyPurpose;
+    use sha2::Digest as _;
+
+    // The seeds are read from a store they are written to, as the device's own are.
+    let store = MemoryStore::new();
+    store_device_keys(&store, "device", keys).expect("the keys are stored");
+    let mut kept = Vec::new();
+    for (purpose, public) in [
+        (KeyPurpose::Transport, None),
+        (KeyPurpose::Authorisation, None),
+        (
+            KeyPurpose::StoredEnvelope,
+            Some(*keys.stored_envelope.public().as_bytes()),
+        ),
+        (
+            KeyPurpose::NotificationPreview,
+            Some(*keys.notification_preview.public().as_bytes()),
+        ),
+    ] {
+        let name = SecretName::device_key("device", purpose).expect("a name");
+        let seed = store
+            .get(&name)
+            .expect("the store reads")
+            .unwrap_or_else(|| panic!("the store kept a {purpose:?} key"))
+            .expose()
+            .to_vec();
+        kept.push((format!("{purpose:?} seed"), seed.clone()));
+        if let Some(public) = public {
+            let secret = sha2::Sha512::digest(&seed)[..32].to_vec();
+            let derived = aws_lc_rs::agreement::PrivateKey::from_private_key(
+                &aws_lc_rs::agreement::X25519,
+                &secret,
+            )
+            .expect("an X25519 private key")
+            .compute_public_key()
+            .expect("its public key");
+            assert_eq!(
+                derived.as_ref(),
+                public.as_slice(),
+                "the {purpose:?} private key is the first half of its seed's hash"
+            );
+            kept.push((format!("{purpose:?} private key (derived)"), secret));
+        }
+    }
+    assert_eq!(kept.len(), 6, "four seeds and two keys made from them");
+    for (name, key) in &kept {
+        assert!(key.len() >= 32, "the {name} is a key, not a stub");
+    }
+    kept
+}
+
+/// The manifest object of a generation as `reader` decrypts it, whole: `open_archive` hands out the
+/// signed manifest and keeps the member key wraps, so a scan of everything the object holds opens
+/// it here, under the context `open_archive` checks the manifest key's wrap against.
+fn manifest_payload_as(
+    reader: &ArchiveReader<'_>,
+    sender: &kr_protocol::scalars::StoredEnvelopeKey,
+    descriptor: &kr_protocol::archive::ArchiveDescriptor,
+    encrypted_manifest: &[u8],
+) -> kr_protocol::archive::ManifestPayload {
+    use kr_protocol::archive::{
+        KeyWrapContext, KeyWrapFormat, KeyWrapPurpose, MANIFEST_PAYLOAD_LIMITS,
+    };
+
+    let reader_key_id = reader.key_id();
+    let wrap = kr_crypto::archive::manifest_wrap_for(descriptor, &reader_key_id)
+        .expect("a manifest key wrap addressed to the reader");
+    let expected = KeyWrapContext {
+        format: KeyWrapFormat::V1,
+        purpose: KeyWrapPurpose::ManifestKey,
+        archive_id: descriptor.archive_id,
+        backup_generation: descriptor.backup_generation,
+        object_id: descriptor.encrypted_manifest.object_id,
+        encrypted_object_hash: descriptor.encrypted_manifest.encrypted_object_hash,
+        sender_key_id: kr_crypto::backup::recipient_key_id(sender),
+        recipient_key_id: reader_key_id,
+    };
+    let key = match reader {
+        ArchiveReader::Device(keys) => {
+            kr_crypto::archive::unwrap_object_key(keys, sender, wrap, &expected)
+        }
+        ArchiveReader::Recovery(recovery) => {
+            kr_crypto::archive::unwrap_object_key_with_recovery(recovery, sender, wrap, &expected)
+        }
+    }
+    .expect("the manifest key opens");
+    let plaintext = kr_crypto::archive::decrypt_object(
+        &key,
+        &descriptor.encrypted_manifest,
+        encrypted_manifest,
+    )
+    .expect("the manifest object decrypts");
+    kr_cbor::from_canonical_slice(plaintext.expose(), &MANIFEST_PAYLOAD_LIMITS)
+        .expect("a manifest payload")
+}
+
+/// The manifest object's payload in the two encodings a scan reads it in: the canonical bytes it was
+/// sealed as, and the JSON a client sees.
+fn payload_encodings(payload: &kr_protocol::archive::ManifestPayload) -> Vec<(String, Vec<u8>)> {
+    vec![
+        (
+            "the manifest object as canonical bytes".to_owned(),
+            kr_cbor::to_canonical_vec(payload).expect("a payload encodes"),
+        ),
+        (
+            "the manifest object as JSON".to_owned(),
+            serde_json::to_vec(payload).expect("a payload encodes"),
+        ),
+    ]
+}
+
+/// KR-REQ-20.17, the settings archive producer only, and only what this case reads: the bundle, the
+/// descriptor, the manifest object and every request the producer sends the service hold none of
+/// the private keys of the device that makes the archive. That device keeps four keys (transport,
+/// which is the reusable endpoint key; authorisation, which is the control-signing key and here the
+/// writer's; stored envelope, here the producer's; and notification preview). The case reads the
+/// four seeds, and the private keys of the two X25519 pairs, checked against their public keys. It
+/// reads, each on its own: the recovery bundle the service holds, opened with the kit's seed alone,
+/// as the JSON a client sees and as canonical bytes; the publication as the service holds it, with
+/// its descriptor, its writer's key identifier, its time and its signature; the descriptor as
+/// canonical bytes; the manifest object decrypted whole, as a `ManifestPayload`, with the signed
+/// manifest and every member key wrap (the sealed keys and the clear context fields of the wraps
+/// among them, so an unused wrap is read too), once as canonical bytes and once as JSON; the
+/// settings member's plaintext; and every request sent to the storage and manifest services, each
+/// body, the content beside it and the account token. Each key is looked for as bytes, in
+/// hexadecimal of either case, in either base64 alphabet wherever it lies in a longer value, and as
+/// a list of numbers. The controls are the scan finding a key where one is put, in the sealed key of
+/// an unused wrap and in a clear context field of one, in both encodings of the payload; the
+/// writer's public key in the bundle; the writer's key identifier in the publication; and the
+/// manifest object's ciphertext in the contents sent. Not shown here: the bundle's ciphertext as
+/// the owner's sync service holds it and the stored bytes of the objects, which are read only as
+/// the ciphertext sent (a key sealed inside them is read through the opened bundle and archive); a
+/// key in a binary list of integers, split, reversed or otherwise transformed; the seed of the
+/// recovery kit, which is not an endpoint or a control key; or the other data paths of backup and
+/// recovery material.
+#[tokio::test]
+async fn the_settings_archive_holds_none_of_the_private_keys_the_device_keeps() {
+    let keys = DeviceKeys::generate().expect("a device's keys");
+    let kept = private_keys_of(&keys);
+    let owner = Owner::holding(keys);
+    let archive = owner
+        .enable()
+        .await
+        .expect("the settings writer is enabled");
+    owner
+        .back_up(&archive, 1)
+        .await
+        .expect("the settings are backed up");
+    let archive_text = archive_id().to_string();
+
+    // The bundle the service holds, opened with the kit's seed alone.
+    let sealed = {
+        let held = owner.bundles.held.lock().expect("the bundles");
+        assert_eq!(held.len(), 1, "one bundle");
+        held.values().next().expect("a bundle").1.clone()
+    };
+    let key = owner
+        .seed
+        .bundle_key_for(&Owner::context())
+        .expect("the bundle's key");
+    let bundle = kr_crypto::archive::decrypt_recovery_bundle(&key, &sealed)
+        .expect("the kit's seed opens the bundle");
+    assert!(
+        bundle
+            .collections
+            .iter()
+            .any(|collection| collection.archive_id == archive_id()),
+        "the bundle names the settings collection"
+    );
+
+    // The publication as the service holds it, and the descriptor in it.
+    let publication = owner
+        .web
+        .publication(&archive_text, 1)
+        .expect("the service holds the publication");
+    let held: kr_protocol::archive::BackupGenerationPublication =
+        serde_json::from_value(publication.clone()).expect("a publication");
+    let descriptor_bytes =
+        kr_cbor::to_canonical_vec(&held.payload.descriptor).expect("a descriptor encodes");
+    let descriptor = read_descriptor(&descriptor_bytes).expect("a descriptor");
+
+    // The manifest object, whole, and the member, opened with the kit's seed alone.
+    let encrypted_manifest = owner
+        .web
+        .stored(
+            &archive_text,
+            &descriptor.encrypted_manifest.object_id.to_string(),
+        )
+        .expect("the service holds the manifest object");
+    let recovery = owner.seed.recipient().expect("the recovery recipient");
+    let reader = ArchiveReader::Recovery(&recovery);
+    let sender = *owner.producer.public();
+    let trusted: Vec<_> = bundle.trusted_writers.iter().cloned().collect();
+    let opened = open_archive(
+        &reader,
+        &sender,
+        &trusted,
+        &ArchiveExpectation {
+            archive_id: archive_id(),
+            generation: GenerationExpectation::Unverified,
+        },
+        &descriptor_bytes,
+        &encrypted_manifest,
+    )
+    .expect("the archive opens against the bundle's writer");
+    let payload = manifest_payload_as(&reader, &sender, &descriptor, &encrypted_manifest);
+    assert_eq!(
+        &payload.manifest,
+        opened.manifest(),
+        "the payload read here is the manifest the archive opened"
+    );
+    let [member] = opened.objects() else {
+        panic!("one member");
+    };
+    let member_bytes = owner
+        .web
+        .stored(&archive_text, &member.object.object_id.to_string())
+        .expect("the service holds the member");
+    let settings = opened
+        .restore_object(&reader, &sender, member.object.object_id, &member_bytes)
+        .expect("the member restores");
+
+    // Every request the producer sent: the document, the content beside it, the token.
+    let mut sent = Vec::new();
+    for (at, arrived) in owner.web.arrived().iter().enumerate() {
+        let to = format!("request {at} to {}", arrived.path);
+        sent.push((
+            format!("the body of {to}"),
+            serde_json::to_vec(&arrived.body).expect("a body encodes"),
+        ));
+        if let Some(content) = &arrived.content {
+            sent.push((format!("the content of {to}"), content.clone()));
+        }
+        if let Some(token) = &arrived.token {
+            sent.push((format!("the token of {to}"), token.clone().into_bytes()));
+        }
+    }
+
+    // The controls: the scan finds a key where one is put, in the unused wrap of the manifest
+    // object (its sealed key and a clear context field, in both encodings), and reads the bundle,
+    // the publication and what was sent.
+    let (_, probe) = &kept[0];
+    for (form, needle) in forms_of(probe) {
+        let document = [b"{\"a\":\"".as_slice(), &needle, b"\"}"].concat();
+        assert!(
+            carried_in(&document, probe).is_some(),
+            "the scan misses a key {form}"
+        );
+    }
+    let list = format!(
+        "{{\"k\":[\n  {}\n]}}",
+        probe
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",\n  ")
+    )
+    .into_bytes();
+    assert_eq!(
+        carried_in(&list, probe).as_deref(),
+        Some("as a list of numbers")
+    );
+    let wraps = &payload.member_key_wraps;
+    assert!(!wraps.is_empty(), "the manifest object holds wraps");
+    let probe_hash: [u8; 32] = probe.as_slice().try_into().expect("a 32-byte seed");
+    for (where_, in_the_sealed_key) in [
+        ("the sealed key of an unused wrap", true),
+        ("a clear context field of an unused wrap", false),
+    ] {
+        let mut planted = payload.clone();
+        let mut unused = wraps[0].clone();
+        if in_the_sealed_key {
+            unused.ciphertext = kr_protocol::scalars::Bytes::new(probe.clone());
+        } else {
+            unused.context.encrypted_object_hash =
+                kr_protocol::scalars::Digest256::from_bytes(probe_hash);
+        }
+        planted.member_key_wraps.push(unused);
+        assert_eq!(
+            carried_keys(&payload_encodings(&planted), &kept[..1]).len(),
+            2,
+            "the scan of the manifest object misses a key in {where_}"
+        );
+    }
+    assert_eq!(
+        carried_keys(&payload_encodings(&payload), &kept[..1]).len(),
+        0,
+        "the unplanted payload carries the key the controls plant"
+    );
+    let bundle_json = serde_json::to_vec(&bundle).expect("a bundle encodes");
+    assert!(
+        carried_in(&bundle_json, owner.device.0.public().as_bytes()).is_some(),
+        "the scan does not read the writer's key in the bundle"
+    );
+    let publication = serde_json::to_vec(&publication).expect("a publication encodes");
+    assert!(
+        carried_in(&publication, owner.device.0.key_id().as_bytes()).is_some(),
+        "the scan does not read the publication's writer"
+    );
+    let manifest_object = &encrypted_manifest;
+    assert!(
+        sent.iter().any(|(_, bytes)| bytes
+            .windows(manifest_object.len())
+            .any(|window| window == manifest_object.as_slice())),
+        "the scan does not read the contents sent"
+    );
+
+    // Everything the archive is, each read on its own.
+    let mut clear = vec![
+        ("the bundle as JSON".to_owned(), bundle_json),
+        (
+            "the bundle as canonical bytes".to_owned(),
+            kr_cbor::to_canonical_vec(&bundle).expect("a bundle encodes"),
+        ),
+        ("the publication the service holds".to_owned(), publication),
+        ("the descriptor".to_owned(), descriptor_bytes),
+        (
+            "the settings member".to_owned(),
+            settings.plaintext.expose().to_vec(),
+        ),
+    ];
+    clear.extend(payload_encodings(&payload));
+    clear.extend(sent);
+    assert_eq!(
+        carried_keys(&clear, &kept),
+        Vec::<String>::new(),
+        "something the settings archive makes or sends holds a private key the device keeps"
     );
 }
 
