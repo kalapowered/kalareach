@@ -451,6 +451,50 @@ impl ProjectModule {
         }
     }
 
+    /// Says what an exact repeat of a project action is owed when the window it carries is not one
+    /// this connection issued, if this service holds anything for its action.
+    ///
+    /// [`Self::retained`] answers a settled action and has nothing for one whose claim is open,
+    /// which is an action whose first attempt is still carrying it out, or ended without recording
+    /// what it did. Such an action is not a first one, so a window that admits nothing is no reason
+    /// to refuse it: that refusal is definite, and a client takes it for the host's word that
+    /// nothing was done. The repeat is told that what became of the action is not known yet, and
+    /// asks again under the same identifier. A claim the first attempt settled since the lookup is
+    /// answered with its record. `None` is an action this service holds no claim for, which is a
+    /// first admission and has no window to be admitted under.
+    pub async fn held_answer(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Option<ControlFrame> {
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        let service = Arc::clone(&self.service);
+        let actor = actor_id.clone();
+        let action_id = mutation.action_id.get();
+        let name = method.as_str();
+        let outcome = blocking(move || {
+            // One read: a claim that is open at one read and settled at the next is not absent.
+            service
+                .action_state(&actor, action_id, name, digest)
+                .map_err(|error| {
+                    ControllerError::found_unreadable_on_the_wire(error.into(), RECORDS)
+                })
+        })
+        .await;
+        match outcome {
+            Err(error) => Some(frame(mutation.request_id, Err(error))),
+            Ok(ActionState::Absent) => None,
+            Ok(ActionState::Open) => Some(frame(
+                mutation.request_id,
+                Err(ControllerError::attempt_still_running().to_protocol_error()),
+            )),
+            Ok(ActionState::Settled(retained)) => {
+                Some(frame(mutation.request_id, recorded(retained)))
+            }
+        }
+    }
+
     /// Serves one project read and returns the frame it answers with.
     #[must_use]
     pub async fn read_frame(&self, request: &Request) -> ControlFrame {
