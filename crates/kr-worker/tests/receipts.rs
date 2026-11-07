@@ -6455,47 +6455,6 @@ async fn a_live_host_collects_records_past_the_retention_period_on_its_own() {
     );
 }
 
-/// KR-REQ-09.17: what a host writes down about its clocks is what the next one reads back.
-#[test]
-fn a_restarted_host_reads_back_what_it_recorded_about_its_clocks() {
-    let temp = kr_ipc::testing::TempHost::create();
-    let environment = temp.environment();
-    let session_id = SessionId::new(kr_ipc::new_uuid());
-    let path = environment.journal_database(session_id);
-    std::fs::create_dir_all(path.parent().expect("a parent")).expect("the journal directory");
-
-    let first = Session::open(session_config(&environment, session_id)).expect("opens");
-    let recorded = first.time().checkpoint().expect("a checkpoint");
-    let trust = first.time().trust();
-    drop(first);
-
-    // The row is there, written by the session that took the mark rather than by anything a
-    // caller asked for.
-    let row: Vec<u8> = rusqlite::Connection::open(&path)
-        .expect("the same database")
-        .query_row("SELECT state FROM host_time WHERE id = 1", [], |row| {
-            row.get(0)
-        })
-        .expect("the recorded state");
-    let state: kr_protocol::action::HostTimeState =
-        kr_cbor::from_canonical_slice(&row, &kr_cbor::Limits::DEFAULT).expect("decodes");
-    assert_eq!(state.trust, trust);
-    assert_eq!(
-        state
-            .checkpoint
-            .as_ref()
-            .map(|mark| mark.reading.platform.as_str()),
-        Some(platform_name())
-    );
-
-    // A second host on the same journal starts from what the first one wrote rather than from
-    // whatever its own clock happens to say.
-    let second = Session::open(session_config(&environment, session_id)).expect("reopens");
-    assert_eq!(second.time().trust(), trust);
-    let restored = second.time().checkpoint().expect("a checkpoint");
-    assert_eq!(restored.boot_identity, recorded.boot_identity);
-}
-
 /// KR-REQ-09.18: a host whose recorded clock cannot be proved stops collecting and keeps serving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_clock_that_cannot_be_proved_stops_collection_and_not_the_session() {
@@ -6577,6 +6536,51 @@ async fn a_clock_that_cannot_be_proved_stops_collection_and_not_the_session() {
     let state: kr_protocol::action::HostTimeState =
         kr_cbor::from_canonical_slice(&row, &kr_cbor::Limits::DEFAULT).expect("decodes");
     assert_eq!(state.trust, kr_protocol::action::WallClockTrust::Unresolved);
+}
+
+// ---------------------------------------------------------------------------------------------
+// What a restarted host reads back of its clocks: the case below names its own row
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-09.17: what a host writes down about its clocks is what the next one reads back.
+#[test]
+fn a_restarted_host_reads_back_what_it_recorded_about_its_clocks() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let path = environment.journal_database(session_id);
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("the journal directory");
+
+    let first = Session::open(session_config(&environment, session_id)).expect("opens");
+    let recorded = first.time().checkpoint().expect("a checkpoint");
+    let trust = first.time().trust();
+    drop(first);
+
+    // The row is there, written by the session that took the mark rather than by anything a
+    // caller asked for.
+    let row: Vec<u8> = rusqlite::Connection::open(&path)
+        .expect("the same database")
+        .query_row("SELECT state FROM host_time WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .expect("the recorded state");
+    let state: kr_protocol::action::HostTimeState =
+        kr_cbor::from_canonical_slice(&row, &kr_cbor::Limits::DEFAULT).expect("decodes");
+    assert_eq!(state.trust, trust);
+    assert_eq!(
+        state
+            .checkpoint
+            .as_ref()
+            .map(|mark| mark.reading.platform.as_str()),
+        Some(platform_name())
+    );
+
+    // A second host on the same journal starts from what the first one wrote rather than from
+    // whatever its own clock happens to say.
+    let second = Session::open(session_config(&environment, session_id)).expect("reopens");
+    assert_eq!(second.time().trust(), trust);
+    let restored = second.time().checkpoint().expect("a checkpoint");
+    assert_eq!(restored.boot_identity, recorded.boot_identity);
 }
 
 // ---------------------------------------------------------------------------------------------
