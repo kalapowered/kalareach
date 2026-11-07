@@ -3577,9 +3577,12 @@ carrying the action out, as a long `project.clone` does, or may have ended witho
 did, and the host cannot tell which. The answer says that, and does not promise a later one: asking
 again gives the record once a running attempt has settled the claim, and an attempt that ended
 unrecorded leaves none. A repeat that finds the claim settled is given the recorded answer. Where the journal holds no claim, the door refuses the window only if no other
-arrival holds the action. A copy that arrives while the first attempt has been admitted and has not
-yet written its claim is told `OUTCOME_UNKNOWN`, because that attempt goes on to carry the action
-out; a transfer action repeated with no usable window is told the same in that case. At the network
+arrival under the same identifier may carry the action out. The door keeps every arrival from the
+moment it has the mutation, as one that has not decided, one that carries the action out, or one that
+is refused. A copy that finds no claim waits for the arrivals that have not decided. It is told
+`OUTCOME_UNKNOWN` if one of them carries the action out, as a first attempt that has not yet written
+its claim does, and it is refused for its window if every other is refused as well. A transfer action
+repeated with no usable window is told the same. At the network
 door, the route that every project action claims before it is carried out gives a repeat the
 unknown outcome. A create asked again is told
 `OUTCOME_UNKNOWN` when its worker is known and the daemon cannot ask it about the session: the
