@@ -753,10 +753,10 @@ fn transport_config() -> QuicTransportConfig {
         // device without transmit checksum offload: the Android emulator's Wi-Fi, some phones'
         // cellular and Wi-Fi drivers, some Linux NICs. The socket layer then stops batching, but
         // iroh 1.4.1 reads its limit once, when a connection is created, so a connection already
-        // open keeps asking for batches that are all refused: its stream data stalls for tens of
-        // seconds at a time, or for good, while single datagrams still pass. Remove this, and the
-        // transport guide's "Datagrams" bullet, once iroh reads the limit at every send (iroh
-        // issue 4555).
+        // open keeps asking for batches that are all refused: whenever it has more than one
+        // datagram to send at a time its stream data can stall for tens of seconds, or for good,
+        // while single datagrams still pass. Remove this, the transport guide's "Datagrams" bullet
+        // and `tests/segmentation.rs` once iroh reads the limit at every send (iroh issue 4555).
         .enable_segmentation_offload(false)
         .build()
 }

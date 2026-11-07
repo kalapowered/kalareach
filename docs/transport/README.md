@@ -541,9 +541,9 @@ through.
 * Datagrams: every connection sends one UDP datagram per send and never a segmented batch (UDP
   segmentation offload is off). Some kernels refuse a segmented send, for example Linux before
   6.11 on a device without transmit checksum offload. A connection that was open when that first
-  happened would go on sending batches, and its stream data would then stall for tens of seconds
-  at a time or for good, while single datagrams could still keep it inside the inactivity
-  threshold.
+  happened would go on sending batches, and whenever it had more than one datagram to send at a
+  time its stream data could then stall for tens of seconds or for good, while single datagrams
+  could still keep it inside the inactivity threshold.
 * Reconnect: jittered exponential backoff from 250 ms to 30 seconds, drawn with full jitter so a
   fleet that lost the same relay does not return in step. The ladder resets after a connection that
   lasted at least the inactivity threshold; a connection that died immediately does not reset it.
