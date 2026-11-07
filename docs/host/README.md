@@ -357,9 +357,11 @@ voice service are built. `kr doctor` prints each field with its value, its sourc
 are doing, read from them: whether the endpoint is up, how many sockets it holds, how many relays
 and discovery services it was built with, and whether the voice service names a broker. When the
 document now selects something other than what the daemon started with, the check warns that the
-edit applies at the next start. What only the start can find out, a trust anchor file that is
-missing or empty or a bind address somebody else holds, stops the start with the key named, rather
-than leaving a host that appears to run and cannot be reached.
+edit applies at the next start. A document that spells out what the section would default to (a
+`network.enabled` of `false` where it said nothing) selects nothing other, and draws no warning.
+What only the start can find out, a trust anchor file that is missing or empty or a bind address
+somebody else holds, stops the start with the key named, rather than leaving a host that appears to
+run and cannot be reached.
 
 ### Relay leases
 

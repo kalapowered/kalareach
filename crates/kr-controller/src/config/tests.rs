@@ -1285,6 +1285,69 @@ fn a_document_whose_effects_failed_is_reported_as_not_in_force() {
         in_force.remedy().is_some(),
         "and it says what to do: {in_force:?}"
     );
+
+    // A host that applied the document and could not record that it had acts on every value the
+    // document asks for, so its remedy does not say that the values are not what the document asks
+    // for. It says what is always true of them: they are what the host acts on.
+    for accepted in [
+        accepted,
+        Accepted {
+            not_in_force: Some(
+                Sentence::new().stated("this host applied the document and could not record it"),
+            ),
+            ..Accepted::in_force(open(&environment), HardLimits::default())
+        },
+    ] {
+        let report = effective(
+            &accepted,
+            HardLimits::default(),
+            WorkerProfile::HeadlessUser,
+        );
+        let produced = checks(&report);
+        let remedy = produced
+            .iter()
+            .find(|check| check.id() == "configuration-in-force")
+            .and_then(|check| check.remedy())
+            .expect("the remedy of the in-force check");
+        assert!(
+            remedy.contains("acting on") && !remedy.contains("not what the document asks"),
+            "{remedy}"
+        );
+    }
+}
+
+/// KR-REQ-26.14: an option a document leaves out and the default the section gives it are one
+/// selection, so a host that started over a document without `network.enabled` is not told that an
+/// edit saying `false` selects anything else; a real change is.
+#[test]
+fn a_document_that_spells_out_a_default_it_left_unsaid_selects_nothing_new() {
+    let read = |document: &ConfigurationDocument| {
+        configuration::load(Some(configuration::contents(document).as_bytes()))
+    };
+    let document = ConfigurationDocument::empty();
+    let started = Started::of(&read(&document));
+    let running = Running {
+        network: None,
+        names_a_broker: false,
+    };
+
+    // The same choices, said out loud: off, no relay, no anchor, no discovery.
+    let mut spelled = document.clone();
+    spelled.network.enabled = Nullable::some(false);
+    spelled.network.relay_only = Nullable::some(false);
+    spelled.network.local_discovery = Nullable::some(false);
+    spelled.network.mainline_dht = Nullable::some(false);
+    spelled.network.relay_urls = Nullable::some(Vec::new());
+    spelled.network.relay_trust_anchors = Nullable::some(Vec::new());
+    let check = network_check(&started, &read(&spelled), running);
+    assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
+    assert!(check.remedy().is_none(), "{check:?}");
+
+    // A different choice is one.
+    let mut proxied = spelled.clone();
+    proxied.network.proxy_url = Nullable::some("http://127.0.0.1:3128".to_owned());
+    let check = network_check(&started, &read(&proxied), running);
+    assert_eq!(check.status, DoctorStatus::Warning, "{check:?}");
 }
 
 /// KR-REQ-01.23: an enrolment section that names one budget is one budget the owner configured,
