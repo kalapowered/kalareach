@@ -335,7 +335,8 @@ pub const OWN_HARNESS_VARIABLE: &str = "KR_CONFORMANCE_OWN_HARNESS";
 
 /// Runs one test binary for Cargo, as its runner, framed by the listing's two marker lines, and
 /// returns its exit status: `arguments` are the binary and what Cargo passes it. A binary this
-/// run's [`OWN_HARNESS_VARIABLE`] names is not run at all.
+/// run's [`OWN_HARNESS_VARIABLE`] names is not run at all. A binary that fails, or cannot be
+/// started, is also said so on the standard error.
 #[must_use]
 pub fn list_one(arguments: &[String]) -> u8 {
     let Some((executable, rest)) = arguments.split_first() else {
@@ -348,16 +349,27 @@ pub fn list_one(arguments: &[String]) -> u8 {
     let _ = writeln!(out, "{LISTING_BEGIN}{executable}");
     let _ = out.flush();
     drop(out);
-    let status = if own.split(',').any(|entry| entry == name) {
-        "skipped".to_owned()
+    let (status, failure) = if own.split(',').any(|entry| entry == name) {
+        ("skipped".to_owned(), None)
     } else {
         match Command::new(executable).args(rest).status() {
-            Ok(status) => status
-                .code()
-                .map_or_else(|| "a signal".to_owned(), |code| code.to_string()),
-            Err(error) => format!("could not start: {error}"),
+            Ok(ended) => (
+                ended
+                    .code()
+                    .map_or_else(|| "a signal".to_owned(), |code| code.to_string()),
+                (!ended.success()).then(|| format!("ended with {ended}")),
+            ),
+            Err(error) => {
+                let failure = format!("could not start: {error}");
+                (failure.clone(), Some(failure))
+            }
         }
     };
+    // Cargo shows only that its runner failed, so the reason is also said where a failed listing's
+    // error is read from.
+    if let Some(failure) = failure {
+        eprintln!("kr-conformance list-one: {executable} {failure}");
+    }
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{LISTING_END}{executable}\t{status}");
     let _ = out.flush();
@@ -627,10 +639,10 @@ const ERROR_BYTES: usize = 800;
 
 /// The end of a failed listing's standard error as the step's error names it: its last
 /// [`ERROR_LINES`] lines that say anything, on one line, the last [`ERROR_BYTES`] bytes of them at
-/// most, with the checkout's path left out of them (a result names none). Only what comes before
-/// Cargo's first line about a failed program counts ([`what_the_program_said`]): Cargo writes its
-/// account of a failure, and its lines for the programs it goes on to, after the program's own
-/// words, and they would take the place of the lines that say why.
+/// most, with the checkout's path left out of them (a result names none). Only what says why the
+/// first failed program failed counts ([`what_the_program_said`]): Cargo writes its account of a
+/// failure, and its lines for the programs it goes on to, after the program's own words, and they
+/// would take the place of the lines that say why.
 fn ends_of(standard_error: &str, root: &Path) -> String {
     let resolved = std::fs::canonicalize(root).ok();
     ends_of_root_resolved(standard_error, root, resolved.as_deref())
@@ -692,18 +704,21 @@ fn without_the_verbatim_prefix(path: &str) -> Option<String> {
     path.strip_prefix(r"\\?\").map(str::to_owned)
 }
 
-/// The lines of `text`, trimmed, that come before Cargo's first line about a failed program,
-/// "error: test failed, to rerun pass ..." (or "error: doctest failed ..."). Cargo lets a program
-/// write to its standard error as it runs, so what the program said stands before that line; after
-/// it come Cargo's account of the failure ("Caused by:", the program's exit status) and the status
-/// lines of every program it goes on to when it was told to, and none of them says why the program
-/// failed. When no program failed, all the lines count but Cargo's header "error: N targets
-/// failed:" with the indented, backquoted command lines that follow it. A similar line anywhere
-/// else is kept.
+/// The lines of `text`, trimmed, that say why Cargo's first failed program failed: the lines before
+/// Cargo's first line about it, "error: test failed, to rerun pass ..." (or "error: doctest failed
+/// ..."), and the causes Cargo gives after that line. Cargo lets a program write to its standard
+/// error as it runs, so what the program said stands before the line. What Cargo says of the
+/// program after it ("Caused by:" and a cause on the next line, which is all the cause there is when
+/// the runner could not start or was killed) is kept, but not a plain exit status, which says
+/// nothing the runner's own words do not. The note that follows, the status lines of every program
+/// Cargo goes on to when it was told to, and its header "error: N targets failed:" with the
+/// indented, backquoted command lines that follow, are left out. A similar line anywhere else is
+/// kept.
 fn what_the_program_said(text: &str) -> Vec<&str> {
     let mut said = Vec::new();
     let mut in_the_account = false;
-    for line in text.lines() {
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -711,6 +726,7 @@ fn what_the_program_said(text: &str) -> Vec<&str> {
         if trimmed.starts_with("error: test failed, to rerun pass")
             || trimmed.starts_with("error: doctest failed, to rerun pass")
         {
+            said.extend(causes_cargo_gives(lines));
             break;
         }
         if names_the_targets_that_failed(trimmed) {
@@ -729,6 +745,36 @@ fn what_the_program_said(text: &str) -> Vec<&str> {
         said.push(trimmed);
     }
     said
+}
+
+/// The causes in the "Caused by:" blocks that follow a line about a failed program, in `after`, the
+/// lines after it, each block being a cause on one line. A plain exit status of the runner (a
+/// number, and not a signal or a Windows status in hexadecimal) is none of them.
+fn causes_cargo_gives<'a>(after: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut causes = Vec::new();
+    let mut after = after.map(str::trim).filter(|line| !line.is_empty());
+    while after.next() == Some("Caused by:") {
+        let Some(cause) = after.next() else { break };
+        if !is_a_plain_exit_status(cause) {
+            causes.push(cause);
+        }
+    }
+    causes
+}
+
+/// Whether `cause` is "process didn't exit successfully: `...` (exit status: 3)", or the Windows
+/// "(exit code: 3)", with a decimal number.
+fn is_a_plain_exit_status(cause: &str) -> bool {
+    cause.starts_with("process didn't exit successfully: ")
+        && cause
+            .strip_suffix(')')
+            .and_then(|rest| rest.rsplit_once('('))
+            .and_then(|(_, status)| {
+                status
+                    .strip_prefix("exit status: ")
+                    .or_else(|| status.strip_prefix("exit code: "))
+            })
+            .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Whether `line` is "error: 1 target failed:" or "error: 3 targets failed:".
