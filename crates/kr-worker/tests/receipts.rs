@@ -4227,18 +4227,26 @@ async fn a_retained_receipt_is_read_after_its_window_is_gone_without_redispatch(
 
     // The connection goes, and its windows go with it: a window that outlived its connection could
     // first-admit a request through a connection that no longer exists.
+    assert_eq!(
+        host.service.outstanding_windows(),
+        1,
+        "the first connection's window is the one the worker holds before the connection goes"
+    );
     drop(first);
     // The worker retires a connection's windows when it notices the connection has ended, which is
-    // its own read failing rather than anything this test can announce.
+    // its own read failing rather than anything this test can announce. The new connection holds
+    // the one window left once the first connection's is retired, so the case waits for that
+    // count: a window that was never retired leaves two, and the wait fails.
     let mut client = cli(&host).await;
-    for _ in 0..50 {
-        if host.service.outstanding_windows() <= 1 {
-            break;
-        }
-        tokio::task::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(40)))
-            .await
-            .expect("the waiting thread finishes");
-    }
+    let retired = within(std::time::Duration::from_secs(120), || {
+        host.service.outstanding_windows() <= 1
+    })
+    .await;
+    assert!(
+        retired,
+        "the worker retired the first connection's window when the connection ended: {} remain",
+        host.service.outstanding_windows()
+    );
     let attachments_before = host.service.runtime().session().attachments().len();
 
     // The exact same action, on a connection that never held its window. The de-duplication key is
@@ -6169,7 +6177,18 @@ async fn the_lease_names_the_connection_that_holds_it_and_a_reconnect_is_another
     // The first connection goes. The worker takes its attachment away when it handles the end of
     // the connection, so the case waits until that attachment has left the table and only then
     // reads the lease: a read taken before the worker has handled the end would show the second
-    // connection's lease whatever the end did to it.
+    // connection's lease whatever the end did to it. Both attachments are there until it does, so
+    // the wait below ends only because the worker removed the first.
+    {
+        let session = host.service.runtime().session();
+        let attachments = session.attachments();
+        assert!(
+            [attachment, reattached].iter().all(|wanted| attachments
+                .iter()
+                .any(|summary| summary.attachment_id == *wanted)),
+            "both connections' attachments are in the worker's table before the first connection goes"
+        );
+    }
     drop(first);
     let gone = within(std::time::Duration::from_secs(120), || {
         let session = host.service.runtime().session();
