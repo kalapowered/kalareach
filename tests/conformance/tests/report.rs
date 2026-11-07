@@ -1389,6 +1389,34 @@ fn a_listing_that_fails_leaves_what_it_said_in_the_log_and_the_end_of_it_in_the_
     assert!(!document.passed());
 }
 
+/// The lister is Cargo's runner, and Cargo shows only that the runner failed. The status of the test
+/// binary the lister ran, or that it could not start it, is on the lister's standard error beside
+/// the listing's frame on its standard output, so that a failed listing names it.
+#[test]
+fn a_test_binary_the_lister_could_not_run_to_the_end_says_so_on_its_standard_error() {
+    let ran = |arguments: &[&str]| {
+        let output = std::process::Command::new(lister())
+            .arg("list-one")
+            .args(arguments)
+            .output()
+            .expect("the lister runs");
+        assert_eq!(output.status.code(), Some(1));
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let (framed, said) = ran(&["/nowhere/a-test-binary-that-is-not-there", "--list"]);
+    assert!(framed.contains("could not start"), "{framed}");
+    assert!(said.contains("could not start"), "{said}");
+    #[cfg(unix)]
+    {
+        let (framed, said) = ran(&["/bin/sh", "-c", "exit 7"]);
+        assert!(framed.contains("\t7"), "{framed}");
+        assert!(said.contains("exit status: 7"), "{said}");
+    }
+}
+
 /// A program to stand where the report's own does as Cargo's runner when the first test program
 /// cannot be listed: it says `why` on its standard error and fails, once, and is silent and well
 /// for every program after that.
