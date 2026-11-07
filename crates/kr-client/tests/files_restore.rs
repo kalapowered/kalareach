@@ -1609,6 +1609,12 @@ fn reread(export: &OfflineExport) -> Arc<ExportSource> {
 /// kit and that file restores the same members as one that asks the service. The file holds no
 /// member name or content in the clear, and everything about it is checked on the way back: the
 /// kit's checksum, the bundle under the kit's key, the publication's signature and the manifest.
+///
+/// KR-REQ-20.17, the export of an archive only: the file adds no byte to what the service holds. The
+/// bundle is the sealed bundle as stored, and the archive is the publication, the manifest object
+/// and every member object as stored, so what an export can carry of a reusable endpoint or control
+/// private key is what the archive carries, which the daemon's production case shows is none. Not
+/// shown here: the daemon's production, or the other data paths of backup and recovery material.
 #[tokio::test]
 async fn an_archive_exports_as_one_file_that_restores_with_only_the_kit() {
     let world = World::new();
@@ -1618,6 +1624,30 @@ async fn an_archive_exports_as_one_file_that_restores_with_only_the_kit() {
         Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
     let prepared = restore(&world, &source, None).await.expect("a restore");
     let export = prepared.export().await.expect("an export");
+    assert_eq!(
+        export.encrypted_bundle.as_slice(),
+        source.sealed_bundle().as_slice(),
+        "the bundle is the one the service holds"
+    );
+    let archived = export.archive.0.as_ref().expect("an archive");
+    assert_eq!(archived.publication, sealed.publication);
+    assert_eq!(
+        archived.encrypted_manifest.as_slice(),
+        sealed.objects[&sealed.manifest_object].as_slice(),
+        "the manifest object is the one the service holds"
+    );
+    assert_eq!(
+        archived.objects.len() + 1,
+        sealed.objects.len(),
+        "every member object and no other"
+    );
+    for object in &archived.objects {
+        assert_eq!(
+            object.bytes.as_slice(),
+            sealed.objects[&object.object_id].as_slice(),
+            "a member object is the one the service holds"
+        );
+    }
     let bytes = export.to_canonical_bytes().expect("canonical bytes");
     for clear in [
         b"what the session did".as_slice(),
