@@ -2495,6 +2495,60 @@ test.describe("the phone's tab bar", () => {
       })
     }
   }
+
+  // A label that fills its tab touches the edge of the screen or the word beside it, and a count that
+  // is larger than its circle runs over the glyph: neither shows at one width in the cases above, since
+  // each is a width at which the bar's last form fits, so every width from a narrow phone to a wide one
+  // is looked at. A word keeps a gap from the screen's edges and from the word beside it, and the badge
+  // holds its digits and, where the glyph has a place of its own, sits clear of it.
+  test('keeps every label and the badge clear at each width and at the largest text, on android', async ({ page }) => {
+    const failures: string[] = []
+    for (let width = 320; width <= 480; width += 10) {
+      await onPhone(page, 'android', { width, height: 844, scale: '200%' })
+      await expect(page.getByRole('navigation', { name: 'Sections' })).toBeVisible()
+      const seen = await page.evaluate(() => {
+        const probe = document.createElement('div')
+        probe.style.paddingLeft = 'var(--gap-2)'
+        document.body.append(probe)
+        const gap = parseFloat(getComputedStyle(probe).paddingLeft)
+        probe.remove()
+        const bar = document.querySelector('.m-tabbar') as HTMLElement
+        const words = Array.from(bar.querySelectorAll<HTMLElement>('.m-tab-label')).map((label) => {
+          const range = document.createRange()
+          range.selectNodeContents(label)
+          const word = range.getBoundingClientRect()
+          return { name: label.textContent ?? '', left: word.left, right: word.right, top: word.top, bottom: word.bottom }
+        })
+        const badge = bar.querySelector<HTMLElement>('.m-tab-badge')
+        const glyph = badge?.closest('.m-tab-glyph')?.querySelector('svg')?.getBoundingClientRect()
+        const count = badge?.getBoundingClientRect()
+        return {
+          gap,
+          form: bar.getAttribute('data-form'),
+          words,
+          holdsDigits: badge === null ? true : badge.scrollWidth <= badge.clientWidth + 0.5 && badge.scrollHeight <= badge.clientHeight + 0.5,
+          overGlyph:
+            count === undefined || glyph === undefined
+              ? false
+              : count.left < glyph.right - 0.5 && glyph.left < count.right - 0.5 && count.top < glyph.bottom - 0.5 && glyph.top < count.bottom - 0.5
+        }
+      })
+      const at = `${width} px wide (${seen.form ?? 'row'})`
+      for (const word of seen.words) {
+        if (word.left < seen.gap - 0.5) failures.push(`${at}: ${word.name} is ${word.left.toFixed(1)} px from the left edge`)
+        if (width - word.right < seen.gap - 0.5) failures.push(`${at}: ${word.name} is ${(width - word.right).toFixed(1)} px from the right edge`)
+        for (const other of seen.words) {
+          const sameRow = word.top < other.bottom - 0.5 && other.top < word.bottom - 0.5
+          if (sameRow && other.left > word.left && other.left - word.right < seen.gap - 0.5) {
+            failures.push(`${at}: ${word.name} and ${other.name} are ${(other.left - word.right).toFixed(1)} px apart`)
+          }
+        }
+      }
+      if (!seen.holdsDigits) failures.push(`${at}: the badge does not hold its digits`)
+      if (seen.form !== null && seen.overGlyph) failures.push(`${at}: the badge is over the glyph in the ${seen.form} form`)
+    }
+    expect(failures, 'where a label or the badge is too close').toEqual([])
+  })
 })
 
 // KR-REQ-13.19: the conversation keeps a height it scrolls within at a person's own text size: at

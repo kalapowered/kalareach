@@ -183,7 +183,7 @@
   gap: 2px;
   min-block-size: var(--target);
   min-inline-size: var(--target);
-  padding: var(--gap-2) var(--gap-1);
+  padding: var(--gap-2);
   border: 0;
   background: none;
   color: var(--faint);
@@ -207,9 +207,10 @@
 }
 
 /*
- * A label stays inside its own tab. Where even the bar's last form leaves a tab too narrow for it,
- * it ends in an ellipsis rather than run into the next tab; its whole name stays for a screen
- * reader.
+ * A label stays inside its own tab, with a gap's room on each side of it: a word that would touch
+ * the edge of the screen or the next word takes the next form instead. Where even the bar's last
+ * form leaves a tab too narrow for it, it ends in an ellipsis rather than run into the next tab;
+ * its whole name stays for a screen reader.
  *
  * A label keeps the room of its bold form, which the tab the person is on is set in: the tabs keep
  * the same widths wherever the person is, since a face's bold is wider than its regular. Under its
@@ -290,21 +291,31 @@
 .m-tab-badge {
   position: absolute;
   /*
-   * Over the glyph's top corner at the base size, and growing up and away from the glyph, which
-   * does not grow with the text: its bottom edge and its left edge stay where they are.
+   * Over the glyph's top corner at the base size: its bottom edge 15px down the glyph's 26px and its
+   * left edge 14px along it. The glyph does not grow with the text and the badge does, so as the
+   * badge grows it moves out along its own growth, half of it to the side and the rest down, and
+   * stays under the top of its tab: it covers no more of the glyph than at the base size and
+   * does not run over the edge of the bar.
    */
-  inset-block-start: calc(15px - 1.7em);
+  inset-block-end: 11px;
   inset-inline-start: 14px;
-  /* The circle is measured in its own digits' size, so it grows with them: 17px at the base size. */
+  inset-block-end: calc(26px - max(15px, 1lh - var(--gap-2)));
+  inset-inline-start: calc(14px + (1lh - 17px) / 2);
+  /*
+   * The circle is as tall as the line of its digits, and as wide as it is tall at the least, so it
+   * holds them at whatever size the text is set: 17px at the base size. A web view that scales the
+   * text and leaves a length in em where it was, as Android's does, would otherwise grow the digits
+   * out of a circle that did not grow.
+   */
   min-inline-size: 1.7em;
-  block-size: 1.7em;
+  min-inline-size: 1lh;
   padding-inline: 0.4em;
-  border-radius: 0.9em;
+  border-radius: 999px;
   background: var(--danger);
   color: var(--primary-text);
   font-size: calc(var(--chrome-unit) * 0.625);
   font-weight: 700;
-  line-height: 1.7em;
+  line-height: 1.7;
   text-align: center;
 }
 
@@ -318,28 +329,26 @@
 }
 
 /*
- * Beside its label, a glyph's badge takes up room in the row: it sits over the glyph's top corner
- * as it does in one row, and a wider count moves the label along rather than covering it.
+ * Beside its label, a glyph's badge takes up room in the row, beside the glyph and clear of it, and
+ * a wider count moves the label along rather than covering it. These are the forms of text too
+ * large for the corner a badge takes in one row, where it would sit over the glyph.
  */
 .m-tabbar[data-form] .m-tab-glyph {
-  grid-template-areas: 'glyph';
-  place-items: start;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-1);
   inline-size: auto;
-  min-inline-size: 26px;
-}
-
-.m-tabbar[data-form] .m-tab-glyph > * {
-  grid-area: glyph;
+  block-size: auto;
+  min-block-size: 26px;
 }
 
 .m-tabbar[data-form] .m-tab-glyph > svg {
+  flex: none;
   margin: 2px;
 }
 
 .m-tabbar[data-form] .m-tab-badge {
   position: static;
-  margin-block-start: calc(15px - 1.7em);
-  margin-inline-start: 14px;
 }
 
 /* ---- Rows and cards -------------------------------------------------------------------------- */
