@@ -2113,8 +2113,8 @@ impl GrantDirectory {
     /// # Errors
     ///
     /// Returns [`ControllerError::IdConflict`] when the identifier was reused with a different
-    /// payload, [`ControllerError::Uncertain`] when the claim cannot be read, and a storage error
-    /// when the row cannot be written.
+    /// payload, [`ControllerError::Uncertain`] when the claim cannot be read or its transaction
+    /// cannot be begun, and a storage error when the row cannot be written.
     pub fn claim_action(
         &self,
         actor_id: &ActorId,
@@ -2123,7 +2123,9 @@ impl GrantDirectory {
         now_ms: u64,
     ) -> Result<ActionClaim> {
         let key = claim_key(actor_id, action_id);
-        self.in_transaction(|connection| {
+        let begun = std::cell::Cell::new(false);
+        let claimed = self.in_transaction(|connection| {
+            begun.set(true);
             // A claim that cannot be read is not one that is absent, and this read cannot tell a
             // first attempt from a repeat that arrived after the caller's own look found nothing:
             // another copy may have claimed since, and carried the action out. So the caller is
@@ -2158,7 +2160,13 @@ impl GrantDirectory {
                     key: key.clone(),
                 },
             })
-        })
+        });
+        // A transaction that could not be begun read nothing either, and is told as the read in it
+        // is. One that began and failed to commit has written nothing that stands.
+        match claimed {
+            Err(error) if !begun.get() => Err(error.found_unreadable("action claims")),
+            claimed => claimed,
+        }
     }
 
     /// Records what the action `hold` claimed produced, once.
