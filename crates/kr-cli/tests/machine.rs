@@ -1406,26 +1406,40 @@ async fn a_step_whose_outcome_the_environment_cannot_establish_is_sent_again_onl
     ]);
     assert_eq!(elsewhere["code"], "INVALID_ARGUMENT", "{elsewhere}");
 
-    // The person asks for it: the step is sent again as a new action that names the earlier one.
-    let (status, asked) = pair.a.kr_json(
+    // The person asks for it. The earlier result and the record are shown first, and the step is sent
+    // again as a new action that names the earlier action and the revision of the record shown.
+    let output = run_kr(
+        &pair.a.temp,
         Some(pair.bridges.path()),
-        &["host", "machine", "finish", "--after-unknown", &first],
+        &[
+            "host",
+            "machine",
+            "finish",
+            "--after-unknown",
+            &first,
+            "--json",
+        ],
     );
-    assert_eq!(status, Some(1), "{asked}");
+    assert_eq!(output.status.code(), Some(1));
+    let asked: Value = serde_json::from_slice(&output.stdout).expect("a document");
+    let shown_first = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        shown_first.contains(&first)
+            && shown_first.contains(&format!("revision {}", shown.revision)),
+        "the earlier action and the record are shown before the new one goes: {shown_first}"
+    );
     let second = text(&asked["steps"][1]["action_id"]);
     assert_ne!(
         second, first,
         "a new action was made at the person's request: {asked}"
     );
-    let kept = std::fs::read(pair.a.plan_file()).expect("the plan");
-    let holds = |needle: &[u8]| kept.windows(needle.len()).any(|window| window == needle);
-    assert!(
-        holds(b"supersedes_action_id") && holds(&uuid_bytes(&first)),
-        "the new request names the earlier action"
-    );
-    assert!(
-        holds(b"supersedes_revision"),
-        "and the revision of the record shown"
+    let (quoted_action, quoted_revision) =
+        quote_in_the_plan(&pair.a.plan_file()).expect("the new request names an earlier action");
+    assert_eq!(quoted_action, uuid_bytes(&first), "the earlier action");
+    assert_eq!(
+        quoted_revision,
+        i128::from(shown.revision),
+        "and the revision of the record that was shown"
     );
 
     renamed("authority_receipts_aside", "authority_receipts");
@@ -1433,6 +1447,39 @@ async fn a_step_whose_outcome_the_environment_cannot_establish_is_sent_again_onl
     assert_eq!(finished["steps"][1]["state"], "done", "{finished}");
     assert_eq!(finished["kept"], Value::Bool(false), "{finished}");
     assert_eq!(pair.b.group().machine_id, into);
+}
+
+/// The earlier action and the revision a request in the kept plan names: the pair in the preconditions
+/// of the step's request, wherever the plan keeps them.
+fn quote_in_the_plan(plan: &Path) -> Option<(Vec<u8>, i128)> {
+    use kr_cbor::CanonicalValue;
+
+    fn find(value: &CanonicalValue) -> Option<(Vec<u8>, i128)> {
+        match value {
+            CanonicalValue::Map(map) => {
+                if let (
+                    Some(CanonicalValue::Bytes(action)),
+                    Some(CanonicalValue::Integer(revision)),
+                ) = (
+                    map.get("supersedes_action_id"),
+                    map.get("supersedes_revision"),
+                ) {
+                    return Some((action.clone(), revision.get()));
+                }
+                map.entries().iter().find_map(|(_, inner)| find(inner))
+            }
+            CanonicalValue::Array(items) => items.iter().find_map(find),
+            // A request kept as bytes holds its own encoding.
+            CanonicalValue::Bytes(bytes) => kr_cbor::decode(bytes, &kr_cbor::Limits::DEFAULT)
+                .ok()
+                .as_ref()
+                .and_then(find),
+            _ => None,
+        }
+    }
+
+    let kept = std::fs::read(plan).ok()?;
+    find(&kr_cbor::decode(&kept, &kr_cbor::Limits::DEFAULT).ok()?)
 }
 
 /// The bytes of an action identity, as the plan file keeps them.

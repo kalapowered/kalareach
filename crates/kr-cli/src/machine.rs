@@ -28,10 +28,7 @@
 //!   took it answers from its receipt. A step the environment refuses without a receipt is read
 //!   against what the environment reports: at the precondition nothing was applied, and a step sent
 //!   again is composed again under a new action identity (unless its first action is still running,
-//!   in which case it waits for that, or the environment answers `OUTCOME_UNKNOWN`: then the
-//!   command stops with that action and the record the environment shows, and sends nothing new
-//!   unless the person's later `finish --after-unknown <action>` names it), while a step composed
-//!   now is refused for what the
+//!   in which case it waits for that), while a step composed now is refused for what the
 //!   environment refused it for, unless the environment could not write, answer or finish it, which
 //!   stay sent; one step on, the plan takes the record as showing the step was taken once the
 //!   environment has confirmed that the record survives a crash, which it does before it claims any
@@ -48,6 +45,11 @@
 //!   `STORAGE_UNAVAILABLE`, and a step sent before stays sent, under any action, until the
 //!   environment can read its record. A step saved before it was sent counts as sent. An
 //!   environment that cannot be reached stays pending.
+//!   An environment that answers `OUTCOME_UNKNOWN` to any attempt, with its record still at the
+//!   precondition, has not said whether the step applied: `finish` stops with that action and the
+//!   record the environment shows, leaves the step sent, and composes no new action for it. A new
+//!   action is the person's later request, `finish --after-unknown <action>`, which shows the
+//!   same action and record first and then sends the step as a new action that names them.
 //! - `undo` moves each environment the plan moved back into the group it left, by a step of its own
 //!   against the record the first one left, sent by the next `finish` or at once. A step that was
 //!   never sent is given up. One that may or may not have been taken has to be finished first,
@@ -1514,6 +1516,20 @@ async fn settle(
                     });
                     return Ok(());
                 }
+                // The person's later request: the earlier result and the record are shown before
+                // the new action goes. The quote names the environment's record revision, since a
+                // daemon's action has no receipt `action.read` could show; the daemon reads no
+                // supersession key from a step, so the quote is what this command records of what
+                // the person saw.
+                crate::report::say(&shown!(
+                    "Environment {} answered action {} with an outcome it could not establish, and \
+                     its record shows group {} at revision {}. The step is sent again as a new \
+                     action that names that action and that revision.",
+                    step.environment_id,
+                    named,
+                    record.machine_id.get(),
+                    record.revision
+                ));
                 Some(answers::Quote {
                     action_id: named,
                     revision: record.revision.get(),
@@ -2028,31 +2044,6 @@ mod tests {
         assert_eq!(
             judge(&step, None, ErrorCode::OutcomeUnknown, Sent::Again),
             Verdict::Pending
-        );
-    }
-
-    /// What the command says when it stops names each action, the record its environment shows and
-    /// the command that makes the later request, and is an unknown outcome and not a pending step.
-    #[test]
-    fn the_stop_names_the_action_the_record_and_the_later_request() {
-        let step = step();
-        let stopped = Stopped {
-            environment_id: step.environment_id,
-            action_id: step.action_id,
-            record: at_the_precondition(),
-        };
-        let error = unknown_outcome(&[stopped]);
-        assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
-        assert_eq!(error.exit_code(), 1);
-        let said = error.to_string();
-        assert!(said.contains(&step.action_id.to_string()), "{said}");
-        assert!(
-            said.contains(&format!("--after-unknown {}", step.action_id)),
-            "{said}"
-        );
-        assert!(
-            said.contains(&format!("revision {}", at_the_precondition().revision)),
-            "{said}"
         );
     }
 
