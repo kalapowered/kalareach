@@ -332,17 +332,23 @@ whatever size it has. When the session refuses it for now, the newest size is sa
 the terminal is still at the size that was sent. It goes at once if the terminal
 changed size or a key moved the window while the report was on its way. Otherwise it goes with the
 session's next word, up to three times in a row, and after that with the terminal's next resize or
-key. A move, or the return to the live screen that typing asks for, which the session refuses for
-now or cannot say what became of, is settled as not taken and is not made again: press the key
-again. If the terminal owes a size after such a return, or the question a refused resize leaves
+key. A move, or the return to the live screen that typing asks for, is not made again, whatever the
+session answers: press the key again. One the session refuses for now is settled as not taken. One
+it cannot say what became of is settled as unknown, and a return of unknown outcome may have been
+taken. If the terminal owes a size after such a return, or the question a refused resize leaves
 owed, it sends it at the live screen, where the typing wanted the window, until a screen says where
 the window is. That includes the size the return itself carried: the return takes the newest size
 with it, and when the session refuses the return for now the size is owed again, with the session's
 next word. A resize that the terminal makes as the owner of the session's size, and that the
-session refuses for now or cannot say what became of, is asked about with the session's next word:
-the answer says what size the session has, and the terminal resizes again if the session is at
-another. It does this for at most three such resizes in a row, and after that the session stays at
-the size it has until the terminal is resized again.
+session refuses for now, is asked about with the session's next word: the answer says what size the
+session has, and the terminal resizes again if the session is at another. It does this for at most
+three such resizes in a row, and after that the session stays at the size it has until the terminal
+is resized again. A resize that the session cannot say what became of, or that it answers with a
+success the terminal cannot read, may have been dispatched, and an unknown outcome is not retried:
+no answer sends that resize again, and nothing is asked in its place, because a size report changes
+the window the session keeps for the terminal and is not a read. The session stays at the size it
+has until the terminal is resized again. If the unknown resize was taken, that next resize is
+refused for the size owner's epoch, and the question follows that refusal as above.
 
 A read is one of those keys or it is the session's, whole and unchanged. That is the rule rather
 than a reader that looks inside a batch, because looking inside is how a command starts altering
@@ -431,10 +437,13 @@ reported while a new subscription is being asked for, so the first thing it deli
 what was sent before. That settles where the window is, and not what became of a size: when the
 session's answer to a report that carried the size, a size report, the question a refused resize
 leaves owed or a return to the live screen, comes after the first bytes and says the session
-refused it for now, the size is owed again as above. A session that refuses a new subscription for
-now has changed nothing: the stream goes on, and the subscription is asked for again after the
-pause the retry policy gives, whether or not the session says anything meanwhile, up to three
-times, after which the attachment ends as it does when the session refuses in its definite word.
+refused it for now, the size is owed again as above, unless a newer report has carried the size
+since and the session took that report or could not say what became of it. Then the session has
+the size, or sending it again would send that report again. A session that refuses a new
+subscription for now has changed nothing: the stream goes on, and the subscription is asked for
+again after the pause the retry policy gives, whether or not the session says anything meanwhile,
+up to three times, after which the attachment ends as it does when the session refuses in its
+definite word.
 What the person presses meanwhile waits too, and goes from where that screen puts the window.
 Presses in one direction add up, and a reversal waits its turn, so a press the window cannot make
 is spent without taking the next one with it. A report of this terminal's *size*
@@ -1809,11 +1818,14 @@ read of what the owner device is shown, within thirty seconds, or before the cha
 comes first, has changed nothing: the command says so and exits 3. So does a connection that fails
 before the host answers the read of what the owner device is shown, whether it ended or sent what
 could not be read: the command says what failed and ends there, and does not ask for the effect on
-a connection that has failed. A challenge that has ended when it arrives is said to have run out,
-with `OWNER_CONFIRMATION_REQUIRED`, and the host is not asked what the owner device is shown for
-it. At a terminal that confirms for a host with no owner, the answer to the challenge and the effect it confirms are each waited for
-as long as the wait gives a request the host began to perform, and a host that answers neither
-leaves the outcome unknown, as above.
+a connection that has failed. A host whose release cannot read the request for what the owner
+device is shown has not failed to answer: the request was not sent and the connection stands. The
+command goes on without it, except at a terminal that needs it to say what it confirms, where it
+ends with `UNSUPPORTED_CAPABILITY` and exit status 8. A challenge that has ended when it arrives is
+said to have run out, with `OWNER_CONFIRMATION_REQUIRED`, and the host is not asked what the owner
+device is shown for it. At a terminal that confirms for a host with no owner, the answer to the
+challenge and the effect it confirms are each waited for as long as the wait gives a request the
+host began to perform, and a host that answers neither leaves the outcome unknown, as above.
 
 ### A host's first owner
 
@@ -2123,6 +2135,13 @@ from its own records, an owner device confirms exactly that plan, and the comman
 transfer under the action the confirmation was asked for. Afterwards the receiving device holds the
 session and the giving device's grant is revoked.
 
+While it waits for the owner device, the command reads the host's list of pending confirmations
+once a second. Each read is given thirty seconds, and never past the end of the challenge, which is
+measured once, when the challenge arrives. A host that does not answer a read, or a connection that
+fails, ends the command with nothing changed and exit status 3, and the command says which. A
+challenge that the host stops listing, or lists unanswered until it ends, is said to have run out:
+exit status 8 with `OWNER_CONFIRMATION_REQUIRED`, and nothing was handed over.
+
 ## `kr plugin`
 
 | Command | What it does |
@@ -2165,7 +2184,9 @@ it may have been performed. A host that does not answer one of the requests befo
 budgets, for the challenge and for what the owner device is shown, within thirty seconds, or for
 what the owner device is shown before the challenge ends if that comes first, changed nothing, and
 the command exits 3; so does a connection that fails before the host answers the read of what the
-owner device is shown. A challenge that has ended when it arrives exits with
+owner device is shown. A host whose release cannot read that request has not failed a connection:
+the command says the request was not sent, changes nothing, and exits 8 with
+`UNSUPPORTED_CAPABILITY`. A challenge that has ended when it arrives exits with
 `OWNER_CONFIRMATION_REQUIRED` and says that it ran out and that nothing was changed. If the host
 has no owner device yet, it says so at once and
 names `kr pair invite --owner`. A host that is not on the network has no owner device to ask and
