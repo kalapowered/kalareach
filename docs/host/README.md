@@ -3582,9 +3582,10 @@ project action repeated with no usable window, because the window is one this co
 issued or one that has expired on it, is told what its journal holds for the action:
 `OUTCOME_UNKNOWN` while its claim is open, because the attempt that wrote the claim may still be
 carrying the action out, as a long `project.clone` does, or may have ended without recording what it
-did, and the host cannot tell which. The answer says that, and does not promise a later one: asking
-again gives the record once a running attempt has settled the claim, and an attempt that ended
-unrecorded leaves none. A repeat that finds the claim settled is given the recorded answer. Where the journal holds no claim, the door refuses the window only if no other
+did, and the host cannot tell which. The answer says that, and does not promise one now: asking
+again gives the record once the claim is settled, which a running attempt does when it ends and the
+daemon does for a claim left unrecorded when it next starts. A repeat that finds the claim settled
+is given the recorded answer. Where the journal holds no claim, the door refuses the window only if no other
 arrival under the same identifier may carry the action out. The door keeps every arrival from the
 moment it has the mutation, as one that has not decided, one that carries the action out, or one that
 is refused. A copy that finds no claim waits for the arrivals that have not decided. It is told

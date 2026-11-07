@@ -215,18 +215,18 @@ impl ControllerError {
     ///
     /// A claim with no outcome is an attempt that is still carrying the action out, or one that
     /// ended without recording what it did, and the host cannot tell which. The action is not
-    /// performed again either way. The repeat is not promised an answer: asking again under the same
-    /// action gives the record once a running attempt settles it, and an attempt that ended
-    /// unrecorded leaves nothing to give.
+    /// performed again either way. The repeat is not promised an answer now: asking again under the
+    /// same action gives the record once the claim is settled, which a running attempt does when it
+    /// ends, and the daemon does for a claim left unrecorded when it next starts.
     #[must_use]
     pub fn claim_without_outcome() -> Self {
         Self::Uncertain {
             detail: "this host holds the claim of an earlier attempt at this action and no record \
                      of what it came to: that attempt is still running, or it ended without \
                      recording what it did, and the host cannot tell which; the action is not \
-                     performed again, asking again under the same action gives the record once a \
-                     running attempt has settled it, and an attempt that ended unrecorded leaves \
-                     none, so read what the action concerns before asking under a new one"
+                     performed again, and asking again under the same action gives the record \
+                     once the claim is settled, which a running attempt does when it ends and \
+                     this host does for an unrecorded one when it next starts"
                 .to_owned(),
         }
     }
