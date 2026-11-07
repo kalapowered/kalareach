@@ -2213,11 +2213,13 @@ fn a_gateway_that_is_unavailable() -> String {
     origin
 }
 
-/// KR-REQ-16.04: `kr host push-gateways` with nothing to change does not describe the list as the
-/// one the host delivers through when the host says it has not put its configuration document into
-/// force: it says so, with the host's reason, and fails, as a change does. Here the host could not
-/// write down the revocation it owes a gateway the document no longer lists, so the credential it
-/// holds for that gateway is unusable and the list it reports is not the one it acts on.
+/// KR-REQ-16.04: `kr host push-gateways` with nothing to change fails, as a change does, when the
+/// host says it has not finished putting its configuration document into force, and says both what
+/// the host delivers through and what it has not finished. Here the host could not write down the
+/// revocation it owes a gateway the document no longer lists. It moves the list before it retires
+/// the gateway's credential, so the list it reports is the one it delivers through, and what is
+/// unfinished is the retirement; a list shown on its own would suggest that the host has acted on
+/// the whole document.
 #[test]
 fn kr_host_push_gateways_with_nothing_to_change_fails_when_the_host_did_not_put_the_document_into_force()
  {
@@ -2275,13 +2277,22 @@ fn kr_host_push_gateways_with_nothing_to_change_fails_when_the_host_did_not_put_
     )
     .expect("writes the configuration document");
     let (ok, shown) = show();
-    assert!(!ok, "the host did not put the document into force: {shown}");
+    assert!(
+        !ok,
+        "the host did not finish putting the document into force: {shown}"
+    );
     assert_eq!(shown["code"], "RESOURCE_UNAVAILABLE", "{shown}");
     assert!(
         shown["message"]
             .as_str()
             .is_some_and(|message| message.contains("could not be written down")),
         "it gives the host's reason: {shown}"
+    );
+    assert!(
+        shown["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("the official gateway only")),
+        "it says the list in use is the document's, which no longer lists the gateway: {shown}"
     );
     assert_eq!(owed(), 0, "and nothing was written down");
 

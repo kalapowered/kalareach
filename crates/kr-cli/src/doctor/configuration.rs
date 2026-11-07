@@ -169,10 +169,16 @@ pub fn push_gateways_reported(
 
 /// The push gateways the host reports it delivers through, when it says it acts on its document.
 ///
-/// A host reports the list it holds. When it also says that it did not put the document into force
-/// (a revocation it owes could not be written down, say), or that it cannot use the document (a
-/// host that started over one closes its routes and delivers through no gateway), the list alone
-/// would mislead. That is said instead, with the host's reason.
+/// A host reports the list it holds. When it says that it cannot use the document (a host that
+/// started over one closes its routes and delivers through no gateway), the list alone would
+/// mislead, and that is said instead, with the host's reason.
+///
+/// When it says that it has not finished putting the document into force (a revocation it owes
+/// could not be written down, say, or it applied the document and could not record that it had),
+/// the list it reports is the one in force: the host moves the list for every document it loads,
+/// whatever failed before, and ahead of the retirement of a removed gateway's credentials. What is
+/// unfinished is the host's reason, and the command fails with both, because a list shown on its
+/// own would suggest that the host has acted on the whole document.
 ///
 /// # Errors
 ///
@@ -182,15 +188,6 @@ pub fn push_gateways_acted_on(
     effective: &kr_protocol::hostinfo::EffectiveConfiguration,
 ) -> Result<Vec<String>> {
     let reported = push_gateways_reported(effective)?;
-    if let Some(problem) = effective.not_in_force.as_ref() {
-        return Err(CliError::Unfinished {
-            code: kr_protocol::error::ErrorCode::ResourceUnavailable,
-            message: shown!(
-                "the host did not put its configuration into force: {}",
-                crate::shown::host_text(problem)
-            ),
-        });
-    }
     if effective.status.state.is_a_problem() {
         return Err(CliError::Unfinished {
             code: kr_protocol::error::ErrorCode::ResourceUnavailable,
@@ -198,6 +195,25 @@ pub fn push_gateways_acted_on(
                 "the host cannot use its configuration document ({}): {}",
                 effective.status.state.as_str(),
                 crate::shown::host_text(&effective.status.detail)
+            ),
+        });
+    }
+    if let Some(problem) = effective.not_in_force.as_ref() {
+        let in_force = if reported.is_empty() {
+            Shown::said("the official gateway only")
+        } else {
+            shown!(
+                "the official gateway and {}",
+                Shown::joined(reported.iter().map(|origin| Shown::address(origin)), ", ")
+            )
+        };
+        return Err(CliError::Unfinished {
+            code: kr_protocol::error::ErrorCode::ResourceUnavailable,
+            message: shown!(
+                "the push gateways in force are {}, and this host has not finished putting its \
+                 configuration into force: {}",
+                in_force,
+                crate::shown::host_text(problem)
             ),
         });
     }
@@ -345,6 +361,50 @@ mod tests {
                 shown,
                 "{}",
                 state.as_str()
+            );
+        }
+    }
+
+    /// KR-REQ-16.04: a host that has not finished putting its document into force fails the
+    /// command with one answer: the exit says it is unfinished, and the message says what the host
+    /// delivers through and what it has not finished. A host that applied the document and could
+    /// not record that it had is not said to have failed to put it into force.
+    #[test]
+    fn a_host_that_has_not_finished_putting_its_document_into_force_is_said_to_have_not_finished() {
+        const LISTED: &str = "https://push.builder.example";
+        for (list, reason) in [
+            (
+                &[LISTED][..],
+                "this host applied the document and could not record that it had, so it will \
+                 apply it again when it next starts: the registry is read-only",
+            ),
+            (
+                &[][..],
+                "the credentials of a push gateway the document does not list were not let go \
+                 of, because the revocation they owe could not be written down",
+            ),
+        ] {
+            let effective = reporting(Some(list), Some(reason));
+            let Err(CliError::Unfinished { code, message }) = push_gateways_acted_on(&effective)
+            else {
+                panic!("a host that has not finished is not shown as done");
+            };
+            assert_eq!(code, kr_protocol::error::ErrorCode::ResourceUnavailable);
+            let said = message.to_string();
+            assert!(said.contains(reason), "the host's reason is given: {said}");
+            assert_eq!(
+                said.contains(LISTED),
+                !list.is_empty(),
+                "the list in force is named: {said}"
+            );
+            assert!(
+                said.contains("official gateway"),
+                "the official gateway is always among them: {said}"
+            );
+            assert!(
+                !said.contains("did not put") && !said.contains("delivers"),
+                "the message does not say the host failed to move a list it moved, and does not \
+                 claim delivery, which a closed route would make untrue: {said}"
             );
         }
     }
