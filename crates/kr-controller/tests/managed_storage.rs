@@ -3759,12 +3759,40 @@ fn opened_members(rig: &Rig, generation: u64) -> std::collections::BTreeMap<Stri
     )
 }
 
-/// What a generation holds, opened as `reader` opens it.
+/// What a generation holds, opened as `reader` opens it, with every member by name. A generation
+/// whose members share a name is a fault of the host's, so the name stands for one member.
 fn opened_members_as(
     rig: &Rig,
     generation: u64,
     reader: &kr_crypto::backup::ArchiveReader<'_>,
 ) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut named = std::collections::BTreeMap::new();
+    for (name, plaintext) in opened_generation_as(rig, generation, reader).members {
+        assert!(
+            named.insert(name.clone(), plaintext).is_none(),
+            "two members of the generation are named {name}"
+        );
+    }
+    named
+}
+
+/// A generation opened as a reader opens it, object by object.
+struct OpenedGeneration {
+    /// The descriptor, as the service publishes it and as it is not encrypted.
+    descriptor: Vec<u8>,
+    /// The manifest, decrypted and verified, as canonical bytes.
+    manifest: Vec<u8>,
+    /// Every member in the order the manifest names them, with its plaintext. Two members may share
+    /// a name here: nothing is collected by name.
+    members: Vec<(String, Vec<u8>)>,
+}
+
+/// What a generation is made of, opened as `reader` opens it.
+fn opened_generation_as(
+    rig: &Rig,
+    generation: u64,
+    reader: &kr_crypto::backup::ArchiveReader<'_>,
+) -> OpenedGeneration {
     use kr_crypto::backup::{ArchiveExpectation, GenerationExpectation, open_archive};
 
     let record = rig
@@ -3800,7 +3828,7 @@ fn opened_members_as(
         &manifest,
     )
     .expect("the recovery recipient opens the generation");
-    opened
+    let members = opened
         .objects()
         .iter()
         .map(|entry| {
@@ -3814,7 +3842,12 @@ fn opened_members_as(
                 .expect("a member opens");
             (entry.filename.clone(), restored.plaintext.expose().to_vec())
         })
-        .collect()
+        .collect();
+    OpenedGeneration {
+        manifest: kr_cbor::to_canonical_vec(opened.manifest()).expect("a manifest encodes"),
+        descriptor: descriptor_bytes,
+        members,
+    }
 }
 
 /// A generation is made of a closed session and the configuration document, uploaded, published,
@@ -3908,32 +3941,114 @@ async fn the_host_makes_a_backup_of_a_closed_session_and_its_configuration_once_
     );
 }
 
-/// Whether `needle` is in `haystack` as it is, in lower-case hexadecimal, or as base64url on its
-/// own: the ways a document of the host's could carry a key. A key that is part of a longer base64
-/// value is not found, because its last encoded characters depend on the bytes that follow it.
-fn is_carried_in(haystack: &[u8], needle: &[u8]) -> bool {
-    let hex: String = needle.iter().map(|byte| format!("{byte:02x}")).collect();
-    [
-        needle.to_vec(),
-        hex.into_bytes(),
-        kr_protocol::scalars::to_base64url(needle).into_bytes(),
-    ]
-    .iter()
-    .any(|form| haystack.windows(form.len()).any(|window| window == form))
+/// The forms in which a document of the host's could carry `key`, as the bytes to look for in it:
+/// the bytes themselves and their hexadecimal in either case; and base64 in either alphabet, which
+/// puts three bytes in four characters, so that the characters standing for the key's whole groups
+/// of three are the same wherever the key lies in a longer value. Which groups those are depends
+/// on where the key starts, so each of the three ways it can start is looked for.
+fn forms_of(key: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let hex = |upper: bool| -> Vec<u8> {
+        key.iter()
+            .map(|byte| {
+                if upper {
+                    format!("{byte:02X}")
+                } else {
+                    format!("{byte:02x}")
+                }
+            })
+            .collect::<String>()
+            .into_bytes()
+    };
+    let mut forms = vec![
+        ("as bytes".to_owned(), key.to_vec()),
+        ("in lower-case hexadecimal".to_owned(), hex(false)),
+        ("in upper-case hexadecimal".to_owned(), hex(true)),
+    ];
+    for start in 0..3 {
+        let whole = &key[start..start + (key.len() - start) / 3 * 3];
+        let url = kr_protocol::scalars::to_base64url(whole);
+        forms.push((
+            format!("in base64url from its byte {start}"),
+            url.clone().into_bytes(),
+        ));
+        forms.push((
+            format!("in base64 from its byte {start}"),
+            url.replace('-', "+").replace('_', "/").into_bytes(),
+        ));
+    }
+    forms
+}
+
+/// How `key` is carried in `haystack`, in a form [`forms_of`] names or as serde writes a list of
+/// bytes, a list of numbers, with any space between its items; nothing when it is not.
+fn carried_in(haystack: &[u8], key: &[u8]) -> Option<String> {
+    let found = |needle: &[u8], haystack: &[u8]| {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    };
+    if let Some((form, _)) = forms_of(key)
+        .into_iter()
+        .find(|(_, needle)| found(needle, haystack))
+    {
+        return Some(form);
+    }
+    let compact: Vec<u8> = haystack
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let numbers = key
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+        .into_bytes();
+    found(&numbers, &compact).then(|| "as a list of numbers".to_owned())
+}
+
+/// Every key of `kept` that is carried in an object of `clear`, as the object's label and the key's
+/// name with the form. Each object is read on its own, so two with one name are two reads.
+fn carried_keys(clear: &[(String, Vec<u8>)], kept: &[(String, Vec<u8>)]) -> Vec<String> {
+    let mut found = Vec::new();
+    for (label, bytes) in clear {
+        for (name, key) in kept {
+            if let Some(form) = carried_in(bytes, key) {
+                found.push(format!("{label} holds the {name} {form}"));
+            }
+        }
+    }
+    found
+}
+
+/// The X25519 secret the key of a stored-envelope or notification-preview pair is made from a seed
+/// as: the first half of the seed's SHA-512, which is what libsodium's `crypto_box_seed_keypair`
+/// takes it to be. The case that uses it checks it against the public key the pair has.
+fn x25519_secret_of(seed: &[u8]) -> Vec<u8> {
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA512, seed).as_ref()[..32].to_vec()
 }
 
 /// KR-REQ-20.17, the host's own backup production only: a generation the daemon makes holds the
-/// members the convention names, each of a kind the material table lets a backup carry, and none
-/// holds a private key this host keeps. The host keeps two sets of four keys (transport, which is
-/// the reusable endpoint key; authorisation, which is the control-signing key; stored envelope; and
-/// notification preview): the controller identity that signs its workers' tokens, and the device
-/// keys it pairs with. It also keeps a backup writer's key. The case reads all nine seeds from the
-/// secret store the daemon wrote them to and scans every member for each as the bytes, in
-/// hexadecimal or as base64url. The controls are the scan finding each of those forms of a seed
-/// where one is put, and the session's own output in the session's member, so the scan reads what
-/// the members hold. Not shown here: a key that is part of a longer base64 value, that a restore
-/// refuses a member under a reserved name or a revoked grant, which the restore cases show, or the
-/// other data paths of backup and recovery material.
+/// members the convention names, each of a kind the material table lets a backup carry, and no
+/// object of it holds a private key this host keeps. The host keeps two sets of four keys
+/// (transport, which is the reusable endpoint key; authorisation, which is the control-signing key;
+/// stored envelope; and notification preview): the controller identity that signs its workers'
+/// tokens, and the device keys it pairs with. It also keeps a backup writer's key. The case reads
+/// all nine seeds from the secret store the daemon wrote them to, and for the four X25519 keys
+/// (whose private key is made from the seed by a hash, so that the seed is not the key) the
+/// private key too, checked against the public key the pair has. It reads each object of the
+/// generation on its own, as the recovery recipient opens it: the descriptor, which is not
+/// encrypted, the decrypted manifest, and each member's plaintext, so a member that shares a name
+/// with another is read as well; and it asserts the service holds no object beyond the manifest
+/// and the members. Each key is looked for as bytes, in hexadecimal of either case, in either
+/// base64 alphabet wherever it lies in a longer value, and as a list of numbers. The controls are
+/// the scan finding each form of a seed where one is put, in a member of the same name as another,
+/// and the session's own output in the session's member, so the scan reads what the members hold.
+/// Not shown here: a key in a binary list of integers, split, reversed or otherwise transformed;
+/// the ciphertext of the objects and the key wraps sealed in the manifest, which hold no readable
+/// key; that a restore refuses a member under a reserved name or a revoked grant, which the
+/// restore cases show; or the other data paths of backup and recovery material.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_keeps() {
     use kr_crypto::backup::{Material, may_back_up, member_material};
@@ -3955,10 +4070,22 @@ async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_kee
     rig.set_up();
     rig.until("the first generation is published", |rig| rig.published(1))
         .await;
-    let members = opened_members(&rig, 1);
+    let generation = opened_generation_as(
+        &rig,
+        1,
+        &kr_crypto::backup::ArchiveReader::Device(&rig.device),
+    );
+
+    // The service holds the manifest and the members and nothing else of the archive, so the
+    // objects read below are every object there is.
+    assert_eq!(
+        web.stored_objects(),
+        generation.members.len() + 1,
+        "the service holds an object that neither the manifest nor a member names"
+    );
 
     // Every member is of a kind the table lets a backup carry.
-    for name in members.keys() {
+    for (name, _) in &generation.members {
         let material = member_material(name).expect("a name the convention knows");
         assert!(
             matches!(
@@ -3995,6 +4122,41 @@ async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_kee
                 .unwrap_or_else(|| panic!("the daemon kept a {whose} {purpose:?} key"));
             kept.push((format!("{whose} {purpose:?}"), seed.expose().to_vec()));
         }
+        // The X25519 keys' private keys are made from their seeds, which the store does not hold:
+        // each is the first half of the seed's hash, and the public key it gives is the pair's own.
+        let pairs = kr_crypto::store::load_device_keys(store.store.as_ref(), scope)
+            .expect("the store reads")
+            .unwrap_or_else(|| panic!("the daemon kept a {whose} set of keys"));
+        for (purpose, public) in [
+            (
+                KeyPurpose::StoredEnvelope,
+                pairs.stored_envelope.public().as_bytes(),
+            ),
+            (
+                KeyPurpose::NotificationPreview,
+                pairs.notification_preview.public().as_bytes(),
+            ),
+        ] {
+            let seed = &kept
+                .iter()
+                .find(|(name, _)| *name == format!("{whose} {purpose:?}"))
+                .expect("the seed was read")
+                .1;
+            let secret = x25519_secret_of(seed);
+            let derived = aws_lc_rs::agreement::PrivateKey::from_private_key(
+                &aws_lc_rs::agreement::X25519,
+                &secret,
+            )
+            .expect("an X25519 private key")
+            .compute_public_key()
+            .expect("its public key");
+            assert_eq!(
+                derived.as_ref(),
+                public.as_slice(),
+                "the {whose} {purpose:?} private key is the first half of its seed's hash"
+            );
+            kept.push((format!("{whose} {purpose:?} private (derived)"), secret));
+        }
     }
     let writer = kr_crypto::store::SecretName::backup_writer(&device_scope).expect("a name");
     kept.push((
@@ -4007,38 +4169,102 @@ async fn a_generation_the_host_makes_holds_none_of_the_private_keys_the_host_kee
             .expose()
             .to_vec(),
     ));
-    assert_eq!(kept.len(), 9, "two sets of four keys and the writer's");
-    for (name, seed) in &kept {
-        assert!(seed.len() >= 32, "the {name} key is a seed, not a stub");
+    assert_eq!(
+        kept.len(),
+        13,
+        "two sets of four seeds, the four X25519 private keys made from them and the writer's"
+    );
+    for (name, key) in &kept {
+        assert!(key.len() >= 32, "the {name} key is a key, not a stub");
     }
 
-    // The controls: the scan finds a seed in each form it looks for, and finds what a member does
-    // hold, in the encoding the member uses.
+    // The controls: the scan finds a key in each form it looks for, wherever the key lies in a
+    // longer value, and reads an earlier object of a name another object has.
     let (_, probe) = &kept[0];
-    let hex: String = probe.iter().map(|byte| format!("{byte:02x}")).collect();
-    for form in [
-        probe.clone(),
-        hex.into_bytes(),
-        kr_protocol::scalars::to_base64url(probe).into_bytes(),
-    ] {
-        let mut around = b"{\"a\":\"".to_vec();
-        around.extend_from_slice(&form);
-        around.extend_from_slice(b"\"}");
-        assert!(is_carried_in(&around, probe), "the scan misses a form");
+    let clean = (String::from("sessions/x.json"), b"{\"a\":1}".to_vec());
+    for (form, needle) in forms_of(probe) {
+        let document = [b"{\"a\":\"".as_slice(), &needle, b"\"}"].concat();
+        assert_eq!(
+            carried_keys(
+                &[(String::from("sessions/x.json"), document), clean.clone()],
+                &kept[..1]
+            )
+            .len(),
+            1,
+            "the scan misses a key {form}"
+        );
     }
-    let output = b"first line\r\nsecond line\r\n";
-    assert!(
-        is_carried_in(&members[&format!("sessions/{session}.json")], output),
-        "the scan does not read the session's member"
-    );
-    for (member, plaintext) in &members {
-        for (key, seed) in &kept {
+    for alphabet in ["base64url", "base64"] {
+        for before in 0..3 {
+            let mut longer = vec![0x5a_u8; before];
+            longer.extend_from_slice(probe);
+            longer.extend_from_slice(b"tail");
+            let encoded = kr_protocol::scalars::to_base64url(&longer);
+            let encoded = if alphabet == "base64" {
+                encoded.replace('-', "+").replace('_', "/")
+            } else {
+                encoded
+            };
+            let value = format!("{{\"k\":\"{encoded}\"}}").into_bytes();
             assert!(
-                !is_carried_in(plaintext, seed),
-                "{member} holds the {key} private key the host keeps"
+                carried_in(&value, probe).is_some(),
+                "the scan misses a key inside a longer {alphabet} value that starts {before} \
+                 bytes before it"
             );
         }
     }
+    let list = format!(
+        "{{\"k\":[\n  {}\n]}}",
+        probe
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",\n  ")
+    )
+    .into_bytes();
+    assert_eq!(
+        carried_in(&list, probe).as_deref(),
+        Some("as a list of numbers")
+    );
+    let earlier = (String::from("sessions/x.json"), probe.clone());
+    assert_eq!(
+        carried_keys(&[earlier, clean], &kept[..1]).len(),
+        1,
+        "the scan reads an earlier object that a later one shares its name with"
+    );
+    let output = b"first line\r\nsecond line\r\n";
+    let session_member = format!("sessions/{session}.json");
+    assert!(
+        carried_in(
+            &generation
+                .members
+                .iter()
+                .find(|(name, _)| *name == session_member)
+                .expect("the session's member")
+                .1,
+            output
+        )
+        .is_some(),
+        "the scan does not read the session's member"
+    );
+
+    // Every object of the generation, each read on its own.
+    let mut clear = vec![
+        ("the descriptor".to_owned(), generation.descriptor.clone()),
+        ("the manifest".to_owned(), generation.manifest.clone()),
+    ];
+    assert!(!clear[0].1.is_empty() && !clear[1].1.is_empty());
+    clear.extend(
+        generation
+            .members
+            .iter()
+            .map(|(name, bytes)| (format!("the member {name}"), bytes.clone())),
+    );
+    assert_eq!(
+        carried_keys(&clear, &kept),
+        Vec::<String>::new(),
+        "an object of the generation holds a private key the host keeps"
+    );
 }
 
 /// A journal of an earlier build for a closed session, at the schema that build wrote: with the
