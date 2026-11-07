@@ -8,16 +8,16 @@
 //! The kit, the bundle and the archive are sealed here with the production primitives, and the
 //! restore is the one `kr backup restore` calls.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use kr_client::ClientError;
 use kr_client::error::HostWord;
 use kr_client::recovery::{
     BundleWrite, BundleWriter, BundleWritten, CandidateState, CheckpointRecorded, ExportSource,
-    FilesRestore, MemberRefusal, MemberRole, MemberVerdict, OfflineExport, PublicationRefusal,
-    RecoveryError, RestoreError, RestoreSource, SignInCause, SourceService, SourceSignIn,
-    fresh_locator,
+    FilesRestore, MemberRefusal, MemberRole, MemberVerdict, OFFLINE_EXPORT_FORMAT, OfflineExport,
+    PublicationRefusal, RecoveryError, RestoreError, RestoreSource, SignInCause, SourceService,
+    SourceSignIn, fresh_locator,
 };
 use kr_client::retry::RETRY_BACKOFF_MIN;
 use kr_client::services::{ServiceFuture, SyncFetched, SyncPosition};
@@ -1610,14 +1610,14 @@ fn reread(export: &OfflineExport) -> Arc<ExportSource> {
 /// member name or content in the clear, and everything about it is checked on the way back: the
 /// kit's checksum, the bundle under the kit's key, the publication's signature and the manifest.
 ///
-/// KR-REQ-20.17, the export of an archive, in part: the sealed bundle in the file equals the one the
-/// service holds, the publication and the manifest object equal the service's, and each member
-/// object the file carries equals the bytes the service holds under its identifier, with as many
-/// member objects as the archive has. Not shown here: that each member object appears once (an
-/// object repeated while another is missing passes the count and the comparison of each), the
-/// file's format line, origin and archive identifier, what the archive itself carries (the daemon's
-/// production case reads the host's), the contents of the sealed bundle, or the other data paths of
-/// backup and recovery material.
+/// KR-REQ-20.17, the export of an archive, in part: the file adds no byte to what the service holds.
+/// Its format line is the one this release writes, its origin is the kit's and its archive is the
+/// one restored; the sealed bundle in it equals the one the service holds, the publication and the
+/// manifest object equal the service's, and the member objects it carries are exactly the ones the
+/// archive has, each once, each equal to the bytes the service holds under its identifier. Not shown
+/// here: what the archive itself carries (the daemon's production case reads the host's), the
+/// contents of the sealed bundle (the companion's export case opens the one it writes), or the
+/// other data paths of backup and recovery material.
 #[tokio::test]
 async fn an_archive_exports_as_one_file_that_restores_with_only_the_kit() {
     let world = World::new();
@@ -1627,22 +1627,43 @@ async fn an_archive_exports_as_one_file_that_restores_with_only_the_kit() {
         Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
     let prepared = restore(&world, &source, None).await.expect("a restore");
     let export = prepared.export().await.expect("an export");
+    assert_eq!(export.format, OFFLINE_EXPORT_FORMAT);
+    assert_eq!(
+        export.service_origin, ORIGIN,
+        "the origin is the one the kit names"
+    );
     assert_eq!(
         export.encrypted_bundle.as_slice(),
         source.sealed_bundle().as_slice(),
         "the bundle is the one the service holds"
     );
     let archived = export.archive.0.as_ref().expect("an archive");
+    assert_eq!(archived.archive_id, archive(), "the archive restored");
     assert_eq!(archived.publication, sealed.publication);
     assert_eq!(
         archived.encrypted_manifest.as_slice(),
         sealed.objects[&sealed.manifest_object].as_slice(),
         "the manifest object is the one the service holds"
     );
+    // Each member object of the archive once and no other: a repeated object with another missing
+    // would keep the count.
+    let carried: Vec<BackupObjectId> = archived
+        .objects
+        .iter()
+        .map(|object| object.object_id)
+        .collect();
+    let once: BTreeSet<BackupObjectId> = carried.iter().copied().collect();
+    assert_eq!(once.len(), carried.len(), "a member object appears twice");
+    let held: BTreeSet<BackupObjectId> = sealed
+        .objects
+        .keys()
+        .copied()
+        .filter(|object| *object != sealed.manifest_object)
+        .collect();
+    assert_eq!(held.len() + 1, sealed.objects.len());
     assert_eq!(
-        archived.objects.len() + 1,
-        sealed.objects.len(),
-        "every member object and no other"
+        once, held,
+        "every member object the archive has, and no other"
     );
     for object in &archived.objects {
         assert_eq!(
