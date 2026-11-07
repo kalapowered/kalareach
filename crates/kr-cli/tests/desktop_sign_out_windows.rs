@@ -678,32 +678,45 @@ fn listed_tasks() -> Vec<String> {
         .collect()
 }
 
-/// The guard deletes the entry of a task when a step after it is registered fails.
-#[test]
-#[ignore = registers_a_task!()]
-fn a_registered_task_is_deleted_when_the_case_that_holds_it_fails() {
-    let name = format!("kr-guard-test-{}", std::process::id());
-    let listed = format!("\\{name}");
-    let created = Command::new(system32("schtasks.exe"))
+/// A name that no other run has: the process's number and a random part.
+fn unique(prefix: &str) -> String {
+    let random = kr_ipc::new_uuid().to_string().replace('-', "");
+    format!("{prefix}-{}-{}", std::process::id(), &random[..12])
+}
+
+/// Registers a task that would run once, tomorrow or later today, and no task of that name is
+/// replaced: without `/F`, `schtasks` refuses a name that is taken.
+fn register(name: &str) -> std::process::Output {
+    Command::new(system32("schtasks.exe"))
         .args([
             "/Create",
             "/TN",
-            &name,
+            name,
             "/TR",
             "cmd.exe /c exit 0",
             "/SC",
             "ONCE",
             "/ST",
             "23:59",
-            "/F",
         ])
         .output()
-        .expect("schtasks runs");
-    // The guard is made as soon as the entry may be there, whatever the system answered.
+        .expect("schtasks runs")
+}
+
+/// The guard's self-test, over the name of a task to register. The guard is made only once the
+/// registration has succeeded, so it deletes an entry this registration made and no other.
+fn check_a_registered_task_is_deleted_when_the_case_that_holds_it_fails(name: &str) {
+    let listed = format!("\\{name}");
+    let created = register(name);
+    assert!(
+        created.status.success(),
+        "the entry {name} is registered: {}{}",
+        String::from_utf8_lossy(&created.stdout),
+        String::from_utf8_lossy(&created.stderr)
+    );
     let seen = std::cell::Cell::new(false);
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _task = RegisteredTask::new(name.clone());
-        assert!(created.status.success(), "the entry {name} is registered");
+        let _task = RegisteredTask::new(name.to_owned());
         seen.set(listed_tasks().contains(&listed));
         panic!("a step after the entry was registered fails");
     }));
@@ -711,7 +724,7 @@ fn a_registered_task_is_deleted_when_the_case_that_holds_it_fails() {
     if left {
         // A run that is red tries to remove the entry it made.
         let _ = Command::new(system32("schtasks.exe"))
-            .args(["/Delete", "/TN", &name, "/F"])
+            .args(["/Delete", "/TN", name, "/F"])
             .output();
     }
     assert!(failed.is_err(), "the step failed");
@@ -720,4 +733,36 @@ fn a_registered_task_is_deleted_when_the_case_that_holds_it_fails() {
         "the entry {name} was listed while the guard held it"
     );
     assert!(!left, "the entry {name} is left registered");
+}
+
+/// The guard deletes the entry of a task when a step after it is registered fails.
+#[test]
+#[ignore = registers_a_task!()]
+fn a_registered_task_is_deleted_when_the_case_that_holds_it_fails() {
+    check_a_registered_task_is_deleted_when_the_case_that_holds_it_fails(&unique("kr-guard-test"));
+}
+
+/// A task of the name that is taken already is neither replaced nor deleted by the self-test: its
+/// registration is refused, and the case fails before any guard exists.
+#[test]
+#[ignore = registers_a_task!()]
+fn a_task_that_is_there_already_is_refused_and_left_registered() {
+    let name = unique("kr-guard-there");
+    let created = register(&name);
+    assert!(
+        created.status.success(),
+        "the entry {name} is registered: {}{}",
+        String::from_utf8_lossy(&created.stdout),
+        String::from_utf8_lossy(&created.stderr)
+    );
+    // The entry is this case's own, and goes with it.
+    let _task = RegisteredTask::new(name.clone());
+    let refused = std::panic::catch_unwind(|| {
+        check_a_registered_task_is_deleted_when_the_case_that_holds_it_fails(&name);
+    });
+    assert!(refused.is_err(), "a name that is taken is refused");
+    assert!(
+        listed_tasks().contains(&format!("\\{name}")),
+        "the entry that was there is still registered"
+    );
 }
