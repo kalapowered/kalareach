@@ -166,6 +166,49 @@ async fn a_repeat_of_a_voice_change_whose_record_cannot_be_read_is_told_the_outc
     );
 }
 
+/// KR-REQ-09.09: a repeat of an authority change whose kept result is not an encoding of anything is
+/// told the outcome is unknown, by both lookups. The change was made and its answer is lost; a
+/// refusal of the argument would say that the request was malformed, which it was not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_of_an_authority_change_whose_kept_result_cannot_be_decoded_is_told_the_outcome_is_unknown()
+ {
+    let (temp, controller) = daemon().await;
+    let actor_id = ActorId::new("local:test").expect("a principal");
+    let mutation = revoke_request(&temp);
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("the registry opens beside the daemon's own handle");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    let digest = kr_protocol::digest::mutation_digest(&mutation, &actor_id).expect("digests it");
+    registry
+        .execute(
+            "INSERT INTO authority_receipts
+                 (actor_id, action_id, payload_digest, claimed_at_ms, result, recorded_at_ms,
+                  refusal_code, refusal_detail)
+             VALUES (?1, ?2, ?3, 1, x'ff', 1, NULL, NULL)",
+            rusqlite::params![
+                actor_id.as_str(),
+                mutation.action_id.get().as_bytes().to_vec(),
+                digest.as_bytes().to_vec(),
+            ],
+        )
+        .expect("the claim is written with a result that is not an encoding");
+
+    let waiting = told(
+        controller
+            .retained_authority_answer(&actor_id, &mutation)
+            .await,
+    );
+    let not_waiting = told(controller.retained_authority_change(&actor_id, &mutation));
+    assert_eq!(waiting.code, ErrorCode::OutcomeUnknown, "{waiting:?}");
+    assert_eq!(
+        not_waiting.code,
+        ErrorCode::OutcomeUnknown,
+        "{not_waiting:?}"
+    );
+}
+
 /// KR-REQ-09.09: a voice change that found no record of its action at the early look, and then meets
 /// a claim that cannot be read where it claims the action, is told the outcome is unknown. A copy
 /// of the change may have claimed in between and carried it out; the claim's own transaction cannot

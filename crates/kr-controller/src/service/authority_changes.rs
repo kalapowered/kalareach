@@ -285,7 +285,11 @@ impl Controller {
         record: &crate::grants::ActionRecord,
     ) -> Option<Result<ParamsValue>> {
         match record {
-            crate::grants::ActionRecord::Answered { result } => Some(decoded(result)),
+            // A result this host kept and cannot read back leaves open what the change came to.
+            crate::grants::ActionRecord::Answered { result } => Some(
+                decoded(result)
+                    .map_err(|_| ControllerError::record_unreadable("authority changes")),
+            ),
             crate::grants::ActionRecord::Refused { code, detail } => {
                 Some(Err(ControllerError::Refused {
                     code: *code,
