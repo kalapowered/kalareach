@@ -479,8 +479,8 @@ async fn after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost(
             )
         }))
         .expect("a record");
-    // The first half's task is deleted whichever way this half ends, after the daemon that uses it
-    // is let go of.
+    // Deleting the first half's task is tried whichever way this half ends, after the daemon that
+    // uses it is let go of.
     let mut task = RegisteredTask::new(record["task"].as_str().expect("a task").to_owned());
     let before_login = record["login"].as_u64().expect("a login session");
     let session_id: SessionId =
@@ -705,7 +705,7 @@ fn a_registered_task_is_deleted_when_the_case_that_holds_it_fails() {
     }));
     let left = listed_tasks().contains(&listed);
     if left {
-        // A run that is red leaves nothing of its own behind.
+        // A run that is red tries to remove the entry it made.
         let _ = Command::new(system32("schtasks.exe"))
             .args(["/Delete", "/TN", &name, "/F"])
             .output();

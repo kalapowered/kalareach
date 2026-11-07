@@ -326,8 +326,9 @@ fn is_stopped(distribution: &str, registered: &str, running: &str) -> bool {
         && !is(&running, distribution)
 }
 
-/// Records `wsl.exe` running a command in the distribution, and leaves the distribution stopped if
-/// it was stopped.
+/// Records `wsl.exe` running a command in the distribution, and ends the distribution again when
+/// both lists showed it registered and stopped. A distribution whose state the lists leave unknown
+/// is left as it is.
 #[test]
 #[ignore = records!()]
 fn record_wsl_exe() {
