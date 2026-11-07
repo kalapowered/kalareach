@@ -223,6 +223,19 @@ struct WithheldStrings {
     ranges: VecDeque<(u64, u64)>,
 }
 
+/// Whether a pair `gap` apart is joined: it is when it is narrower than the median, or as wide
+/// as it while `ties` pairs of that width are still to be joined.
+fn joins(gap: u64, median: u64, ties: &mut usize) -> bool {
+    if gap < median {
+        return true;
+    }
+    if gap == median && *ties > 0 {
+        *ties -= 1;
+        return true;
+    }
+    false
+}
+
 impl WithheldStrings {
     /// Notes one range, which begins no earlier than the one noted before it.
     fn note(&mut self, start: u64, end: u64) {
@@ -251,10 +264,17 @@ impl WithheldStrings {
             .collect();
         let middle = gaps.len() / 2;
         let median = *gaps.select_nth_unstable(middle).1;
+        // Pairs wider than the median stay apart. Of the pairs exactly as wide, only as many are
+        // joined as bring the count to half, so a record of evenly spaced strings does not
+        // become one range that withholds all the text between them.
+        let below = gaps.iter().filter(|&&gap| gap < median).count();
+        let mut ties = (middle + 1).saturating_sub(below);
         let mut joined = VecDeque::with_capacity(self.ranges.len() / 2 + 1);
         for &(start, end) in &self.ranges {
             match joined.back_mut() {
-                Some((_, last_end)) if start.saturating_sub(*last_end) <= median => {
+                Some((_, last_end))
+                    if joins(start.saturating_sub(*last_end), median, &mut ties) =>
+                {
                     *last_end = (*last_end).max(end);
                 }
                 _ => joined.push_back((start, end)),
@@ -1476,8 +1496,9 @@ impl OutputHistory {
     /// byte, so every cursor in it is where it was, and cut where `settled` is when it reaches
     /// further: the sequence the engine is part way through is not known for what it is until it
     /// ends, and what the page leaves out is read from `next_cursor` once it has. A page that
-    /// would begin beyond `settled` begins there instead, so that a reader that asks where the
-    /// output ends is told where it may read to.
+    /// would begin beyond `settled` and carries no gap begins there instead, or at the oldest
+    /// retained cursor when that is later, so that a reader that asks where the output ends is
+    /// told where it may read to.
     ///
     /// # Errors
     ///
@@ -3077,6 +3098,9 @@ mod tests {
                 "the range {start}..{stop} is withheld"
             );
         }
+        // Strings spaced evenly do not all join: the text between two of the newer ones stays.
+        let newer = (ranges * 3 / 4) as usize * 6 + 4;
+        assert_eq!(&page.bytes.as_slice()[newer..newer + 4], b"cdab");
     }
 
     /// A range that reaches past the oldest retained cursor keeps its tail withheld: output that

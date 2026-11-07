@@ -8247,22 +8247,23 @@ its connector's `filesystem.read` was granted. What a program prints is session 
 page of retained output serves it under `session.view` and the history bound, a file's text that
 the program printed included.
 
-A control string that a terminal takes for a file or a picture is not served either. An application
-can print an iTerm2 inline file, a sixel picture or a Kitty graphics command. The terminal engine
-consumes each of them and gives no attachment their bytes, as it does any control string the
-profile names no class for and any it discards whole. A page of retained output served to a caller
-that holds no file right, which is every caller under a grant, has each such string replaced by
-NUL, byte for byte, so no cursor moves and the words around it stay where they were. So has a
-string of any class whose payload a terminal could frame differently from the engine, such as one
-that holds a raw 8-bit control, which can end it and begin another. A page that begins or ends
+A control string that the terminal engine frames as a file or a picture is not served either. An
+application can print an iTerm2 inline file, a sixel picture or a Kitty graphics command. The
+terminal engine consumes each of them and gives no attachment their bytes, as it does any control
+string the profile names no class for and any it discards whole. A page of retained output served to
+a caller that holds no file right, which is every caller under a grant, has each such string
+replaced by NUL, byte for byte, so no cursor moves and the words around it stay where they were. So
+has a string of any class whose payload a terminal could frame differently from the engine, such as
+one that holds a raw 8-bit control, which can end it and begin another. A page that begins or ends
 inside one withholds that part of it, and a string that has begun and not ended is left out of the
-page until it ends, because nothing yet says what it is. A reader that asks where the output ends
-is told where it may read to. The worker keeps up to 65,536 such strings apart for a session; past
-that it joins the nearest, and the words between two joined strings are replaced too. The local
-owner is paged the output as it was written. The worker cannot tell a device that holds
-`files.read` from one that does not, since the scope a forwarded read carries states no rights, so
-no device is paged one. A transfer that is not a control string, as ZMODEM is not, is paged as
-written.
+page until it ends, because nothing yet says what it is. A reader that asks where the output ends is
+told where it may read to. The worker keeps up to 65,536 such ranges apart for a session; past that
+it joins the nearest, and the words between two joined ranges are replaced too. The local owner is
+paged the output as it was written. The worker cannot tell a device that holds `files.read` from one
+that does not, since the scope a forwarded read carries states no rights, so no device is paged one.
+A transfer that is not a control string, as ZMODEM is not, is paged as written. So is a run the
+engine reads as text but another terminal may read as a control, such as an encoded 8-bit control
+(`U+009D`): a client that replays a page into a terminal classifies it first.
 
 ## The broker
 
