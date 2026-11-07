@@ -451,16 +451,17 @@ impl ProjectModule {
         }
     }
 
-    /// Says what an exact repeat of a project action is owed when the window it carries is not one
-    /// this connection issued, if this service holds anything for its action.
+    /// Says what an exact repeat of a project action is owed when the window it carries admits
+    /// nothing here, because this connection never issued it or it has expired on this connection,
+    /// if this service holds anything for its action.
     ///
     /// [`Self::retained`] answers a settled action and has nothing for one whose claim is open,
     /// which is an action whose first attempt is still carrying it out, or ended without recording
     /// what it did. Such an action is not a first one, so a window that admits nothing is no reason
     /// to refuse it: that refusal is definite, and a client takes it for the host's word that
-    /// nothing was done. The repeat is told that what became of the action is not known yet, and
-    /// asks again under the same identifier. A claim the first attempt settled since the lookup is
-    /// answered with its record. `None` is an action this service holds no claim for: a first
+    /// nothing was done. The repeat is told what the host knows: it holds the claim and no record
+    /// of what the attempt came to, and cannot tell a running attempt from one that ended
+    /// unrecorded. A claim the first attempt settled since the lookup is answered with its record. `None` is an action this service holds no claim for: a first
     /// admission, which has no window to be admitted under, or a copy that arrived before the first
     /// attempt wrote its claim. The door tells the two apart by whether another arrival holds the
     /// action, which the service cannot see.
@@ -489,7 +490,7 @@ impl ProjectModule {
             Ok(ActionState::Absent) => None,
             Ok(ActionState::Open) => Some(frame(
                 mutation.request_id,
-                Err(ControllerError::attempt_still_running().to_protocol_error()),
+                Err(ControllerError::claim_without_outcome().to_protocol_error()),
             )),
             Ok(ActionState::Settled(retained)) => {
                 Some(frame(mutation.request_id, recorded(retained)))
@@ -797,7 +798,7 @@ where
     match service.action_state(actor, action_id, name, digest) {
         Ok(ActionState::Absent) => Err(Err(refusal)),
         Ok(ActionState::Open) => Err(Err(
-            ControllerError::attempt_still_running().to_protocol_error()
+            ControllerError::claim_without_outcome().to_protocol_error()
         )),
         Ok(ActionState::Settled(retained)) => {
             copied.store(true, Ordering::Release);

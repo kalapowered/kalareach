@@ -77,7 +77,10 @@ pub enum ControllerError {
     /// The managed shell integration this request asked for is not available.
     #[error("{0}")]
     ShellIntegrationUnsupported(String),
-    /// The freshness window this first admission is bound to is expired or unknown.
+    /// The freshness window this request is bound to admits nothing here: it is unknown, belongs to
+    /// another connection or boot, or has expired on the connection that issued it. A first
+    /// admission is refused for it, and an exact repeat of an action this host holds a claim or a
+    /// record for is answered from that instead.
     #[error("{detail}")]
     WindowExpired {
         /// What went wrong.
@@ -203,6 +206,27 @@ impl ControllerError {
         Self::Uncertain {
             detail: "another attempt under this action identifier has not finished, so what \
                      became of the action is not known yet"
+                .to_owned(),
+        }
+    }
+
+    /// What a repeat of an action is told when this host holds the claim of its first attempt and no
+    /// record of what the attempt came to.
+    ///
+    /// A claim with no outcome is an attempt that is still carrying the action out, or one that
+    /// ended without recording what it did, and the host cannot tell which. The action is not
+    /// performed again either way. The repeat is not promised an answer: asking again under the same
+    /// action gives the record once a running attempt settles it, and an attempt that ended
+    /// unrecorded leaves nothing to give.
+    #[must_use]
+    pub fn claim_without_outcome() -> Self {
+        Self::Uncertain {
+            detail: "this host holds the claim of an earlier attempt at this action and no record \
+                     of what it came to: that attempt is still running, or it ended without \
+                     recording what it did, and the host cannot tell which; the action is not \
+                     performed again, asking again under the same action gives the record once a \
+                     running attempt has settled it, and an attempt that ended unrecorded leaves \
+                     none, so read what the action concerns before asking under a new one"
                 .to_owned(),
         }
     }
