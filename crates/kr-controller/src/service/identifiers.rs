@@ -321,11 +321,14 @@ impl Performing {
 }
 
 impl Arrival {
-    /// Says that this arrival is going on to carry its action out.
+    /// Says that this arrival is going on to carry its action out. A copy that was refused for its
+    /// window and found a claim open goes on to finish what the claim began, and is one that runs.
     pub(super) fn runs(&mut self) {
-        if self.stage != Stage::Undecided {
-            return;
-        }
+        let was_undecided = match self.stage {
+            Stage::Running => return,
+            Stage::Undecided => true,
+            Stage::Refused => false,
+        };
         {
             let mut arrivals = self
                 .door
@@ -333,7 +336,9 @@ impl Arrival {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             if let Some(entry) = arrivals.get_mut(&self.key) {
-                entry.undecided -= 1;
+                if was_undecided {
+                    entry.undecided -= 1;
+                }
                 entry.running += 1;
             }
         }
