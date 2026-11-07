@@ -632,10 +632,7 @@ const ERROR_BYTES: usize = 800;
 /// account of a failure, and its lines for the programs it goes on to, after the program's own
 /// words, and they would take the place of the lines that say why.
 fn ends_of(standard_error: &str, root: &Path) -> String {
-    #[cfg(unix)]
     let resolved = std::fs::canonicalize(root).ok();
-    #[cfg(not(unix))]
-    let resolved = None;
     ends_of_root_resolved(standard_error, root, resolved.as_deref())
 }
 
@@ -654,9 +651,12 @@ fn ends_of_root_resolved(standard_error: &str, root: &Path, resolved: Option<&Pa
     // output are the working directory's own.
     let given = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
     let mut spellings = vec![given.to_string_lossy().into_owned()];
-    // On Windows the physical path has a `\\?\` prefix that no output carries.
+    // The physical path differs from it by a link or a junction on the way. On Windows it has a
+    // `\\?\` prefix that Cargo's output does not carry, so it is left out with and without it.
     if let Some(physical) = resolved {
-        spellings.push(physical.to_string_lossy().into_owned());
+        let physical = physical.to_string_lossy().into_owned();
+        spellings.extend(without_the_verbatim_prefix(&physical));
+        spellings.push(physical);
     }
     for spelling in spellings.clone() {
         let backslashes = spelling.replace('/', "\\");
@@ -681,6 +681,15 @@ fn ends_of_root_resolved(standard_error: &str, root: &Path, resolved: Option<&Pa
         ends = format!("...{}", &ends[from..]);
     }
     format!("its standard error ends: {ends}")
+}
+
+/// `path` without the prefix that Windows gives a physical path: `\\?\C:\a` is `C:\a`, and
+/// `\\?\UNC\server\share` is `\\server\share`. None when it has no such prefix.
+fn without_the_verbatim_prefix(path: &str) -> Option<String> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return Some(format!(r"\\{rest}"));
+    }
+    path.strip_prefix(r"\\?\").map(str::to_owned)
 }
 
 /// The lines of `text`, trimmed, that come before Cargo's first line about a failed program,
@@ -1609,7 +1618,8 @@ mod tests {
     }
 
     #[test]
-    fn a_root_resolved_through_a_junction_or_with_a_verbatim_prefix_is_left_out_on_every_platform() {
+    fn a_root_resolved_through_a_junction_or_with_a_verbatim_prefix_is_left_out_on_every_platform()
+    {
         // Windows resolves a junction, and writes `\\?\` before the physical path; what Cargo
         // prints has neither the link nor the prefix.
         let root = Path::new("link");
