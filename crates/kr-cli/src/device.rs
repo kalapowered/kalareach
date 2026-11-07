@@ -313,10 +313,12 @@ pub(crate) fn revocation_document(revoked: &RevocationResult) -> Document {
 /// What a revocation did, as lines for a person: the grants it took, and how far each affected
 /// session's worker has got in fencing what the device could still have been doing.
 ///
-/// A worker still pending is named with why. So is a worker whose barrier holds but whose
-/// evidence is not all here: names the host has not received yet, actions the worker could hold
-/// no name for, or anything else the host says about it. Every action a worker could not show did
-/// not run before the revocation reached it is named too.
+/// A worker still pending is named with why, and while any is pending every worker the host
+/// listed is named with its state, so a mixed answer says which sessions have fenced it. When all
+/// have, a worker is named only if its barrier holds but its evidence is not all here: names the
+/// host has not received yet, actions the worker could hold no name for, or anything else the host
+/// says about it. Every action a worker could not show did not run before the revocation reached
+/// it is named too.
 fn revocation(device: DeviceId, revoked: &RevocationResult) -> Vec<Line> {
     let grants = usize::try_from(revoked.revoked_grants_total.get()).unwrap_or(usize::MAX);
     let first = if revoked.barrier.holds() {
@@ -366,10 +368,19 @@ pub(crate) fn barrier_lines(
             "Every affected session's worker has fenced it."
         ));
     }
+    // While any worker has not fenced it, every worker the host listed is stated, so a person
+    // reading a mixed answer sees which sessions have fenced it and which have not. When every one
+    // has, the one line above says so, and only a worker with something more to say is named.
+    let mixed = !barrier.holds();
     for worker in &barrier.workers {
         let names_pending = worker.names_pending.get();
         let omitted = worker.omitted_actions.get();
-        if !worker.state.holds() || !worker.detail.is_empty() || names_pending > 0 || omitted > 0 {
+        if mixed
+            || !worker.state.holds()
+            || !worker.detail.is_empty()
+            || names_pending > 0
+            || omitted > 0
+        {
             lines.push(if worker.detail.is_empty() {
                 stdout_line!("  session {}: {}", worker.session_id, worker.state.as_str())
             } else {
@@ -585,9 +596,13 @@ mod tests {
             text.contains("may have run before the revocation"),
             "{text}"
         );
+        // A pending revocation says which sessions have fenced it too.
         assert!(
-            !text.contains(&SessionId::new(Uuid::from_bytes([4; 16])).to_string()),
-            "a worker whose barrier holds needs no line: {text}"
+            text.contains(&format!(
+                "session {}: acknowledged",
+                SessionId::new(Uuid::from_bytes([4; 16]))
+            )),
+            "a mixed answer states the worker that fenced it: {text}"
         );
     }
 

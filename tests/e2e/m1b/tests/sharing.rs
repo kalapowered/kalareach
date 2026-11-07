@@ -602,6 +602,76 @@ fn a_revocation_a_session_worker_has_not_fenced_is_pending_in_kr_and_complete_on
         .unwrap_or_else(|left| panic!("the leg left processes running: {left}"));
 }
 
+/// KR-REQ-18.14, from `kr`, each worker: a device holds shares of two sessions and the owner revokes
+/// the device while one session's worker has fenced the revocation and the other has not answered.
+/// The command states the authority revision and names each of the two sessions with where it has
+/// got, the one that fenced it as well as the one that has not, and does not call it done.
+#[test]
+fn a_revocation_one_worker_has_fenced_and_another_has_not_names_both_in_kr() {
+    let runtime = runtime();
+    let run = Run::start("sharing-revoke-mixed");
+    let host = Host::start(&run, &HostOptions::default());
+    let owner_device = runtime.block_on(Device::create("owner", &run.root().join("o")));
+    let (_, owner) = ceremony::pair_first_owner(&host, &owner_device, &runtime);
+    let (first, first_display) = new_session(&host);
+    let (second, second_display) = new_session(&host);
+    let guest_device = runtime.block_on(Device::create("guest", &run.root().join("g")));
+    let (guest_paired, guest) = ceremony::pair_guest(&host, &owner, &guest_device, &runtime, "60");
+    let device_id = guest_paired.device_id.to_string();
+
+    // The device accepts a share of each session, so each session's worker is told of it.
+    for display in [&first_display, &second_display] {
+        let (_, issued) = ceremony::share_at_terminal(
+            &host,
+            &[display, "--to", &device_id, "--for", "15m"],
+            b"share",
+        );
+        assert_eq!(issued.exit, 0, "the share: {}", issued.document);
+        let offer = held(&runtime, &guest).offers.remove(0);
+        let _: GrantRedeemResult = runtime
+            .block_on(guest.mutate_environment(
+                Method::GrantRedeem,
+                &GrantRedeemParams {
+                    invitation_id: offer.invitation_id,
+                },
+            ))
+            .unwrap_or_else(|why| panic!("grant.redeem: {why}"));
+    }
+
+    // One worker does not answer; the other does.
+    let stopped = StoppedWorker::stop(host.worker_of(&first.to_string()));
+    let revoked = host.kr(&["device", "revoke", &device_id]);
+    assert!(
+        !revoked.status.success(),
+        "a revocation a worker has not fenced is not a success: {}{}",
+        String::from_utf8_lossy(&revoked.stdout),
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+    let said = String::from_utf8_lossy(&revoked.stdout);
+    assert!(said.contains("is pending"), "{said}");
+    assert!(!said.contains("Revoked device"), "{said}");
+    revision_stated(&said);
+    assert!(
+        said.contains(&format!("session {first}: pending")),
+        "the worker that has not fenced it is named with its state: {said}"
+    );
+    assert!(
+        said.contains(&format!("session {second}: "))
+            && !said.contains(&format!("session {second}: pending")),
+        "the worker that has fenced it is named too, with its state: {said}"
+    );
+
+    drop(stopped);
+    guest.close();
+    owner.close();
+    runtime.block_on(guest_device.close());
+    runtime.block_on(owner_device.close());
+    host.stop()
+        .unwrap_or_else(|problem| panic!("the host did not stop cleanly: {problem}"));
+    run.closing_check()
+        .unwrap_or_else(|left| panic!("the leg left processes running: {left}"));
+}
+
 /// The host carries an invitation out and never says so, to the command or to any repeat of it: the
 /// command asks again three times, each on a connection of its own, then reads the host's state,
 /// finds the invitation, and says it happened without the host's own answer. The share is made
@@ -656,7 +726,7 @@ fn an_invitation_whose_every_answer_is_lost_is_found_by_reading_the_host() {
 /// is refused where the receiving device now holds the session. KR-REQ-18.03.
 #[test]
 fn a_session_handed_to_another_device_is_held_by_it_and_refused_to_the_giver() {
-    hand_over("sharing-transfer", None);
+    hand_over("sharing-transfer", None, false);
 }
 
 /// The host's answer to the request for the owner devices' confirmation is lost on the way back:
@@ -668,13 +738,23 @@ fn a_hand_over_whose_first_answer_was_lost_goes_on_and_is_made_once() {
     hand_over(
         "sharing-transfer-lost",
         Some(Method::OwnerConfirmationRequest),
+        false,
     );
+}
+
+/// KR-REQ-18.14, from `kr`, a transfer: the giving device's grant is revoked with the hand-over, and
+/// the session's worker has not answered the revocation. The command states the authority revision
+/// the host issued and names the session whose worker has not fenced it, and is not a success; the
+/// hand-over itself is made once.
+#[test]
+fn a_hand_over_a_session_worker_has_not_fenced_states_the_revision_and_the_worker() {
+    hand_over("sharing-transfer-pending", None, true);
 }
 
 /// Hands a session from one guest to another with `kr share transfer`, the owner device confirming
 /// after the command is waiting, with the host's answer to `lose` lost on the way back when one is
-/// named.
-fn hand_over(leg: &str, lose: Option<Method>) {
+/// named, and the session's worker not answering when `stopped` is set.
+fn hand_over(leg: &str, lose: Option<Method>, stopped: bool) {
     let runtime = runtime();
     let run = Run::start(leg);
     let host = Host::start(&run, &HostOptions::default());
@@ -720,7 +800,7 @@ fn hand_over(leg: &str, lose: Option<Method>) {
     // A transfer the host refuses before an owner device is asked, because the receiving device's
     // pairing ends before the access it would be given, is refused in the host's own words, and
     // takes nothing from the giver.
-    if lose.is_none() {
+    if lose.is_none() && !stopped {
         let brief_device = runtime.block_on(Device::create("brief", &run.root().join("b")));
         let (brief_paired, brief) =
             ceremony::pair_guest(&host, &owner, &brief_device, &runtime, "2");
@@ -746,6 +826,8 @@ fn hand_over(leg: &str, lose: Option<Method>) {
 
     // The command waits; the owner device answers exactly that plan; the transfer completes.
     let relay = lose.map(|method| Relay::losing_the_answer_to(&host, &runtime, method));
+    // The session's worker, when it is to be one that does not answer the revocation.
+    let stopped = stopped.then(|| StoppedWorker::stop(host.worker_of(&session_id.to_string())));
     let taker_id = taker_paired.device_id.to_string();
     let transferring = ceremony::waiting(
         &host,
@@ -773,6 +855,27 @@ fn hand_over(leg: &str, lose: Option<Method>) {
         "the transfer ended: {}",
         done.document
     );
+    if let Some(stopped) = stopped {
+        assert_eq!(
+            done.exit, 1,
+            "a hand-over a worker has not fenced is not a success: {}",
+            done.document
+        );
+        assert_eq!(done.document["ok"], false, "{}", done.document);
+        assert!(
+            counter(&done.document["authority_revision"]) > 0,
+            "the document states the revision the host issued: {}",
+            done.document
+        );
+        let workers = done.document["barrier"]["workers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no list of workers: {}", done.document));
+        assert_eq!(workers.len(), 1, "{}", done.document);
+        assert_eq!(workers[0]["session_id"], session_id.to_string().as_str());
+        assert_eq!(workers[0]["state"], "pending", "{}", done.document);
+        // The worker answers again, so what follows can read the session.
+        drop(stopped);
+    }
     assert_eq!(
         done.document["to_device_id"].as_str(),
         Some(taker_id.as_str()),
