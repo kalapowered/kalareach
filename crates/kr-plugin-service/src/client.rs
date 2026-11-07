@@ -126,14 +126,15 @@ struct Churn {
     registering: usize,
     /// How many removals of it wait for their answers now.
     removing: usize,
-    /// How many registrations of it the host has answered as registered, less the removals it has
-    /// answered as having removed one that no registration overlapped. It is the client's account,
+    /// How many registrations of it the host has answered as registered, until the answer to a
+    /// removal that no registration overlapped, which sets it to nothing. It is the client's account,
     /// from the answers it has read, of the registrations the host stands behind, and it is never
     /// below what the host holds, so a count of nothing is the client's word that no registration
-    /// of the identifier is live. A removal that a registration overlapped is not taken off it: the
+    /// of the identifier is live. A removal that a registration overlapped changes nothing: the
     /// host answers a removal for the registration it was about, which can be one that was still
     /// being made and was refused, and nothing in the answer says which. The count can stay above
-    /// what the host holds then, which keeps the queue, until the client is dropped.
+    /// what the host holds then, which keeps the queue, until the next removal that nothing
+    /// overlapped or until the client is dropped.
     live: usize,
 }
 
@@ -306,20 +307,27 @@ impl Removing {
         let Some(churn) = churning.get_mut(&self.binding_id) else {
             return;
         };
+        let answered = matches!(
+            answer,
+            Some(ResponseBody::Unbound { .. } | ResponseBody::Refused { .. })
+        );
         let removed = match answer {
             Some(ResponseBody::Unbound { existed }) => *existed,
             Some(ResponseBody::Refused { .. }) => true,
             _ => false,
         };
         let overlapped = self.registering_before || churn.started != self.started_before;
-        if removed && !overlapped {
-            // With no registration under way when the request began and none started since, the
-            // removal is about a registration the client read the answer to, which is one it
-            // counts, or about one that another removal has already taken off the count. Nothing
-            // is live at the host after either answer, so taking one more off cannot leave the
-            // count below what the host holds; it saturates at nothing.
-            churn.live = churn.live.saturating_sub(1);
-            self.sink.forget(self.binding_id);
+        if answered && !overlapped {
+            // With no registration under way when the request began and none started since, every
+            // registration of the identifier had been answered before the host read the request,
+            // and the host's answer, whichever it is, leaves it holding none: a registration it
+            // held was removed by this request or by another removal, and a refusal takes the
+            // registration out of the runtime as well. So nothing is live, whatever the count was,
+            // and a count that an overlap left too high ends here.
+            churn.live = 0;
+            if removed {
+                self.sink.forget(self.binding_id);
+            }
         }
         churn.removing = churn.removing.saturating_sub(1);
         if churn.idle() {
@@ -1014,9 +1022,11 @@ impl PluginClient {
     /// none of it is shown to the identifier's next one.
     ///
     /// That is done when the answer is read, whatever the caller of this has done by then: a
-    /// caller that stops waiting for the answer, by a deadline of its own or by dropping this
-    /// future, leaves the removal with the host, which carries it out, and the queue is emptied as
-    /// the answer comes, where a retry would find nothing to remove.
+    /// caller that stops waiting for the answer after the request was written in full, by a
+    /// deadline of its own or by dropping this future, leaves the removal with the host, which
+    /// carries it out, and the queue is emptied as the answer comes, where a retry would find
+    /// nothing to remove. One that stops before the request was written sends nothing, and a retry
+    /// finds the binding.
     ///
     /// That holds for a caller that registers the identifier again only after this returns, which
     /// is what a worker does. A caller that has a registration of the identifier under way when

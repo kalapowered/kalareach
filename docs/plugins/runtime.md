@@ -227,9 +227,10 @@ again, and it asks only the registration that suffered the loss. The host writes
 registration produced before it answers that registration's unbind, and nothing after, so the
 worker's client empties its own queue of the binding's notices when it reads an answer that says a
 binding was removed. It does so when it reads the answer, whether or not the caller that asked is
-still waiting: a caller that gives up on an unbind leaves the host to carry it out, and a retry
-finds nothing to remove. That is exact for a worker, which registers the identifier again only
-after the answer. A caller with a registration of the identifier under way when the unbind begins,
+still waiting: a caller that gives up on an unbind after its request was written in full leaves the
+host to carry it out, and a retry finds nothing to remove, while one that gives up before the
+request was written sends nothing, and a retry finds the binding. That is exact for a worker,
+which registers the identifier again only after the answer. A caller with a registration of the identifier under way when the unbind begins,
 or one that starts one while it waits, could have the new registration's first notices written
 before the answer, with nothing in a notice to tell them from the old ones, so its client keeps
 what its queue holds. A registration is under way until the host has answered it, also when its
@@ -244,9 +245,10 @@ left in its own queue out, but the writer may have written a notice already, and
 only word the client has that the registration it came from is gone. So the client empties its
 queue of the identifier when it reads the refusal, unless it counts a registration of the
 identifier as live or another registration of it is still waiting for its answer. It counts a
-registration as live from the host's answer that it was registered, and stops counting it at the
-answer to a removal that no registration overlapped. After a removal that one overlapped it can
-count more than the host holds, which keeps the queue.
+registration as live from the host's answer that it was registered, and counts none at the answer
+to a removal that no registration overlapped, whatever that answer says, because the host holds
+none then. After a removal that one overlapped it can count more than the host holds, which keeps
+the queue until the next removal that nothing overlapped.
 
 A binding also holds a bounded number of unanswered calls. A caller whose deadline ran out has
 stopped waiting, but its request is still on the binding's thread until that thread reaches it, and
