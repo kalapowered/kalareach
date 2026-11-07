@@ -2122,34 +2122,47 @@ fn held_open(error: &std::io::Error) -> bool {
     cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
 }
 
+/// Whether a failure to look at `path` leaves nothing there to scan: it was removed since its
+/// folder was listed or was never made, or, on Windows, it is a lock file another process holds
+/// open without sharing it, as the daemon holds its own (it records the daemon's process id, which
+/// holds no secret). A lock file nothing holds is read, and so is every lock file on Unix.
+fn nothing_to_scan(path: &Path, error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || (held_open(error)
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "lock"))
+}
+
 /// Every file below `root`, by relative path.
+///
+/// A folder, an entry or a file the scan cannot look at would leave a scan of the tree vacuous, so
+/// it fails the case, unless it leaves nothing there to scan ([`nothing_to_scan`]). A socket or a
+/// pipe is not a file and is not read.
 fn tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, at: &Path, into: &mut BTreeMap<String, Vec<u8>>) {
-        let Ok(entries) = std::fs::read_dir(at) else {
-            return;
+        let entries = match std::fs::read_dir(at) {
+            Ok(entries) => entries,
+            Err(error) if nothing_to_scan(at, &error) => return,
+            Err(error) => panic!("{} cannot be listed: {error}", at.display()),
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) if nothing_to_scan(at, &error) => continue,
+                Err(error) => panic!("an entry of {} cannot be read: {error}", at.display()),
+            };
+            let kind = match std::fs::metadata(&path) {
+                Ok(kind) => kind,
+                Err(error) if nothing_to_scan(&path, &error) => continue,
+                Err(error) => panic!("{} cannot be examined: {error}", path.display()),
+            };
+            if kind.is_dir() {
                 walk(root, &path, into);
-            } else if path.is_file() {
-                // A regular file that exists and cannot be read would leave a scan of the tree
-                // vacuous, so it fails the case. Three kinds are not read: one removed since the
-                // folder was listed; a socket or a pipe, which is not a file; and, on Windows, a
-                // lock file another process holds open without sharing it, as the daemon holds its
-                // own (it records the daemon's process id, which holds no secret). A lock file
-                // nothing holds is read, and so is every lock file on Unix.
+            } else if kind.is_file() {
                 let bytes = match std::fs::read(&path) {
                     Ok(bytes) => bytes,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error)
-                        if held_open(&error)
-                            && path
-                                .extension()
-                                .is_some_and(|extension| extension == "lock") =>
-                    {
-                        continue;
-                    }
+                    Err(error) if nothing_to_scan(&path, &error) => continue,
                     Err(error) => panic!("{} cannot be read: {error}", path.display()),
                 };
                 // Named with `/` between its parts on every platform, so a case compares a name
