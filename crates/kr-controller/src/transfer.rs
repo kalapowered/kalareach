@@ -1111,11 +1111,15 @@ impl TransferModule {
                 }
                 // A refusal that cannot be written down is not told as a definite one, nor as the
                 // store's transient word: it can be a word about what another copy of the action
-                // did. The record is read instead. It is the answer where the action has one, and
-                // where there is none to be read the outcome is not known.
+                // did. The record is read instead. It is the answer where the action has one, under
+                // the check any retained answer is owed, and where there is none to be read the
+                // outcome is not known.
                 Err(_) => {
                     return match service.retained_action(&actor, action_id, name, digest) {
-                        Ok(Some(retained)) => answer_of(retained),
+                        Ok(Some(retained)) => {
+                            admission.check_retained()?;
+                            answer_of(retained)
+                        }
                         Ok(None) => Err(ControllerError::refusal_not_recorded()),
                         Err(error @ kr_transfer::TransferError::IdConflict { .. }) => {
                             Err(error.into())
