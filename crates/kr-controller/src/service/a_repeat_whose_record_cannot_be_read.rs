@@ -439,7 +439,8 @@ async fn a_repeat_of_an_unfinished_share_whose_grants_cannot_be_read_is_told_the
 }
 
 /// KR-REQ-09.09: a repeat of an unfinished revocation, asked of a registry that cannot read the
-/// grants its records are compared with, is told the outcome is unknown. The claim shows the first
+/// grants its records are compared with, or that holds a grant it cannot decode, is told the outcome
+/// is unknown. The claim shows the first
 /// attempt began and the grants are what say whether it withdrew anything, so a transient word
 /// would say that nothing took effect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -467,4 +468,24 @@ async fn a_repeat_of_an_unfinished_revocation_whose_grants_cannot_be_read_is_tol
         .execute_batch("ALTER TABLE grants_aside RENAME TO grants;")
         .expect("the grants can be read again");
     assert_eq!(waiting.code, ErrorCode::OutcomeUnknown, "{waiting:?}");
+
+    // The row of the grant the revocation names is not an encoding of a grant.
+    let named = mutation
+        .params
+        .to_typed::<GrantRevokeParams>()
+        .expect("the parameters of the revocation")
+        .grant_id;
+    registry
+        .execute(
+            "INSERT INTO grants (grant_id, recipient_device_id, grant, issued_at_ms)
+             VALUES (?1, x'00', x'ff', 1)",
+            rusqlite::params![named.get().as_bytes().to_vec()],
+        )
+        .expect("the row is written");
+    let undecoded = told(
+        controller
+            .retained_authority_answer(&actor_id, &mutation)
+            .await,
+    );
+    assert_eq!(undecoded.code, ErrorCode::OutcomeUnknown, "{undecoded:?}");
 }
