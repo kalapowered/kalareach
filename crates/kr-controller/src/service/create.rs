@@ -730,9 +730,28 @@ impl Controller {
         let place = {
             let project = Arc::clone(self.project().service());
             let directory = create.cwd.as_ref().cloned();
-            tokio::task::spawn_blocking(move || project.session_place(directory.as_deref()))
-                .await
-                .map_err(|error| ControllerError::supervision(error.to_string()))?
+            #[cfg(test)]
+            let panics = self
+                .place_lookup_panics
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let looked = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                assert!(!panics, "the look at where the session starts was lost");
+                project.session_place(directory.as_deref())
+            })
+            .await;
+            match looked {
+                Ok(place) => place,
+                Err(error) => {
+                    // The thread that looked is lost, and nothing was started, so the reservation
+                    // is resolved as a confirmed failure and stops occupying the environment. No
+                    // other attempt holds it: a repeat would otherwise be told, until the next
+                    // start, that this one is still under way.
+                    hold.end_wait().await;
+                    self.resolve_failed(reservation.reservation_id).await?;
+                    return Err(ControllerError::supervision(error.to_string()));
+                }
+            }
         };
 
         // The reservation moves to `spawned` before anything is started. A worker can reach the

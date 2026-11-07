@@ -1967,6 +1967,54 @@ async fn a_create_whose_directory_cannot_be_made_releases_its_reservation() {
     );
 }
 
+/// KR-REQ-09.09: a create that ends before it has asked for a worker settles the reservation it
+/// made, whatever ended it, and the same create asked again is told what the reservation shows. The
+/// look at where the session starts is made on a thread of its own, and a thread that is lost is a
+/// failure of the create, which nothing else in the host would answer for: with the reservation
+/// left as `reserved`, every repeat would be told that the first attempt is still under way, and no
+/// attempt is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_that_ends_before_it_asks_for_a_worker_settles_its_reservation() {
+    let (temp, controller, asked) = daemon().await;
+    let environment_id = temp.environment_id();
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let request = create_request(environment_id);
+    let carried = carried(&controller, connection_id, half_a_minute(&controller));
+
+    controller
+        .place_lookup_panics
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let first = controller
+        .session_create(&actor_id, &request, carried)
+        .await
+        .into_answer()
+        .expect_err("a create whose look at where the session starts is lost starts nothing");
+    assert!(
+        asked.lock().expect("the record is not poisoned").is_empty(),
+        "no worker was asked for: {first}"
+    );
+    let reservation = controller
+        .registry
+        .lock()
+        .await
+        .reservation_for_token(&actor_id, request.action_id.get())
+        .expect("reads the token")
+        .expect("the first attempt reserved the token");
+    assert_eq!(
+        reservation.phase,
+        LaunchPhase::Failed,
+        "the create that made the reservation settles it"
+    );
+    assert!(reservation.claimed_key.is_none(), "no worker claimed it");
+
+    let told = controller
+        .session_create(&actor_id, &request, carried)
+        .await
+        .into_answer()
+        .expect_err("a create that started nothing leaves no session to answer with");
+    assert_eq!(told.code(), ErrorCode::ResourceUnavailable, "{told}");
+}
+
 /// Makes the registry refuse the write that moves a reservation to `spawned`, which a create
 /// makes after it has registered the wait for its worker.
 fn refuse_the_move_to_spawned(temp: &kr_ipc::testing::TempHost) {
