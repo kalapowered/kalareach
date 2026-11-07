@@ -17,7 +17,7 @@ import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
 import { MobileApp } from '../src/mobile/MobileApp'
 import { PURCHASE_WORDS } from '../src/model/account'
-import { readAloud } from './live-regions'
+import { readAloud, shown } from './live-regions'
 
 const SIGNED_IN = {
   state: 'signed_in',
@@ -114,6 +114,11 @@ describe('recovery', () => {
     })
     expect(controls.recovery.turnedOn).toBe(1)
     expect(within(recovery).getByTestId('recovery-status')).toHaveTextContent('reach.kala.to')
+    // The live region says where the bundle is kept as words, and a screen reader reads no dotted form.
+    expect(readAloud(within(recovery).getByTestId('recovery-status'))).toContain(
+      'The bundle is kept at reach dot kala dot to.'
+    )
+    expect(readAloud(within(recovery).getByTestId('recovery-status'))).not.toContain('reach.kala.to')
     expect(within(recovery).queryByTestId('recovery-turn-on')).toBeNull()
     // The pressed control is gone, so focus is on the line that says what happened.
     expect(within(recovery).getByTestId('recovery-status')).toHaveFocus()
@@ -189,7 +194,9 @@ describe('recovery', () => {
     const words = within(recovery).getByTestId('recovery-blocker')
     expect(words).toHaveTextContent('sync.example')
     expect(words).toHaveTextContent('reach.kala.to')
-    expect(words).toHaveTextContent(/change the setting to reach\.kala\.to/i)
+    expect(shown(words)).toMatch(/change the setting to reach\.kala\.to/i)
+    expect(readAloud(words)).toContain('names sync dot example, which is not the service this device is signed in to (reach dot kala dot to)')
+    expect(readAloud(words)).toContain('Change the setting to reach dot kala dot to to use recovery.')
     expect(within(recovery).queryByRole('button')).toBeNull()
 
     // With a record of a bundle, the service is the one the record names, which the setting cannot
@@ -203,13 +210,19 @@ describe('recovery', () => {
       controls.account.set({ ...SIGNED_IN, generation: 'dddd' })
     })
     await waitFor(() => {
-      expect(within(recovery).getByTestId('recovery-blocker')).toHaveTextContent(
+      expect(shown(within(recovery).getByTestId('recovery-blocker'))).toContain(
         'names sync.example as the service for its bundle'
       )
     })
     const kept = within(recovery).getByTestId('recovery-blocker')
     expect(kept).toHaveTextContent('reach.kala.to')
-    expect(kept).toHaveTextContent('until this device is signed in to sync.example')
+    expect(readAloud(kept)).toContain('names sync dot example as the service for its bundle')
+    expect(readAloud(kept)).toContain('signed in to reach dot kala dot to,')
+    // The note that the bundle stays where its kit points is a sentence of the same region.
+    expect(readAloud(within(recovery).getByTestId('recovery-stays-at'))).toBe(
+      'Recovery stays at sync dot example, where its kit points. Choosing another sync service does not move it.'
+    )
+    expect(shown(kept)).toContain('until this device is signed in to sync.example')
     // The old instructions, in either form, are not among the words: the setting cannot move a
     // record, so neither a change of it nor a choice of the account's service is asked for.
     expect(kept).not.toHaveTextContent(/change the setting/i)

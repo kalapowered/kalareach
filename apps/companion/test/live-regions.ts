@@ -52,3 +52,10 @@ export function readAloud(element: Element): string {
   }
   return read(element).replace(/\s+/g, ' ').trim()
 }
+
+/** The words as they are drawn: the text of `element` less what is there for a screen reader alone. */
+export function shown(element: Element): string {
+  const copy = element.cloneNode(true) as Element
+  for (const each of copy.querySelectorAll('.spoken-form')) each.remove()
+  return copy.textContent ?? ''
+}

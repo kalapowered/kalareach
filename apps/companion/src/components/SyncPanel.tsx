@@ -70,7 +70,7 @@ import {
   describeSettingsSync,
   describeWaiting
 } from '../model/settings'
-import { ServiceAddress } from './ServiceAddress'
+import { sayingAddresses, ServiceAddress } from './ServiceAddress'
 import { SettingsChoiceForm } from './SettingsChoice'
 import { SettingsDevices } from './SettingsDevices'
 import { Button, Card, Switch } from './ui'
@@ -428,7 +428,9 @@ export function SyncPanel({
                 data-testid="settings-sync-status"
               >
                 {settings !== null ? (
-                  <p className="account-lead">{describeSettingsSync(settings.sync)}</p>
+                  <p className="account-lead">
+                    {sayingAddresses(describeSettingsSync(settings.sync), [settings.sync.kept_at])}
+                  </p>
                 ) : null}
                 {settings?.sync.state === 'off' ? (
                   <p className="account-note">{SETTINGS_SYNC_HELP}</p>
@@ -650,14 +652,16 @@ export function SyncPanel({
                 data-testid="recovery-status"
               >
                 {recovery !== null ? (
-                  <p className="account-lead">{describeRecovery(recovery)}</p>
+                  <p className="account-lead">
+                    {sayingAddresses(describeRecovery(recovery), [recovery.kept_at])}
+                  </p>
                 ) : null}
                 {recovery?.state === 'unsettled' ? (
                   <p className="account-note">{SETTLE_HELP}</p>
                 ) : null}
                 {staysAt !== null ? (
                   <p className="account-note" data-testid="recovery-stays-at">
-                    {staysAt}
+                    {sayingAddresses(staysAt, [recovery?.kept_at])}
                   </p>
                 ) : null}
                 {blocker !== null ? (
@@ -666,7 +670,10 @@ export function SyncPanel({
                     data-testid="recovery-blocker"
                     data-reason={blocker.reason}
                   >
-                    {describeBlocker(blocker, recovery?.kept_at ?? null)}
+                    {sayingAddresses(
+                      describeBlocker(blocker, recovery?.kept_at ?? null),
+                      blocker.reason === 'wrong_service' ? [blocker.sync_service, blocker.account] : []
+                    )}
                   </p>
                 ) : null}
                 {recovery?.state === 'off' ? (
