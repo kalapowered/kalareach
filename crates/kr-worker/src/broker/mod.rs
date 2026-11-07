@@ -1258,7 +1258,7 @@ impl Broker {
         profile_id: Option<LaunchProfileId>,
         process: Option<ManagedProcess>,
     ) -> Result<()> {
-        let semantic = crate::broker::semantic::SemanticLog::new();
+        let semantic = crate::broker::semantic::SemanticLog::new(Arc::clone(&self.observation));
         let mut state = self.state();
         state.check_unheld(application_instance_id)?;
         state.insert_instance(application_instance_id, mode, profile_id, process, semantic);
@@ -1278,7 +1278,7 @@ impl Broker {
         profile_id: Option<LaunchProfileId>,
         process: Option<ManagedProcess>,
     ) -> Result<()> {
-        let semantic = crate::broker::semantic::SemanticLog::new();
+        let semantic = crate::broker::semantic::SemanticLog::new(Arc::clone(&self.observation));
         let mut state = self.state();
         if state.launches.get(&application_instance_id) != Some(&token) {
             return Err(BrokerError::invalid(format!(
@@ -1327,7 +1327,7 @@ impl Broker {
         process: ProcessStartIdentity,
         saved_conversation: Option<String>,
     ) -> Result<()> {
-        let semantic = crate::broker::semantic::SemanticLog::new();
+        let semantic = crate::broker::semantic::SemanticLog::new(Arc::clone(&self.observation));
         let mut state = self.state();
         state.check_unheld(application_instance_id)?;
         state.stored(kr_ipc::now_ms(), "a launch profile", |ledger| {
@@ -3947,6 +3947,19 @@ impl Broker {
     }
 
     // -- observed history ---------------------------------------------------------------------
+
+    /// Removes the semantic history every instance retains, as enabling privacy mode does, and says
+    /// how much that was.
+    pub fn discard_semantic_history(&self) -> crate::broker::semantic::Discarded {
+        let mut state = self.state();
+        let mut discarded = crate::broker::semantic::Discarded::default();
+        for instance in state.instances.values_mut() {
+            let removed = instance.semantic.discard();
+            discarded.entries += removed.entries;
+            discarded.bytes += removed.bytes;
+        }
+        discarded
+    }
 
     /// Records one observed semantic entry and returns its cursor.
     ///

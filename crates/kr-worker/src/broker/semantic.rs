@@ -34,6 +34,9 @@
 //! given the last one refuses the next entry ([`Exhausted`]).
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+
+use crate::broker::observation::ObservationLane;
 
 use kr_protocol::agent::AgentSnapshotEntry;
 use kr_protocol::ids::{AgentBindingRevision, AgentTurnId, StreamCursor};
@@ -295,29 +298,57 @@ pub struct ObservedUnder {
     pub turn_id: Option<AgentTurnId>,
 }
 
+/// What discarding a log's retained entries removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Discarded {
+    /// How many entries were held.
+    pub entries: u64,
+    /// The bytes of their texts.
+    pub bytes: u64,
+}
+
 /// One instance's retained semantic entries.
+///
+/// Privacy mode disables content-history retention prospectively (section 24): while the broker's
+/// observation lane says it is on, an entry takes its number and is not kept, and enabling it
+/// removes what was kept ([`SemanticLog::discard`]). The numbers are still spent, so no cursor is
+/// given twice and a reader that holds an earlier one is told there is a gap, which is the
+/// answer to history that is not there.
 #[derive(Debug)]
 pub struct SemanticLog {
     entries: VecDeque<(StreamCursor, AgentSnapshotEntry)>,
     first_retained: StreamCursor,
     next: u64,
-}
-
-impl Default for SemanticLog {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// The lane that knows whether privacy mode is on.
+    lane: Arc<ObservationLane>,
 }
 
 impl SemanticLog {
-    /// An empty log.
+    /// An empty log, retaining while `lane` says privacy mode is off.
     #[must_use]
-    pub const fn new() -> Self {
+    pub const fn new(lane: Arc<ObservationLane>) -> Self {
         Self {
             entries: VecDeque::new(),
             first_retained: StreamCursor::new(1),
             next: 1,
+            lane,
         }
+    }
+
+    /// Removes every retained entry, as enabling privacy mode does. The numbers already given are
+    /// not given again: the earliest cursor this log still holds is the next one.
+    pub fn discard(&mut self) -> Discarded {
+        let discarded = Discarded {
+            entries: self.entries.len() as u64,
+            bytes: self
+                .entries
+                .iter()
+                .map(|(_, entry)| entry.text.len() as u64)
+                .sum(),
+        };
+        self.entries.clear();
+        self.first_retained = StreamCursor::new(self.next);
+        discarded
     }
 
     /// Appends one observed entry, made under `under`, and returns its cursor.
@@ -335,6 +366,12 @@ impl SemanticLog {
         let following = self.next.checked_add(1).ok_or(Exhausted)?;
         let cursor = StreamCursor::new(self.next);
         self.next = following;
+        if self.lane.is_private() {
+            // Nothing is recorded while privacy mode is on. What a reader asks for from before this
+            // is a gap, never an entry.
+            self.discard();
+            return Ok(cursor);
+        }
         let mut text = text.into();
         let kept = text.floor_char_boundary(MAX_ENTRY_TEXT_BYTES);
         let omitted = text.len() - kept;
@@ -477,9 +514,73 @@ impl SemanticLog {
     }
 }
 
+/// Privacy mode's hold on the semantic history every agent instance of a session keeps.
+///
+/// What it removes is the retained entries. What stops new ones being kept is the lane's own flag
+/// ([`ObservationLane::is_private`]), which the session sets with the rest of its privacy
+/// subsystems, so the history follows the same state as the session's output and its descriptions.
+#[derive(Debug)]
+pub struct SemanticPrivacy {
+    broker: Arc<crate::broker::Broker>,
+}
+
+impl SemanticPrivacy {
+    /// Builds the subsystem over a session's broker.
+    #[must_use]
+    pub const fn over(broker: Arc<crate::broker::Broker>) -> Self {
+        Self { broker }
+    }
+}
+
+impl crate::privacy::PrivacySubsystem for SemanticPrivacy {
+    fn name(&self) -> &'static str {
+        "semantic_history"
+    }
+
+    fn fence(
+        &mut self,
+        _generation: crate::privacy::PrivacyGeneration,
+    ) -> Result<crate::privacy::Fenced, crate::privacy::Unavailable> {
+        // The lane's flag, which the session's observation subsystem raises, is what stops an
+        // entry being kept; there is no queue of this subsystem's own to stop.
+        Ok(crate::privacy::Fenced {
+            queues: 1,
+            items: 0,
+        })
+    }
+
+    fn cancel_undispatched(
+        &mut self,
+        _generation: crate::privacy::PrivacyGeneration,
+    ) -> Result<crate::privacy::Cancelled, crate::privacy::Unavailable> {
+        Ok(crate::privacy::Cancelled::default())
+    }
+
+    fn remove_retained(
+        &mut self,
+        _generation: crate::privacy::PrivacyGeneration,
+    ) -> Result<crate::privacy::Removed, crate::privacy::Unavailable> {
+        let discarded = self.broker.discard_semantic_history();
+        Ok(crate::privacy::Removed {
+            bytes: discarded.bytes,
+            records: discarded.entries,
+        })
+    }
+
+    fn outstanding(&self) -> Result<u64, crate::privacy::Unavailable> {
+        // The removal is synchronous: once it has answered nothing of this history is held.
+        Ok(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lane whose privacy flag a case can raise.
+    fn lane() -> Arc<ObservationLane> {
+        Arc::new(ObservationLane::new())
+    }
 
     /// A log that is about to give `next`, as one that has given every number before it would be.
     fn log_whose_next_number_is(next: u64) -> SemanticLog {
@@ -487,11 +588,12 @@ mod tests {
             entries: VecDeque::new(),
             first_retained: StreamCursor::new(next),
             next,
+            lane: lane(),
         }
     }
 
     fn log(count: u64) -> SemanticLog {
-        let mut log = SemanticLog::new();
+        let mut log = SemanticLog::new(lane());
         for index in 1..=count {
             said(&mut log, format!("entry {index}"), index);
         }
@@ -562,7 +664,7 @@ mod tests {
     fn an_entry_larger_than_its_part_is_carried_cut_at_a_character_boundary() {
         const ALLOWANCE: u64 = 1_000;
         let large = "€".repeat(2_000);
-        let mut log = SemanticLog::new();
+        let mut log = SemanticLog::new(lane());
         said(&mut log, "said before", 1);
         said(&mut log, large.clone(), 2);
         said(&mut log, "said after", 3);
@@ -650,7 +752,7 @@ mod tests {
 
     #[test]
     fn an_evicted_range_rebuilds_with_a_visible_history_gap() {
-        let mut log = SemanticLog::new();
+        let mut log = SemanticLog::new(lane());
         for index in 1..=(MAX_RETAINED_ENTRIES as u64 + 10) {
             said(&mut log, format!("entry {index}"), index);
         }
@@ -713,7 +815,7 @@ mod tests {
             log.replay(from, filter, 100_000, SnapshotCarried::NOTHING)
                 .expect("every entry fits a part of its own")
         };
-        let mut log = SemanticLog::new();
+        let mut log = SemanticLog::new(lane());
         said(&mut log, large.clone(), 1_000);
         said(&mut log, large.clone(), 2_500);
         said(&mut log, large.clone(), 1_500);
@@ -799,7 +901,7 @@ mod tests {
     /// The control: ordinary numbering is what it was, one after another from one.
     #[test]
     fn entries_are_numbered_one_after_another() {
-        let mut log = SemanticLog::new();
+        let mut log = SemanticLog::new(lane());
         let numbers: Vec<u64> = (1..=3)
             .map(|at| said(&mut log, "entry", at).get())
             .collect();
@@ -897,7 +999,7 @@ mod tests {
     /// snapshot at itself.
     #[test]
     fn a_snapshots_first_entry_is_decided_by_its_part() {
-        let mut log = SemanticLog::new();
+        let mut log = SemanticLog::new(lane());
         let large = "x".repeat(MAX_ENTRY_TEXT_BYTES);
         said(&mut log, large, 1);
         let part = log
@@ -912,7 +1014,7 @@ mod tests {
     /// carries it when its text does not fit.
     #[test]
     fn an_entry_keeps_what_it_was_observed_under_when_its_text_is_cut() {
-        let mut log = SemanticLog::new();
+        let mut log = SemanticLog::new(lane());
         let turn = AgentTurnId::new("turn-9").expect("valid");
         let under = ObservedUnder {
             binding_revision: AgentBindingRevision::new(3),
