@@ -8,15 +8,24 @@ fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
-/// The variables the native compilers read when a build script compiles C or C++: the deployment
-/// target and the SDK, the compilers, their flags and wrappers, each also in the forms the `cc`
-/// crate reads for one target or for the host.
+/// The variables the native compilers and the C builds of the third-party crates read: the
+/// deployment target and the SDK, the compilers, their flags and wrappers, each also in the forms
+/// the `cc` crate reads for one target or for the host, the include and library paths, and the
+/// variables a build script reads and does not tell Cargo about (`SODIUM_LDFLAGS`, `PKG_CONFIG_PATH`).
 const NATIVE: &[&str] = &[
     "MACOSX_DEPLOYMENT_TARGET",
     "IPHONEOS_DEPLOYMENT_TARGET",
     "SDKROOT",
     "DEVELOPER_DIR",
     "CROSS_COMPILE",
+    "CPATH",
+    "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH",
+    "LIBRARY_PATH",
+    "PKG_CONFIG_PATH",
+    "SODIUM_LDFLAGS",
+    "SODIUM_DIST_DIR",
+    "LIBSQLITE3_FLAGS",
     "CC",
     "CXX",
     "CFLAGS",

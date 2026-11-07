@@ -1800,40 +1800,78 @@ mod tests {
     }
 
     #[test]
-    fn a_file_is_told_from_one_of_the_same_name_in_another_directory() {
-        // The same bytes are named alike wherever a macro writes them, and the library's compile
-        // reading one of the files says nothing of the other.
+    fn a_file_is_told_from_one_of_the_same_name_in_another_output_directory_of_the_package() {
+        // The same bytes are named alike wherever a macro writes them, and every build script's
+        // output directory is called `out`: a package can have two (a host and a target build, or
+        // two feature sets), and the library's compile reading a file in one says nothing of the
+        // file in the other, or in a directory under it.
         let directory = tempfile::tempdir().expect("a directory");
         let digest = "5d4140c1a3b2c9d6e7f80a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5";
         let began = SystemTime::now() - Duration::from_secs(10);
-        for beside in ["a", "b"] {
-            std::fs::create_dir(directory.path().join(beside)).expect("a directory");
-            std::fs::write(directory.path().join(beside).join(digest), "x").expect("a file");
+        let first = directory.path().join("build").join("p-1111").join("out");
+        let second = directory.path().join("build").join("p-2222").join("out");
+        for place in [first.clone(), first.join("sub"), second.clone()] {
+            std::fs::create_dir_all(&place).expect("a directory");
+            std::fs::write(place.join(digest), "x").expect("a file");
         }
-        let reads = |beside: &str| {
-            Some(format!(
-                "target: {}\n",
-                directory.path().join(beside).join(digest).display()
-            ))
-        };
-        let compiled = |unit, beside| Compiled {
+        let compiled = |unit, place: &Path| Compiled {
             package: "p".to_owned(),
             unit,
-            read: reads(beside),
+            read: Some(format!("target: {}\n", place.join(digest).display())),
         };
         let dating = date_before(
-            &[("p".to_owned(), directory.path().to_path_buf())],
             &[
-                compiled(Unit::Library, "a"),
-                compiled(Unit::Other, "b"),
-                compiled(Unit::Other, "b"),
+                ("p".to_owned(), first.clone()),
+                ("p".to_owned(), second.clone()),
+            ],
+            &[
+                compiled(Unit::Library, &first),
+                compiled(Unit::Other, &first.join("sub")),
+                compiled(Unit::Other, &first.join("sub")),
+                compiled(Unit::Other, &second),
+                compiled(Unit::Other, &second),
             ],
             began,
         );
-        // The library alone read `a`, and two programs that it did not wait for read `b`.
+        // The library alone read the file in the first output directory, and two programs that it
+        // did not wait for read each of the others.
         assert_eq!(dating.dated, 1, "{dating:?}");
-        assert_eq!(dating.left.len(), 1, "{dating:?}");
-        assert!(dating.left[0].contains("b"), "{dating:?}");
+        assert_eq!(dating.left.len(), 2, "{dating:?}");
+        assert!(
+            dating.left.iter().any(|line| line.contains("sub")),
+            "{dating:?}"
+        );
+        assert!(
+            dating.left.iter().any(|line| line.contains("p-2222")),
+            "{dating:?}"
+        );
+    }
+
+    #[test]
+    fn cargos_status_lines_and_paths_outside_the_checkout_are_not_in_the_end() {
+        // A program that says one line leaves room for the lines Cargo wrote before it, and the
+        // paths of a target directory outside the checkout are the machine's.
+        let text = "    Finished `test` profile [unoptimized] target(s) in 0.1s\n\
+                    \x20    Running unittests src/lib.rs (/ext/target/debug/deps/a-0123)\n\
+                    kr-conformance list-one: /ext/target/debug/deps/a-0123 ended with exit status: 7\n\
+                    cannot write in /ext/cache/a b: the volume is full\n\
+                    cannot write in C:\\ext\\cache\\a.exe: the volume is full\n\
+                    Running the tests now\n\
+                    error: test failed, to rerun pass `-p a --lib`\n\
+                    \nCaused by:\n  could not execute process `/ext/bin/lister list-one /ext/target/debug/deps/a-0123 --list` (never executed)\n";
+        let ends = ends_of(text, Path::new("/nowhere"));
+        for word in ["Finished", "Running unittests", "/ext", "C:", "\\ext"] {
+            assert!(!ends.contains(word), "{word}: {ends}");
+        }
+        for word in [
+            "a-0123 ended with exit status: 7",
+            "the volume is full",
+            "Running the tests now",
+            "(never executed)",
+            "lister list-one a-0123 --list",
+        ] {
+            assert!(ends.contains(word), "{word}: {ends}");
+        }
     }
 
     #[test]
