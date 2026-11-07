@@ -63,6 +63,11 @@ AWAY = ([-1.807, 0.32, 3.584], [0.0, 30.0, 0.0])
 # looks at a frame about eight times a second, so this is many frames.
 VIEW_SECONDS = 6
 
+# How long a scan is given in all: every view its seconds, and a minute besides for the wrong codes
+# put away on the way. A wrong code restarts the scanner at the same view; it never gives the scan
+# more time than this.
+SCAN_SECONDS = len(VIEWS) * VIEW_SECONDS + 60
+
 
 def look(port: str, view) -> None:
     """Puts the virtual camera at `view`."""
@@ -286,9 +291,10 @@ def scan(
     """
     wait_for_file(directory, f"{picture}.png.added")
     phone.press(opener)
+    limit = time.monotonic() + SCAN_SECONDS
     for view in VIEWS:
         look(port, view)
-        end = time.monotonic() + VIEW_SECONDS
+        end = min(time.monotonic() + VIEW_SECONDS, limit)
         while time.monotonic() < end:
             nodes = phone.screen()
             asking = [node for node in nodes if node["label"] in ("While using the app", "Only this time", "Allow")]
@@ -302,7 +308,7 @@ def scan(
                 phone.press("Cancel")
                 phone.wait(lambda each: each == "Pair with a host", "the pairing screen after the wrong code was put away")
                 phone.press("Scan code")
-                end = time.monotonic() + VIEW_SECONDS
+                end = min(time.monotonic() + VIEW_SECONDS, limit)
                 continue
             time.sleep(0.3)
     phone.give_up(f"timed out waiting for {what}: the scanner read the picture at none of {len(VIEWS)} views")
@@ -789,7 +795,15 @@ def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
     """A second host, paired by the same scan as a guest, which then refuses the phone its inbox
     (13.01): the inbox of the host in use says that host refused to show its inbox, in the host's own
     words and without calling it lost, beside what the host in use holds. Nothing before the refusal
-    says it did: the guest is served an empty inbox, and the host chooses to refuse after."""
+    says it did, and the host chooses to refuse after. The host keeps only a count of the phone's
+    connections, no request of the phone's, so which request of the phone's it refused is not
+    recorded: the picture of the host's lapsed words on the phone's screen is the evidence of the
+    refusal. A device under a lapsed bound is still admitted, and the host refuses its requests alike:
+    who the host is and the opening of the connection (the first two a connection of the application
+    makes) as much as the inbox read. The application gives a refusal of any request of its visit as
+    the same row, with the host's words. So a control stands beside the screen: another guest of that
+    host, paired as the phone is, is served before the choice, and the host's answer to each of those
+    three requests after it is recorded."""
     # The picker case took the camera's permission away for good. A person who scans a second host
     # allows it again, in the system's settings.
     camera = "android.permission.CAMERA"
@@ -812,6 +826,9 @@ def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
         if outcome["label"] == "Check this value on the host":
             break
         opener = "Scan again"
+    # Three scans that each ended in a refusal leave the screen on the refusal: it is named here, with
+    # the screen, and not found out by the host's file that never comes.
+    phone.wait(lambda each: each == "Check this value on the host", "the second host's value", 90)
     wait_for_file(directory, "second-value.txt")
     host = read(directory, "second-value.txt").replace(" ", "")
     spelled = ", ".join(" ".join(group) for group in (host[:4], host[4:]))
@@ -828,7 +845,8 @@ def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
     say("the second host is paired by the same scan and listed beside the first, which stays in use")
 
     # Nothing of the second host is refused yet. The host chooses to refuse once it is serving a
-    # connection of the phone, which the phone's visit of its inbox keeps: it waits for that itself.
+    # connection of the phone, which the phone's visit of the second host's inbox opened and which
+    # may not have read yet: it waits for that itself.
     environment = read(directory, "second-environment.txt")[:8]
     if re.fullmatch(r"[0-9a-f]{8}", environment) is None:
         phone.give_up(f"the second host named no environment: {environment!r}")
@@ -861,7 +879,18 @@ def a_host_that_refuses(phone: Phone, directory: Path, port: str) -> None:
     phone.shot("inbox-host-refused")
     say("the inbox shows a host that refused it, in the host's words, above what the host in use holds")
     result = read(directory, "bound-result.txt")
-    if not result.startswith("before served items=0\nafter refused PermissionDenied: ") or "offline-validity policy has lapsed" not in result:
+    # The host's count of the phone's connections when it chose, and the control's answers: its inbox
+    # served before, then each of the three requests refused alike after the choice, with the lapsed
+    # words.
+    lapsed = r"refused PermissionDenied: [^\n]*offline-validity policy has lapsed[^\n]*"
+    wanted = (
+        r"phone connections served at the choice: [1-9][0-9]*\n"
+        r"control before read: served items=0\n"
+        rf"control after host\.info: {lapsed}\n"
+        rf"control after session\.open: {lapsed}\n"
+        rf"control after read: {lapsed}"
+    )
+    if re.fullmatch(wanted, result) is None:
         raise SystemExit(f"the second host did not answer as expected: {result}")
 
 
