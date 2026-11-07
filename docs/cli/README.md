@@ -2035,7 +2035,9 @@ A revocation is complete when every affected session's worker has fenced it, so 
 how far they have got. Until then it is pending, not a success: the command names each worker it
 waits for with the reason the host gives, and exits with 1 and `RESOURCE_UNAVAILABLE`; its `--json`
 document is the host's whole result with the failure beside it. Running it again reports how far
-the revocation has got. A worker that has fenced it but whose evidence has not all arrived is named
+the revocation has got. While any worker is pending, the command names every worker the host
+listed with its state, so a result where one session's worker has fenced it and another's has not
+says which is which. A worker that has fenced it but whose evidence has not all arrived is named
 too, and so is any action a worker could not show did not run before the revocation reached it.
 
 ## `kr action`
@@ -2121,7 +2123,8 @@ listed as `viewer plus question.respond`. A share that carries no role in full, 
 `session.view`, is listed as `custom:` and its rights.
 `kr share revoke` takes a share back, or withdraws an invitation nobody has accepted. A revocation
 is complete when every affected session's worker has fenced it; until then it is pending, and the
-command names each session whose worker has not fenced it and exits with 1. When the host cut its
+command names every session the host listed with its state, the ones whose workers have fenced it
+as well as the ones that have not, and exits with 1. When the host cut its
 list of workers, it listed those still waiting first, so the command says "at least" before the
 count of them, and `barrier.workers_total` gives how many workers were affected in all. Asking again
 is a new revocation. What the device already saw stays with it. With `--json` it returns `grant_id`
@@ -2136,7 +2139,14 @@ each worker has fenced the revocation.
 `kr share transfer` hands a session's control to another device. The host describes the transfer
 from its own records, an owner device confirms exactly that plan, and the command then sends the
 transfer under the action the confirmation was asked for. Afterwards the receiving device holds the
-session and the giving device's grant is revoked.
+session and the giving device's grant is revoked. That revocation is stated as `kr share revoke`
+states one: the authority revision the host issued and each affected session's worker with its
+state. The command calls the giving grant revoked only when every worker has fenced it; until then
+it says the revocation is pending, names the sessions as above and exits with 1. When the host's
+answer was not read, it says that the receiving device was handed the session and that whether the
+giving grant is fenced is not known. With `--json` the document carries `authority_revision`,
+`revoked_grants`, `revoked_grants_total` and the `barrier` beside the session, the two grants and
+the receiving device, and `barrier_holds` as before.
 
 While it waits for the owner device, the command reads the host's list of pending confirmations
 once a second. Each read is given thirty seconds, and never past the end of the challenge, which is

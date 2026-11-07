@@ -1916,7 +1916,7 @@ fn finish_transfer(
         }),
     };
     if json {
-        let document = Document::new()
+        let mut document = Document::new()
             .with("session_id", closed(&descriptor.session_id))
             .with("from_grant_id", closed(&from))
             .with("new_grant_id", closed(&new_grant_id))
@@ -1924,30 +1924,73 @@ fn finish_transfer(
             .with(
                 "barrier_holds",
                 result.map(|result| result.revoked.barrier.holds()),
-            )
-            .with("ok", true);
+            );
+        // The revocation of the giving device's grant, in the shape a revocation is answered in.
+        if let Some(result) = result {
+            document.merge(crate::device::revocation_document(&result.revoked));
+        } else {
+            document.set("ok", true);
+        }
         match &error {
             None => output::document(&document),
             Some(error) => output::document(&report::with_failure(document, error)),
         }
     } else {
-        output::line(&stdout_line!(
-            "Session {} {} {}. Grant {} holds it; grant {} was revoked.",
+        output::lines(&transfer_lines(
             descriptor.display_number.get(),
-            if result.is_some() {
-                "is now with"
-            } else {
-                "was handed to"
-            },
-            Asked::text(Request::Devices, &receiver.display_name),
-            new_grant_id,
-            from
+            &receiver.display_name,
+            (from, new_grant_id),
+            result.map(|result| &result.revoked),
         ));
         if let Some(error) = &error {
             report::failed(error);
         }
     }
     Ok(error.map_or(Completion::Done, Completion::Reported))
+}
+
+/// What a transfer did, as lines for a person: where the session went, and how far each affected
+/// session's worker has got in fencing the giving device's grant. A grant some worker has not
+/// fenced, or whose result was not read, is not said to be revoked.
+fn transfer_lines(
+    session_number: u64,
+    receiver_name: &str,
+    (from, new_grant_id): (GrantId, GrantId),
+    revoked: Option<&RevocationResult>,
+) -> Vec<Line> {
+    let Some(revoked) = revoked else {
+        return vec![stdout_line!(
+            "Session {} was handed to {}. Grant {} holds it. Whether grant {}, the giving \
+             device's, is revoked and fenced is not known: the host's answer was not read.",
+            session_number,
+            Asked::text(Request::Devices, receiver_name),
+            new_grant_id,
+            from
+        )];
+    };
+    let first = if revoked.barrier.holds() {
+        stdout_line!(
+            "Session {} is now with {}. Grant {} holds it; grant {} was revoked, at authority \
+             revision {}.",
+            session_number,
+            Asked::text(Request::Devices, receiver_name),
+            new_grant_id,
+            from,
+            revoked.authority_revision
+        )
+    } else {
+        stdout_line!(
+            "Session {} is now with {}. Grant {} holds it. The revocation of grant {} is \
+             pending, at authority revision {}: it is complete only when these sessions' workers \
+             fence it.",
+            session_number,
+            Asked::text(Request::Devices, receiver_name),
+            new_grant_id,
+            from,
+            revoked.authority_revision
+        )
+    };
+    crate::device::barrier_lines(first, &revoked.barrier)
 }
 
 #[cfg(test)]
@@ -2269,6 +2312,51 @@ mod tests {
             revoked_grants_total: U64::new(0),
             barrier,
         }
+    }
+
+    /// KR-REQ-18.14, a transfer: the giving device's grant is revoked with the transfer, so what the
+    /// command says of it is a revocation's. It states the authority revision, says it is pending
+    /// and names the session whose worker has not fenced it while one has not, and says the grant
+    /// is revoked only when every worker has, or nothing of it when the host's answer was not read.
+    #[test]
+    fn a_transfer_states_the_revision_and_each_worker_and_says_revoked_only_when_fenced() {
+        let written = |lines: Vec<Line>| -> String {
+            lines
+                .iter()
+                .map(|line| format!("{}\n", line.text()))
+                .collect()
+        };
+        let from = GrantId::new(Uuid::from_bytes([7; 16]));
+        let new = GrantId::new(Uuid::from_bytes([8; 16]));
+        let waiting = waiting_on_one_of(1);
+        let text = written(transfer_lines(3, "Sam", (from, new), Some(&waiting)));
+        assert!(text.contains("authority revision 4"), "{text}");
+        assert!(text.contains("pending"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "session {}: pending",
+                SessionId::new(Uuid::from_bytes([2; 16]))
+            )),
+            "{text}"
+        );
+        assert!(
+            !text.contains("was revoked"),
+            "a grant a worker has not fenced is not called revoked: {text}"
+        );
+
+        let mut fenced = waiting_on_one_of(1);
+        fenced.barrier.workers[0].state = kr_protocol::action::BarrierState::Acknowledged;
+        let text = written(transfer_lines(3, "Sam", (from, new), Some(&fenced)));
+        assert!(
+            text.contains("was revoked, at authority revision 4"),
+            "{text}"
+        );
+
+        let text = written(transfer_lines(3, "Sam", (from, new), None));
+        assert!(
+            !text.contains("was revoked") && text.contains("not known"),
+            "an unread answer claims nothing of the grant: {text}"
+        );
     }
 
     /// When the host cut its list of workers it named those still waiting first, so how many it
