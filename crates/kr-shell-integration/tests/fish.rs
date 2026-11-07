@@ -36,8 +36,12 @@ fn the_reader_counts_what_the_host_put_into_its_terminal_as_input_it_has_not_tak
     shellpkg::bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(FISH);
 }
 
-/// KR-REQ-08.49: the host's answers alone in the terminal, with no key behind them, are input the
-/// reader has not taken.
+/// KR-REQ-08.49, the last clause for a Fish reader only: the shell bridge accounts for bytes the
+/// host delivered that are not a person's keys. The host's answers alone in the terminal, with no
+/// key behind them, are input the reader has not taken, and once it has read them they have not
+/// reached its edit buffer. Not shown here: the other readers, which the case above shows, and the
+/// clause's other parts (the replies' deadlines and queue limits, source loss closing paste
+/// framing, and what a reply that does alter reader state does to the fence's proof).
 #[test]
 #[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
 fn the_reader_counts_the_hosts_answers_alone_as_input_it_has_not_taken() {

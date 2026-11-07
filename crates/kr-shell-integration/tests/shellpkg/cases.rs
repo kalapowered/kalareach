@@ -7,9 +7,9 @@
 use std::time::Duration;
 
 use kr_protocol::root::{
-    AcceptedOrigin, DETACH_HINT, EditorBufferRevision, EditorLeaveReason, FENCE_EXCHANGE_TIMEOUT,
-    FenceCause, LAUNCH_READER_BUDGET, LaunchCommand, PromptGeneration, RootEditorFenceParams,
-    RootEditorFenceResult, WithheldReason,
+    AcceptedOrigin, DETACH_HINT, EditorBufferRevision, EditorLeaveReason, EditorState,
+    FENCE_EXCHANGE_TIMEOUT, FenceCause, LAUNCH_READER_BUDGET, LaunchCommand, PromptGeneration,
+    RootEditorFenceParams, RootEditorFenceResult, WithheldReason,
 };
 use kr_protocol::scalars::{DurationMs, U64, Uuid};
 use kr_shell_integration::contract::events::{
@@ -550,26 +550,48 @@ pub fn bytes_the_host_put_into_the_terminal_are_input_the_reader_has_not_taken(k
     }
 }
 
-/// KR-REQ-08.49: three answers a terminal gives to a device-attributes query, alone in a Fish
-/// reader's terminal, are input the reader has not taken.
+/// Three answers a terminal gives to a device-attributes query, alone in a Fish reader's terminal,
+/// are input the reader has not taken.
 ///
 /// The case for every reader but PowerShell puts three plain keys behind the answers, because a
 /// reader of Zsh or Bash takes a whole answer out of its keys as it reads them and it is the keys
 /// that are waiting when that reader meets the request. A Fish reader that counted the keys and
 /// nothing else would pass that case, so this one puts the answers into the terminal with nothing
 /// behind them, and what the reader reports on meeting the request is a count of the answers
-/// themselves. Once it has read them a later exchange says the queues are drained.
+/// themselves. Once it has read them a later exchange says the queues are drained, and the editor's
+/// buffer in that answer is empty and at the revision the reader's idle report gave it: taken as
+/// the host's answers, they never reached the command line.
+///
+/// KR-REQ-08.49, the last clause for a Fish reader only: the shell bridge accounts for bytes the
+/// host delivered that are not a person's keys. Not shown here: the other readers, which the case
+/// above shows with keys behind the answers, and the clause's other parts (the replies' deadlines
+/// and queue limits, source loss closing paste framing, and what a reply that does alter reader
+/// state does to the fence's proof).
 ///
 /// # Panics
 ///
-/// Panics when the reader says its terminal's typeahead is drained with the answers unread, or
-/// says it is not after it has taken them.
+/// Panics when the reader says its terminal's typeahead is drained with the answers unread, says
+/// it is not after it has taken them, or has put them into its edit buffer.
 #[cfg(unix)]
 pub fn three_answers_alone_in_the_terminal_are_input_the_fish_reader_has_not_taken() {
-    unread_input_is_not_drained(
+    let (before, after) = unread_input_is_not_drained(
         ShellKind::Fish,
         b"\x1b[?62;22c\x1b[?62;22c\x1b[?62;22c",
         b"",
+    );
+    // Counted as input the reader has not taken is not the same as taken as the person's keys: an
+    // editor that put the answers into the command line would also have them unread until it did.
+    assert!(
+        before.buffer_empty,
+        "the buffer was empty before the answers: {before:?}"
+    );
+    assert!(
+        after.buffer_empty,
+        "the answers the reader took were put into the command line: {after:?}"
+    );
+    assert_eq!(
+        after.buffer_revision, before.buffer_revision,
+        "and the reader's edit buffer was not changed by them"
     );
 }
 
@@ -2695,12 +2717,20 @@ fn shown_since(session: &Session, start: usize) -> String {
 /// Types `unread` into the terminal of an idle reader that is stopped, asks it for its queues, and
 /// expects it to say they are not drained. Then types `completion`, which the reader needs to take
 /// what it has, and expects it to say they are.
+///
+/// Returns the editor's state in the reader's idle report before anything was typed and in the
+/// last answer, which is the one that says the queues are drained, so a case whose bytes should
+/// never reach the buffer can say what the buffer held.
 #[cfg(unix)]
-fn unread_input_is_not_drained(kind: ShellKind, unread: &[u8], completion: &[u8]) {
+fn unread_input_is_not_drained(
+    kind: ShellKind,
+    unread: &[u8],
+    completion: &[u8],
+) -> (EditorState, EditorState) {
     let package = Package::built(kind);
     let mut session = Session::start(&package);
     let first = session.first_prompt();
-    session.expect_event(
+    let (_, idle) = session.expect_event(
         "an idle report from this reader with its queues clear",
         |event| {
             matches!(
@@ -2775,6 +2805,10 @@ fn unread_input_is_not_drained(kind: ShellKind, unread: &[u8], completion: &[u8]
         latest.queues,
         session.terminal_output()
     );
+    let BridgeEvent::ReaderIdle(idle) = idle else {
+        unreachable!("the event was accepted as an idle report")
+    };
+    (idle.editor, latest.editor)
 }
 
 /// KR-REQ-07.34, KR-REQ-07.35: the reader's own boundaries, and the fence its state proves.
