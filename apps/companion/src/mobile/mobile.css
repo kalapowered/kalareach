@@ -207,10 +207,10 @@
 }
 
 /*
- * A label stays inside its own tab, with a gap's room on each side of it: a word that would touch
- * the edge of the screen or the next word takes the next form instead. Where even the bar's last
- * form leaves a tab too narrow for it, it ends in an ellipsis rather than run into the next tab;
- * its whole name stays for a screen reader.
+ * A label stays inside its own tab. In the bar's first form a tab keeps a gap's room on each side of
+ * its label, so a word that would touch the edge of the screen or the next word takes the next form
+ * instead. Where even the bar's last form leaves a tab too narrow for it, it ends in an ellipsis
+ * rather than run into the next tab; its whole name stays for a screen reader.
  *
  * A label keeps the room of its bold form, which the tab the person is on is set in: the tabs keep
  * the same widths wherever the person is, since a face's bold is wider than its regular. Under its
@@ -299,8 +299,6 @@
    */
   inset-block-end: 11px;
   inset-inline-start: 14px;
-  inset-block-end: calc(26px - max(15px, 1lh - var(--gap-2)));
-  inset-inline-start: calc(14px + (1lh - 17px) / 2);
   /*
    * The circle is as tall as the line of its digits, and as wide as it is tall at the least, so it
    * holds them at whatever size the text is set: 17px at the base size. A web view that scales the
@@ -308,7 +306,6 @@
    * out of a circle that did not grow.
    */
   min-inline-size: 1.7em;
-  min-inline-size: 1lh;
   padding-inline: 0.4em;
   border-radius: 999px;
   background: var(--danger);
@@ -317,6 +314,15 @@
   font-weight: 700;
   line-height: 1.7;
   text-align: center;
+}
+
+/* Where the line's own height can be named, the badge's width and place follow it. */
+@supports (height: 1lh) {
+  .m-tab-badge {
+    min-inline-size: 1lh;
+    inset-block-end: calc(26px - max(15px, 1lh - var(--gap-2)));
+    inset-inline-start: calc(14px + (1lh - 17px) / 2);
+  }
 }
 
 :root[data-theme='dark'] .m-tab-badge {
@@ -1101,6 +1107,25 @@
     grid-auto-flow: column;
     gap: var(--gap-2);
     align-items: center;
+  }
+
+  /* A glyph beside its label gives its badge room beside it, as in the stacked forms of the bar. */
+  .m-tab-glyph {
+    display: flex;
+    align-items: center;
+    gap: var(--gap-1);
+    inline-size: auto;
+    block-size: auto;
+    min-block-size: 26px;
+  }
+
+  .m-tab-glyph > svg {
+    flex: none;
+    margin: 2px;
+  }
+
+  .m-tab-badge {
+    position: static;
   }
 
   .m-topbar {
