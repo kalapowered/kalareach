@@ -354,22 +354,14 @@ fn grant_create_request(temp: &kr_ipc::testing::TempHost) -> MutationRequest {
     }
 }
 
-/// KR-REQ-09.09: a repeat of a `grant.create` whose claim is unfinished, asked of a registry that
-/// cannot read what the first attempt wrote, is told the outcome is unknown, by both lookups. The
-/// claim shows the first attempt began, and a transient word would say that nothing took effect and
-/// have the share sent again as though nothing had.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_repeat_of_an_unfinished_share_whose_grants_cannot_be_read_is_told_the_outcome_is_unknown()
- {
-    let (temp, controller) = daemon().await;
-    let actor_id = ActorId::new("local:test").expect("a principal");
-    let mutation = grant_create_request(&temp);
-    let registry = rusqlite::Connection::open(temp.environment().registry_database())
-        .expect("the registry opens beside the daemon's own handle");
-    registry
-        .busy_timeout(std::time::Duration::from_secs(10))
-        .expect("waits for the daemon's own writes");
-    let digest = kr_protocol::digest::mutation_digest(&mutation, &actor_id).expect("digests it");
+/// Writes a claim for `mutation` with nothing recorded under it: an attempt that began and has no
+/// outcome, which no attempt is carrying out.
+fn an_unfinished_claim(
+    registry: &rusqlite::Connection,
+    actor_id: &ActorId,
+    mutation: &MutationRequest,
+) {
+    let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).expect("digests it");
     registry
         .execute(
             "INSERT INTO authority_receipts
@@ -383,6 +375,25 @@ async fn a_repeat_of_an_unfinished_share_whose_grants_cannot_be_read_is_told_the
             ],
         )
         .expect("the claim is written with nothing recorded under it");
+}
+
+/// KR-REQ-09.09: a repeat of a `grant.create` whose claim is unfinished, asked of a registry that
+/// cannot read what the first attempt wrote, or that holds a row for the share it cannot decode, is
+/// told the outcome is unknown, by both lookups. The claim shows the first attempt began, and a
+/// transient word would say that nothing took effect and have the share sent again as though
+/// nothing had, while a refusal of the argument would say that the request was malformed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_of_an_unfinished_share_whose_grants_cannot_be_read_is_told_the_outcome_is_unknown()
+ {
+    let (temp, controller) = daemon().await;
+    let actor_id = ActorId::new("local:test").expect("a principal");
+    let mutation = grant_create_request(&temp);
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("the registry opens beside the daemon's own handle");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    an_unfinished_claim(&registry, &actor_id, &mutation);
 
     registry
         .execute_batch("ALTER TABLE grants RENAME TO grants_aside;")
@@ -402,4 +413,58 @@ async fn a_repeat_of_an_unfinished_share_whose_grants_cannot_be_read_is_told_the
         ErrorCode::OutcomeUnknown,
         "{not_waiting:?}"
     );
+
+    // The row the first attempt wrote for the share is not an encoding of a grant.
+    let (grant_id, _invitation_id) =
+        kr_protocol::sharing::share_identities(&actor_id, mutation.action_id.get());
+    registry
+        .execute(
+            "INSERT INTO grants (grant_id, recipient_device_id, grant, issued_at_ms)
+             VALUES (?1, x'00', x'ff', 1)",
+            rusqlite::params![grant_id.get().as_bytes().to_vec()],
+        )
+        .expect("the row is written");
+    let waiting = told(
+        controller
+            .retained_authority_answer(&actor_id, &mutation)
+            .await,
+    );
+    let not_waiting = told(controller.retained_authority_change(&actor_id, &mutation));
+    assert_eq!(waiting.code, ErrorCode::OutcomeUnknown, "{waiting:?}");
+    assert_eq!(
+        not_waiting.code,
+        ErrorCode::OutcomeUnknown,
+        "{not_waiting:?}"
+    );
+}
+
+/// KR-REQ-09.09: a repeat of an unfinished revocation, asked of a registry that cannot read the
+/// grants its records are compared with, is told the outcome is unknown. The claim shows the first
+/// attempt began and the grants are what say whether it withdrew anything, so a transient word
+/// would say that nothing took effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_of_an_unfinished_revocation_whose_grants_cannot_be_read_is_told_the_outcome_is_unknown()
+ {
+    let (temp, controller) = daemon().await;
+    let actor_id = ActorId::new("local:test").expect("a principal");
+    let mutation = revoke_request(&temp);
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("the registry opens beside the daemon's own handle");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    an_unfinished_claim(&registry, &actor_id, &mutation);
+
+    registry
+        .execute_batch("ALTER TABLE grants RENAME TO grants_aside;")
+        .expect("the grants cannot be read");
+    let waiting = told(
+        controller
+            .retained_authority_answer(&actor_id, &mutation)
+            .await,
+    );
+    registry
+        .execute_batch("ALTER TABLE grants_aside RENAME TO grants;")
+        .expect("the grants can be read again");
+    assert_eq!(waiting.code, ErrorCode::OutcomeUnknown, "{waiting:?}");
 }

@@ -305,11 +305,12 @@ impl Controller {
                     let (grant_id, invitation_id) =
                         kr_protocol::sharing::share_identities(actor_id, mutation.action_id.get());
                     // The claim shows the first attempt began, so a registry that cannot be read
-                    // here has not said that the share was never made.
+                    // here, or holds a row for the share that cannot be decoded, has not said that
+                    // the share was never made.
                     Some(
                         self.sharing
                             .shared(grant_id, invitation_id)
-                            .map_err(|error| error.found_unreadable("authority changes"))
+                            .map_err(|_| ControllerError::record_unreadable("authority changes"))
                             .and_then(|shared| match shared {
                                 Some(shared) => encode(&shared),
                                 None => Err(unfinished_and_unknown()),
@@ -343,6 +344,51 @@ impl Controller {
         actor_id: &ActorId,
         mutation: &MutationRequest,
     ) -> Result<ParamsValue> {
+        // A record that cannot be read here says nothing of whether the earlier attempt carried the
+        // change out, so the repeat is told that what became of it is not known, and not a
+        // transient word, which says nothing took effect. The completion below only raises what the
+        // earlier attempt owed, which is safe to do again, and keeps the words of its own failures.
+        let left = self
+            .what_an_unfinished_revocation_left(actor_id, mutation)
+            .map_err(|error| error.found_unreadable("authority changes"))?
+            .ok_or_else(unfinished_and_unknown)?;
+        match left {
+            OnRecord::Transferred {
+                replacement,
+                withdrawn,
+            } => encode(
+                &self
+                    .complete_transfer(
+                        replacement,
+                        withdrawn.into_iter().collect(),
+                        self.publish_debts(&[]),
+                    )
+                    .await?,
+            ),
+            OnRecord::Revoked { named, withdrawn } => encode(
+                &self
+                    .complete_revocation(
+                        Audience::of(actor_id),
+                        named,
+                        withdrawn.into_iter().collect(),
+                        self.publish_debts(&[]),
+                    )
+                    .await?,
+            ),
+        }
+    }
+
+    /// What this host's records show an unfinished revocation left, when they show that nothing is
+    /// left for it to do ([`Self::revocation_on_record`]), and `None` when they do not.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of a read, or of the request's own parameters.
+    fn what_an_unfinished_revocation_left(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Result<Option<OnRecord>> {
         // The grant a revocation names, whose sessions its answer may name to a device.
         let mut named = None;
         let nothing_left = match mutation.method.method() {
@@ -384,45 +430,32 @@ impl Controller {
             _ => false,
         };
         if !nothing_left {
-            return Err(unfinished_and_unknown());
+            return Ok(None);
         }
         let Some(withdrawn) = self
             .sharing
             .grants()
             .recorded_withdrawal(actor_id, mutation.action_id)?
         else {
-            return Err(unfinished_and_unknown());
+            return Ok(None);
         };
         if mutation.method.method() == Some(Method::GrantTransfer) {
-            let replacement = self
-                .sharing
-                .grants()
-                .record(kr_protocol::sharing::transfer_identity(
-                    actor_id,
-                    mutation.action_id,
-                ))?
-                .ok_or_else(unfinished_and_unknown)?
-                .grant;
-            return encode(
-                &self
-                    .complete_transfer(
-                        replacement,
-                        withdrawn.into_iter().collect(),
-                        self.publish_debts(&[]),
-                    )
-                    .await?,
-            );
+            let Some(written) =
+                self.sharing
+                    .grants()
+                    .record(kr_protocol::sharing::transfer_identity(
+                        actor_id,
+                        mutation.action_id,
+                    ))?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(OnRecord::Transferred {
+                replacement: written.grant,
+                withdrawn,
+            }));
         }
-        encode(
-            &self
-                .complete_revocation(
-                    Audience::of(actor_id),
-                    named,
-                    withdrawn.into_iter().collect(),
-                    self.publish_debts(&[]),
-                )
-                .await?,
-        )
+        Ok(Some(OnRecord::Revoked { named, withdrawn }))
     }
 
     /// Keeps what a claimed action came to, under the hold that claimed it.
@@ -2919,6 +2952,20 @@ pub(super) fn destination_identifier(
 
 /// The answer to an action whose attempt ended without recording what it did, when this host's
 /// records do not show what it did either.
+/// What an unfinished revocation's records show it did, once they show nothing left to do.
+enum OnRecord {
+    /// A grant or a device revocation: the grants it withdrew, and the grant it named.
+    Revoked {
+        named: Option<kr_protocol::ids::GrantId>,
+        withdrawn: Vec<kr_protocol::ids::GrantId>,
+    },
+    /// A transfer: the grant it wrote and the grants it withdrew.
+    Transferred {
+        replacement: kr_protocol::grant::Grant,
+        withdrawn: Vec<kr_protocol::ids::GrantId>,
+    },
+}
+
 fn unfinished_and_unknown() -> ControllerError {
     ControllerError::Uncertain {
         detail: "an earlier attempt at this action ended without recording what it did, and this \
