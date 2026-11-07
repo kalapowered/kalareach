@@ -4898,10 +4898,9 @@ mod tests {
             matches!(looked_up, ControllerError::Uncertain { .. }),
             "{looked_up:?}"
         );
-        let claimed = store
-            .claim_action(&actor, action, &digest, 2)
-            .err()
-            .expect("a refusal that cannot be read is not claimed over");
+        let Err(claimed) = store.claim_action(&actor, action, &digest, 2) else {
+            panic!("a refusal that cannot be read is not claimed over");
+        };
         assert!(
             matches!(claimed, ControllerError::Uncertain { .. }),
             "{claimed:?}"
