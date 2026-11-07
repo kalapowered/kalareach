@@ -8,15 +8,51 @@ fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
+/// The variables the native compilers read when a build script compiles C or C++: the deployment
+/// target and the SDK, the compilers, their flags and wrappers, each also in the forms the `cc`
+/// crate reads for one target or for the host.
+const NATIVE: [&str; 15] = [
+    "MACOSX_DEPLOYMENT_TARGET",
+    "SDKROOT",
+    "DEVELOPER_DIR",
+    "CC",
+    "CXX",
+    "CFLAGS",
+    "CXXFLAGS",
+    "CPPFLAGS",
+    "LDFLAGS",
+    "AR",
+    "CC_x86_64_apple_darwin",
+    "CXXFLAGS_x86_64-apple-darwin",
+    "HOST_CC",
+    "TARGET_CFLAGS",
+    "CRATE_CC_NO_DEFAULTS",
+];
+
 /// The three parts of the key `scripts/cargo-cache-key.sh` prints, with the runner image variables
 /// as given: set to a value, or removed from the environment where `None`.
 fn key(image_os: Option<&str>, image_version: Option<&str>) -> [String; 3] {
+    key_with(image_os, image_version, &[])
+}
+
+/// [`key`] with `extra` set in the environment, after every native compiler variable is removed.
+fn key_with(
+    image_os: Option<&str>,
+    image_version: Option<&str>,
+    extra: &[(&str, &str)],
+) -> [String; 3] {
     let mut command = Command::new("bash");
     command
         .arg("scripts/cargo-cache-key.sh")
         .current_dir(repository())
         .env_remove("ImageOS")
         .env_remove("ImageVersion");
+    for name in NATIVE {
+        command.env_remove(name);
+    }
+    for (name, value) in extra {
+        command.env(name, value);
+    }
     if let Some(value) = image_os {
         command.env("ImageOS", value);
     }
@@ -76,4 +112,24 @@ fn a_machine_that_is_not_a_hosted_runner_has_a_key_of_its_own() {
     assert_ne!(none[0], hosted[0]);
     assert_ne!(none[0], half[0], "one variable is not both");
     assert_ne!(half[0], hosted[0]);
+}
+
+/// Cargo does not see a change to what the native compilers read: a build script that compiles C
+/// reruns only for the variables it names, and a cached build tree keeps the objects it has. So the
+/// key holds them, and a cache built with other flags, another compiler or another deployment
+/// target is not restored. A variable that no compiler reads is not in it.
+#[test]
+fn a_cache_built_with_other_native_compiler_inputs_is_never_restored() {
+    let image = (Some("macos15"), Some("20260907.0337.1"));
+    let base = key_with(image.0, image.1, &[]);
+    for name in NATIVE {
+        let one = key_with(image.0, image.1, &[(name, "a value")]);
+        let other = key_with(image.0, image.1, &[(name, "another value")]);
+        assert_ne!(base[0], one[0], "{name} is not in the key");
+        assert_ne!(one[0], other[0], "{name}'s value is not in the key");
+        // The week and the dependencies are what they were.
+        assert_eq!(base[2], one[2], "{name}");
+    }
+    let unrelated = key_with(image.0, image.1, &[("GITHUB_RUN_ID", "1")]);
+    assert_eq!(base[0], unrelated[0], "a variable no compiler reads");
 }
