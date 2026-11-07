@@ -922,31 +922,9 @@ fn members() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
-fn borrowed(members: &[(String, Vec<u8>)]) -> Vec<(&str, Vec<u8>)> {
-    members
-        .iter()
-        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
-        .collect()
-}
-
-/* -------------------------------------------------------------------------- */
-/* Cases                                                                       */
-/* -------------------------------------------------------------------------- */
-
-/// KR-REQ-24.16, 20.16, 20.19, KR-ACC-033: a fresh host with only the kit previews, then confirms
-/// the digest it saw, and the folder holds exactly the plaintexts; the host's stored keys,
-/// configuration and devices are as they were.
-///
-/// KR-REQ-20.17, the restore through the shipped command only: the archive here also carries an
-/// endpoint key, a control key, host authority, a revoked grant and a name no host archive carries,
-/// and the plan lists those five as not restored, with a reason each; none of their bytes is in
-/// the restored folder, and the host's own secrets, configuration and devices are as they were.
-/// Not shown here: that a backup is made without those keys, which the daemon's production case
-/// shows, or the kind the table gives each name, which the library's case shows.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_of_its_own() {
-    let world = World::new();
-    let rig = Rig::start(SignIn::Usable).await;
+/// The archive of [`members`] with the two kinds of member a host's archive never carries and a
+/// restore never puts back: an endpoint key and a revoked grant.
+fn members_with_every_kind_a_restore_refuses() -> Vec<(String, Vec<u8>)> {
     let mut held = members();
     held.push((
         "keys/endpoint/device".to_owned(),
@@ -956,58 +934,14 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
         "grants/revoked/grant-2".to_owned(),
         b"REVOKED-GRANT-A-RESTORE-MUST-NOT-WRITE".to_vec(),
     ));
-    let sealed = seal(&world, 1, &borrowed(&held));
-    rig.put(&world, &sealed, None).await;
-    let kit = rig.work.join("kit.txt");
-    std::fs::write(&kit, world.kit_text(&[rig.origin()])).expect("the kit file");
-    let kit_arg = kit.display().to_string();
-    let into = folder(&rig, "restored");
-    let into_arg = into.display().to_string();
+    held
+}
 
-    let before = host_state(&rig).await;
-
-    let preview = rig
-        .run(
-            &[
-                "backup",
-                "restore",
-                "--into",
-                &into_arg,
-                "--kit-file",
-                &kit_arg,
-                "--preview",
-                "--json",
-            ],
-            None,
-        )
-        .await;
-    assert!(preview.status.success(), "{}", text(&preview.stderr));
-    assert!(names(&into).is_empty(), "a preview writes nothing");
-    let digest = digest_of(&preview);
-    let plan: Value = serde_json::from_slice(&preview.stdout).expect("the plan is JSON");
-    assert_eq!(plan["files"].as_array().expect("files").len(), 3);
-    // The plan names the archive, the generation, the writer whose signature was checked and where
-    // the generation stands, which a person confirms with the digest.
-    assert_eq!(plan["backup_generation"], 1);
-    assert_eq!(plan["archive"], archive().get().to_string());
-    let writer: String = world
-        .writer_pair
-        .key_id()
-        .as_bytes()
-        .iter()
-        .take(8)
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    assert_eq!(plan["writer_key"], writer);
-    assert!(
-        plan["standing"]
-            .as_str()
-            .is_some_and(|standing| standing.contains("generation 1")),
-        "{plan}"
-    );
-    // The five members that are not restored, each by the object the plan names it by, with the
-    // table's reason for its kind; the unknown name has a reason of its own, and none of the three
-    // members that are restored is among them.
+/// Asserts that the plan of a restore of [`members_with_every_kind_a_restore_refuses`] shows the
+/// five members that are not restored, each by the object the plan names it by, with the table's
+/// reason for its kind; the unknown name has a reason of its own, and none of the three members
+/// that are restored is among them.
+fn plan_names_what_it_does_not_restore(plan: &Value, held: &[(String, Vec<u8>)]) {
     let not_restored = plan["not_restored"].as_array().expect("refused");
     assert_eq!(
         not_restored.len(),
@@ -1064,6 +998,102 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
             "{name} is restored, not refused: {plan}"
         );
     }
+}
+
+/// Asserts that nothing a restore refuses was written into `into`.
+fn nothing_refused_came_back(into: &Path) {
+    for refused in [
+        "ENDPOINT-KEY-BYTES",
+        "CONTROL-KEY-BYTES",
+        "AUTHORITY",
+        "REVOKED-GRANT",
+        "UNKNOWN",
+    ] {
+        assert!(
+            tree(into)
+                .values()
+                .all(|bytes| !text(bytes).contains(refused)),
+            "{refused} is not restored"
+        );
+    }
+}
+
+fn borrowed(members: &[(String, Vec<u8>)]) -> Vec<(&str, Vec<u8>)> {
+    members
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+        .collect()
+}
+
+/* -------------------------------------------------------------------------- */
+/* Cases                                                                       */
+/* -------------------------------------------------------------------------- */
+
+/// KR-REQ-24.16, 20.16, 20.19, KR-ACC-033: a fresh host with only the kit previews, then confirms
+/// the digest it saw, and the folder holds exactly the plaintexts; the host's stored keys,
+/// configuration and devices are as they were.
+///
+/// KR-REQ-20.17, the restore through the shipped command only: the archive here also carries an
+/// endpoint key, a control key, host authority, a revoked grant and a name no host archive carries,
+/// and the plan lists those five as not restored, with a reason each; none of their bytes is in
+/// the restored folder, and the host's own secrets, configuration and devices are as they were.
+/// Not shown here: that a backup is made without those keys, which the daemon's production case
+/// shows, or the kind the table gives each name, which the library's case shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_of_its_own() {
+    let world = World::new();
+    let rig = Rig::start(SignIn::Usable).await;
+    let held = members_with_every_kind_a_restore_refuses();
+    let sealed = seal(&world, 1, &borrowed(&held));
+    rig.put(&world, &sealed, None).await;
+    let kit = rig.work.join("kit.txt");
+    std::fs::write(&kit, world.kit_text(&[rig.origin()])).expect("the kit file");
+    let kit_arg = kit.display().to_string();
+    let into = folder(&rig, "restored");
+    let into_arg = into.display().to_string();
+
+    let before = host_state(&rig).await;
+
+    let preview = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(preview.status.success(), "{}", text(&preview.stderr));
+    assert!(names(&into).is_empty(), "a preview writes nothing");
+    let digest = digest_of(&preview);
+    let plan: Value = serde_json::from_slice(&preview.stdout).expect("the plan is JSON");
+    assert_eq!(plan["files"].as_array().expect("files").len(), 3);
+    // The plan names the archive, the generation, the writer whose signature was checked and where
+    // the generation stands, which a person confirms with the digest.
+    assert_eq!(plan["backup_generation"], 1);
+    assert_eq!(plan["archive"], archive().get().to_string());
+    let writer: String = world
+        .writer_pair
+        .key_id()
+        .as_bytes()
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(plan["writer_key"], writer);
+    assert!(
+        plan["standing"]
+            .as_str()
+            .is_some_and(|standing| standing.contains("generation 1")),
+        "{plan}"
+    );
+    plan_names_what_it_does_not_restore(&plan, &held);
 
     let restored = rig
         .run(
@@ -1146,20 +1176,7 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
             );
         }
     }
-    for refused in [
-        "ENDPOINT-KEY-BYTES",
-        "CONTROL-KEY-BYTES",
-        "AUTHORITY",
-        "REVOKED-GRANT",
-        "UNKNOWN",
-    ] {
-        assert!(
-            tree(&into)
-                .values()
-                .all(|bytes| !text(bytes).contains(refused)),
-            "{refused} is not restored"
-        );
-    }
+    nothing_refused_came_back(&into);
     // Nothing of the kit reached anything the commands printed.
     for output in [&preview, &restored] {
         let shown = format!("{}{}", text(&output.stdout), text(&output.stderr));
@@ -1548,11 +1565,19 @@ async fn a_restore_from_a_file_is_confirmed_apart_from_one_that_records_a_genera
 /// alone: no service is reached, the files are the ones a restore from the service writes, and the
 /// output says the recovery bundle at the service was left as it is. A file that is not an export,
 /// in another format, or sealed for another kit restores nothing and is refused by name.
+///
+/// KR-REQ-20.17, the restore from an export file only: the archive in the file also carries an
+/// endpoint key, a control key, host authority, a revoked grant and a name no host archive carries;
+/// the plan lists those five as not restored, with the reason of each kind, the folder holds
+/// exactly the three files the restore writes and its record, none of the five's bytes is in it,
+/// and the host's own secrets, configuration and devices are as they were. Not shown here: that an
+/// export holds none of those keys, which the companion's case shows for what it writes; or the
+/// kind the table gives each name, which the library's case shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restore_from_an_export_file_needs_no_service_and_no_sign_in() {
     let world = World::new();
     let rig = Rig::start(SignIn::Nobody).await;
-    let held = members();
+    let held = members_with_every_kind_a_restore_refuses();
     let sealed = seal(&world, 1, &borrowed(&held));
     let kit = rig.work.join("kit.txt");
     std::fs::write(&kit, world.kit_text(&[rig.origin()])).expect("the kit file");
@@ -1569,6 +1594,7 @@ async fn a_restore_from_an_export_file_needs_no_service_and_no_sign_in() {
     let into = folder(&rig, "restored");
     let into_arg = into.display().to_string();
     let asked = rig.served.web().arrived().len();
+    let before = host_state(&rig).await;
 
     // Without the file the host has no sign-in to ask the service with.
     let unsigned = rig
@@ -1607,6 +1633,9 @@ async fn a_restore_from_an_export_file_needs_no_service_and_no_sign_in() {
         .await;
     assert!(preview.status.success(), "{}", text(&preview.stderr));
     let digest = digest_of(&preview);
+    let plan: Value = serde_json::from_slice(&preview.stdout).expect("the plan is JSON");
+    assert_eq!(plan["files"].as_array().expect("files").len(), 3);
+    plan_names_what_it_does_not_restore(&plan, &held);
     let restored = rig
         .run(
             &[
@@ -1634,19 +1663,26 @@ async fn a_restore_from_an_export_file_needs_no_service_and_no_sign_in() {
             .is_some_and(|words| words.contains("reached no service")),
         "{report}"
     );
-    let written = names(&into);
-    assert!(
-        written.contains(&"session-0001.json".to_owned()),
-        "{written:?}"
-    );
-    assert!(
-        written.contains(&"configuration.json".to_owned()),
-        "{written:?}"
+    assert_eq!(
+        names(&into),
+        [
+            "configuration.json",
+            "restore.json",
+            "session-0001.json",
+            "session-0002.json"
+        ],
+        "the folder holds what the restore writes and nothing else"
     );
     assert_eq!(
         std::fs::read(into.join("session-0001.json")).expect("a session"),
         held[0].1,
         "the file gives back the member as the service would"
+    );
+    nothing_refused_came_back(&into);
+    assert_eq!(
+        host_state(&rig).await,
+        before,
+        "a restore from a file imports nothing into the host"
     );
     assert_eq!(
         rig.served.web().arrived().len(),
