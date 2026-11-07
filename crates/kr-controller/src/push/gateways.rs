@@ -60,7 +60,11 @@ impl AllowedGateways {
     }
 
     /// Makes the document's list the one in force.
-    pub fn replace(&self, listed: &[String]) {
+    ///
+    /// Only the delivery service moves the set, in its journal's lock
+    /// ([`super::DeliveryModule::replace_gateways`]), which is where the sweep of owed revocations
+    /// reads it.
+    pub(super) fn replace(&self, listed: &[String]) {
         let listed = Arc::new(listed.to_vec());
         *self
             .listed

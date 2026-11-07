@@ -1015,8 +1015,18 @@ impl Controller {
         let held_credentials = Arc::new(crate::push::credentials::HeldCredentials::persisted(
             destination_secrets,
         ));
-        held_credentials.attach_gateways(Arc::clone(&gateways));
-        delivery.attach_gateways(Arc::clone(&gateways));
+        // The one set the credential store, the delivery service and the controller share: the
+        // list moves in one place and every reader sees it. Both are new, so neither has a set
+        // already, and a host that went on with two would allow a gateway for some readers and
+        // not for others.
+        assert!(
+            held_credentials.attach_gateways(Arc::clone(&gateways)),
+            "the credential store was given its gateways twice"
+        );
+        assert!(
+            delivery.attach_gateways(Arc::clone(&gateways)),
+            "the delivery service was given its gateways twice"
+        );
         crate::push::load_held_credentials(&delivery, &held_credentials)?;
         // The runtime is built here and started once the daemon exists. Its renewals are proven
         // with this host's own authorisation key, which the installation named when it authorised

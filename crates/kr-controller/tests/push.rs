@@ -10444,6 +10444,26 @@ fn a_recipient_whose_grant_ended_is_left_no_object() {
 // The gateways a credential may name
 // ---------------------------------------------------------------------------------------------
 
+/// A delivery module over a journal of its own in `directory`, with no gateways attached.
+fn a_module_in(directory: &std::path::Path) -> DeliveryModule {
+    DeliveryModule::open_at(
+        &directory.join("delivery.sqlite3"),
+        kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+        kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        secrets(),
+    )
+    .expect("a delivery module")
+}
+
+/// Runs a closure when it is dropped, which includes the drop during an unwind.
+struct OnDrop<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
 /// KR-REQ-16.04: every exchange under a bearer is made through the gateways the host allows, and
 /// is checked when it starts. A question a registration asks and a renewal never leave the host for
 /// a gateway taken out of the list, whatever looked at the credential before; a revocation is the
@@ -10490,7 +10510,8 @@ fn an_exchange_under_a_bearer_never_leaves_for_a_gateway_taken_out_of_the_list_b
     let _ = senders.renew(&held);
     assert_eq!(recorder.asked().len(), 2);
 
-    gateways.replace(&[]);
+    let directory = tempfile::tempdir().expect("a directory");
+    a_module_in(directory.path()).replace_gateways(&gateways, &[]);
     let before = recorder.asked().len();
     assert!(matches!(
         senders.begin_renewal(&origin, id),
@@ -10579,9 +10600,8 @@ fn a_revocation_owed_to_a_gateway_taken_out_of_the_list_is_never_given_up() {
 /// owed to it keeps the debt. The sweep reads the list when it settles, not before it takes the
 /// journal: a debt owed to a gateway that left the list ends only when the gateway has made it.
 ///
-/// The host moves the list with `replace_gateways`, as it does in production. That the sweep reads
-/// the list inside the journal's lock, and the move takes the same lock, is not shown by a case: it
-/// would take a wait for a thread to block, and a case decides by a condition and not by a delay.
+/// The host moves the list with `replace_gateways`, as it does in production. That the move takes
+/// the journal's lock is shown by the next case.
 #[test]
 fn a_gateway_taken_out_of_the_list_as_the_sweep_settles_its_debt_keeps_the_debt() {
     use kr_controller::push::gateways::AllowedGateways;
@@ -10595,13 +10615,7 @@ fn a_gateway_taken_out_of_the_list_as_the_sweep_settles_its_debt_keeps_the_debt(
     // and the gateway is taken out of the list there when `remove` says so.
     let still_owed_after_the_fourth_ask = |remove: bool| {
         let directory = tempfile::tempdir().expect("a directory");
-        let module = DeliveryModule::open_at(
-            &directory.path().join("delivery.sqlite3"),
-            kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
-            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
-            secrets(),
-        )
-        .expect("a delivery module");
+        let module = a_module_in(directory.path());
         let gateways = Arc::new(AllowedGateways::new(
             "https://reach.invalid",
             &[LISTED.to_owned()],
@@ -10630,10 +10644,21 @@ fn a_gateway_taken_out_of_the_list_as_the_sweep_settles_its_debt_keeps_the_debt(
         }
         let (arrived, release) = module.pause_before_a_debt_is_settled();
         std::thread::scope(|scope| {
-            let sweeping = scope.spawn(|| sweep(t0 + 400 * DAY));
-            arrived.recv().expect("the sweep has its answer");
+            // Owned by the closure, so a case that fails before it lets the sweep go drops it and
+            // the sweep goes on by itself.
+            let release = release;
+            let sweeping = scope.spawn(|| {
+                // Arming again drops the end the case waits on, if the sweep never used it. It
+                // runs when the sweep ends, and when it panics, so a sweep that does not reach
+                // the pause fails the case and does not hang it.
+                let _closes_the_arrival = OnDrop(|| drop(module.pause_before_a_debt_is_settled()));
+                sweep(t0 + 400 * DAY);
+            });
+            arrived
+                .recv()
+                .expect("the sweep reached the pause before it ended");
             if remove {
-                module.replace_gateways(&[]);
+                module.replace_gateways(&gateways, &[]);
             }
             release.send(()).expect("the sweep goes on");
             sweeping.join().expect("the sweep ends");
@@ -10652,4 +10677,88 @@ fn a_gateway_taken_out_of_the_list_as_the_sweep_settles_its_debt_keeps_the_debt(
         still_owed_after_the_fourth_ask(true),
         "a debt owed to a gateway taken out of the list as it is settled is kept"
     );
+}
+
+/// KR-REQ-16.04: the list moves in the journal's lock, which is where the sweep of owed revocations
+/// reads it. The move is stopped once it holds the lock and before the list moves: the journal is
+/// held then, and the list is still the old one. Taking the lock is what makes a removal either
+/// seen by a sweep or settled after it.
+#[test]
+fn the_gateway_list_moves_while_the_journal_is_held() {
+    use kr_controller::push::gateways::AllowedGateways;
+
+    const LISTED: &str = "https://push.listed.invalid";
+    let directory = tempfile::tempdir().expect("a directory");
+    let module = a_module_in(directory.path());
+    let gateways = Arc::new(AllowedGateways::new(
+        "https://reach.invalid",
+        &[LISTED.to_owned()],
+    ));
+    assert!(module.attach_gateways(Arc::clone(&gateways)));
+    assert!(!module.journal_is_held(), "the control: nothing holds it");
+
+    let (arrived, release) = module.pause_while_the_gateways_move();
+    std::thread::scope(|scope| {
+        // Owned by the closure, so a case that fails before it lets the move go drops it and the
+        // move goes on by itself.
+        let release = release;
+        let moving = scope.spawn(|| {
+            // Arming again drops the end the case waits on, if the move never used it. It runs
+            // when the move ends, and when it panics, so a move that does not reach the pause
+            // fails the case and does not hang it.
+            let _closes_the_arrival = OnDrop(|| drop(module.pause_while_the_gateways_move()));
+            module.replace_gateways(&gateways, &[]);
+        });
+        arrived
+            .recv()
+            .expect("the move reached the pause before it ended");
+        assert!(
+            module.journal_is_held(),
+            "the journal is held while the list moves"
+        );
+        assert!(gateways.allows(LISTED), "the list has not moved yet");
+        release.send(()).expect("the move goes on");
+        moving.join().expect("the move ends");
+    });
+    assert!(!gateways.allows(LISTED), "the list moved");
+    assert!(!module.journal_is_held(), "and the journal is free again");
+}
+
+/// KR-REQ-16.04: the list moves in the set the caller names, whether or not any is attached to the
+/// delivery service yet, and a set that is not the attached one is refused where assertions are
+/// on: the sweep would read a list the host no longer holds.
+#[test]
+fn a_move_of_the_gateway_list_moves_the_set_it_names() {
+    use kr_controller::push::gateways::AllowedGateways;
+
+    const LISTED: &str = "https://push.listed.invalid";
+    let directory = tempfile::tempdir().expect("a directory");
+    let module = a_module_in(directory.path());
+    let set = || {
+        Arc::new(AllowedGateways::new(
+            "https://reach.invalid",
+            &[LISTED.to_owned()],
+        ))
+    };
+
+    // Nothing attached yet: the set named is the one that moves.
+    let unattached = set();
+    module.replace_gateways(&unattached, &[]);
+    assert!(!unattached.allows(LISTED));
+
+    // Attached: the same set moves.
+    let attached = set();
+    assert!(module.attach_gateways(Arc::clone(&attached)));
+    module.replace_gateways(&attached, &[]);
+    assert!(!attached.allows(LISTED));
+
+    // Another set than the attached one is refused in a build with debug assertions.
+    if cfg!(debug_assertions) {
+        let other = set();
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            module.replace_gateways(&other, &[]);
+        }));
+        assert!(refused.is_err(), "a set that is not the attached one moved");
+        assert!(other.allows(LISTED), "and it was left as it was");
+    }
 }
